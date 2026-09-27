@@ -53,6 +53,33 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
+def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("kpool", [0, -1])
+def test_dsa_kpool_requires_positive_pool_size(kpool):
+    with pytest.raises(ValueError, match="dsa_indexer_kpool must be positive"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=kpool)
+
+
+def test_dsa_kpool_requires_divisible_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be divisible"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4, dsa_indexer_topk=6)
+
+
+def test_dsa_kpool_requires_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4)
+
+
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
 def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
     config = TransformerConfig(
@@ -381,35 +408,6 @@ def test_mxfp8_wire_dtypes_reject_non_ncclep_dispatcher(overrides):
 def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
     with pytest.raises(ValueError, match="require BOTH"):
         _make_mxfp8_wire_config(**overrides)
-
-
-def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
-    kwargs = dict(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        experimental_attention_variant="dsa",
-        add_bias_linear=False,
-        dsa_indexer_topk=8,
-        dsa_indexer_kpool=4,
-    )
-    kwargs.update(overrides)
-    return TransformerConfig(**kwargs)
-
-
-def test_dsa_kpool_requires_divisible_indexer_topk():
-    with pytest.raises(ValueError, match="dsa_indexer_topk must be divisible"):
-        _make_dsa_kpool_config(dsa_indexer_topk=5)
-
-
-def test_dsa_kpool_accepts_divisible_indexer_topk():
-    config = _make_dsa_kpool_config(dsa_indexer_topk=8)
-    assert config.dsa_indexer_kpool == 4
-
-
-def test_dsa_kpool_requires_positive_pool_size():
-    with pytest.raises(ValueError, match="dsa_indexer_kpool must be positive"):
-        _make_dsa_kpool_config(dsa_indexer_kpool=0)
 
 
 requires_te_2_9 = pytest.mark.skipif(

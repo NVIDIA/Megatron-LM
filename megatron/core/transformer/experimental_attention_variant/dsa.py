@@ -680,13 +680,19 @@ def _compute_index_scores(
     """
     sq, batch, n_heads, head_dim = q.shape
     sk = k.size(0)
+    if sq == 0:
+        return torch.empty(batch, 0, sk, dtype=torch.float32, device=q.device)
     k_fp32 = k.float()
 
     # Chunk over seqlen_q to avoid materializing the full [sq, batch, heads, sk]
     # fp32 tensor. Target 256 MiB per chunk to leave room for the output.
     bytes_per_token = batch * n_heads * sk * 4
     chunk_size = min(sq, max(1, 256 * 1024 * 1024 // max(1, bytes_per_token)))
-    index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
+    needs_grad = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, weights, k))
+    if needs_grad:
+        score_chunks = []
+    else:
+        index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
 
     for start in range(0, sq, chunk_size):
         end = min(start + chunk_size, sq)
@@ -694,17 +700,23 @@ def _compute_index_scores(
         scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
         if use_relu:
             scores.relu_()
-        # Top-k selection runs without gradients and can reuse the score buffer.
-        # Preserve the ReLU output when autograd needs it for the indexer loss.
+        # Top-k selection runs without gradients and can reuse the score buffer. When autograd
+        # is active, collect chunks so the returned scores retain their computation graph.
         head_weights = weights[start:end].unsqueeze(-1)
-        if torch.is_grad_enabled():
+        if needs_grad:
             scores = scores * head_weights
         else:
             scores.mul_(head_weights)
-        index_scores[start:end] = scores.sum(dim=2)
+        score_chunk = scores.sum(dim=2)
+        if needs_grad:
+            score_chunks.append(score_chunk)
+        else:
+            index_scores[start:end] = score_chunk
         del scores
 
     # Transpose to [batch, seqlen_q, seqlen_k].
+    if needs_grad:
+        index_scores = torch.cat(score_chunks, dim=0)
     index_scores = index_scores.transpose(0, 1)
 
     return index_scores
@@ -1324,6 +1336,8 @@ def bwd_fused_indexer_loss_naive(
 
     # Chunk over seqlen_q to avoid materializing the full [sq, b, h, sk] fp32 tensor.
     sq_q, b_q, h_q, d_q = q.shape
+    if sq_q == 0:
+        return (torch.zeros_like(q), torch.zeros_like(weights), torch.zeros_like(k))
     k_fp32 = k.float()
     bytes_per_token = b_q * h_q * sk * 4
     chunk_size = min(sq_q, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
@@ -1902,16 +1916,29 @@ class DSAIndexer(MegatronModule):
         if self.index_kpool > 1:
             # KPool currently supports selection only, not an auxiliary indexer loss.
             # fp32 [kpool, index_head_dim] additive positional bias per pool slot.
+            kpool_param_device = (
+                "cpu" if self.config.use_cpu_initialization else torch.cuda.current_device()
+            )
             self.index_kpool_compress_ape = mark_keep_in_fp32(
                 torch.nn.Parameter(
-                    torch.zeros(self.index_kpool, self.index_head_dim, dtype=torch.float32),
+                    torch.zeros(
+                        self.index_kpool,
+                        self.index_head_dim,
+                        dtype=torch.float32,
+                        device=kpool_param_device,
+                    ),
                     requires_grad=False,
                 )
             )
             # bf16 [index_head_dim, hidden_size]; gate_score = F.linear(x, gate) = x @ gate^T
             # -> [seqlen, index_head_dim]. Matches vLLM's checkpoint name (no .weight suffix).
             self.index_kpool_compress_gate = torch.nn.Parameter(
-                torch.empty(self.index_head_dim, self.hidden_size, dtype=torch.bfloat16)
+                torch.empty(
+                    self.index_head_dim,
+                    self.hidden_size,
+                    dtype=torch.bfloat16,
+                    device=kpool_param_device,
+                )
             )
             nn.init.normal_(self.index_kpool_compress_gate, std=0.01)
         else:
@@ -2109,7 +2136,7 @@ class DSAIndexer(MegatronModule):
             # Select pools, then expand them to token indices.
             _cu_kv = None
             if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
-                _cu_kv, _ = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+                _, _cu_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
             index_scores, topk_indices = fused_qk_topk_kpool(
                 q,
                 k,

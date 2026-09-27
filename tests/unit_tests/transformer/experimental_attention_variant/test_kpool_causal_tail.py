@@ -162,3 +162,17 @@ def test_kpool_rotation_applies_to_query_and_pooled_key():
         rotate_activation(q), weights, rotate_activation(pooled), use_relu=False
     )
     torch.testing.assert_close(scores, expected, rtol=0, atol=0)
+
+
+def test_compute_index_scores_preserves_autograd_graph():
+    torch.manual_seed(460)
+    q = torch.randn(3, 1, 2, 4, requires_grad=True)
+    k = torch.randn(5, 1, 4, requires_grad=True)
+    weights = torch.randn(3, 1, 2, requires_grad=True)
+
+    scores = _compute_index_scores(q, weights, k)
+    assert scores.requires_grad
+    scores.sum().backward()
+    assert q.grad is not None
+    assert weights.grad is not None
+    assert k.grad is not None
