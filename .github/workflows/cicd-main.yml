@@ -1351,6 +1351,9 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     needs: [Nemo_CICD_Test]
     if: |
       (
@@ -1375,14 +1378,14 @@ jobs:
       - name: Download coverage reports of current branch
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          pattern: coverage-${{ matrix.flag }}-*
+          github-token: ${{ github.token }}
+          pattern: coverage-${{ matrix.flag }}-${{ github.run_id }}-*
 
       - name: List coverage files
         run: find . -type f -name "*.xml" -o -name "*.lcov"
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
-        if: always()
         run: |
           pip install coverage
 
