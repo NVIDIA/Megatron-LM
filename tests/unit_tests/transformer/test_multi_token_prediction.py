@@ -3406,6 +3406,24 @@ class TestMultiTokenPrediction:
 
         torch.testing.assert_close(rolled, expected)
 
+    def test_roll_tensor_preserves_trailing_slots_after_final_packed_sequence(self):
+        tensor = torch.arange(10)
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+            pad_between_seqs=True,
+            total_tokens=tensor.numel(),
+        )
+
+        rolled, _ = roll_tensor(tensor, packed_seq_params=packed_seq_params)
+
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9]))
+
     def test_roll_tensor_with_attention_padded_packed_sequences(self):
         cp = 4
         if int(os.environ.get("WORLD_SIZE", "1")) < cp:
@@ -3444,6 +3462,43 @@ class TestMultiTokenPrediction:
         )
 
         torch.testing.assert_close(rolled, expected)
+
+        # pretrain_gpt supplies the physical boundaries as both arrays and
+        # leaves pad_between_seqs unset.
+        physical_only = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+        )
+        rolled_physical_only, _ = roll_tensor(
+            tensor, cp_group=cp_group, packed_seq_params=physical_only
+        )
+        torch.testing.assert_close(rolled_physical_only, expected)
+
+        # Fixed-size RL metadata may contain empty documents anywhere, while
+        # trailing local slots beyond the final boundary must stay unchanged.
+        tensor_with_tail = torch.cat((tensor, torch.tensor([99, 100], device="cuda")))
+        physical_with_empty = torch.tensor(
+            [0, 0, 8, 8, 24, 24], dtype=torch.int32, device="cuda"
+        )
+        logical_with_empty = torch.tensor([0, 0, 3, 3, 13, 13], dtype=torch.int32, device="cuda")
+        packed_with_empty = PackedSeqParams(
+            cu_seqlens_q=logical_with_empty,
+            cu_seqlens_kv=logical_with_empty,
+            cu_seqlens_q_padded=physical_with_empty,
+            cu_seqlens_kv_padded=physical_with_empty,
+            qkv_format="thd",
+            pad_between_seqs=True,
+            total_tokens=tensor_with_tail.numel() * cp,
+        )
+        rolled_with_tail, _ = roll_tensor(
+            tensor_with_tail, cp_group=cp_group, packed_seq_params=packed_with_empty
+        )
+        torch.testing.assert_close(
+            rolled_with_tail, torch.cat((expected, tensor_with_tail[-2:]))
+        )
         Utils.destroy_model_parallel()
 
 

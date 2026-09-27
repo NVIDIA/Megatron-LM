@@ -366,14 +366,14 @@ def _roll_tensor_packed_seq(
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
 
-    # Notice: This is a naive implementation to test the correctness,
-    # a better solution will only sync the boundary tokens once.
     ndim = tensor.dim()
     sequence_dim = dims if dims >= 0 else ndim + dims
     assert sequence_dim in (
         0,
         ndim - 1,
     ), f"Packed sequence roll only supports the first or last dimension, got dims={dims}."
+    mask_shape = [1] * ndim
+    mask_shape[sequence_dim] = -1
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
@@ -390,29 +390,39 @@ def _roll_tensor_packed_seq(
             tensor.size(sequence_dim), device=tensor.device, dtype=physical_cu_seqlens.dtype
         )
         document_ids = torch.searchsorted(physical_cu_seqlens[1:], positions, right=True)
+        # A packed tensor may have trailing slots after its final document.
+        # Clamp the lookup, then keep those slots unchanged as the loop did.
+        trailing = positions >= physical_cu_seqlens[-1]
+        document_ids.clamp_max_(len(cu_seqlens) - 2)
         valid_ends = physical_cu_seqlens[:-1] + torch.diff(cu_seqlens)
         invalid = positions >= valid_ends.index_select(0, document_ids) - 1
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        mask_shape = [1] * tensor.dim()
-        mask_shape[sequence_dim] = -1
         rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
+        rolled_tensor = torch.where(trailing.view(mask_shape), tensor, rolled_tensor)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
-    if packed_seq_params.cu_seqlens_q_padded is not None and packed_seq_params.pad_between_seqs:
-        # Packed CP pads every document to 2 * CP tokens. Gather one boundary
-        # value per document, exchange the whole vector with each neighbour,
-        # then patch all chunk ends. The previous path launched four NCCL
-        # operations and many tensor kernels for *each* document.
-        local_starts = torch.div(physical_cu_seqlens[:-1], cp_size, rounding_mode='floor').long()
+    if packed_seq_params.cu_seqlens_q_padded is not None:
+        # Exchange one boundary vector per neighbour for all nonempty documents.
         chunk_lengths = torch.div(
             torch.diff(physical_cu_seqlens), 2 * cp_size, rounding_mode='floor'
         ).long()
+        # RL packing keeps fixed-size cu_seqlens by repeating the final boundary.
+        # Empty entries cannot be gathered or patched, particularly at the end.
+        nonempty = torch.nonzero(chunk_lengths > 0).flatten()
+        if nonempty.numel() == 0:
+            rolled_tensor = tensor.clone()
+            return rolled_tensor, rolled_tensor.sum() if return_sum else None
+        local_starts = torch.div(
+            physical_cu_seqlens[:-1], cp_size, rounding_mode='floor'
+        ).long()
+        local_starts = local_starts.index_select(0, nonempty)
+        chunk_lengths = chunk_lengths.index_select(0, nonempty)
         second_starts = local_starts + chunk_lengths
         first_ends = second_starts - 1
         second_ends = second_starts + chunk_lengths - 1
-        first_boundary = tensor.index_select(sequence_dim, local_starts).contiguous()
-        second_boundary = tensor.index_select(sequence_dim, second_starts).contiguous()
+        first_boundary = tensor.index_select(sequence_dim, local_starts)
+        second_boundary = tensor.index_select(sequence_dim, second_starts)
         first_received = torch.empty_like(first_boundary)
         second_received = torch.empty_like(second_boundary)
 
@@ -453,6 +463,9 @@ def _roll_tensor_packed_seq(
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
         rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
         rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
+        positions = torch.arange(tensor.size(sequence_dim), device=tensor.device)
+        trailing = positions >= physical_cu_seqlens[-1] // cp_size
+        rolled_tensor = torch.where(trailing.view(mask_shape), tensor, rolled_tensor)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
@@ -630,7 +643,7 @@ def _packed_seq_params_for_local_hsm_roll(
         chunk_lengths = torch.div(torch.diff(padded), 2 * cp_size, rounding_mode='floor')
         valid_lengths = torch.diff(cu_seqlens)
         owned_lengths = 2 * chunk_lengths
-        local_starts = torch.cumsum(owned_lengths, dim=0) - owned_lengths
+        local_starts = torch.cumsum(owned_lengths, dim=0, dtype=padded.dtype) - owned_lengths
         if cp_rank == cp_size - 1:
             valid = torch.minimum(
                 (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), owned_lengths
