@@ -32,7 +32,42 @@ class KDALayerConfig(TransformerConfig):
 
     def validate_kda(self) -> None:
         """Validate KDA-specific dimensions, including configs copied with from_config."""
+        if self.gdn_conv_pad_alignment is not None and self.gdn_conv_pad_alignment <= 0:
+            raise ValueError(
+                "gdn_conv_pad_alignment must be positive when set for KDA, got "
+                f"{self.gdn_conv_pad_alignment}."
+            )
+        if self.kda_safe_gate and (
+            self.kda_lower_bound is None or not (-5 <= self.kda_lower_bound < 0)
+        ):
+            raise ValueError(
+                "kda_lower_bound must be in the safe range [-5, 0) when kda_safe_gate=True, "
+                f"got {self.kda_lower_bound}."
+            )
+        required_positive = (
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        )
+        for name in required_positive:
+            value = getattr(self, name)
+            if value is None or value <= 0:
+                raise ValueError(f"{name} must be positive for KDA, got {value}.")
         if self.linear_num_key_heads != self.linear_num_value_heads:
             raise ValueError("KDA requires equal key and value head counts.")
         if self.linear_key_head_dim != self.linear_value_head_dim:
             raise ValueError("KDA requires equal key and value head dimensions.")
+        if self.linear_num_key_heads % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                "KDA key/value head count must be divisible by tensor parallel size; "
+                f"got heads={self.linear_num_key_heads}, tp={self.tensor_model_parallel_size}."
+            )
+        if self.linear_cp_mode == "headwise":
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            if self.linear_num_key_heads % tp_cp_size != 0:
+                raise ValueError(
+                    "KDA headwise context parallelism requires head count divisible by TP*CP; "
+                    f"got heads={self.linear_num_key_heads}, tp_cp={tp_cp_size}."
+                )
