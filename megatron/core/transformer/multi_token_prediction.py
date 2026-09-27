@@ -381,7 +381,80 @@ def _roll_tensor_packed_seq(
     if physical_cu_seqlens is None:
         physical_cu_seqlens = cu_seqlens
 
-    rolled_tensor = tensor.clone()
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        # A single roll supplies every interior token. Mask each document's last
+        # valid position and its physical padding in one operation instead of
+        # launching GPU work separately for every packed document.
+        positions = torch.arange(
+            tensor.size(sequence_dim), device=tensor.device, dtype=physical_cu_seqlens.dtype
+        )
+        document_ids = torch.searchsorted(physical_cu_seqlens[1:], positions, right=True)
+        valid_ends = physical_cu_seqlens[:-1] + torch.diff(cu_seqlens)
+        invalid = positions >= valid_ends.index_select(0, document_ids) - 1
+        rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+        mask_shape = [1] * tensor.dim()
+        mask_shape[sequence_dim] = -1
+        rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
+        rolled_sum = rolled_tensor.sum() if return_sum else None
+        return rolled_tensor, rolled_sum
+
+    if packed_seq_params.cu_seqlens_q_padded is not None and packed_seq_params.pad_between_seqs:
+        # Packed CP pads every document to 2 * CP tokens. Gather one boundary
+        # value per document, exchange the whole vector with each neighbour,
+        # then patch all chunk ends. The previous path launched four NCCL
+        # operations and many tensor kernels for *each* document.
+        local_starts = torch.div(physical_cu_seqlens[:-1], cp_size, rounding_mode='floor').long()
+        chunk_lengths = torch.div(
+            torch.diff(physical_cu_seqlens), 2 * cp_size, rounding_mode='floor'
+        ).long()
+        second_starts = local_starts + chunk_lengths
+        first_ends = second_starts - 1
+        second_ends = second_starts + chunk_lengths - 1
+        first_boundary = tensor.index_select(sequence_dim, local_starts).contiguous()
+        second_boundary = tensor.index_select(sequence_dim, second_starts).contiguous()
+        first_received = torch.empty_like(first_boundary)
+        second_received = torch.empty_like(second_boundary)
+
+        local_rank = torch.distributed.get_rank(group=cp_group)
+        global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+        ops = []
+        if local_rank != 0:
+            previous_rank = global_ranks[local_rank - 1]
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, first_boundary, previous_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, second_received, previous_rank, group=cp_group
+                )
+            )
+        else:
+            second_received.zero_()
+        if local_rank != cp_size - 1:
+            next_rank = global_ranks[local_rank + 1]
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, first_received, next_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, second_boundary, next_rank, group=cp_group
+                )
+            )
+        else:
+            first_received.copy_(second_boundary)
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
+
+        rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+        rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
+        rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
+        rolled_sum = rolled_tensor.sum() if return_sum else None
+        return rolled_tensor, rolled_sum
 
     def slice_sequence(tensor, start, end):
         index = [slice(None)] * tensor.dim()
@@ -393,27 +466,8 @@ def _roll_tensor_packed_seq(
         index[sequence_dim] = slice(start, end)
         tensor[tuple(index)] = value
 
-    cp_size = cp_group.size() if cp_group is not None else 1
-    if cp_size == 1:
-        # CP disabled: roll each packed sequence independently within its boundaries
-        for i in range(len(cu_seqlens) - 1):
-            start_idx = physical_cu_seqlens[i]
-            valid_length = cu_seqlens[i + 1] - cu_seqlens[i]
-            end_idx = start_idx + valid_length
-            physical_end_idx = physical_cu_seqlens[i + 1]
-            # Shard-local packed boundaries can collapse documents outside this
-            # SP rank to empty slices. They have no boundary token to clear.
-            if end_idx > start_idx:
-                seq_slice = slice_sequence(tensor, start_idx, end_idx)
-                rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=sequence_dim)
-                # Zero out the last position that would cross a document boundary.
-                rolled_seq.select(sequence_dim, shifts).zero_()
-                assign_sequence(rolled_tensor, start_idx, end_idx, rolled_seq)
-            assign_sequence(rolled_tensor, end_idx, physical_end_idx, 0)
-        rolled_sum = rolled_tensor.sum() if return_sum else None
-        return rolled_tensor, rolled_sum
-
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
+    rolled_tensor = tensor.clone()
     local_rank = torch.distributed.get_rank(group=cp_group)
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
     next_rank = global_ranks[(local_rank + 1) % cp_size]
@@ -573,26 +627,33 @@ def _packed_seq_params_for_local_hsm_roll(
     if padded is not None and padded is not cu_seqlens:
         cp_size = get_pg_size(cp_group)
         cp_rank = get_pg_rank(cp_group)
-        boundaries = [padded.new_zeros(())]
-        local_offset = padded.new_zeros(())
-        for doc_idx in range(len(cu_seqlens) - 1):
-            padded_length = padded[doc_idx + 1] - padded[doc_idx]
-            valid_length = cu_seqlens[doc_idx + 1] - cu_seqlens[doc_idx]
-            chunk_length = torch.div(padded_length, 2 * cp_size, rounding_mode='floor')
-            if cp_rank == cp_size - 1:
-                owned_length = 2 * chunk_length
-                valid = torch.minimum(
-                    (valid_length - cp_rank * chunk_length).clamp_min(0), owned_length
-                )
-                boundaries.extend([local_offset + valid, local_offset + owned_length])
-                local_offset = local_offset + owned_length
-                continue
-            starts = (cp_rank * chunk_length, (2 * cp_size - cp_rank - 1) * chunk_length)
-            for start in starts:
-                valid = torch.minimum((valid_length - start).clamp_min(0), chunk_length)
-                boundaries.extend([local_offset + valid, local_offset + chunk_length])
-                local_offset = local_offset + chunk_length
-        cp_local = torch.stack(boundaries).unique_consecutive()
+        chunk_lengths = torch.div(torch.diff(padded), 2 * cp_size, rounding_mode='floor')
+        valid_lengths = torch.diff(cu_seqlens)
+        owned_lengths = 2 * chunk_lengths
+        local_starts = torch.cumsum(owned_lengths, dim=0) - owned_lengths
+        if cp_rank == cp_size - 1:
+            valid = torch.minimum(
+                (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), owned_lengths
+            )
+            boundaries = torch.stack(
+                (local_starts + valid, local_starts + owned_lengths), dim=1
+            ).flatten()
+        else:
+            front_valid = torch.minimum(
+                (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), chunk_lengths
+            )
+            back_start = (2 * cp_size - cp_rank - 1) * chunk_lengths
+            back_valid = torch.minimum((valid_lengths - back_start).clamp_min(0), chunk_lengths)
+            boundaries = torch.stack(
+                (
+                    local_starts + front_valid,
+                    local_starts + chunk_lengths,
+                    local_starts + chunk_lengths + back_valid,
+                    local_starts + owned_lengths,
+                ),
+                dim=1,
+            ).flatten()
+        cp_local = torch.cat((padded.new_zeros(1), boundaries)).unique_consecutive()
         add_zigzag_midpoints = False
     else:
         cp_size = get_pg_size(cp_group)

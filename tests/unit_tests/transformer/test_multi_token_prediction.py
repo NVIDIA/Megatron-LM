@@ -3399,6 +3399,7 @@ class TestMultiTokenPrediction:
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
             qkv_format="thd",
+            pad_between_seqs=True,
         )
 
         rolled, _ = roll_tensor(tensor, shifts=-1, dims=-1, packed_seq_params=packed_seq_params)
@@ -3435,6 +3436,7 @@ class TestMultiTokenPrediction:
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
             qkv_format="thd",
+            pad_between_seqs=True,
         )
 
         rolled, _ = roll_tensor(
