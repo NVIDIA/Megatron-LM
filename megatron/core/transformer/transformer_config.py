@@ -1625,6 +1625,46 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_router_aux_loss_fusion is None:
             self.moe_router_aux_loss_fusion = self.moe_router_fusion
 
+        if self.wide_residual is not None:
+            if self.enable_mhc_connections:
+                raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
+            if self.moe_shortcut_connection:
+                raise NotImplementedError(
+                    "wide_residual does not yet support moe_shortcut_connection. "
+                    "ShortcutMoE groups and executes paired hybrid layers outside the ordinary "
+                    "wide-residual branch-connection path."
+                )
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+                raise NotImplementedError(
+                    "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
+                )
+            if self.pipeline_model_parallel_size > 1:
+                raise NotImplementedError(
+                    "wide_residual does not yet support pipeline_model_parallel_size > 1. "
+                    "Inter-stage communication buffers are still sized from hidden_size."
+                )
+            if self.mtp_num_layers is not None:
+                raise NotImplementedError(
+                    "wide_residual does not yet support Multi-Token Prediction (MTP)."
+                )
+            if self.inference_fuse_tp_communication:
+                raise NotImplementedError(
+                    "wide_residual is not compatible with inference_fuse_tp_communication. "
+                    "The fused inference path assumes an ordinary-width residual tensor."
+                )
+            if self.heterogeneous_block_specs:
+                raise NotImplementedError(
+                    "wide_residual does not yet support heterogeneous_block_specs. "
+                    "Residual-stream width is currently owned by the enclosing block."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise NotImplementedError(
+                    "wide_residual does not yet support overlap_moe_expert_parallel_comm. "
+                    "The fine-grained EP-overlap schedule invokes the pre-MLP norm and MLP BDA "
+                    "outside TransformerLayer._forward_mlp, bypassing the wide-residual MLP "
+                    "read and write connection."
+                )
+
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
         # spec module imports this one.

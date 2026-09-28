@@ -9,3 +9,4 @@ from .transformer_layer import (
     TransformerLayerSubmodules,
 )
 from .wide_residual_config import WideResidualConfig
+from .wide_residual_layer import WideResidualTransformerLayer

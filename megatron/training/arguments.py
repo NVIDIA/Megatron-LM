@@ -34,6 +34,7 @@ from megatron.core.utils import (
 from megatron.training import global_vars
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
+    _wide_residual_config_from_args,
     core_transformer_config_from_args,
 )
 from megatron.training.utils import (
@@ -49,6 +50,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
+    parser = _add_wide_residual_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -144,6 +146,11 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Experimental yaml
     if args.yaml_cfg is not None:
+        if _wide_residual_config_from_args(args) is not None:
+            raise ValueError(
+                'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
+                'YAML model configuration replaces argparse model arguments.'
+            )
         from .yaml_arguments import load_yaml
 
         args = load_yaml(args.yaml_cfg)
@@ -2521,6 +2528,8 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # Constructed from the dedicated flat CLI arguments below.
+        "wide_residual",
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
@@ -2614,6 +2623,43 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
+    return parser
+
+
+def _add_wide_residual_args(parser):
+    """Add CLI arguments used to construct ``WideResidualConfig``."""
+
+    group = parser.add_argument_group(title='wide residual')
+    group.add_argument(
+        '--wide-residual',
+        dest='wide_residual_num_streams',
+        type=int,
+        default=None,
+        help='Enable streamwise wide residuals with this many hidden-size streams.',
+    )
+    group.add_argument(
+        '--wide-residual-streamwise-sigmoid-init-scale',
+        type=float,
+        default=0.01,
+        help='Symmetric initialization spread for streamwise write logits.',
+    )
+    group.add_argument(
+        '--wide-residual-learned-retention',
+        action='store_true',
+        help='Apply one bounded learned carry factor to every residual stream.',
+    )
+    group.add_argument(
+        '--wide-residual-retention-init',
+        type=float,
+        default=0.999,
+        help='Initial retention factor for learned wide-residual retention.',
+    )
+    group.add_argument(
+        '--wide-residual-retention-max-forget',
+        type=float,
+        default=0.10,
+        help='Maximum forget rate for learned wide-residual retention.',
+    )
     return parser
 
 def _add_straggler_detector_args(parser):
