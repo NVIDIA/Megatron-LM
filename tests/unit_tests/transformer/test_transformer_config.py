@@ -112,6 +112,22 @@ def test_explicit_mhc_fused_backend_requires_fused_mhc():
         )
 
 
+def test_mhc_full_recompute_is_rejected():
+    with pytest.raises(
+        NotImplementedError, match="not yet compatible with full activation recompute"
+    ):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            distribute_saved_activations=True,
+        )
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 

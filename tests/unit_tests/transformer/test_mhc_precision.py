@@ -59,7 +59,10 @@ def test_mhc_precision(fp32_mixing, input_scale):
         (streams.float() * expected_pre.float().unsqueeze(-1)).sum(2).to(residual.dtype)
     )
     torch.testing.assert_close(aggregated, expected_aggregate)
-    actual = layer.fused_h_res_h_post_bda(comb, residual, post, (output, None), 0.0, True, False)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=fp32_mixing):
+        actual = layer.fused_h_res_h_post_bda(
+            comb, residual, post, (output, None), 0.0, True, False
+        )
     expected_mix = torch.einsum("...ij,...ih->...jh", comb, streams.to(expected_dtype))
     expected_output = (
         expected_mix.float() + post.float().unsqueeze(-1) * output.float().unsqueeze(2)
