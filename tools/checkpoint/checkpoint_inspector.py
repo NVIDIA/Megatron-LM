@@ -1037,6 +1037,21 @@ def _is_keep_fp32_key(key):
     return any(pattern.search(key) for pattern in _KEEP_FP32_KEY_RES)
 
 
+def _strip_module_wrappers(key):
+    """Drop a leading run of ``module.`` wrappers (robust to wrapper depth)."""
+    while key.startswith("module."):
+        key = key[len("module.") :]
+    return key
+
+
+def _is_dropped_key(key):
+    """Entries the reverse converter never writes: TE ``_extra_state`` (incl. FP8
+    amax history), RNG state (re-seedable) and rerun-state (optional on load)."""
+    return (
+        "_extra_state" in key or key.startswith("rng_state") or key.startswith("rerun_state_machine")
+    )
+
+
 def _strip_fsdp_model_prefix(key, configured_prefix=_FSDP_MODEL_PREFIX_DEFAULT):
     """Return the bare mcore key for an fsdp model-weight key, else ``None``.
 
@@ -1050,9 +1065,7 @@ def _strip_fsdp_model_prefix(key, configured_prefix=_FSDP_MODEL_PREFIX_DEFAULT):
         rest = key[len("model.") :]
     else:
         return None
-    while rest.startswith("module."):
-        rest = rest[len("module.") :]
-    return rest
+    return _strip_module_wrappers(rest)
 
 
 def _reverse_optimizer_state_key(key):
@@ -1065,10 +1078,7 @@ def _reverse_optimizer_state_key(key):
     ``exp_avg_sq`` / ``step`` / ...); the ``module.`` wrapper run is stripped.
     """
     assert key.startswith("optimizer.state."), key
-    rest = key[len("optimizer.state.") :]
-    while rest.startswith("module."):
-        rest = rest[len("module.") :]
-    param_fqn, subkey = rest.rsplit(".", 1)
+    param_fqn, subkey = _strip_module_wrappers(key[len("optimizer.state.") :]).rsplit(".", 1)
     return f"optimizer.state.{subkey}.{param_fqn}"
 
 
@@ -1249,6 +1259,21 @@ _MAMBA_CONV_RE = re.compile(r"^(.*\.mixer\.)(conv1d_weight|conv1d_bias)$")
 _MAMBA_CONV_RENAME = {"conv1d_weight": "conv1d.weight", "conv1d_bias": "conv1d.bias"}
 
 
+def _split_fused(value, key, out_key, sections, names, out):
+    """Split a fused projection into ``out[f"{out_key}.{name}"]`` sub-tensors.
+
+    Per-layer keys carry an explicit ``.layers.{idx}.`` and split dim 0; a stacked
+    homogeneous block carries a leading num-layers axis and splits dim 1.
+    """
+    dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
+    assert all(size > 0 for size in sections) and sum(sections) == value.shape[dim], (
+        f"Split of '{key}': sections {sections} (sum {sum(sections)}) != dim {dim} "
+        f"size {value.shape[dim]} — args/checkpoint mismatch?"
+    )
+    for piece, name in zip(torch.split(value, sections, dim=dim), names):
+        out[f"{out_key}.{name}"] = piece.contiguous()
+
+
 def _split_gdn_projections(tensors, args):
     """Split fused GatedDeltaNet ``in_proj``/``conv1d`` into named factory sub-keys.
 
@@ -1282,19 +1307,7 @@ def _split_gdn_projections(tensors, args):
         if spec is None:
             out[key] = value
             continue
-        sections, names = spec
-        # Per-layer keys keep an explicit ``.layers.{idx}.`` (interleaved GDN) and
-        # split dim 0; a stacked homogeneous block carries a leading num-layers axis
-        # and splits dim 1.
-        dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
-        assert value.shape[dim] == sum(sections), (
-            f"GDN split for '{key}': dim {dim} size {value.shape[dim]} != "
-            f"sum({sections})={sum(sections)} — args/checkpoint mismatch?"
-        )
-        start = 0
-        for size, name in zip(sections, names):
-            out[f"{key}.{name}"] = value.narrow(dim, start, size).contiguous()
-            start += size
+        _split_fused(value, key, key, *spec, out)
         n_split += 1
     return out, n_split
 
@@ -1332,8 +1345,6 @@ def _split_mamba_projections(tensors, args):
         if not is_inproj and conv_m is None:
             out[key] = value
             continue
-        # Per-layer keys carry an explicit ``.layers.{idx}.`` (interleaved hybrid) and
-        # split dim 0; a stacked homogeneous block carries a leading num-layers axis.
         dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
         width = value.shape[dim]
         if is_inproj:
@@ -1348,14 +1359,7 @@ def _split_mamba_projections(tensors, args):
             sections = [d_inner, gds, gds]
             names = ["x", "B", "C"]
             out_key = conv_m.group(1) + _MAMBA_CONV_RENAME[conv_m.group(2)]
-        assert d_inner > 0 and sum(sections) == width, (
-            f"Mamba split for '{key}': derived sections {sections} (sum {sum(sections)}) "
-            f"!= dim {dim} size {width} — args/checkpoint mismatch?"
-        )
-        start = 0
-        for size, name in zip(sections, names):
-            out[f"{out_key}.{name}"] = value.narrow(dim, start, size).contiguous()
-            start += size
+        _split_fused(value, key, out_key, sections, names, out)
         n_split += 1
     return out, n_split
 
@@ -1407,10 +1411,7 @@ def _rebuild_param_groups_from_meta(param_meta_flat, meta_prefix):
     """
     per_param = {}  # param_fqn -> {attr: value}
     for key, value in param_meta_flat.items():
-        rest = key[len(meta_prefix) :]
-        while rest.startswith("module."):
-            rest = rest[len("module.") :]
-        param_fqn, attr = rest.rsplit(".", 1)
+        param_fqn, attr = _strip_module_wrappers(key[len(meta_prefix) :]).rsplit(".", 1)
         per_param.setdefault(param_fqn, {})[attr] = value
 
     groups = {}  # identifier tuple -> (representative meta, [param_fqns])
@@ -1476,14 +1477,12 @@ def _assign_tensor_keys_to_rank(
     """Return the set of fsdp tensor keys this rank owns for a sharded convert.
 
     Tensor items are partitioned by :func:`_output_group_id` and assigned to ranks
-    round-robin over the sorted group list (deterministic across ranks). ``_extra_state``
-    / RNG / rerun keys are skipped (never written). ``world_size == 1`` returns every key.
+    round-robin over the sorted group list (deterministic across ranks). Keys matched
+    by :func:`_is_dropped_key` are skipped. ``world_size == 1`` returns every key.
     """
     key_group = {}
     for key, md in md_items.items():
-        if not isinstance(md, TensorStorageMetadata) or "_extra_state" in key:
-            continue
-        if key.startswith("rng_state") or key.startswith("rerun_state_machine"):
+        if not isinstance(md, TensorStorageMetadata) or _is_dropped_key(key):
             continue
         bare = _strip_fsdp_model_prefix(key, input_prefix)
         if bare is not None:
@@ -1556,7 +1555,7 @@ def reverse_convert_checkpoint(
     # full key set so sharded ranks agree (never from a rank's partial subset).
     global_model_keys = []
     for k, md in md_items.items():
-        if isinstance(md, TensorStorageMetadata) and "_extra_state" not in k:
+        if isinstance(md, TensorStorageMetadata) and not _is_dropped_key(k):
             bare = _strip_fsdp_model_prefix(k, input_model_weight_prefix)
             if bare is not None:
                 global_model_keys.append(bare)
@@ -1592,11 +1591,9 @@ def reverse_convert_checkpoint(
     param_meta_flat = {}  # optimizer.param_to_group_meta.* (fsdp-native)
     n_skipped_extra_state = 0
     for key, value in load_dict.items():
-        if "_extra_state" in key:
-            n_skipped_extra_state += 1
+        if _is_dropped_key(key):
+            n_skipped_extra_state += "_extra_state" in key
             continue
-        if key.startswith("rng_state") or key.startswith("rerun_state_machine"):
-            continue  # RNG is re-seedable; rerun state is optional on load.
         if isinstance(value, torch.Tensor):
             bare = _strip_fsdp_model_prefix(key, input_model_weight_prefix)
             if bare is not None:
@@ -1622,9 +1619,8 @@ def reverse_convert_checkpoint(
         common_flat[key] = value
 
     # ---- 2a. Fail loudly on architectures this tool cannot invert ----------
-    # (Mamba fused conv1d, un-indexed stacked-layer buffers). Done before any
-    # transform so an unsupported checkpoint raises rather than silently
-    # producing a wrong one. GatedDeltaNet's dotted conv1d.weight is unaffected.
+    # (un-indexed stacked-layer buffers). Done before any transform so an
+    # unsupported checkpoint raises rather than silently producing a wrong one.
     _assert_supported_scope(tensors)
 
     # ---- 2b. Reconstruct fp32 optimizer masters + downcast the model section --
