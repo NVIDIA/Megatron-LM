@@ -4457,7 +4457,9 @@ def training_log(
         if pg_collection is None:
             # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
             # The core logger still receives explicit groups and does not read MPU globals.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['pp', 'dp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp', 'gtp_remat']
+            )
         assert isinstance(
             pg_collection, ProcessGroupCollection
         ), "DSA indexer logging requires a ProcessGroupCollection"
