@@ -1950,6 +1950,13 @@ class DSAIndexer(MegatronModule):
         for param in self.parameters():
             setattr(param, "average_gradients_across_tp_domain", True)
 
+        # The sparse-attention top-k path is discrete and runs under ``no_grad``.  Without the
+        # auxiliary indexer loss, none of these parameters can receive a gradient; leave them
+        # out of DDP/optimizer bookkeeping instead of failing on an unused-parameter reset.
+        if (self.config.dsa_indexer_loss_coeff or 0.0) <= 0:
+            for param in self.parameters():
+                param.requires_grad_(False)
+
     def _project_indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
         """Run ``linear_weights_proj`` according to the DSA-specific precision contract."""
         weights_proj_context = (

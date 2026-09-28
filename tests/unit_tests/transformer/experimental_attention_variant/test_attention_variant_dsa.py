@@ -2434,6 +2434,7 @@ class TestDSAIndexer:
         assert self.indexer.index_head_dim == 64
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
+        assert all(not param.requires_grad for param in self.indexer.parameters())
 
     def test_kpool_projection_precision_and_backward(self, seqlen):
         self.indexer.cuda()
