@@ -25,7 +25,7 @@ class RNGConfig:
 class ProfilingConfig:
     """Configuration settings for profiling the training process."""
 
-    use_nsys_profiler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--profile"], "dest": "profile"}})
+    use_nsys_profiler: bool = False
     """Enable nsys profiling, mutually exclusive with use_pytorch_profiler.
     The legacy CLI --profile selects nsys unless --use-pytorch-profiler is also set.
     When using this option, nsys options should be specified in
