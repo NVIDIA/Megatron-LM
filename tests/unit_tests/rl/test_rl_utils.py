@@ -3,6 +3,7 @@
 import asyncio
 import io
 import itertools
+import math
 import tempfile
 import traceback
 from contextlib import nullcontext
@@ -41,6 +42,7 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
@@ -51,7 +53,7 @@ from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
 SEQ = 4
-VOCAB = 754
+VOCAB = 768
 
 
 class MockModel(LanguageModule):
@@ -66,11 +68,13 @@ class MockModel(LanguageModule):
         )
         self.model_type = ModelType.encoder_or_decoder
 
-    def __call__(self, x, position_ids, attention_mask, **kwargs):
+    def __call__(self, x, position_ids, attention_mask, runtime_gather_output=True, **kwargs):
         del position_ids
         del attention_mask
         batch, seq = x.shape
-        mock_model_outputs = torch.ones((batch, seq, self.vocab), device=x.device, dtype=self.dtype)
+        tp_size = get_pg_size(self.pg_collection.tp)
+        width = self.vocab if runtime_gather_output else self.vocab // tp_size
+        mock_model_outputs = torch.ones((batch, seq, width), device=x.device, dtype=self.dtype)
         return mock_model_outputs
 
     def load_state_dict(self, params):
@@ -790,7 +794,9 @@ class TestRLUtils:
         # CUDA tokens (MockModel follows x.device): the vocab-parallel path
         # all-reduces over the NCCL-only TP group, which rejects CPU tensors.
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        tokens = torch.ones((BATCH, SEQ), dtype=torch.long, device=device)
+        # Spread the ids over the vocab so the targets land on every TP rank's shard.
+        num_tokens = BATCH * SEQ
+        tokens = torch.arange(num_tokens, device=device).view(BATCH, SEQ) * (VOCAB // num_tokens)
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
         )
@@ -798,10 +804,12 @@ class TestRLUtils:
             # We chop off 1 element from the sequence dimension.
             assert logprobs.shape == (BATCH, SEQ - 1)
             assert logprobs.dtype == (torch.float32 if batch_invariant else torch.bfloat16)
-            # As we return ones as logits, all logprobs should be the same.
-            assert torch.all(logprobs == logprobs[0, 0]).item()
+            # Uniform logits: every token has logprob -log(VOCAB), whichever rank owns its id.
+            torch.testing.assert_close(logprobs, torch.full_like(logprobs, -math.log(VOCAB)))
         else:
-            assert logprobs.shape == (BATCH, SEQ, VOCAB)
+            # Non-last stages return the model output as is: vocab-sharded unless gathered.
+            vocab = VOCAB if batch_invariant else VOCAB // get_pg_size(model.pg_collection.tp)
+            assert logprobs.shape == (BATCH, SEQ, vocab)
 
     @pytest.mark.parametrize("dtype, chunk_tokens, sliced", _VP_CASES)
     @pytest.mark.parametrize("tp_world", [1, 2])
