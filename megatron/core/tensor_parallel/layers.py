@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
@@ -432,7 +433,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
-            if self.use_inference_optimized_reduce_scatter and not self.training:
+            if self.use_inference_optimized_reduce_scatter and InferenceMode.is_active():
                 # Deferred to avoid circular import: inference_layers → TE → layers.
                 from .inference_layers import inference_reduce_scatter_to_sequence_parallel_region
 
@@ -1403,7 +1404,7 @@ class ColumnParallelLinear(torch.nn.Module):
         Returns:
             The gathered output, [..., output_size].
         """
-        if self.use_inference_optimized_all_gather and not self.training:
+        if self.use_inference_optimized_all_gather and InferenceMode.is_active():
             # Deferred to avoid circular import: inference_layers → TE → layers.
             from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
 

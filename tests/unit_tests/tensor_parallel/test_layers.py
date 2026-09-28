@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     _wgrad_gemm,
@@ -164,19 +165,19 @@ def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
 
 
 @pytest.mark.parametrize(
-    "inference_optimized,training,expected",
-    [(True, False, "inference"), (True, True, "default"), (False, False, "default")],
+    "inference_optimized,inference_active,expected",
+    [(True, True, "inference"), (True, False, "default"), (False, True, "default")],
 )
 def test_column_parallel_linear_gather_tensor_parallel_output_dispatch(
-    inference_optimized, training, expected
+    inference_optimized, inference_active, expected
 ):
     layer = _make_column_parallel_linear_for_weight_shape_check()
     layer.use_inference_optimized_all_gather = inference_optimized
-    layer.train(training)
     output_parallel = torch.zeros(2, 8)
     gathered = {"inference": torch.ones(2, 16), "default": torch.full((2, 16), 2.0)}
 
     with (
+        mock.patch.object(InferenceMode, "_is_active", inference_active),
         mock.patch(
             "megatron.core.tensor_parallel.inference_layers."
             "inference_all_gather_from_tensor_model_parallel_region",
@@ -214,11 +215,14 @@ def test_column_parallel_linear_gather_tensor_parallel_output_dispatch(
         assert default_gather.call_args.kwargs == {"group": layer.tp_group}
 
     # Omitting the argument keeps forward's gather barrier-free.
-    with mock.patch(
-        "megatron.core.tensor_parallel.inference_layers."
-        "inference_all_gather_from_tensor_model_parallel_region",
-        return_value=gathered["inference"],
-    ) as inference_gather:
+    with (
+        mock.patch.object(InferenceMode, "_is_active", inference_active),
+        mock.patch(
+            "megatron.core.tensor_parallel.inference_layers."
+            "inference_all_gather_from_tensor_model_parallel_region",
+            return_value=gathered["inference"],
+        ) as inference_gather,
+    ):
         layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), runtime_gather_output=True)
     if expected == "inference":
         assert inference_gather.call_args.kwargs == {"barrier_before": False}
