@@ -373,19 +373,13 @@ def _roll_tensor_packed_seq(
     physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
     if physical_cu_seqlens is None:
         physical_cu_seqlens = cu_seqlens
+    physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
 
     cp_size = cp_group.size() if cp_group is not None else 1
     rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-    if tensor.size(sequence_dim) > 0:
-        rolled_tensor.select(dims, shifts).zero_()
+    rolled_tensor.select(dims, shifts).zero_()
     if cp_size == 1:
-        original_cu_seqlens = cu_seqlens
         cu_seqlens = cu_seqlens.to(device=tensor.device)
-        physical_cu_seqlens = (
-            cu_seqlens
-            if physical_cu_seqlens is original_cu_seqlens
-            else physical_cu_seqlens.to(device=tensor.device)
-        )
         if cu_seqlens.numel() == 1:
             return rolled_tensor, rolled_tensor.sum() if return_sum else None
         # Mask each document's last valid position and physical padding; slots
@@ -403,7 +397,6 @@ def _roll_tensor_packed_seq(
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
-    physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
     # CP attention requires two equal chunks per rank for every physical document.
     torch._assert_async(
         (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all(),
