@@ -1089,8 +1089,18 @@ def _in_swiglu_modules(key, modules):
     return any(f".{m}." in key or key.startswith(f"{m}.") for m in modules)
 
 
-def _reverse_mtp_keys(tensors):
-    """Rename ``mtp_model_layer`` back to ``transformer_layer`` in MTP keys."""
+def _reverse_mtp_keys(tensors, args=None):
+    """Rename ``mtp_model_layer`` back to ``transformer_layer`` in GPT MTP keys.
+
+    Mirrors ``MultiTokenPredictionLayer.sharded_state_dict``: a GPTModel MTP layer
+    stores its inner layer as ``transformer_layer`` on disk, while a HybridModel MTP
+    layer (``mtp_layer_pattern`` set) keeps ``mtp_model_layer`` as its native name, so
+    checkpoints whose ``args`` carry a ``hybrid_layer_pattern`` are left untouched.
+    Recent Megatron-FSDP checkpoints already apply the GPT rename on save
+    (``handle_mtp_in_state_dict``); for those this is a no-op.
+    """
+    if getattr(args, "hybrid_layer_pattern", None) is not None:
+        return tensors, 0
     out = {}
     renamed = 0
     for key, value in tensors.items():
@@ -1657,7 +1667,7 @@ def reverse_convert_checkpoint(
                 tensors[key] = value.to(model_dtype)
 
     # ---- 3. Apply the inverse transforms (order mirrors the forward split) -
-    tensors, n_mtp = _reverse_mtp_keys(tensors)
+    tensors, n_mtp = _reverse_mtp_keys(tensors, common_flat.get("args"))
     tensors, n_swiglu = _merge_swiglu(tensors, swiglu_modules)
     tensors, n_experts = _restack_experts(tensors)
 

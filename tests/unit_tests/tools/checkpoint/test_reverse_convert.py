@@ -109,6 +109,20 @@ class TestReverseMTP:
         assert n == 0
         assert "decoder.layers.0.mlp.linear_fc1.weight" in out
 
+    def test_hybrid_model_mtp_keeps_native_name(self):
+        # HybridModel MTP layers store ``mtp_model_layer`` natively (no GPT rename).
+        key = "mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.weight"
+        args = SimpleNamespace(hybrid_layer_pattern="M*-M*E/*E")
+        out, n = _reverse_mtp_keys({key: torch.zeros(1)}, args)
+        assert n == 0
+        assert key in out
+
+    def test_gpt_args_still_renamed(self):
+        args = SimpleNamespace(hybrid_layer_pattern=None)
+        out, n = _reverse_mtp_keys({"mtp.layers.0.mtp_model_layer.w": torch.zeros(1)}, args)
+        assert n == 1
+        assert "mtp.layers.0.transformer_layer.w" in out
+
 
 class TestMergeSwiglu:
     def test_dense_weight_merge(self):
