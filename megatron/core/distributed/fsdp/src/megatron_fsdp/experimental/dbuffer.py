@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import TensorAtomic, changed_mesh_axis
+from .placement import BlockAtomic, TensorAtomic, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +65,16 @@ def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
     """Convert a DTensor Partial reduction name to a torch.distributed op."""
     reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
     return reduce_ops[partial_placement.reduce_op]
+
+
+def _validate_layout(layout: GlobalLayout, placements: Iterable[Placement]) -> None:
+    """Check layout coordinates satisfy each requested shard placement."""
+    for placement in placements:
+        if isinstance(placement, TensorAtomic):
+            layout.validate_for_tensor_atomic()
+        elif isinstance(placement, Shard):
+            block_size = placement.block_size if isinstance(placement, BlockAtomic) else 1
+            layout.validate_for_row_atomic(block_size=block_size)
 
 
 class DBuffer:
@@ -108,6 +118,7 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
+        _validate_layout(layout, placements)
         self.mesh = mesh
         self.placements = placements
 
@@ -228,6 +239,7 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
+        _validate_layout(layout, placements)
 
         if local_buffer.dim() != 1:
             raise ValueError("local_buffer must be a flat 1D tensor.")
@@ -469,6 +481,9 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=placements)
         group = self.mesh.get_group(mesh_axis)
         if self.layout.is_uniform:
+            # PyTorch's NCCL all_gather uses a temporary buffer for equal-size
+            # inputs, then copies into the outputs. Gather directly into out to
+            # avoid that copy and preserve its symmetric-memory registration.
             # Symmetric-memory registration is scoped to the collective's process
             # group, so rendezvous the output on the same mesh axis as the all-gather.
             if out.is_symmetric_memory:
@@ -477,6 +492,8 @@ class DBuffer:
                 output_tensor=out.local_buffer, input_tensor=self.local_buffer, group=group
             )
         else:
+            # Uneven all_gather uses grouped NCCL broadcasts, which cannot use
+            # symmetric-memory kernels: https://github.com/pytorch/pytorch/issues/198344.
             # Non-uniform segments: ``out`` spans the whole global buffer (without padding) and the
             # layout's rank segments index it directly.
             chunks = [

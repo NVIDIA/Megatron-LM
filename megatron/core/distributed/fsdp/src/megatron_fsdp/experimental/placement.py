@@ -32,12 +32,11 @@ sharded        ``Replicate``  ``allgather()``
 """
 
 from collections.abc import Iterable
-from typing import TypeAlias
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "RowAtomic", "TensorAtomic", "PlacementReference", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "TensorAtomic", "changed_mesh_axis"]
 
 
 class RowAtomic(Shard):
@@ -110,6 +109,3 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
-
-
-PlacementReference: TypeAlias = RowAtomic | BlockAtomic | TensorAtomic

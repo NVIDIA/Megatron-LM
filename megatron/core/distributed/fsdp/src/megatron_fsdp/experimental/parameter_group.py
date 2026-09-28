@@ -31,7 +31,7 @@ from ..utils import HAVE_TE
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
-from .placement import BlockAtomic, PlacementReference, RowAtomic, TensorAtomic
+from .placement import BlockAtomic, RowAtomic, TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
@@ -113,9 +113,6 @@ class FsdpParameterGroup:
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
-    # The single Shard placement that every DBuffer in this group plans its
-    # GlobalLayout against.
-    layout_reference: PlacementReference
 
     def __init__(
         self,
@@ -157,7 +154,7 @@ class FsdpParameterGroup:
         self.grad_divisor = grad_divisor
         parameters = tuple(parameter_to_fqns)
 
-        self.layout_reference = self._resolve_layout_reference(
+        layout_placement = self._resolve_layout_placement(
             self.mesh,
             # MXFP8 groups keep 32-row blocks on one rank; every other dtype packs rows.
             block_size=32 if self.dtype == torch.uint8 else 1,
@@ -165,7 +162,15 @@ class FsdpParameterGroup:
         )
         # All buffers share this layout; owner assignments are construction-only.
         shapes = (parameter.shape for parameter in parameters)
-        if isinstance(self.layout_reference, TensorAtomic):
+        if isinstance(layout_placement, TensorAtomic):
+            # Uneven all-gather / reduce-scatter use grouped NCCL broadcasts /
+            # reductions, which cannot use symmetric-memory kernels:
+            # https://github.com/pytorch/pytorch/issues/198344.
+            if use_symmetric_memory:
+                raise ValueError(
+                    "Symmetric-memory collectives require uniform shards; "
+                    "TensorAtomic is not supported."
+                )
             if parameter_to_owner is None:
                 raise ValueError("TensorAtomic placements require parameter_to_owner.")
             missing = [
@@ -185,9 +190,7 @@ class FsdpParameterGroup:
             )
         else:
             block_size = (
-                self.layout_reference.block_size
-                if isinstance(self.layout_reference, BlockAtomic)
-                else 1
+                layout_placement.block_size if isinstance(layout_placement, BlockAtomic) else 1
             )
             layout = GlobalLayout.build_for_row_atomic(
                 shapes, dp_size=self.mesh.size(), block_size=block_size
@@ -250,15 +253,6 @@ class FsdpParameterGroup:
         """Allocate weight and gradient buffers in their required dependency order."""
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
-
-        # TensorAtomic produces non-uniform per-rank shards, but the NCCL
-        # symmetric-memory all-gather / reduce-scatter kernels only support the
-        # equal-size *_into_tensor collectives.
-        if use_symmetric_memory and isinstance(self.layout_reference, TensorAtomic):
-            raise ValueError(
-                "Symmetric-memory collectives require uniform shards; "
-                "TensorAtomic is not supported."
-            )
 
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
@@ -349,10 +343,10 @@ class FsdpParameterGroup:
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
 
     @staticmethod
-    def _resolve_layout_reference(
+    def _resolve_layout_placement(
         mesh: DeviceMesh, *, block_size: int, placement_lists: Iterable[tuple[Placement, ...]]
-    ) -> PlacementReference:
-        """Pick the single layout reference shared by every DBuffer in a parameter group.
+    ) -> RowAtomic | BlockAtomic | TensorAtomic:
+        """Resolve the placement used to choose a parameter group's layout builder.
 
         All buffers in a group (model weight, main weight, main grad, and their
         views) must be planned against one ``GlobalLayout`` so that views and

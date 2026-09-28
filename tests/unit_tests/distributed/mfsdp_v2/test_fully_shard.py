@@ -1082,7 +1082,7 @@ def test_parameter_group_validates_parameter_to_owner(distributed_setup):
 
     group = build({linear.weight: 1, linear.bias: 0})
     assert group.main_weight.layout.tensor_to_offset == (4, 0)
-    assert group.main_weight.layout.rank_segment_offsets[:3] == (0, 4, 20)
+    assert group.main_weight.layout.rank_to_offset[:3] == (0, 4, 20)
 
 
 def test_fully_shard_tensor_atomic_preserves_parameter_order(distributed_setup):
@@ -1108,7 +1108,7 @@ def test_fully_shard_tensor_atomic_preserves_parameter_order(distributed_setup):
     layout = group.main_weight.layout
     assert not layout.is_uniform
     assert layout.tensor_to_offset == (16, 0)
-    assert layout.rank_segment_offsets[:3] == (0, 16, 16 + 16 * 8)
+    assert layout.rank_to_offset[:3] == (0, 16, 16 + 16 * 8)
     rank = mesh.get_local_rank(0)
     for index, fsdp_parameter in enumerate(group.fsdp_parameters):
         full_shape = layout.tensor_shapes[index]
@@ -1150,7 +1150,7 @@ def test_tensor_atomic_context_mapping_handles_ties_and_parameter_groups(distrib
     assert [p.fqns for p in group.fsdp_parameters] == [("a", "tied_a"), ("b",), ("c",)]
     assert model.a is model.tied_a
     assert group.main_weight.layout.tensor_to_offset == (3, 0, 5)
-    assert group.main_weight.layout.rank_segment_offsets[:3] == (0, 3, 9)
+    assert group.main_weight.layout.rank_to_offset[:3] == (0, 3, 9)
     gathered = group.main_weight.allgather(0)
     for index, expected in enumerate(expected_tensors):
         torch.testing.assert_close(gathered.get_tensor_view(index), expected)

@@ -26,8 +26,6 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from .placement import BlockAtomic, PlacementReference, RowAtomic, TensorAtomic
-
 Shape: TypeAlias = torch.Size | Iterable[int]
 
 
@@ -39,23 +37,18 @@ class GlobalLayout:
         tensor_shapes: Logical tensor shapes in tensor-id order.
         tensor_to_offset: Global element offset of each logical tensor's first element.
         size: Total number of global elements, including any padding or gaps.
-        rank_segment_offsets: Boundaries of the ``dp_size`` contiguous segments this layout
-            was planned for, in global element coordinates (``dp_size + 1`` entries). Segment
-            ``k`` is ``[rank_segment_offsets[k], rank_segment_offsets[k + 1])``. On a 1-D
+        rank_to_offset: Global element offset of each rank segment's first element,
+            followed by a final entry equal to ``size`` (``dp_size + 1`` entries).
+            Segment ``k`` is ``[rank_to_offset[k], rank_to_offset[k + 1])``. On a 1-D
             mesh ``k`` is the rank; on a multi-axis mesh ``get_local_range`` maps the ranks
-            of the Shard axes to ``k``. Uniform (``size // dp_size``) for ``RowAtomic`` /
-            ``BlockAtomic``; generally uneven for ``TensorAtomic``.
-        reference: The Shard placement this layout was planned against. ``RowAtomic`` and
-            ``BlockAtomic`` produce a row-/block-aligned layout padded to equal-size
-            per-rank shards; ``TensorAtomic`` produces a gap-free layout in which each
-            rank's contiguous segment holds exactly the tensors it owns.
+            of the Shard axes to ``k``. Segment sizes are equal (``size // dp_size``) for
+            ``RowAtomic`` / ``BlockAtomic``; generally uneven for ``TensorAtomic``.
     """
 
     tensor_shapes: tuple[torch.Size, ...]
     tensor_to_offset: tuple[int, ...]
     size: int
-    rank_segment_offsets: tuple[int, ...]
-    reference: PlacementReference = dataclasses.field(default_factory=RowAtomic)
+    rank_to_offset: tuple[int, ...]
 
     @classmethod
     def build_for_row_atomic(
@@ -197,13 +190,14 @@ class GlobalLayout:
 
         size = _pad_to_multiple(next_offset, chunk_size * dp_size)
         segment = size // dp_size
-        return cls(
+        layout = cls(
             tensor_shapes=tensor_shapes,
             tensor_to_offset=tuple(tensor_to_offset),
             size=size,
-            rank_segment_offsets=tuple(segment * rank for rank in range(dp_size + 1)),
-            reference=BlockAtomic(block_size) if block_size > 1 else RowAtomic(),
+            rank_to_offset=tuple(segment * rank for rank in range(dp_size + 1)),
         )
+        layout.validate_for_row_atomic(block_size=block_size)
+        return layout
 
     @classmethod
     def build_for_tensor_atomic(
@@ -242,7 +236,7 @@ class GlobalLayout:
         tensor_owners = tuple(tensor_owners)
         if len(tensor_owners) != len(tensor_shapes):
             raise ValueError(
-                "For TensorAtomic reference placement, the number of tensors "
+                "For TensorAtomic placement, the number of tensors "
                 f"({len(tensor_shapes)}) must equal the number of tensor owners "
                 f"({len(tensor_owners)})."
             )
@@ -259,23 +253,24 @@ class GlobalLayout:
         per_rank = [0] * dp_size
         for numel, owner in zip(numels, tensor_owners):
             per_rank[owner] += numel
-        rank_segment_offsets = tuple(itertools.accumulate(per_rank, initial=0))
-        next_offsets = list(rank_segment_offsets[:-1])
+        rank_to_offset = tuple(itertools.accumulate(per_rank, initial=0))
+        next_offsets = list(rank_to_offset[:-1])
         tensor_to_offset = []
         for numel, owner in zip(numels, tensor_owners):
             tensor_to_offset.append(next_offsets[owner])
             next_offsets[owner] += numel
 
-        return cls(
+        layout = cls(
             tensor_shapes=tensor_shapes,
             tensor_to_offset=tuple(tensor_to_offset),
             size=sum(numels),
-            rank_segment_offsets=rank_segment_offsets,
-            reference=TensorAtomic(),
+            rank_to_offset=rank_to_offset,
         )
+        layout.validate_for_tensor_atomic()
+        return layout
 
     def __post_init__(self) -> None:
-        """Validate tensor offsets are in bounds, non-overlapping, and reference-compatible."""
+        """Validate offsets are in bounds and tensor ranges do not overlap."""
 
         @dataclasses.dataclass(frozen=True)
         class TensorRange:
@@ -292,29 +287,13 @@ class GlobalLayout:
                 "Global layout has mismatched tensor shapes and offsets: "
                 f"{len(self.tensor_shapes)} shapes and {len(self.tensor_to_offset)} offsets."
             )
-        offsets = self.rank_segment_offsets
+        offsets = self.rank_to_offset
         if len(offsets) < 2:
-            raise AssertionError(
-                f"'rank_segment_offsets' needs at least 2 entries, got {len(offsets)}."
-            )
+            raise AssertionError(f"'rank_to_offset' needs at least 2 entries, got {len(offsets)}.")
         if offsets[0] != 0 or offsets[-1] != self.size:
-            raise AssertionError(f"rank_segment_offsets must span [0, {self.size}), got {offsets}.")
+            raise AssertionError(f"rank_to_offset must span [0, {self.size}), got {offsets}.")
         if any(a > b for a, b in zip(offsets, offsets[1:])):
-            raise AssertionError(f"rank_segment_offsets must be non-decreasing, got {offsets}.")
-
-        if isinstance(self.reference, TensorAtomic):
-            # Every tensor must sit entirely inside one rank's segment.
-            for tensor_id, (shape, start) in enumerate(
-                zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
-            ):
-                end = start + shape.numel()
-                # bisect_right skips empty segments that end at ``start``.
-                rank = bisect.bisect_right(offsets, start) - 1
-                if rank < 0 or rank >= self.dp_size or end > offsets[rank + 1]:
-                    raise AssertionError(
-                        f"Tensor {tensor_id} [{start}, {end}) is not contained in a single "
-                        f"rank segment of {offsets}."
-                    )
+            raise AssertionError(f"rank_to_offset must be non-decreasing, got {offsets}.")
 
         tensor_ranges: list[TensorRange] = []
         for tensor_id, (shape, start) in enumerate(
@@ -322,19 +301,6 @@ class GlobalLayout:
         ):
             if start < 0:
                 raise AssertionError(f"Tensor {tensor_id} offset {start} is negative.")
-
-            if not isinstance(self.reference, TensorAtomic):
-                # RowAtomic / BlockAtomic shards may cut through a tensor, so every tensor must
-                # start on a row (and block) boundary to keep dim-0 rows intact per rank.
-                # TensorAtomic never splits a tensor, so no alignment is required.
-                row_size = non_leading_numel(shape)
-                if row_size <= 0:
-                    raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
-                if start % (self.block_size * row_size) != 0:
-                    raise AssertionError(
-                        f"Tensor {tensor_id} offset {start} is not aligned to block size "
-                        f"{self.block_size * row_size}."
-                    )
 
             end = start + shape.numel()
             if end > self.size:
@@ -356,20 +322,60 @@ class GlobalLayout:
                 )
             previous_range = current_range
 
-    @property
-    def block_size(self) -> int:
-        """Number of dim-0 rows kept together per rank; 1 unless the reference is BlockAtomic."""
-        return self.reference.block_size if isinstance(self.reference, BlockAtomic) else 1
+    def validate_for_row_atomic(self, *, block_size: int = 1) -> None:
+        """Check equal-size shards and row/block alignment from the actual offsets."""
+        if block_size <= 0:
+            raise ValueError(f"Block size must be positive, got {block_size}.")
+        if not self.is_uniform:
+            raise ValueError(
+                "Unequal rank segment sizes are incompatible with RowAtomic/BlockAtomic."
+            )
+        chunk_size = 1
+        for tensor_id, (shape, start) in enumerate(
+            zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
+        ):
+            row_size = non_leading_numel(shape)
+            if row_size <= 0 or shape[0] % block_size != 0:
+                raise ValueError(
+                    f"Tensor {tensor_id} shape {shape} is incompatible with block size "
+                    f"{block_size}."
+                )
+            alignment = block_size * row_size
+            if start % alignment != 0:
+                raise ValueError(
+                    f"Tensor {tensor_id} offset {start} is incompatible with alignment {alignment}."
+                )
+            chunk_size = math.lcm(chunk_size, alignment)
+        if any(offset % chunk_size for offset in self.rank_to_offset):
+            raise ValueError(
+                f"Rank offsets {self.rank_to_offset} are incompatible with alignment {chunk_size}."
+            )
+
+    def validate_for_tensor_atomic(self) -> None:
+        """Check every nonempty tensor is contained in a single rank segment."""
+        for tensor_id, (shape, start) in enumerate(
+            zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
+        ):
+            if shape.numel() == 0:
+                continue
+            end = start + shape.numel()
+            # bisect_right skips empty segments that end at ``start``.
+            rank = bisect.bisect_right(self.rank_to_offset, start) - 1
+            if rank >= self.dp_size or end > self.rank_to_offset[rank + 1]:
+                raise ValueError(
+                    f"Tensor {tensor_id} [{start}, {end}) crosses a rank segment boundary "
+                    "and is incompatible with TensorAtomic."
+                )
 
     @property
     def dp_size(self) -> int:
         """Number of segments (data-parallel shards) this layout was planned for."""
-        return len(self.rank_segment_offsets) - 1
+        return len(self.rank_to_offset) - 1
 
     @property
     def rank_segments(self) -> tuple[tuple[int, int], ...]:
         """``(start, numel)`` of each of the ``dp_size`` segments."""
-        offsets = self.rank_segment_offsets
+        offsets = self.rank_to_offset
         return tuple(
             (offsets[rank], offsets[rank + 1] - offsets[rank]) for rank in range(self.dp_size)
         )
@@ -377,6 +383,7 @@ class GlobalLayout:
     @property
     def is_uniform(self) -> bool:
         """Whether every rank's segment has the same numel."""
+        # TODO: Rename to has_equal_shard_sizes to clarify what "uniform" refers to.
         return len({numel for _, numel in self.rank_segments}) == 1
 
     def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
@@ -387,15 +394,6 @@ class GlobalLayout:
         ]
         if not shard_axes:
             return 0, self.size
-
-        innermost_placement = placements[shard_axes[-1]]
-        if isinstance(innermost_placement, TensorAtomic) != isinstance(
-            self.reference, TensorAtomic
-        ):
-            raise ValueError(
-                f"Placement {innermost_placement!r} is incompatible with layout reference "
-                f"{self.reference!r}."
-            )
 
         shard_index = 0
         num_shards = 1
@@ -408,8 +406,8 @@ class GlobalLayout:
                 f"over {num_shards} shard ranks on mesh axes {shard_axes}."
             )
         segments_per_rank = self.dp_size // num_shards
-        start = self.rank_segment_offsets[shard_index * segments_per_rank]
-        end = self.rank_segment_offsets[(shard_index + 1) * segments_per_rank]
+        start = self.rank_to_offset[shard_index * segments_per_rank]
+        end = self.rank_to_offset[(shard_index + 1) * segments_per_rank]
         return start, end - start
 
 
