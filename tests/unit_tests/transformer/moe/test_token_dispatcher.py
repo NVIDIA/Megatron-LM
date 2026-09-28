@@ -560,6 +560,11 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     )
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
 
     local_num_tokens = 17
     max_num_tokens_across_ep = 70
@@ -599,6 +604,11 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     manager.router_topk = 1
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
 
     routing_map = torch.tensor([[True, False], [False, False]])
     probs = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
@@ -622,6 +632,11 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
     manager.router_topk = 2
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
 
     routing_map = torch.tensor(
         [[True, False, False, True], [False, True, False, False], [False, False, False, False]]
@@ -657,6 +672,9 @@ def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     manager.moe_expert_rank_capacity_factor = None
     manager.capacity_factor = capacity_factor
     manager.drop_and_pad = True
+    manager.dense_routing_supported = True
+    # Pad-to-capacity keeps the bool map even in "indices" mode.
+    manager.use_dense_routing_for_bool_map = False
 
     # Every token picked expert 0; pad-to-capacity fills expert 1 with the same tokens.
     capacity = get_capacity(num_tokens * topk, num_experts, capacity_factor)
@@ -683,6 +701,11 @@ def test_hybridep_dense_input_requires_backend_support(monkeypatch):
     manager.router_topk = 2
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
 
     with pytest.raises(RuntimeError, match="does not support dense topk_idx metadata"):
         manager.setup_metadata(torch.tensor([[0, 2]], dtype=torch.int16), torch.ones(1, 4))
@@ -773,10 +796,7 @@ def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls, 
     torch.testing.assert_close(manager.token_probs, torch.tensor([[0.8, 0.2]]))
 
 
-@pytest.mark.parametrize("explicit_dense_routing", [False, True])
-def test_hybridep_dispatch_supports_inferred_and_explicit_dense_apis(
-    monkeypatch, explicit_dense_routing
-):
+def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
     class FakeHybridEPBuffer:
         def __init__(self):
             self.kwargs = None
@@ -794,7 +814,6 @@ def test_hybridep_dispatch_supports_inferred_and_explicit_dense_apis(
     fake_buffer = FakeHybridEPBuffer()
     monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", fake_buffer)
     monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
-    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING", explicit_dense_routing)
     hidden = torch.randn(2, 4)
     probs = torch.randn(2, 4)
     topk_idx = torch.tensor([[0, 1], [2, 3]], dtype=torch.int16)
@@ -806,7 +825,7 @@ def test_hybridep_dispatch_supports_inferred_and_explicit_dense_apis(
     assert fake_buffer.kwargs["topk_idx"] is topk_idx
     assert fake_buffer.kwargs["num_of_experts"] == 4
     assert "routing_map" not in fake_buffer.kwargs
-    assert ("dense_routing" in fake_buffer.kwargs) is explicit_dense_routing
+    assert "dense_routing" not in fake_buffer.kwargs
 
 
 @pytest.mark.skipif(

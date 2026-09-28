@@ -1043,6 +1043,18 @@ class _HybridEPManager(_DispatchManager):
         self.capacity_factor = config.moe_expert_capacity_factor
         # Drop and pad the input to capacity.
         self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
+        # Dense [num_tokens, topk] expert ids for HybridEP are int16, so the expert-TP-expanded
+        # expert count must fit. Resolved once here: every input to the decision is static.
+        self.dense_routing_supported = (
+            HAVE_HYBRIDEP_DENSE_ROUTING and self.num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
+        )
+        # With pad-to-capacity the routing map is the capacity mask, so a token can carry more
+        # than topk assignments; dense ids cannot represent that, so keep the bool map.
+        self.use_dense_routing_for_bool_map = (
+            self.dense_routing_supported
+            and self.config.moe_hybridep_routing_map_mode == "indices"
+            and not self.drop_and_pad
+        )
         if self.drop_and_pad:
             assert self.capacity_factor is not None
         self.capacity = None
@@ -1089,7 +1101,6 @@ class _HybridEPManager(_DispatchManager):
         self._padded_num_tokens = padded_num_tokens
 
         probs = probs.reshape(num_tokens, self.num_experts)
-        provided_topk_idx = None
 
         if routing_map.dtype == torch.bool:
             routing_map = routing_map.reshape(num_tokens, self.num_experts)
@@ -1099,54 +1110,40 @@ class _HybridEPManager(_DispatchManager):
                     [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
                 )
             self.routing_map = routing_map
+            if self.use_dense_routing_for_bool_map:
+                # Dense expert ids come from the bool map itself, not from the probabilities:
+                # callers may pass full-width weights that are nonzero outside the selected
+                # routes. HybridEP gathers the weights by index, so the in-row order of the ids
+                # does not matter. Rows with fewer than topk routes are filled with -1.
+                route_hits, topk_idx = torch.topk(
+                    routing_map.to(probs.dtype), self.router_topk, dim=-1
+                )
+                self.topk_idx = topk_idx.to(torch.int16).masked_fill(route_hits == 0, -1)
+            else:
+                self.topk_idx = None
         else:
-            if not HAVE_HYBRIDEP_DENSE_ROUTING:
+            if not self.dense_routing_supported:
                 raise RuntimeError(
                     "HybridEP dense routing map was provided, but the installed HybridEPBuffer "
-                    "does not support dense topk_idx metadata. Use a newer HybridEP backend or "
-                    "disable dense routing."
+                    "does not support dense topk_idx metadata or the expert-TP-expanded expert "
+                    f"count {self.num_experts} exceeds the int16 limit "
+                    f"{_HYBRIDEP_INT16_EXPERT_LIMIT}. Use a newer HybridEP backend or disable "
+                    "dense routing."
                 )
             self.routing_map = None
-            provided_topk_idx = routing_map.reshape(num_tokens, self.router_topk).contiguous()
+            topk_idx = routing_map.reshape(num_tokens, self.router_topk).to(torch.int16)
             if padded_num_tokens > num_tokens:
                 pad_rows = padded_num_tokens - num_tokens
-                provided_topk_idx = torch.cat(
-                    [
-                        provided_topk_idx,
-                        provided_topk_idx.new_full((pad_rows, self.router_topk), -1),
-                    ],
-                    dim=0,
+                topk_idx = torch.cat(
+                    [topk_idx, topk_idx.new_full((pad_rows, self.router_topk), -1)], dim=0
                 )
+            self.topk_idx = topk_idx.contiguous()
 
         if padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
             probs = torch.cat([probs, probs.new_zeros((pad_rows, self.num_experts))], dim=0)
 
         self.token_probs = probs
-
-        if provided_topk_idx is not None:
-            if self.num_experts > _HYBRIDEP_INT16_EXPERT_LIMIT:
-                raise RuntimeError(
-                    "HybridEP dense routing requires int16 expert ids, but the expert-TP-expanded "
-                    f"expert count is {self.num_experts}; the maximum is "
-                    f"{_HYBRIDEP_INT16_EXPERT_LIMIT}."
-                )
-            self.topk_idx = provided_topk_idx.to(torch.int16)
-        elif (
-            HAVE_HYBRIDEP_DENSE_ROUTING
-            and self.config.moe_hybridep_routing_map_mode == "indices"
-            and self.num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
-            # With pad-to-capacity the routing map is the capacity mask, so a token can carry
-            # more than topk assignments; a topk reconstruction would drop the padded ones while
-            # tokens_per_expert below still declares the full capacity. Keep the bool map.
-            and not self.drop_and_pad
-        ):
-            route_hits, self.topk_idx = torch.topk(
-                self.routing_map.to(self.token_probs.dtype), self.router_topk, dim=-1
-            )
-            self.topk_idx = self.topk_idx.to(torch.int16).masked_fill(route_hits == 0, -1)
-        else:
-            self.topk_idx = None
 
         if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)

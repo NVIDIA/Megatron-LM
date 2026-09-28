@@ -280,24 +280,16 @@ try:
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
-    HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = _has_parameter(
-        HybridEPBuffer.dispatch_with_permute, "dense_routing"
-    )
+    # HybridEP accepts dense [num_tokens, topk] expert ids (topk_idx) when its config carries a
+    # topk field; older builds only take the bool [num_tokens, num_experts] routing map.
     try:
         import hybrid_ep_cpp
 
-        HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = hasattr(
-            hybrid_ep_cpp.HybridEpConfigInstance(), "topk"
-        )
+        HAVE_HYBRIDEP_DENSE_ROUTING = hasattr(hybrid_ep_cpp.HybridEpConfigInstance(), "topk")
     except (ImportError, AttributeError, TypeError, ValueError):
-        HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = False
-    HAVE_HYBRIDEP_DENSE_ROUTING = (
-        HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING or HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING
-    )
+        HAVE_HYBRIDEP_DENSE_ROUTING = False
 except ImportError:
     HAVE_HYBRIDEP = False
-    HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = False
-    HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = False
     HAVE_HYBRIDEP_DENSE_ROUTING = False
 
 _hybrid_ep_buffer = None
@@ -443,12 +435,7 @@ class HybridEPDispatch(torch.autograd.Function):
         use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
         if use_dense:
             assert num_of_experts is not None, "num_of_experts is required for dense routing"
-            dense_kwargs = {"dense_routing": True} if HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING else {}
-            dispatch_kwargs = {
-                "topk_idx": topk_idx,
-                "num_of_experts": num_of_experts,
-                **dense_kwargs,
-            }
+            dispatch_kwargs = {"topk_idx": topk_idx, "num_of_experts": num_of_experts}
         else:
             assert (
                 routing_map is not None
