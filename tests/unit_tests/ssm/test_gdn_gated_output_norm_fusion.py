@@ -102,6 +102,20 @@ def _model(pre_fusion, recompute=False, **overrides):
     return model.cuda().to(config.params_dtype)
 
 
+def test_gdn_recompute_disables_two_stage_attention(model_parallel):
+    config = _config(recompute_granularity="selective", recompute_modules=["gdn"])
+    spec = get_experimental_attention_variant_module_spec(config=config)
+    groups = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(),
+        cp=parallel_state.get_context_parallel_group(),
+    )
+    model = spec.module(
+        config, submodules=spec.submodules, layer_number=1, pg_collection=groups
+    ).cuda()
+    assert model.recompute_gdn
+    assert not model.supports_two_stage_attention()
+
+
 def _inputs(packed):
     hidden = torch.randn(257, 1, 256, device="cuda", dtype=torch.bfloat16)
     dy = torch.randn_like(hidden)
