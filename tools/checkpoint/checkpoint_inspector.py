@@ -38,7 +38,7 @@ from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
 
-from megatron.core.dist_checkpointing.strategies.common import load_common
+from megatron.core.dist_checkpointing.serialization import load_common_state_dict
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
@@ -47,6 +47,11 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.core.dist_checkpointing.validation import verify_checkpoint
 from megatron.core.msc_utils import MultiStorageClientFeature
+
+
+# Key under which megatron stores non-sharded state inside a torch_dist DCP store;
+# its unique_key is "common_state/shard_0_1" (see dist_checkpointing/serialization.py).
+_COMMON_STATE_KEY = "common_state"
 
 
 def rank0_echo(message):
@@ -107,7 +112,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
         )
 
         # Common state section
-        common_state = load_common(checkpoint_dir)
+        common_state = load_common_state_dict(checkpoint_dir)
         print_header(f"common state ({len(common_state)} items)", "cyan")
         for key, value in common_state.items():
             bullet = click.style("•", fg="magenta")
@@ -393,6 +398,12 @@ def convert_checkpoint(
     metadata = reader.read_metadata()
     state_dict = {}
     for key, md in metadata.state_dict_metadata.items():
+        if key.split("/", 1)[0] == _COMMON_STATE_KEY:
+            # Non-sharded state (args, iteration, ...) is stored inside the torch_dist
+            # store as a single ShardedObject. It is read separately below via
+            # load_common_state_dict() and flattened into the fsdp_dtensor namespace;
+            # loading it here too would write it back out as an opaque blob.
+            continue
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
             assert len(md.size) > 0, (
@@ -735,7 +746,7 @@ def convert_checkpoint(
             f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
         )
     )
-    common_state = load_common(input_dir)
+    common_state = load_common_state_dict(input_dir)
     try:
         if "param_groups" in common_state["optimizer"]:
             ckpt_param_groups = common_state["optimizer"]["param_groups"]
