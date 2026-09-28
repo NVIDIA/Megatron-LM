@@ -111,6 +111,16 @@ def test_kda_config_rejects_headwise_cp_misalignment():
         _make_config(cp_size=2, linear_num_key_heads=3, linear_num_value_heads=3)
 
 
+def test_kda_config_rejects_deterministic_chunkwise_cp():
+    with pytest.raises(ValueError, match="incompatible with deterministic_mode"):
+        _make_config(
+            cp_size=2,
+            linear_cp_mode="chunkwise",
+            linear_cp_layout="contiguous",
+            deterministic_mode=True,
+        )
+
+
 @pytest.mark.parametrize("alignment", [0, -4])
 def test_kda_config_rejects_nonpositive_conv_padding_alignment(alignment):
     with pytest.raises(ValueError, match="gdn_conv_pad_alignment must be positive"):
