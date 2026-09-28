@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -228,7 +229,19 @@ class P2PCommunicator:
                 tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
             )
 
-        if config.use_ring_exchange_p2p:
+        if os.environ.get("QWEN48_PP_SHAPE_UNBATCHED") == "1":
+            reqs = _p2p_ops(
+                tensor_send_prev=send_prev_shape_tensor,
+                tensor_recv_prev=recv_prev_shape_tensor,
+                tensor_send_next=send_next_shape_tensor,
+                tensor_recv_next=recv_next_shape_tensor,
+                group=self.pp_group,
+                prev_pipeline_rank=self.prev_rank,
+                next_pipeline_rank=self.next_rank,
+            )
+            for req in reqs.values():
+                req.wait()
+        elif config.use_ring_exchange_p2p:
             torch.distributed.ring_exchange(
                 tensor_send_prev=send_prev_shape_tensor,
                 tensor_recv_prev=recv_prev_shape_tensor,
@@ -317,6 +330,9 @@ class P2PCommunicator:
         """
 
         config = self.config
+        payload_unbatched = os.environ.get("QWEN48_PP_PAYLOAD_UNBATCHED") == "1"
+        if payload_unbatched and config.use_ring_exchange_p2p:
+            raise RuntimeError("QWEN48_PP_PAYLOAD_UNBATCHED is incompatible with ring exchange")
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
@@ -372,7 +388,7 @@ class P2PCommunicator:
                 return []
 
             p2p_func = _ring_exchange_wrapper
-        elif config.batch_p2p_comm:
+        elif config.batch_p2p_comm and not payload_unbatched:
             assert wait_on_reqs
             p2p_func = _batched_p2p_ops
         else:
@@ -382,7 +398,7 @@ class P2PCommunicator:
         next_rank = self.next_rank
         prev_rank = self.prev_rank
 
-        if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+        if config.use_ring_exchange_p2p or (config.batch_p2p_comm and not payload_unbatched):
             reqs = []
         else:
             reqs = {}
@@ -414,7 +430,7 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if config.batch_p2p_comm and not payload_unbatched and config.batch_p2p_sync:
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
             torch.cuda.synchronize()
