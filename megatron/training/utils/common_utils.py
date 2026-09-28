@@ -42,7 +42,10 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import (
+    param_is_not_gtp_duplicate,
+    param_is_not_tensor_parallel_duplicate,
+)
 from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.optimizer.clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from megatron.core.utils import (
@@ -399,6 +402,8 @@ def _collect_dsa_split_grads(model, optimizer) -> tuple[list[torch.Tensor], list
             if not param_is_not_shared(param):
                 continue
             if not param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group):
+                continue
+            if not param_is_not_gtp_duplicate(param):
                 continue
 
             if getattr(optim_param, "__fsdp_param__", False):
