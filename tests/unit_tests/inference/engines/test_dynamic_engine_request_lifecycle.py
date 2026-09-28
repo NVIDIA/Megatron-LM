@@ -23,6 +23,7 @@ REQUEST_FIELD_POLICY = {
     "inference_parameters": "checkpoint:drop-deprecated-alias / merge:drop",
     "prompt_tokens": "checkpoint:append-output / merge:first / wire:opt-in",
     "compact_prompt_tokens": "checkpoint:preserve / merge:first / wire:opt-in",
+    "media_tensors": "checkpoint:preserve / merge:first / wire:drop",
     "prompt_length": "checkpoint:reset / merge:reset / wire:derive",
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",

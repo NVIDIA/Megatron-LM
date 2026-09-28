@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
+    wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -27,6 +28,7 @@ from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAM
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import ModuleSpec, TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
@@ -40,11 +42,36 @@ from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
 def _make_pg_collection():
     return SimpleNamespace(pp=None, tp=None, cp=SimpleNamespace(size=lambda: 1), tp_cp=None)
+
+
+def test_wide_residual_spec_preserves_unmodified_stack_submodules():
+    """Wide specialization changes layer classes without dropping stack-level specs."""
+
+    base = hybrid_stack_spec.submodules
+    wide = wide_residual_hybrid_stack_spec.submodules
+
+    assert wide.mamba_layer.module is WideResidualMambaLayer
+    for layer_spec in (
+        wide.gdn_layer,
+        wide.gdn2_layer,
+        wide.attention_layer,
+        wide.dsa_layer,
+        wide.csa_layer,
+        wide.csa_qk_layernorm_layer,
+        wide.mla_layer,
+        wide.mla_fused_down_proj_layer,
+        wide.mlp_layer,
+        wide.moe_layer,
+    ):
+        assert layer_spec.module is WideResidualTransformerLayer
+    assert wide.mtp_block_spec is base.mtp_block_spec
 
 
 @pytest.mark.parametrize(
@@ -821,6 +848,37 @@ class TestHybridBlock:
             layer.config is layer_config
             for layer, layer_config in zip(block.layers, block.layer_config_list)
         )
+
+    def test_wide_residual_gpu_forward_and_backward(self):
+        """Hybrid boundaries stay at D while every physical layer carries K * D."""
+
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_hybrid_block(
+            layer_pattern,
+            stack_spec=wide_residual_hybrid_stack_spec,
+            wide_residual=WideResidualConfig(num_streams=3, streamwise_sigmoid_init_scale=0.01),
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        ).cuda()
+        block.train()
+
+        hidden_states = torch.randn(
+            16, 2, block.config.hidden_size, device="cuda", requires_grad=True
+        )
+        attention_mask = torch.ones((2, 1, 16, 16), dtype=torch.bool, device="cuda")
+        output = block(hidden_states, attention_mask=attention_mask)
+
+        assert output.shape == hidden_states.shape
+        assert isinstance(block.layers[0], WideResidualMambaLayer)
+        assert all(isinstance(layer, WideResidualTransformerLayer) for layer in block.layers[1:])
+        assert all(
+            layer.residual_stream_hidden_size == 3 * block.config.hidden_size
+            for layer in block.layers
+        )
+
+        output.sum().backward()
+        assert hidden_states.grad is not None
+        assert block.residual_stream_readout.exit_map.logit.grad is not None
 
     @pytest.mark.parametrize(
         ("compute_symbol", "stack_spec", "compute_config"), TWO_STAGE_ATTENTION_CASES

@@ -29,6 +29,8 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
@@ -276,6 +278,38 @@ def test_build_vlm_request_keeps_compact_expansion_path():
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
     assert torch.equal(request.compact_prompt_tokens, compact_tokens)
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+
+def test_build_vlm_request_passes_temporal_video_metadata_to_expansion():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.multimodal_prompt_config = MultimodalPromptConfig(
+        video_spec=MediaPromptSpec(expansion_mode="temporal_patch")
+    )
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+    frame_indices = [[0, 30]]
+    fps = [30.0]
+
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        request = engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=torch.tensor([10, 42, 20], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            imgs=torch.ones(1, 2, 4),
+            num_tiles=None,
+            num_img_embeddings_per_tile=0,
+            imgs_sizes=torch.tensor([[2, 2], [2, 2]]),
+            num_frames=torch.tensor([2]),
+            video_frame_indices=frame_indices,
+            video_fps=fps,
+        )
+
+    expansion_kwargs = wrapper.expand_image_tokens.call_args.kwargs
+    assert expansion_kwargs["tokenizer"] is engine.controller.tokenizer
+    assert expansion_kwargs["video_frame_indices"] is frame_indices
+    assert expansion_kwargs["video_fps"] is fps
+    assert request.video_frame_indices is frame_indices
+    assert request.video_fps is fps
 
 
 def test_build_vlm_request_preserves_adjacent_compact_media_placeholders():
@@ -1728,6 +1762,44 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     assert request.image_token_mask is None
 
 
+def test_finished_vlm_reply_omits_input_only_tensors():
+    request = DynamicVLMInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([99, 5]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        num_frames=torch.tensor([1]),
+        video_frame_indices=[[0]],
+        video_fps=[30.0],
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(1, 1, 4),
+        image_token_mask=torch.tensor([0, -1]),
+    )
+    request.generated_tokens = [7]
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.payload_stager = None
+
+    serialized = engine._serialize_finished_request(request, None)
+
+    assert serialized["generated_tokens"] == [7]
+    for key in (
+        "imgs",
+        "num_tiles",
+        "imgs_sizes",
+        "num_frames",
+        "video_frame_indices",
+        "video_fps",
+        "image_embeddings",
+        "image_token_mask",
+    ):
+        assert key in serialized
+        assert serialized[key] is None
+
+
 def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.allow_stale_multimodal_embeddings = True
@@ -1751,13 +1823,19 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
         media_cache_key="media",
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
-        num_tiles=torch.tensor([1]),
+        num_tiles=None,
         imgs_sizes=torch.tensor([[1, 1]]),
+        num_frames=torch.tensor([1]),
+        video_frame_indices=[[0]],
+        video_fps=[30.0],
         decoder_seq_length=0,
         image_embeddings=None,
         image_token_mask=None,
     )
     wrapper = types.SimpleNamespace(
+        multimodal_prompt_config=MultimodalPromptConfig(
+            video_spec=MediaPromptSpec(expansion_mode="temporal_patch")
+        ),
         resolve_media_token_id=mock.Mock(return_value=99),
         expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
         _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
@@ -1767,7 +1845,8 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
     retained_imgs.to.return_value = device_imgs
     request.imgs = retained_imgs
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    tokenizer = object()
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=tokenizer)
     engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
     engine._cache_vision_embedding = mock.Mock()
 
@@ -1776,8 +1855,13 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
     retained_imgs.to.assert_called_once_with(device=request.prompt_tokens.device)
     encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
     assert encoder_args[0] is device_imgs
-    assert encoder_kwargs["num_image_tiles"].device == request.prompt_tokens.device
+    assert encoder_kwargs["num_image_tiles"] is None
     assert encoder_kwargs["imgs_sizes"].device == request.prompt_tokens.device
+    assert encoder_kwargs["num_frames"].device == request.prompt_tokens.device
+    expansion_kwargs = wrapper.expand_image_tokens.call_args.kwargs
+    assert expansion_kwargs["tokenizer"] is tokenizer
+    assert expansion_kwargs["video_frame_indices"] == [[0]]
+    assert expansion_kwargs["video_fps"] == [30.0]
     assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
     assert request.image_token_mask.tolist() == [0, 1, -1, -1]
     engine._cache_vision_embedding.assert_called_once()
