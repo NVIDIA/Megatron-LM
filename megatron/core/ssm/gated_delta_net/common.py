@@ -324,8 +324,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.reset_parameters()
 
     def supports_two_stage_attention(self) -> bool:
-        """Output-norm recomputation requires the original atomic forward path."""
-        return not self.recompute_norm_out
+        """Recomputation requires the original atomic forward path."""
+        return not (self.recompute_norm_out or self.recompute_gdn)
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor
@@ -408,7 +408,19 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 )
                 return self.forward_post_core_attn(norm_out)
 
-            return tensor_parallel.checkpoint(_checkpointed_forward, False, hidden_states)
+            if self.config.fp8 or self.config.fp4:
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                return te_checkpoint(
+                    _checkpointed_forward,
+                    self.config.distribute_saved_activations,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            return tensor_parallel.checkpoint(
+                _checkpointed_forward, self.config.distribute_saved_activations, hidden_states
+            )
 
         norm_out = self.forward_pre_attn_and_core_attn(
             hidden_states,
