@@ -155,7 +155,7 @@ class GatedDeltaNet2(_GDNBase):
 
         return g, {"b": b.contiguous(), "w": w.contiguous()}
 
-    def forward(
+    def _forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,

@@ -181,7 +181,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         y = y.to(x_dtype)
         return y
 
-    def forward(
+    def _forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,

@@ -413,6 +413,11 @@ class Attention(MegatronModule, ABC):
             and "attn_proj" in self.config.offload_modules
         )
 
+        self.recompute_attention = (
+            self.config.recompute_granularity == 'selective'
+            and "attention" in self.config.recompute_modules
+        )
+
         # Output.
         self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
@@ -1335,6 +1340,58 @@ class Attention(MegatronModule, ABC):
         return output_total
 
     def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Run the full attention block, checkpointing it whole when requested during training."""
+        if self.recompute_attention and self.training:
+
+            def custom_forward(checkpointed_hidden_states):
+                return self._forward(
+                    checkpointed_hidden_states,
+                    attention_mask,
+                    key_value_states=key_value_states,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                )
+
+            return tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+
+        return self._forward(
+            hidden_states,
+            attention_mask,
+            key_value_states=key_value_states,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+        )
+
+    def _forward(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,

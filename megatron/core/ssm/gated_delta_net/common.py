@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -270,10 +271,16 @@ class _GDNBase(MegatronModule):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+        self.recompute_gdn = False
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
-            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
+            # Whole-mixer checkpointing subsumes the output-only checkpoint and avoids
+            # nesting CheckpointWithoutOutput inside a normal checkpoint.
+            self.recompute_norm_out = (
+                "gdn_norm_out" in self.config.recompute_modules and not self.recompute_gdn
+            )
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -335,6 +342,43 @@ class _GDNBase(MegatronModule):
                 self.A_log.data.copy_(torch.log(A))
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the GDN mixer, checkpointing the complete forward when requested during training."""
+        if self.recompute_gdn and self.training:
+
+            def custom_forward(checkpointed_hidden_states):
+                return self._forward(
+                    checkpointed_hidden_states,
+                    attention_mask,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                    **kwargs,
+                )
+
+            return tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+
+        return self._forward(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+
+    def _forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,

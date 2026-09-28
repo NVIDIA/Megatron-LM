@@ -183,6 +183,104 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
 
 
+class TestSelectiveRecomputeAttention:
+    """Whole-block "attention" recompute must be numerically identical to no recompute, and
+    mutually exclusive with the narrower "core_attn" recompute -- mirrors
+    test_gated_delta_net_recompute.py's test_selective_recompute for the GDN mixer.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_self_attention(self, recompute_modules):
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            recompute_granularity='selective',
+            recompute_modules=recompute_modules,
+        )
+        attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+        )
+        return attention.cuda()
+
+    def _run(self, attention, hidden_states):
+        attention.train()
+        output, _ = attention(hidden_states, None)
+        output.float().sum().backward()
+        grads = {
+            name: param.grad.detach()
+            for name, param in attention.named_parameters()
+            if param.grad is not None
+        }
+        input_grad = hidden_states.grad.detach().clone()
+        return output.detach(), grads, input_grad
+
+    def test_recompute_attention_flag_and_two_stage_gating(self):
+        baseline = self._build_self_attention(["core_attn"])
+        assert baseline.recompute_attention is False
+        assert baseline.supports_two_stage_attention() is True
+
+        recompute = self._build_self_attention(["attention"])
+        assert recompute.recompute_attention is True
+        # Whole-block checkpointing needs the atomic forward path: the two-stage split calls
+        # forward_pre_attn_and_core_attn/forward_post_core_attn separately (for overlap),
+        # bypassing forward() -- and the checkpoint it wraps -- entirely.
+        assert recompute.supports_two_stage_attention() is False
+
+    def test_recompute_attention_matches_baseline(self):
+        sequence_length = 32
+        micro_batch_size = 2
+
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, 128),
+            device='cuda',
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # --- Baseline (core_attn recompute only) ---
+        baseline = self._build_self_attention(["core_attn"])
+        assert baseline.recompute_attention is False
+        base_output, base_grads, base_input_grad = self._run(baseline, hidden_states)
+        hidden_states.grad = None
+        del baseline
+        torch.cuda.empty_cache()
+
+        # --- Whole-block attention recompute ---
+        recompute = self._build_self_attention(["attention"])
+        assert recompute.recompute_attention is True
+        rec_output, rec_grads, rec_input_grad = self._run(recompute, hidden_states)
+
+        assert torch.equal(rec_output, base_output), "Output not identical"
+        assert torch.equal(rec_input_grad, base_input_grad), "Input grad not identical"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(rec_grads[name], base_grads[name]), f"Grad not identical for {name}"
+
+    def test_attention_and_core_attn_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="attention and core_attn cannot both be"):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=128,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                recompute_granularity='selective',
+                recompute_modules=["attention", "core_attn"],
+            )
+
+
 @pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 class TestClipQK:
 
