@@ -24,7 +24,19 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import numpy
 import torch
@@ -548,6 +560,65 @@ def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
         )
 
 
+_CALLABLE_KWARG_SIGNATURE_CACHE: Dict[int, Tuple[Callable, Optional[frozenset[str]], bool]] = {}
+
+
+def filter_kwargs_for_callable(
+    func: Callable,
+    candidate_kwargs: Mapping[str, Any],
+    *,
+    signature_unavailable_fallback: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Return the candidate keyword arguments accepted by a callable.
+
+    Args:
+        func: Callable whose keyword-capable parameters should be inspected.
+        candidate_kwargs: Candidate keyword arguments to filter.
+        signature_unavailable_fallback: Names to forward when ``func`` has no
+            inspectable signature.
+
+    Returns:
+        A dictionary containing only keyword arguments accepted by ``func``.
+    """
+    cache_key = id(func)
+    cached = _CALLABLE_KWARG_SIGNATURE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is func:
+        accepted_names = cached[1]
+        signature_is_unavailable = cached[2]
+    else:
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            accepted_names = frozenset()
+            signature_is_unavailable = True
+        else:
+            signature_is_unavailable = False
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            ):
+                accepted_names = None
+            else:
+                accepted_names = frozenset(
+                    name
+                    for name, parameter in signature.parameters.items()
+                    if parameter.kind
+                    in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                )
+        # Retain the callable so Python object-id reuse cannot apply a stale signature.
+        _CALLABLE_KWARG_SIGNATURE_CACHE[cache_key] = (
+            func,
+            accepted_names,
+            signature_is_unavailable,
+        )
+
+    if accepted_names is None:
+        return dict(candidate_kwargs)
+    if signature_is_unavailable:
+        accepted_names = frozenset(signature_unavailable_fallback)
+    return {name: value for name, value in candidate_kwargs.items() if name in accepted_names}
+
+
 def accepts_parameter(func: Callable, name: str) -> bool:
     """Check if a callable accepts a parameter with the given name or **kwargs."""
     params = inspect.signature(func).parameters.values()
@@ -689,6 +760,51 @@ def get_model_xattn(model):
 def get_model_config(model):
     """Returns the config attribute, allowed to return None"""
     return get_attr_wrapped_model(model, "config", allow_none=False)
+
+
+def move_host_tensor_to_device(
+    values: torch.Tensor, device: torch.device, pin_memory: bool = True
+) -> torch.Tensor:
+    """Move a host tensor to ``device``.
+
+    Args:
+        values (torch.Tensor): The host tensor to move.
+        device (torch.device): The destination device.
+        pin_memory (bool): Pin the source before a CUDA transfer. Defaults to True
+            and is ignored for non-CUDA destinations. Pinning an unpinned tensor
+            adds a blocking host copy; already pinned tensors are reused.
+
+    Returns:
+        torch.Tensor: The tensor on the destination device.
+    """
+    if pin_memory and device.type == "cuda":
+        values = values.pin_memory()
+    return values.to(device, non_blocking=device.type == "cuda")
+
+
+def maybe_move_tensor_to_cpu(
+    tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
+) -> torch.Tensor:
+    """Move a tensor to CPU if it is on GPU.
+    Args:
+        tensor (torch.Tensor): The tensor to move to CPU.
+        as_numpy (bool, optional): Whether to convert the tensor to a numpy array.
+                                   Defaults to False.
+        record_stream (bool, optional): Whether to record the stream of the tensor, to prevent
+                                        memory leak when the DtoH data transfer is on a side
+                                        stream. Defaults to False.
+
+    Returns:
+        torch.Tensor: The tensor moved to CPU.
+    """
+    if torch.is_tensor(tensor) and tensor.is_cuda:
+        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
+        if as_numpy:
+            cpu_tensor = cpu_tensor.numpy()
+        if record_stream:
+            tensor.record_stream(torch.cuda.current_stream())
+        tensor = cpu_tensor
+    return tensor
 
 
 class GlobalMemoryBuffer:

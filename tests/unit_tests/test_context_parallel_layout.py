@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import megatron.core.context_parallel_layout.conversion as context_parallel_layout_conversion
+import megatron.core.context_parallel_layout.routes as context_parallel_layout_routes
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout import (
     CpPartitionModeConverter,
@@ -90,6 +91,18 @@ def _get_test_thd_token_indices(cu_seqlens, cp_size, cp_rank, cp_partition_mode)
         token_indices.extend(range(first_start, first_start + chunk_len))
         token_indices.extend(range(second_start, second_start + chunk_len))
     return torch.tensor(token_indices, dtype=torch.long)
+
+
+def _assert_thd_routes_equal(actual, expected):
+    for field in ("zigzag_index", "contiguous_index"):
+        actual_index = getattr(actual, field)
+        expected_index = getattr(expected, field)
+        if expected_index is None:
+            assert actual_index is None
+        else:
+            assert torch.equal(actual_index, expected_index)
+    assert actual.zigzag_split_sizes == expected.zigzag_split_sizes
+    assert actual.contiguous_split_sizes == expected.contiguous_split_sizes
 
 
 @pytest.mark.parametrize(
@@ -401,6 +414,108 @@ def test_prebuild_thd_cp_partition_routes_populates_direct_fields():
     assert same_route is route
     assert reverse_route is route
     assert packed_seq_params.cp_partition_route is route
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
+    assert packed_seq_params.thd_cp_host_cu_seqlens_kv is (
+        packed_seq_params.thd_cp_host_cu_seqlens_q
+    )
+
+
+def test_prebuild_thd_cp_partition_routes_materializes_aliased_qkv_once(monkeypatch):
+    cu_q = torch.tensor([0, 16, 40, 40], dtype=torch.int32)
+    expected_route = build_thd_cp_partition_route(cu_q, cp_size=2, cp_rank=1)
+    materialized = []
+    original_materialize = context_parallel_layout_routes._materialize_thd_cu_seqlens_to_list
+
+    def track_materialize(cu_seqlens):
+        materialized.append(cu_seqlens)
+        return original_materialize(cu_seqlens)
+
+    monkeypatch.setattr(
+        context_parallel_layout_routes, "_materialize_thd_cu_seqlens_to_list", track_materialize
+    )
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=cu_q,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv=cu_q,
+        cu_seqlens_kv_padded=None,
+        cp_partition_route=None,
+    )
+
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=2, rank=1))
+
+    assert len(materialized) == 1
+    assert materialized[0] is cu_q
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
+    assert packed_seq_params.thd_cp_host_cu_seqlens_kv is (
+        packed_seq_params.thd_cp_host_cu_seqlens_q
+    )
+    _assert_thd_routes_equal(packed_seq_params.cp_partition_route, expected_route)
+
+
+def test_prebuild_thd_cp_partition_routes_materializes_distinct_qkv_jointly_once(monkeypatch):
+    cu_q = torch.tensor([0, 16, 40, 40], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 8, 40, 40], dtype=torch.int64)
+    expected_route = build_thd_cp_partition_route(cu_q, cp_size=2, cp_rank=0)
+    materialized = []
+    original_materialize = context_parallel_layout_routes._materialize_thd_cu_seqlens_to_list
+
+    def track_materialize(cu_seqlens):
+        materialized.append(cu_seqlens)
+        return original_materialize(cu_seqlens)
+
+    monkeypatch.setattr(
+        context_parallel_layout_routes, "_materialize_thd_cu_seqlens_to_list", track_materialize
+    )
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=cu_q,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv=cu_kv,
+        cu_seqlens_kv_padded=None,
+        cp_partition_route=None,
+    )
+
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=2, rank=0))
+
+    assert len(materialized) == 1
+    assert torch.equal(materialized[0], torch.cat((cu_q, cu_kv)))
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
+    assert packed_seq_params.thd_cp_host_cu_seqlens_kv == [0, 8, 40]
+    assert packed_seq_params.thd_cp_host_cu_seqlens_kv is not (
+        packed_seq_params.thd_cp_host_cu_seqlens_q
+    )
+    _assert_thd_routes_equal(packed_seq_params.cp_partition_route, expected_route)
+
+
+def test_prebuild_thd_cp_partition_routes_preserves_mixed_device_fallback(monkeypatch):
+    cu_q = torch.tensor([0, 16, 40])
+    cu_kv = torch.empty(3, device="meta", dtype=torch.int32)
+    materialized = []
+
+    def fake_compact(cu_seqlens):
+        materialized.append(cu_seqlens)
+        return [0, 16, 40] if cu_seqlens is cu_q else [0, 8, 40]
+
+    monkeypatch.setattr(
+        context_parallel_layout_routes, "_compact_thd_cu_seqlens_to_list", fake_compact
+    )
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=cu_q,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv=cu_kv,
+        cu_seqlens_kv_padded=None,
+        cp_partition_route=None,
+    )
+
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=2, rank=0))
+
+    assert len(materialized) == 2
+    assert materialized[0] is cu_q
+    assert materialized[1] is cu_kv
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
+    assert packed_seq_params.thd_cp_host_cu_seqlens_kv == [0, 8, 40]
 
 
 def test_prebuild_thd_cp_partition_routes_raises_route_errors():

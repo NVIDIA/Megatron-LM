@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
 from argparse import ArgumentError, ArgumentParser, Namespace
@@ -656,6 +656,21 @@ class TestArgumentGroupFactoryArgparseMeta:
 
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
+
+    def test_balanced_dynamic_pack_state_is_not_registered_as_a_cli_arg(self):
+        """The derived routing state must not be exposed as a user-provided option."""
+        from megatron.core.transformer import TransformerConfig
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+
+        destinations = {action.dest for action in parser._actions}
+        assert "dsa_cp_balance_indexer_graph_dynamic_packs" not in destinations
+        assert (
+            "dsa_cp_balance_indexer_graph_dynamic_packs"
+            not in TransformerConfig.__dataclass_fields__
+        )
 
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""

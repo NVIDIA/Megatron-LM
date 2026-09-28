@@ -41,3 +41,27 @@ CP support is included on the GPT code path. Other models that share that path, 
 
 Enable CP by setting `context_parallel_size=<CP_SIZE>` on the command line. The default `context_parallel_size` is 1, which disables CP. Running with CP requires Megatron Core (>=0.5.0) and Transformer Engine (>=1.1).
 
+## Dynamic Context Parallelism Configuration
+
+With `dynamic_context_parallel=True`, the sequence packing scheduler chooses the CP
+process group for each microbatch. The group can contain multiple ranks even when
+`context_parallel_size=1`. Configuration validation therefore checks CP capabilities
+whenever static CP is greater than one **or** Dynamic CP is enabled.
+
+These checks cover the attention variant's supported contiguous or zigzag layout,
+GDN-family `linear_cp_mode`, and the incompatibility between chunkwise CP and
+`gdn_conv_pad_alignment`. DSA requires `cp_comm_type="all_gather"` (also accepting
+`"allgather"`); eager attention and the local transformer implementation require
+`"all_gather"` when a communication type is supplied. A supplied `cp_comm_type` must
+be a string or a list with one entry per transformer layer. Non-DSA configurations
+retain their existing behavior when `cp_comm_type=None`.
+
+These are capability checks, not a prediction of each microbatch's group size.
+Numeric constraints such as head divisibility and hierarchical CP group sizes
+continue to use the configured parallel sizes. Ordinary static CP with
+`context_parallel_size=1` retains its existing validation behavior.
+
+Packed absorbed MLA uses the microbatch's actual CP group for RoPE indexing. Its
+frequency table must cover the full sequence even when each rank holds only a
+chunk and the configured CP size is one. QKV up-projection recomputation retains
+the forward microbatch's group after the caller restores or changes its group.

@@ -6,6 +6,8 @@ import inspect
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from megatron.core.enums import ModelType
 from megatron.training import training as training_mod
 
@@ -485,7 +487,12 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     assert result[-3:] == (3, 12.0, 34.0)
 
 
-def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
+@pytest.mark.parametrize(
+    ("dsa_indexer_loss_coeff", "expect_tracker_init"), [(0.1, True), (None, False)]
+)
+def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
+    dsa_indexer_loss_coeff, expect_tracker_init
+):
     """The config-container path must preserve Muon's layer-wise DDP routing flag."""
     args = SimpleNamespace(
         skip_train=True,
@@ -500,6 +507,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
         micro_batch_size=1,
         fp16=False,
         ckpt_convert_format=None,
+        dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
     )
     builder = mock.Mock()
     wrapped_model = mock.Mock()
@@ -529,6 +537,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "get_current_global_batch_size", return_value=1),
         mock.patch.object(training_mod.mpu, "model_parallel_is_initialized", return_value=False),
+        mock.patch.object(training_mod, "initialize_dsa_metric_tracker") as initialize_tracker,
         mock.patch("megatron.training.utils.start_memory_history_recording"),
     ):
         model, optimizer, scheduler = training_mod.setup_model_and_optimizer(
@@ -538,6 +547,10 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
     assert model == [wrapped_model]
     assert optimizer is None
     assert scheduler is None
+    if expect_tracker_init:
+        initialize_tracker.assert_called_once_with([unwrapped_model], pg_collection)
+    else:
+        initialize_tracker.assert_not_called()
     builder_cls.assert_called_once_with(model_config)
     builder.build_distributed_models.assert_called_once_with(
         pg_collection=pg_collection,

@@ -915,12 +915,10 @@ def validate_args(args, defaults={}):
                 )
                 args.mtp_num_layers = inferred_mtp_num_layers
 
-    # MTP validation
-    if args.mtp_num_layers:
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
-        )
+    # NOTE: the MTP position-embedding-type check lives with the other MTP
+    # validation further down (search for `supported_position_types`). Keeping a
+    # second, narrower copy here caused 'mrope' to be rejected before the
+    # authoritative check ever ran.
 
     # Validate MTP args for hybrid vs non-hybrid models
     if args.hybrid_layer_pattern is not None:
@@ -2153,7 +2151,11 @@ def validate_args(args, defaults={}):
 
     if args.mtp_num_layers:
         # MTP is compatible with position embedding types that use position_ids.
-        supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
+        # 'learned_absolute' is excluded: MTP's sequence roll shifts position_ids,
+        # but learned_absolute adds embeddings from the unshifted embedding-side
+        # positions, and that combination has no test coverage. It was already
+        # unreachable before the duplicate check above was removed.
+        supported_position_types = ["rope", "mrope", "none"]
         assert args.position_embedding_type in supported_position_types, (
             f"Multi-Token Prediction (MTP) is not supported with '{args.position_embedding_type}' position embedding type. "
             f"The supported position embedding types are: {', '.join(supported_position_types)}."

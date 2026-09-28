@@ -93,6 +93,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_cp_balance_indexer": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
@@ -115,6 +116,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_cuda_graph": False,
     "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
+    "ep_overlap_use_scheduled_tensor_release": False,
     "experimental_attention_variant": None,
     "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
@@ -347,6 +349,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_te_activation_func": False,
     "use_te_rng_tracker": False,
     "variable_seq_lengths": False,
+    "pipeline_p2p_fixed_shape": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
@@ -656,6 +659,7 @@ class TestHybridMoEModel:
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        padding_mask = torch.ones_like(input_ids, dtype=torch.bool)
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
@@ -664,6 +668,7 @@ class TestHybridMoEModel:
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             runtime_gather_output=True,
         )
 

@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -30,6 +31,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    mla_rope_apply_raw_,
+    mla_rope_unapply_raw,
+)
 from megatron.core.quantization.indexer_quantization import (
     HAVE_TE_MXFP8,
     HAVE_TRITON,
@@ -43,10 +48,105 @@ from megatron.core.quantization.indexer_quantization import (
     refresh_indexer_mxfp8_scale_cu_seqlens,
 )
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+    warn_fused_indexer_row_limit_once,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
+
+# ---------------------------------------------------------------------------
+# Output inverse-RoPE fused into the sparse-attention Functions
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OutputRopeParams:
+    """Inverse-RoPE applied to the attention output inside the fused Functions.
+
+    DSv4 undoes the query-side RoPE on the attention output.  Folding that into
+    the sparse-attention ``Function`` lets the rotation happen in place on the
+    tensor the Function already saves for backward, instead of on a private
+    clone, which removes one full ``(rows, heads, v_head_dim)`` buffer per layer
+    from the forward-to-backward live set.
+
+    The rotation is orthogonal only when the cos/sin were built with
+    ``mscale=1.0`` (DSv4's "pure rotation" contract).  That is what makes
+    :meth:`undo` an exact inverse rather than just a transpose, so the backward
+    can recover the pre-RoPE output and gradient.
+
+    ``sbhd_batch_size`` is required for the sbhd layout, where the flat
+    ``(sq * b, ...)`` rows are sq-major and the kernel derives the token index
+    as ``row // batch_size``.  For thd it must be None and ``cu_seqlens_q``
+    supplies the segment boundaries instead.
+    """
+
+    cos: Tensor
+    sin: Tensor
+    nope_dim: int
+    pos_dim: int
+    cu_seqlens_q: Optional[Tensor] = None
+    cp_rank: int = 0
+    cp_size: int = 1
+    position_ids: Optional[Tensor] = None
+    sbhd_batch_size: Optional[int] = None
+
+    def _kernel_view(self, out_flat: Tensor) -> Tensor:
+        """View a flat ``(rows, heads, head_dim)`` output the way the kernel wants it."""
+        if out_flat.shape[-1] != self.nope_dim + self.pos_dim:
+            raise ValueError(
+                "Output inverse-RoPE expects head_dim == nope_dim + pos_dim, got "
+                f"{out_flat.shape[-1]} != {self.nope_dim} + {self.pos_dim}."
+            )
+        if self.cu_seqlens_q is not None:
+            return out_flat
+        if self.sbhd_batch_size is None:
+            raise ValueError("sbhd_batch_size is required when cu_seqlens_q is None.")
+        rows, nheads, head_dim = out_flat.shape
+        return out_flat.view(rows // self.sbhd_batch_size, self.sbhd_batch_size, nheads, head_dim)
+
+    def _kernel_kwargs(self) -> dict:
+        return dict(
+            cu_seqlens_q=self.cu_seqlens_q,
+            cp_rank=self.cp_rank,
+            cp_size=self.cp_size,
+            inverse=True,
+            remove_interleaving=True,
+            position_ids=self.position_ids,
+        )
+
+    def apply_(self, out_flat: Tensor) -> Tensor:
+        """Inverse-RoPE a ``(rows, heads, head_dim)`` attention output in place."""
+        mla_rope_apply_raw_(
+            self._kernel_view(out_flat),
+            self.cos,
+            self.sin,
+            self.nope_dim,
+            self.pos_dim,
+            **self._kernel_kwargs(),
+        )
+        return out_flat
+
+    def undo(self, t: Tensor, out: Optional[Tensor] = None) -> Tensor:
+        """Recover the pre-RoPE values of ``t``, in place or into ``out``.
+
+        Pass ``out`` whenever ``t`` is aliased by a tensor that another autograd
+        node still expects to hold the rotated values, which is the case for the
+        saved attention output.
+        """
+        mla_rope_unapply_raw(
+            self._kernel_view(t),
+            self.cos,
+            self.sin,
+            self.nope_dim,
+            self.pos_dim,
+            out=None if out is None else self._kernel_view(out),
+            **self._kernel_kwargs(),
+        )
+        return t if out is None else out
+
 
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
@@ -740,6 +840,33 @@ def _csa_fwd_flash_mla(
     return out, lse, None
 
 
+def _undo_output_rope_for_backward(
+    out_rope: Optional[OutputRopeParams], out_flat: Tensor, dO_flat: Tensor
+) -> Tuple[Tensor, Tensor]:
+    """Recover the pre-RoPE ``(O, dO)`` pair that the cuDNN backward expects.
+
+    ``dO`` is un-rotated in place; the gradient buffer is exclusively ours.
+    ``O`` is un-rotated into a fresh buffer because the saved output aliases the
+    tensor the downstream output projection saved for its own backward, and a
+    triton in-place write would corrupt it without tripping autograd's version
+    counter.
+
+    #TODO:
+    Two follow-ups can remove work here. The only thing ``O`` feeds is cuDNN's
+    internal ``delta = rowsum(dO * O)``, which the rotation leaves unchanged, so
+    a ``sparse_attention_backward_wrapper`` that accepts a precomputed delta
+    would let the ``O`` un-rotation be dropped entirely. Short of that, one
+    triton kernel could un-rotate ``O`` and ``dO`` in a single launch.
+    """
+    if out_rope is None:
+        return out_flat, dO_flat
+    o_unrot = torch.empty_like(out_flat)
+    out_rope.undo(out_flat, out=o_unrot)
+    dO_flat = dO_flat.contiguous()
+    out_rope.undo(dO_flat)
+    return o_unrot, dO_flat
+
+
 def _ensure_dsa_namespace():
     """Lazily import the cudnn-frontend DSA namespace."""
     global _DSA
@@ -1380,6 +1507,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         softmax_scale: float,
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -1392,6 +1520,12 @@ class CSASparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
 
+        # Inverse-RoPE in place before the save, so the saved tensor, the
+        # returned tensor and what the downstream projection saves are all one
+        # buffer. Mutating after the save would trip the version counter.
+        if out_rope is not None:
+            out_rope.apply_(out)
+
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
@@ -1400,6 +1534,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
+        ctx.out_rope = out_rope
         return out, lse, lse_indexer
 
     @staticmethod
@@ -1415,6 +1550,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         else:
             q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
+        out, dO = _undo_output_rope_for_backward(ctx.out_rope, out, dO)
+
         result = _DSA.sparse_attention_backward_wrapper(
             q,
             kv,
@@ -1427,7 +1564,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_length=ctx.topk_length,
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -1440,6 +1577,7 @@ def csa_sparse_attn(
     indexer_topk: int = 0,
     is_thd: bool = False,
     kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+    out_rope: Optional[OutputRopeParams] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -1473,9 +1611,14 @@ def csa_sparse_attn(
             checkpointing release their storage instead of retaining the
             concatenated ``kv`` allocation. ``kv`` remains the differentiable
             Function input and receives the reconstructed buffer's gradient.
+        out_rope: when given, the DSv4 output inverse-RoPE is applied inside
+            the Function, in place on the tensor it saves for backward, and
+            undone there before the cuDNN backward. Saves one full O buffer
+            per layer against rotating the returned tensor out of place.
 
     Returns:
-        SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16.
+        SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16,
+        inverse-RoPE'd when ``out_rope`` is given.
     """
     # Layout-specific input pre-reshape — the kernel always consumes a
     # flat ``(rows, np, d)`` query and ``(n_kv, d)`` KV; only the rows
@@ -1510,6 +1653,7 @@ def csa_sparse_attn(
         softmax_scale,
         indexer_topk,
         kv_reconstruction_parts,
+        out_rope,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
@@ -1523,6 +1667,56 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 # Path C inference: indexer scoring + top-K
 # ---------------------------------------------------------------------------
+
+
+# Upper bound on the transient buffers one ``_stable_topk_indices`` sort may
+# hold at once: the masked score copy, the sorted scores and the int64 order.
+_STABLE_TOPK_SORT_BYTES = 256 << 20
+_NEG_INF = float("-inf")
+
+
+def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
+    """Select the ``topk_k`` highest-scoring key ids per row with a fixed tie order.
+
+    Rows may only draw from their first ``seq_lens[row]`` key columns; a row with
+    fewer valid keys than ``topk_k`` is padded with ``-1``. Exact score ties are
+    resolved toward the smallest key id and the selected ids are returned in
+    descending-score order, so identical inputs always yield identical ids. The
+    radix Top-K kernel does not order equal scores, which matters for ReLU-scored
+    indexers where many keys share a score of exactly zero.
+
+    Rows are independent, so they are sorted in slabs sized to keep the sort's
+    temporary buffers under ``_STABLE_TOPK_SORT_BYTES`` regardless of ``rows``.
+
+    Args:
+        scores: ``(rows, sk)`` fp32 indexer scores; masked positions hold ``-inf``.
+        seq_lens: ``(rows,)`` int32 number of candidate key columns per row.
+        topk_k: number of ids to select, at most ``sk``.
+
+    Returns:
+        ``(rows, topk_k)`` int32 key ids, ``-1`` where a row has no more valid keys.
+    """
+    rows, sk = scores.shape
+    columns = torch.arange(sk, device=scores.device, dtype=seq_lens.dtype)
+    bytes_per_row = sk * (2 * scores.element_size() + 8)
+    slab = max(1, min(rows, _STABLE_TOPK_SORT_BYTES // bytes_per_row))
+    selected = torch.empty(rows, topk_k, dtype=torch.int32, device=scores.device)
+    for start in range(0, rows, slab):
+        stop = min(start + slab, rows)
+        candidates = scores[start:stop].masked_fill(
+            columns.unsqueeze(0) >= seq_lens[start:stop].unsqueeze(1), _NEG_INF
+        )
+        sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
+        selected[start:stop] = (
+            order[:, :topk_k]
+            .to(torch.int32)
+            .masked_fill(torch.isneginf(sorted_scores[:, :topk_k]), -1)
+        )
+    return selected
+
+
+# The balanced CP path fails closed above the shared limit before reaching this
+# compatibility warning; see cp_utils.compute_cp_indexer_topk.
 
 
 def _indexer_topk_core(
@@ -1800,6 +1994,12 @@ def _indexer_topk_core(
         )
         if q_causal_offsets is not None:
             forward_kwargs["q_causal_offsets"] = q_causal_offsets
+        total_q_rows = int(q.shape[0])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            # Warn only after validation and backend resolution, immediately before
+            # an affected fused invocation. Invalid/no-op calls must not consume the
+            # process-wide warning or imply that the kernel actually ran.
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
             "scores"
         ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
@@ -1813,6 +2013,9 @@ def _indexer_topk_core(
         )
     else:
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
+        total_q_rows = int(q.shape[0] * q.shape[1])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
             "scores"
         ]  # (b, sq, sk) fp32, -inf on masked positions
@@ -1829,10 +2032,13 @@ def _indexer_topk_core(
 
     # ---------------- Shared: radix top-K + pad-to-topk -----------------
     topk_k = min(topk, sk)
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
-    )
-    topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
+    if deterministic:
+        topk_indices = _stable_topk_indices(scores_flat, seq_lens, topk_k)
+    else:
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        )
+        topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
     if is_thd:
         topk_indices, topk_length = thd_indexer_kernels.sanitize_topk(
@@ -1870,6 +2076,7 @@ def indexer_topk(
     q_causal_offsets: Optional[Tensor] = None,
     compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
     precision: str = "bf16",
+    use_compact: bool = True,
     deterministic: bool = False,
     return_softmax: bool = False,
 ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Optional[Tensor]]:
@@ -1900,9 +2107,13 @@ def indexer_topk(
             storage prepared during eager warmup. Candidate scratch and compact
             outputs are allocated by each dispatch. A matching workspace is
             required while capturing the compact path.
+        use_compact: select the compact forward plus Top-K backend when
+            available. False retains dense scoring for the balanced indexer's
+            existing unpadded synthetic layouts.
         deterministic: resolve exact-value ties at the K-th boundary toward
-            the smallest local KV indices. The output slot order remains
-            unspecified.
+            the smallest local KV indices. Compact dispatch leaves the output
+            slot order unspecified; the standalone Top-K fallback returns ids in
+            descending-score order.
         return_softmax: also return the compact kernel's Top-K softmax. The
             third return is ``None`` when compact dispatch is unavailable.
 
@@ -1948,7 +2159,7 @@ def indexer_topk(
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
         q_causal_offsets=q_causal_offsets,
-        use_compact=True,
+        use_compact=use_compact,
         return_softmax=return_softmax,
         compact_workspace=compact_workspace,
         precision=precision,
@@ -2346,6 +2557,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         deterministic: bool = False,
         thd_window_size: int | None = None,
         thd_compressed_is_sequence_major: bool = False,
+        out_rope: Optional[OutputRopeParams] = None,  # inverse-RoPE fused onto the output
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -2486,6 +2698,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         # longer needs that segment boundary because FlashMLA's partial
         # ``lse_indexer`` is not used, so compact the full attention set once
         # and share the resulting prefix length with forward and backward.
+        if padding_row_mask is not None:
+            # Padding queries are sink-only in forward; backward supplies a
+            # harmless tile after masking their output gradients.
+            global_idxs.masked_fill_(padding_row_mask.unsqueeze(-1), -1)
         if is_thd and thd_compressed_is_sequence_major:
             logical_window_width = int(thd_window_size)
         else:
@@ -2810,7 +3026,15 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_q_indexer[padding_row_mask] = 0
             precomputed_grad_weights[padding_row_mask] = 0
 
-        # ---- 7. Save context (only sparse-attn bwd tensors + indexer grads). -
+        # ---- 7. Inverse-RoPE the output, in place, before it is saved. -------
+        # Saving the rotated output means it is the same storage the caller
+        # returns and the downstream projection saves, so only one copy of O is
+        # live from here to backward. Must happen before save_for_backward:
+        # mutating a saved tensor afterwards trips the version counter.
+        if out_rope is not None:
+            out_rope.apply_(out_flat)
+
+        # ---- 8. Save context (only sparse-attn bwd tensors + indexer grads). -
         ctx.save_for_backward(
             q_flat,
             kv_flat,
@@ -2828,6 +3052,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         ctx.padding_row_mask = padding_row_mask
         ctx.np_ = np_
         ctx.d = d
+        ctx.out_rope = out_rope
         if is_thd:
             ctx.total_q = total_q
         else:
@@ -2874,6 +3099,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
 
+        out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
@@ -2909,7 +3136,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         #   max_seqlen_q, max_seqlen_compressed_idx,
         #   compressed_kv, cu_seqlens_q_unpadded, compact_workspace,
         #   indexer_precision, deterministic,
-        #   thd_window_size, thd_compressed_is_sequence_major
+        #   thd_window_size, thd_compressed_is_sequence_major, out_rope
         return (
             grad_query,
             grad_kv_full,
@@ -2918,6 +3145,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -2980,6 +3208,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         compressed_kv_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
         logical_window_width: int | None = None,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -2991,6 +3220,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         # Preserve the fixed window suffix for the dense teacher before
         # compacting the complete attention index set.
+        if q_padding_mask is not None:
+            # Padding queries attend only to the sink, as in raw THD lowering.
+            topk_idxs.masked_fill_(q_padding_mask.unsqueeze(-1), -1)
         if logical_window_width is None:
             logical_window_width = topk_idxs.shape[-1] - indexer_topk
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
@@ -3182,6 +3414,12 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
         ctx.indexer_grad_is_sequence_major = cp_group is not None and not sparse_loss
         ctx.num_forward_inputs = len(ctx.needs_input_grad)
+
+        # Inverse-RoPE in place before saving, so the saved output and the
+        # returned one are a single buffer. See FusedCSAIndexerSparseAttnFunc.
+        if out_rope is not None:
+            out_rope.apply_(out_flat)
+
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             _validate_kv_reconstruction_parts(kv_full, kv_reconstruction_parts)
@@ -3214,6 +3452,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             )
         ctx.softmax_scale = softmax_scale
         ctx.q_padding_mask = q_padding_mask
+        ctx.out_rope = out_rope
 
         return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
 
@@ -3275,6 +3514,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         if ctx.q_padding_mask is not None:
             dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+
+        out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
@@ -3374,6 +3616,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
         # Older call sites omit the optional CP-overlap inputs. PyTorch expects
         # exactly one backward result for every argument passed to ``apply``.
@@ -3410,6 +3653,7 @@ def fused_csa_indexer_sparse_attn(
     deterministic: bool = False,
     thd_window_size: int | None = None,
     thd_compressed_is_sequence_major: bool = False,
+    out_rope: Optional[OutputRopeParams] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -3499,6 +3743,9 @@ def fused_csa_indexer_sparse_attn(
             ``thd_compressed_is_sequence_major=True``.
         thd_compressed_is_sequence_major: lower logical compressed ids directly
             into the appended sequence-major compressed buffer.
+        out_rope: when supplied, DSv4's inverse RoPE is applied to the attention
+            output in place before it is saved, so the returned output is
+            already rotated and only one copy of it is live until backward.
     """
     if indexer_precision == "mxfp8" and not sparse_loss and loss_coeff > 0:
         raise ValueError("MXFP8 indexer loss supports only sparse indexer loss")
@@ -3552,11 +3799,13 @@ def fused_csa_indexer_sparse_attn(
         deterministic,
         thd_window_size,
         thd_compressed_is_sequence_major,
+        out_rope,
     )
 
 
 __all__ = [
     "BSHDCompactIndexerWorkspace",
+    "OutputRopeParams",
     "THDCompactIndexerWorkspace",
     "batch_of_row",
     "build_thd_compact_k_layout",

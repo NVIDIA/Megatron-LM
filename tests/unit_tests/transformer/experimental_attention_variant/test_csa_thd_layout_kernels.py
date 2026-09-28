@@ -423,6 +423,101 @@ def test_compressor_input_compact_matches_native_forward_backward():
     assert torch.equal(boundary.grad, ref_boundary_grad)
 
 
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("rank", [0, 1, 3])
+@pytest.mark.parametrize(
+    "width,dtype", [(7, torch.float32), (7, torch.bfloat16), (256, torch.bfloat16)]
+)
+def test_projected_compressor_layout_matches_hidden_compaction(ratio, rank, width, dtype):
+    """The reused maps preserve exact payload bits and zero every unused gradient row."""
+    _require_cute_cuda()
+    cu = _make_e2e_like_cu_seqlens()
+    local_rows = 1024
+    start = rank * local_rows
+    boundary_rows = 128
+    values = [
+        torch.randn(rows, 1, width, dtype=dtype, device="cuda", requires_grad=True)
+        for rows in (local_rows, local_rows, boundary_rows, boundary_rows)
+    ]
+    local_kv, local_score, boundary_kv, boundary_score = values
+    reference = [
+        prepare_cp_compressor_input(local, boundary, cu, start, _E2E_CP_SIZE, ratio)
+        for local, boundary in ((local_kv, boundary_kv), (local_score, boundary_score))
+    ]
+    layout = thd_layout_kernels.build_cp_compressor_layout(
+        cu, start, local_rows, _E2E_CP_SIZE, ratio
+    )
+    for actual, expected in zip(layout[2:8], reference[0][1:]):
+        assert torch.equal(actual, expected)
+    actual = thd_layout_kernels.CompressorProjectionCompact.apply(
+        local_kv,
+        local_score,
+        boundary_kv[-layout.boundary_rows :],
+        boundary_score[-layout.boundary_rows :],
+        layout,
+    )
+    for output, ref in zip(actual, reference):
+        assert torch.equal(output, ref[0])
+    grads = [torch.randn_like(output) for output in actual]
+    expected_grads = torch.autograd.grad([ref[0] for ref in reference], values, grads)
+    actual_grads = torch.autograd.grad(actual, values, grads)
+    for result, expected in zip(actual_grads, expected_grads):
+        assert torch.equal(result, expected)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_projected_compressor_graph_replay_updates_maps_and_backward(ratio):
+    """Pack contents change under capture without stale maps or unwritten gradients."""
+    _require_cute_cuda()
+    local_rows, width, cp_size = 1024, 128, 4
+    cu = _make_e2e_like_cu_seqlens()
+    boundary_rows = 8 if ratio == 4 else ratio
+    values = [
+        torch.randn(rows, 1, width, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for rows in (local_rows, local_rows, boundary_rows, boundary_rows)
+    ]
+
+    def run():
+        layout = thd_layout_kernels.build_cp_compressor_layout(
+            cu, local_rows, local_rows, cp_size, ratio
+        )
+        outputs = thd_layout_kernels.CompressorProjectionCompact.apply(*values, layout)
+        # Consume only KV to exercise the unused score gradient as well.
+        grads = torch.autograd.grad(outputs[0].sum(), values)
+        return layout, outputs, grads
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_layout, captured_outputs, captured_grads = run()
+
+    for lengths in (
+        _E2E_RAGGED_PADDED_SEG_LENS,
+        (3, 9, 130, 129, 7, 2001, 256, 127, 65, 10, 511, 848),
+        # No complete compression groups in this rank, with fixed tensor shapes.
+        (1024,) + (0,) * 11,
+        (4096,) + (0,) * 11,
+    ):
+        assert sum(lengths) <= cp_size * local_rows
+        cu.copy_(torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), device="cuda"))
+        with torch.no_grad():
+            for value in values:
+                value.normal_()
+        expected_layout, expected_outputs, expected_grads = run()
+        graph.replay()
+        for actual, expected in zip(captured_layout[:8], expected_layout[:8]):
+            assert torch.equal(actual, expected)
+        for actual, expected in zip(
+            captured_outputs + captured_grads, expected_outputs + expected_grads
+        ):
+            assert torch.equal(actual, expected)
+
+
 def test_build_attention_indices_matches_native():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()

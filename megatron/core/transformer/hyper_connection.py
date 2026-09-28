@@ -567,7 +567,8 @@ class HyperConnectionModule(MegatronModule):
             mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
             output_slot: Optional arena slot used as the aggregate kernel's
-                caller-owned output for both forward and recompute.
+                caller-owned output for both forward and recompute. A differing
+                slot dtype is handled by casting the aggregate into the slot.
 
         Returns:
             A 4-tuple. This is an intentional breaking change from the older
@@ -578,6 +579,7 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
+
         if mhc_recompute_manager is not None:
             return self._forward_with_checkpoint(
                 hidden_states, mhc_recompute_manager, output_slot=output_slot
@@ -631,7 +633,8 @@ class HyperConnectionModule(MegatronModule):
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
             manager: MHCCheckpointManager for unified recomputation
-            output_slot: Optional direct-write attention CUDA Graph input slot.
+            output_slot: Optional attention CUDA Graph input slot. Aggregation
+                preserves the input dtype before casting into a differing slot dtype.
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -648,15 +651,20 @@ class HyperConnectionModule(MegatronModule):
 
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 
-        # Checkpoint aggregate - auto-registers to manager
-        # With an arena slot the aggregate direct-writes into the graph consumer's
-        # captured input surface, so forward and recompute land at the same fixed
-        # address. writer is read per call by design: it hands back a fresh view.
-        aggregate_function = (
-            self.aggregate
-            if output_slot is None
-            else lambda x, h: self.aggregate(x, h, out=output_slot.writer)
-        )
+        def aggregate_function(x, h):
+            if output_slot is None:
+                return self.aggregate(x, h)
+
+            # Both forward and recompute must populate the graph's captured input address.
+            # Read writer per call so each invocation gets a fresh detached view.
+            out = output_slot.writer
+            if out.dtype == x.dtype:
+                return self.aggregate(x, h, out=out)
+
+            # FP32 residual streams can feed a lower-precision attention graph.
+            # Preserve the aggregation precision and checkpoint the cast/copy too,
+            # so recompute restores the captured bytes before attention backward.
+            return out.copy_(self.aggregate(x, h))
 
         aggregated = CheckpointWithoutOutput(
             ckpt_manager=manager, output_slot=output_slot
