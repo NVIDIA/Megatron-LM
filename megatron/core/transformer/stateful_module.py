@@ -115,6 +115,7 @@ class _GraphOutputs(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, owner, slot, *outputs):
+        """Track a graph slot's outputs without materializing absent gradients."""
         ctx.owner, ctx.slot = owner, slot
         ctx.active = tuple(t.requires_grad for t in outputs)
         ctx.set_materialize_grads(False)
@@ -124,6 +125,7 @@ class _GraphOutputs(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
+        """Validate output gradients and release the slot after captured backward."""
         if ctx.owner is None:
             raise RuntimeError("Stateful graph outputs support one backward per invocation")
         if any(active and grad is None for active, grad in zip(ctx.active, grads)):
