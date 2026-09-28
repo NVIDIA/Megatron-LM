@@ -253,7 +253,9 @@ def test_switch_load_balancing_loss_replays(fused, all_padding):
             probs, tokens_per_expert, total_num_tokens, 8, 256, 1e-2, fused=fused
         )
 
-    assert_replays_bit_exact(fn, (probs,), replays=4, what=f"aux loss[fused={fused}]")
+    assert_replays_bit_exact(
+        fn, (probs,), replays=4, what=f"aux loss[fused={fused}, all_padding={all_padding}]"
+    )
 
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])

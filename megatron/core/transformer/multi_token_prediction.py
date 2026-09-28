@@ -2236,6 +2236,7 @@ class MultiTokenPredictionInputs:
     loss_mask: Optional[Tensor]
     mtp_input_mask: Optional[Tensor]
     packed_seq_params: Optional[PackedSeqParams]
+    padding_mask: Optional[Tensor] = None
 
 
 def _get_mtp_block_submodules(
@@ -2399,8 +2400,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_input_mask: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         cp_batch: Optional[ContextParallelBatch],
+        padding_mask: Optional[Tensor] = None,
     ) -> MultiTokenPredictionInputs:
-        """Prepare activations and token-aligned inputs for the MTP block's CP layout."""
+        """Prepare MTP inputs, including the batch-major, optionally SP-sharded padding mask."""
         source_layout = (
             cp_batch.boundary_layout if cp_batch is not None else self.config.linear_cp_layout
         )
@@ -2444,6 +2446,23 @@ class MultiTokenPredictionBlock(MegatronModule):
                     self.tp_cp_group,
                     cp_batch.thd_plan,
                 )
+            if padding_mask is not None:
+                # Convert validity so any new THD padding slots (zero-filled by
+                # layout conversion) remain excluded from routing.
+                padding_mask = (
+                    ~convert_cp_layout(
+                        (~padding_mask).transpose(0, 1).contiguous(),
+                        source_layout,
+                        target_layout,
+                        self.cp_group,
+                        self.sequence_parallel,
+                        self.tp_group,
+                        self.tp_cp_group,
+                        cp_batch.thd_plan,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
             packed_seq_params = cp_batch.get_packed_seq_params(target_layout)
             layout_batch = cp_batch.get_batch(target_layout)
             input_ids = layout_batch["tokens"]
@@ -2461,6 +2480,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             loss_mask=loss_mask,
             mtp_input_mask=mtp_input_mask,
             packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
 
     def _build_layers(self, pg_collection):
@@ -2619,6 +2639,19 @@ class MultiTokenPredictionBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
+                if padding_mask is not None:
+                    # Precomputed embeddings bypass the layer's _get_embeddings,
+                    # so shift validity here alongside those embeddings.
+                    valid_mask, _ = roll_tensor_precomputed_embeddings(
+                        (~padding_mask).transpose(0, 1).contiguous(),
+                        shifts=-1,
+                        dims=0,
+                        sp_group=self.tp_group if self.sequence_parallel else None,
+                        cp_group=self.cp_group,
+                        packed_seq_params=packed_seq_params,
+                        return_sum=False,
+                    )
+                    padding_mask = ~valid_mask.transpose(0, 1).contiguous()
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.

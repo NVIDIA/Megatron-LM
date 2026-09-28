@@ -736,6 +736,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
+                padding_mask=padding_mask,
             )
             if mtp_inputs.decoder_input is None:
                 assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
@@ -754,6 +755,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
+                padding_mask=mtp_inputs.padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )

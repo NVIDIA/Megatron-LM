@@ -8,7 +8,7 @@ import types
 import pytest
 import torch
 
-from megatron.core.context_parallel import ContextParallelBatch
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
 from megatron.core.inference.utils import InferenceMode
@@ -33,6 +33,7 @@ from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
@@ -3368,6 +3369,163 @@ class TestMultiTokenPredictionHybrid:
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
 
+    @pytest.mark.parametrize("tp,cp", [(1, 1), (2, 1), (1, 2), (2, 2)])
+    @pytest.mark.parametrize("with_mask", [False, True])
+    @pytest.mark.parametrize("precomputed", [False, True])
+    def test_hybrid_mtp_moe_receives_padding_mask(self, tp, cp, with_mask, precomputed):
+        """Real hybrid MoE routers receive the shifted mask at both MTP depths."""
+        if Utils.world_size < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(_SEED)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            context_parallel_size=cp,
+            linear_cp_layout="zigzag",
+            attention_cp_layout="zigzag",
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=True,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=32,
+            max_sequence_length=16,
+            hybrid_layer_pattern="-/E/E",
+            position_embedding_type="none",
+        ).cuda()
+        # Inspect MTP activations directly while keeping the real embedding,
+        # backbone, MTP layers, expert routers, and backward path.
+        model.post_process = False
+        cp_rank = get_context_parallel_group().rank()
+        tp_rank = get_tensor_model_parallel_group().rank()
+        indices = torch.arange(16, device="cuda").reshape(2 * cp, -1)
+        indices = indices[[cp_rank, 2 * cp - cp_rank - 1]].flatten()
+        valid_lengths = torch.tensor([10, 16, 0], device="cuda").unsqueeze(1)
+        input_ids = indices.unsqueeze(0).expand(3, -1).contiguous()
+        padding_mask = input_ids >= valid_lengths if with_mask else None
+        seen_masks = []
+
+        def capture_router_mask(_module, args, kwargs):
+            mask = args[1] if len(args) > 1 else kwargs.get("padding_mask")
+            seen_masks.append(mask.clone() if mask is not None else None)
+
+        handles = [
+            module.register_forward_pre_hook(capture_router_mask, with_kwargs=True)
+            for module in model.mtp.modules()
+            if isinstance(module, TopKRouter)
+        ]
+        assert len(handles) == 2
+        try:
+            output = model(
+                input_ids=input_ids,
+                position_ids=input_ids,
+                attention_mask=None,
+                padding_mask=padding_mask,
+                decoder_input=model.embedding(input_ids, input_ids) if precomputed else None,
+            )
+            assert len(seen_masks) == 2
+            for depth, actual in enumerate(seen_masks, start=1):
+                if not with_mask:
+                    assert actual is None
+                    continue
+                expected = input_ids >= (valid_lengths - depth).clamp_min(0)
+                expected = expected.chunk(tp, dim=1)[tp_rank].transpose(0, 1)
+                torch.testing.assert_close(actual, expected)
+            assert torch.isfinite(output).all()
+            output.float().square().mean().backward()
+            router_grads = [
+                module.weight.grad
+                for module in model.mtp.modules()
+                if isinstance(module, TopKRouter)
+            ]
+            assert all(grad is not None and torch.isfinite(grad).all() for grad in router_grads)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    @pytest.mark.parametrize("tp", [1, 2])
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("with_mask", [False, True])
+    def test_prepare_cp_layout_converts_padding_mask(self, tp, packed, with_mask):
+        """Real CP redistribution preserves masks, including newly inserted THD padding."""
+        cp = 2
+        if Utils.world_size < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        tp_group = get_tensor_model_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+        tokens = torch.arange(1, 9, device="cuda").unsqueeze(0)
+        batch = {
+            "tokens": tokens,
+            "position_ids": tokens - 1,
+            "labels": tokens + 1,
+            "loss_mask": torch.ones_like(tokens, dtype=torch.float32),
+            "attention_mask": None,
+        }
+        if packed:
+            batch["cu_seqlens"] = torch.tensor([[0, 3, 8]], dtype=torch.int32, device="cuda")
+            batch["max_seqlen"] = torch.tensor([5], dtype=torch.int32, device="cuda")
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="contiguous",
+            is_hybrid_cp=False,
+            cp_group=cp_group,
+            additional_layouts=("zigzag",),
+            sequence_parallel=tp > 1,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            tokens_per_sample=8,
+        )
+        source = cp_batch.get_batch("contiguous")
+        local_tokens = source["tokens"].chunk(tp, dim=1)[tp_group.rank()]
+        # Multiples of three mark existing padding. New THD padding receives
+        # token ID zero in the independently prepared target batch.
+        padding_mask = local_tokens.remainder(3) == 0 if with_mask else None
+        original_mask = padding_mask.clone() if with_mask else None
+        block = types.SimpleNamespace(
+            config=types.SimpleNamespace(attention_cp_layout="zigzag"),
+            cp_group=cp_group,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            sequence_parallel=tp > 1,
+        )
+        prepared = MultiTokenPredictionBlock.prepare_cp_layout(
+            block,
+            input_ids=source["tokens"],
+            position_ids=source["position_ids"],
+            hidden_states=local_tokens.transpose(0, 1).unsqueeze(-1).float(),
+            decoder_input=None,
+            mhc_multistream=None,
+            labels=source["labels"],
+            loss_mask=source["loss_mask"],
+            mtp_input_mask=None,
+            packed_seq_params=cp_batch.get_packed_seq_params("contiguous"),
+            cp_batch=cp_batch,
+            padding_mask=padding_mask,
+        )
+        target_tokens = cp_batch.get_batch("zigzag")["tokens"].chunk(tp, dim=1)[tp_group.rank()]
+        torch.testing.assert_close(
+            prepared.hidden_states.squeeze(-1).transpose(0, 1), target_tokens.float()
+        )
+        if with_mask:
+            torch.testing.assert_close(prepared.padding_mask, target_tokens.remainder(3) == 0)
+            torch.testing.assert_close(padding_mask, original_mask)
+        else:
+            assert prepared.padding_mask is None
+
     def test_hybrid_mtp_delegates_full_recompute_to_nested_stack(self):
         """Hybrid MTP must not add an outer checkpoint around its HybridStack."""
         layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
@@ -3743,11 +3901,14 @@ class TestMultiTokenPredictionHybrid:
         else:
             torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
 
-    def test_forward_uses_mtp_cp_layout_inputs(self, monkeypatch):
+    @pytest.mark.parametrize("with_mask", [False, True])
+    def test_forward_uses_mtp_cp_layout_inputs(self, monkeypatch, with_mask):
         model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
         contiguous_packed_seq_params = object()
         zigzag_packed_seq_params = object()
         zigzag_hidden_states = hidden_states + 10.0
+        padding_mask = torch.tensor([[False, True]]) if with_mask else None
+        zigzag_padding_mask = torch.tensor([[True, False]]) if with_mask else None
         captured = {}
 
         expected_packed_seq_params_by_layout = {
@@ -3787,6 +3948,9 @@ class TestMultiTokenPredictionHybrid:
             assert passed_tp_group is tp_group
             assert passed_tp_cp_group is tp_cp_group
             assert thd_plan is cp_layout_plan
+            if layer_hidden_states.dtype == torch.bool:
+                torch.testing.assert_close(layer_hidden_states, (~padding_mask).transpose(0, 1))
+                return (~zigzag_padding_mask).transpose(0, 1).contiguous()
             assert layer_hidden_states is hidden_states
             return zigzag_hidden_states
 
@@ -3849,6 +4013,7 @@ class TestMultiTokenPredictionHybrid:
             loss_mask=loss_mask,
             packed_seq_params=contiguous_packed_seq_params,
             cp_batch=cp_batch,
+            padding_mask=padding_mask,
         )
 
         assert captured["mtp"]["hidden_states"] is zigzag_hidden_states
@@ -3860,6 +4025,10 @@ class TestMultiTokenPredictionHybrid:
             captured["mtp"]["packed_seq_params_by_layout"] is expected_packed_seq_params_by_layout
         )
         assert captured["mtp"]["cp_layout_plan"] is cp_layout_plan
+        if with_mask:
+            torch.testing.assert_close(captured["mtp"]["padding_mask"], zigzag_padding_mask)
+        else:
+            assert captured["mtp"]["padding_mask"] is None
         assert captured["mtp_loss"]["labels"] is zigzag_labels
         assert captured["mtp_loss"]["loss_mask"] is zigzag_loss_mask
         assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
