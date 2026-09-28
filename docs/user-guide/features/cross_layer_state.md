@@ -7,6 +7,10 @@ The implementation is adapted from the general state and transport contracts
 in [#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224), by Hongxiao Bai.
 It contains no DeepSeek-specific attention, compression, or routing rules.
 
+THD (packed sequences) support is still a work in progress and is not supported
+by this feature's main-branch implementation. The existing layout-plan hooks
+and variable-shape tensor transport do not provide end-to-end THD support.
+
 ## Declare the inputs and outputs of a region
 
 `TensorField` declares a stable key, concrete shape, dtype, layout, gradient
@@ -88,8 +92,9 @@ and breaks the graphed-forward closure cycles.
 The helpers in `megatron.core.context_parallel.shared_state` accept an explicit
 CP process group:
 
-- `redistribute_state` reuses the existing contiguous/zigzag conversion. Packed
-  fields can provide their own `THDCPLayoutPlan` in `thd_plans`.
+- `redistribute_state` reuses the existing contiguous/zigzag conversion. Its
+  `thd_plans` argument is preliminary plumbing for `THDCPLayoutPlan`; packed THD
+  execution remains unsupported.
 - `gather_state` gathers equal contiguous sequence shards and sums all consumer
   gradient contributions back to each owner. Integer fields use ordinary
   collectives. A local slice of the result needs no additional gradient
