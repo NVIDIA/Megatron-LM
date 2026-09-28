@@ -168,8 +168,8 @@ class QuantizedDBuffer:
         device: torch.device | str,
     ) -> "QuantizedDBuffer":
         """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
-        layout = GlobalLayout.build(
-            tensor_shapes, dp_size=mesh.size(), reference=BlockAtomic(_MXFP8_BLOCK_SIZE)
+        layout = GlobalLayout.build_for_row_atomic(
+            tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
         )
         return cls(mesh, placements, layout, device)
 

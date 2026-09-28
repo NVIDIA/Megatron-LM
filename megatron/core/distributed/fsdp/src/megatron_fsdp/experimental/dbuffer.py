@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import PlacementReference, RowAtomic, TensorAtomic, changed_mesh_axis
+from .placement import TensorAtomic, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,10 +124,12 @@ class DBuffer:
         dtype: torch.dtype,
         device: torch.device | str,
         *,
-        reference: PlacementReference = RowAtomic(),
-        tensor_owners: tuple[int, ...] | None = None,
+        block_size: int = 1,
     ) -> "DBuffer":
-        """Build a layout from logical tensor shapes and allocate its local buffer.
+        """Build a RowAtomic or BlockAtomic layout and allocate its local buffer.
+
+        For TensorAtomic, use ``GlobalLayout.build_for_tensor_atomic`` and pass
+        the resulting layout to the DBuffer constructor.
 
         Args:
             mesh: Device mesh whose dimensions correspond to ``placements``.
@@ -135,15 +137,10 @@ class DBuffer:
             tensor_shapes: Logical shapes that the DBuffer manages.
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
-            reference: Shard placement the global layout is planned against.
-            tensor_owners: Per-tensor owner ranks for a ``TensorAtomic`` reference; see
-                ``GlobalLayout.build``.
+            block_size: Number of consecutive rows kept together on one rank.
         """
-        layout = GlobalLayout.build(
-            tuple(torch.Size(shape) for shape in tensor_shapes),
-            dp_size=mesh.size(),
-            reference=reference,
-            tensor_owners=tensor_owners,
+        layout = GlobalLayout.build_for_row_atomic(
+            tensor_shapes, dp_size=mesh.size(), block_size=block_size
         )
         return cls(mesh, placements, layout, dtype, device)
 
@@ -299,8 +296,7 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         *,
-        reference: PlacementReference = RowAtomic(),
-        tensor_owners: tuple[int, ...] | None = None,
+        layout: GlobalLayout | None = None,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -309,9 +305,9 @@ class DBuffer:
                 shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
-            reference: Shard placement the global layout is planned against.
-            tensor_owners: Per-tensor owner ranks for a ``TensorAtomic`` reference; see
-                ``GlobalLayout.build``.
+            layout: Prebuilt layout matching the input tensor shapes and order. If
+                omitted, build a RowAtomic layout. Use the GlobalLayout builders
+                to supply a TensorAtomic or BlockAtomic layout.
 
         Returns:
             A DBuffer whose real local storage matches ``placements``. Ranges
@@ -327,14 +323,12 @@ class DBuffer:
                 raise ValueError("All tensors in a DBuffer must have the same dtype.")
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
-        buffer = cls.empty(
-            mesh=mesh,
-            placements=placements,
-            tensor_shapes=tensor_shapes,
-            dtype=dtype,
-            device=mesh.device_type,
-            reference=reference,
-            tensor_owners=tensor_owners,
+        if layout is None:
+            layout = GlobalLayout.build_for_row_atomic(tensor_shapes, dp_size=mesh.size())
+        elif layout.tensor_shapes != tensor_shapes:
+            raise ValueError("Layout tensor shapes must match the input tensors in order.")
+        buffer = cls(
+            mesh=mesh, placements=placements, layout=layout, dtype=dtype, device=mesh.device_type
         )
         for index, tensor in enumerate(tensors):
             buffer.copy_from(index, tensor)

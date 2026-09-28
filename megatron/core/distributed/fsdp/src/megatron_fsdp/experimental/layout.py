@@ -58,68 +58,10 @@ class GlobalLayout:
     reference: PlacementReference = dataclasses.field(default_factory=RowAtomic)
 
     @classmethod
-    def build(
-        cls,
-        shapes: Iterable[Shape],
-        dp_size: int,
-        *,
-        reference: PlacementReference = RowAtomic(),
-        tensor_owners: tuple[int, ...] | None = None,
+    def build_for_row_atomic(
+        cls, shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1
     ) -> "GlobalLayout":
-        """Plan a global layout for ``shapes`` under the given reference placement.
-
-        Dispatches to ``_build_for_tensor_atomic`` for ``TensorAtomic`` and to
-        ``_build_for_row_aligned`` for ``RowAtomic`` / ``BlockAtomic``.
-
-        Args:
-            shapes: Logical tensor shapes in tensor-id order.
-            dp_size: Data-parallel shard count for this global layout.
-            reference: Shard placement the layout must be compatible with.
-            tensor_owners: Owner rank of each tensor, in tensor-id order. Required for
-                ``TensorAtomic``; owners may appear in any order. ``None`` for
-                ``RowAtomic`` / ``BlockAtomic``.
-
-        Returns:
-            A validated ``GlobalLayout``.
-        """
-        if dp_size <= 0:
-            raise ValueError(f"DP size must be positive, got {dp_size}.")
-        if not isinstance(reference, (RowAtomic, BlockAtomic, TensorAtomic)):
-            raise ValueError(
-                "'reference' type should be chosen from (RowAtomic, BlockAtomic, TensorAtomic), "
-                f"but got {type(reference)}."
-            )
-
-        tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
-        if isinstance(reference, TensorAtomic):
-            if tensor_owners is None:
-                raise ValueError("TensorAtomic reference placement requires 'tensor_owners'.")
-            tensor_owners = tuple(tensor_owners)
-            if len(tensor_owners) != len(tensor_shapes):
-                raise ValueError(
-                    "For TensorAtomic reference placement, the number of tensors "
-                    f"({len(tensor_shapes)}) must equal the number of tensor owners "
-                    f"({len(tensor_owners)})."
-                )
-            return cls._build_for_tensor_atomic(
-                tensor_shapes, dp_size=dp_size, tensor_owners=tensor_owners
-            )
-        if tensor_owners is not None:
-            raise ValueError(
-                "'tensor_owners' is only supported with a TensorAtomic reference placement, "
-                f"got {tensor_owners!r} with {reference!r}."
-            )
-        return cls._build_for_row_aligned(tensor_shapes, dp_size=dp_size, reference=reference)
-
-    @classmethod
-    def _build_for_row_aligned(
-        cls,
-        tensor_shapes: Iterable[Shape],
-        dp_size: int,
-        *,
-        reference: PlacementReference = RowAtomic(),
-    ) -> "GlobalLayout":
-        """Compute global tensor element offsets and padded size.
+        """Build equal-size rank segments for RowAtomic or BlockAtomic placements.
 
         This is a DBuffer-specific reimplementation of
         ``param_and_grad_buffer.build_data_parallel_buffer_index``. It keeps only
@@ -147,10 +89,10 @@ class GlobalLayout:
         padding gaps.
 
         Args:
-            tensor_shapes: Logical tensor shapes in tensor-id order.
+            shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
-            reference: ``RowAtomic`` or ``BlockAtomic``. For ``BlockAtomic`` its
-                ``block_size`` rows are kept together on one rank.
+            block_size: Number of consecutive rows kept on one rank. Defaults to
+                one for RowAtomic; larger values build a BlockAtomic layout.
 
         Returns:
             Global layout with row-aligned tensor offsets and a total size padded
@@ -158,10 +100,12 @@ class GlobalLayout:
             length is a multiple of ``chunk_size``.
         """
 
-        block_size = reference.block_size if isinstance(reference, BlockAtomic) else 1
+        if dp_size <= 0:
+            raise ValueError(f"DP size must be positive, got {dp_size}.")
         if block_size <= 0:
             raise ValueError(f"Block size must be positive, got {block_size}.")
 
+        tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
         chunk_size = 1
         for shape in tensor_shapes:
             row_size = non_leading_numel(shape)
@@ -258,12 +202,12 @@ class GlobalLayout:
             tensor_to_offset=tuple(tensor_to_offset),
             size=size,
             rank_segment_offsets=tuple(segment * rank for rank in range(dp_size + 1)),
-            reference=reference,
+            reference=BlockAtomic(block_size) if block_size > 1 else RowAtomic(),
         )
 
     @classmethod
-    def _build_for_tensor_atomic(
-        cls, tensor_shapes: Iterable[Shape], dp_size: int, *, tensor_owners: tuple[int, ...]
+    def build_for_tensor_atomic(
+        cls, shapes: Iterable[Shape], dp_size: int, *, tensor_owners: Iterable[int]
     ) -> "GlobalLayout":
         """Compute global tensor element offsets from a per-tensor owner-rank list.
 
@@ -283,7 +227,7 @@ class GlobalLayout:
         ```
 
         Args:
-            tensor_shapes: Logical tensor shapes in tensor-id order.
+            shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
             tensor_owners: Owner rank of each tensor, in tensor-id order. Every rank
                 must be an integer in ``[0, dp_size)``.
@@ -292,6 +236,16 @@ class GlobalLayout:
             Global layout whose per-rank segments are gap-free and whose ``size`` is
             the total number of logical elements.
         """
+        if dp_size <= 0:
+            raise ValueError(f"DP size must be positive, got {dp_size}.")
+        tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
+        tensor_owners = tuple(tensor_owners)
+        if len(tensor_owners) != len(tensor_shapes):
+            raise ValueError(
+                "For TensorAtomic reference placement, the number of tensors "
+                f"({len(tensor_shapes)}) must equal the number of tensor owners "
+                f"({len(tensor_owners)})."
+            )
         for rank in tensor_owners:
             if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < dp_size:
                 raise ValueError(

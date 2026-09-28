@@ -163,7 +163,8 @@ class FsdpParameterGroup:
             block_size=32 if self.dtype == torch.uint8 else 1,
             placement_lists=(model_weight_placements, main_grad_placements, main_weight_placements),
         )
-        tensor_owners = None
+        # All buffers share this layout; owner assignments are construction-only.
+        shapes = (parameter.shape for parameter in parameters)
         if isinstance(self.layout_reference, TensorAtomic):
             if parameter_to_owner is None:
                 raise ValueError("TensorAtomic placements require parameter_to_owner.")
@@ -177,16 +178,20 @@ class FsdpParameterGroup:
                 raise ValueError(
                     f"parameter_to_owner is missing entries for parameters {missing!r}."
                 )
-            tensor_owners = tuple(parameter_to_owner[parameter] for parameter in parameters)
-
-        # All weight and gradient buffers share the same packing and padding. Owner
-        # assignments are only needed to build these offsets, not at runtime.
-        layout = GlobalLayout.build(
-            (parameter.shape for parameter in parameters),
-            dp_size=self.mesh.size(),
-            reference=self.layout_reference,
-            tensor_owners=tensor_owners,
-        )
+            layout = GlobalLayout.build_for_tensor_atomic(
+                shapes,
+                dp_size=self.mesh.size(),
+                tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+            )
+        else:
+            block_size = (
+                self.layout_reference.block_size
+                if isinstance(self.layout_reference, BlockAtomic)
+                else 1
+            )
+            layout = GlobalLayout.build_for_row_atomic(
+                shapes, dp_size=self.mesh.size(), block_size=block_size
+            )
         self._initialize_buffers(
             parameters,
             layout,
