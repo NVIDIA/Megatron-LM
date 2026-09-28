@@ -398,15 +398,15 @@ def _roll_tensor_packed_seq(
         return rolled_tensor, rolled_sum
 
     # CP attention requires two equal chunks per rank for every physical document.
-    torch._assert_async(
-        (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all(),
-        "Packed document lengths must be divisible by twice the CP size",
-    )
+    aligned = (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all()
     local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
     local_lengths = torch.diff(local_boundaries)
     # Exchange one boundary vector per neighbour for all nonempty documents.
     # RL packing may repeat the final boundary in fixed-size metadata.
     nonempty = torch.nonzero(local_lengths > 0).flatten()
+    # nonzero already waits for CUDA, so validate on the host before indexing or communication.
+    if not bool(aligned):
+        raise ValueError("Packed document lengths must be divisible by twice the CP size")
     if nonempty.numel() == 0:
         return rolled_tensor, rolled_tensor.sum() if return_sum else None
     local_starts = local_boundaries[:-1].index_select(0, nonempty)

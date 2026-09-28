@@ -3483,19 +3483,24 @@ class TestMultiTokenPrediction:
             rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0], device="cuda")
         )
 
-    def test_roll_tensor_rejects_misaligned_cp_document(self):
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_roll_tensor_rejects_misaligned_cp_document(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+
         class CPGroup:
             def size(self):
                 return 2
 
-        tensor = torch.tensor([7])
-        boundaries = torch.tensor([0, 2], dtype=torch.int32)
+        tensor = torch.tensor([7], device=device)
+        boundaries = torch.tensor([0, 2], dtype=torch.int32, device=device)
         packed = PackedSeqParams(
             cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
         )
 
-        with pytest.raises(RuntimeError, match="divisible by twice the CP size"):
+        with pytest.raises(ValueError, match="divisible by twice the CP size"):
             roll_tensor(tensor, cp_group=CPGroup(), packed_seq_params=packed)
+        torch.testing.assert_close(tensor + 1, tensor.new_tensor([8]))
 
     def test_roll_tensor_packed_cp_gradients(self):
         cp = 4
