@@ -269,7 +269,11 @@ class DummyEngine(DynamicInferenceEngine):
         pass
 
     def add_request(
-        self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
+        self,
+        request_id: int,
+        prompt: str,
+        sampling_params: Optional[SamplingParams] = None,
+        offload_params=None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Dummy add_request."""
 
