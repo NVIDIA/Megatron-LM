@@ -144,7 +144,9 @@ class SwigluFactoryModel(torch.nn.Module):
         return sharded_state_dict
 
 
-class SwigluFactoryModel(torch.nn.Module):
+class PPAgnosticModel(torch.nn.Module):
+    """Like SwigluFactoryModel, but the linear weight is TP-replicated (no sharded axis)."""
+
     def __init__(self, pp_separate_model: bool = False):
         super().__init__()
         self.linear = torch.nn.Linear(5, 64, bias=False)
@@ -358,7 +360,7 @@ def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
-    return SwigluFactoryModel(False)
+    return PPAgnosticModel(False)
 
 
 def initialize_pp_agnostic_gpt_model(pre_process=True, post_process=True, seed=0, **config_kwargs):

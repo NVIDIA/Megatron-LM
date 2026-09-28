@@ -32,6 +32,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
+    PromptPreparationError,
     TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -46,6 +47,9 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    OffloadedRequestPayload,
+    RequestPayloadStager,
+    RequestPromptPreparer,
     Status,
     compute_media_cache_key,
     merge_multimodal_data,
@@ -78,6 +82,24 @@ from megatron.core.utils import (
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
+
+# Engine-owned control field written into ``offload_params`` on MP rank 0 when the
+# RequestPromptPreparer fails, and read back by ``_apply_prompt_preparation_error``
+# on every rank. The HTTP endpoints reject client-supplied ``offload_params`` keys
+# that start with ``_`` (see ``endpoints.common.validate_offload_params``), so
+# this namespace cannot be forged from a request body.
+_PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
+
+# Wire encoding of a None offload frame: msgpack nil is the single byte 0xc0,
+# i.e. ``msgpack.packb(None, use_bin_type=True)``. Spelled as a literal because
+# msgpack is an optional import below. Compared against the frame bytes so a
+# request without offload params is recognised without decoding anything.
+_PACKED_NONE = b"\xc0"
+
+# Frames the coordinator forwards for a SUBMIT_REQUEST: metadata, prompt,
+# media, offload params. The block-hash frame the client sent is consumed there.
+_SUBMIT_REQUEST_FRAMES = 4
+_SUBMIT_REQUEST_METADATA_FIELDS = 4
 
 try:
     from tqdm import tqdm
@@ -160,6 +182,8 @@ class _VisionCacheEntry:
     num_img_embeddings_per_tile: int
     imgs_sizes: Optional[Tensor]
     num_frames: Optional[Tensor]
+    video_frame_indices: Optional[List[List[int]]] = None
+    video_fps: Optional[List[float]] = None
 
 
 def format_mem_bytes(mem_bytes):
@@ -344,6 +368,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
 
+    # Defaults for instances created without __init__ (tests build the engine via __new__).
+    payload_stager: Optional[RequestPayloadStager] = None
+    prompt_preparer: Optional[RequestPromptPreparer] = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -411,6 +439,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self._initialize_disaggregation_state()
         # Initialize engine.
         self.reset()
+
+        # Payload offload: with a stager attached, each completed request's per-token payload
+        # (log probs, MoE routing indices, token ids) is handed to stage() and dropped from the
+        # reply instead of riding the RESTful API. Consumer-owned, so it survives reset().
+        self.payload_stager: Optional[RequestPayloadStager] = None
+        self.prompt_preparer: Optional[RequestPromptPreparer] = None
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
@@ -701,6 +735,14 @@ class DynamicInferenceEngine(AbstractEngine):
             expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
             if num_frames is not None:
                 expansion_kwargs["num_frames"] = num_frames
+                prompt_config = wrapper.multimodal_prompt_config
+                if (
+                    prompt_config is not None
+                    and prompt_config.video_spec.expansion_mode == "temporal_patch"
+                ):
+                    expansion_kwargs["tokenizer"] = self.controller.tokenizer
+                    expansion_kwargs["video_frame_indices"] = request.video_frame_indices
+                    expansion_kwargs["video_fps"] = request.video_fps
             _, mask_list = wrapper.expand_image_tokens(
                 [request.compact_prompt_tokens.tolist()],
                 image_token_id=media_token_id,
@@ -744,6 +786,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_img_embeddings_per_tile=request.num_img_embeddings_per_tile,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            video_frame_indices=request.video_frame_indices,
+            video_fps=request.video_fps,
         )
         self.context.add_vlm_request_data(
             request.request_id, image_embeddings=embeddings, image_token_mask=mask
@@ -780,6 +824,8 @@ class DynamicInferenceEngine(AbstractEngine):
         num_img_embeddings_per_tile: int = 0,
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
+        video_frame_indices: Optional[List[List[int]]] = None,
+        video_fps: Optional[List[float]] = None,
     ) -> None:
         if not cache_key or self.vision_embedding_cache_max_bytes == 0:
             return
@@ -791,6 +837,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            video_frame_indices=video_frame_indices,
+            video_fps=video_fps,
         )
         cache_entry_bytes = self._vision_cache_entry_nbytes(entry)
         if cache_entry_bytes > self.vision_embedding_cache_max_bytes:
@@ -941,6 +989,35 @@ class DynamicInferenceEngine(AbstractEngine):
                                 depth=depth,
                                 cache_key=("mtp", n, depth),
                             )
+
+                        # KV-aware MTP graph: when the MTP KV cache is enabled, ALSO capture a graph
+                        # that includes the draft-attention KV append+attend (the cache-free graph
+                        # above does not), under a distinct ("mtp_kv", n, depth) key that the real
+                        # spec-decode path replays. The EP dummy path keeps the cache-free graph.
+                        # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
+                        # replay overwrites it from gpu_view each step, so only shapes/bounds count.
+                        if context.enable_mtp_kv_cache:
+                            context.mtp_metadata.begin_decode_for_capture(n)
+                            for depth in mtp_warmup_depths:
+                                context._mtp_setup_decode_step()
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
+                                    depth=depth,
+                                    mtp_inference_context=context,
+                                    cache_key=("mtp_kv", n, depth),
+                                )
+                                context.mtp_metadata.advance_decode_step()
+                            context.mtp_metadata.end_forward()
 
                 context.reset()
 
@@ -1475,21 +1552,61 @@ class DynamicInferenceEngine(AbstractEngine):
     def _send_requests_to_coordinator(self, requests: List[DynamicInferenceRequest]) -> None:
         """Send completed or failed flat requests from model-parallel rank 0."""
 
-        if self.local_metadata_ledger_enabled:
-            # Failed requests are sent immediately but remain in the engine until the
-            # next bookkeeping pass. Index only completed requests as they are dropped.
-            for request in requests:
-                if request.status == Status.FAILED:
-                    continue
+        # Failed requests are sent immediately but remain in the engine until the next
+        # bookkeeping pass; only completed requests are indexed and staged.
+        # A reply is stripped only when its payload was staged.
+        serialized = []
+        for request in requests:
+            if request.status == Status.FAILED:
+                serialized.append(request.serialize())
+                continue
+            # One metadata record per completed request serves both the ledger and the stager.
+            finished_metadata = None
+            if self.local_metadata_ledger_enabled or self.payload_stager is not None:
+                finished_metadata = FinishedRequestRecord.from_request(request)
+            if self.local_metadata_ledger_enabled:
                 assert (
                     request.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {request.uid!r}"
-                self.local_metadata_ledger[request.uid] = FinishedRequestRecord.from_request(
-                    request
-                )
-        self.socket_for_receiving_requests.send_multipart(
-            _engine_reply_frames([request.serialize() for request in requests])
+                self.local_metadata_ledger[request.uid] = finished_metadata
+            serialized.append(self._serialize_finished_request(request, finished_metadata))
+        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
+
+    def _serialize_finished_request(
+        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
+    ) -> Dict:
+        """Stage a non-streaming accepted payload before constructing its coordinator reply."""
+        stage_result = None
+        if self.payload_stager is not None and not getattr(
+            request.sampling_params, "streaming", False
+        ):
+            stage_result = self.payload_stager.stage(
+                request.uid,
+                OffloadedRequestPayload.from_request(request),
+                finished_metadata=finished_metadata,
+                offload_params=request.offload_params,
+            )
+        serialized = request.serialize(
+            payload_offloaded=stage_result is not None,
+            payload_stage_metadata=(
+                stage_result.response_metadata if stage_result is not None else None
+            ),
         )
+        if isinstance(request, DynamicVLMInferenceRequest):
+            # Active VLM requests retain these inputs for refresh/cache bookkeeping,
+            # but completion replies must not echo large input-only tensors.
+            for key in (
+                "imgs",
+                "num_tiles",
+                "imgs_sizes",
+                "num_frames",
+                "video_frame_indices",
+                "video_fps",
+                "image_embeddings",
+                "image_token_mask",
+            ):
+                serialized[key] = None
+        return serialized
 
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
@@ -1523,6 +1640,9 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+        # Media registered by _build_vlm_request is never consumed for a request
+        # that fails before admission, so drop it here (a no-op for text-only).
+        self.context.remove_vlm_request_data(request_id)
         finished_request = self._complete_request(request_entry)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
@@ -1753,7 +1873,10 @@ class DynamicInferenceEngine(AbstractEngine):
         num_img_embeddings_per_tile: int = 0,
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
+        video_frame_indices: Optional[List[List[int]]] = None,
+        video_fps: Optional[List[float]] = None,
         media_tokens_preexpanded: bool = False,
+        offload_params: Optional[Dict] = None,
         media_cache_key: Optional[str] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
@@ -1785,8 +1908,12 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W].
                 Dynamic resolution.
             num_frames (Optional[Tensor]): Number of frames per image/video item.
+            video_frame_indices (Optional[List[List[int]]]): Source indices for
+                each sampled video frame.
+            video_fps (Optional[List[float]]): Source FPS for each video item.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
+            offload_params (Optional[Dict]): Opaque metadata forwarded to the payload stager.
             media_cache_key (Optional[str]): Media identity computed by the submitting
                 inference client. Direct callers may omit it and let the engine derive
                 an identity from the resolved media tensors.
@@ -1861,11 +1988,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     imgs_sizes=imgs_sizes,
                     precomputed_block_hashes=precomputed_block_hashes,
                     num_frames=num_frames,
+                    video_frame_indices=video_frame_indices,
+                    video_fps=video_fps,
                     media_tokens_preexpanded=media_tokens_preexpanded,
+                    offload_params=offload_params,
                     media_cache_key=media_cache_key,
                 )
             finally:
                 nvtx_range_pop(nvtx_range)
+            self._apply_prompt_preparation_error(request, offload_params)
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
             # _add_request now rejects the request (oversized prompt, cache
@@ -1882,6 +2013,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 prompt=prompt_str,
                 prompt_tokens=tokens,
                 sampling_params=sampling_params,
+                offload_params=offload_params,
                 block_size_tokens=self.context.block_size_tokens,
                 enable_prefix_caching=self.context.enable_prefix_caching,
                 precomputed_block_hashes=precomputed_block_hashes or [],
@@ -1892,8 +2024,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 # generation its sender hashed under.
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
+            self._apply_prompt_preparation_error(request, offload_params)
 
         return self._add_request(request)
+
+    def _apply_prompt_preparation_error(self, request, offload_params) -> None:
+        """Fail a request whose prompt preparer reported an error on MP rank zero."""
+        error = (
+            offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
+            if isinstance(offload_params, dict)
+            else None
+        )
+        if error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(
+                PromptPreparationError(request.request_id, str(error))
+            )
 
     def _build_vlm_request(
         self,
@@ -1908,7 +2054,10 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor],
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
+        video_frame_indices: Optional[List[List[int]]] = None,
+        video_fps: Optional[List[float]] = None,
         media_tokens_preexpanded: bool = False,
+        offload_params: Optional[Dict] = None,
         media_cache_key: Optional[str] = None,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
@@ -1922,6 +2071,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_img_embeddings_per_tile = cached_vision_entry.num_img_embeddings_per_tile
             imgs_sizes = cached_vision_entry.imgs_sizes
             num_frames = cached_vision_entry.num_frames
+            video_frame_indices = cached_vision_entry.video_frame_indices
+            video_fps = cached_vision_entry.video_fps
         elif num_frames is not None:
             modality = "video"
             missing = [
@@ -1975,6 +2126,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 ("num_tiles", num_tiles),
                 ("imgs_sizes", imgs_sizes),
                 ("num_frames", num_frames),
+                ("video_frame_indices", video_frame_indices),
+                ("video_fps", video_fps),
             ):
                 if value is not None:
                     media_inputs[name] = value
@@ -2023,6 +2176,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                 if num_frames is not None:
                     expansion_kwargs["num_frames"] = num_frames
+                    prompt_config = inference_wrapper.multimodal_prompt_config
+                    if (
+                        prompt_config is not None
+                        and prompt_config.video_spec.expansion_mode == "temporal_patch"
+                    ):
+                        expansion_kwargs["tokenizer"] = self.controller.tokenizer
+                        expansion_kwargs["video_frame_indices"] = video_frame_indices
+                        expansion_kwargs["video_fps"] = video_fps
                 expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
                     token_list, image_token_id=media_token_id, **expansion_kwargs
                 )
@@ -2079,6 +2240,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                     imgs_sizes=imgs_sizes,
                     num_frames=num_frames,
+                    video_frame_indices=video_frame_indices,
+                    video_fps=video_fps,
                 )
 
         self.context.add_vlm_request_data(
@@ -2094,12 +2257,24 @@ class DynamicInferenceEngine(AbstractEngine):
         enable_prefix_caching = self.context.enable_prefix_caching and (
             not request_has_images or bool(media_cache_key)
         )
+        media_tensors = {
+            name: tensor
+            for name, tensor in (
+                ("imgs", imgs),
+                ("imgs_sizes", imgs_sizes),
+                ("num_frames", num_frames),
+                ("num_tiles", num_tiles),
+            )
+            if tensor is not None
+        }
         return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             compact_prompt_tokens=compact_prompt_tokens,
+            media_tensors=media_tensors,
             sampling_params=sampling_params,
+            offload_params=offload_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
             # Recompute the block hashes for multimodal embeddings,
@@ -2113,6 +2288,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_tiles=num_tiles,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            video_frame_indices=video_frame_indices,
+            video_fps=video_fps,
             media_tokens_preexpanded=media_tokens_preexpanded,
             media_cache_key=media_cache_key,
             decoder_seq_length=0,
@@ -2235,8 +2412,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
             num_stop_word_trim = 0
             num_stop_word_prompt_score_trim = 0
+            eos_mid_block_hit = False
             is_prefill = len(request.generated_tokens) == 0
             if request_id != consumed_chunked_prefill_request_id:
+                tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
+                    request, tokens, request_log_probs, top_n_logprobs, req_idx
+                )
+
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -2322,6 +2504,34 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 )
 
+                # Record tokens emitted (and kept) this step so a client can reconstruct
+                # per-step acceptance lengths. Runs AFTER the stop-word check, which may
+                # truncate the last step in place, so subtract the trim to keep the list
+                # summing to `generated_length`. The same reason excludes a consumed chunked
+                # prefill: it samples tokens that are never appended. Spec decoding only.
+                if (
+                    self.num_speculative_tokens > 0
+                    and request_id != consumed_chunked_prefill_request_id
+                    and request_id not in self.stop_word_being_finished_ids
+                ):
+                    emitted = len(tokens) - num_stop_word_trim
+                    if emitted > 0:
+                        request.acceptance_step_lengths.append(emitted)
+                    else:
+                        # A stop sequence can reach back past this step's tokens, removing ones
+                        # earlier entries already counted. Unwind them so the list keeps summing
+                        # to `generated_length`; a client reconstructing acceptance from it
+                        # would otherwise read a length longer than the output.
+                        residual = -emitted
+                        while residual > 0 and request.acceptance_step_lengths:
+                            last = request.acceptance_step_lengths[-1]
+                            if last > residual:
+                                request.acceptance_step_lengths[-1] = last - residual
+                                residual = 0
+                            else:
+                                residual -= last
+                                request.acceptance_step_lengths.pop()
+
                 # Track per-position acceptance statistics for logging.
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
@@ -2367,9 +2577,11 @@ class DynamicInferenceEngine(AbstractEngine):
                             handoff_ssm_slots_by_request.get(request_id)
                         )
                     finished_entry = self.requests[request_id]
-                elif stop_word_hit:
-                    # Stop word detected - mark for removal in next step's bookkeeping
-                    # Don't pop yet; let the next step handle it properly via callback
+                elif stop_word_hit or eos_mid_block_hit:
+                    # Stop word or mid-speculative-block EOS detected - mark for removal in
+                    # next step's bookkeeping. Don't pop yet; let the next step handle it
+                    # properly via callback. Both share this deferred-finish channel
+                    # because the context still has the request active at this point.
                     self.stop_word_finished_request_ids.add(request_id)
                     active_request_ids.append(request_id)
                 else:
@@ -2530,6 +2742,93 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
+
+    def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
+        """Token ids that end generation for this request.
+
+        The CPU-side counterpart of the controller's per-step tensor check, resolved
+        through the controller so every termination site shares one rule. Empty when
+        termination is disabled (`ignore_eos`).
+
+        Args:
+            request (DynamicInferenceRequest): Request to resolve ids for.
+
+        Returns:
+            frozenset: Terminating token ids, empty when termination is disabled.
+        """
+        return self.controller.terminating_token_ids(request.sampling_params.termination_id)
+
+    def _truncate_at_mid_block_eos(
+        self,
+        request: DynamicInferenceRequest,
+        tokens: list[int],
+        request_log_probs: Optional[list],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]],
+        req_idx: int,
+    ) -> Tuple[list, Optional[list], bool]:
+        """Drop everything a speculative step emitted after an EOS.
+
+        An EOS can land on an *accepted* speculative token rather than on the step's
+        last token, which is the only one the controller's termination check sees
+        (`sampled_tokens_cpu` is the target model's own sample at the last accepted
+        position). Accepted tokens are verified target tokens, not rolled-back drafts,
+        so an EOS among them is real and must end the request -- otherwise the rest of
+        the block, plus every later step, is emitted after EOS. This mirrors the
+        stop-word check, which truncates a stop sequence that ends mid-block.
+
+        Trailing log probs / top-n are trimmed to match, keeping them aligned with
+        `tokens`. `top_n_logprobs` is trimmed in place; log probs are returned.
+
+        Args:
+            request (DynamicInferenceRequest): Request the tokens belong to.
+            tokens (list[int]): Tokens emitted by this step, in order.
+            request_log_probs (Optional[list]): This step's log probs, or None.
+            top_n_logprobs (Optional[Dict]): Per-request top-n log probs, or None.
+            req_idx (int): This request's index into `top_n_logprobs`.
+
+        Returns:
+            Tuple[list, Optional[list], bool]: Truncated tokens, truncated log probs,
+            and whether an EOS was found (the caller defers the finish by a step).
+        """
+        eos_idx = self._find_mid_block_eos(request, tokens)
+        if eos_idx is None:
+            return tokens, request_log_probs, False
+
+        num_trim = len(tokens) - (eos_idx + 1)
+        if num_trim > 0:
+            if request_log_probs is not None:
+                request_log_probs = request_log_probs[:-num_trim]
+            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_trim]
+        return tokens[: eos_idx + 1], request_log_probs, True
+
+    def _find_mid_block_eos(
+        self, request: DynamicInferenceRequest, tokens: list[int]
+    ) -> Optional[int]:
+        """Locate an EOS token inside a multi-token speculative step.
+
+        Only meaningful when a step emits more than one token, i.e. under speculative
+        decoding: the controller's termination check inspects just the step's last token,
+        so an EOS on an accepted draft position is otherwise missed and generation runs
+        past it. A single-token step was already checked by the controller, and a request
+        the controller has already finished does not reach here as unfinished.
+
+        Args:
+            request (DynamicInferenceRequest): Request the tokens belong to.
+            tokens (list[int]): Tokens emitted by this step, in order.
+
+        Returns:
+            Optional[int]: Index of the first EOS in `tokens`, or None if there is none.
+        """
+        if len(tokens) <= 1 or request.request_id in self.stop_word_being_finished_ids:
+            return None
+        terminating_ids = self._terminating_token_ids(request)
+        if not terminating_ids:
+            return None
+        for idx, token in enumerate(tokens):
+            if token in terminating_ids:
+                return idx
+        return None
 
     def _check_stop_words_for_request_post_append(
         self,
@@ -3032,9 +3331,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
-                    _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
+                    prefix_skip = self.context._compute_prefix_match(
                         req, remaining_len
-                    )
+                    ).prefix_skip_tokens
                     prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
 
                 computed_budget = min(remaining_len - prefix_skip, token_budget)
@@ -3112,9 +3411,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # admits the request). For >= 2 computed tokens add_request computes
                 # exactly this chunk, which already fits the budget.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
+                    actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
-                    )
+                    ).effective_prefill_chunk_length
                     if self.context.active_token_count + actual_effective > self.context.max_tokens:
                         can_schedule = False
                         break
@@ -3775,9 +4074,8 @@ class DynamicInferenceEngine(AbstractEngine):
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    all_messages.append(
-                        self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
-                    )
+                    message = self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
+                    all_messages.append(self._prepare_submit_request_message(message))
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
@@ -3798,10 +4096,29 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
+                # Drop rather than raise: this loop runs on every MP rank over
+                # the same broadcast list, so a raise here takes the whole
+                # engine down for one version-skewed client, while `continue`
+                # stays collective because every rank skips the same message.
+                if (
+                    len(data) != _SUBMIT_REQUEST_METADATA_FIELDS
+                    or len(message) != _SUBMIT_REQUEST_FRAMES
+                ):
+                    logger.warning(
+                        "dropping malformed SUBMIT_REQUEST: %d metadata fields, %d frames "
+                        "(expected %d and %d)",
+                        len(data),
+                        len(message),
+                        _SUBMIT_REQUEST_METADATA_FIELDS,
+                        _SUBMIT_REQUEST_FRAMES,
+                    )
+                    continue
                 request_id, sampling_params, media_meta = data[1:]
-                # The prompt and the media each ride in their own frame. The
-                # coordinator forwarded both untouched, while the bounded media
-                # descriptor lets a cache hit avoid decoding the payload frame.
+                # The prompt, the media, and the offload params each ride in
+                # their own frame; the engine is their first consumer, so this
+                # is where they finally get decoded. The coordinator forwarded
+                # all three untouched, while the bounded media descriptor in
+                # the metadata lets a cache hit avoid decoding the media frame.
                 nvtx_range = "megatron.inference.multimodal.message_unpack"
                 nvtx_range_push(nvtx_range)
                 try:
@@ -3820,6 +4137,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         multi_modal_data = merge_multimodal_data(media_meta, media_payload)
                     else:
                         multi_modal_data = None
+                    offload_params = msgpack.unpackb(message[3], raw=False)
                     sampling_params = SamplingParams.deserialize(sampling_params)
                 finally:
                     nvtx_range_pop(nvtx_range)
@@ -3863,9 +4181,17 @@ class DynamicInferenceEngine(AbstractEngine):
                         finally:
                             nvtx_range_pop(nvtx_range)
                     if vlm_kwargs:
-                        self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
+                        self.add_request(
+                            request_id,
+                            prompt,
+                            sampling_params,
+                            offload_params=offload_params,
+                            **vlm_kwargs,
+                        )
                     else:
-                        self.add_request(request_id, prompt, sampling_params)
+                        self.add_request(
+                            request_id, prompt, sampling_params, offload_params=offload_params
+                        )
                 except Exception as error:  # pylint: disable=broad-except
                     self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
@@ -3991,6 +4317,50 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._collect_failed_requests()
         return len(all_messages)
+
+    def _prepare_submit_request_message(self, message: List[bytes]) -> List[bytes]:
+        """Resolve a prompt once on MP rank zero before broadcasting the request.
+
+        The preparer only has work when the client sent offload params, so a
+        request whose offload frame is None passes through untouched without
+        any frame being decoded. When it runs, only the prompt frame and the
+        offload frame are rewritten; the metadata frame is never repacked.
+        """
+        if (
+            self.prompt_preparer is None
+            or len(message) < _SUBMIT_REQUEST_FRAMES
+            or message[3] == _PACKED_NONE
+        ):
+            return message
+        data = msgpack.unpackb(message[0], raw=False)
+        if data[0] != Headers.SUBMIT_REQUEST.value or len(data) != _SUBMIT_REQUEST_METADATA_FIELDS:
+            return message
+        request_id = data[1]
+        prompt = msgpack.unpackb(message[1], raw=False)
+        offload_params = msgpack.unpackb(message[3], raw=False)
+
+        def _pack(prompt, offload_params):
+            if isinstance(prompt, torch.Tensor):
+                prompt = prompt.tolist()
+            return [
+                message[0],
+                msgpack.packb(prompt, use_bin_type=True),
+                message[2],
+                msgpack.packb(offload_params, use_bin_type=True),
+                *message[4:],
+            ]
+
+        try:
+            # Packing stays inside the try: an unserializable preparer result must
+            # fail this request, not exit rank 0 and hang the other MP ranks.
+            result = self.prompt_preparer.prepare_prompt(prompt, offload_params=offload_params)
+            return _pack(result.prompt, result.offload_params)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.exception("prompt preparation failed for request %s", request_id)
+            # The original prompt and params came off the wire, so they pack safely.
+            failed_params = dict(offload_params) if isinstance(offload_params, dict) else {}
+            failed_params[_PROMPT_PREPARATION_ERROR_FIELD] = f"{type(error).__name__}: {error}"
+            return _pack(prompt, failed_params)
 
     async def shutdown(self):
         """Shut down the engine and clean up ZMQ resources.

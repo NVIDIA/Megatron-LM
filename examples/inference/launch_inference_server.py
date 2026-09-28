@@ -30,6 +30,7 @@ from megatron.inference.utils import (
 )
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 
 def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
@@ -52,20 +53,26 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
     group.add_argument(
         "--default-temperature",
         type=float,
-        default=1.0,
-        help="Default temperature sampling value when a request omits temperature.",
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     group.add_argument(
         "--default-top-p",
         type=float,
-        default=1.0,
-        help="Default top-p sampling value when a request omits top_p.",
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     group.add_argument(
         "--default-top-k",
         type=int,
-        default=0,
-        help="Default top-k sampling value when a request omits top_k.",
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
     )
     group.add_argument(
         "--eval-mode",
@@ -99,10 +106,11 @@ async def _serve(args, model, tokenizer, inference_config):
 
 
 def main():
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()

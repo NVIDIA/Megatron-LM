@@ -159,6 +159,27 @@ def test_nonzero_baseline_rank_runs_without_recording(project, tmp_path):
 
 
 @pytest.mark.parametrize("rank", (0, 3))
+def test_baseline_can_start_spawned_checkpoint_workers(project, tmp_path, rank):
+    (project / "tests/test_app.py").write_text(textwrap.dedent(f"""\
+            import multiprocessing
+            import sys
+            from pathlib import Path
+
+            def test_spawned_checkpoint_worker():
+                script_dir = Path({str(WRAPPER_PATH.parent)!r}).resolve()
+                assert all(Path(entry or '.').resolve() != script_dir for entry in sys.path)
+                assert 'tests.unit_tests' not in sys.modules
+                with multiprocessing.get_context('spawn').Manager() as manager:
+                    queue = manager.Queue()
+                    queue.put('checkpoint-worker-ready')
+                    assert queue.get(timeout=5) == 'checkpoint-worker-ready'
+            """))
+    result = _invoke(project, tmp_path / "spawn-cache", "baseline", rank=rank)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
+@pytest.mark.parametrize("rank", (0, 3))
 def test_zero_selection_uses_private_copy_and_keeps_cache_readonly(project, cache, rank):
     phase = cache / "prod"
     before = _snapshot(phase)
