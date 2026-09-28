@@ -144,7 +144,7 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
     if torch.distributed.is_initialized():
         config_obj = [None]
 
-        if get_rank_safe() == 0:
+        if safe_get_rank() == 0:
             try:
                 if MultiStorageClientFeature.is_enabled():
                     msc = MultiStorageClientFeature.import_package()
