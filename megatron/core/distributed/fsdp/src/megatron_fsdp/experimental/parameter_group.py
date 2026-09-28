@@ -116,9 +116,6 @@ class FsdpParameterGroup:
     # The single Shard placement that every DBuffer in this group plans its
     # GlobalLayout against.
     layout_reference: PlacementReference
-    # Owner rank of each unique parameter (in fsdp_parameters order) for TensorAtomic
-    # layouts; None otherwise.
-    tensor_owners: tuple[int, ...] | None
 
     def __init__(
         self,
@@ -131,14 +128,14 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
-        tensor_owners: tuple[int, ...] | None = None,
+        parameter_to_owner: dict[nn.Parameter, int] | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
-            fqn_to_parameter: Root-module-relative FQNs and their parameters. For
-                ``TensorAtomic`` placements the caller must have ordered it by owner rank.
+            fqn_to_parameter: Root-module-relative FQNs and their parameters, in logical
+                tensor order. Tied parameters count once.
             mesh: Parent device mesh containing the data-parallel axes.
             model_weight_placements: Compute-weight buffer placements.
             main_grad_placements: Main-gradient buffer placements.
@@ -148,28 +145,51 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
-            tensor_owners: Owner rank of each unique parameter (tied parameters count
-                once), in ``fqn_to_parameter`` order. Required with ``TensorAtomic``
-                placements and must be ``None`` otherwise.
+            parameter_to_owner: Construction-time mapping from original parameters to
+                owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
+                entries for other parameters and non-TensorAtomic groups are ignored.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
         )
-        if tensor_owners is not None:
-            tensor_owners = tuple(tensor_owners)
-            if len(tensor_owners) != len(parameter_to_fqns):
-                raise ValueError(
-                    f"Expected one owner per unique parameter ({len(parameter_to_fqns)}), "
-                    f"got {len(tensor_owners)} tensor_owners."
-                )
-        self.tensor_owners = tensor_owners
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         parameters = tuple(parameter_to_fqns)
 
+        self.layout_reference = self._resolve_layout_reference(
+            self.mesh,
+            # MXFP8 groups keep 32-row blocks on one rank; every other dtype packs rows.
+            block_size=32 if self.dtype == torch.uint8 else 1,
+            placement_lists=(model_weight_placements, main_grad_placements, main_weight_placements),
+        )
+        tensor_owners = None
+        if isinstance(self.layout_reference, TensorAtomic):
+            if parameter_to_owner is None:
+                raise ValueError("TensorAtomic placements require parameter_to_owner.")
+            missing = [
+                fqn
+                for parameter, fqns in parameter_to_fqns.items()
+                if parameter not in parameter_to_owner
+                for fqn in fqns
+            ]
+            if missing:
+                raise ValueError(
+                    f"parameter_to_owner is missing entries for parameters {missing!r}."
+                )
+            tensor_owners = tuple(parameter_to_owner[parameter] for parameter in parameters)
+
+        # All weight and gradient buffers share the same packing and padding. Owner
+        # assignments are only needed to build these offsets, not at runtime.
+        layout = GlobalLayout.build(
+            (parameter.shape for parameter in parameters),
+            dp_size=self.mesh.size(),
+            reference=self.layout_reference,
+            tensor_owners=tensor_owners,
+        )
         self._initialize_buffers(
             parameters,
+            layout,
             model_weight_placements,
             main_grad_placements,
             main_weight_placements,
@@ -215,6 +235,7 @@ class FsdpParameterGroup:
     def _initialize_buffers(
         self,
         parameters: tuple[nn.Parameter, ...],
+        layout: GlobalLayout,
         model_weight_placements: tuple[Placement, ...],
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
@@ -225,13 +246,6 @@ class FsdpParameterGroup:
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
-        self.layout_reference = self._resolve_layout_reference(
-            self.mesh,
-            self.tensor_owners is not None,
-            # MXFP8 groups keep 32-row blocks on one rank; every other dtype packs rows.
-            block_size=32 if self.dtype == torch.uint8 else 1,
-            placement_lists=(model_weight_placements, main_grad_placements, main_weight_placements),
-        )
         # TensorAtomic produces non-uniform per-rank shards, but the NCCL
         # symmetric-memory all-gather / reduce-scatter kernels only support the
         # equal-size *_into_tensor collectives.
@@ -241,13 +255,6 @@ class FsdpParameterGroup:
                 "TensorAtomic is not supported."
             )
 
-        # All weight and gradient buffers share the same packing and padding.
-        layout = GlobalLayout.build(
-            (parameter.shape for parameter in parameters),
-            dp_size=self.mesh.size(),
-            reference=self.layout_reference,
-            tensor_owners=self.tensor_owners,
-        )
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
         self.main_weight = DBuffer(
@@ -338,11 +345,7 @@ class FsdpParameterGroup:
 
     @staticmethod
     def _resolve_layout_reference(
-        mesh: DeviceMesh,
-        has_tensor_owners: bool,
-        *,
-        block_size: int,
-        placement_lists: Iterable[tuple[Placement, ...]],
+        mesh: DeviceMesh, *, block_size: int, placement_lists: Iterable[tuple[Placement, ...]]
     ) -> PlacementReference:
         """Pick the single layout reference shared by every DBuffer in a parameter group.
 
@@ -352,7 +355,6 @@ class FsdpParameterGroup:
 
         Args:
             mesh: Data-parallel device mesh the buffers are distributed over.
-            has_tensor_owners: Whether the caller supplied per-tensor owner ranks.
             block_size: Rows kept together on one rank.
             placement_lists: The per-buffer placement tuples (model weight, main
                 grad, main weight).
@@ -364,12 +366,8 @@ class FsdpParameterGroup:
         shards = [p for placements in placement_lists for p in placements if isinstance(p, Shard)]
         tensor_atomics = [p for p in shards if isinstance(p, TensorAtomic)]
         if not tensor_atomics:
-            if has_tensor_owners:
-                raise ValueError("tensor_owners is only supported with TensorAtomic placements.")
             return BlockAtomic(block_size) if block_size > 1 else RowAtomic()
 
-        if not has_tensor_owners:
-            raise ValueError("TensorAtomic placements require tensor_owners.")
         if mesh.ndim != 1:
             raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
         if len(tensor_atomics) != len(shards):

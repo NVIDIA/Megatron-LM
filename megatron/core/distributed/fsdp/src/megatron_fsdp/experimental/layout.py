@@ -76,8 +76,8 @@ class GlobalLayout:
             dp_size: Data-parallel shard count for this global layout.
             reference: Shard placement the layout must be compatible with.
             tensor_owners: Owner rank of each tensor, in tensor-id order. Required for
-            ``TensorAtomic`` and must be non-decreasing. ``None`` for
-            ``RowAtomic`` / ``BlockAtomic``.
+                ``TensorAtomic``; owners may appear in any order. ``None`` for
+                ``RowAtomic`` / ``BlockAtomic``.
 
         Returns:
             A validated ``GlobalLayout``.
@@ -267,9 +267,9 @@ class GlobalLayout:
     ) -> "GlobalLayout":
         """Compute global tensor element offsets from a per-tensor owner-rank list.
 
-        Tensors are expected to arrive already grouped by owner rank in ascending
-        rank order, so the layout is simply the tensors packed back to back.
-        Rank ``r``'s segment is the contiguous subrange of the list of tensors owned by ``r``.
+        Pack tensors by ascending owner rank, preserving tensor-id order within each
+        rank. Logical tensor IDs and shapes stay in their original order; only their
+        offsets reflect the packing. Rank ``r``'s segment contains exactly its tensors.
         Tensors are never split across ranks. Because segments are packed tightly, there is
         no padding: ``size`` equals the sum of all tensor numels. Segment lengths are
         in general different per rank.
@@ -286,33 +286,35 @@ class GlobalLayout:
             tensor_shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
             tensor_owners: Owner rank of each tensor, in tensor-id order. Every rank
-                must be in ``[0, dp_size)`` and the sequence must be non-decreasing.
+                must be an integer in ``[0, dp_size)``.
 
         Returns:
             Global layout whose per-rank segments are gap-free and whose ``size`` is
             the total number of logical elements.
         """
-        out_of_range = [rank for rank in tensor_owners if not 0 <= rank < dp_size]
-        if out_of_range:
-            raise ValueError(
-                "In planning a layout for TensorAtomic placement, the owner of each tensor "
-                f"must be within the range of data parallel size [0, {dp_size}), "
-                f"but got {out_of_range}."
-            )
-        if any(a > b for a, b in zip(tensor_owners, tensor_owners[1:])):
-            raise ValueError(f"'tensor_owners' must be non-decreasing, got {tensor_owners}.")
+        for rank in tensor_owners:
+            if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < dp_size:
+                raise ValueError(
+                    "In planning a layout for TensorAtomic placement, the owner of each tensor "
+                    f"must be an integer within the range of data parallel size [0, {dp_size}), "
+                    f"but got {rank!r}."
+                )
 
         numels = [shape.numel() for shape in tensor_shapes]
-        tensor_to_offset = tuple(itertools.accumulate(numels, initial=0))[:-1]
 
         per_rank = [0] * dp_size
         for numel, owner in zip(numels, tensor_owners):
             per_rank[owner] += numel
         rank_segment_offsets = tuple(itertools.accumulate(per_rank, initial=0))
+        next_offsets = list(rank_segment_offsets[:-1])
+        tensor_to_offset = []
+        for numel, owner in zip(numels, tensor_owners):
+            tensor_to_offset.append(next_offsets[owner])
+            next_offsets[owner] += numel
 
         return cls(
             tensor_shapes=tensor_shapes,
-            tensor_to_offset=tensor_to_offset,
+            tensor_to_offset=tuple(tensor_to_offset),
             size=sum(numels),
             rank_segment_offsets=rank_segment_offsets,
             reference=TensorAtomic(),

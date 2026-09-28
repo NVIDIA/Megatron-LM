@@ -78,6 +78,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    parameter_to_owner: dict[nn.Parameter, int] | None = None,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -92,6 +93,11 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        parameter_to_owner: Construction-time owner assignments for TensorAtomic
+            parameters, keyed by the original parameters before sharding. Owners are
+            ranks in each parameter group's 1-D data-parallel mesh and must agree across
+            that mesh. Every TensorAtomic parameter needs an entry; other entries are
+            ignored. Tensors are packed by owner without changing logical parameter order.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -104,6 +110,7 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        parameter_to_owner=parameter_to_owner,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
@@ -124,7 +131,6 @@ def fully_shard(
     grad_divisor: int = 1,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
-    param_to_owner: dict[nn.Parameter, int] | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -153,10 +159,6 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
-        param_to_owner: Owner rank of every parameter this call manages, required when
-            ``placements`` uses ``TensorAtomic`` and must be omitted otherwise. Parameters
-            are reordered by owner rank when parameter groups are built, so each rank's
-            tensors form one contiguous segment.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -188,7 +190,6 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
-            param_to_owner=param_to_owner,
         )
     except Exception:
         module.__class__ = original_cls
