@@ -13,6 +13,8 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.imag
     _decode_sampled_video_frames,
     _load_frame_sequence_manifest,
     _video_sample_indices,
+    dynamic_res_preprocess,
+    preprocess_image,
     preprocess_image_bytes_list,
     preprocess_video_bytes_list,
 )
@@ -35,7 +37,9 @@ class _FakeFrame:
 class _FakeContainer:
     def __init__(self, frames, declared_frames):
         self._frames = frames
-        self.streams = SimpleNamespace(video=[SimpleNamespace(frames=declared_frames)])
+        self.streams = SimpleNamespace(
+            video=[SimpleNamespace(frames=declared_frames, average_rate=30.0)]
+        )
 
     def __enter__(self):
         return self
@@ -60,13 +64,21 @@ def test_video_sample_indices_preserve_temporal_rounding():
     assert _video_sample_indices(3, config) == [0, 2]
 
 
+def test_video_sample_indices_repeat_short_clip_to_temporal_patch():
+    config = SimpleNamespace(num_frames=64, temporal_patch_size=2)
+
+    assert _video_sample_indices(1, config) == [0, 0]
+
+
 def test_declared_frame_count_converts_only_sampled_frames(monkeypatch):
     frames = _install_fake_av(monkeypatch, total_frames=10, declared_frames=10)
     config = SimpleNamespace(num_frames=3, temporal_patch_size=1)
 
-    sampled = _decode_sampled_video_frames(b"video", config)
+    sampled, frame_indices, fps = _decode_sampled_video_frames(b"video", config)
 
     assert sampled == [0, 4, 9]
+    assert frame_indices == [0, 4, 9]
+    assert fps == 30.0
     assert sum(frame.conversions for frame in frames) == 3
 
 
@@ -74,9 +86,11 @@ def test_unindexed_stream_counts_then_converts_only_sampled_frames(monkeypatch):
     frames = _install_fake_av(monkeypatch, total_frames=10, declared_frames=0)
     config = SimpleNamespace(num_frames=3, temporal_patch_size=1)
 
-    sampled = _decode_sampled_video_frames(b"video", config)
+    sampled, frame_indices, fps = _decode_sampled_video_frames(b"video", config)
 
     assert sampled == [0, 4, 9]
+    assert frame_indices == [0, 4, 9]
+    assert fps == 30.0
     assert sum(frame.conversions for frame in frames) == 3
 
 
@@ -89,11 +103,18 @@ def test_frame_sequence_manifest_loads_rgb_copies(tmp_path):
         frame_paths.append(str(frame_path))
 
     magic = b"frames:"
-    payload = magic + json.dumps({"frame_paths": frame_paths}).encode()
-    frames = _load_frame_sequence_manifest(payload, magic)
+    payload = (
+        magic
+        + json.dumps(
+            {"frame_paths": frame_paths, "metadata": {"frames_indices": [3, 7], "fps": 29.97}}
+        ).encode()
+    )
+    frames, frame_indices, fps = _load_frame_sequence_manifest(payload, magic)
 
     assert [frame.mode for frame in frames] == ["RGB", "RGB"]
     assert [frame.size for frame in frames] == [(2, 2), (2, 2)]
+    assert frame_indices == [3, 7]
+    assert fps == 29.97
 
 
 @pytest.mark.parametrize(
@@ -131,6 +152,96 @@ def test_image_bytes_list_preserves_per_image_aspect_ratios():
     assert result["imgs_sizes"].tolist() == [[2, 4], [4, 2]]
 
 
+def test_round_plus_half_matches_observed_hf_grid_contract():
+    image_module = pytest.importorskip("PIL.Image")
+    image = image_module.new("RGB", (368, 656))
+
+    old_megatron = dynamic_res_preprocess(
+        image,
+        min_patches=1024,
+        max_patches=13312,
+        res_step=16,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        rounding_mode="ceil",
+    )
+    hf_compatible = dynamic_res_preprocess(
+        image,
+        min_patches=1024,
+        max_patches=13312,
+        res_step=16,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        rounding_mode="round_plus_half",
+    )
+
+    assert old_megatron.size == (384, 704)
+    assert hf_compatible.size == (416, 704)
+
+
+def test_torch_bicubic_antialias_resize_mode_uses_tensor_resize(monkeypatch):
+    image_module = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")
+    import torch.nn.functional as functional
+
+    interpolate = functional.interpolate
+    calls = []
+
+    def record_interpolate(input_tensor, **kwargs):
+        calls.append(kwargs)
+        return interpolate(input_tensor, **kwargs)
+
+    monkeypatch.setattr(functional, "interpolate", record_interpolate)
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        dynamic_resolution_min_patches=4,
+        dynamic_resolution_max_patches=4,
+        dynamic_resolution_resize_mode="torch_bicubic_antialias",
+        pixel_mean=[0.0, 0.0, 0.0],
+        pixel_std=[1.0, 1.0, 1.0],
+    )
+
+    images, imgs_sizes = preprocess_image(image_module.new("RGB", (2, 2)), config)
+
+    assert calls == [{"size": (4, 4), "mode": "bicubic", "align_corners": False, "antialias": True}]
+    assert images.shape == (1, 4, 12)
+    assert imgs_sizes.tolist() == [[4, 4]]
+
+
+def test_image_list_applies_model_length_budget_per_request(monkeypatch, caplog):
+    observed_budgets = []
+
+    def fake_preprocess(_payload, config, target_hw=None, device=None):
+        del target_hw, device
+        observed_budgets.append(config.dynamic_resolution_max_patches)
+        return torch.zeros(1, 1, 3), torch.ones(1, 2, dtype=torch.int32)
+
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        image_preprocessing,
+    )
+
+    image_preprocessing._warn_multi_image_patch_budget.cache_clear()
+    monkeypatch.setattr(image_preprocessing, "preprocess_image_bytes", fake_preprocess)
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        dynamic_resolution_min_patches=2,
+        dynamic_resolution_max_patches=32,
+        dynamic_resolution_model_length=5,
+    )
+
+    with caplog.at_level("WARNING"):
+        preprocess_image_bytes_list([b"first", b"second", b"third"], config)
+        preprocess_image_bytes_list([b"first", b"second", b"third"], config)
+
+    assert observed_budgets == [6, 6, 6, 6, 6, 6]
+    assert caplog.text.count("may use more patches per image when given more images") == 1
+    image_preprocessing._warn_multi_image_patch_budget.cache_clear()
+
+
 def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     image_module = pytest.importorskip("PIL.Image")
     frames = [
@@ -144,7 +255,9 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     )
 
     monkeypatch.setattr(
-        image_preprocessing, "_load_frame_sequence_manifest", lambda _payload, _magic: frames
+        image_preprocessing,
+        "_load_frame_sequence_manifest",
+        lambda _payload, _magic: (frames, [0, 1], 1.0),
     )
     monkeypatch.setattr(
         image_preprocessing,
@@ -170,6 +283,8 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     assert result["imgs"].shape == (1, 2, 2)
     assert result["imgs_sizes"].tolist() == [[4, 6], [4, 6]]
     assert result["num_frames"].tolist() == [2]
+    assert result["video_frame_indices"] == [[0, 1]]
+    assert result["video_fps"] == [1.0]
 
 
 def test_video_manifest_rejects_wrong_frame_count(monkeypatch):
@@ -181,7 +296,7 @@ def test_video_manifest_rejects_wrong_frame_count(monkeypatch):
     monkeypatch.setattr(
         image_preprocessing,
         "_load_frame_sequence_manifest",
-        lambda _payload, _magic: [image_module.new("RGB", (2, 2))],
+        lambda _payload, _magic: ([image_module.new("RGB", (2, 2))], [0], 1.0),
     )
     config = VideoProcessingConfig(
         image_config=ImageProcessingConfig(patch_dim=2, dynamic_resolution=True),

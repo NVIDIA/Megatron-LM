@@ -4,6 +4,7 @@
 
 import gc
 import logging
+import os
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -12,6 +13,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import (
     get_pg_rank,
     get_tensor_model_parallel_group_if_none,
@@ -23,6 +25,60 @@ if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def set_attention_backend(config: 'TransformerConfig') -> None:
+    """Configure Transformer Engine attention backends from a transformer config."""
+    attention_backend = config.attention_backend
+    if isinstance(attention_backend, str):
+        try:
+            attention_backend = AttnBackend[attention_backend]
+        except KeyError as exc:
+            choices = ", ".join(backend.name for backend in AttnBackend)
+            raise ValueError(
+                f"Unknown attention backend {attention_backend!r}; expected one of: {choices}"
+            ) from exc
+
+    if config.batch_invariant_mode:
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            assert_te_supports_batch_invariant_attention,
+        )
+
+        assert_te_supports_batch_invariant_attention()
+
+    def check_and_set_env_variable(
+        env_variable_name: str, expected_value: int, attn_type: AttnBackend
+    ) -> None:
+        current_value = os.getenv(env_variable_name)
+        assert current_value is None or current_value == str(expected_value), (
+            f'{env_variable_name} is set to {current_value}, but attention_backend='
+            f'{attn_type.name!r} and flash_attention_version='
+            f'{config.flash_attention_version!r} require {expected_value}. Transformer Engine '
+            'attention backend and FlashAttention version controls are process-wide; all models '
+            'constructed in one process must use compatible settings. Unset the NVTE attention '
+            'environment variables before model construction to let the configs set them.'
+        )
+        os.environ[env_variable_name] = str(expected_value)
+
+    backend_flags = {
+        AttnBackend.local: (0, 0, 0),
+        AttnBackend.flash: (1, 0, 0),
+        AttnBackend.fused: (0, 1, 0),
+        AttnBackend.unfused: (0, 0, 1),
+        AttnBackend.auto: (1, 1, 1),
+    }
+    flash, fused, unfused = backend_flags[attention_backend]
+    check_and_set_env_variable('NVTE_FLASH_ATTN', flash, attention_backend)
+    check_and_set_env_variable('NVTE_FUSED_ATTN', fused, attention_backend)
+    check_and_set_env_variable('NVTE_UNFUSED_ATTN', unfused, attention_backend)
+
+    if config.flash_attention_version is not None:
+        for version in (2, 3, 4):
+            check_and_set_env_variable(
+                f'NVTE_FLASH_ATTN_V{version}',
+                int(version == config.flash_attention_version),
+                attention_backend,
+            )
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):

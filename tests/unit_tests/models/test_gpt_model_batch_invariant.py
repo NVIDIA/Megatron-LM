@@ -220,9 +220,11 @@ class TestGPTModelBatchInvariant:
                 num_cuda_graphs=None,
                 materialize_only_last_token_logits=False,
                 use_cuda_graphs_for_non_decode_steps=False,
+                use_flashinfer_fused_rope=None,
                 unified_memory_level=0,
             ),
         )
+        assert not ctx.use_flashinfer_fused_rope
 
         wrapper = GPTInferenceWrapper(inference_model, ctx)
         tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
