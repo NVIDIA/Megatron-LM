@@ -151,7 +151,7 @@ class MegatronCheckpointSaverBase:
             sys.exit(1)
 
         # Temporary args/config duplication during the training-loop refactor:
-        # profiling is config-owned; unmigrated consumers still use legacy args.
+        # migrated settings use config; remaining settings still use legacy args.
         set_run_config(inference_cfg_container_from_args(self.margs, build_model_config=False))
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
 

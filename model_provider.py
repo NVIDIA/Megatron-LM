@@ -35,7 +35,7 @@ def model_provider(
     """
     args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
-    # profiling is config-owned; unmigrated consumers still use legacy args.
+    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
 
     if cfg.profiling.record_memory_history:

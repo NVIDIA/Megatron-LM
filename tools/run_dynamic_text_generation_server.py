@@ -163,7 +163,7 @@ def parse_args_and_detect_vlm(
 
     args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
     # Temporary args/config duplication during the training-loop refactor:
-    # profiling is config-owned; unmigrated consumers still use legacy args.
+    # migrated settings use config; remaining settings still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
@@ -445,9 +445,9 @@ if __name__ == "__main__":
         # nvtx_range_push labels (bookkeeping, Decode, _ep_establish_consensus,
         # etc.) are no-ops and the inter-step gap is unattributable in nsys.
         # Temporary args/config duplication during the training-loop refactor:
-        # profiling is config-owned; unmigrated consumers still use legacy args.
+        # migrated settings use config; remaining settings still use legacy args.
         cfg = get_run_config()
-        if cfg.profiling.use_nsys_profiler and cfg.profiling.nvtx_ranges:
+        if (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler) and cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(True)
 
         # Already requested via --return-log-probs default above; keep this

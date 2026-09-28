@@ -10,6 +10,7 @@ import types
 import typing
 import warnings
 from argparse import ArgumentParser, Namespace, _ArgumentGroup
+from copy import deepcopy
 from dataclasses import Field, fields
 from typing import Any, Callable, Optional
 
@@ -622,13 +623,14 @@ def hybrid_config_from_args(
 
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
-    from copy import deepcopy
-
     # Legacy args retain these fields temporarily during the training-loop refactor;
     # ProfilingConfig is authoritative after construction.
     kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    # The legacy CLI uses --profile as a master switch and selects one backend.
     if hasattr(args, "profile"):
-        kwargs["use_nsys_profiler"] = args.profile
+        use_pytorch = kwargs.get("use_pytorch_profiler", False)
+        kwargs["use_nsys_profiler"] = args.profile and not use_pytorch
+        kwargs["use_pytorch_profiler"] = args.profile and use_pytorch
     return ProfilingConfig(**deepcopy(kwargs))
 
 

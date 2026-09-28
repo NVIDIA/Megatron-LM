@@ -3642,7 +3642,7 @@ def training_log(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
-    # profiling is config-owned; unmigrated consumers still use legacy args.
+    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -4397,7 +4397,7 @@ def post_training_step_callbacks(
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
-    # profiling is config-owned; unmigrated consumers still use legacy args.
+    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
@@ -4431,7 +4431,7 @@ def post_training_step_callbacks(
 
     # Profiling.
     if (
-        cfg.profiling.use_nsys_profiler
+        (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
         and iteration == cfg.profiling.profile_step_end
         and (len(cfg.profiling.profile_ranks) == 0 or
              torch.distributed.get_rank() in cfg.profiling.profile_ranks)
@@ -4610,7 +4610,7 @@ def train(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
-    # profiling is config-owned; unmigrated consumers still use legacy args.
+    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
 
@@ -4921,10 +4921,9 @@ def train(
     prof = None
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
-        cfg.profiling.use_nsys_profiler
+        cfg.profiling.use_pytorch_profiler
         and (len(cfg.profiling.profile_ranks) == 0 or
              torch.distributed.get_rank() in cfg.profiling.profile_ranks)
-        and cfg.profiling.use_pytorch_profiler
     ):
         cfg.profiling.validate()
         if cfg.profiling.pytorch_profiler_collect_chakra:
@@ -5008,7 +5007,7 @@ def train(
         # trace instead of accreting into a run-long one. Must be the first thing in
         # the pass so everything below nests under the current interval root.
         _maybe_reroot_otel_interval()
-        if (cfg.profiling.use_nsys_profiler
+        if ((cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
             and (len(cfg.profiling.profile_ranks) == 0 or
                  torch.distributed.get_rank() in cfg.profiling.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.

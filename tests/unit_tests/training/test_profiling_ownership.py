@@ -106,15 +106,39 @@ def inline_profiler(monkeypatch, run_config):
     return start
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_cli_and_native_settings_match_without_aliasing(enabled):
-    args, config = cli_config(*(["--profile"] if enabled else []), "--profile-ranks", "1", "3")
-    native = ProfilingConfig(use_nsys_profiler=enabled, profile_ranks=[1, 3])
+@pytest.mark.parametrize(
+    "profile,pytorch", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_cli_and_native_settings_match_without_aliasing(profile, pytorch):
+    options = (["--profile"] if profile else []) + (["--use-pytorch-profiler"] if pytorch else [])
+    args, config = cli_config(*options, "--profile-ranks", "1", "3")
+    native = ProfilingConfig(
+        use_nsys_profiler=profile and not pytorch,
+        use_pytorch_profiler=profile and pytorch,
+        profile_ranks=[1, 3],
+    )
     assert asdict(config) == asdict(native)
     args.profile_ranks.append(7)
-    args.profile = not enabled
+    args.profile = not profile
+    args.use_pytorch_profiler = not pytorch
     assert config.profile_ranks == [1, 3]
-    assert config.use_nsys_profiler is enabled
+    assert config.use_nsys_profiler is (profile and not pytorch)
+    assert config.use_pytorch_profiler is (profile and pytorch)
+
+
+def test_profiler_backends_are_mutually_exclusive(inline_profiler):
+    config = ProfilingConfig(use_nsys_profiler=True, use_pytorch_profiler=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        config.validate()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        inline_profiler(config)
+
+
+@pytest.mark.parametrize("backend", ["use_nsys_profiler", "use_pytorch_profiler"])
+def test_canonical_backend_without_legacy_profile_alias(backend):
+    config = profiling_config_from_args(SimpleNamespace(**{backend: True}))
+    assert getattr(config, backend) is True
+    assert config.use_nsys_profiler is not config.use_pytorch_profiler
 
 
 def test_legacy_inference_owner_does_not_construct_unused_training_configs():
@@ -142,10 +166,7 @@ def test_inference_factory_keeps_automatic_model_construction(monkeypatch, expli
 def test_active_pytorch_window_validation(native, inline_profiler):
     if native:
         config = ProfilingConfig(
-            use_nsys_profiler=True,
-            use_pytorch_profiler=True,
-            profile_step_start=5,
-            profile_step_end=5,
+            use_pytorch_profiler=True, profile_step_start=5, profile_step_end=5
         )
     else:
         _, config = cli_config(
@@ -163,10 +184,9 @@ def test_active_pytorch_window_validation(native, inline_profiler):
     config.profile_ranks = [1]
     inline_profiler(config)  # Excluded ranks do not validate the window.
     config.profile_ranks = []
-    config.use_nsys_profiler = False
+    config.use_pytorch_profiler = False
     inline_profiler(config)
     config.use_nsys_profiler = True
-    config.use_pytorch_profiler = False
     inline_profiler(config)
 
 
@@ -231,7 +251,6 @@ def test_pytorch_consumer_inputs_and_resume_progress(
     monkeypatch, inline_profiler, tmp_path, start, chakra
 ):
     config = ProfilingConfig(
-        use_nsys_profiler=True,
         use_pytorch_profiler=True,
         profile_step_start=start,
         profile_step_end=5,
@@ -245,6 +264,8 @@ def test_pytorch_consumer_inputs_and_resume_progress(
     backend.execution_trace_observer = observer if chakra else None
     factory = Mock(return_value=backend)
     schedule = Mock()
+    cudart = Mock()
+    monkeypatch.setattr(training.torch.cuda, "cudart", cudart)
     monkeypatch.setattr(training.torch.profiler, "profile", factory)
     monkeypatch.setattr(training.torch.profiler, "schedule", schedule)
     monkeypatch.setattr(
@@ -269,11 +290,13 @@ def test_pytorch_consumer_inputs_and_resume_progress(
     backend.start.assert_called_once()
     backend.step.assert_called_once()
     backend.stop.assert_called_once()
+    cudart.assert_not_called()
     assert observer.unregister_callback.call_count == int(chakra)
 
 
-def test_checkpoint_profiling_does_not_override_current_run(monkeypatch):
-    args, config = cli_config("--profile-step-start", "7", "--profile-ranks", "2")
+@pytest.mark.parametrize("options", [[], ["--profile"], ["--profile", "--use-pytorch-profiler"]])
+def test_checkpoint_profiling_does_not_override_current_run(monkeypatch, options):
+    args, config = cli_config(*options, "--profile-step-start", "7", "--profile-ranks", "2")
     args.rank = 0
     args.load = "checkpoint"
     saved_args = SimpleNamespace(profile=True, profile_step_start=100, profile_ranks=[99])
