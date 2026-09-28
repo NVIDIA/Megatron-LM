@@ -23,6 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    check_checkpoint_args,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -398,6 +399,69 @@ def test_load_args_restores_activation_func_tanh_clamp_scale_from_checkpoint(
         restored_args, _ = load_args_from_checkpoint(args)
 
     assert restored_args.activation_func_tanh_clamp_scale == expected_scale
+
+
+def test_load_args_restores_wide_residual_config_from_checkpoint():
+    """Checkpoint arguments should reconstruct the flat wide-residual CLI settings."""
+    checkpoint_args = SimpleNamespace(
+        wide_residual_num_streams=3,
+        wide_residual_streamwise_sigmoid_init_scale=0.02,
+        wide_residual_learned_retention=True,
+        wide_residual_retention_init=0.998,
+        wide_residual_retention_max_forget=0.2,
+    )
+    args = SimpleNamespace(
+        load='checkpoint',
+        iteration=0,
+        wide_residual_num_streams=None,
+        wide_residual_streamwise_sigmoid_init_scale=0.01,
+        wide_residual_learned_retention=False,
+        wide_residual_retention_init=0.999,
+        wide_residual_retention_max_forget=0.10,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {'args': checkpoint_args, 'iteration': 12}
+
+    with mock.patch(
+        'megatron.training.checkpointing._load_base_checkpoint',
+        return_value=(state_dict, 'checkpoint', False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.wide_residual_num_streams == 3
+    assert restored_args.wide_residual_streamwise_sigmoid_init_scale == 0.02
+    assert restored_args.wide_residual_learned_retention
+    assert restored_args.wide_residual_retention_init == 0.998
+    assert restored_args.wide_residual_retention_max_forget == 0.2
+
+
+def test_check_checkpoint_args_rejects_wide_residual_mismatch():
+    """Resuming must reject a checkpoint with different wide-residual geometry."""
+    current_args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        add_position_embedding=False,
+        vocab_file=None,
+        data_parallel_random_init=False,
+        phase_transition_iterations=None,
+        use_dist_ckpt=True,
+        wide_residual_num_streams=3,
+        wide_residual_streamwise_sigmoid_init_scale=0.01,
+        wide_residual_learned_retention=False,
+        wide_residual_retention_init=0.999,
+        wide_residual_retention_max_forget=0.10,
+    )
+    checkpoint_args = SimpleNamespace(**vars(current_args))
+    checkpoint_args.wide_residual_num_streams = 4
+
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=current_args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+        pytest.raises(AssertionError, match='wide_residual_num_streams value from checkpoint'),
+    ):
+        check_checkpoint_args(checkpoint_args)
 
 
 def create_checkpoint(load_path, ckpt_format):
