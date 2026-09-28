@@ -19,7 +19,7 @@ from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
-from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
+from megatron.core.datasets.indexed_dataset import DType, IndexedDataset, IndexedDatasetBuilder
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
 from megatron.core.safe_globals import safe_numpy_load
@@ -64,6 +64,56 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents
         file_prefixes.append(file_prefix_path)
 
     return file_prefixes
+
+
+@pytest.mark.parametrize("vocab_size", [20000, 65499, 65500, 65536, 65537, 131072])
+def test_per_dataset_sequences_reads_the_dtype_that_was_written(tmp_path, vocab_size):
+    """The --per-dataset-sequences-path read must use the dtype preprocessing wrote.
+
+    That path skips the .idx header and takes the dtype from the tokenizer's vocab size
+    instead, so the rule it uses has to be the same one IndexedDatasetBuilder was given.
+    Between 65500 and 65536 the two disagreed, and the mismatch is silent: the tokens
+    come back interleaved with zeros and every consistency assert still passes.
+    """
+    tokenizer = build_tokenizer(
+        Namespace(
+            vocab_size=vocab_size,
+            tokenizer_type="NullTokenizer",
+            rank=0,
+            make_vocab_size_divisible_by=128,
+            tensor_model_parallel_size=1,
+            pad_vocab_size=True,
+        )
+    )
+
+    prefix = os.path.join(tmp_path, "dataset")
+    builder = IndexedDatasetBuilder(
+        prefix + ".bin", dtype=DType.optimal_dtype(tokenizer.vocab_size)
+    )
+    builder.add_document([str(token) for token in range(1, 9)], [8])
+    builder.finalize(prefix + ".idx")
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=8,
+        blend=get_blend_from_list([prefix]),
+        split="1,0,0",
+        tokenizer=tokenizer,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+
+    from_header = IndexedDataset(prefix, multimodal=False, mmap=False)
+    from_vocab_size = IndexedDataset(
+        prefix,
+        multimodal=False,
+        mmap=False,
+        sequences_per_dataset=(from_header.index.sequence_count, from_header.index.document_count),
+        dtype_code=config.token_dtype_code,
+    )
+
+    numpy.testing.assert_array_equal(from_header.get(0), from_vocab_size.get(0))
 
 
 def test_multimodal_builder_add_document_default_modes():
