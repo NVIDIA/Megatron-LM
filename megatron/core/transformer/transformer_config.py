@@ -1519,6 +1519,10 @@ class TransformerConfig(ModelParallelConfig):
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
     "attn_proj": offload the input of the attn linear projection part.
+    "qkv_linear"/"core_attn"/"attn_proj" cannot be combined with "attention" in
+    recompute_modules: those offload points are nested inside Attention._forward, which
+    "attention" wraps wholesale in a single checkpoint, so their own saved-tensor hooks never
+    reach the checkpoint's own save and would be dead code (see moe/moe_act precedent below).
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
@@ -2665,6 +2669,20 @@ class TransformerConfig(ModelParallelConfig):
                     f"so offloading activations inside it is redundant and will cause errors. "
                     f"Either remove 'moe' from --recompute-modules or remove "
                     f"{offload_inside_moe} from --offload-modules."
+                )
+
+            if self.recompute_granularity == "selective" and "attention" in self.recompute_modules:
+                offload_inside_attention = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                    self.offload_modules
+                )
+                assert not offload_inside_attention, (
+                    f"Cannot offload {offload_inside_attention} while recomputing the whole "
+                    f"self/cross-attention block. 'attention' in recompute_modules wraps QKV "
+                    f"projection, core attention, and output projection in a single checkpoint, "
+                    f"so their own offload scopes never reach the checkpoint's own "
+                    f"save_for_backward call and would be dead code. Either remove 'attention' "
+                    f"from --recompute-modules or remove {offload_inside_attention} from "
+                    f"--offload-modules."
                 )
             assert (
                 self.min_offloaded_tensor_size >= 0
