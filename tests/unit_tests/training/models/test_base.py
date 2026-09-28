@@ -5,7 +5,9 @@ from typing import Callable, ClassVar
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
 
@@ -17,6 +19,7 @@ def _disable_allowlist():
     target_allowlist.disable()
     yield
     target_allowlist.enable()
+
 
 # ---------------------------------------------------------------------------
 # Dummy concrete implementations
@@ -56,18 +59,22 @@ def _dummy_callable() -> None:
     """Placeholder callable used as a field default in DummyNestedModelConfig."""
 
 
+class _CallbackOwner:
+    """Owns a bound method, like the optimizer whose scale_loss setup attaches."""
+
+    def scale_loss(self, loss):
+        return loss
+
+
 @dataclass
 class DummyNestedModelConfig(ModelConfig):
-    """ModelConfig subclass with a nested dataclass field and a callable field.
-
-    Used to test nested serialization and callable-field exclusion without
-    depending on MambaModelConfig or TransformerConfig.
-    """
+    """ModelConfig subclass with nested-dataclass, callable, and TransformerConfig fields."""
 
     builder: ClassVar[str] = ""  # set dynamically below
     sub: DummySubConfig = field(default_factory=DummySubConfig)
     fn_field: Callable = _dummy_callable
     extra: int = 0
+    transformer: TransformerConfig | None = None
 
 
 DummyNestedModelConfig.builder = f"{DummyModelBuilder.__module__}.DummyModelBuilder"
@@ -128,7 +135,7 @@ class TestModelConfigGetBuilderCls:
 
 
 class TestModelConfigToDict:
-    """as_dict() serializes all non-callable, non-private dataclass fields, including nested dataclasses."""
+    """as_dict() serializes non-private fields, nested dataclasses, and importable callables."""
 
     def test_target_key_present(self):
         cfg = DummyModelConfig()
@@ -152,11 +159,31 @@ class TestModelConfigToDict:
         assert "restore_modelopt_state" in result
         assert "extra_checkpoint_metadata" in result
 
-    def test_hook_lists_excluded(self):
-        cfg = DummyModelConfig()
+    def test_runtime_fields_excluded(self):
+        """Hooks and callbacks that each run attaches are never serialized, even when encodable."""
+        runtime_fields = [
+            "timers",
+            "finalize_model_grads_func",
+            "grad_scale_func",
+            "no_sync_func",
+            "grad_sync_func",
+            "param_sync_func",
+        ]
+        transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+        for name in runtime_fields:
+            setattr(transformer, name, _dummy_callable)
+        transformer.no_sync_func = [_dummy_callable, _dummy_callable]  # one per VPP chunk
+        cfg = DummyNestedModelConfig(
+            transformer=transformer,
+            pre_wrap_hooks=[_dummy_callable],
+            post_wrap_hooks=[_dummy_callable],
+        )
+
         result = cfg.as_dict()
-        assert "pre_wrap_hooks" not in result
-        assert "post_wrap_hooks" not in result
+        assert "pre_wrap_hooks" not in result and "post_wrap_hooks" not in result
+        assert set(runtime_fields).isdisjoint(result["transformer"])
+        # Setup asserts no_sync_func is unset before attaching DDP's under overlap_grad_reduce.
+        assert ModelConfig.from_dict(result).transformer.no_sync_func is None
 
     def test_callable_field_encoded(self):
         """Module-level callables serialize as _target_/_call_ dicts (they used to be dropped)."""
@@ -167,11 +194,14 @@ class TestModelConfigToDict:
             "_call_": False,
         }
 
-    def test_unencodable_callable_skipped(self):
-        """Lambdas cannot be re-imported and are still dropped from the dict."""
-        cfg = DummyNestedModelConfig(fn_field=lambda: None)
-        result = cfg.as_dict()
-        assert "fn_field" not in result
+    @pytest.mark.parametrize(
+        "fn",
+        [lambda: None, _CallbackOwner().scale_loss, torch.relu],
+        ids=["lambda", "bound_method", "torch_builtin"],
+    )
+    def test_unencodable_callable_skipped(self, fn):
+        """Callables whose import path does not resolve back to them are dropped from the dict."""
+        assert "fn_field" not in DummyNestedModelConfig(fn_field=fn).as_dict()
 
     def test_nested_dataclass_serialized_recursively(self):
         cfg = DummyNestedModelConfig()

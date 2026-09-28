@@ -2,8 +2,8 @@
 
 import abc
 import functools
-import inspect
 import importlib
+import inspect
 from dataclasses import dataclass, field, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
@@ -13,6 +13,20 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
+
+# Hooks and callbacks that each run attaches to the live config. Not to be serialized.
+_RUNTIME_FIELDS = frozenset(
+    {
+        "pre_wrap_hooks",
+        "post_wrap_hooks",
+        "timers",
+        "finalize_model_grads_func",
+        "grad_scale_func",
+        "no_sync_func",
+        "grad_sync_func",
+        "param_sync_func",
+    }
+)
 
 
 def _encode_callable(value: Callable) -> dict[str, Any] | None:
@@ -32,7 +46,13 @@ def _encode_callable(value: Callable) -> dict[str, Any] | None:
 
     module = inspect.getmodule(value)
     qualname = getattr(value, "__qualname__", None)
-    if module is None or qualname is None or "<" in qualname:
+    if module is None or qualname is None:
+        return None
+    # Encode only paths that resolve back to `value`; a bound method's path drops its instance.
+    resolved = module
+    for part in qualname.split("."):
+        resolved = getattr(resolved, part, None)
+    if resolved != value:
         return None
     return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
 
@@ -126,7 +146,7 @@ class ModelConfig:
                 "_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}",
             }
             for f in dataclass_fields(config):
-                if f.name.startswith("_") or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]:
+                if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
                     continue
                 value = getattr(config, f.name)
 
