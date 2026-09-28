@@ -195,6 +195,8 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 [tool.uv]
 managed = true
 default-groups = ["linting", "build", "test"]
+# CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
+constraint-dependencies = ["quack-kernels>=0.6.5"]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",

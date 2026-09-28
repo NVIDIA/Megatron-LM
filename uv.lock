@@ -14,6 +14,7 @@ resolution-markers = [
 ]
 
 [manifest]
+constraints = [{ name = "quack-kernels", specifier = ">=0.6.5" }]
 overrides = [
     { name = "apache-tvm-ffi", specifier = "==0.1.11" },
     { name = "tilelang", specifier = "==0.1.12" },
@@ -4579,7 +4580,7 @@ wheels = [
 
 [[package]]
 name = "quack-kernels"
-version = "0.4.1"
+version = "0.6.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -4588,9 +4589,9 @@ dependencies = [
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "torch-c-dlpack-ext" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2a/58/58b82e91b236539f424ff5681e7095b1f2860ddfb7778fe0be14d8fb58de/quack_kernels-0.4.1.tar.gz", hash = "sha256:9d7d6ba412bc0c8a9b1331c52a73db76280adb9dc2f2750df4851ddabef1466b", size = 274766, upload-time = "2026-04-30T14:37:55.65Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/18/6c2a20d00dff254f154fb3b951f4e5a0377a60122c17385e5f08d5f5b5e1/quack_kernels-0.6.5.tar.gz", hash = "sha256:dd9405a4a6fa35fc3a5a18fe35b46a14b0bf7e3ad9fe2451903e355047ac471d", size = 846876, upload-time = "2026-09-11T05:08:20.621Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/38/e4/a6c3bbbe3d4242fa412454b8e8069a079e500be331aecf8f2aa666164e9c/quack_kernels-0.4.1-py3-none-any.whl", hash = "sha256:c1c8df2935bf5156ec47d2c5384ac08b411fd0ee702d80ae916dbf6d6f5ae813", size = 260827, upload-time = "2026-04-30T14:37:54.584Z" },
+    { url = "https://files.pythonhosted.org/packages/73/d8/f5e56c38b286308d115a171e3c5c44f24e9d03980c3cfd22588df40261fa/quack_kernels-0.6.5-py3-none-any.whl", hash = "sha256:df1ddd31366c82eb9692fe087c671209189dcbde53c909c81a865d4ee66b158d", size = 729615, upload-time = "2026-09-11T05:08:19.306Z" },
 ]
 
 [[package]]
