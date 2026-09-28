@@ -101,19 +101,23 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
-    # First, figure out how we are going to do wd skipping. The two main approaches are:
-    #  1. The classic megatron approach of skipping all len 1 and bias parameters.
-    #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
+    # Select the model-family convention for zero weight decay on vector-like parameters:
+    # the classic rule skips all 1-D parameters and biases, while the Qwen3-Next rule keeps
+    # weight decay on Q/K layernorm parameters. Wide-residual retention controllers intentionally
+    # follow the run's ordinary weight-decay policy rather than this generic vector exemption.
     if config.apply_wd_to_qk_layernorm:
         shape_1_not_qkln_param = ParamWithNamePredicate(
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
-            and not ("q_layernorm." in name or "k_layernorm." in name),
+            and not ("q_layernorm." in name or "k_layernorm." in name)
+            and not getattr(param, "is_wide_residual_retention_parameter", False),
         )
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
     else:
         param_length_1_match = ParamPredicate(
-            name="param_len_1", fn=lambda param: len(param.shape) == 1
+            name="param_len_1_except_wide_residual_retention",
+            fn=lambda param: len(param.shape) == 1
+            and not getattr(param, "is_wide_residual_retention_parameter", False),
         )
         param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
