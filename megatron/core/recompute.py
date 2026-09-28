@@ -13,6 +13,7 @@ from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.utils import make_viewless_tensor
 
 
 def checkpointed_forward(
@@ -175,6 +176,13 @@ def checkpointed_forward(
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
+        if use_checkpoint and self.config.enable_mhc_connections:
+            # mHC expands the block input and its zero-dropout BDA path can return views.
+            # Distributed activation checkpointing replaces the first input's .data, which
+            # requires a viewless tensor at every checkpoint boundary.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (
             hidden_states,
