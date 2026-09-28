@@ -15,6 +15,7 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -57,6 +58,18 @@ class Placements:
         ):
             if len(placements) != axis_count:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
+
+
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
 
 
 @contextmanager
@@ -229,6 +242,10 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
-    module_cls = module.__class__
-    fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
-    module.__class__ = fsdp_cls
+    module.__class__ = _get_fsdp_class(module.__class__)
+
+
+@functools.cache
+def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
+    """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
+    return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})

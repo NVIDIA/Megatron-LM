@@ -30,6 +30,7 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -178,16 +179,33 @@ def get_grouped_quantized_members(
     if not is_grouped_tensor_with_quantized_storage(grouped_tensor):
         raise ValueError("get_grouped_quantized_members expects grouped quantized storage.")
 
-    quantized_members = getattr(grouped_tensor, "quantized_tensors", None)
-    if quantized_members is None:
+    return get_grouped_tensor_members(grouped_tensor, create_if_missing=create_if_missing)
+
+
+def get_grouped_tensor_members(
+    tensor: torch.Tensor, *, create_if_missing: bool = False
+) -> List[torch.Tensor]:
+    """Return cached per-member views for a high-precision or quantized GroupedTensor.
+
+    Transformer Engine uses ``quantized_tensors`` and
+    ``split_into_quantized_tensors`` for these members even when the grouped
+    storage is high precision. Keep that upstream cache convention so TE and
+    MCore share the same stable member views.
+    """
+    grouped_tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor(grouped_tensor):
+        raise ValueError("get_grouped_tensor_members expects a TE GroupedTensor.")
+
+    members = getattr(grouped_tensor, "quantized_tensors", None)
+    if members is None:
         if not create_if_missing:
             raise RuntimeError(
-                "Grouped quantized parameter is missing cached member tensors. "
+                "Grouped parameter is missing cached member tensors. "
                 "Create them outside the training critical path."
             )
-        quantized_members = grouped_tensor.split_into_quantized_tensors()
-        grouped_tensor.quantized_tensors = quantized_members
-    return quantized_members
+        members = grouped_tensor.split_into_quantized_tensors()
+        grouped_tensor.quantized_tensors = members
+    return members
 
 
 def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> None:

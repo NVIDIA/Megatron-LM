@@ -30,8 +30,8 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import Flat
+from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
 
@@ -56,6 +56,10 @@ class FsdpContext:
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
+    # The optimizer runs on the current stream and must wait for reductions on
+    # this context's reduce-scatter stream. Each context owns its own stream, so
+    # independent roots sharing a context need only one completion callback.
+    _post_backward_hook_registered: bool
 
     def __init__(
         self,
@@ -77,6 +81,7 @@ class FsdpContext:
         self.unify_communication_stream = unify_communication_stream
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -130,19 +135,28 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def register_post_backward_final_callback(self) -> None:
-        """Register this root context's final callback for the current backward.
+    def post_backward(self) -> None:
+        """Order current-stream consumers after this context's gradient reductions."""
+        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self._post_backward_hook_registered = False
 
-        Root ``post_backward()`` means only that root-owned parameters have
-        accumulated gradients; it may run before descendant reductions, or not
-        run at all when the root owns no trainable parameters. Waiting at
-        autograd completion orders consumers after every descendant reduction.
+    def register_post_backward_hook(self) -> None:
+        """Register one context-level final callback for the current backward.
+
+        Multiple FSDP roots can share this context. Waiting for the
+        reduce-scatter stream in each root's ``post_backward()`` would prevent
+        one root's backward compute from overlapping another root's gradient
+        reductions. Wait once at context-level autograd completion instead.
         """
 
-        def post_backward_final_callback() -> None:
-            self.current_stream().wait_stream(self.reduce_scatter_stream)
+        if self._post_backward_hook_registered:
+            return
+        self._post_backward_hook_registered = True
 
-        torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
+        # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
+        # requires a PyTorch version that includes it:
+        # https://github.com/pytorch/pytorch/pull/193958
+        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
 
 
 class FsdpModule:
@@ -199,11 +213,12 @@ class FsdpModule:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
-            group_dtype = next(iter(group_parameters.values())).dtype
+            first_parameter = next(iter(group_parameters.values()))
+            group_dtype = effective_dtype(first_parameter)
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
-                    parameters=group_parameters,
+                    fqn_to_parameter=group_parameters,
                     mesh=mesh,
                     model_weight_placements=_specialize_placements(
                         model_weight_placements, group_dtype
@@ -488,7 +503,7 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            context.register_post_backward_final_callback()
+            context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
             # part of any active CUDA-graph capture. A stream only joins the
@@ -526,7 +541,9 @@ class FsdpModule:
 
                 reduce_scatter_stream.wait_stream(current_stream)
                 with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+                    group.reduce_partial_gradients(
+                        partial_grad, is_last_microbatch=self.context.is_last_microbatch
+                    )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
@@ -603,25 +620,27 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
     grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
 
 def _specialize_placements(
-    placements: tuple[Placement, ...], dtype: torch.dtype
+    placements: tuple[Placement, ...], group_dtype: torch.dtype
 ) -> tuple[Placement, ...]:
     """Specialize public placements for one homogeneous parameter group.
 
-    Today every parameter group maps Torch's user-facing ``Shard(0)`` to the
-    DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
-    where MXFP8 groups will instead select ``BlockAtomic``.
+    Map Torch's user-facing ``Shard(0)`` to ``BlockAtomic`` for MXFP8 groups
+    and ``RowAtomic`` for ordinary floating-point groups.
     """
-    if dtype not in (torch.float32, torch.bfloat16, torch.float16):
-        raise NotImplementedError(f"Unsupported dtype: {dtype}.")
+    if group_dtype not in (torch.uint8, torch.float32, torch.bfloat16, torch.float16):
+        raise NotImplementedError(f"Unsupported group dtype: {group_dtype}.")
     for placement in placements:
         if type(placement) is Shard and placement.dim != 0:
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    return tuple(Flat() if type(placement) is Shard else placement for placement in placements)
+    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else RowAtomic()
+    return tuple(
+        placement_type if type(placement) is Shard else placement for placement in placements
+    )

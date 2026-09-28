@@ -152,6 +152,35 @@ def test_supplied_ddp_config_wins_over_global_args(mocker):
     assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
 
 
+def test_freezing_language_model_keeps_language_projection_trainable(mocker):
+    language_model = torch.nn.Linear(4, 4)
+    projection = torch.nn.Linear(8, 4)
+    projections = torch.nn.ModuleDict({ENCODER: projection})
+    mimo_model = SimpleNamespace(
+        language_model=language_model,
+        language_model_input_projections=projections,
+        modality_submodules={},
+    )
+    topology = SimpleNamespace(module_pgs={MIMO_LANGUAGE_MODULE_KEY: mocker.Mock()})
+    mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[language_model],
+    )
+    mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.Mock())
+    mocker.patch("examples.mimo.training.runtime.print_rank_0")
+
+    wrap_active_modules_with_ddp(
+        _args(freeze_lm=True, freeze_projection=False),
+        mimo_model,
+        topology,
+        DistributedDataParallelConfig(),
+    )
+
+    assert not language_model.weight.requires_grad
+    assert not language_model.bias.requires_grad
+    assert all(parameter.requires_grad for parameter in projection.parameters())
+
+
 def _eight_gpu_topology():
     """Encoder dp=4 at ranks 0-3; language dp=4 at ranks 4-7 (non-colocated, tiles world)."""
     return create_topology(
@@ -353,6 +382,40 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
         match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
     ):
         builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+
+
+def test_configure_module_rng_forwards_rng_tracker_options(mocker):
+    pg_collection = SimpleNamespace(
+        pp=object(),
+        dp=object(),
+        tp=object(),
+        ep=object(),
+        expt_tp=object(),
+        gtp_remat=object(),
+        expt_gtp_remat=object(),
+    )
+    set_random_seed = mocker.patch("examples.mimo.training.runtime._set_random_seed")
+
+    configure_module_rng(
+        _args(te_rng_tracker=True, inference_rng_tracker=True, cuda_graph_impl="local"),
+        pg_collection,
+        role_seed_offset=10,
+        data_parallel_random_init=True,
+    )
+
+    assert set_random_seed.call_args.args == (1244, True)
+    assert set_random_seed.call_args.kwargs == {
+        "te_rng_tracker": True,
+        "inference_rng_tracker": True,
+        "use_cudagraphable_rng": True,
+        "pp_group": pg_collection.pp,
+        "dp_group": pg_collection.dp,
+        "tp_group": pg_collection.tp,
+        "ep_group": pg_collection.ep,
+        "etp_group": pg_collection.expt_tp,
+        "gtp_remat_group": pg_collection.gtp_remat,
+        "egtp_remat_group": pg_collection.expt_gtp_remat,
+    }
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")

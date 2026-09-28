@@ -8,8 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
-# TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
-ARG NCCL_VERSION=2.30.7-1+cuda13.3
+ARG REINSTALL_NCCL=False
+ARG NCCL_VERSION
 ARG NCCL_EXTENSIONS_VERSION=0.1.0
 ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
@@ -48,17 +48,34 @@ RUN bash -ex <<"EOF"
 EOF
 
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
-    bash /opt/install_nccl.sh --NCCL_VER=${NCCL_VERSION}
+    bash -ex <<"EOF"
+    case "${REINSTALL_NCCL}" in
+        True)
+            if [ -z "${NCCL_VERSION}" ]; then
+                echo "NCCL_VERSION must be set when REINSTALL_NCCL=True" >&2
+                exit 1
+            fi
+            bash /opt/install_nccl.sh --NCCL_VER="${NCCL_VERSION}"
+            ;;
+        False) ;;
+        *)
+            echo "REINSTALL_NCCL must be True or False" >&2
+            exit 1
+            ;;
+    esac
+EOF
 
-COPY README.md pyproject.toml uv.lock /workspace/
+COPY pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
 ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
-RUN --mount=type=cache,target=/root/.cache/uv \
+# Preserve Ampere support unless a caller selects narrower TE build targets.
+ARG NVTE_CUDA_ARCHS="80;90;100"
+# Keep compiled wheels separate when the CPU or TE GPU targets change.
+RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cache/uv \
     bash -ex <<"EOF"
-    export NVTE_CUDA_ARCHS="80;90;100"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
     # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
@@ -79,6 +96,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
         --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+        --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -106,10 +124,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
         -print -quit)
     test -n "${NCCL_EP_JIT_HEADERS}"
-    test -f "${NCCL_EP_JIT_HEADERS}/device/hybrid_ep.cuh"
+    test -f "${NCCL_EP_JIT_HEADERS}/device/ht_ep.cuh"
     mkdir -p /opt/nccl-ep/include
     cp -a "${NCCL_EP_JIT_HEADERS}" /opt/nccl-ep/include/
-    test -f /opt/nccl-ep/include/nccl_ep/device/hybrid_ep.cuh
+    cp -a "${NCCL_EP_JIT_HEADERS}/../nccl_ep.h" /opt/nccl-ep/include/
+    test -f /opt/nccl-ep/include/nccl_ep/device/ht_ep.cuh
+    test -f /opt/nccl-ep/include/nccl_ep.h
 EOF
 
 ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
@@ -123,12 +143,13 @@ ENV NCCL_EP_JIT_BUILD_INCLUDE_DIR=/usr/include
 ENV NCCL_EP_JIT_CUDA_INCLUDE_DIR=/usr/local/cuda/include
 
 # Install DeepEP
-ARG DEEPEP_COMMIT=de0dd1185142c727b9c118aeb4cc4702e34deeba
+ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
+COPY docker/patches/deepep-nvshmem.patch /workspace/deepep-nvshmem.patch
 RUN bash -ex <<"EOF"
     if [ "$IMAGE_TYPE" = "lts" ]; then
         echo "[DeepEP] skipping install for IMAGE_TYPE=lts"
@@ -144,16 +165,21 @@ RUN bash -ex <<"EOF"
     ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib
 
     cd /workspace
-    uv pip install nvidia-nvshmem-cu13==3.4.5
+    # DeepEP discovers NVSHMEM through the wheel, including the headers and
+    # static archive it needs. Keep its runtime ABI aligned with NGC PyTorch.
+    uv pip install nvidia-nvshmem-cu13==3.7.1
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so
     popd
+    python -c "import torch"
 
     git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
         git fetch origin $DEEPEP_COMMIT
         git checkout FETCH_HEAD
         patch -p1 < /workspace/deepep.patch
+        # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
+        patch -p1 < /workspace/deepep-nvshmem.patch
         apt-get update
         apt-get install -y --no-install-recommends libnvidia-ml-dev
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .
@@ -163,6 +189,11 @@ RUN bash -ex <<"EOF"
     popd
     rm -rf DeepEP
 EOF
+
+# Install the local project after expensive dependency builds so README-only
+# changes do not invalidate those layers.
+COPY README.md /workspace/
+RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
