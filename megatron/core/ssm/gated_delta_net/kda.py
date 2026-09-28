@@ -408,7 +408,20 @@ class KimiDeltaAttention(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            if self.config.fp8 or self.config.fp4:
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute, self.config.distribute_saved_activations, hidden_states
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
@@ -499,6 +512,12 @@ class KimiDeltaAttention(_GDNBase):
             raise ValueError(
                 "KDA chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
                 "when cp_context is used. Use packed THD input or micro_batch_size=1."
+            )
+        if cp_size_chunkwise > 1 and (self.config.deterministic_mode or causal_conv1d is None):
+            raise NotImplementedError(
+                "KDA chunkwise CP requires the causal_conv1d path to exchange convolution "
+                "history across ranks; the deterministic/fallback convolution is not valid "
+                "for chunkwise CP."
             )
         if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
             raise ValueError(
