@@ -1956,8 +1956,8 @@ class TestMTPHiddenStateRollUnderParallelism:
 
         Also pins which packed-parameter shapes are recognised. One tensor used as both
         ``cu_seqlens_q`` and ``cu_seqlens_q_padded`` is what the training scripts build
-        when ``CP > 1`` and must be translated; genuinely different padded boundaries
-        are not handled and must leave the caller alone rather than be mistranslated.
+        when ``CP > 1`` and must be translated. Genuinely different padded boundaries
+        must also be translated, retaining repeated boundaries at local seams.
         """
         tp, cp = 2, 2
         if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
@@ -2035,12 +2035,12 @@ class TestMTPHiddenStateRollUnderParallelism:
         )
         assert really_padded is not None
         expected_padded = {
-            (0, 0): [0, 4, 8, 8, 8],
-            (0, 1): [0, 0, 0, 4, 8],
+            (0, 0): [0, 4, 4, 4, 8, 8, 8, 8, 8],
+            (0, 1): [0, 0, 0, 0, 0, 4, 4, 4, 8],
             (1, 0): [0, 6, 8, 8, 8],
             (1, 1): [0, 0, 0, 6, 8],
         }[(get_pg_rank(cp_group), get_pg_rank(tp_group))]
-        assert really_padded.cu_seqlens_q.unique_consecutive().tolist() == expected_padded
+        assert really_padded.cu_seqlens_q.tolist() == expected_padded
         assert really_padded.cu_seqlens_q_padded is None
 
         Utils.destroy_model_parallel()
