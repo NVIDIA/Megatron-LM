@@ -69,4 +69,6 @@ if [[ -z "$next_approval_line" ]] || ! /usr/bin/sed -n "${guard_line},${next_app
   exit 1
 fi
 
-echo "Approve Test Queue preserves concurrency while skipping disabled full-test PRs"
+python3 .github/scripts/test_approve_test_queue.py "$WORKFLOW"
+
+echo "Approve Test Queue counts admitted runs and preserves existing queue policies"

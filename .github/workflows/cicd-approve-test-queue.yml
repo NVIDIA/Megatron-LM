@@ -155,6 +155,47 @@ jobs:
                   role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
               )
 
+          def get_paginated(endpoint, key):
+              """Read the complete result or stop approvals if a page cannot be inspected."""
+              items = []
+              page = 1
+              separator = "&" if "?" in endpoint else "?"
+              while True:
+                  response = make_request(f"{endpoint}{separator}per_page=100&page={page}")
+                  if (
+                      not isinstance(response, dict)
+                      or not isinstance(response.get(key), list)
+                      or not isinstance(response.get("total_count"), int)
+                      or response["total_count"] < 0
+                  ):
+                      raise RuntimeError(f"Failed to inspect {endpoint}, page {page}")
+                  items.extend(response[key])
+                  if len(items) >= response["total_count"]:
+                      return items
+                  if not response[key]:
+                      raise RuntimeError(f"Incomplete results for {endpoint}, page {page}")
+                  page += 1
+
+          def has_test_queue_admission(workflow_run):
+              """Count approved gates, including jobs queued for a runner after approval."""
+              run_id = workflow_run["id"]
+              attempt = workflow_run.get("run_attempt")
+              if not isinstance(attempt, int) or attempt < 1:
+                  raise RuntimeError(f"Missing run attempt for workflow {run_id}")
+              # A failed-job rerun can reuse a successful gate from an earlier attempt.
+              # A gate present in the current attempt takes precedence over older gates.
+              for number in range(attempt, 0, -1):
+                  jobs = get_paginated(f"actions/runs/{run_id}/attempts/{number}/jobs", "jobs")
+                  gates = [job for job in jobs if job["name"] == "cicd-wait-in-queue"]
+                  if len(gates) > 1:
+                      raise RuntimeError(f"Ambiguous test queue gate for workflow {run_id}")
+                  if gates:
+                      gate = gates[0]
+                      return gate["status"] in {"queued", "in_progress"} or (
+                          gate["status"] == "completed" and gate["conclusion"] == "success"
+                      )
+              return False
+
           def get_pr_base_branch(workflow_run):
               """
               Return the base branch of the PR associated with a workflow run, or None.
@@ -172,8 +213,7 @@ jobs:
               # Fetch PR info from GitHub API
               pr_info = make_request(f"pulls/{pr_number}")
               if not pr_info:
-                  print(f"Failed to fetch PR #{pr_number}")
-                  return None, None
+                  raise RuntimeError(f"Failed to fetch PR #{pr_number}")
 
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
@@ -223,18 +263,16 @@ jobs:
                   print(f"PR #{pr_number} targets {target_branch}, contributor_type={contributor_type} (internal={internal})")
               return branch_match and contributor_match
 
-          # Get current running and queued workflows
+          # CPU builds can run before admission. Only admitted runs occupy test slots.
           print("Fetching workflow runs...")
-          queued_resp = make_request("actions/runs?status=queued")
-          if queued_resp is None:
-              print("Failed to fetch queued workflow runs after retries, exiting")
-              exit(1)
-          queued_workflow_runs = queued_resp.get("workflow_runs", [])
-          in_progress_resp = make_request("actions/runs?status=in_progress")
-          if in_progress_resp is None:
-              print("Failed to fetch in-progress workflow runs after retries, exiting")
-              exit(1)
-          in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
+          queued_workflow_runs = [
+              run for run in get_paginated("actions/runs?status=queued", "workflow_runs")
+              if run["name"] == CICD_WORKFLOW_NAME and has_test_queue_admission(run)
+          ]
+          in_progress_workflow_runs = [
+              run for run in get_paginated("actions/runs?status=in_progress", "workflow_runs")
+              if run["name"] == CICD_WORKFLOW_NAME and has_test_queue_admission(run)
+          ]
 
           # The functional-test slot is global across all branch/contributor queues.
           functional_test_workflow_running = any(
@@ -272,11 +310,7 @@ jobs:
 
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
-          waiting_resp = make_request("actions/runs?status=waiting")
-          if waiting_resp is None:
-              print("Failed to fetch waiting workflow runs after retries, exiting")
-              exit(1)
-          pending_workflows = waiting_resp.get("workflow_runs", [])
+          pending_workflows = get_paginated("actions/runs?status=waiting", "workflow_runs")
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows

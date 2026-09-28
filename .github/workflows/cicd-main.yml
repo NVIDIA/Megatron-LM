@@ -477,7 +477,9 @@ jobs:
         run: .github/scripts/test_cache_keys.sh
 
       - name: Test queue approval topology
-        run: .github/scripts/test_approve_test_queue.sh
+        run: |
+          .github/scripts/test_approve_test_queue.sh
+          bash .github/scripts/test_ci_queue_dependencies.sh
 
       - name: Test DCO gate publisher
         run: python3 .github/scripts/test_dco_gate.py
@@ -541,10 +543,20 @@ jobs:
 
   cicd-wait-in-queue:
     runs-on: ubuntu-latest
-    needs: [pre-flight, linting]
+    # CPU builds finish before admission. External builds still need a GPU slot.
+    needs: [is-not-external-contributor, pre-flight, linting, cicd-container-build-cpu]
     environment: "test"
     if: |
-      !(needs.pre-flight.outputs.is_ci_workload == 'true'
+      !cancelled()
+      && needs.pre-flight.result == 'success'
+      && needs.linting.result == 'success'
+      && (
+        (needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+          && needs.cicd-container-build-cpu.result == 'success')
+        || (needs.is-not-external-contributor.outputs.is_maintainer == 'false'
+          && needs.cicd-container-build-cpu.result == 'skipped')
+      )
+      && !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.docs_only == 'true')
@@ -554,6 +566,8 @@ jobs:
           echo "Running CI tests"
           echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
 
+  # Check direct dependency results below: the unused build path intentionally
+  # skips, so an inherited success() check can suppress otherwise-ready tests.
   cicd-parse-downstream-testing:
     runs-on: ubuntu-latest
     needs:
@@ -565,7 +579,9 @@ jobs:
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
-        success()
+        (needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -603,7 +619,10 @@ jobs:
       && needs.configure.outputs.run_mbridge == 'true'
       && needs.pre-flight.outputs.docs_only == 'false'
       && (
-        success()
+        (needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success'
+          && needs.cicd-parse-downstream-testing.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -660,7 +679,10 @@ jobs:
       && github.event_name != 'merge_group'
       && needs.pre-flight.outputs.docs_only == 'false'
       && (
-        success()
+        (needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success'
+          && needs.cicd-parse-downstream-testing.result == 'success')
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
@@ -735,18 +757,48 @@ jobs:
             • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
             • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
 
-  cicd-container-build:
+  cicd-container-build-cpu:
+    needs: [is-not-external-contributor, pre-flight, configure, linting]
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
+    if: |
+      needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.linting.result != 'cancelled'
+      && (
+        (success()
+          && needs.pre-flight.outputs.docs_only != 'true'
+          && needs.pre-flight.outputs.is_deployment_workflow != 'true')
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    uses: ./.github/workflows/_build_ci_container.yml
+    with:
+      is-maintainer: true
+      source-sha: ${{ needs.configure.outputs.sha }}
+      lts: ${{ needs.configure.outputs.lts == 'true' }}
+
+  cicd-container-build-external:
     needs: [is-not-external-contributor, pre-flight, configure, cicd-wait-in-queue]
     permissions:
       contents: read
       id-token: write
       pull-requests: read
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      needs.is-not-external-contributor.outputs.is_maintainer == 'false'
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
-        success()
+        (needs.is-not-external-contributor.result == 'success'
+          && needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
@@ -759,6 +811,23 @@ jobs:
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
+
+  # Preserve one build result for all test jobs, regardless of runner type.
+  cicd-container-build:
+    runs-on: ubuntu-latest
+    needs: [cicd-container-build-cpu, cicd-container-build-external]
+    if: |
+      !cancelled()
+      && (needs.cicd-container-build-cpu.result != 'skipped'
+        || needs.cicd-container-build-external.result != 'skipped')
+    steps:
+      - name: Check container builds
+        env:
+          CPU_RESULT: ${{ needs.cicd-container-build-cpu.result }}
+          EXTERNAL_RESULT: ${{ needs.cicd-container-build-external.result }}
+        run: |
+          [[ "$CPU_RESULT" == 'success' && "$EXTERNAL_RESULT" == 'skipped' ]] \
+            || [[ "$CPU_RESULT" == 'skipped' && "$EXTERNAL_RESULT" == 'success' ]]
 
   cicd-parse-unit-tests:
     runs-on: ubuntu-latest
@@ -775,7 +844,10 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && (
-        success()
+        (needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success'
+          && needs.cicd-container-build.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -815,7 +887,12 @@ jobs:
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests.result != 'cancelled'
       && (
-        success()
+        (needs.is-not-external-contributor.result == 'success'
+          && needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success'
+          && needs.cicd-container-build.result == 'success'
+          && needs.cicd-parse-unit-tests.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -862,7 +939,11 @@ jobs:
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
       && (
-        success()
+        (needs.is-not-external-contributor.result == 'success'
+          && needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success'
+          && needs.cicd-container-build.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -904,7 +985,12 @@ jobs:
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
       && (
-        success()
+        (needs.is-not-external-contributor.result == 'success'
+          && needs.pre-flight.result == 'success'
+          && needs.configure.result == 'success'
+          && needs.cicd-wait-in-queue.result == 'success'
+          && needs.cicd-container-build.result == 'success'
+          && needs.cicd-parse-unit-tests-gb200.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -1351,14 +1437,12 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test]
+    needs: [Nemo_CICD_Test, pre-flight]
     if: |
-      (
-        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-        || success()
-      )
-      && !cancelled()
+      !cancelled()
+      && needs.Nemo_CICD_Test.result == 'success'
+      && needs.pre-flight.outputs.docs_only != 'true'
+      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
