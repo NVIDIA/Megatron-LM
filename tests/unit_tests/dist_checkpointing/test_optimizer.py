@@ -15,6 +15,7 @@ from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_ten
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
+    make_sharded_optimizer_tensor,
     optim_state_to_sharding_state,
 )
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding, extract_sharded_tensors
@@ -268,6 +269,161 @@ class TestOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('prepend_axis_num', [0, 1])
+    @pytest.mark.parametrize(
+        'model_shape, state_shape, sharded_axis',
+        [((8, 4), (8, 1), 0), ((4, 8), (1, 8), 1), ((8, 4), (8, 4), 0)],
+    )
+    def test_optimizer_state_shape(self, model_shape, state_shape, sharded_axis, prepend_axis_num):
+        """Preserve unreduced sharding, prepended axes, dtype and replica identity."""
+        rank_offsets = [(sharded_axis + prepend_axis_num, 1, 2)]
+        if prepend_axis_num:
+            rank_offsets.append((0, 2, 3))
+        model = ShardedTensor.from_rank_offsets(
+            'weight',
+            torch.zeros(model_shape, dtype=torch.bfloat16),
+            *rank_offsets,
+            prepend_axis_num=prepend_axis_num,
+            replica_id=(0, 1),
+        )
+        state = torch.ones(state_shape, dtype=torch.float32)
+        sharded = make_sharded_optimizer_tensor(model, state, 'optimizer.state.moment2_buffer')
+        expected_global_shape = list(model.global_shape)
+        for dim, size in enumerate(state_shape):
+            if size != model_shape[dim]:
+                expected_global_shape[dim + prepend_axis_num] = size
+        assert sharded.data is state
+        assert sharded.key == 'optimizer.state.moment2_buffer.weight'
+        assert sharded.local_shape == state_shape
+        assert sharded.global_shape == tuple(expected_global_shape)
+        assert sharded.global_offset == model.global_offset
+        assert sharded.axis_fragmentations == model.axis_fragmentations
+        assert sharded.prepend_axis_num == prepend_axis_num
+        assert sharded.replica_id == model.replica_id
+        assert sharded.dtype == torch.float32
+        assert model.local_shape == model_shape
+        assert model.dtype == torch.bfloat16
+        sharded.validate_metadata_integrity()
+
+    @pytest.mark.parametrize('state_shape', [(8,), (2, 4), (8, 3)])
+    def test_optimizer_state_rejects_incompatible_shape(self, state_shape):
+        model = ShardedTensor.from_rank_offsets('weight', torch.zeros(8, 4))
+        with pytest.raises(AssertionError):
+            make_sharded_optimizer_tensor(
+                model, torch.zeros(state_shape), 'optimizer.state.moment2_buffer'
+            )
+
+    @pytest.mark.parametrize('reduction_axis', [0, 1])
+    def test_optimizer_state_rejects_sharded_reduction_axis(self, reduction_axis):
+        model = ShardedTensor.from_rank_offsets('weight', torch.zeros(8, 4), (reduction_axis, 0, 2))
+        state_shape = [8, 4]
+        state_shape[reduction_axis] = 1
+        with pytest.raises(AssertionError, match='unsharded reduction axis'):
+            make_sharded_optimizer_tensor(
+                model, torch.zeros(state_shape), 'optimizer.state.moment2_buffer'
+            )
+
+    def test_optimizer_state_rejects_irregular_reduced_grid(self):
+        model = ShardedTensor.from_rank_offsets('weight', torch.zeros(8, 4))
+        model.axis_fragmentations = None
+        with pytest.raises(AssertionError, match='regular grid'):
+            make_sharded_optimizer_tensor(
+                model, torch.zeros(8, 1), 'optimizer.state.moment2_buffer'
+            )
+
+    @pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason='emerging_optimizers package not installed'
+    )
+    @pytest.mark.parametrize('async_save', [False, True])
+    def test_normuon_checkpoint_round_trip(self, tmp_path_dist_ckpt, async_save):
+        """Restore reduced moments and BF16 master weights without changing the next update."""
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer.emerging_optimizers import (
+            TensorParallelAdaptiveMuon,
+            _eopt_init_state_fn,
+        )
+        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+
+        if async_save:
+            async_module = pytest.importorskip(
+                'nvidia_resiliency_ext.checkpointing.async_ckpt.core'
+            )
+
+        Utils.initialize_model_parallel(1, 1)
+
+        def make_optimizer(seed):
+            torch.manual_seed(seed)
+            params = [
+                torch.nn.Parameter(torch.randn(*shape, device='cuda', dtype=torch.bfloat16))
+                for shape in ((8, 4), (4, 8), (8, 4))
+            ]
+            inner = TensorParallelAdaptiveMuon(
+                params, moment2_method='normuon', coefficient_type='simple', num_ns_steps=10
+            )
+            optimizer = Float16OptimizerWithFloat16Params(
+                inner,
+                OptimizerConfig(optimizer='adaptive_muon', bf16=True, clip_grad=0),
+                None,
+                _eopt_init_state_fn,
+            )
+            return params, optimizer
+
+        def model_state(params):
+            state = {
+                str(i): ShardedTensor.from_rank_offsets(
+                    f'weight_{i}', param, (0, 0, 1), prepend_axis_num=1, replica_id=Utils.rank
+                )
+                for i, param in enumerate(params)
+            }
+            state['2'] = apply_swiglu_sharded_factory(state['2'], ((0, 0, 1),))
+            return state
+
+        def step(params, optimizer, seed):
+            torch.manual_seed(seed)
+            for param in params:
+                param.main_grad = torch.randn_like(param, dtype=torch.float32)
+            assert optimizer.step()[0]
+
+        params, optimizer = make_optimizer(123)
+        step(params, optimizer, 124)
+        with TempNamedDir(tmp_path_dist_ckpt / f'normuon_{async_save}', sync=True) as checkpoint:
+            sharded_model = model_state(params)
+            request = save(
+                {'model': sharded_model, 'optimizer': optimizer.sharded_state_dict(sharded_model)},
+                checkpoint,
+                async_sharded_save=async_save,
+            )
+            if async_save:
+                queue = async_module.AsyncCallsQueue(persistent=True)
+                queue.schedule_async_request(request)
+                queue.maybe_finalize_async_calls(blocking=True)
+                queue.close()
+
+            restored_params, restored_optimizer = make_optimizer(456)
+            restored_model = model_state(restored_params)
+            loaded = load(
+                {
+                    'model': restored_model,
+                    'optimizer': restored_optimizer.sharded_state_dict(
+                        restored_model, is_loading=True
+                    ),
+                },
+                checkpoint,
+            )
+            with torch.no_grad():
+                for i, param in enumerate(restored_params):
+                    param.copy_(loaded['model'][str(i)])
+            restored_optimizer.load_state_dict(loaded['optimizer'])
+            torch.testing.assert_close(
+                optimizer.state_dict(), restored_optimizer.state_dict(), rtol=0, atol=0
+            )
+            step(params, optimizer, 125)
+            step(restored_params, restored_optimizer, 125)
+            torch.testing.assert_close(params, restored_params, rtol=0, atol=0)
+            torch.testing.assert_close(
+                optimizer.state_dict(), restored_optimizer.state_dict(), rtol=0, atol=0
+            )
 
     def test_optimizer_params(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
