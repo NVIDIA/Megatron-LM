@@ -1,302 +1,189 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end round-trip validation for the fsdp_dtensor -> torch_dist converter.
+"""Round-trip test for the fsdp_dtensor -> torch_dist reverse converter.
 
-This is a standalone GPU script (like ``test_distributed_round_trip.py``), not a
-pytest-collected test — it drives the real ``checkpoint_inspector.py`` CLIs and,
-for the real-model case, a full mcore save/convert/convert/load cycle. Run it
-inside the CI dev container on 1+ GPU:
+For each architecture archetype, build a synthetic native ``torch_dist`` checkpoint,
+run it through both ``checkpoint_inspector.py`` CLIs
 
-    # Synthetic round-trip for every architecture archetype (fast, no model):
-    #   torch_dist --(forward)--> fsdp_dtensor --(reverse)--> torch_dist' ; compare.
-    python tests/unit_tests/tools/checkpoint/test_reverse_convert_roundtrip.py synthetic
+    torch_dist --(convert-torch-dist-to-fsdp-dtensor)--> fsdp_dtensor
+               --(convert-fsdp-dtensor-to-torch-dist)--> torch_dist'
 
-    # Real dense GPTModel round-trip WITH load into a fresh model+optimizer:
-    RANK=0 WORLD_SIZE=1 LOCAL_RANK=0 MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 \
-        python tests/unit_tests/tools/checkpoint/test_reverse_convert_roundtrip.py real
+and assert ``torch_dist' == torch_dist`` tensor-for-tensor. This drives the whole
+``reverse_convert_checkpoint`` pipeline (DCP load, key classification, SwiGLU merge,
+expert re-stack, layer stacking, MTP rename, optimizer-key remap, DCP save) on CPU
+in seconds. The end-to-end proof on real Megatron-FSDP checkpoints lives in the
+opt-in suite under ``tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist``.
 
-    # Both:
-    python tests/unit_tests/tools/checkpoint/test_reverse_convert_roundtrip.py
-
-The synthetic case validates every key/tensor transform (prefix strip, SwiGLU
-merge, expert re-stack, layer stacking, MTP rename, GDN passthrough, optimizer
-state) by asserting ``forward∘reverse == identity`` on the tensors. The real case
-proves the converted checkpoint actually loads into a native (non-FSDP) mcore
-GPTModel + DistributedOptimizer and reproduces the weights.
+The converters run as subprocesses: each initializes its own single-rank gloo
+group, which must not collide with the process group of the (torchrun-launched)
+unit-test session. Only rank 0 runs the test; it has no collectives.
 """
 
-import argparse
 import os
+import socket
 import subprocess
 import sys
-import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import (
-    DefaultLoadPlanner,
-    DefaultSavePlanner,
-    FileSystemReader,
-    FileSystemWriter,
-)
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
 from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
-from megatron.core.dist_checkpointing.strategies.common import save_common
+from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-sys.path.insert(0, _REPO_ROOT)  # make ``tests.unit_tests.*`` importable as a script
-_INSPECTOR = os.path.join(_REPO_ROOT, "tools", "checkpoint", "checkpoint_inspector.py")
-_ARCHETYPES = ("dense", "moe", "swiglu", "gdnmtp")
-_PORT = [29811]
+_INSPECTOR = (
+    Path(__file__).resolve().parents[4] / "tools" / "checkpoint" / "checkpoint_inspector.py"
+)
+_DIST_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
 
 
-def _clean_subprocess_env():
-    """Fresh single-rank env for a converter subprocess.
-
-    Strips ``torchrun``'s elastic-agent variables so the child does a plain
-    env:// rendezvous on its own port instead of trying to reach the parent's
-    agent store.
-    """
-    _PORT[0] += 1
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TORCHELASTIC")}
-    env.update(
-        {
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(_PORT[0]),
-            "RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_RANK": "0",
-        }
-    )
-    return env
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 def _run_cli(*cli_args):
-    py = os.environ.get("PYTHON", sys.executable)
-    subprocess.run([py, _INSPECTOR, *cli_args], check=True, env=_clean_subprocess_env())
+    """Run a converter CLI as a fresh single-rank process (no inherited rendezvous)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _DIST_ENV_KEYS and not k.startswith("TORCHELASTIC")
+    }
+    env.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(_free_port()), RANK="0", WORLD_SIZE="1")
+    proc = subprocess.run(
+        [sys.executable, str(_INSPECTOR), *map(str, cli_args)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    tail = "\n".join(proc.stdout.splitlines()[-30:])
+    assert proc.returncode == 0, f"{cli_args[0]} failed (rc={proc.returncode}):\n{tail}"
 
 
 def _load_tensors(path):
-    reader = FileSystemReader(path)
-    md = reader.read_metadata()
+    md = FileSystemReader(path).read_metadata().state_dict_metadata
     out = {
-        k: torch.empty(v.size, dtype=v.properties.dtype)
-        for k, v in md.state_dict_metadata.items()
-        if isinstance(v, TensorStorageMetadata)
+        k: torch.empty(m.size, dtype=m.properties.dtype)
+        for k, m in md.items()
+        if isinstance(m, TensorStorageMetadata)
     }
-    dcp.load(out, storage_reader=reader, planner=DefaultLoadPlanner())
+    dcp.load(out, storage_reader=FileSystemReader(path), no_dist=True)
     return out
 
 
-def _assert_tensors_equal(a, b, label):
-    ka, kb = set(a), set(b)
-    assert ka == kb, (
-        f"[{label}] key mismatch: {len(ka - kb)} missing {sorted(ka - kb)[:5]}, "
-        f"{len(kb - ka)} extra {sorted(kb - ka)[:5]}"
-    )
-    bad = [
-        k
-        for k in ka
-        if a[k].shape != b[k].shape or not torch.allclose(a[k], b[k], atol=1e-6, rtol=1e-5)
-    ]
-    assert not bad, f"[{label}] {len(bad)} tensor mismatches: {bad[:8]}"
-    print(f"  PASS [{label}]: {len(ka)} tensors round-tripped exactly")
+def _model_tensors(kind, num_layers=3, hidden=16, vocab=32, experts=4):
+    """Model section of a native torch_dist checkpoint for one archetype."""
+    g = torch.Generator().manual_seed(1234)
 
+    def rnd(*shape):
+        return torch.randn(*shape, generator=g)
 
-# ---------------------------------------------------------------------------
-# Synthetic round-trip: build a native torch_dist state dict per archetype.
-# ---------------------------------------------------------------------------
-def _build_source(path, kind, num_layers=3, hidden=16, vocab=32, experts=4):
-    torch.manual_seed(1234)
     sd = {
-        "embedding.word_embeddings.weight": torch.randn(vocab, hidden),
-        "decoder.final_layernorm.weight": torch.randn(hidden),
-        "output_layer.weight": torch.randn(vocab, hidden),
+        "embedding.word_embeddings.weight": rnd(vocab, hidden),
+        "decoder.final_layernorm.weight": rnd(hidden),
+        "output_layer.weight": rnd(vocab, hidden),
     }
-    if kind in ("dense", "swiglu"):
-        # Dense/homogeneous -> layers stacked on axis 0.
+    if kind in ("dense", "swiglu", "mtp"):
+        # Homogeneous block -> mcore stores every layer param stacked on axis 0.
         fc1 = 2 * 4 * hidden if kind == "swiglu" else 4 * hidden
         sd.update(
             {
-                "decoder.layers.self_attention.linear_qkv.weight": torch.randn(
+                "decoder.layers.self_attention.linear_qkv.weight": rnd(
                     num_layers, 3 * hidden, hidden
                 ),
-                "decoder.layers.self_attention.linear_proj.weight": torch.randn(
-                    num_layers, hidden, hidden
-                ),
-                "decoder.layers.input_layernorm.weight": torch.randn(num_layers, hidden),
-                "decoder.layers.pre_mlp_layernorm.weight": torch.randn(num_layers, hidden),
-                "decoder.layers.mlp.linear_fc1.weight": torch.randn(num_layers, fc1, hidden),
-                "decoder.layers.mlp.linear_fc2.weight": torch.randn(num_layers, hidden, 4 * hidden),
+                "decoder.layers.self_attention.linear_proj.weight": rnd(num_layers, hidden, hidden),
+                "decoder.layers.input_layernorm.weight": rnd(num_layers, hidden),
+                "decoder.layers.pre_mlp_layernorm.weight": rnd(num_layers, hidden),
+                "decoder.layers.mlp.linear_fc1.weight": rnd(num_layers, fc1, hidden),
+                "decoder.layers.mlp.linear_fc2.weight": rnd(num_layers, hidden, 4 * hidden),
             }
         )
     elif kind == "moe":
-        # MoE -> non-homogeneous: every param per-layer; experts stacked on axis 0.
+        # Interleaved dense/MoE (layer 0 dense) -> non-homogeneous, stored per-layer;
+        # the routed experts are stacked on axis 0.
         for i in range(num_layers):
             p = f"decoder.layers.{i}."
-            sd[p + "self_attention.linear_qkv.weight"] = torch.randn(3 * hidden, hidden)
-            sd[p + "self_attention.linear_proj.weight"] = torch.randn(hidden, hidden)
-            sd[p + "input_layernorm.weight"] = torch.randn(hidden)
-            sd[p + "pre_mlp_layernorm.weight"] = torch.randn(hidden)
-            sd[p + "mlp.router.weight"] = torch.randn(experts, hidden)
-            sd[p + "mlp.experts.experts.linear_fc1.weight"] = torch.randn(
-                experts, 4 * hidden, hidden
-            )
-            sd[p + "mlp.experts.experts.linear_fc2.weight"] = torch.randn(
-                experts, hidden, 4 * hidden
-            )
-    elif kind == "gdnmtp":
-        # Gated DeltaNet (split sub-keys, per-layer) + an MTP layer.
-        for i in range(num_layers):
-            p = f"decoder.layers.{i}."
-            for sub in ("query", "key", "value", "z", "beta", "alpha"):
-                sd[p + f"self_attention.in_proj.weight.{sub}"] = torch.randn(hidden, hidden)
-            for sub in ("query", "key", "value"):
-                sd[p + f"self_attention.conv1d.weight.{sub}"] = torch.randn(hidden, 1, 4)
-            sd[p + "input_layernorm.weight"] = torch.randn(hidden)
-            sd[p + "mlp.linear_fc1.weight"] = torch.randn(4 * hidden, hidden)
-            sd[p + "mlp.linear_fc2.weight"] = torch.randn(hidden, 4 * hidden)
-        sd["mtp.layers.0.transformer_layer.self_attention.linear_qkv.weight"] = torch.randn(
-            3 * hidden, hidden
-        )
-        sd["mtp.layers.0.transformer_layer.mlp.linear_fc1.weight"] = torch.randn(4 * hidden, hidden)
+            sd[p + "self_attention.linear_qkv.weight"] = rnd(3 * hidden, hidden)
+            sd[p + "input_layernorm.weight"] = rnd(hidden)
+            if i == 0:
+                sd[p + "mlp.linear_fc1.weight"] = rnd(4 * hidden, hidden)
+                sd[p + "mlp.linear_fc2.weight"] = rnd(hidden, 4 * hidden)
+                continue
+            sd[p + "mlp.router.weight"] = rnd(experts, hidden)
+            sd[p + "mlp.experts.experts.linear_fc1.weight"] = rnd(experts, 4 * hidden, hidden)
+            sd[p + "mlp.experts.experts.linear_fc2.weight"] = rnd(experts, hidden, 4 * hidden)
+    else:
+        raise ValueError(kind)
+    if kind == "mtp":
+        # An MTP layer is its own block, always stored per-layer, and must not stop
+        # the decoder block from being stacked.
+        p = "mtp.layers.0.transformer_layer."
+        sd[p + "self_attention.linear_qkv.weight"] = rnd(3 * hidden, hidden)
+        sd[p + "mlp.linear_fc1.weight"] = rnd(4 * hidden, hidden)
+    return sd
 
-    # MoE fc2 optimizer state cannot round-trip through the *forward* converter's
-    # nd_reformulated ETP transpose from a model-shaped synthetic source, so the
-    # synthetic MoE case is weights-only; full MoE optimizer is covered by the
-    # real-model case below.
-    full = dict(sd)
-    if kind != "moe":
-        for k, v in sd.items():
-            full[f"optimizer.state.exp_avg.{k}"] = torch.randn_like(v)
-            full[f"optimizer.state.exp_avg_sq.{k}"] = torch.randn_like(v).abs()
 
+def _save_torch_dist(path, kind, with_optimizer):
+    """Write a native torch_dist checkpoint: model + (optionally) fully-reshardable
+    optimizer state (fp32 masters under ``optimizer.state.param`` plus Adam moments)."""
+    model = _model_tensors(kind)
+    full = dict(model)
+    if with_optimizer:
+        g = torch.Generator().manual_seed(4321)
+        for k, v in model.items():
+            full[f"optimizer.state.param.{k}"] = v.clone()
+            full[f"optimizer.state.exp_avg.{k}"] = torch.randn(v.shape, generator=g)
+            full[f"optimizer.state.exp_avg_sq.{k}"] = torch.rand(v.shape, generator=g)
     os.makedirs(path, exist_ok=True)
-    dcp.save(full, storage_writer=FileSystemWriter(path), planner=DefaultSavePlanner())
-    save_common(
+    dcp.save(full, storage_writer=FileSystemWriter(path), no_dist=True)
+    # Written directly: ``save_common`` needs a process group and this test has none.
+    torch.save(
         {
-            "args": SimpleNamespace(num_layers=num_layers, hidden_size=hidden),
+            "args": SimpleNamespace(num_layers=3, hidden_size=16),
             "checkpoint_version": 3.0,
             "iteration": 100,
             "optimizer": {
-                "optimizer": {"param_groups": [{"lr": 1e-3, "params": list(range(len(sd)))}]}
+                "optimizer": {"param_groups": [{"lr": 1e-3, "params": list(range(len(model)))}]}
             },
         },
-        path,
+        path / COMMON_STATE_FNAME,
     )
     save_config(CheckpointingConfig(sharded_backend="torch_dist"), path)
 
 
-def run_synthetic():
-    if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29799")
-        dist.init_process_group("gloo", rank=0, world_size=1)
-    for kind in _ARCHETYPES:
-        print(f"==== synthetic:{kind} ====")
-        tmp = tempfile.mkdtemp(prefix=f"rt_{kind}_")
-        td, fsdp, td2 = f"{tmp}/td", f"{tmp}/fsdp", f"{tmp}/td2"
-        _build_source(td, kind)
-        fwd = ["convert-torch-dist-to-fsdp-dtensor", td, fsdp]
-        if kind == "swiglu":
-            fwd.append("--swiglu")
-        if kind == "gdnmtp":
-            fwd.append("--rename-mtp-keys")
-        _run_cli(*fwd)
-        _run_cli("convert-fsdp-dtensor-to-torch-dist", fsdp, td2)
-        _assert_tensors_equal(_load_tensors(td), _load_tensors(td2), f"synthetic:{kind}")
+# (archetype, forward-converter flags, with optimizer state). MoE optimizer state
+# cannot go through the *forward* converter from a model-shaped synthetic source
+# (its fc2 ETP transpose expects mcore's nd-reformulated layout), so the MoE case is
+# weights-only; real MoE optimizer state is covered by the end-to-end suite.
+_CASES = [
+    pytest.param("dense", (), True, id="dense"),
+    pytest.param("swiglu", ("--swiglu",), True, id="swiglu"),
+    pytest.param("moe", (), False, id="moe"),
+    pytest.param("mtp", ("--rename-mtp-keys",), True, id="mtp"),
+]
 
 
-# ---------------------------------------------------------------------------
-# Real dense GPTModel round-trip WITH load into a fresh model+optimizer.
-# ---------------------------------------------------------------------------
-def run_real():
-    from unittest import mock
+@pytest.mark.parametrize("kind, forward_flags, with_optimizer", _CASES)
+def test_forward_then_reverse_is_identity(tmp_path, kind, forward_flags, with_optimizer):
+    if dist.is_initialized() and dist.get_rank() != 0:
+        pytest.skip("single-process test; runs on rank 0 only")
+    td, fsdp, td2 = tmp_path / "td", tmp_path / "fsdp", tmp_path / "td2"
+    _save_torch_dist(td, kind, with_optimizer)
 
-    from megatron.training.arguments import parse_args
-    from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-    from megatron.training.training import preprocess_common_state_dict
-    from tests.unit_tests.dist_checkpointing.utils import (
-        init_checkpointing_mock_args,
-        setup_model_and_optimizer,
+    _run_cli("convert-torch-dist-to-fsdp-dtensor", td, fsdp, *forward_flags)
+    _run_cli("convert-fsdp-dtensor-to-torch-dist", fsdp, td2)
+
+    before, after = _load_tensors(td), _load_tensors(td2)
+    assert set(after) == set(before), (
+        f"missing {sorted(set(before) - set(after))[:5]}, "
+        f"extra {sorted(set(after) - set(before))[:5]}"
     )
-    from tests.unit_tests.test_utilities import Utils
-
-    print("==== real:dense (with load) ====")
-    Utils.initialize_model_parallel(1, 1)
-    root = tempfile.mkdtemp(prefix="rt_real_")
-    a_dir, fsdp_dir, b_dir = f"{root}/A", f"{root}/fsdp", f"{root}/B"
-
-    args_a = parse_args(ignore_unknown_args=True)
-    args_a.use_distributed_optimizer = True
-    with mock.patch("megatron.training.checkpointing.get_args", new=lambda: args_a):
-        model_a, opt_a = setup_model_and_optimizer(seed=2, tp=1, pp=1)
-        init_checkpointing_mock_args(args_a, a_dir)
-        args_a.dist_ckpt_optim_fully_reshardable = True
-        save_checkpoint(
-            10,
-            model_a,
-            opt_a,
-            None,
-            0,
-            preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        )
-    state_a = {
-        k: v.clone() for k, v in model_a[0].state_dict().items() if isinstance(v, torch.Tensor)
-    }
-
-    if torch.distributed.get_rank() == 0:
-        _run_cli(
-            "convert-torch-dist-to-fsdp-dtensor", f"{a_dir}/iter_0000010", fsdp_dir, "--swiglu"
-        )
-        os.makedirs(f"{b_dir}/iter_0000010", exist_ok=True)
-        _run_cli("convert-fsdp-dtensor-to-torch-dist", fsdp_dir, f"{b_dir}/iter_0000010")
-        with open(f"{b_dir}/latest_checkpointed_iteration.txt", "w") as fh:
-            fh.write("10")
-    torch.distributed.barrier()
-
-    args_b = parse_args(ignore_unknown_args=True)
-    args_b.use_distributed_optimizer = True
-    with mock.patch("megatron.training.checkpointing.get_args", new=lambda: args_b):
-        model_b, opt_b = setup_model_and_optimizer(seed=999, tp=1, pp=1)
-        init_checkpointing_mock_args(args_b, b_dir)
-        args_b.dist_ckpt_optim_fully_reshardable = True
-        args_b.dist_ckpt_strictness = "log_all"  # tolerate omitted _extra_state
-        args_b.no_load_rng = True  # rng_state is not round-tripped
-        with (
-            mock.patch("megatron.training.checkpointing.check_checkpoint_args"),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
-        ):
-            iteration, _ = load_checkpoint(model_b, opt_b, None)
-
-    state_b = {k: v for k, v in model_b[0].state_dict().items() if isinstance(v, torch.Tensor)}
-    if torch.distributed.get_rank() == 0:
-        bad = [
-            k
-            for k in state_a
-            if k not in state_b
-            or not torch.allclose(
-                state_a[k].cpu().float(), state_b[k].cpu().float(), atol=1e-3, rtol=1e-3
-            )
-        ]
-        assert iteration == 10, iteration
-        assert not bad, f"real-load mismatches: {bad[:8]}"
-        print(f"  PASS [real:dense]: loaded into a fresh GPTModel; {len(state_a)} weights match")
-    Utils.destroy_model_parallel()
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("modes", nargs="*", default=["synthetic", "real"])
-    args = parser.parse_args()
-    if "synthetic" in args.modes:
-        run_synthetic()
-    if "real" in args.modes:
-        run_real()
-
-
-if __name__ == "__main__":
-    main()
+    bad = [k for k in before if not torch.equal(before[k], after[k])]
+    assert not bad, f"{len(bad)} tensors changed in the round trip: {bad[:8]}"
