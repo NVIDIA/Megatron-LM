@@ -113,7 +113,8 @@ def native_h_post_bda(
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C).to(h_res.dtype)
-    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
+        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
@@ -518,7 +519,8 @@ class HyperConnectionModule(MegatronModule):
         residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
 
         # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
+        with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
+            mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
 
         return mixed.view(s, b, n * C)
 
