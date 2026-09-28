@@ -271,28 +271,21 @@ def roll_tensor(
     cp_layout: CPLayout = "zigzag",
     fill_value=0,
 ):
-    """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
+    """Roll a tensor along the sequence dimension, exchanging CP boundary tokens when needed.
 
-    This function extends the original roll_tensor to support Context Parallelism, which allows
-    MTP to work with CP > 1. When CP is enabled, the sequence dimension is split across CP ranks,
-    and tensor rolling requires communication between adjacent CP ranks to properly handle the
-    boundary conditions.
-
-    For CP=1 (default behavior): Uses standard torch.roll with zero padding
-    For zigzag CP>1: Rolls within each chunk, then exchanges boundary elements between
-    adjacent CP ranks. The contiguous layout exchanges shard boundaries and honors fill_value.
-
-    For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
-    from different sequences.
+    Packed rolls respect document boundaries. With zigzag CP > 1, each physical document
+    length must be divisible by twice the CP size so every rank receives two equal chunks.
+    In the zigzag path, slots after the final physical document roll as a separate trailing
+    segment, with its last slot zeroed. The contiguous layout honors fill_value.
 
     Args:
         tensor (Tensor): The input tensor to roll. If None, returns (None, None).
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
-        cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
-                               falls back to standard rolling behavior.
-        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
-                                            If provided, respects sequence boundaries.
+        cp_group (ProcessGroup): The context parallelism process group. None or size 1
+            uses a local roll.
+        packed_seq_params (PackedSeqParams): Logical and optional physical document
+            boundaries for packed sequences.
         return_sum (bool): Whether to calculate and return the rolled tensor sum.
                            Defaults to True.
         cp_layout (CPLayout): "contiguous" selects contiguous CP shards and requires
@@ -355,8 +348,10 @@ def roll_tensor(
 def _roll_tensor_packed_seq(
     tensor, shifts, dims, packed_seq_params, cp_group=None, return_sum=True
 ):
-    """Roll tensor with packed sequence support.
-    This function handles rolling for packed sequences by respecting sequence boundaries
+    """Roll packed documents one token left, exchanging CP boundary tokens when needed.
+
+    With CP > 1, each physical document length must be divisible by ``2 * cp_size``.
+    Slots after the final physical boundary roll as a separate segment and end in zero.
     """
 
     ndim = tensor.dim()
