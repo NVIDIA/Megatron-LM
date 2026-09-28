@@ -196,13 +196,15 @@ class RecipeConfig:
 
         return RecipeConfig(matchers, config_dict)
 
-    def to_cfg_dict(self) -> dict:
+    def as_dict(self) -> dict:
         """Serialize recipe to dict configuration."""
 
+        # need to specify how to re-initialize with these contents
+        target_str = f"{self.__class__.__module__}.{self.__class__.__qualname__}.from_config_dict"
+
         return {
-            "matchers": self._matchers_to_dict(),
-            "configs": self.configs,
-            "_target_": RecipeConfig.from_config_dict,
+            "config": {"matchers": self._matchers_to_dict(), "configs": self.configs},
+            "_target_": target_str,
         }
 
     def _matchers_to_dict(self) -> dict | None:
