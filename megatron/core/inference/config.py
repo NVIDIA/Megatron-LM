@@ -381,9 +381,7 @@ class MultimodalPromptConfig:
         return cls(
             image_spec=replace(defaults.image_spec, **dict(value.get("image_spec", {}))),
             video_spec=replace(defaults.video_spec, **dict(value.get("video_spec", {}))),
-            content_part_order=value.get(
-                "content_part_order", defaults.content_part_order
-            ),
+            content_part_order=value.get("content_part_order", defaults.content_part_order),
         )
 
 

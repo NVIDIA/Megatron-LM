@@ -128,10 +128,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
 
     multimodal_prompt_config = MultimodalPromptConfig(
         image_spec=MediaPromptSpec(
-            model_token="<image>",
-            prefix="<img>",
-            suffix="</img>",
-            content_part_separator="\n",
+            model_token="<image>", prefix="<img>", suffix="</img>", content_part_separator="\n"
         ),
         video_spec=MediaPromptSpec(
             model_token="<image>",

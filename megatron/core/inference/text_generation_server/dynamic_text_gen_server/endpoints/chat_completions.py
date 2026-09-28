@@ -475,17 +475,10 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
-            if (
-                prompt_config is not None
-                and prompt_config.content_part_order == "media_first"
-            ):
+            if prompt_config is not None and prompt_config.content_part_order == "media_first":
                 media_sentinels = media_sentinels_by_message.get(message_index, set())
-                media_chunks = [
-                    chunk for chunk in text_chunks if chunk in media_sentinels
-                ]
-                non_media_chunks = [
-                    chunk for chunk in text_chunks if chunk not in media_sentinels
-                ]
+                media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
+                non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
                 text_chunks = media_chunks + non_media_chunks
             separator = ""
             message_modalities = media_modalities_by_message.get(message_index, set())

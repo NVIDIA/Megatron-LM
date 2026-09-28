@@ -367,32 +367,19 @@ class RADIOViTModel(VisionModule):
             )
 
         if self.separate_video_embedder and self.temporal_patch_dim > 1:
-            # Run at most one TP gather per embedder. Repeated gathered linear
-            # calls can reuse asynchronous collective scratch storage, causing
-            # retained outputs from earlier tubelets to be overwritten before
-            # they are concatenated.
-            embedded_chunks = [None] * len(x)
-            for image_flag, embedder in (
-                (True, self.embedder),
-                (False, self.video_embedder),
-            ):
-                chunk_indices = [
-                    index for index, flag in enumerate(is_image) if flag == image_flag
-                ]
-                if not chunk_indices:
-                    continue
-                chunk_lengths = [x[index].shape[1] for index in chunk_indices]
-                combined = torch.cat([x[index] for index in chunk_indices], dim=1)
-                combined_emb, _ = embedder(combined)
-                for index, emb in zip(
-                    chunk_indices,
-                    torch.split(combined_emb, chunk_lengths, dim=1),
-                ):
-                    embedded_chunks[index] = emb
-            assert all(chunk is not None for chunk in embedded_chunks)
-            x = torch.cat(
-                [chunk for chunk in embedded_chunks if chunk is not None], dim=1
-            )
+            # Compute image and video embeddings per temporal patch.
+            # x: list of [1, num_patches_for_chunk, 3TP^2 or 3P^2] where
+            # the hidden dimension is the flat concat of patch features
+            # and image -> embedder and video -> video_embedder.
+            local_chunks = [
+                (self.embedder if is_img else self.video_embedder)(
+                    chunk, runtime_gather_output=False
+                )[0]
+                for chunk, is_img in zip(x, is_image)
+            ]
+            # One all-gather for every chunk: back-to-back inference-optimized
+            # gathers on the shared symmetric buffer race across TP ranks.
+            x = self.embedder.gather_tensor_parallel_output(torch.cat(local_chunks, dim=1))
         else:
             x, _ = self.embedder(x)
 

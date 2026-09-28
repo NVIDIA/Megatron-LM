@@ -1281,6 +1281,7 @@ class ColumnParallelLinear(torch.nn.Module):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        inference_tp_ag_barrier: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1291,6 +1292,12 @@ class ColumnParallelLinear(torch.nn.Module):
                 weight tensor to use, compulsory when skip_weight_param_allocation is True.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `gather_output` arg in the constructor will be used.
+            inference_tp_ag_barrier (bool): Synchronizes consecutive AG launched via
+                ``multimem_all_gather`` for ``megatron.core.inference`` to prevent
+                AG multicast from overwriting the symmetric buffers before TP ranks
+                can copy-out the previous AG output. For more information, refer to
+                ``barrier_before`` in ``multimem_all_gather``
+                (``megatron.core.inference.communication.torch_symm_triton.collectives``).
 
         Returns:
             - output
@@ -1374,22 +1381,36 @@ class ColumnParallelLinear(torch.nn.Module):
             gather_output = runtime_gather_output
 
         if gather_output:
-            # All-gather across the partitions.
-            if self.use_inference_optimized_all_gather and not self.training:
-                # Deferred to avoid circular import: inference_layers → TE → layers.
-                from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
-
-                output = inference_all_gather_from_tensor_model_parallel_region(
-                    output_parallel, self.tp_group, self.config
-                )
-            else:
-                output = gather_from_tensor_model_parallel_region(
-                    output_parallel, group=self.tp_group
-                )
+            output = self.gather_tensor_parallel_output(
+                output_parallel, barrier_before=inference_tp_ag_barrier
+            )
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def gather_tensor_parallel_output(
+        self, output_parallel: torch.Tensor, barrier_before: bool = False
+    ) -> torch.Tensor:
+        """All-gather a partitioned output along the last dimension.
+
+        Args:
+            output_parallel: This rank's partition of the output, [..., output_size_per_partition].
+            barrier_before: Barrier before the inference-optimized all-gather overwrites the
+                shared symmetric buffer. Set it when this gather directly follows another
+                all-gather on that buffer. Ignored by the default NCCL all-gather.
+
+        Returns:
+            The gathered output, [..., output_size].
+        """
+        if self.use_inference_optimized_all_gather and not self.training:
+            # Deferred to avoid circular import: inference_layers → TE → layers.
+            from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
+
+            return inference_all_gather_from_tensor_model_parallel_region(
+                output_parallel, self.tp_group, self.config, barrier_before=barrier_before
+            )
+        return gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
 
     def backward_dw(self) -> None:
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled.
