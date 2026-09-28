@@ -1978,7 +1978,7 @@ def _worker_count_zeros_excludes_gtp_padding(rank, world_size, port):
         )
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 class TestGTPCountZerosExcludesPadding:
@@ -2058,7 +2058,7 @@ def _worker_bias_is_replicated(rank, world_size, port, gtp_remat_size):
         )
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 class TestGTPReplicatedBias:
@@ -2069,3 +2069,49 @@ class TestGTPReplicatedBias:
         biased at GTP_remat=2, with no error)."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_bias_is_replicated, 4, gtp_remat_size)
+
+
+_NO_CALCULATOR = object()
+
+
+class TestWgradAccumBatchScheduleGate:
+    """Pre-RS wgrad accumulation stays off when num_microbatches can change mid-run.
+
+    A rising consume count double-fires DDP grad-ready and drops that iteration's last
+    consume (see _is_last_expected_consume). CPU-only: the gate is decided at tagging time.
+    """
+
+    def _tag_output_layer(self, monkeypatch, schedule):
+        """Enabled flag for one output_layer param, under the calculator production builds."""
+        from types import SimpleNamespace
+
+        from megatron.core import num_microbatches_calculator as nmb
+
+        nmb.destroy_num_microbatches_calculator()
+        if schedule is not _NO_CALCULATOR:
+            nmb.init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=None if schedule else 32,
+                micro_batch_size=1,
+                data_parallel_size=1,
+                step_batch_size_schedule=schedule,
+            )
+        # The stub stands in for a GTPShardedParam; only the name drives the decision.
+        monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
+        param = SimpleNamespace()
+        try:
+            gtp_module.tag_gtp_params_with_names(
+                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
+            )
+        finally:
+            nmb.destroy_num_microbatches_calculator()
+        return param._wgrad_accum_enabled
+
+    @pytest.mark.parametrize(
+        "schedule, enabled",
+        # "THRESHOLD:BS THRESHOLD:BS ..." is what --step-batch-size-schedule takes.
+        [(None, True), ("0:16 1000:32", False), (_NO_CALCULATOR, True)],
+        ids=["fixed-batch", "step-schedule", "no-calculator"],
+    )
+    def test_gate(self, monkeypatch, schedule, enabled):
+        assert self._tag_output_layer(monkeypatch, schedule) is enabled

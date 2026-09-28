@@ -6,13 +6,40 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class _MockCPGroup:
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+@pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
+def test_resolve_runtime_cp_group(runtime_cp_size):
+    static_group = _MockCPGroup(8)
+    runtime_group = _MockCPGroup(runtime_cp_size)
+    packed_seq_params = PackedSeqParams(local_cp_size=runtime_cp_size, cp_group=runtime_group)
+
+    assert resolve_cp_group(static_group, packed_seq_params) is runtime_group
+
+
+def test_resolve_runtime_cp_group_requires_matching_group():
+    with pytest.raises(AssertionError, match="must be set"):
+        resolve_cp_group(_MockCPGroup(4), PackedSeqParams(local_cp_size=1))
+
+    with pytest.raises(AssertionError, match="must match"):
+        resolve_cp_group(
+            _MockCPGroup(4), PackedSeqParams(local_cp_size=2, cp_group=_MockCPGroup(1))
+        )
 
 
 def make_test_packed_seq_params(sequence_length):
@@ -208,7 +235,8 @@ class TestAttentionDynamicContextParallel:
     per-microbatch CP group at runtime via PackedSeqParams.cp_group. Two
     contracts must hold: RoPE position math must use that runtime group (not
     the static one), and TEDotProductAttention must lazily create its
-    auxiliary CP stream (the constructor only allocates it for static CP > 1).
+    auxiliary CP stream (the constructor only allocates it for static CP > 1)
+    while restoring its build-time state on every exit path.
     """
 
     def setup_method(self, method):
@@ -234,21 +262,29 @@ class TestAttentionDynamicContextParallel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _runtime_cp_group(self):
-        # A 1-rank group standing in for the group the hybrid-CP scheduler
-        # binds per microbatch; identity is what the assertions check.
-        return torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+    def _runtime_cp_group(self, size=2):
+        world_size = torch.distributed.get_world_size()
+        assert world_size % size == 0
+
+        rank = torch.distributed.get_rank()
+        local_group = None
+        for first_rank in range(0, world_size, size):
+            ranks = list(range(first_rank, first_rank + size))
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                local_group = group
+        assert local_group is not None
+        return local_group
 
     def test_rope_uses_runtime_cp_group(self, monkeypatch):
         import megatron.core.transformer.attention as attention_module
         from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
         captured = []
-        real_apply = attention_module.apply_rotary_pos_emb
 
         def spying_apply(t, freqs, **kwargs):
             captured.append(kwargs.get("cp_group"))
-            return real_apply(t, freqs, **kwargs)
+            return t
 
         monkeypatch.setattr(attention_module, "apply_rotary_pos_emb", spying_apply)
 
@@ -277,9 +313,9 @@ class TestAttentionDynamicContextParallel:
 
         build_time_group = self.parallel_attention.pg_collection.cp
 
-        # Microbatch with a runtime CP group: RoPE (and the collection) must
-        # use it.
-        runtime_group = self._runtime_cp_group()
+        # RoPE must use the runtime group without rebinding the shared
+        # process-group collection.
+        runtime_group = self._runtime_cp_group(size=2)
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         packed_seq_params.cp_group = runtime_group
         packed_seq_params.local_cp_size = 2
@@ -287,16 +323,19 @@ class TestAttentionDynamicContextParallel:
             hidden_states, None, rotary_pos_emb=rotary_pos_emb, packed_seq_params=packed_seq_params
         )
         assert captured and all(group is runtime_group for group in captured)
-        assert self.parallel_attention.pg_collection.cp is runtime_group
+        assert self.parallel_attention.pg_collection.cp is build_time_group
 
-        # Next microbatch without a runtime group (e.g. local_cp_size == 1):
-        # the build-time group must be restored, not the previous microbatch's.
+        # A CP1 microbatch still carries its singleton group. RoPE sees that
+        # group while the shared collection remains unchanged.
         captured.clear()
+        singleton_group = self._runtime_cp_group(size=1)
         packed_seq_params = make_test_packed_seq_params(sequence_length)
+        packed_seq_params.cp_group = singleton_group
+        packed_seq_params.local_cp_size = 1
         self.parallel_attention(
             hidden_states, None, rotary_pos_emb=rotary_pos_emb, packed_seq_params=packed_seq_params
         )
-        assert captured and all(group is build_time_group for group in captured)
+        assert captured and all(group is singleton_group for group in captured)
         assert self.parallel_attention.pg_collection.cp is build_time_group
 
     def test_te_cp_stream_lazily_created_for_runtime_cp_group(self, monkeypatch):
@@ -310,10 +349,10 @@ class TestAttentionDynamicContextParallel:
         # Model built with context_parallel_size == 1: constructor allocated no stream.
         monkeypatch.setattr(TEDotProductAttention, "cp_stream", None)
 
-        captured = {}
+        captured = []
 
         def fake_set_context_parallel_group(self, cp_group, ranks, stream, comm_type=None):
-            captured["stream"] = stream
+            captured.append((cp_group, ranks, stream))
 
         def fake_forward(self, query, *args, **kwargs):
             return torch.zeros(
@@ -334,7 +373,8 @@ class TestAttentionDynamicContextParallel:
         key = torch.zeros_like(query)
         value = torch.zeros_like(query)
         packed_seq_params = make_test_packed_seq_params(32)
-        packed_seq_params.cp_group = self._runtime_cp_group()
+        runtime_group = self._runtime_cp_group(size=2)
+        packed_seq_params.cp_group = runtime_group
         packed_seq_params.local_cp_size = 2
 
         core_attention(
@@ -346,50 +386,92 @@ class TestAttentionDynamicContextParallel:
             packed_seq_params=packed_seq_params,
         )
 
-        assert isinstance(captured.get("stream"), torch.cuda.Stream)
+        assert captured[0][0] is runtime_group
+        assert isinstance(captured[0][2], torch.cuda.Stream)
+        assert captured[-1] == (None, None, None)
         assert isinstance(TEDotProductAttention.cp_stream, torch.cuda.Stream)
 
+    def test_te_disables_cp_communication_for_singleton_runtime_group(self, monkeypatch):
+        import transformer_engine.pytorch as te_pytorch
 
-class TestRuntimeCPGroupContract:
-    """Guard the runtime-CP contract: local_cp_size == 1 means CP is off for
-    the sub-sample and cp_group must be None. A producer that starts binding
-    size-1 groups would silently route CP-off microbatches through the CP
-    attention path; this test makes that loud.
-    """
+        from megatron.core.extensions.transformer_engine import TEDotProductAttention
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            pipeline_dtype=torch.bfloat16,
-            autocast_dtype=torch.bfloat16,
+        core_attention = self.parallel_attention.core_attention
+        assert isinstance(core_attention, TEDotProductAttention)
+        monkeypatch.setattr(TEDotProductAttention, "cp_stream", None)
+
+        captured = []
+
+        def fake_set_context_parallel_group(self, cp_group, ranks, stream, comm_type=None):
+            captured.append((cp_group, ranks, stream))
+
+        def fake_forward(self, query, *args, **kwargs):
+            return torch.zeros(
+                (query.shape[0], query.shape[-2] * query.shape[-1]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+
+        monkeypatch.setattr(
+            te_pytorch.DotProductAttention,
+            "set_context_parallel_group",
+            fake_set_context_parallel_group,
         )
-        self.parallel_attention = SelfAttention(
-            transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-        )
+        monkeypatch.setattr(te_pytorch.DotProductAttention, "forward", fake_forward)
 
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    def test_cp_group_with_local_cp_size_one_is_rejected(self):
-        core_attention = self.parallel_attention.core_attention.cuda()
+        core_attention.cuda()
         query = torch.zeros(32, 4, 16, dtype=torch.bfloat16, device="cuda")
+        singleton_group = self._runtime_cp_group(size=1)
         packed_seq_params = make_test_packed_seq_params(32)
-        packed_seq_params.cp_group = torch.distributed.new_group(
-            ranks=[torch.distributed.get_rank()]
-        )
+        packed_seq_params.cp_group = singleton_group
         packed_seq_params.local_cp_size = 1
 
-        with pytest.raises(AssertionError, match="local_cp_size == 1"):
+        core_attention(
+            query,
+            torch.zeros_like(query),
+            torch.zeros_like(query),
+            None,
+            AttnMaskType.padding_causal,
+            packed_seq_params=packed_seq_params,
+        )
+
+        assert packed_seq_params.cp_group is singleton_group
+        assert captured
+        assert all(call == (None, None, None) for call in captured)
+        assert TEDotProductAttention.cp_stream is None
+
+    def test_te_restores_build_time_cp_state_when_forward_raises(self, monkeypatch):
+        import transformer_engine.pytorch as te_pytorch
+
+        from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+        core_attention = self.parallel_attention.core_attention
+        assert isinstance(core_attention, TEDotProductAttention)
+        monkeypatch.setattr(TEDotProductAttention, "cp_stream", None)
+
+        captured = []
+
+        def fake_set_context_parallel_group(self, cp_group, ranks, stream, comm_type=None):
+            captured.append((cp_group, ranks, stream))
+
+        def failing_forward(self, query, *args, **kwargs):
+            raise RuntimeError("synthetic TE failure")
+
+        monkeypatch.setattr(
+            te_pytorch.DotProductAttention,
+            "set_context_parallel_group",
+            fake_set_context_parallel_group,
+        )
+        monkeypatch.setattr(te_pytorch.DotProductAttention, "forward", failing_forward)
+
+        core_attention.cuda()
+        query = torch.zeros(32, 4, 16, dtype=torch.bfloat16, device="cuda")
+        runtime_group = self._runtime_cp_group(size=2)
+        packed_seq_params = make_test_packed_seq_params(32)
+        packed_seq_params.cp_group = runtime_group
+        packed_seq_params.local_cp_size = 2
+
+        with pytest.raises(RuntimeError, match="synthetic TE failure"):
             core_attention(
                 query,
                 torch.zeros_like(query),
@@ -398,3 +480,6 @@ class TestRuntimeCPGroupContract:
                 AttnMaskType.padding_causal,
                 packed_seq_params=packed_seq_params,
             )
+
+        assert captured[0][0] is runtime_group
+        assert captured[-1] == (None, None, None)
