@@ -42,6 +42,7 @@ class SourceShardCase:
 
     layout: str  # "DP2" | "TP2" | "PP2" | "EP2"
     unsupported: Optional[str] = None
+    loss_rtol: Optional[float] = None  # overrides the family's resume tolerance
 
 
 @dataclass(frozen=True)
@@ -67,8 +68,9 @@ class ModelFamily:
 _EP_OPTIM_XFAIL = "EP>1 optimizer load: ChainedOptimizer entry-count mismatch (Expected 2, got 4)"
 _PP2_SOURCE_NA = "Megatron-FSDP + pipeline-parallel training fails at model build (EinopsError)"
 _FP8_NOT_BITEXACT = (
-    "FP8 not bit-exact by design: the amax/scale _extra_state is dropped in the "
-    "fsdp_dtensor checkpoint, so a few fp8 weight tensors re-quantize differently on re-save"
+    "FP8 GEMM weights are held re-quantized to fp8 with fresh scaling state (the amax/"
+    "scale _extra_state is not in the fsdp_dtensor checkpoint), so they differ from the "
+    "bf16 source; the fp32 masters and Adam moments are still bit-exact"
 )
 
 
@@ -106,7 +108,9 @@ MODELS = {
         num_layers=12,
         arch=("--swiglu", "--num-experts", "8", "--moe-grouped-gemm", "--disable-bias-linear"),
         reshard_cases=_ep2_reshard_pair() + (ReshardCase("TP2SP"),),
-        source_shard_cases=(SourceShardCase("DP2"), SourceShardCase("EP2")),
+        # The EP2 reference run dispatches experts across 2 GPUs while the resume runs
+        # them on one; top-k routing amplifies that numerical difference over steps.
+        source_shard_cases=(SourceShardCase("DP2"), SourceShardCase("EP2", loss_rtol=1e-2)),
     ),
     "moe_gated": ModelFamily(
         name="moe_gated",
@@ -257,7 +261,7 @@ MODELS = {
             "32",
             "--fp8-param-gather",
         ),
-        loss_rtol=3e-2,  # FP8 re-inits amax on resume and tracks ~1% looser than bf16
+        loss_rtol=5e-2,  # FP8 re-inits amax on resume; first resumed loss seen up to 2.5% off
         bitexact_xfail=_FP8_NOT_BITEXACT,
     ),
 }

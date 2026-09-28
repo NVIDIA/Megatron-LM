@@ -39,8 +39,8 @@ dropout off); iterations 60 and 80 are converted and shared by every check.
 | `test_bitexact.py` | **Bit-exact vs the source** — load the converted checkpoint into a real classic model + `DistributedOptimizer`, then compare every model tensor, fp32 master, `exp_avg` / `exp_avg_sq` and per-parameter group hyperparameter (`step`, `betas`, …) against the original `fsdp_dtensor` checkpoint with `torch.equal`, with coverage checked both ways | 1 |
 | `test_resume.py` | **Resume continuity** — a classic job resumed from each converted checkpoint reproduces the FSDP run's `lm loss` (within `loss_rtol`) and LR (exactly) for 3 iterations | 1 |
 | `test_multiprocess_convert.py` | **Multi-process convert** — `torchrun --nproc_per_node 2` conversion is identical (tensors + `common.pt`) to the single-process one | CPU |
-| `test_reshard.py` | **Load-side reshard** — the converted checkpoint loads under TP2 / TP2+SP / PP2 / EP2 target layouts and continues the FSDP run | 2 |
-| `test_source_sharding.py` | **Source-side sharding** — an FSDP source trained on 2 GPUs (DP2 / TP2 / EP2) converts and resumes | 2 |
+| `test_reshard.py` | **Load-side reshard** — the converted checkpoint loads under TP2 / TP2+SP / PP2 / EP2 target layouts and continues the FSDP run (weights-only loads: first-iteration loss only) | 2 |
+| `test_source_sharding.py` | **Source-side sharding** — an FSDP source trained on 2 GPUs (DP2 / TP2 / EP2) converts bit-exactly and resumes | 2 |
 
 **Why both a bit-exact and a resume check.** The bit-exact check is the proof: the
 oracle is the FSDP checkpoint itself (read without any converter code, keyed by the
@@ -69,11 +69,14 @@ Each family in `registry.py` gates at least one converter transform:
 
 ## Known limitations (encoded as registry flags)
 
-- **`dense_fp8` bit-exact** — `xfail`: the amax/scale `_extra_state` is dropped by
-  design, so a few fp8 weight tensors re-quantize differently. Its resume check
-  passes under a looser `loss_rtol`.
+- **`dense_fp8` bit-exact** — `xfail`: its GEMM weights are held re-quantized to
+  fp8 with fresh scaling state (the amax/scale `_extra_state` is not in the
+  `fsdp_dtensor` checkpoint), so those model tensors differ from the bf16 source;
+  its fp32 masters and Adam moments are still bit-exact. Its resume check passes
+  under a looser `loss_rtol`.
 - **EP>1 optimizer reshard** (`moe_grouped`, `moe_gated`) — strict `xfail`
-  (`ChainedOptimizer` entry-count mismatch). The weights-only EP2 companion passes.
+  (`ChainedOptimizer` entry-count mismatch). The weights-only EP2 companion passes
+  (loss only: `--no-load-optim` also skips the LR-scheduler state).
 - **PP2 source sharding** — `skip`: Megatron-FSDP + pipeline-parallel *training*
   fails at model build, so no PP2 source can be produced.
 - **`mamba_hybrid` runs with `--eval-iters 0`**: Megatron-FSDP + Mamba crashes when

@@ -268,6 +268,18 @@ def run_bitexact_worker(
     return _parse_bitexact_json(fam.name, proc.stdout or "", log_path)
 
 
+def assert_bitexact(verdict: BitexactVerdict, family: str, iteration: int) -> None:
+    """Assert a bit-exact verdict is clean and non-vacuous."""
+    assert verdict.loaded_iteration == iteration
+    # Guard against a vacuous pass: every section must actually have been compared.
+    assert all(n > 0 for n in verdict.counts.values()), verdict.counts
+    assert not (verdict.mismatches or verdict.missing or verdict.unexpected), (
+        f"[{family}] not bit-exact vs the FSDP source ({verdict.counts}): "
+        f"mismatches={verdict.mismatches[:20]} missing={verdict.missing[:20]} "
+        f"unexpected={verdict.unexpected[:20]}"
+    )
+
+
 def diff_torch_dist(dir_a: Path, dir_b: Path) -> list:
     """Differences between two torch_dist checkpoint dirs: tensor keys, tensor values
     (``torch.equal``) and the ``common.pt`` payload. Empty list means identical.
@@ -333,7 +345,9 @@ def assert_loaded_at(text: str, iteration: int) -> None:
     )
 
 
-def compare_loss_lr(ref: IterMetrics, got: IterMetrics, *, loss_rtol: float) -> Optional[str]:
+def compare_loss_lr(
+    ref: IterMetrics, got: IterMetrics, *, loss_rtol: float, check_lr: bool = True
+) -> Optional[str]:
     """Compare a resumed iteration against the FSDP reference at the same iteration.
 
     Loss must match within ``loss_rtol``; LR must match ~exactly (optimizer +
@@ -343,31 +357,41 @@ def compare_loss_lr(ref: IterMetrics, got: IterMetrics, *, loss_rtol: float) -> 
     lr_rel = abs(got.learning_rate - ref.learning_rate) / max(abs(ref.learning_rate), 1e-12)
     if loss_rel > loss_rtol:
         return f"lm loss rel diff {loss_rel:.2e} > tol {loss_rtol:.2e}"
-    if lr_rel > 1e-6:
+    if check_lr and lr_rel > 1e-6:
         return f"learning rate rel diff {lr_rel:.2e}; expected an exact match"
     return None
 
 
 def check_resume(
-    fam, reference: Dict[int, IterMetrics], td_dir: Path, iteration: int, log_path: Path, **kw
+    fam,
+    reference: Dict[int, IterMetrics],
+    td_dir: Path,
+    iteration: int,
+    log_path: Path,
+    *,
+    loss_rtol: Optional[float] = None,
+    **kw,
 ) -> None:
     """Resume a classic job from ``td_dir`` and assert it continues the FSDP run.
 
     Every resumed iteration is compared, not just the first: the first post-load
     loss is a forward pass on the loaded weights, while the later ones also depend
     on the Adam step taken from the loaded masters, moments and step count. A
-    weights-only load (``with_optimizer=False``) starts from fresh moments, so only
-    its first iteration can match. Every comparison is printed before asserting.
+    weights-only load (``with_optimizer=False``) restores neither the moments nor
+    the LR-scheduler state, so only its first iteration's loss can match. Every
+    comparison is printed before asserting.
     """
     text = resume_classic(fam, td_dir, iteration, log_path, **kw)
     assert_loaded_at(text, iteration)
     resumed = parse_iter_metrics(text)
-    n_iters = config.RESUME_EXTRA_ITERS if kw.get("with_optimizer", True) else 1
+    loss_rtol = fam.loss_rtol if loss_rtol is None else loss_rtol
+    with_optimizer = kw.get("with_optimizer", True)
+    n_iters = config.RESUME_EXTRA_ITERS if with_optimizer else 1
     failures = []
     for it in range(iteration + 1, iteration + 1 + n_iters):
         assert it in resumed, f"[{fam.name}] no iteration {it} in {log_path}"
         ref, got = reference[it], resumed[it]
-        failure = compare_loss_lr(ref, got, loss_rtol=fam.loss_rtol)
+        failure = compare_loss_lr(ref, got, loss_rtol=loss_rtol, check_lr=with_optimizer)
         print(
             f"[{fam.name}] {log_path.stem} iter {it}: lm loss FSDP {ref.lm_loss:.6f} -> "
             f"resumed {got.lm_loss:.6f}, lr {ref.learning_rate:.6e} -> "
