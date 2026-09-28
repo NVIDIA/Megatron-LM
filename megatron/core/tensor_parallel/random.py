@@ -91,6 +91,13 @@ try:
 except ModuleNotFoundError:
     HAVE_TE = False
 
+try:
+    import spmd_types as spmd
+
+    HAVE_SPMD_TYPES = True
+except ImportError:
+    HAVE_SPMD_TYPES = False
+
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
@@ -329,8 +336,11 @@ class CudaRNGStatesTracker:
         try:
             yield
         finally:
-            # Throw a warning if cpu RNG state changed
-            if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
+            # Throw a warning if cpu RNG state changed. Comparing host RNG state is
+            # bookkeeping rather than model computation, so it is not type-checked.
+            with spmd.no_typecheck() if HAVE_SPMD_TYPES else contextlib.nullcontext():
+                cpu_rng_state_changed = not torch.all(cpu_rng_state == torch.get_rng_state()).item()
+            if cpu_rng_state_changed:
                 logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
             # Check if the current state name is the same as the desired state name.
             if self._current_state_name != name:

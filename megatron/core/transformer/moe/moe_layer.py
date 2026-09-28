@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -59,6 +60,13 @@ try:
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
+
+try:
+    import spmd_types as spmd
+
+    HAVE_SPMD_TYPES = True
+except ImportError:
+    HAVE_SPMD_TYPES = False
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
@@ -728,12 +736,18 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                assert (
-                    mlp_bias is None
-                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
+                # Only tensor parallelism is type-checked. Tokens cross onto the
+                # expert mesh here and come back on their original rank, so the
+                # combined output keeps the input's type.
+                with spmd.no_typecheck() if HAVE_SPMD_TYPES else nullcontext():
+                    dispatched_input, probs = self.dispatch(hidden_states, probs)
+                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                    assert (
+                        mlp_bias is None
+                    ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                    output = self.combine(output)
+                if HAVE_SPMD_TYPES and spmd.is_type_checking():
+                    spmd.assert_local_type_like(output, hidden_states)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
