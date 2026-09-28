@@ -410,6 +410,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             and "attn_proj" in self.config.offload_modules
         )
 
+        self.recompute_attention = (
+            self.config.recompute_granularity == 'selective'
+            and "attention" in self.config.recompute_modules
+        )
+
         # Output.
         self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
@@ -1338,8 +1343,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         return output_total
 
     def supports_two_stage_attention(self) -> bool:
-        """Specialized attention subclasses retain their atomic forward path."""
-        return type(self).forward is Attention.forward
+        """Specialized attention subclasses retain their atomic forward path.
+
+        Whole-block recomputation ("attention" in recompute_modules) also requires the
+        atomic path: the two-stage split calls forward_pre_attn_and_core_attn and
+        forward_post_core_attn separately (for overlap), bypassing forward() -- and the
+        checkpoint -- entirely, which would silently disable the requested recomputation.
+        """
+        return type(self).forward is Attention.forward and not self.recompute_attention
 
     def forward_pre_attn_and_core_attn(
         self,
@@ -1704,9 +1715,21 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         return output, bias
 
     @copy_signature(forward_pre_attn_and_core_attn)
-    def forward(self, *args, **kwargs):
+    def _forward(self, *args, **kwargs):
         """Run core attention followed by the output projection."""
         return self.forward_post_core_attn(self.forward_pre_attn_and_core_attn(*args, **kwargs))
+
+    @copy_signature(forward_pre_attn_and_core_attn)
+    def forward(self, hidden_states, *args, **kwargs):
+        """Run the full attention block, checkpointing it whole when requested during training."""
+        if self.recompute_attention and self.training:
+
+            def custom_forward(checkpointed_hidden_states):
+                return self._forward(checkpointed_hidden_states, *args, **kwargs)
+
+            return tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+
+        return self._forward(hidden_states, *args, **kwargs)
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):
