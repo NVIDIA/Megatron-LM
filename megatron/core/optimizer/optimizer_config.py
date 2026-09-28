@@ -267,7 +267,14 @@ class OptimizerConfig:
     """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
     ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
     from the Emerging-Optimizers revision pinned in ``pyproject.toml``. By default, Muon
-    orthogonalizes the Q, gate, K, and V projection matrices separately."""
+    orthogonalizes the Q, gate, K, and V projection matrices separately. MLA up-projections
+    are only split when ``muon_split_mla_qkv`` is also enabled."""
+
+    muon_split_mla_qkv: bool = False
+    """Whether to split MLA up-projection weights (MLA, Absorbed MLA, and DSv4 hybrid attention
+    query/key-value up-projections) for Muon. Requires ``muon_split_qkv``. When disabled, these
+    weights are orthogonalized as whole matrices. Combine with ``muon_split_qkv_per_head`` to
+    orthogonalize each MLA head independently."""
 
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""

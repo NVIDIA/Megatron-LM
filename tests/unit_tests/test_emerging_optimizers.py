@@ -752,6 +752,7 @@ class TestMuonOptimizerMultiRankTP:
             use_distributed_optimizer=False,
             muon_split_qkv=True,
             muon_split_qkv_per_head=split_per_head,
+            muon_split_mla_qkv=True,
             muon_tp_mode="blockwise",
         )
 

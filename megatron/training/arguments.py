@@ -3338,7 +3338,15 @@ def _add_regularization_args(parser):
         help='Orthogonalize each Q, gate, K, and V head independently. '
         'Uniform head sizes use the batched Newton-Schulz implementation from '
         'the emerging-optimizers revision pinned in pyproject.toml. By default, '
-        'Q, gate, K, and V projections are orthogonalized separately',
+        'Q, gate, K, and V projections are orthogonalized separately. '
+        'MLA up-projections additionally require --muon-split-mla-qkv',
+    )
+    group.add_argument(
+        '--muon-split-mla-qkv',
+        action='store_true',
+        help='Split MLA up-projection weights into their per-head projection slices for Muon. '
+        'By default MLA up-projections are orthogonalized as whole matrices. '
+        'Combine with --muon-split-qkv-per-head to orthogonalize each MLA head independently',
     )
     group.add_argument(
         '--muon-nesterov',

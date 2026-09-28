@@ -150,12 +150,14 @@ class QKVLayout:
     ``projection_split_shapes`` describes the projection slices repeated in every group.
     ``per_head_split_shapes`` describes the independently orthogonalizable head slices in the
     same group. Standard fused QKV has one group per query group, while MLA up-projections have
-    one group per attention head.
+    one group per attention head. ``is_mla`` marks MLA-style up-projection layouts, which Muon
+    only splits when ``muon_split_mla_qkv`` is enabled.
     """
 
     num_groups: int
     projection_split_shapes: tuple[int, ...]
     per_head_split_shapes: tuple[int, ...]
+    is_mla: bool = False
 
     @classmethod
     def from_transformer_config(cls, config: TransformerConfig) -> 'QKVLayout':
@@ -178,11 +180,12 @@ class QKVLayout:
 
     @classmethod
     def from_splits(cls, num_groups: int, split_shapes: tuple[int, ...]) -> 'QKVLayout':
-        """Build a layout whose projection slices are repeated once per attention head."""
+        """Build an MLA-style layout whose projection slices repeat once per attention head."""
         return cls(
             num_groups=num_groups,
             projection_split_shapes=split_shapes,
             per_head_split_shapes=split_shapes,
+            is_mla=True,
         )
 
 

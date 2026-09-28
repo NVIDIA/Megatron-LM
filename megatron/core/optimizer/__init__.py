@@ -772,6 +772,8 @@ def _get_megatron_emerging_optimizer(
         raise ValueError('emerging optimizer with fp16 is not supported.')
     if config.muon_split_qkv_per_head and not config.muon_split_qkv:
         raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
+    if config.muon_split_mla_qkv and not config.muon_split_qkv:
+        raise ValueError("muon_split_mla_qkv requires muon_split_qkv=True")
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -786,6 +788,9 @@ def _get_megatron_emerging_optimizer(
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
             qkv_layout = getattr(param, 'qkv_layout', None)
+            if qkv_layout is not None and qkv_layout.is_mla and not config.muon_split_mla_qkv:
+                # MLA up-projections are opt-in; keep whole-matrix orthogonalization by default.
+                continue
             if (qkv_layout is not None or 'linear_qkv.weight' in name) and len(param.shape) == 2:
                 if qkv_layout is not None:
                     qkv_split_shapes = _get_qkv_split_shapes(
