@@ -439,6 +439,64 @@ class TestNativeHPostBDA:
 class TestFusedHPostBDA:
     """Public fused h_post_bda dispatch/fallback plus numerical correctness."""
 
+    @pytest.mark.parametrize("with_bias", [False, True])
+    @pytest.mark.parametrize("backend", ["triton", "cutile", "native"])
+    @pytest.mark.parametrize("output_dtype", [None, torch.bfloat16])
+    def test_fp32_coefficients_with_bf16_activations(
+        self, monkeypatch, with_bias, backend, output_dtype
+    ):
+        """Direct BF16 output preserves FP32 mixing and coefficient gradients."""
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        if backend == "triton" and kernels._get_triton_h_post_bda_fwd() is None:
+            pytest.skip("Triton mHC is unavailable")
+        if backend == "cutile" and not kernels.is_cutile_available():
+            pytest.skip("cuTile mHC is unavailable")
+        if backend != "triton":
+            monkeypatch.setattr(kernels, "_get_triton_h_post_bda_fwd", lambda: None)
+            monkeypatch.setattr(kernels, "_get_triton_h_post_bda_bwd", lambda: None)
+        if backend == "native":
+            monkeypatch.setattr(kernels, "is_cutile_available", lambda: False)
+        torch.manual_seed(2441)
+        hr = torch.randn(2, 1, 4, 4, device=DEVICE, dtype=torch.float32, requires_grad=True)
+        hp = torch.randn(2, 1, 4, device=DEVICE, dtype=torch.float32, requires_grad=True)
+        orig = torch.randn(2, 1, 4, 32, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        x = torch.randn(2, 1, 32, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        bias = (
+            torch.randn(32, device=DEVICE, dtype=DTYPE, requires_grad=True) if with_bias else None
+        )
+        inputs = (hr, orig, hp, x) + ((bias,) if with_bias else ())
+        refs = tuple(value.detach().clone().requires_grad_() for value in inputs)
+        rhr, rorig, rhp, rx = refs[:4]
+        rbias = refs[4] if with_bias else None
+        raw = kernels.fused_h_post_bda(hr, orig, hp, x, bias, output_dtype=output_dtype)
+        assert raw.dtype == (output_dtype or hr.dtype)
+        incoming_dtypes = []
+        raw.register_hook(lambda grad: incoming_dtypes.append(grad.dtype))
+        actual = raw.to(DTYPE)
+        mixed = (rhr.unsqueeze(-1) * rorig.float().unsqueeze(-2)).sum(-3)
+        branch = rx.float() if rbias is None else rx.float() + rbias.float()
+        expected = (mixed + rhp.unsqueeze(-1) * branch.unsqueeze(-2)).to(DTYPE)
+        torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
+        probe = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, inputs, probe)
+        assert incoming_dtypes == [raw.dtype]
+        expected_grads = torch.autograd.grad(expected, refs, probe)
+        for value, reference, parameter in zip(actual_grads, expected_grads, inputs):
+            assert value.dtype == parameter.dtype
+            torch.testing.assert_close(value, reference, rtol=8e-3, atol=8e-3)
+        if output_dtype is not None:
+            # A/B against the old FP32-output + external-cast graph with the
+            # same BF16 upstream values, independently of the formula oracle.
+            old_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
+            old = kernels.fused_h_post_bda(
+                *old_inputs[:4], old_inputs[4] if with_bias else None
+            ).to(DTYPE)
+            torch.testing.assert_close(actual, old, rtol=0, atol=0)
+            old_grads = torch.autograd.grad(old, old_inputs, probe)
+            for value, reference in zip(actual_grads, old_grads):
+                torch.testing.assert_close(value, reference, rtol=2e-6, atol=2e-6)
+
     def test_forward_uses_h_res_transpose(self):
         from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
 

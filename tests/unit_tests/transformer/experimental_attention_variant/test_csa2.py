@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -35,6 +36,7 @@ from megatron.core.packed_seq_params import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import csa
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
     Compressor,
@@ -168,6 +170,11 @@ def _reference_norm(x, weight, eps):
     return (xf * (xf.square().mean(-1, keepdim=True) + eps).rsqrt() * weight).to(x.dtype)
 
 
+def _reference_indexer_rope(x, config, ratio, position_stride=1):
+    """Native indexer uses FP32 rotation followed by one activation-dtype cast."""
+    return _reference_rope(x.float(), config, ratio, position_stride=position_stride).to(x.dtype)
+
+
 def _reference(x, weights, config, ratio):
     """Dense oracle including the grouped output projection and indexer score graph."""
 
@@ -215,9 +222,9 @@ def _reference(x, weights, config, ratio):
         index_q = linear(qr, prefix + "linear_wq_b").reshape(
             seq_len, batch, config.dsa_indexer_n_heads, config.dsa_indexer_head_dim
         )
-        index_q = _reference_rope(index_q, config, ratio)
+        index_q = _reference_indexer_rope(index_q, config, ratio)
         index_k = norm(linear(latent, prefix + "linear_wk"), prefix + "k_norm")
-        index_k = _reference_rope(index_k, config, ratio, position_stride=ratio)
+        index_k = _reference_indexer_rope(index_k, config, ratio, position_stride=ratio)
         index_weights = linear(x, prefix + "linear_weights_proj").float()
         index_scores = torch.einsum("sbhd,tbd->bsht", index_q.float(), index_k.float()).relu()
         index_scores = (
@@ -345,6 +352,94 @@ def test_bf16_conversion_keeps_only_sink_in_fp32(pg_collection):
     ratio_one = _layer(pg_collection, 1, torch.bfloat16).core_attention.compressor
     assert ratio_one.linear_wkv.weight.dtype == torch.bfloat16
     assert ratio_one.linear_wgate is None
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("fp8_param", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_compressor_and_indexer_preserve_bf16_under_fp8(pg_collection, ratio, fp8_param, packed):
+    """Exercise real TE init/autocast: protected GEMMs stay BF16, Q remains FP8."""
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    config = _make_config(
+        params_dtype=torch.bfloat16,
+        use_cpu_initialization=False,
+        num_layers=1,
+        csa_compress_ratios=[ratio],
+        csa2_kv_source_layers=[0],
+        csa2_index_source_layers=[0],
+        csa2_candidate_source_layer=None,
+        csa2_candidate_topk_blocks=0,
+        csa2_candidate_block_size=0,
+        hidden_size=128,
+        q_lora_rank=64,
+        v_head_dim=128,
+        dsa_indexer_n_heads=32,
+        dsa_indexer_head_dim=128,
+        fp8="hybrid",
+        fp8_recipe="tensorwise",
+        fp8_param=fp8_param,
+    )
+    with get_fp8_context(config, is_init=True):
+        layer = build_module(
+            get_experimental_attention_variant_module_spec(config),
+            config=config,
+            layer_number=1,
+            pg_collection=pg_collection,
+        ).cuda()
+    compressor, indexer = layer.core_attention.compressor, layer.core_attention.indexer
+    protected = {
+        "wkv": compressor.linear_wkv,
+        "wk": indexer.linear_wk,
+        "weights": indexer.linear_weights_proj,
+    }
+    if ratio == 2:
+        protected["wgate"] = compressor.linear_wgate
+    for linear in protected.values():
+        assert not is_float8tensor(linear.weight)
+        assert linear.weight.dtype == torch.bfloat16
+    assert is_float8tensor(indexer.linear_wq_b.weight) == fp8_param
+
+    calls = {}
+
+    def record_linear(name):
+        def record(module, args, output):
+            calls[name] = (FP8GlobalStateManager.is_fp8_enabled(), args[0].dtype, output[0].dtype)
+
+        return record
+
+    handles = [
+        linear.register_forward_hook(record_linear(name))
+        for name, linear in {**protected, "q": indexer.linear_wq_b}.items()
+    ]
+    x = torch.randn(64, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    qr = torch.randn(64, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    metadata = {}
+    if packed:
+        params, _, _ = _packed([32, 32], [32, 32], device="cuda")
+        metadata["thd_layout"] = build_csa2_thd_layout(params, x.shape[0])
+    try:
+        with get_fp8_context(config):
+            assert FP8GlobalStateManager.is_fp8_enabled()
+            latent = compressor(x, thd_layout=metadata.get("thd_layout"))
+            if packed:
+                latent, metadata["compressed_layout"] = latent
+            q, k, weights = indexer._project_inputs(
+                x, qr, latent, layer.core_attention.rotary_pos_emb, **metadata
+            )
+            assert FP8GlobalStateManager.is_fp8_enabled(), "Must restore the outer FP8 context"
+        sum(t.float().square().mean() for t in (latent, q, k, weights)).backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert calls == {
+        **{name: (False, torch.bfloat16, torch.bfloat16) for name in protected},
+        "q": (True, torch.bfloat16, torch.bfloat16),
+    }
+    for tensor in (x, qr, *(linear.weight for linear in protected.values())):
+        assert tensor.grad is not None
+        assert tensor.grad.dtype == torch.bfloat16
+        assert torch.isfinite(tensor.grad).all()
 
 
 @pytest.mark.parametrize("layer_number", [3, 5, 6])
@@ -495,7 +590,9 @@ def _reference_layer(x, weights, config, layer_idx, state):
             state["global_kv"] = _reference_rope(latent, config, ratio, position_stride=ratio)
             prefix = "core_attention.indexer."
             index_k = norm(linear(latent, prefix + "linear_wk"), prefix + "k_norm")
-            state["indexer_k"] = _reference_rope(index_k, config, ratio, position_stride=ratio)
+            state["indexer_k"] = _reference_indexer_rope(
+                index_k, config, ratio, position_stride=ratio
+            )
         global_len = state["global_kv"].shape[0]
         causal = torch.arange(global_len, device=x.device) < (query_positions + 1) // ratio
         if layer_idx in config.csa2_index_source_layers:
@@ -503,7 +600,7 @@ def _reference_layer(x, weights, config, layer_idx, state):
             q_index = linear(qr, prefix + "linear_wq_b").reshape(
                 seq_len, batch, config.dsa_indexer_n_heads, config.dsa_indexer_head_dim
             )
-            q_index = _reference_rope(q_index, config, ratio)
+            q_index = _reference_indexer_rope(q_index, config, ratio)
             scores = torch.einsum(
                 "sbhd,tbd->bsht", q_index.float(), state["indexer_k"].float()
             ).relu()
@@ -1528,6 +1625,10 @@ class _RMSNorm(nn.Module):
 
 def _config(dtype):
     return SimpleNamespace(
+        fp8=None,
+        fp4=None,
+        fp8_param=False,
+        fp4_param=False,
         attention_backend="unfused",
         dsa_kernel_backend="none",
         params_dtype=dtype,
@@ -2277,7 +2378,9 @@ def test_packed_indexer_key_projection_preserves_owner_gradients_and_input(ratio
     projected = F.linear(safe_latent.float(), wk).to(dtype)
     xf = projected.float()
     normalized = (xf * (xf.square().mean(-1, keepdim=True) + 1e-20).rsqrt() * gamma).to(dtype)
-    expected = _rope_reference(normalized, config, rotary, layout.position_ids, layout.valid_groups)
+    expected = _rope_reference(
+        normalized.float(), config, rotary, layout.position_ids, layout.valid_groups
+    ).to(dtype)
     tolerance = dict(atol=3e-6, rtol=3e-5)
     if dtype == torch.bfloat16:
         tolerance = dict(atol=2e-2, rtol=3e-2)
@@ -3205,6 +3308,60 @@ def _kernel_indexer(ratio, precision, heads, device):
     # Exercise the adapter independently of config validation and main attention.
     indexer.use_fused_kernels, indexer.precision = True, precision
     return indexer
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_bf16_indexer_rotates_q_and_k_in_fp32(monkeypatch, fused, packed, ratio):
+    """RoPE must not reintroduce BF16 trig/product rounding before selection."""
+    _require_candidate_kernels()
+    torch.manual_seed(817)
+    indexer = _kernel_indexer(ratio, "bf16", 32, "cuda")
+    indexer.config.apply_rope_fusion = fused
+    rotary = _rotary_module(indexer.config, False, indexer.cp_group)
+    layout = compressed = None
+    length = 12
+    valid = torch.ones(length, device="cuda", dtype=torch.bool)
+    positions = torch.arange(length, device="cuda")
+    key_positions = torch.arange(length // ratio, device="cuda") * ratio
+    key_valid = torch.ones(length // ratio, device="cuda", dtype=torch.bool)
+    if packed:
+        params, _, valid = _packed([3, 7], [4, 8], device="cuda")
+        layout = build_csa2_thd_layout(params, length)
+        compressed = layout.for_compression(ratio)
+        positions, key_positions, key_valid = (
+            layout.position_ids,
+            compressed.position_ids,
+            compressed.valid_groups,
+        )
+    x = torch.randn(length, 1, 6, device="cuda", dtype=torch.bfloat16)
+    qr = torch.randn(length, 1, 4, device="cuda", dtype=torch.bfloat16)
+    latent = torch.randn(key_positions.numel(), 1, 8, device="cuda", dtype=torch.bfloat16)
+    q0 = indexer.linear_wq_b(qr.masked_fill(~valid[:, None, None], 0))[0].reshape(
+        length, 1, 32, 128
+    )
+    k0 = indexer.k_norm(indexer.linear_wk(latent.masked_fill(~key_valid[:, None, None], 0))[0])
+    expected_q = _rope_reference(q0.float(), indexer.config, rotary, positions, valid).bfloat16()
+    expected_k = _rope_reference(
+        k0.float(), indexer.config, rotary, key_positions, key_valid
+    ).bfloat16()
+    fused_dtypes = []
+    apply_fused = csa._apply_fused_rope
+
+    def record_fused(x, cos, sin, *args, **kwargs):
+        fused_dtypes.append((x.dtype, cos.dtype, sin.dtype))
+        return apply_fused(x, cos, sin, *args, **kwargs)
+
+    monkeypatch.setattr(csa, "_apply_fused_rope", record_fused)
+    actual_q, actual_k, _ = indexer._project_inputs(
+        x, qr, latent, rotary, thd_layout=layout, compressed_layout=compressed
+    )
+    if packed:
+        expected_q, expected_k = expected_q.squeeze(1), expected_k.squeeze(1)
+    torch.testing.assert_close(actual_q, expected_q, atol=0, rtol=0)
+    torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
+    assert fused_dtypes == ([(torch.bfloat16, torch.float32, torch.float32)] * 2 if fused else [])
 
 
 @pytest.mark.parametrize("ratio", [1, 2])

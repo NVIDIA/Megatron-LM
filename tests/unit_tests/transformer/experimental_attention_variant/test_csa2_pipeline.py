@@ -194,7 +194,7 @@ def test_prepared_specs_need_no_device_values(use_fused_mhc, max_seqlen, single_
         )
         assert ("pre_mix" in specs) == single_pass
         if single_pass:
-            assert specs["pre_mix"].dtype == (torch.bfloat16 if use_fused_mhc else torch.float32)
+            assert specs["pre_mix"].dtype == torch.float32
         assert descriptor.metadata == (chunk.outgoing.layer_offset, max_seqlen)
         if chunk.outgoing.compress_ratio == 2 and max_seqlen < 2:
             assert specs["global_kv"].shape[0] == 0

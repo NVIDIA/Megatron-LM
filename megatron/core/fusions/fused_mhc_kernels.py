@@ -551,12 +551,18 @@ if _TRITON_AVAILABLE:
             )
 
     def _triton_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        output_dtype: torch.dtype | None = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         dev = h_res.device
-        out = torch.empty(sb, n, C, dtype=h_res.dtype, device=dev)
+        out = torch.empty(sb, n, C, dtype=output_dtype or h_res.dtype, device=dev)
         hr_flat = h_res.contiguous().view(sb, n, n)
         orig_flat = original_residual.contiguous().view(sb, n, C)
         hp_flat = h_post.contiguous().view(sb, n)
@@ -1193,6 +1199,10 @@ if _CUTILE_AVAILABLE:
                 x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO
             )
             bias_tile = ct.load(bias, index=(ct_idx,), shape=(TILE_C,), padding_mode=PAD_ZERO)
+            if hr.dtype == ct.float32 or hp.dtype == ct.float32:
+                # Keep the bias addition in the same precision as the mixing.
+                x_tile = x_tile.astype(ct.float32)
+                bias_tile = bias_tile.astype(ct.float32)
             xb_exp = ct.expand_dims(x_tile + bias_tile, axis=1)  # (TILE_SIZE, 1, TILE_C)
             out_tile = hp_exp * xb_exp  # (TILE_SIZE, N, TILE_C)
             for j in range(N):
@@ -1254,6 +1264,10 @@ if _CUTILE_AVAILABLE:
             go_tile = ct.load(
                 go, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
+            # Direct BF16 output also supplies BF16 grad_output. Preserve the
+            # FP32 coefficient-gradient products without a full gradient cast.
+            if g_hr.dtype == ct.float32 or g_hp.dtype == ct.float32:
+                go_tile = go_tile.astype(ct.float32)
             orig_tile = ct.load(
                 orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
@@ -1281,10 +1295,15 @@ if _CUTILE_AVAILABLE:
                 x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO
             )
             bias_tile = ct.load(bias, index=(ct_idx,), shape=(TILE_C,), padding_mode=PAD_ZERO)
+            if g_hr.dtype == ct.float32 or g_hp.dtype == ct.float32:
+                x_tile = x_tile.astype(ct.float32)
+                bias_tile = bias_tile.astype(ct.float32)
             xb_exp = ct.expand_dims(x_tile + bias_tile, axis=1)  # [TS, 1, TC]
             go_tile = ct.load(
                 go, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
+            if g_hr.dtype == ct.float32 or g_hp.dtype == ct.float32:
+                go_tile = go_tile.astype(ct.float32)
             orig_tile = ct.load(
                 orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
@@ -1309,12 +1328,18 @@ if _CUTILE_AVAILABLE:
     _hpb_bwd_g_hp_hr_best_cfg: dict = {}
 
     def _cutile_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        output_dtype: torch.dtype | None = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         stream = torch.cuda.current_stream()
-        out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
+        out = torch.empty(sb, n, C, dtype=output_dtype or h_res.dtype, device=h_res.device)
         hr_flat = h_res.view(sb, n, n)
         orig_flat = original_residual.view(sb, n, C)
         hp_flat = h_post.view(sb, n)
@@ -1492,9 +1517,9 @@ if _CUTILE_AVAILABLE:
                 A, index=(tile_m_id, tile_k_id), shape=(TILE_M, TILE_K), padding_mode=PAD_ZERO
             )
             b_tile = ct.load(B, index=(0, tile_k_id), shape=(TILE_N, TILE_K), padding_mode=PAD_ZERO)
-            acc = ct.mma(
-                a_tile.astype(ct.tfloat32), b_tile.transpose().astype(ct.tfloat32), acc=acc
-            )
+            # FP32 mapping parameters must retain their mantissa in the MMA;
+            # FP32 accumulation cannot recover weights rounded to TF32.
+            acc = ct.mma(a_tile.astype(ct.float32), b_tile.transpose().astype(ct.float32), acc=acc)
             # Square in fp32: a bf16 square/reduction loses ~2e-3 relative on the
             # RMS scale, which native (fp32) does not.
             a_tile_f32 = a_tile.astype(ct.float32)
@@ -2144,14 +2169,14 @@ if _CUTILE_AVAILABLE:
             inv_rK = 1.0 / (ct.where(ct.less(0.0, r_tile), r_tile, 1.0) * K)
             acc_grad_x = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
             acc_grad_x = ct.mma(
-                grad_proj_tile.astype(ct.tfloat32), weight_tile.astype(ct.tfloat32), acc=acc_grad_x
+                grad_proj_tile.astype(ct.float32), weight_tile.astype(ct.float32), acc=acc_grad_x
             )
             ct.store(GRAD_X, index=(tile_m_id, tile_k_id), tile=acc_grad_x.astype(GRAD_X.dtype))
 
             # Accumulate grad_weight += x.T @ grad_proj
             acc_grad_weight = ct.mma(
-                x_tile.transpose().astype(ct.tfloat32),
-                grad_proj_tile.astype(ct.tfloat32),
+                x_tile.transpose().astype(ct.float32),
+                grad_proj_tile.astype(ct.float32),
                 acc=acc_grad_weight,
             )
 
@@ -2318,8 +2343,8 @@ if _CUTILE_AVAILABLE:
                     )
 
                     accumulator_db = ct.mma(
-                        x_tile.transpose().astype(ct.tfloat32),
-                        grad_proj_tile.astype(ct.tfloat32),
+                        x_tile.transpose().astype(ct.float32),
+                        grad_proj_tile.astype(ct.float32),
                         acc=accumulator_db,
                     )
 
@@ -2374,8 +2399,8 @@ if _CUTILE_AVAILABLE:
                     padding_mode=zero_pad,
                 )
                 accumulator_da = ct.mma(
-                    grad_proj_tile.astype(ct.tfloat32),
-                    weight_tile.astype(ct.tfloat32),
+                    grad_proj_tile.astype(ct.float32),
+                    weight_tile.astype(ct.float32),
                     acc=accumulator_da,
                 )
                 ct.store(
@@ -2809,6 +2834,12 @@ def _torch_h_post_bda_bwd(
     hp = h_post.reshape(sb, n)
     x_flat = x.reshape(sb, C)
 
+    if h_res.dtype != original_residual.dtype:
+        # The single-pass path retains FP32 coefficients and casts activations
+        # only after mixing. Its fallback backward must use compatible operands.
+        mix_dtype = torch.promote_types(h_res.dtype, original_residual.dtype)
+        go, hr, orig, hp, x_flat = (value.to(mix_dtype) for value in (go, hr, orig, hp, x_flat))
+
     g_hr = torch.bmm(orig, go.transpose(1, 2)).view(s, b, n, n)
     g_res = torch.bmm(hr, go).view(s, b, n, C)
     g_x = torch.sum(go * hp.unsqueeze(-1), dim=1).view(s, b, C)
@@ -3051,7 +3082,10 @@ class FusedHAggregateInto(torch.autograd.Function):
         elif is_cutile_available():
             output = _cutile_h_aggregate_fwd(x, h_pre, out)
         else:
-            torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+            if h_pre.dtype == torch.float32 and x.dtype in (torch.bfloat16, torch.float16):
+                out.copy_(torch.sum(x.float() * h_pre.unsqueeze(-1), dim=2))
+            else:
+                torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
             output = out
         ctx.save_for_backward(x, h_pre)
         return output
@@ -3078,15 +3112,22 @@ class FusedHPostBDA(torch.autograd.Function):
         h_post: Tensor,
         x: Tensor,
         bias: Optional[Tensor],
+        output_dtype: torch.dtype | None,
     ):
         """Run h_post_bda forward using the best available backend."""
         triton_fwd = _get_triton_h_post_bda_fwd()
         if triton_fwd is not None:
-            output = triton_fwd(h_res, original_residual, h_post, x, bias)
+            output = triton_fwd(
+                h_res, original_residual, h_post, x, bias, output_dtype=output_dtype
+            )
         elif is_cutile_available():
-            output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
+            output = _cutile_h_post_bda_fwd(
+                h_res, original_residual, h_post, x, bias, output_dtype=output_dtype
+            )
         else:
             output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+            if output_dtype is not None:
+                output = output.to(output_dtype)
         if bias is not None:
             ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
             ctx.has_bias = True
@@ -3106,10 +3147,12 @@ class FusedHPostBDA(torch.autograd.Function):
 
         triton_bwd = _get_triton_h_post_bda_bwd()
         if triton_bwd is not None:
-            return triton_bwd(grad_output, h_res, orig_res, h_post, x, bias)
-        if is_cutile_available():
-            return _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
-        return _torch_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
+            grads = triton_bwd(grad_output, h_res, orig_res, h_post, x, bias)
+        elif is_cutile_available():
+            grads = _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
+        else:
+            grads = _torch_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
+        return (*grads, None)
 
 
 def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
@@ -3144,13 +3187,24 @@ def fused_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
 
 
 def fused_h_post_bda(
-    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+    h_res: Tensor,
+    original_residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+    *,
+    output_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """Fused H_res.T @ residual + H_post * (x + bias)."""
+    """Fused H_res.T @ residual + H_post * (x + bias).
+
+    ``output_dtype`` lets fused kernels cast on store while keeping FP32 mixing
+    coefficients. When omitted, the existing backend output dtype is preserved.
+    """
     _raise_mhc_backend_validation_error()
     if x.is_cuda and x.numel() and (_TRITON_AVAILABLE or is_cutile_available()):
-        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
-    return native_h_post_bda(h_res, original_residual, h_post, x, bias)
+        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias, output_dtype)
+    output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+    return output.to(output_dtype) if output_dtype is not None else output
 
 
 def fused_proj_rms_compute_h(

@@ -565,6 +565,7 @@ def _apply_rope(
     max_seqlen_rope: Optional[int] = None,
     *,
     inplace: bool = True,
+    rotary_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Apply RoPE to the last ``pos_dim`` dims, leaving the rest unchanged.
 
@@ -585,6 +586,9 @@ def _apply_rope(
         max_seqlen_rope: pre-computed ``max(seg_lens) * ratio`` for the
             THD + ``ratio > 1`` path (avoids a GPU→CPU sync when the
             caller already knows the max original sequence length).
+        rotary_dtype: optional fused cos/sin table dtype, independent of the
+            activation dtype. FP32 tables give BF16 activations FP32 rotation
+            arithmetic inside the kernel without a full activation cast.
     """
     if x.shape[0] == 0:
         return x
@@ -603,12 +607,13 @@ def _apply_rope(
     use_fused = config.apply_rope_fusion
 
     if use_fused:
+        table_dtype = rotary_dtype or x.dtype
         # ``mscale=1.0`` keeps the cached cos/sin free of yarn's
         # concentration factor so the fused kernel matches the unfused
         # split-rotate path (DSv4 "pure rotation" contract).
         if packed_seq:
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
-                max_total, dtype=x.dtype, packed_seq=True, mscale=1.0
+                max_total, dtype=table_dtype, packed_seq=True, mscale=1.0
             )
             if ratio > 1:
                 cos = cos[:max_total:ratio]
@@ -616,7 +621,7 @@ def _apply_rope(
         else:
             total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
-                total, dtype=x.dtype, packed_seq=False, mscale=1.0
+                total, dtype=table_dtype, packed_seq=False, mscale=1.0
             )
             if ratio > 1:
                 cos = cos[:total:ratio][:rotary_seq_len]

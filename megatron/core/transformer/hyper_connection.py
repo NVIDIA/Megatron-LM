@@ -60,8 +60,8 @@ class SinglePassMHCState:
     def contract(self, hidden_states: Tensor, n: int, *, use_fused: bool = False) -> Tensor:
         """Contract flattened ``[s, b, n*C]`` streams using the preceding mix.
 
-        Native mixing uses FP32 arithmetic; fused mixing follows DSv4 by casting
-        coefficients to the activation dtype. At stack exit, the last FFN's mix
+        Both paths retain FP32 coefficients until the mixed activation is cast
+        back to the input dtype. At stack exit, the last FFN's mix
         supplies the contraction without learned head parameters.
         """
         if n < 1 or hidden_states.ndim != 3 or hidden_states.shape[-1] % n:
@@ -78,7 +78,7 @@ class SinglePassMHCState:
         if use_fused:
             from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
 
-            return fused_h_aggregate(streams, self.pre_mix.to(hidden_states.dtype))
+            return fused_h_aggregate(streams, self.pre_mix.float()).to(hidden_states.dtype)
         return (
             (streams.float() * self.pre_mix.float().unsqueeze(-1)).sum(-2).to(hidden_states.dtype)
         )
@@ -101,7 +101,7 @@ class SinglePassMHCStateCodec:
         return TensorField(
             f"mhc.decoder/pre_mix:L{source}",
             (*shape, config.num_residual_streams),
-            dtype or (config.params_dtype if config.use_fused_mhc else torch.float32),
+            dtype or torch.float32,
             "sbn",
             differentiable,
             present,
@@ -396,8 +396,10 @@ def native_h_post_bda(
 ) -> Tensor:
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
-    h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C)
+    # Single-pass fused fallback mixes FP32 coefficients with BF16 activations.
+    mix_dtype = torch.promote_types(h_res.dtype, original_residual.dtype)
+    h_res_batched = h_res.to(mix_dtype).view(s * b, n, n)
+    residual_batched = original_residual.to(mix_dtype).view(s * b, n, C)
     mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
@@ -706,13 +708,9 @@ class HyperConnectionModule(MegatronModule):
             h_res = self._sinkhorn_op(
                 h_res.reshape(s, b, self.n, self.n), self.sinkhorn_iterations, self.sinkhorn_eps
             )
-            # Match the existing DSv4 kernel contract: compute mappings/Sinkhorn
-            # with FP32 parameters, then mix streams in the activation dtype.
-            return (
-                h_pre.reshape(s, b, self.n).to(x.dtype),
-                h_post.reshape(s, b, self.n).to(x.dtype),
-                h_res.to(x.dtype),
-            )
+            # The shifted pre-mix is a live edge into the next sublayer. Keep all
+            # coefficients in FP32 and round only the mixed activations.
+            return (h_pre.reshape(s, b, self.n), h_post.reshape(s, b, self.n), h_res)
         x_fp32 = x.float()
         inv_rms = torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + self.norm_eps)
         with torch.autocast(device_type=x.device.type, enabled=False):
@@ -972,10 +970,7 @@ class HyperConnectionModule(MegatronModule):
                     f"Single-pass mHC pre_mix shape {tuple(pre_mix.shape)} "
                     f"does not match {tuple(expected_shape)}"
                 )
-            # Native single-pass mixing retains FP32 coefficients and arithmetic;
-            # the fused DSv4 kernels use activation-dtype coefficients instead.
-            mix = pre_mix.to(hidden_states.dtype) if self.config.use_fused_mhc else pre_mix.float()
-            return self._h_aggregate_into_op(streams, mix, out)
+            return self._h_aggregate_into_op(streams, pre_mix.float(), out)
         aggregated = SinglePassMHCState(pre_mix).contract(
             hidden_states, self.n, use_fused=self.config.use_fused_mhc
         )
@@ -1197,7 +1192,9 @@ class HyperConnectionModule(MegatronModule):
         if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
             streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
             with torch.autocast(device_type=x.device.type, enabled=False):
-                return self._h_post_bda_op(h_res, streams, h_post, x, bias).flatten(-2)
+                return self._h_post_bda_op(
+                    h_res, streams, h_post, x, bias, output_dtype=x.dtype
+                ).flatten(-2)
         streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
         mixed = (h_res.float().unsqueeze(-1) * streams.unsqueeze(-2)).sum(-3)
         expanded = h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)

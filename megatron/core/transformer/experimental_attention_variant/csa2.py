@@ -4,8 +4,8 @@
 
 This uses the existing DSv4 attention wrapper, sparse attention kernels and native reference.
 Ordinary indexer Top-K and chunked candidate scores also reuse DSv4 kernels.
-Candidate-aware Reindex and indexer loss use indexed kernels. The r2 compressor uses
-BF16 projections and cuDNN gated pooling, retaining the existing Linear and RMSNorm modules.
+Candidate-aware Reindex and indexer loss use indexed kernels. Compressor projections
+use the model dtype outside FP8/FP4 contexts; gated pooling accumulates in FP32.
 Shared graph tensors belong to one stack forward and are passed explicitly; modules retain
 no activation state or inference caches.
 """
@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -530,6 +531,8 @@ def apply_csa2_thd_rope(
     config: MLATransformerConfig,
     layout: CSA2THDLayout | CSA2THDCompressionLayout,
     cp_group: torch.distributed.ProcessGroup,
+    *,
+    rotary_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Apply DSv4's segmented RoPE to token or compressed rows, excluding padding.
 
@@ -537,6 +540,7 @@ def apply_csa2_thd_rope(
     position ``ratio * j``. Physical prefixes describe any reserved padding rows.
     Masking before rotation also gives fused RoPE private storage, so the main and
     indexer branches cannot overwrite their shared pre-RoPE latent.
+    ``rotary_dtype`` selects the fused table dtype without promoting activations.
     """
     compressed = isinstance(layout, CSA2THDCompressionLayout)
     layout_cp_size = layout.cp_size
@@ -555,6 +559,7 @@ def apply_csa2_thd_rope(
         return x
     ratio = layout.ratio if compressed else 1
     pos_dim = config.qk_pos_emb_head_dim
+    table_dtype = rotary_dtype or x.dtype
     if layout_cp_size > 1:
         if cp_group.rank() != layout.cp_rank:
             raise ValueError("CSA2 THD RoPE rank must match its row layout")
@@ -564,7 +569,7 @@ def apply_csa2_thd_rope(
             length = layout.max_seqlen * ratio
             if config.apply_rope_fusion:
                 cos, sin = rotary_pos_emb.get_cached_cos_sin(
-                    length, dtype=x.dtype, packed_seq=True, mscale=1.0
+                    length, dtype=table_dtype, packed_seq=True, mscale=1.0
                 )
                 output = fused_mla_rope_inplace(
                     x.squeeze(1) if x.ndim == 4 else x,
@@ -594,7 +599,7 @@ def apply_csa2_thd_rope(
             return output.masked_fill(mask, 0)
         if config.apply_rope_fusion:
             cos, sin = rotary_pos_emb.get_cached_cos_sin(
-                layout.max_seqlen, dtype=x.dtype, packed_seq=True, mscale=1.0
+                layout.max_seqlen, dtype=table_dtype, packed_seq=True, mscale=1.0
             )
             output = cp_utils.apply_thd_cp_local_rope_fused(
                 x,
@@ -630,6 +635,7 @@ def apply_csa2_thd_rope(
         cp_group=cp_group,
         cu_seqlens=layout.cu_seqlens_padded,
         max_seqlen_rope=layout.max_seqlen * ratio,
+        rotary_dtype=rotary_dtype,
     )
     return output.masked_fill(mask, 0)
 
@@ -723,14 +729,17 @@ class CSA2Compressor(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
-        self.linear_wkv = build_module(
-            submodules.linear_wkv, config.hidden_size, config.v_head_dim, **linear_kwargs
-        )
-        self.linear_wgate = None
-        if compress_ratio == 2:
-            self.linear_wgate = build_module(
-                submodules.linear_wgate, config.hidden_size, config.v_head_dim, **linear_kwargs
+        # Match V4's BF16 training policy, including under FP8/FP4 model init.
+        # HF inference instead promotes ratio-2 projections to FP32.
+        with get_fp8_disabled_context(config, is_init=True):
+            self.linear_wkv = build_module(
+                submodules.linear_wkv, config.hidden_size, config.v_head_dim, **linear_kwargs
             )
+            self.linear_wgate = None
+            if compress_ratio == 2:
+                self.linear_wgate = build_module(
+                    submodules.linear_wgate, config.hidden_size, config.v_head_dim, **linear_kwargs
+                )
         self.norm = build_module(
             submodules.norm,
             config=config,
@@ -783,9 +792,10 @@ class CSA2Compressor(MegatronModule):
         return self._forward_sbhd(x)
 
     def _project(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Keep the original Megatron Linear graph and its precision contract."""
-        latent, _ = self.linear_wkv(x)
-        gate = self.linear_wgate(x)[0] if self.linear_wgate is not None else None
+        """Keep compressor GEMMs in the model dtype even under FP8/FP4 training."""
+        with get_fp8_disabled_context(self.config):
+            latent, _ = self.linear_wkv(x)
+            gate = self.linear_wgate(x)[0] if self.linear_wgate is not None else None
         return latent, gate
 
     def _pool_r2(
@@ -795,7 +805,7 @@ class CSA2Compressor(MegatronModule):
         dtype: torch.dtype,
         valid_groups: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Pool BF16 projections with cuDNN, using FP32 intermediates in both paths."""
+        """Pool BF16/FP32 projections in FP32, then cast to the activation dtype."""
         pooled = maybe_pool_csa2_r2_fused(
             latent, gate, dtype, valid_groups=valid_groups, enabled=self.use_fused_compressor
         )
@@ -833,7 +843,7 @@ class CSA2Compressor(MegatronModule):
         *,
         input_is_sanitized: bool = False,
     ) -> tuple[torch.Tensor, CSA2THDCompressionLayout]:
-        """Project before gathering on the BF16 fused path; retain the native reference."""
+        """Project token-order inputs before gathering when fusion is enabled."""
         if (
             self.use_fused_compressor
             and x.is_cuda
@@ -885,7 +895,7 @@ class CSA2Compressor(MegatronModule):
         return self._normalize_thd(latent.to(x.dtype), layout.local), layout
 
     def _forward_thd_projected(self, x, layout, cu_seqlens_padded, *, input_is_sanitized):
-        """Reuse token-order hidden storage and let the V4 kernel gather KV/gate."""
+        """Project token-order inputs before gathering the smaller KV/gate tensors."""
         ratio = self.compress_ratio
         # At most ratio-1 physical tail tokens occur per sequence. This host-known
         # bound retains every physical segment while avoiding large orphan capacity.
@@ -996,14 +1006,18 @@ class CSA2Indexer(MegatronModule):
             self.n_heads * self.head_dim,
             **linear_kwargs,
         )
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj, config.hidden_size, self.n_heads, **linear_kwargs
-        )
+        # HF keeps head weights and the new latent-to-key projection in BF16.
+        # Q remains inside the enclosing quantization context, as in V4.
+        with get_fp8_disabled_context(config, is_init=True):
+            self.linear_weights_proj = build_module(
+                submodules.linear_weights_proj, config.hidden_size, self.n_heads, **linear_kwargs
+            )
         self.linear_wk = self.k_norm = None
         if owns_k:
-            self.linear_wk = build_module(
-                submodules.linear_wk, config.v_head_dim, self.head_dim, **linear_kwargs
-            )
+            with get_fp8_disabled_context(config, is_init=True):
+                self.linear_wk = build_module(
+                    submodules.linear_wk, config.v_head_dim, self.head_dim, **linear_kwargs
+                )
             self.k_norm = build_module(
                 submodules.k_norm,
                 config=config,
@@ -1031,9 +1045,16 @@ class CSA2Indexer(MegatronModule):
             ):
                 raise ValueError("CSA2 indexer latent must match its THD compression layout.")
             latent = latent.masked_fill(~thd_layout.valid_groups[:, None, None], 0)
-        k, _ = self.linear_wk(latent)
+        with get_fp8_disabled_context(self.config):
+            k, _ = self.linear_wk(latent)
         # An incomplete first compression group produces no key rows.
         k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
+        key_dtype = k.dtype
+        rotary_dtype = torch.float32 if self.precision == "bf16" else None
+        # Fused RoPE keeps BF16 I/O and promotes arithmetic with FP32 tables.
+        # The unfused PyTorch path still needs FP32 inputs for one final cast.
+        if self.precision == "bf16" and not self.config.apply_rope_fusion:
+            k = k.float()
         if thd_layout is not None:
             return apply_csa2_thd_rope(
                 k,
@@ -1041,7 +1062,8 @@ class CSA2Indexer(MegatronModule):
                 self.config,
                 thd_layout,
                 cp_group if cp_group is not None else self.cp_group,
-            )
+                rotary_dtype=rotary_dtype,
+            ).to(key_dtype)
         pos_dim = self.config.qk_pos_emb_head_dim
         return _apply_rope(
             k,
@@ -1053,7 +1075,8 @@ class CSA2Indexer(MegatronModule):
             ratio=self.compress_ratio,
             cp_group=self.cp_group,
             inplace=False,
-        )
+            rotary_dtype=rotary_dtype,
+        ).to(key_dtype)
 
     def _project_inputs(
         self,
@@ -1092,6 +1115,10 @@ class CSA2Indexer(MegatronModule):
             raise ValueError("Provide either latent or indexer_k, not both.")
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim)
+        query_dtype = q.dtype
+        rotary_dtype = torch.float32 if self.precision == "bf16" else None
+        if self.precision == "bf16" and not self.config.apply_rope_fusion:
+            q = q.float()
         if thd_layout is not None:
             if indexer_k.shape[:2] != (compressed_layout.capacity, 1):
                 raise ValueError("CSA2 shared indexer keys must match the THD compression layout.")
@@ -1102,9 +1129,11 @@ class CSA2Indexer(MegatronModule):
                 self.config,
                 thd_layout,
                 cp_group if cp_group is not None else self.cp_group,
+                rotary_dtype=rotary_dtype,
             )
-            weights, _ = self.linear_weights_proj(x)
-            return q.squeeze(1), indexer_k.squeeze(1), weights.squeeze(1)
+            with get_fp8_disabled_context(self.config):
+                weights, _ = self.linear_weights_proj(x)
+            return q.to(query_dtype).squeeze(1), indexer_k.squeeze(1), weights.squeeze(1)
         pos_dim = self.config.qk_pos_emb_head_dim
         q = _apply_rope(
             q,
@@ -1114,9 +1143,11 @@ class CSA2Indexer(MegatronModule):
             config=self.config,
             rotary_seq_len=q.shape[0],
             cp_group=self.cp_group,
+            rotary_dtype=rotary_dtype,
         )
-        weights, _ = self.linear_weights_proj(x)
-        return q, indexer_k, weights
+        with get_fp8_disabled_context(self.config):
+            weights, _ = self.linear_weights_proj(x)
+        return q.to(query_dtype), indexer_k, weights
 
     def _score_projected(
         self,
@@ -1664,10 +1695,16 @@ class CompressedSparseAttention2(MegatronModule):
                     # The indexer's linear backward retains this same latent,
                     # including when its input was detached from the compressor.
                     inplace=False,
+                    rotary_dtype=torch.float32,
                 )
             else:
                 state.global_kv = apply_csa2_thd_rope(
-                    latent, self.rotary_pos_emb, self.config, local_layout, cp_group
+                    latent,
+                    self.rotary_pos_emb,
+                    self.config,
+                    local_layout,
+                    cp_group,
+                    rotary_dtype=torch.float32,
                 )
             if cp_layout is not None:
                 # One autograd edge per shared tensor: reduce-scatter runs after

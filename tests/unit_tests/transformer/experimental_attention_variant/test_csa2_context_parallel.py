@@ -882,7 +882,11 @@ def _sharing_modules(
     actual.load_state_dict(reference.state_dict())
     if config.apply_rope_fusion:
         for module in (*reference, *actual):
-            module.rotary_pos_emb = _rotary_module(module.config, True, module.pg_collection.cp)
+            # SWA consumes a plain frequency tensor; compressed layers unpack
+            # YaRN's (frequencies, mscale) pair, just as in their constructors.
+            module.rotary_pos_emb = _rotary_module(
+                module.config, module._dsv4_uses_yarn_rope, module.pg_collection.cp
+            )
             module.core_attention.rotary_pos_emb = module.rotary_pos_emb
     return reference, actual
 

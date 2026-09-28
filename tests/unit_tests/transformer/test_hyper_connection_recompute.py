@@ -1090,6 +1090,27 @@ class TestSinglePassMHC:
             torch.testing.assert_close(actual_gradient, expected_gradient, atol=0, rtol=0)
 
     @pytest.mark.parametrize("use_fused", [False, True])
+    @pytest.mark.parametrize("with_slot", [False, True])
+    def test_single_pass_preserves_mix_below_bf16_resolution(self, device, use_fused, with_slot):
+        """Rounding the live FP32 mix before multiplication loses this entire signal."""
+        module = self._module(device, use_fused_mhc=use_fused)
+        hidden = torch.ones(2, 1, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+        previous = (
+            torch.tensor([1.0 + 2**-10, -1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+            .repeat(2, 1, 1)
+            .requires_grad_()
+        )
+        slot = torch.empty(2, 1, 32, device=device, dtype=hidden.dtype) if with_slot else None
+        actual = module._single_pass_aggregate(hidden, previous, out=slot)
+        torch.testing.assert_close(actual, torch.full_like(actual, 2**-10), rtol=0, atol=0)
+        if slot is not None:
+            assert actual.data_ptr() == slot.data_ptr()
+        hidden_grad, mix_grad = torch.autograd.grad(actual.float().sum(), (hidden, previous))
+        assert hidden_grad.dtype == hidden.dtype
+        assert mix_grad.dtype == torch.float32
+        torch.testing.assert_close(mix_grad, torch.full_like(previous, 32), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("use_fused", [False, True])
     @pytest.mark.parametrize("with_mix", [False, True])
     def test_single_pass_graph_slot_survives_checkpoint_discard_and_restore(
         self, device, use_fused, with_mix
@@ -1108,7 +1129,7 @@ class TestSinglePassMHC:
             hidden = torch.randn(3, 2, 4 * module.hidden_size, device=device, dtype=dtype)
             hidden.requires_grad_()
             previous = (
-                torch.randn(3, 2, 4, device=device, dtype=dtype, requires_grad=True)
+                torch.randn(3, 2, 4, device=device, dtype=torch.float32, requires_grad=True)
                 if with_mix
                 else None
             )
@@ -1567,39 +1588,43 @@ class TestSinglePassMHC:
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("with_bias", [False, True])
-    def test_fused_mixing_uses_dsv4_dtypes(self, device, dtype, with_bias, monkeypatch):
-        """Use activation-dtype coefficients with the existing DSv4 mixing operators."""
+    def test_fused_mixing_preserves_fp32_coefficients(self, device, dtype, with_bias, monkeypatch):
+        """Keep FP32 maps through fused mixing and round only the activation output."""
         from megatron.core.fusions import fused_mhc_kernels
 
         torch.manual_seed(2211)
         module = self._module(device, use_fused_mhc=True)
         hidden = torch.randn(3, 2, 128, device=device, dtype=dtype, requires_grad=True)
         x = torch.randn(3, 2, 32, device=device, dtype=dtype, requires_grad=True)
-        previous = torch.randn(3, 2, 4, device=device, dtype=dtype, requires_grad=True)
+        previous = torch.randn(3, 2, 4, device=device, dtype=torch.float32, requires_grad=True)
         bias = (
             torch.randn(32, device=device, dtype=dtype, requires_grad=True) if with_bias else None
         )
         state = SinglePassMHCState(previous)
         aggregated, comb, post, residual = module(hidden, mhc_state=state)
-        assert state.pre_mix.dtype == comb.dtype == post.dtype == dtype
+        assert state.pre_mix.dtype == comb.dtype == post.dtype == torch.float32
         assert all(parameter.dtype == torch.float32 for parameter in module.parameters())
         post_calls = []
         original_post = fused_mhc_kernels.fused_h_post_bda
 
-        def observe_post(comb, streams, post, x, bias):
-            assert comb.dtype == streams.dtype == post.dtype == x.dtype == dtype
+        def observe_post(comb, streams, post, x, bias, *, output_dtype=None):
+            assert comb.dtype == post.dtype == torch.float32
+            assert streams.dtype == x.dtype == dtype
+            assert output_dtype == dtype
             if bias is not None:
                 assert bias.dtype == dtype
-            post_calls.append(x.shape)
-            return original_post(comb, streams, post, x, bias)
+            result = original_post(comb, streams, post, x, bias, output_dtype=output_dtype)
+            assert result.dtype == dtype
+            post_calls.append(result)
+            return result
 
         monkeypatch.setattr(module, "_h_post_bda_op", observe_post)
         output = module.fused_h_res_h_post_bda(comb, residual, post, (x, bias), 0.0, True, False)
         assert len(post_calls) == 1
+        assert output.data_ptr() == post_calls[0].data_ptr()
         assert aggregated.dtype == output.dtype == dtype
-        # Use the DSv4 native expression, including activation-dtype rounding.
-        expected_aggregate = self._reference_dsv4_contract(hidden, previous, 4)
-        expected_output = self._reference_dsv4_merge(hidden, x, post, comb, bias)
+        expected_aggregate = self._reference_contract(hidden, previous, 4)
+        expected_output = self._reference_merge(hidden, x, post, comb, bias)
         tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-6
         torch.testing.assert_close(aggregated, expected_aggregate, atol=tolerance, rtol=tolerance)
         torch.testing.assert_close(output, expected_output, atol=tolerance, rtol=tolerance)
@@ -1625,7 +1650,8 @@ class TestSinglePassMHC:
         original_aggregate = fused_mhc_kernels.fused_h_aggregate
 
         def observe_aggregate(x, pre):
-            assert pre.dtype == x.dtype == dtype
+            assert pre.dtype == torch.float32
+            assert x.dtype == dtype
             aggregate_calls.append(pre)
             return original_aggregate(x, pre)
 
@@ -1650,9 +1676,7 @@ class TestSinglePassMHC:
         hidden = torch.randn(7, batch_size, 128, device=device, dtype=dtype, requires_grad=True)
         ref_hidden = hidden.detach().clone().requires_grad_()
         actual, actual_pre = self._run_chain(modules, hidden)
-        expected, expected_pre = self._run_chain(
-            modules, ref_hidden, reference=True, dsv4_mixing=True
-        )
+        expected, expected_pre = self._run_chain(modules, ref_hidden, reference=True)
         assert len(calls) == len(modules)
         # Three shifted contractions plus the last FFN's contraction at stack exit.
         assert len(aggregate_calls) == len(modules)
