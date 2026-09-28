@@ -1057,9 +1057,8 @@ class TEGroupedMLP(MegatronModule):
         # self.training is not sufficient here: when "moe" is also in recompute_modules,
         # CheckpointFunction invokes this forward once under no_grad and again under
         # enable_grad during backward, and self.training is True in both cases.
-        setup_activation_checkpoint = (
-                self.activation_recompute and torch.is_grad_enabled()
-            )
+        setup_activation_checkpoint = self.activation_recompute and torch.is_grad_enabled()
+
         if setup_activation_checkpoint:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with moe_act_manager as fc1_output:
