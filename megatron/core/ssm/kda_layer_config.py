@@ -59,6 +59,15 @@ class KDALayerConfig(TransformerConfig):
             raise ValueError("KDA requires equal key and value head counts.")
         if self.linear_key_head_dim != self.linear_value_head_dim:
             raise ValueError("KDA requires equal key and value head dimensions.")
+        if (
+            self.context_parallel_size > 1
+            and self.linear_cp_mode == "chunkwise"
+            and self.deterministic_mode
+        ):
+            raise ValueError(
+                "KDA chunkwise context parallelism is incompatible with deterministic_mode "
+                "because the fallback convolution cannot exchange history across ranks."
+            )
         if self.linear_num_key_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(
                 "KDA key/value head count must be divisible by tensor parallel size; "
