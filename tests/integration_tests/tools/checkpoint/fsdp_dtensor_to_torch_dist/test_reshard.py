@@ -29,11 +29,14 @@ from tests.integration_tests.tools.checkpoint.fsdp_dtensor_to_torch_dist import 
 def test_reshard(family, reshard, family_runs):
     run = family_runs(family)
     iteration = config.CONVERT_ITERS[-1]  # the most-trained converted checkpoint
-    nxt = iteration + 1
     mode = "optim" if reshard.with_optimizer else "weights"
-    log = run.root / f"reshard_{reshard.layout}_{mode}.log"
-    text = harness.reshard_load(family, run.td[iteration], reshard, log, iteration=iteration)
-    harness.assert_loaded_at(text, iteration)
-    resumed = harness.parse_iter_metrics(text)
-    assert nxt in resumed, f"[{family.name}/{reshard.layout}] no iteration {nxt} in {log}"
-    harness.assert_loss_lr(run.fsdp_metrics[nxt], resumed[nxt], loss_rtol=family.loss_rtol)
+    harness.check_resume(
+        family,
+        run.fsdp_metrics,
+        run.td[iteration],
+        iteration,
+        run.root / f"reshard_{reshard.layout}_{mode}.log",
+        target_parallel=config.target_parallel_flags(reshard.layout),
+        with_optimizer=reshard.with_optimizer,
+        nproc=2,
+    )

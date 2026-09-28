@@ -3,14 +3,15 @@
 """Controller-side orchestration for the reverse-converter end-to-end suite.
 
 Launches the real training / resume / reshard stages as ``torchrun`` subprocesses
-running ``pretrain_gpt.py``, converts checkpoints via the converter CLI, and parses
-their output into structured Python values (per-iteration loss + LR, load
-confirmations, bit-exact verdicts) that the tests assert on.
+running each family's entrypoint (``pretrain_gpt.py`` / ``pretrain_hybrid.py``),
+converts checkpoints via the converter CLI, and parses their output into structured
+Python values (per-iteration loss + LR, load confirmations, bit-exact verdicts) that
+the tests assert on.
 
-It is **controller-only**: it never imports ``torch`` / ``megatron`` and never
-initializes CUDA or NCCL. All model work happens in the subprocess children (the
-torchrun jobs and the bit-exact worker), so this suite is safe to run as plain
-pytest — each test spawns its own torchrun children.
+It is **controller-only**: it never imports ``megatron`` and never initializes CUDA
+or NCCL (``diff_torch_dist`` reads CPU tensors only). All model work happens in the
+subprocess children (the torchrun jobs and the bit-exact worker), so this suite is
+safe to run as plain pytest — each test spawns its own torchrun children.
 """
 
 import json
@@ -53,14 +54,10 @@ class BitexactVerdict:
 
     family: str
     loaded_iteration: int
-    verdict: str
-    weight_mismatches: Tuple[str, ...]
-    optim_mismatches: Tuple[str, ...]
-    unexpected_extra: Tuple[str, ...]
-
-    @property
-    def is_bit_exact(self) -> bool:
-        return not (self.weight_mismatches or self.optim_mismatches or self.unexpected_extra)
+    counts: Dict[str, int]  # tensors / param groups compared, per section
+    mismatches: Tuple[str, ...]
+    missing: Tuple[str, ...]  # in the FSDP source, not held by the classic job
+    unexpected: Tuple[str, ...]  # held by the classic job, not in the FSDP source
 
 
 # --- env + subprocess plumbing ----------------------------------------------
@@ -179,9 +176,7 @@ def run_training(
     """
     shutil.rmtree(out_dir, ignore_errors=True)
     log_path = out_dir / "train_fsdp.log"
-    extra = dict(fam.extra_env)
-    if nproc >= 2:
-        extra.update(config.MULTI_GPU_TRAIN_ENV)
+    extra = config.MULTI_GPU_TRAIN_ENV if nproc >= 2 else None
     args = [
         *config.FSDP_TRAIN_FLAGS, *config.COMMON_ARGS,
         "--num-layers", str(fam.num_layers), *fam.arch, *src_parallel,
@@ -189,7 +184,7 @@ def run_training(
         "--save", str(out_dir / "fsdp"), "--data-cache-path", str(_data_cache_for(log_path)),
     ]  # fmt: skip
     proc = _run(
-        _torchrun_argv(nproc, _free_port(), config.PRETRAIN_GPT, args),
+        _torchrun_argv(nproc, _free_port(), config.REPO_ROOT / fam.entrypoint, args),
         _torchrun_env(extra),
         log_path,
         timeout,
@@ -198,19 +193,23 @@ def run_training(
     return proc.stdout or ""
 
 
-def convert(fsdp_iter_dir: Path, td_dir: Path, iteration: int, *, timeout: int = 900) -> Path:
+def convert(
+    fsdp_iter_dir: Path, td_dir: Path, iteration: int, *, nproc: int = 1, timeout: int = 900
+) -> Path:
     """Reverse-convert one fsdp_dtensor checkpoint to torch_dist under ``td_dir``.
 
     Writes ``td_dir/iter_XXXXXXX`` and the ``latest_checkpointed_iteration.txt``
-    marker mcore's loader needs. Returns ``td_dir``.
+    marker mcore's loader needs. ``nproc > 1`` runs the converter's multi-process
+    (CPU, gloo) mode under torchrun. Returns ``td_dir``.
     """
     out_iter = td_dir / f"iter_{iteration:07d}"
     log_path = td_dir / f"convert_{iteration}.log"
-    argv = [
-        sys.executable, str(config.INSPECTOR),
-        "convert-fsdp-dtensor-to-torch-dist", str(fsdp_iter_dir), str(out_iter),
-    ]  # fmt: skip
-    proc = _run(argv, _single_rank_env(_free_port()), log_path, timeout)
+    cli = ["convert-fsdp-dtensor-to-torch-dist", str(fsdp_iter_dir), str(out_iter)]
+    if nproc > 1:
+        argv, env = _torchrun_argv(nproc, _free_port(), config.INSPECTOR, cli), _torchrun_env()
+    else:
+        argv, env = [sys.executable, str(config.INSPECTOR), *cli], _single_rank_env(_free_port())
+    proc = _run(argv, env, log_path, timeout)
     _check(proc, log_path, f"convert iter {iteration}")
     (td_dir / "latest_checkpointed_iteration.txt").write_text(str(iteration))
     return td_dir
@@ -235,9 +234,7 @@ def resume_classic(
     (also written to ``log_path``).
     """
     end = iteration + config.RESUME_EXTRA_ITERS
-    extra = dict(fam.extra_env)
-    if nproc >= 2:
-        extra.update(config.MULTI_GPU_LOAD_ENV)
+    extra = config.MULTI_GPU_LOAD_ENV if nproc >= 2 else None
     load_flags = list(config.CLASSIC_LOAD_FLAGS)
     if not with_optimizer:
         load_flags.append("--no-load-optim")
@@ -248,7 +245,7 @@ def resume_classic(
         "--load", str(td_dir), "--data-cache-path", str(_data_cache_for(log_path)),
     ]  # fmt: skip
     proc = _run(
-        _torchrun_argv(nproc, _free_port(), config.PRETRAIN_GPT, args),
+        _torchrun_argv(nproc, _free_port(), config.REPO_ROOT / fam.entrypoint, args),
         _torchrun_env(extra),
         log_path,
         timeout,
@@ -257,26 +254,49 @@ def resume_classic(
     return proc.stdout or ""
 
 
-def reshard_load(fam, td_dir: Path, reshard, log_path: Path, iteration: int = 80, **kw) -> str:
-    """Load ``td_dir`` (converted) into a 2-GPU classic job under a target layout."""
-    return resume_classic(
-        fam, td_dir, iteration, log_path,
-        target_parallel=config.target_parallel_flags(reshard.layout),
-        with_optimizer=reshard.with_optimizer,
-        nproc=2,
-        **kw,
-    )  # fmt: skip
-
-
 def run_bitexact_worker(
-    fam, td_dir: Path, iteration: int, *, timeout: int = 1800
+    fam, fsdp_dir: Path, td_dir: Path, iteration: int, *, timeout: int = 1800
 ) -> BitexactVerdict:
-    """Run the per-family bit-exact worker in its own process, return its JSON verdict."""
+    """Load ``td_dir`` into a classic model in its own process; diff it against ``fsdp_dir``."""
     log_path = td_dir / f"bitexact_{iteration}.log"
-    argv = [sys.executable, str(_WORKER), fam.name, "--iter", str(iteration), "--td", str(td_dir)]
+    argv = [
+        sys.executable, str(_WORKER), fam.name, "--iter", str(iteration),
+        "--td", str(td_dir), "--fsdp", str(fsdp_dir),
+    ]  # fmt: skip
     proc = _run(argv, _single_rank_env(_free_port()), log_path, timeout)
     _check(proc, log_path, f"[{fam.name}] bit-exact worker")
     return _parse_bitexact_json(fam.name, proc.stdout or "", log_path)
+
+
+def diff_torch_dist(dir_a: Path, dir_b: Path) -> list:
+    """Differences between two torch_dist checkpoint dirs: tensor keys, tensor values
+    (``torch.equal``) and the ``common.pt`` payload. Empty list means identical.
+
+    Imports torch lazily and only touches CPU tensors (no CUDA / NCCL init).
+    """
+    import torch
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    def tensors(path):
+        md = FileSystemReader(str(path)).read_metadata().state_dict_metadata
+        out = {
+            k: torch.empty(m.size, dtype=m.properties.dtype)
+            for k, m in md.items()
+            if isinstance(m, TensorStorageMetadata)
+        }
+        dcp.load(out, storage_reader=FileSystemReader(str(path)), no_dist=True)
+        return out
+
+    a, b = tensors(dir_a), tensors(dir_b)
+    diffs = [f"only in {dir_a.parent.name}: {k}" for k in sorted(set(a) - set(b))]
+    diffs += [f"only in {dir_b.parent.name}: {k}" for k in sorted(set(b) - set(a))]
+    diffs += [f"values differ: {k}" for k in sorted(set(a) & set(b)) if not torch.equal(a[k], b[k])]
+    common_a, common_b = (torch.load(d / "common.pt", weights_only=False) for d in (dir_a, dir_b))
+    if common_a != common_b:
+        diffs.append("common.pt differs")
+    return diffs
 
 
 # --- parsing + assertions ---------------------------------------------------
@@ -313,25 +333,49 @@ def assert_loaded_at(text: str, iteration: int) -> None:
     )
 
 
-def assert_loss_lr(
-    ref: IterMetrics, got: IterMetrics, *, loss_rtol: float, lr_exact: bool = True
-) -> None:
+def compare_loss_lr(ref: IterMetrics, got: IterMetrics, *, loss_rtol: float) -> Optional[str]:
     """Compare a resumed iteration against the FSDP reference at the same iteration.
 
-    Loss must match within ``loss_rtol`` (weights loaded correctly); LR must match
-    ~exactly (optimizer + LR-scheduler bookkeeping converted correctly).
+    Loss must match within ``loss_rtol``; LR must match ~exactly (optimizer +
+    LR-scheduler bookkeeping converted correctly). Returns a failure reason or None.
     """
     loss_rel = abs(got.lm_loss - ref.lm_loss) / max(abs(ref.lm_loss), 1e-12)
-    assert loss_rel <= loss_rtol, (
-        f"lm loss {got.lm_loss:.6f} vs FSDP {ref.lm_loss:.6f} "
-        f"(rel {loss_rel:.2e} > tol {loss_rtol:.2e})"
-    )
-    if lr_exact:
-        lr_rel = abs(got.learning_rate - ref.learning_rate) / max(abs(ref.learning_rate), 1e-12)
-        assert lr_rel <= 1e-6, (
-            f"learning rate {got.learning_rate:.6e} vs FSDP {ref.learning_rate:.6e} "
-            f"(rel {lr_rel:.2e}); expected exact match"
+    lr_rel = abs(got.learning_rate - ref.learning_rate) / max(abs(ref.learning_rate), 1e-12)
+    if loss_rel > loss_rtol:
+        return f"lm loss rel diff {loss_rel:.2e} > tol {loss_rtol:.2e}"
+    if lr_rel > 1e-6:
+        return f"learning rate rel diff {lr_rel:.2e}; expected an exact match"
+    return None
+
+
+def check_resume(
+    fam, reference: Dict[int, IterMetrics], td_dir: Path, iteration: int, log_path: Path, **kw
+) -> None:
+    """Resume a classic job from ``td_dir`` and assert it continues the FSDP run.
+
+    Every resumed iteration is compared, not just the first: the first post-load
+    loss is a forward pass on the loaded weights, while the later ones also depend
+    on the Adam step taken from the loaded masters, moments and step count. A
+    weights-only load (``with_optimizer=False``) starts from fresh moments, so only
+    its first iteration can match. Every comparison is printed before asserting.
+    """
+    text = resume_classic(fam, td_dir, iteration, log_path, **kw)
+    assert_loaded_at(text, iteration)
+    resumed = parse_iter_metrics(text)
+    n_iters = config.RESUME_EXTRA_ITERS if kw.get("with_optimizer", True) else 1
+    failures = []
+    for it in range(iteration + 1, iteration + 1 + n_iters):
+        assert it in resumed, f"[{fam.name}] no iteration {it} in {log_path}"
+        ref, got = reference[it], resumed[it]
+        failure = compare_loss_lr(ref, got, loss_rtol=fam.loss_rtol)
+        print(
+            f"[{fam.name}] {log_path.stem} iter {it}: lm loss FSDP {ref.lm_loss:.6f} -> "
+            f"resumed {got.lm_loss:.6f}, lr {ref.learning_rate:.6e} -> "
+            f"{got.learning_rate:.6e}  {failure or 'ok'}"
         )
+        if failure:
+            failures.append(f"iter {it}: {failure}")
+    assert not failures, f"[{fam.name}] resume from {td_dir.name} diverged: {failures}"
 
 
 def _parse_bitexact_json(family: str, text: str, log_path: Path) -> BitexactVerdict:
@@ -346,8 +390,8 @@ def _parse_bitexact_json(family: str, text: str, log_path: Path) -> BitexactVerd
     return BitexactVerdict(
         family=d["family"],
         loaded_iteration=int(d["loaded_iteration"]),
-        verdict=d["verdict"],
-        weight_mismatches=tuple(d.get("weight_mismatches", ())),
-        optim_mismatches=tuple(d.get("optim_mismatches", ())),
-        unexpected_extra=tuple(d.get("unexpected_extra", ())),
+        counts=dict(d["counts"]),
+        mismatches=tuple(d["mismatches"]),
+        missing=tuple(d["missing"]),
+        unexpected=tuple(d["unexpected"]),
     )

@@ -31,12 +31,5 @@ from tests.integration_tests.tools.checkpoint.fsdp_dtensor_to_torch_dist import 
 def test_source_sharding(family, source, sharded_family_runs):
     run = sharded_family_runs(family, source.layout)
     for iteration in config.CONVERT_ITERS:
-        nxt = iteration + 1
-        log = run.root / f"resume_{iteration}.log"
-        text = harness.resume_classic(
-            family, run.td[iteration], iteration, log
-        )  # classic single-rank
-        harness.assert_loaded_at(text, iteration)
-        resumed = harness.parse_iter_metrics(text)
-        assert nxt in resumed, f"[{family.name}/{source.layout}] no iteration {nxt} in {log}"
-        harness.assert_loss_lr(run.fsdp_metrics[nxt], resumed[nxt], loss_rtol=family.loss_rtol)
+        log = run.root / f"resume_{iteration}.log"  # classic single-rank
+        harness.check_resume(family, run.fsdp_metrics, run.td[iteration], iteration, log)

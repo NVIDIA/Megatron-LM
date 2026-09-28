@@ -12,8 +12,8 @@ Deliberately **stdlib-only** (no ``torch`` / ``megatron`` import) so that pytest
 default-collection gate check stays cheap.
 """
 
-from dataclasses import dataclass, field
-from typing import Mapping, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -49,16 +49,18 @@ class ModelFamily:
     """One converter-transform family."""
 
     name: str  # registry key / results subdir / test id
-    label: str  # human-readable name
     transform: str  # which converter transform this family gates
     num_layers: int
     arch: Tuple[str, ...]  # architecture CLI flags, pre-tokenized
+    entrypoint: str = "pretrain_gpt.py"  # or "pretrain_hybrid.py" (HybridModel)
     reshard_cases: Tuple[ReshardCase, ...] = ()  # load-side target layouts to sweep
     source_shard_cases: Tuple[SourceShardCase, ...] = (SourceShardCase("DP2"),)
     requires: Tuple[str, ...] = ()  # importable deps to gate on, e.g. ("fla",)
-    loss_rtol: float = 1e-2  # resume-continuity tolerance on lm loss (bf16); FP8 loosens
+    # Resume-continuity relative tolerance on lm loss. The first resumed iteration is
+    # typically exact; later ones drift by FSDP-vs-classic backward numerics. Exactness
+    # is proven by the bit-exact check, so this only needs to catch gross errors.
+    loss_rtol: float = 1e-3
     bitexact_xfail: Optional[str] = None  # reason if not bit-exact by design (FP8)
-    extra_env: Mapping[str, str] = field(default_factory=dict)
 
 
 # Reused reason strings so the intent reads once and stays consistent.
@@ -81,7 +83,6 @@ def _ep2_reshard_pair() -> Tuple[ReshardCase, ...]:
 MODELS = {
     "dense": ModelFamily(
         name="dense",
-        label="Dense GPT (GELU)",
         transform="dense layer-stack",
         num_layers=12,
         arch=(),
@@ -94,7 +95,6 @@ MODELS = {
     ),
     "dense_swiglu": ModelFamily(
         name="dense_swiglu",
-        label="Dense GPT + SwiGLU",
         transform="SwiGLU fc1 _w/_v merge",
         num_layers=12,
         arch=("--swiglu",),
@@ -102,7 +102,6 @@ MODELS = {
     ),
     "moe_grouped": ModelFamily(
         name="moe_grouped",
-        label="MoE, grouped-GEMM (mixtral-like)",
         transform="grouped-expert restack",
         num_layers=12,
         arch=("--swiglu", "--num-experts", "8", "--moe-grouped-gemm", "--disable-bias-linear"),
@@ -111,7 +110,6 @@ MODELS = {
     ),
     "moe_gated": ModelFamily(
         name="moe_gated",
-        label="MoE, non-grouped shared-expert + gate",
         transform="non-grouped local_experts restack",
         num_layers=12,
         arch=(
@@ -131,7 +129,6 @@ MODELS = {
     ),
     "mtp": ModelFamily(
         name="mtp",
-        label="GPT + Multi-Token Prediction",
         transform="MTP key-rename",
         num_layers=12,
         arch=(
@@ -145,7 +142,6 @@ MODELS = {
     ),
     "gdn_hybrid": ModelFamily(
         name="gdn_hybrid",
-        label="Hybrid Gated-DeltaNet + MoE (Qwen-Next-like)",
         transform="GDN in_proj/conv1d factory split + non-grouped experts",
         num_layers=6,
         arch=(
@@ -192,11 +188,44 @@ MODELS = {
             "--attention-backend",
             "unfused",
         ),
-        requires=("fla",),  # flash-linear-attention; the dev image's `fla` stub is insufficient
+        requires=("fla",),  # flash-linear-attention
+    ),
+    "mamba_hybrid": ModelFamily(
+        name="mamba_hybrid",
+        transform=(
+            "Mamba-2 in_proj/conv1d factory split + fp32 router.expert_bias + hybrid MTP "
+            "(Nemotron-3-like)"
+        ),
+        num_layers=6,
+        entrypoint="pretrain_hybrid.py",
+        arch=(
+            "--hybrid-layer-pattern",
+            "M*-M*E/*E",  # "/*E": one MTP depth (attention + MoE)
+            "--mtp-num-layers",
+            "1",
+            "--position-embedding-type",
+            "none",  # MTP rejects learned_absolute
+            "--spec",
+            "megatron.core.models.hybrid.hybrid_layer_specs",
+            "hybrid_stack_spec",
+            "--num-experts",
+            "8",
+            "--moe-grouped-gemm",
+            "--disable-bias-linear",
+            "--moe-router-score-function",
+            "sigmoid",
+            "--moe-router-enable-expert-bias",
+            "--moe-router-load-balancing-type",
+            "none",
+            # Megatron-FSDP + Mamba crashes entering eval (MambaMixer.refresh_cache
+            # copies the DTensor A_log into a plain tensor); evaluation is irrelevant
+            # to checkpoint conversion, so turn it off (later flags win).
+            "--eval-iters",
+            "0",
+        ),
     ),
     "moe_mla_mtp": ModelFamily(
         name="moe_mla_mtp",
-        label="MoE + MLA + MTP (deepseek-like)",
         transform="MLA + MTP passthrough over grouped-expert restack",
         num_layers=12,
         arch=(
@@ -218,7 +247,6 @@ MODELS = {
     ),
     "dense_fp8": ModelFamily(
         name="dense_fp8",
-        label="Dense + FP8 (llama3-like)",
         transform="FP8 _extra_state drop (loose ~1% resume, by design)",
         num_layers=12,
         arch=(

@@ -3,8 +3,8 @@
 """Opt-in gate and shared fixtures for the reverse-converter end-to-end suite.
 
 The gate keeps this expensive GPU suite invisible to a default ``pytest tests``
-run and to CI: unless opted in (``MCORE_CHECKPOINT_E2E=1`` or ``--run-e2e``), the
-``test_*.py`` modules here are never even imported. A second guard skips
+run and to CI: unless opted in with ``MCORE_CHECKPOINT_E2E=1``, the ``test_*.py``
+modules here are never even imported. A second guard skips
 everything if pytest was launched under ``torch.distributed.run`` (WORLD_SIZE>1),
 because this suite is a single controller that spawns its OWN torchrun children.
 
@@ -14,6 +14,7 @@ bit-exact and reshard checks all reuse the same converted checkpoints.
 """
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -26,15 +27,6 @@ from tests.integration_tests.tools.checkpoint.fsdp_dtensor_to_torch_dist import 
 # --------------------------------------------------------------------------
 # Opt-in gate
 # --------------------------------------------------------------------------
-def _e2e_enabled(pytest_config) -> bool:
-    if os.environ.get("MCORE_CHECKPOINT_E2E") == "1":
-        return True
-    try:
-        return bool(pytest_config.getoption("--run-e2e"))
-    except (ValueError, KeyError):  # option not registered in this invocation
-        return False
-
-
 def pytest_ignore_collect(collection_path, config):  # noqa: A002 (pytest hook name)
     """Do not even import the test modules unless the suite is opted in.
 
@@ -42,7 +34,7 @@ def pytest_ignore_collect(collection_path, config):  # noqa: A002 (pytest hook n
     imported, and never touches CUDA — so a bare ``pytest tests`` stays green and
     fast. The conftest itself still loads (it must, to register this hook).
     """
-    if _e2e_enabled(config):
+    if os.environ.get("MCORE_CHECKPOINT_E2E") == "1":
         return None
     return Path(str(collection_path)).name.startswith("test_")
 
@@ -58,16 +50,6 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
-def pytest_configure(config):
-    """Seed the deterministic env for the torchrun children (they inherit it)."""
-    for key, value in config_env().items():
-        os.environ.setdefault(key, value)
-
-
-def config_env():
-    return dict(config.DETERMINISTIC_ENV)
-
-
 # --------------------------------------------------------------------------
 # Shared training (one real FSDP run per family, reused across checks)
 # --------------------------------------------------------------------------
@@ -75,12 +57,10 @@ def config_env():
 class FamilyRun:
     """Products of one real Megatron-FSDP training run + conversion for a family."""
 
-    family: object
     root: Path
     fsdp_dir: Path
     td: Dict[int, Path]  # {60: <root>/td60, 80: <root>/td80}
     fsdp_metrics: Dict[int, harness.IterMetrics]  # per-iter (lm loss, lr) reference
-    train_log: Path
 
 
 @pytest.fixture(scope="session")
@@ -95,17 +75,19 @@ def results_root(tmp_path_factory) -> Path:
 
 def _build_family_run(fam, out_dir: Path, *, nproc: int = 1, src_parallel=()) -> FamilyRun:
     text = harness.run_training(fam, out_dir, nproc=nproc, src_parallel=src_parallel)
+    # Only the converted saves are ever read again; drop the rest to bound disk use.
+    for ckpt in (out_dir / "fsdp").glob("iter_*"):
+        if int(ckpt.name[len("iter_") :]) not in config.CONVERT_ITERS:
+            shutil.rmtree(ckpt)
     td = {
         it: harness.convert(out_dir / "fsdp" / f"iter_{it:07d}", out_dir / f"td{it}", it)
         for it in config.CONVERT_ITERS
     }
     return FamilyRun(
-        family=fam,
         root=out_dir,
         fsdp_dir=out_dir / "fsdp",
         td=td,
         fsdp_metrics=harness.parse_iter_metrics(text),
-        train_log=out_dir / "train_fsdp.log",
     )
 
 

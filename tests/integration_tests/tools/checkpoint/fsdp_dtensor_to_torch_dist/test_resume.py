@@ -26,10 +26,5 @@ from tests.integration_tests.tools.checkpoint.fsdp_dtensor_to_torch_dist import 
 def test_resume_continuity(family, family_runs):
     run = family_runs(family)
     for iteration in config.CONVERT_ITERS:  # two independent load points
-        nxt = iteration + 1
         log = run.root / f"resume_{iteration}.log"
-        text = harness.resume_classic(family, run.td[iteration], iteration, log)
-        harness.assert_loaded_at(text, iteration)
-        resumed = harness.parse_iter_metrics(text)
-        assert nxt in resumed, f"[{family.name}] no iteration {nxt} in resume log {log}"
-        harness.assert_loss_lr(run.fsdp_metrics[nxt], resumed[nxt], loss_rtol=family.loss_rtol)
+        harness.check_resume(family, run.fsdp_metrics, run.td[iteration], iteration, log)

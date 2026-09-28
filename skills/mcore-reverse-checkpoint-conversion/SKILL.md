@@ -52,12 +52,13 @@ distributed-optimizer state, reshardable into any target TP/PP/EP/CP/VPP on load
    conversion is correct, run the opt-in end-to-end suite as **plain pytest** (it
    spawns its own torchrun — do not launch it under `torch.distributed.run`):
    `MCORE_CHECKPOINT_E2E=1 uv run pytest
-   tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist --run-e2e`.
+   tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist`.
    Scope with `-k` by family and by check (`test_resume` / `test_bitexact` [1 GPU],
-   `test_reshard` / `test_source_sharding` [≥2 GPUs]).
+   `test_multiprocess_convert` [CPU], `test_reshard` / `test_source_sharding` [≥2 GPUs]).
 4. **Read the PASS criteria from the suite README**, not from intuition: loads at the
-   right iter, first resumed `lm loss` ≈ FSDP loss within bf16 tolerance, LR exact,
-   and (bit-exact) a clean per-tensor diff.
+   right iter, every resumed `lm loss` ≈ the FSDP loss (dropout is off, so the first
+   one is exact), LR exact, and (bit-exact) every model tensor, fp32 master and Adam
+   moment the classic job holds after the load `torch.equal` to the FSDP source.
 5. **Report** the `[Convert]` line, the load-at-iter confirmation, and the numeric
    verdict; link the canonical doc for human readers.
 
@@ -72,9 +73,12 @@ distributed-optimizer state, reshardable into any target TP/PP/EP/CP/VPP on load
 - **Dropped by design:** RNG state, rerun-state, and all `_extra_state` (incl. FP8
   amax history). FP8 resume re-initializes amax, so it tracks ~1% looser than bf16
   tolerance — expected, not a bug.
-- **`gdn_hybrid` needs `flash-linear-attention`** (the image's `fla` stub is
-  insufficient); it is pinned in the `dev` extra, and the e2e suite skips the family
-  if `fla` is not importable (it never pip-installs at test time).
+- **`gdn_hybrid` needs `flash-linear-attention`** (pinned in `pyproject.toml`); the
+  e2e suite skips the family if `fla` is not importable (it never pip-installs at
+  test time).
+- **A matching resume loss is not proof.** A one-ulp master error or an off-by-one
+  Adam `step` stays inside a loss tolerance for several iterations; only the
+  bit-exact check (source-vs-loaded, per tensor) catches them.
 - **Under GPU contention**, prefer the single-rank resume + bit-exact checks; the
   2-GPU reshard sweep can deadlock on a shared GPU.
 - **Suite outputs** land in a tmp dir (or `RESULTS_DIR` if set) and are safe to
@@ -93,7 +97,7 @@ Pure-logic and round-trip coverage belong in
 opt-in pytest suite at
 `tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist/` (add a family
 = one `ModelFamily` entry in its `registry.py`); it is a real-checkpoint complement
-to the unit tests, gated behind `--run-e2e` / `MCORE_CHECKPOINT_E2E=1`.
+to the unit tests, gated behind `MCORE_CHECKPOINT_E2E=1`.
 
 ## Documentation drift
 
