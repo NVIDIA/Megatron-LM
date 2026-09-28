@@ -21,6 +21,7 @@ boundaries) before running the decoder; the module keeps them until the next ``p
 """
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -36,10 +37,17 @@ except ImportError:  # pragma: no cover - torch built without distributed suppor
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.hyper_connection import gated_residual_group_rmsnorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.utils import (
+    get_tensor_model_parallel_group_if_none,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -166,6 +174,95 @@ def shift_tokens_in_segment(
     return torch.where(valid, shifted, token_ids.new_full((), eos_token_id))
 
 
+class PinnedVocabParallelEmbedding(nn.Module):
+    """Frozen TP row shard on pinned host memory, with the GPU embedding's SP contract."""
+
+    def __init__(
+        self, num_embeddings: int, embedding_dim: int, config: TransformerConfig, tp_group
+    ):
+        super().__init__()
+        self.tp_group = tp_group
+        self.reduce_scatter_embeddings = config.sequence_parallel
+        self.vocab_start_index = tp_group.rank() * (num_embeddings // tp_group.size())
+        self.vocab_end_index = self.vocab_start_index + num_embeddings // tp_group.size()
+        if num_embeddings % tp_group.size():
+            raise ValueError("PLE padded vocabulary must divide TP size")
+        # A persistent buffer is visible to Bridge conversion and Megatron DCP, but is
+        # absent from optimizer groups. Native resume restores it without an HF preload.
+        self.register_buffer(
+            "weight",
+            torch.empty(
+                num_embeddings // tp_group.size(),
+                embedding_dim,
+                dtype=config.params_dtype,
+                pin_memory=True,
+            ),
+        )
+        self._table_loaded = False
+
+    def _apply(self, fn):
+        # Parent model.cuda()/to() must not move the 51B-row table to GPU.
+        weight = self._buffers.pop("weight")
+        try:
+            super()._apply(fn)
+        finally:
+            self._buffers["weight"] = weight
+        return self
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Expose persistent host rows to Megatron distributed checkpoints."""
+        key = f"{prefix}weight"
+        return {
+            key: make_tp_sharded_tensor_for_checkpoint(
+                tensor=self.weight,
+                key=key,
+                allow_shape_mismatch=True,
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata["dp_cp_group"],
+            )
+        }
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+        if prefix + "weight" in state_dict:
+            self._table_loaded = True
+
+    def forward(self, input_: Tensor) -> Tensor:
+        """Look up the frozen TP host shard and preserve the SP output layout."""
+        if not self._table_loaded:
+            raise RuntimeError("Pinned PLE table was not loaded from HF or DCP")
+        # Bounded chunks limit host gather and GPU transfer temporaries at 128K.
+        from megatron.core.transformer.ple_host_lookup import gather_pinned_rows
+
+        output_parts = []
+        for ids in input_.split(4096, dim=1):
+            fast_rows = gather_pinned_rows(
+                self.weight, ids, self.vocab_start_index, self.vocab_end_index
+            )
+            if fast_rows is not None:
+                output_parts.append(fast_rows)
+                continue
+            cpu_ids = ids.detach().to("cpu")
+            owned = (cpu_ids >= self.vocab_start_index) & (cpu_ids < self.vocab_end_index)
+            local_ids = (cpu_ids - self.vocab_start_index).clamp(0, self.weight.shape[0] - 1)
+            rows = self.weight[local_ids]
+            rows.masked_fill_(~owned.unsqueeze(-1), 0)
+            output_parts.append(rows.to(input_.device, non_blocking=True))
+        output_parallel = torch.cat(output_parts, dim=1)
+        if self.reduce_scatter_embeddings:
+            return reduce_scatter_to_sequence_parallel_region(
+                output_parallel.transpose(0, 1).contiguous(), group=self.tp_group
+            )
+        if self.tp_group.size() > 1:
+            return reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+        return output_parallel
+
+
 class NGramEmbedding(MegatronModule):
     """Hashed n-gram embedding table of one PLE module (``ple.ple_embedding`` in HF).
 
@@ -213,14 +310,19 @@ class NGramEmbedding(MegatronModule):
         )
 
         tp_group = get_tensor_model_parallel_group_if_none(None)
-        self.ngram_embedding = VocabParallelEmbedding(
-            self.padded_vocab_size,
-            self.head_dim,
-            init_method=config.init_method,
-            reduce_scatter_embeddings=config.sequence_parallel,
-            config=config,
-            tp_group=tp_group,
-        )
+        if os.environ.get("QWEN48_PLE_CPU_OFFLOAD") == "1":
+            self.ngram_embedding = PinnedVocabParallelEmbedding(
+                self.padded_vocab_size, self.head_dim, config, tp_group
+            )
+        else:
+            self.ngram_embedding = VocabParallelEmbedding(
+                self.padded_vocab_size,
+                self.head_dim,
+                init_method=config.init_method,
+                reduce_scatter_embeddings=config.sequence_parallel,
+                config=config,
+                tp_group=tp_group,
+            )
 
     def compute_ngram_ids(self, token_ids: Tensor, cu_seqlens: Optional[Tensor] = None) -> Tensor:
         """Hashed table rows for every token and head.
