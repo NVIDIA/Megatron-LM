@@ -31,7 +31,7 @@ from ..utils import HAVE_TE
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
-from .placement import BlockAtomic, RowAtomic, TensorAtomic
+from .placement import TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
@@ -125,6 +125,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
@@ -154,25 +155,15 @@ class FsdpParameterGroup:
         self.grad_divisor = grad_divisor
         parameters = tuple(parameter_to_fqns)
 
-        layout_placement = self._resolve_layout_placement(
-            self.mesh,
-            # MXFP8 groups keep 32-row blocks on one rank; every other dtype packs rows.
-            block_size=32 if self.dtype == torch.uint8 else 1,
-            placement_lists=(model_weight_placements, main_grad_placements, main_weight_placements),
-        )
-        # All buffers share this layout; owner assignments are construction-only.
-        shapes = (parameter.shape for parameter in parameters)
-        if isinstance(layout_placement, TensorAtomic):
-            # Uneven all-gather / reduce-scatter use grouped NCCL broadcasts /
-            # reductions, which cannot use symmetric-memory kernels:
-            # https://github.com/pytorch/pytorch/issues/198344.
-            if use_symmetric_memory:
-                raise ValueError(
-                    "Symmetric-memory collectives require uniform shards; "
-                    "TensorAtomic is not supported."
-                )
-            if parameter_to_owner is None:
-                raise ValueError("TensorAtomic placements require parameter_to_owner.")
+        if parameter_to_owner is not None and any(
+            isinstance(placement, TensorAtomic)
+            for placements in (
+                model_weight_placements,
+                main_grad_placements,
+                main_weight_placements,
+            )
+            for placement in placements
+        ):
             missing = [
                 fqn
                 for parameter, fqns in parameter_to_fqns.items()
@@ -183,21 +174,9 @@ class FsdpParameterGroup:
                 raise ValueError(
                     f"parameter_to_owner is missing entries for parameters {missing!r}."
                 )
-            layout = GlobalLayout.build_for_tensor_atomic(
-                shapes,
-                dp_size=self.mesh.size(),
-                tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
-            )
-        else:
-            block_size = (
-                layout_placement.block_size if isinstance(layout_placement, BlockAtomic) else 1
-            )
-            layout = GlobalLayout.build_for_row_atomic(
-                shapes, dp_size=self.mesh.size(), block_size=block_size
-            )
         self._initialize_buffers(
             parameters,
-            layout,
+            parameter_to_owner,
             model_weight_placements,
             main_grad_placements,
             main_weight_placements,
@@ -243,14 +222,53 @@ class FsdpParameterGroup:
     def _initialize_buffers(
         self,
         parameters: tuple[nn.Parameter, ...],
-        layout: GlobalLayout,
+        parameter_to_owner: dict[nn.Parameter, int] | None,
         model_weight_placements: tuple[Placement, ...],
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symmetric_memory: bool,
     ) -> None:
-        """Allocate weight and gradient buffers in their required dependency order."""
+        """Build the shared layout and allocate weight and gradient buffers."""
+        shards = [
+            placement
+            for placements in (
+                model_weight_placements,
+                main_grad_placements,
+                main_weight_placements,
+            )
+            for placement in placements
+            if isinstance(placement, Shard)
+        ]
+        shapes = (parameter.shape for parameter in parameters)
+        if any(isinstance(placement, TensorAtomic) for placement in shards):
+            if self.mesh.ndim != 1:
+                raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
+            if not all(isinstance(placement, TensorAtomic) for placement in shards):
+                raise ValueError(
+                    "TensorAtomic cannot be mixed with RowAtomic or BlockAtomic placements."
+                )
+            # Uneven all-gather / reduce-scatter use grouped NCCL broadcasts /
+            # reductions, which cannot use symmetric-memory kernels:
+            # https://github.com/pytorch/pytorch/issues/198344.
+            if use_symmetric_memory:
+                raise ValueError(
+                    "Symmetric-memory collectives require uniform shards; "
+                    "TensorAtomic is not supported."
+                )
+            if parameter_to_owner is None:
+                raise ValueError("TensorAtomic placements require parameter_to_owner.")
+            layout = GlobalLayout.build_for_tensor_atomic(
+                shapes,
+                dp_size=self.mesh.size(),
+                tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+            )
+        else:
+            # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
+            layout = GlobalLayout.build_for_row_atomic(
+                shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
+            )
+
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
@@ -341,39 +359,6 @@ class FsdpParameterGroup:
             device=self.main_weight.device,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
-
-    @staticmethod
-    def _resolve_layout_placement(
-        mesh: DeviceMesh, *, block_size: int, placement_lists: Iterable[tuple[Placement, ...]]
-    ) -> RowAtomic | BlockAtomic | TensorAtomic:
-        """Resolve the placement used to choose a parameter group's layout builder.
-
-        All buffers in a group (model weight, main weight, main grad, and their
-        views) must be planned against one ``GlobalLayout`` so that views and
-        collectives between them are aligned.
-
-        Args:
-            mesh: Data-parallel device mesh the buffers are distributed over.
-            block_size: Rows kept together on one rank.
-            placement_lists: The per-buffer placement tuples (model weight, main
-                grad, main weight).
-
-        Returns:
-            ``TensorAtomic`` if any placement is ``TensorAtomic``; otherwise
-            ``BlockAtomic(block_size)`` when ``block_size > 1``, else ``RowAtomic``.
-        """
-        shards = [p for placements in placement_lists for p in placements if isinstance(p, Shard)]
-        tensor_atomics = [p for p in shards if isinstance(p, TensorAtomic)]
-        if not tensor_atomics:
-            return BlockAtomic(block_size) if block_size > 1 else RowAtomic()
-
-        if mesh.ndim != 1:
-            raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
-        if len(tensor_atomics) != len(shards):
-            raise ValueError(
-                "TensorAtomic cannot be mixed with RowAtomic or BlockAtomic placements."
-            )
-        return TensorAtomic()
 
     def _build_fsdp_parameters(
         self, parameter_to_fqns: dict[nn.Parameter, list[str]]
