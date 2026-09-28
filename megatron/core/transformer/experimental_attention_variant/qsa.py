@@ -87,6 +87,7 @@ class QSASelection:
         all_selected: True when every query selected all of its visible complete blocks, i.e.
             the attention pattern is plain causal attention.
         selected_ids: Optional ``[b * s, K]`` int32 document-relative complete block IDs.
+        max_complete_blocks: Maximum complete blocks in any document in this selection.
     """
 
     doc_ids: Tensor
@@ -97,6 +98,7 @@ class QSASelection:
     compress_ratio: int
     all_selected: bool
     selected_ids: Optional[Tensor] = None
+    max_complete_blocks: Optional[int] = None
     index_query: Optional[Tensor] = None
     compressed_key: Optional[Tensor] = None
     compact_block_prefix: Optional[Tensor] = None
@@ -738,6 +740,7 @@ class QSAIndexer(MegatronModule):
             compress_ratio=self.compress_ratio,
             all_selected=all_selected,
             selected_ids=selected_ids.contiguous() if selected_ids is not None else None,
+            max_complete_blocks=max_doc_len // self.compress_ratio,
             index_query=q_flat if use_loss else None,
             compressed_key=pooled.reshape(-1, D) if use_loss else None,
             compact_block_prefix=compact_block_prefix if use_loss else None,
