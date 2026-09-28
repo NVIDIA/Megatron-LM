@@ -15,6 +15,7 @@ Guides for Megatron Core training and inference features.
 :maxdepth: 2
 
 cuda_graph
+cross_layer_state
 fine_grained_activation_offloading
 moe
 megatron_fsdp
