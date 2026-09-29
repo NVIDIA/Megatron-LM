@@ -2362,6 +2362,7 @@ dev = [
     { name = "flashinfer-python" },
     { name = "hypercorn" },
     { name = "megatron-energon", extra = ["av-decode"] },
+    { name = "mixture-of-kittens", marker = "sys_platform == 'linux'" },
     { name = "multi-storage-client" },
     { name = "nemo-lens" },
     { name = "nvidia-cudnn-frontend", extra = ["cutedsl"] },
@@ -2492,6 +2493,7 @@ requires-dist = [
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
+    { name = "mixture-of-kittens", marker = "sys_platform == 'linux' and extra == 'dev'", git = "https://github.com/QiZhangNV/mixture-of-kittens.git?rev=a2ad2d0ce2366c1817d15498cdbaf8ead5966117" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
@@ -2617,6 +2619,14 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/91/47/746287c8962274f73ee25edb3840d80899464bfffbe2c435424c2d60a071/mfusepy-3.1.1.tar.gz", hash = "sha256:338ece54513d7d1a5e9492837679a0c7432ecf96a03490a2683a1ce1d19570e1", size = 34549, upload-time = "2026-03-13T00:36:52.636Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c5/d5/56bc9326bf75f7ea0f4fe1178f5c9f20d1a1e15e288ecf66088513538ccd/mfusepy-3.1.1-py3-none-any.whl", hash = "sha256:69fb70cfc7f7cce595e6ff586f8451d8298f01f18286a157f24f564b24ec5a37", size = 28264, upload-time = "2026-03-13T00:36:51.843Z" },
+]
+
+[[package]]
+name = "mixture-of-kittens"
+version = "0.1.0"
+source = { git = "https://github.com/QiZhangNV/mixture-of-kittens.git?rev=a2ad2d0ce2366c1817d15498cdbaf8ead5966117#a2ad2d0ce2366c1817d15498cdbaf8ead5966117" }
+dependencies = [
+    { name = "torch", marker = "sys_platform == 'never'" },
 ]
 
 [[package]]
