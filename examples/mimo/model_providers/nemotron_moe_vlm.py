@@ -260,6 +260,7 @@ def language_model_spec(
             "position_embedding_type": "none",
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
+            "logit_dtype": args.logit_dtype,
             "pg_collection": pg_collection,
         },
     )
@@ -372,6 +373,7 @@ def build_nemotron_communicator(
         dim_mapping={"s": 0, "h": 2, "b": 1},
         module_output_ndim={RADIO_ENCODER_MODULE_NAME: 2},
         bridge_recv_shape_fns=bridge_recv_shape_fns,
+        bridge_comm_dtypes={RADIO_ENCODER_MODULE_NAME: language_config.params_dtype},
     )
 
 

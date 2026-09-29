@@ -74,6 +74,10 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
     config.activation_func_tanh_clamp_scale = None
     config.activation_func_tanh_clamp_scale_linear = None
+    # FP32 residual accumulation is a language-model policy. Preserve the pretrained
+    # modality math and restore the communication dtype promoted by TransformerConfig.
+    config.fp32_residual_connection = False
+    config.pipeline_dtype = config.params_dtype
     config.num_moe_experts = None
     config.moe_ffn_hidden_size = None
     config.moe_shared_expert_intermediate_size = None

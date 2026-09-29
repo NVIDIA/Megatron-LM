@@ -182,12 +182,17 @@ class _ToyInferenceService:
         assert torch.all(decoder_output[image_positions] == 1)
         assert torch.all(decoder_output[~image_positions] == 0)
 
-    def add_request(self, prompt, sampling_params, *, multi_modal_data=None):
-        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
-            1
-        ]
+    def add_request(self, prompt, sampling_params, *, multi_modal_data=None, offload_params=None):
+        return self.add_request_with_id(
+            prompt,
+            sampling_params,
+            multi_modal_data=multi_modal_data,
+            offload_params=offload_params,
+        )[1]
 
-    def add_request_with_id(self, prompt, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(
+        self, prompt, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
         """Mirror InferenceClient: the endpoints submit through the id-returning form."""
         future = asyncio.get_running_loop().create_future()
         # Claimed before the work, as the real client claims next_request_id

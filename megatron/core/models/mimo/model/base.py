@@ -272,6 +272,9 @@ class MimoModel(MegatronModule):
                 modality_embeddings, modality_token_indices, batch_size * seq_length
             )
             for modality_name, modality_emb in modality_embeddings.items():
+                # Bridges keep modality activations in parameter dtype; promote only when
+                # they join a higher-precision language-model residual stream.
+                modality_emb = modality_emb.to(dtype=dtype)
                 flat_combined_embeddings.index_copy_(
                     0, modality_token_indices[modality_name], modality_emb
                 )
@@ -296,6 +299,7 @@ class MimoModel(MegatronModule):
                     f"number of {modality_name} embeddings ({modality_emb.size(0)})"
                 )
 
+            modality_emb = modality_emb.to(dtype=dtype)
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)
             combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
 

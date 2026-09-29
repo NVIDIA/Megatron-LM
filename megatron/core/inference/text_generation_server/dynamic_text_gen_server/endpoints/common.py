@@ -2,7 +2,7 @@
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
@@ -36,6 +36,53 @@ def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason
             logger.warning("Failed to abort request %s (%s)", request_id, reason, exc_info=True)
         else:
             logger.debug("Aborted request %s (%s)", request_id, reason)
+
+
+def validate_offload_params(offload_params) -> Optional[str]:
+    """Return an error message if client-supplied ``offload_params`` are malformed, else None.
+
+    Top-level keys starting with ``_`` are engine-owned control fields (for example
+    the prompt-preparation error the engine stamps on MP rank 0), so a client is not
+    allowed to supply them. Called on the raw request value, so the ``dict`` check
+    lives here too.
+    """
+    if offload_params is None:
+        return None
+    if not isinstance(offload_params, dict):
+        return "'offload_params' must be an object"
+    reserved = sorted(key for key in offload_params if isinstance(key, str) and key.startswith("_"))
+    if reserved:
+        return f"'offload_params' keys starting with '_' are reserved: {reserved}"
+    return None
+
+
+def collect_stage_metadata(response_metadata: dict, result: dict) -> None:
+    """Fold one reply's ``payload_stage_metadata`` into the response-level dict.
+
+    Every request in a batch goes through the same stager, so a key that already
+    exists must carry the same value; a mismatch means the stager returned
+    per-request metadata that cannot be represented once at the top level.
+    """
+    stage_metadata = result.get("payload_stage_metadata") or {}
+    for key, value in stage_metadata.items():
+        if key in response_metadata and response_metadata[key] != value:
+            raise ValueError(f"payload stager returned conflicting response metadata for {key!r}")
+        response_metadata[key] = value
+
+
+def attach_stage_metadata(response: dict, response_metadata: dict) -> dict:
+    """Merge the stager's response metadata into the top-level response body.
+
+    The OpenAI-shaped fields already in ``response`` are reserved; a stager key that
+    collides with one is a bug rather than something to overwrite silently.
+    """
+    overlap = set(response).intersection(response_metadata)
+    if overlap:
+        raise ValueError(
+            f"payload stager response metadata collides with reserved fields: {sorted(overlap)}"
+        )
+    response.update(response_metadata)
+    return response
 
 
 def send_do_generate():
