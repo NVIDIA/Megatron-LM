@@ -1,6 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Parameter-readiness contracts for direct parameter consumers."""
+"""Parameter readiness: ``ensure_params_ready`` and DDP's ``_BucketParamReadyCallback``.
+
+The GPU test in ``generalized_tensor_parallel/`` runs one configuration: healthy DDP, pre-hooks
+enabled, ``align_param_gather=False``. These cover the branches it never exercises --
+``align_param_gather=True``, pre-hooks removed mid-sequence, a collected DDP or bucket group,
+CUDA-graph capture deferral, and out-of-order bucket dedup -- which would be contrived to set up
+on real GPUs.
+"""
 
 from types import SimpleNamespace
 
@@ -74,6 +81,24 @@ class TestBucketParamReadiness:
         capturing[0] = False
         ready_callback()
         assert bucket_group.finished == [False]
+
+    def test_cuda_graph_capture_defers_publication_until_replay(self, monkeypatch):
+        ddp = _fake_ddp()
+        bucket_group = _FakeBucketGroup()
+        ready_callback = _BucketParamReadyCallback(ddp, bucket_group)
+        param = torch.nn.Parameter(torch.zeros(1))
+        setattr(param, PARAM_READY_CALLBACK_ATTR, ready_callback)
+        capturing = [True]
+        monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: capturing[0])
+
+        ensure_params_ready([param])
+        assert bucket_group.finished == []
+        assert not bucket_group.param_gather_dispatched
+
+        capturing[0] = False
+        ensure_params_ready([param])
+        assert bucket_group.finished == [False]
+        assert bucket_group.param_gather_dispatched
 
     def test_publishes_once_then_is_idempotent(self):
         ddp = _fake_ddp()

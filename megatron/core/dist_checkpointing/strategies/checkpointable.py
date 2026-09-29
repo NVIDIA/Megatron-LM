@@ -12,6 +12,31 @@ from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, Wri
 from ..mapping import ShardedTensor
 
 
+def _dcp_chunk_size(sh_ten: ShardedTensor) -> torch.Size:
+    """Chunk size for DCP, expressed over the same axes as ``global_offset``.
+
+    ``global_offset`` spans ``prepend_axis_num + data.ndim`` axes while ``local_shape`` spans
+    only the data axes, so handing DCP ``local_shape`` yields a chunk whose sizes are shorter
+    than its offsets. DCP's ``_check_box_overlap`` then indexes ``sizes`` with an offset axis
+    and raises ``IndexError: tuple index out of range``. A prepended axis addresses exactly one
+    slot (e.g. one expert), so its extent is 1.
+    """
+    return torch.Size((1,) * sh_ten.prepend_axis_num + tuple(sh_ten.local_shape))
+
+
+def _dcp_shard_view(sh_ten: ShardedTensor) -> torch.Tensor:
+    """The shard's data viewed over the same axes as its chunk description.
+
+    Must stay consistent with :func:`_dcp_chunk_size`: DCP narrows the returned tensor with the
+    chunk's offsets/sizes, so handing back the bare ``data`` (which lacks the prepended axes)
+    raises ``IndexError: Dimension out of range``. Unsqueezing is free and needs no contiguity.
+    """
+    data = sh_ten.data
+    if not sh_ten.prepend_axis_num:
+        return data
+    return data[(None,) * sh_ten.prepend_axis_num]
+
+
 class CheckpointableShardedTensor(torch.Tensor):
     """ShardedTensor extension compatible with PyTorch DCP checkpointing library.
 
@@ -41,8 +66,8 @@ class CheckpointableShardedTensor(torch.Tensor):
         """
         offsets = torch.Size(sh_ten._sh_ten.global_offset)
         global_shape = torch.Size(sh_ten._sh_ten.global_shape)
-        chunk_size = torch.Size(sh_ten._sh_ten.local_shape)
-        assert chunk_size == sh_ten._sh_ten.data.size()
+        chunk_size = _dcp_chunk_size(sh_ten._sh_ten)
+        assert torch.Size(sh_ten._sh_ten.local_shape) == sh_ten._sh_ten.data.size()
 
         return [
             WriteItem(
@@ -63,8 +88,8 @@ class CheckpointableShardedTensor(torch.Tensor):
             List[ChunkStorageMetadata]: list of DCP ChunkStorageMetadata metadata objects.
         """
         offsets = torch.Size(self._sh_ten.global_offset)
-        chunk_size = torch.Size(self._sh_ten.local_shape)
-        assert chunk_size == self._sh_ten.data.size()
+        chunk_size = _dcp_chunk_size(self._sh_ten)
+        assert torch.Size(self._sh_ten.local_shape) == self._sh_ten.data.size()
 
         return [ChunkStorageMetadata(offsets=offsets, sizes=chunk_size)]
 
@@ -77,7 +102,7 @@ class CheckpointableShardedTensor(torch.Tensor):
         Returns:
             Tensor: the underlying data tensor
         """
-        return self._sh_ten.data
+        return _dcp_shard_view(self._sh_ten)
 
     @classmethod
     def from_sh_ten(cls, sh_ten: ShardedTensor) -> 'CheckpointableShardedTensor':

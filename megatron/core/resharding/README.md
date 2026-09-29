@@ -1,7 +1,7 @@
 # Resharding (Refit)
 
 Transfer model weights between different parallelism configurations
-(TP, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
+(TP, GTP, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
 Used primarily in RL loops to move weights from a training model to an
 inference model that may use a different parallelism layout.
 
@@ -10,7 +10,9 @@ inference model that may use a different parallelism layout.
 ```
 refit.py            High-level API: swap_model_weights, caching, MXFP8 auto-detection
     |
-planner.py          Centralized plan builder (rank 0 builds, scatters to all)
+planner.py          Local plan builder (every rank all-gathers metadata, replays
+                    the same deterministic schedule, keeps only its own ops)
+shard_planner.py    Logical-coordinate planner for TP x GTP weight shards
     |
 execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
@@ -80,20 +82,80 @@ swap_model_weights(None, None, "nccl",
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
 
-All backends detect same-rank (local) transfers via `task_id` and
-short-circuit them into direct `tensor.copy_()` instead of going
-through the network stack.
+Backends that support collocated models detect same-rank (local) transfers via
+`task_id` and short-circuit them into direct `tensor.copy_()` instead of going
+through the network stack. NCCL M2N is the exception because its source and
+destination meshes must be disjoint.
+
+### NCCL M2N backend
+
+Build the current M2N library from
+[NVIDIA/nccl-extensions](https://github.com/NVIDIA/nccl-extensions), then install
+its Python package together with NCCL4Py. M2N v0.2 requires NCCL 2.30.5 or
+newer. For a source checkout, follow the upstream native build instructions,
+then install the bindings from outside the `python/` directory:
+
+```bash
+CUDA_HOME=/usr/local/cuda pip install -e /path/to/nccl-extensions/python
+```
+
+The package imports as `nccl.m2n` and uses `nccl.core` from NCCL4Py. A wheel
+may bundle `libnccl_m2n.so`; otherwise set the loader override explicitly:
+
+```bash
+export NCCL_M2N_LIBRARY=/path/to/libnccl_m2n.so
+```
+
+Select it with `refit_method="nccl_m2n"` or `--refit-method nccl_m2n`.
+The backend preserves the existing ReFIT planner and packs its operations into
+one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
+0, destination ranks shard dimension 1, and one cross-dimension
+`nccl.m2n.reshard` call moves the entire batch through M2N's managed
+copy/staging transport. Before a plan's first call, ranks exchange byte counts,
+tensor counts, and an ordered layout digest for every source/destination pair;
+any sender/receiver disagreement fails before weight data moves. The result is
+cached with the immutable plan, so subsequent refits do not run that collective
+or repeat the peer/layout validation.
+
+This backend supports only non-collocated multi-rank layouts. The communication
+group must contain a contiguous source interval starting at group rank 0,
+immediately followed by a contiguous destination interval, with no overlapping
+or idle ranks, and `num_dst_pools > 1` is not supported. Use a process group
+scoped to exactly one source/destination pool when the application has extra
+ranks. The M2N API describes a regular tensor, so every pair uses the largest
+validated pair payload as its trailing extent; skewed pair sizes therefore add
+wire padding. The logical transfer size is
+`src_count * dst_count * max_pair_bytes`, and each rank temporarily stages
+`peer_count * max_pair_bytes`. The staging tensor is returned to PyTorch's
+caching allocator after each refit rather than retained by the service. Model
+parameter storage itself is not replaced. Supported mesh sizes are validated
+by `nccl-extensions`. GTP-sharded parameters currently use the generic `nccl`,
+`gloo`, `nvshmem`, or `nixl` slice-transfer path; `nccl_m2n` rejects such plans
+before communication instead of treating a GTP shard as a complete weight.
+
+The built-in RL loop currently creates its training and inference models on the
+same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
+API or the ReFIT benchmark.
 
 ## How the Reshard Plan Works
 
 1. Each rank extracts parameter metadata (shape, sharding, TP/EP/PP groups).
-2. Metadata is gathered to rank 0 via `dist.gather_object()`.
-3. Rank 0 builds a complete transfer schedule:
-   - For each destination param, finds the matching source param(s) by name.
-   - Routes to a dimension-specific planner (LCM tiling for standard TP,
-     block-interleaved for partitioned params like Mamba `in_proj`).
-   - Produces `TransferOp` pairs with globally unique `task_id` values.
-4. Plans are scattered back; each rank receives only its own send/recv ops.
+2. Metadata is all-gathered so **every** rank has the full picture
+   (`dist.all_gather_object()`) — no rank-0 bottleneck, no scatter.
+3. Every rank independently replays the **same deterministic schedule**
+   (`_iter_global_transfer_ops`):
+   - Iterate destination ranks, then each rank's destination params in gathered
+     order; for each destination param, find the matching source param(s) by name.
+   - Preserve the established LCM/block-interleaved planner for non-GTP
+     parameters. For a GTP parameter, map every local TP x GTP shard into
+     logical global weight coordinates and intersect it with the destination
+     shard. This excludes GTP alignment padding while composing with column,
+     row, strided, and packed TP layouts.
+   - Assign a monotonic `task_id` per sub-op.  Because the iteration order and
+     counter are a pure function of the gathered metadata, the send op computed
+     on the sender and the recv op computed on the receiver get the **same**
+     `task_id` without any central authority.
+4. Each rank keeps only the ops where it is the sender or receiver.
 5. The plan is cached so repeated refits skip steps 1-4.
 
 ## MXFP8 Transform
@@ -120,8 +182,8 @@ across refits.
 
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
-| `_service_cache` | Backend name | `CopyService` instance | Avoid re-creating CUDA streams / NVSHMEM buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
+| `_service_cache` | Backend name + process-group identity | `CopyService` instance | Avoid re-creating backend communicators and buffers |
+| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP-remat sizes |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.
@@ -138,13 +200,16 @@ attribute with the following groups:
 | `pp` | If PP > 1 | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
+| `gtp_remat` | If dense GTP | Dense weight-rematerialization shards |
+| `expt_gtp_remat` | If expert GTP | Expert weight-rematerialization shards |
 
 ## File Reference
 
 | File | Role |
 |------|------|
 | `refit.py` | Public API, caching, MXFP8 auto-detection |
-| `planner.py` | Centralized plan builder (metadata, LCM/block-interleaved planners) |
+| `planner.py` | Local deterministic plan builder (metadata, LCM/block-interleaved planners) |
+| `shard_planner.py` | Logical-coordinate TP x GTP shard planner |
 | `execution.py` | Plan executor (send/recv submission, writeback, format conversion) |
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |

@@ -27,7 +27,7 @@ from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -277,6 +277,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".in_proj") if name is not None else None,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
@@ -292,6 +293,7 @@ class MambaMixer(MegatronModule):
             self.nheads_local_tp,  # dt
         ]
         setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
+        setattr(self.in_proj.weight, "use_muon", False)
 
         if not self.use_mem_eff_path:
             log_single_rank(
@@ -436,6 +438,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".out_proj") if name is not None else None,
         )
 
@@ -1377,17 +1380,7 @@ class MambaMixer(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim = (
-            self.d_inner_local_tp * 2
-            + 2 * self.ngroups_local_tp * self.d_state
-            + self.nheads_local_tp
-        )
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
-            in_proj_dim,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_in_proj_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             [
                 self.d_inner_local_tp,
@@ -1397,7 +1390,10 @@ class MambaMixer(MegatronModule):
                 self.nheads_local_tp,
             ],
             ["z", "x", "B", "C", "dt"],
-            0,
+            weight=self.in_proj.weight,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+            sharded_offsets=sharded_offsets,
         )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
