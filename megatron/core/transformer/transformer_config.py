@@ -2218,8 +2218,6 @@ class TransformerConfig(ModelParallelConfig):
                 if not condition:
                     raise ValueError(f"Virtual-expert load balancing requires {message}.")
 
-            if self.moe_expert_rank_capacity_factor is None:
-                self.moe_expert_rank_capacity_factor = 1.0
             required_values = {
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "hybridep",
@@ -2229,7 +2227,9 @@ class TransformerConfig(ModelParallelConfig):
                 "add_bias_linear": False,
                 "moe_grouped_gemm": True,
                 "moe_single_grouped_weight": False,
-                "use_transformer_engine_op_fuser": True,
+                "moe_expert_rank_capacity_factor": None,
+                "moe_paged_stash": False,
+                "moe_use_grouped_tensor": True,
                 "gradient_accumulation_fusion": True,
                 "moe_router_dtype": "fp32",
                 "moe_router_enable_expert_bias": False,
@@ -2280,13 +2280,11 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_latent_size (or hidden_size) divisible by 128",
             )
             require(self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128")
-            require(
-                self.moe_expert_rank_capacity_factor >= 1.0, "moe_expert_rank_capacity_factor>=1.0"
-            )
             mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             require(
                 not self.fp8 or mxfp8,
-                "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
+                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' "
+                "and fp8_param=True",
             )
             require(
                 not self.moe_router_padding_for_quantization or mxfp8,
@@ -2295,15 +2293,6 @@ class TransformerConfig(ModelParallelConfig):
             require(
                 self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
                 "moe_flex_dispatcher_num_sms>0",
-            )
-            require(
-                not self.moe_layer_recompute
-                and self.recompute_granularity != "full"
-                and not (
-                    self.recompute_granularity == "selective"
-                    and "moe" in (self.recompute_modules or ())
-                ),
-                "no MoE layer recompute",
             )
 
         if self.moe_shared_expert_intermediate_size is not None:
