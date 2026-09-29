@@ -33,7 +33,7 @@ def offload_pg_collection(distributed_setup) -> Iterator[ProcessGroupCollection]
     # Run the shared setup first so DBuffer's symmetric-memory queries cannot
     # lock in the default backend before the rest of this bucket selects NCCL.
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-    # Keep the singleton's warmup caches and offload statistics local to each test.
+    # Start each test with a fresh offload manager.
     PipelineOffloadManager.reset_instance()
     yield ProcessGroupCollection.use_mpu_process_groups()
     PipelineOffloadManager.reset_instance()
