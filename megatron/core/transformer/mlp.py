@@ -439,7 +439,7 @@ class MLP(MegatronModule):
 
         # fc1/fc2 resolve GTP_remat at the leaf; the TE op-fused MLP ignores shards, so fail fast.
         if hasattr(cls, '_make_fused_impl'):
-            assert config.gtp_weight_remat_size <= 1, (
+            assert not config.dense_gtp_remat_active, (
                 f"{cls.__name__}: GTP sharding of the dense MLP is not supported with the "
                 "TE fused MLP / GroupedLinear path (_make_fused_impl ignores GTP shards). "
                 "Use the non-fused MLP submodule, or do not enable GTP for dense MLP layers."

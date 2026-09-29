@@ -70,7 +70,13 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
-from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
+from .param_layout import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    pad_bucket_end,
+    pad_param_start,
+    resolve_buffer_dp_world_size,
+)
 
 logger = getLogger(__name__)
 
@@ -608,9 +614,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
-        Groups parameters by (param_dtype, grad_dtype, is_expert_parallel), then
-        computes a padded PerBufferParamLayout for each group. Expert-parallel groups use
-        expert_data_parallel_world_size for padding alignment.
+        Groups parameters by :class:`BufferKey`, then computes a padded PerBufferParamLayout
+        for each group over that buffer's own DP group size (see
+        :func:`resolve_buffer_dp_world_size`).
 
         Args:
             params: List of all parameters to lay out.
@@ -627,14 +633,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
-                dp_world_size = (
-                    expert_data_parallel_world_size
-                    if expert_data_parallel_world_size is not None
-                    else data_parallel_world_size
-                )
-            else:
-                dp_world_size = data_parallel_world_size
+            dp_world_size = resolve_buffer_dp_world_size(
+                buffer_key, group_params, data_parallel_world_size, expert_data_parallel_world_size
+            )
             layout = DistributedOptimizer._compute_per_buffer_param_layout(
                 group_params, bucket_size, dp_world_size, ddp_config, param_indices
             )
@@ -1270,6 +1271,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state[gbuf_idx] = dtype_state
         return state
 
+    def _assert_no_cp_folded_gtp_for_dp_zero(self):
+        """dp_zero gathers over the global DP group keyed by gbuf_idx; CP-folded buffers have a
+        CP-free per-buffer DP group and hold **distinct** shards per CP rank under one gbuf_idx."""
+        assert not any(
+            getattr(p, 'excludes_cp_from_bucket', False) for b in self.buffers for p in b.params
+        ), (
+            "dp_zero_gather_scatter / fully_reshardable checkpoint format does not support "
+            "CP-folded GTP weights (--gtp-remat-fold-cp). Use the default dp_reshardable "
+            "format instead."
+        )
+
     def get_parameter_state_dp_zero(
         self,
         use_gloo_comm: bool = True,
@@ -1302,6 +1314,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dict or None: optimizer state dict on DP rank 0, or all ranks if return_on_all_ranks.
                 Returns None on non-zero DP ranks when return_on_all_ranks=False.
         """
+        self._assert_no_cp_folded_gtp_for_dp_zero()
         # Data parallelism variables.
         if use_gloo_comm:
             data_parallel_group = self.data_parallel_group_gloo
@@ -1880,8 +1893,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         change during DP resharding - we want the checkpoint tensor to always have size
         `gbuf_world_numel_unpadded` which means everything except for the last padding above.
         """
+        # Elected writer for the shared (non-per-buffer) per_bucket_key metadata below.
         data_parallel_rank = self.data_parallel_group.rank()
-        data_parallel_world_size = self.data_parallel_group.size()
 
         state = self.get_parameter_state_dp_reshardable()
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
@@ -1899,6 +1912,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            # Per-buffer (not self.data_parallel_group): can differ, see
+            # BufferKey.excludes_cp_from_bucket.
+            buffer = self.buffers[gbuf_idx]
+            buf_dp_group = buffer.data_parallel_group
+            buf_dp_rank = buf_dp_group.rank()
+            buf_dp_world_size = buf_dp_group.size()
+            # excludes_cp_from_bucket buffers share one key across CP ranks; fold in the CP
+            # rank (via group membership, not axis order) so states don't alias. params[0] is
+            # representative -- excludes_cp_from_bucket is itself a BufferKey field.
+            cp_key_suffix = ''
+            first_param = buffer.params[0]
+            if getattr(first_param, 'excludes_cp_from_bucket', False):
+                weight_ranks = set(torch.distributed.get_process_group_ranks(first_param.group))
+                cp_ranks = [
+                    r
+                    for r in torch.distributed.get_process_group_ranks(buffer.dp_cp_group)
+                    if r in weight_ranks
+                ]
+                cp_key_suffix = f'.cp_rank_{cp_ranks.index(torch.distributed.get_rank())}'
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
                 for bucket_idx, bucket_state in enumerate(gbuf_range_map_for_all_buckets):
                     # Compute local DP contiguous shard's size.
@@ -1907,12 +1939,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                     gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
                     assert gbuf_world_numel_unpadded <= gbuf_world_numel
-                    assert gbuf_world_numel % data_parallel_world_size == 0
-                    gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
+                    assert gbuf_world_numel % buf_dp_world_size == 0
+                    gbuf_local_numel = gbuf_world_numel // buf_dp_world_size
 
                     sharded_bucket_key = (
                         f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
+                        f'{cp_key_suffix}'
                     )
 
                     # The global ckpt tensors must be fully covered.
@@ -1932,7 +1965,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             cur_param_end = 0
                         else:
                             cur_param_end = bucket_state[i]['gbuf_local_end']
-                        world_param_end = data_parallel_rank * gbuf_local_numel + cur_param_end
+                        world_param_end = buf_dp_rank * gbuf_local_numel + cur_param_end
                         # Insert padding if there is a gap between next param,
                         # but not exceeding unpadded gbuf size
                         if (
@@ -1988,7 +2021,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 tensors[key].dtype,
                                 tensors[key].shape,
                                 (gbuf_world_numel_unpadded,),
-                                (data_parallel_rank * gbuf_local_numel + gbuf_local_start,),
+                                (buf_dp_rank * gbuf_local_numel + gbuf_local_start,),
                                 axis_fragmentations=None,
                                 flattened_range=None,
                                 allow_shape_mismatch=False,
@@ -2172,7 +2205,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         method, along with `--ckpt-convert-format` and `--ckpt-convert-save` to
         update a legacy-format checkpoint to the modern format.
         """
-
+        self._assert_no_cp_folded_gtp_for_dp_zero()
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
@@ -2288,7 +2321,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # prior to Feb 13, 2024.
         if update_legacy_format:
             return self.load_parameter_state_from_dp_zero_legacy(state_dict)
-
+        self._assert_no_cp_folded_gtp_for_dp_zero()
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()

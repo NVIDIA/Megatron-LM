@@ -1055,6 +1055,332 @@ def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, po
             )
 
 
+def _worker_gtp_cp_writer_election_no_gaps(rank, world_size, port):
+    """Regression: with CP>1 AND gtp_remat>1, every one of the cp*gtp_remat shards must get
+    exactly one checkpoint writer (world=4 -> tp1*cp2*gtp2*dp1). Pre-fix, CP-inclusive replica
+    election collided two CP peers' DISTINCT shards -> half got zero writers.
+    """
+    from collections import defaultdict
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+        gtp_remat_fold_cp=True,
+    )
+    gtp_group = ps.get_gtp_weight_remat_group()
+    assert gtp_group.size() == 4, f"expected cp(2)*gtp_remat(2)=4, got {gtp_group.size()}"
+
+    full_vocab, hidden = 8, 4
+    per_shard = full_vocab // gtp_group.size()  # 2
+    weight = _make_gtp_shard(full_vocab, hidden, gtp_group)
+    assert weight.shape == (per_shard, hidden)
+
+    st = make_tp_sharded_tensor_for_checkpoint(
+        tensor=weight,
+        key="embedding.word_embeddings.weight",
+        tp_axis=0,
+        allow_shape_mismatch=True,  # how VocabParallelEmbedding calls it
+        prepend_offsets=(),
+        tp_group=ps.get_tensor_model_parallel_group(),
+        dp_cp_group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    mine = (int(st.global_offset[0]), tuple(st.replica_id))
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, mine)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        by_offset = defaultdict(list)
+        for off, rid in gathered:
+            by_offset[off].append(rid)
+        expected_offsets = {i * per_shard for i in range(gtp_group.size())}
+        assert set(by_offset) == expected_offsets, (
+            f"cp*gtp_remat shards must tile with no gaps: {sorted(by_offset)} != "
+            f"{sorted(expected_offsets)}"
+        )
+        for off, rids in by_offset.items():
+            n_writers = sum(is_main_replica(r) for r in rids)
+            assert n_writers == 1, (
+                f"vocab offset {off}: expected exactly 1 checkpoint writer, got {n_writers} "
+                f"(replica_ids {rids}); a CP-inclusive replica group leaves a CP-derived shard "
+                f"with no main-replica writer -> 'Invalid access pattern' at save"
+            )
+
+
+def _worker_vocab_embedding_wiring_no_gaps_under_cp(rank, world_size, port):
+    """Regression for the real wiring bug (not just gtp_replica_rank's fallback logic):
+    VocabParallelEmbedding's real pg_collection wiring must also elect exactly one writer per
+    vocab shard under CP+GTP (repros TP1 GTP2 EP2 EGTP1 CP2 'Invalid access pattern').
+    """
+    from collections import defaultdict
+
+    from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+        gtp_remat_fold_cp=True,
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'dp', 'dp_cp', 'gtp_remat']
+    )
+    model_parallel_cuda_manual_seed(42)
+    config = TransformerConfig(
+        num_attention_heads=1,
+        num_layers=1,
+        hidden_size=4,
+        params_dtype=torch.bfloat16,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    full_vocab, hidden = 8, 4
+    embedding = VocabParallelEmbedding(
+        full_vocab,
+        hidden,
+        init_method=torch.nn.init.zeros_,
+        config=config,
+        pg_collection=pg_collection,
+    ).cuda()
+    assert (
+        embedding.gtp_remat_size == 4
+    ), f"expected cp(2)*gtp_remat(2)=4, got {embedding.gtp_remat_size}"
+
+    sd = embedding.sharded_state_dict(metadata={'dp_cp_group': pg_collection.dp_cp})
+    st = sd['weight']
+    mine = (int(st.global_offset[0]), tuple(st.replica_id))
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, mine)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        per_shard = full_vocab // embedding.gtp_remat_size
+        by_offset = defaultdict(list)
+        for off, rid in gathered:
+            by_offset[off].append(rid)
+        expected_offsets = {i * per_shard for i in range(embedding.gtp_remat_size)}
+        assert set(by_offset) == expected_offsets, (
+            f"cp*gtp_remat shards must tile with no gaps: {sorted(by_offset)} != "
+            f"{sorted(expected_offsets)}"
+        )
+        for off, rids in by_offset.items():
+            n_writers = sum(is_main_replica(r) for r in rids)
+            assert n_writers == 1, (
+                f"vocab offset {off}: expected exactly 1 checkpoint writer, got {n_writers} "
+                f"(replica_ids {rids}); wrap_module_params_gtp's replica_group is still "
+                f"CP-inclusive -> 'Invalid access pattern' at save"
+            )
+
+
+def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base, fold=True):
+    """End-to-end DCP save->load of a GTP-sharded weight under CP, folded or not (real
+    VocabParallelEmbedding; world=4 -> tp1*cp2*gtp2*dp1). Each shard is filled with a
+    shard-distinctive value and every rank asserts its LOADED shard matches -- catches a shard
+    swap/overwrite, not just a crash. Unfolded, CP peers are replicas: exactly one must write.
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+        gtp_remat_fold_cp=fold,
+    )
+    try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'dp', 'dp_cp', 'gtp_remat']
+        )
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_attention_heads=1,
+            num_layers=1,
+            hidden_size=4,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        full_vocab, hidden = 8, 4
+        embedding = VocabParallelEmbedding(
+            full_vocab,
+            hidden,
+            init_method=torch.nn.init.zeros_,
+            config=config,
+            pg_collection=pg_collection,
+        ).cuda()
+        assert embedding.gtp_remat_size == (4 if fold else 2), f"fold={fold}: {embedding}"
+
+        # Shard-distinctive fill (rank within the weight group): distinct per rank when folded,
+        # shared by CP replicas when not. A uniform fill would hide a shard mix-up.
+        shard_id = ps.get_gtp_weight_remat_group().rank()
+        with torch.no_grad():
+            embedding.weight.copy_(
+                torch.full_like(embedding.weight, fill_value=float(shard_id), dtype=torch.bfloat16)
+            )
+        original_local = embedding.weight.detach().clone()
+
+        sd = embedding.sharded_state_dict(metadata={'dp_cp_group': pg_collection.dp_cp})
+
+        with TempNamedDir(ckpt_base / 'gtp_cp_sharded_roundtrip', sync=True) as ckpt_dir:
+            save(sd, ckpt_dir)
+            loaded = load(sd, ckpt_dir)
+
+        torch.testing.assert_close(loaded['weight'].cpu(), original_local.cpu(), rtol=0, atol=0)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+def _cp_gtp_moe_model_and_optimizer(cp_size, fold_cp, seed):
+    """Small TE MoE model + DistributedOptimizer (adam) for CP x GTP_remat ckpt tests."""
+    from functools import partial
+
+    from megatron.core.transformer.enums import AttnBackend
+    from tests.unit_tests.dist_checkpointing import setup_model_and_optimizer
+    from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
+
+    moe_cfg = dict(
+        hidden_size=64,
+        num_attention_heads=8,
+        kv_channels=8,
+        ffn_hidden_size=128,
+        use_cpu_initialization=False,
+        # conftest pins NVTE_FLASH_ATTN=0; AttnBackend.auto requires it unset or 1.
+        attention_backend=AttnBackend.unfused,
+        gtp_remat_fold_cp=fold_cp,
+    )
+    return setup_model_and_optimizer(
+        seed=seed,
+        tp=1,
+        pp=1,
+        cp=cp_size,
+        bf16=True,
+        dist_opt=True,
+        use_param_layout=True,
+        initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
+        optimizer='adam',
+    )
+
+
+def _worker_dp_reshardable_cp_gtp_roundtrip(
+    rank, world_size, ckpt_base, cp_size, gtp_remat_size, fold_cp=False
+):
+    """DistributedOptimizer dp_reshardable ckpt round-trip, world=4, covering CP-only (cp4),
+    CP x GTP_remat with and without gtp_remat_fold_cp, and GTP_remat-only (gtp4).
+
+    Stamps every optimizer-state tensor to a RANK-DISTINCT value before saving and asserts the
+    value THIS rank loads back matches what THIS rank originally saved. A same-key aliasing bug
+    (e.g. two CP ranks sharing one checkpoint key) would instead silently hand every rank the
+    SAME (one winning rank's) value -- a plain resave-equality check can't tell the two apart
+    since the corruption is consistent across both saves.
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
+        gtp_remat_fold_cp=fold_cp,
+    )
+    try:
+        meta = {'distrib_optim_sharding_type': 'dp_reshardable'}
+        with TempNamedDir(ckpt_base / 'dp_reshardable_cp_gtp', sync=True) as ckpt_dir:
+            model_A, optimizer_A = _cp_gtp_moe_model_and_optimizer(cp_size, fold_cp, seed=2)
+            model_sd_A = model_A[0].sharded_state_dict()
+            optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)
+
+            # Stamp a rank-distinct value into every leaf tensor and snapshot it by
+            # (key, global_offset): the bucket key alone is shared by every param packed into
+            # that bucket, disambiguated only by offset.
+            snapshot = {}
+            for leaf in nested_values(optim_sd_A):
+                if not isinstance(leaf, ShardedTensor):
+                    continue
+                leaf.data.fill_(float(rank))
+                snapshot[(leaf.key, leaf.global_offset)] = leaf.data.clone()
+            assert snapshot, "no ShardedTensor leaves found; test is not exercising anything"
+            # Only CP-folded GTP buffers are tagged; every other key stays unchanged.
+            tagged = any('.cp_rank_' in key for key, _ in snapshot)
+            assert tagged == (
+                cp_size > 1 and fold_cp
+            ), f"cp{cp_size} gtp{gtp_remat_size} fold={fold_cp}: .cp_rank_ tag present={tagged}"
+
+            save(optim_sd_A, ckpt_dir)
+
+            model_B, optimizer_B = _cp_gtp_moe_model_and_optimizer(cp_size, fold_cp, seed=3)
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_sharded_sd = optimizer_B.sharded_state_dict(
+                model_sd_B, is_loading=True, metadata=meta
+            )
+            state_dict = load(load_sharded_sd, ckpt_dir)
+            optimizer_B.load_state_dict(state_dict)
+
+            # Re-wrap optimizer_B's now-loaded live state and compare THIS rank's own value.
+            optim_sd_B_after = optimizer_B.sharded_state_dict(model_sd_B, metadata=meta)
+            checked = 0
+            for leaf in nested_values(optim_sd_B_after):
+                if not isinstance(leaf, ShardedTensor):
+                    continue
+                snapshot_key = (leaf.key, leaf.global_offset)
+                if snapshot_key not in snapshot:
+                    continue
+                torch.testing.assert_close(
+                    leaf.data.cpu(), snapshot[snapshot_key].cpu(), rtol=0, atol=0
+                )
+                checked += 1
+            assert checked == len(snapshot), (
+                f"only matched {checked}/{len(snapshot)} keys after load; some of this rank's "
+                "own saved state was not found back under its own (key, offset)"
+            )
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+def _worker_fully_reshardable_rejects_cp_folded_gtp(rank, world_size, port):
+    """fully_reshardable must reject CP-folded GTP buffers at save time with a clear error.
+    world=4 -> tp1*cp2*gtp2*dp1 (fully folded)."""
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+        gtp_remat_fold_cp=True,
+    )
+    try:
+        model, optimizer = _cp_gtp_moe_model_and_optimizer(cp_size=2, fold_cp=True, seed=2)
+        meta = {'distrib_optim_sharding_type': 'fully_reshardable'}
+        with pytest.raises(AssertionError, match='does not support CP-folded GTP weights'):
+            optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=meta)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     """GTP_remat+Muon ckpt fix: in_proj's gathered+split model entry does NOT id-match the
     per-shard optimizer param, so get_param_id_to_sharded_param_map misses it (the KeyError seen in
@@ -2000,6 +2326,36 @@ class TestGtpDcpHelper:
     def test_embedding_writer_election(self):
         _require_world_size(4)
         _worker_embedding_writer_election_gtp_inclusive_default(dist.get_rank(), 4, None)
+
+    def test_gtp_cp_writer_election_no_gaps(self):
+        _require_world_size(4)
+        _worker_gtp_cp_writer_election_no_gaps(dist.get_rank(), 4, None)
+
+    def test_vocab_embedding_wiring_no_gaps_under_cp(self):
+        _require_world_size(4)
+        _worker_vocab_embedding_wiring_no_gaps_under_cp(dist.get_rank(), 4, None)
+
+    @pytest.mark.parametrize("fold", [True, False], ids=["fold", "no_fold"])
+    def test_gtp_cp_sharded_save_load_roundtrip(self, tmp_path_dist_ckpt, fold):
+        _require_world_size(4)
+        _worker_gtp_cp_sharded_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt, fold)
+
+    @pytest.mark.parametrize(
+        "cp_size,gtp_remat_size,fold_cp",
+        [(4, 1, False), (2, 2, False), (1, 4, False), (4, 1, True), (2, 2, True)],
+        ids=["cp4", "cp2_gtp2", "gtp4", "cp4_fold", "cp2_gtp2_fold"],
+    )
+    def test_dp_reshardable_cp_gtp_roundtrip(
+        self, tmp_path_dist_ckpt, cp_size, gtp_remat_size, fold_cp
+    ):
+        _require_world_size(4)
+        _worker_dp_reshardable_cp_gtp_roundtrip(
+            dist.get_rank(), 4, tmp_path_dist_ckpt, cp_size, gtp_remat_size, fold_cp
+        )
+
+    def test_fully_reshardable_rejects_cp_folded_gtp(self):
+        _require_world_size(4)
+        _worker_fully_reshardable_rejects_cp_folded_gtp(dist.get_rank(), 4, None)
 
     def test_public_wrapper_delegates(self):
         _require_world_size(4)

@@ -39,6 +39,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
 )
 from megatron.training.utils import (
     get_device_arch_version,
+    is_gtp_remat_active,
     print_rank_0,
     update_use_dist_ckpt,
     warn_rank_0,
@@ -1548,7 +1549,7 @@ def validate_args(args, defaults={}):
         )
     )
 
-    if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+    if is_gtp_remat_active(args):
         if args.fp4 and not args.fp4_param_gather:
             raise ValueError(
                 "GTP (--tensor-parallel-num-weight-shards / "

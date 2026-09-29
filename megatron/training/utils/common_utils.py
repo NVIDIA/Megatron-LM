@@ -598,10 +598,15 @@ def is_hybrid_model(args):
 
 
 def is_gtp_remat_active(args):
-    """Returns True if GTP weight-remat is enabled on the decoder or expert axis."""
+    """Returns True if GTP weight-remat is enabled on the decoder or expert axis (including
+    dense sharding over CP via --gtp-remat-fold-cp)."""
     return (
         getattr(args, 'gtp_weight_remat_size', 1) > 1
         or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
+        or (
+            getattr(args, 'gtp_remat_fold_cp', False)
+            and getattr(args, 'context_parallel_size', 1) > 1
+        )
     )
 
 

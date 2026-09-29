@@ -1057,7 +1057,7 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
-            self.gtp_remat = self.base_module.config.gtp_weight_remat_size > 1
+            self.gtp_remat = self.base_module.config.dense_gtp_remat_active
 
             if self.gtp_remat:
                 # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps

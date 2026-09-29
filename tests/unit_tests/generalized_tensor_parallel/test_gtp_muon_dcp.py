@@ -316,3 +316,54 @@ class TestGTPMuonDCP:
             from megatron.core.dist_checkpointing import load_plain_tensors
 
             check_equal(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
+
+
+class TestGTPMuonCountZeros:
+    """LayerWiseDistributedOptimizer.count_zeros() under GTP."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_count_zeros_gtp_no_typeerror(self):
+        """Regression: count_zeros() passed kwargs count_zeros_fp32 never accepted -> TypeError."""
+        import os
+
+        if int(os.environ.get('WORLD_SIZE', '1')) != 4:
+            pytest.skip("Requires world_size 4 (gtp4)")
+
+        from megatron.core import parallel_state as ps
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+        from tests.unit_tests.dist_checkpointing.utils import initialize_gpt_model
+
+        Utils.initialize_model_parallel(1, 1)  # bootstrap torch.distributed + model parallel
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=4
+        )
+        model_parallel_cuda_manual_seed(2)
+        model, optimizer = setup_model_and_optimizer(
+            seed=2,
+            tp=1,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            use_param_layout=True,
+            initialize_fn=initialize_gpt_model,
+            optimizer='dist_muon',
+        )
+        inp = torch.randint(0, 128, (2, 4), device='cuda')
+        pos = torch.arange(4, device='cuda').unsqueeze(0).expand(2, -1)
+        mask = torch.zeros(2, 1, 4, 4, dtype=torch.bool, device='cuda')
+        out = model[0](inp, pos, mask)
+        out.float().sum().backward()
+
+        # Outer ChainedOptimizer.count_zeros() bypasses the LayerWise override -> call it directly.
+        layer_wise = next(
+            opt
+            for opt in optimizer.chained_optimizers
+            if isinstance(opt, LayerWiseDistributedOptimizer)
+        )
+        num_zeros = layer_wise.count_zeros()  # must not raise TypeError
+        assert isinstance(num_zeros, (int, float))
+        assert num_zeros >= 0

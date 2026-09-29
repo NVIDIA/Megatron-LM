@@ -42,7 +42,7 @@ from megatron.training import (
     inprocess_restart,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.utils import is_gtp_remat_active, is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +384,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
-            if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+            if is_gtp_remat_active(args):
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
                 assert HAVE_GTP, (
@@ -402,6 +402,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
                 gtp_remat_size=args.gtp_weight_remat_size,
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
+                gtp_remat_fold_cp=args.gtp_remat_fold_cp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,
