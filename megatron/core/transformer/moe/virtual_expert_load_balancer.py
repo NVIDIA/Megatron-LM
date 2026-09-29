@@ -679,6 +679,14 @@ class VirtualExpertLoadBalancer:
             tuple(linear.get_parameter(f"weight{i}") for i in range(self.num_owned_experts))
             for linear in linears
         )
+        for fc_layer, group in enumerate(parameters, start=1):
+            for index, parameter in enumerate(group):
+                if getattr(parameter, "main_grad", None) is None:
+                    raise RuntimeError(
+                        "MoonEP requires eagerly allocated expert main_grad buffers before its "
+                        f"first forward; FC{fc_layer}.weight{index} has no main_grad. "
+                        "Lazy gradient allocation is not supported."
+                    )
         grad_dtypes = {parameter.main_grad.dtype for group in parameters for parameter in group}
         if len(grad_dtypes) != 1:
             raise RuntimeError(
@@ -740,10 +748,18 @@ class VirtualExpertLoadBalancer:
 
     @classmethod
     def finalize(cls) -> None:
-        """Release the shared slots and planner scratch; idempotent. A normal exit needs no call;
-        callers that destroy their process groups while a model is still alive (tests, an orderly
-        shutdown) call it first so the NCCL windows are deregistered while their communicator
-        exists."""
+        """Release shared slots and planner scratch before the expert process group is destroyed.
+
+        Called by ``destroy_model_parallel``; safe to call explicitly or repeatedly.
+        """
+        if (
+            not cls.storages
+            and cls.planner is None
+            and cls.planner_stream is None
+            and cls.weight_streams is None
+            and cls.grad_stream is None
+        ):
+            return
         for storage in cls.storages.values():
             storage.destroy()
         cls.storages.clear()
@@ -786,9 +802,7 @@ class VirtualExpertLoadBalancer:
         num_routes = num_tokens * self.router_topk
         alignment = self._alignment
         padding = self.num_runtime_experts * max(alignment - 1, 0)
-        capacity = max(
-            int(num_routes * self.config.moe_expert_rank_capacity_factor), num_routes + padding
-        )
+        capacity = num_routes + padding
         return capacity + (-capacity % alignment if alignment > 1 else 0)
 
     # ---- forward: dispatcher hooks -----------------------------------------------------------

@@ -106,6 +106,27 @@ class DistributedDataParallel(_BaseDataParallel):
 
     """
 
+    @staticmethod
+    def _validate_config(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> None:
+        """Validate model settings that depend on the data-parallel configuration."""
+        if not config.moe_virtual_expert_load_balance or not config.fp8:
+            return
+
+        # TransformerConfig permits only native MXFP8 parameters for quantized virtual experts.
+        # DDP cannot remap their storage into a persistent parameter buffer, so parameter
+        # all-gather must use the gradient buffer instead.
+        if not ddp_config.fp8_param_gather:
+            raise ValueError(
+                "MoonEP with MXFP8 requires fp8_param_gather=True (--fp8-param-gather)."
+            )
+        if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True "
+                "(--reuse-grad-buf-for-mxfp8-param-ag)."
+            )
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -115,6 +136,7 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
         full_param_layout: Optional[FullParamLayout] = None,
     ):
+        self._validate_config(config, ddp_config)
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

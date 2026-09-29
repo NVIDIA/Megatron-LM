@@ -27,6 +27,7 @@ from transformer_engine.pytorch.attention.dot_product_attention import (
 )
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
+from megatron.core import parallel_state as ps
 from megatron.core.activations import squared_relu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -721,7 +722,8 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
 
 
 @requires_hybridep
-def test_bf16_virtual_expert_routing_parity(monkeypatch):
+@pytest.mark.parametrize("use_op_fuser", [True, False], ids=["op-fuser", "grouped-tensor"])
+def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
     """Moving routes preserves BF16 outputs/dgrads; only wgrad summation may round differently."""
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.transformer.spec_utils import get_submodules
@@ -734,6 +736,19 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch):
     monkeypatch.setenv('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '0')
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
     pg = ProcessGroupCollection.use_mpu_process_groups()
+    group = ps.get_model_parallel_group()
+    finalize = VirtualExpertLoadBalancer.finalize
+    resources_alive_at_finalize = []
+
+    def observe_finalize():
+        resources_alive_at_finalize.append(
+            ps.get_model_parallel_group() is group
+            and bool(VirtualExpertLoadBalancer.storages)
+            and VirtualExpertLoadBalancer.planner is not None
+        )
+        finalize()
+
+    monkeypatch.setattr(VirtualExpertLoadBalancer, 'finalize', observe_finalize)
     spec = get_submodules(
         get_gpt_layer_with_transformer_engine_spec(
             num_experts=4, moe_grouped_gemm=True
@@ -767,7 +782,7 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch):
             gated_linear_unit=False,
             gradient_accumulation_fusion=True,
             moe_grouped_gemm=True,
-            use_transformer_engine_op_fuser=True,
+            use_transformer_engine_op_fuser=use_op_fuser,
             use_fused_weighted_squared_relu=True,
             moe_use_grouped_tensor=True,
         )
@@ -797,6 +812,8 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch):
             layer.router.register_forward_hook(capture_routes)
             if virtual:
                 manager = layer.token_dispatcher._comm_manager
+                assert manager.moe_expert_rank_capacity_factor == 1.0
+                assert manager.config.moe_expert_rank_capacity_factor is None
                 dispatch = manager.plan_dispatch
 
                 def record(*args):
@@ -857,7 +874,6 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch):
         finally:
             torch.cuda.synchronize()
             del layer
-            VirtualExpertLoadBalancer.finalize()
             destroy_moe_metrics_tracker()
             gc.collect()
             fused_a2a.reset_hybrid_ep_buffer()
@@ -877,6 +893,10 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch):
                 _assert_bitwise_parity(actual[name], expected, f'BF16 {name}')
     finally:
         Utils.destroy_model_parallel()
+    assert resources_alive_at_finalize == [True]
+    assert not VirtualExpertLoadBalancer.storages
+    assert VirtualExpertLoadBalancer.planner is None
+    finalize()  # Cleanup stays safe after the model-parallel groups are gone.
 
 
 @requires_hybridep
@@ -1250,12 +1270,212 @@ def _virtual_expert_hybridep_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
+@requires_hybridep
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize(
+    "recompute,offload_scope,use_op_fuser",
+    [
+        ("moe_act", None, False),
+        ("moe", None, True),
+        ("full", None, True),
+        (None, "expert_fc1", False),
+        (None, "moe_act", False),
+        (None, "fused_group_mlp", True),
+    ],
+    ids=[
+        "moe-act-unfused",
+        "moe-layer",
+        "full-layer",
+        "offload-fc1",
+        "offload-moe-act",
+        "offload-fused-mlp",
+    ],
+)
+def test_virtual_expert_recompute_offload_scopes(
+    monkeypatch, precision, recompute, offload_scope, use_op_fuser
+):
+    """Exercise real MoonEP transfers through two forwards and reverse-order backward."""
+    from transformer_engine.pytorch.ops.fused import grouped_mlp
+    from transformer_engine.pytorch.ops.fuser import (
+        OperationFuser,
+        register_forward_backward_fusion,
+    )
+
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.tensor_parallel import checkpoint
+    from megatron.core.transformer.spec_utils import get_submodules
+
+    checks = (
+        grouped_mlp._GroupedMLP_CuTeGEMMBase.is_supported,
+        grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported,
+        grouped_mlp._grouped_gemm_dsrelu_backward_supported,
+    )
+    for check in checks:
+        check.cache_clear()
+    monkeypatch.setattr(
+        OperationFuser,
+        "forward_backward_fusion_functions",
+        list(OperationFuser.forward_backward_fusion_functions),
+    )
+    for cls, fuse in (
+        (grouped_mlp.GroupedMLP_CuTeGEMMGLU, grouped_mlp.fuse_ops),
+        (grouped_mlp.GroupedMLP_CuTeGEMMUnary, grouped_mlp.fuse_srelu_ops),
+    ):
+        if cls.is_supported() and fuse not in OperationFuser.forward_backward_fusion_functions:
+            register_forward_backward_fusion(fuse, prepend=True)
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
+    monkeypatch.setattr(
+        fused_a2a.HybridEPBuffer,
+        "__init__",
+        partialmethod(fused_a2a.HybridEPBuffer.__init__, load_cached_kernels=True),
+    )
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    spec = get_submodules(
+        get_gpt_layer_with_transformer_engine_spec(
+            num_experts=4, moe_grouped_gemm=True
+        ).submodules.mlp
+    )
+
+    def run(enabled):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        model_parallel_cuda_manual_seed(1234)
+        torch.manual_seed(1234)
+        overrides = dict(
+            num_moe_experts=4,
+            ffn_hidden_size=256,
+            moe_ffn_hidden_size=256,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_topk_scaling_factor=3.16,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            use_fused_weighted_squared_relu=True,
+            use_transformer_engine_op_fuser=use_op_fuser,
+            moe_use_grouped_tensor=True,
+            min_offloaded_tensor_size=0,
+        )
+        if precision == "mxfp8":
+            overrides.update(
+                fp8="e4m3",
+                fp8_recipe="mxfp8",
+                fp8_param=True,
+                moe_router_padding_for_quantization=True,
+            )
+        if enabled and recompute:
+            overrides.update(
+                recompute_granularity="full" if recompute == "full" else "selective",
+                recompute_modules=[] if recompute == "full" else [recompute],
+            )
+            if recompute == "full":
+                overrides.update(recompute_method="uniform", recompute_num_layers=1)
+        if enabled and offload_scope:
+            overrides.update(
+                fine_grained_activation_offloading=True, offload_modules=[offload_scope]
+            )
+        config = _virtual_expert_hybridep_config(**overrides)
+        layer = None
+        try:
+            with get_fp8_context(config, is_init=True):
+                layer = MoELayer(config, spec, pg_collection=pg).cuda()
+            weights = {
+                name: parameter.detach().float().cpu().clone()
+                for name, parameter in layer.named_parameters()
+            }
+            for parameter in layer.parameters():
+                parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+                parameter.grad_added_to_main_grad = False
+            with torch.no_grad():
+                layer.router.weight.zero_()
+                layer.router.weight[:, 0].copy_(
+                    torch.tensor([1, 0.5, -0.5, -1], device="cuda")
+                )
+                layer.router.weight[2, 1] = 2
+            if enabled and offload_scope:
+                offload.init_chunk_handler(
+                    pp_rank=pg.pp.rank(),
+                    vp_size=None,
+                    vp_stage=None,
+                    min_offloaded_tensor_size=0,
+                    delta_offload_bytes_across_pp_ranks=0,
+                    activation_offload_fraction=1.0,
+                )
+            inputs, outputs, upstreams = [], [], []
+            for use in range(2):
+                generator = torch.Generator(device="cuda").manual_seed(
+                    8765 + 10 * use + pg.ep.rank()
+                )
+                x = torch.randn(32, 1, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
+                x[..., 0] = 1 if use == 0 else -1
+                x.requires_grad_()
+                if enabled and recompute == "full":
+
+                    def replay(input_tensor):
+                        with get_fp8_context(config):
+                            return layer(input_tensor)[0]
+
+                    y = checkpoint(replay, False, x)
+                else:
+                    with get_fp8_context(config):
+                        y, bias = layer(x)
+                    assert bias is None
+                inputs.append(x)
+                outputs.append(y)
+                upstreams.append(
+                    torch.randn(y.shape, device="cuda", dtype=y.dtype, generator=generator)
+                )
+            for y, upstream in reversed(list(zip(outputs, upstreams))):
+                y.backward(upstream)
+            torch.cuda.synchronize()
+            values = {
+                **{f"output {use}": y.detach().cpu() for use, y in enumerate(outputs)},
+                **{f"input gradient {use}": x.grad.cpu() for use, x in enumerate(inputs)},
+                **{
+                    f"expert gradient {name}": parameter.main_grad.cpu().clone()
+                    for name, parameter in layer.experts.named_parameters()
+                },
+            }
+            if enabled and offload_scope:
+                offload.reset(process_group=pg.tp_dp_cp)
+                assert (
+                    PipelineOffloadManager.get_instance().offload_summary_bytes[offload_scope] > 0
+                )
+            return weights, values
+        finally:
+            torch.cuda.synchronize()
+            del layer
+            VirtualExpertLoadBalancer.finalize()
+            FP8GlobalStateManager.reset()
+            offload.reset_instance()
+            destroy_moe_metrics_tracker()
+            gc.collect()
+            fused_a2a.reset_hybrid_ep_buffer()
+
+    try:
+        reference_weights, reference = run(False)
+        actual_weights, actual = run(True)
+        assert actual_weights.keys() == reference_weights.keys()
+        for name, expected in reference_weights.items():
+            _assert_bitwise_parity(actual_weights[name], expected, f"initial {name}")
+        assert actual.keys() == reference.keys()
+        for name, expected in reference.items():
+            _assert_bitwise_parity(actual[name], expected, name)
+    finally:
+        Utils.destroy_model_parallel()
+        for check in checks:
+            check.cache_clear()
+
+
 def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     """The backend is dropless by construction and allows the whole-layer moe graph."""
     config = _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
 
-    assert config.moe_expert_rank_capacity_factor == 1.0
+    assert config.moe_expert_rank_capacity_factor is None
     assert config.moe_single_grouped_weight is False
+    assert config.moe_use_grouped_tensor
 
 
 def test_virtual_expert_hybridep_accepts_native_mxfp8_with_router_padding():
@@ -1268,15 +1488,13 @@ def test_virtual_expert_hybridep_accepts_native_mxfp8_with_router_padding():
     assert config.moe_router_padding_for_quantization
 
 
-@pytest.mark.parametrize(
-    ("fp8", "fp8_recipe", "fp8_param"),
-    [("e4m3", "mxfp8", False), ("e4m3", "tensorwise", True), ("hybrid", "mxfp8", True)],
-)
-def test_virtual_expert_hybridep_rejects_unsupported_fp8_parameter_storage(
-    fp8, fp8_recipe, fp8_param
-):
-    with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
-        _virtual_expert_hybridep_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
+def test_virtual_expert_mxfp8_accepts_ddp_gather_flags():
+    config = _virtual_expert_hybridep_config(fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True)
+    ddp_config = DistributedDataParallelConfig(
+        fp8_param_gather=True, reuse_grad_buf_for_mxfp8_param_ag=True
+    )
+
+    DDP._validate_config(config, ddp_config)
 
 
 @pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
@@ -1294,10 +1512,6 @@ def test_virtual_expert_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
         ({"num_moe_experts": 3}, "num_moe_experts divisible"),
         ({"moe_router_topk": 3}, "1<=moe_router_topk"),
         ({"moe_expert_capacity_factor": 1.0}, "moe_expert_capacity_factor=None"),
-        (
-            {"recompute_granularity": "selective", "recompute_modules": ["moe"]},
-            "no MoE layer recompute",
-        ),
     ],
 )
 def test_virtual_expert_rejects_unsupported_layout(overrides, match):
