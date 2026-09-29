@@ -7,11 +7,13 @@ import torch
 import torch.nn as nn
 
 from megatron.core.enums import ModelType
+from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
     _print_num_params,
     _wrap_with_mp_wrapper,
     build_virtual_pipeline_stages,
+    prepare_existing_model_chunks_for_distributed_training,
     to_empty_if_meta_device,
     unimodal_build_distributed_models,
 )
@@ -31,6 +33,13 @@ def _make_pg():
     pg.pp.size.return_value = 1
     pg.dp_cp.size.return_value = 1
     pg.expt_dp.size.return_value = 1
+    # With a single optimizer instance the intra-instance groups are the full groups.
+    pg.intra_dp_cp.size.return_value = 1
+    pg.intra_expt_dp.size.return_value = 1
+    # A real ProcessGroupCollection returns None for an unset field, and a module with no
+    # GTP axis leaves this unset. Mock would otherwise auto-create a group whose rank is
+    # a Mock rather than an int.
+    pg.gtp_remat = None
     return pg
 
 
@@ -228,6 +237,20 @@ class TestPrintNumParams:
         _print_num_params(model, pg_collection=pg)
         captured = capsys.readouterr()
         assert captured.out == ""
+
+    @pytest.mark.parametrize("gtp_remat_rank, expect_output", [(0, True), (1, False)])
+    def test_gtp_remat_rank_gates_output(self, capsys, gtp_remat_rank, expect_output):
+        # GTP-remat peers hold replicas and report identical counts, so only the first of
+        # them prints. get_pg_rank short-circuits to 0 when torch.distributed is down, so
+        # pin it to keep this independent of how the suite is launched.
+        pg = _make_pg()
+        pg.gtp_remat = Mock()
+        pg.gtp_remat.rank.return_value = gtp_remat_rank
+        model = [_make_model_module()]
+        with patch("torch.distributed.is_initialized", return_value=True):
+            _print_num_params(model, pg_collection=pg)
+        captured = capsys.readouterr()
+        assert bool(captured.out) is expect_output
 
     def test_param_count_is_correct(self, capsys):
         pg = _make_pg()
@@ -498,6 +521,81 @@ class TestDdpWrap:
         assert isinstance(result, list)
         assert len(result) == 2
 
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_full_iteration_capture_stream_for_ddp_initialization(
+        self, mock_shared_stream, mock_current_stream, mock_stream_context, mock_config, mock_ddp
+    ):
+        mock_stream_context.return_value.__enter__ = Mock(return_value=None)
+        mock_stream_context.return_value.__exit__ = Mock(return_value=False)
+        shared_stream = mock_shared_stream.return_value
+        mock_config.return_value.cuda_graph_impl = "full_iteration"
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        shared_stream.wait_stream.assert_called_once_with(mock_current_stream.return_value)
+        mock_stream_context.assert_called_once_with(shared_stream)
+        mock_current_stream.return_value.wait_stream.assert_called_once_with(shared_stream)
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_current_stream_when_cuda_graph_is_disabled(
+        self,
+        mock_shared_stream,
+        mock_stream,
+        mock_current_stream,
+        mock_stream_context,
+        mock_config,
+        mock_ddp,
+    ):
+        mock_stream_context.return_value.__enter__ = Mock(return_value=None)
+        mock_stream_context.return_value.__exit__ = Mock(return_value=False)
+        current_stream = mock_current_stream.return_value
+        mock_config.return_value.cuda_graph_impl = "none"
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        mock_shared_stream.assert_not_called()
+        mock_stream.assert_not_called()
+        mock_stream_context.assert_called_once_with(current_stream)
+        current_stream.wait_stream.assert_not_called()
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_dedicated_stream_for_other_cuda_graph_implementations(
+        self,
+        mock_shared_stream,
+        mock_stream,
+        mock_current_stream,
+        mock_stream_context,
+        mock_config,
+        mock_ddp,
+        cuda_graph_impl,
+    ):
+        mock_stream_context.return_value.__enter__ = Mock(return_value=None)
+        mock_stream_context.return_value.__exit__ = Mock(return_value=False)
+        mock_config.return_value.cuda_graph_impl = cuda_graph_impl
+        dedicated_stream = mock_stream.return_value
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        mock_shared_stream.assert_not_called()
+        dedicated_stream.wait_stream.assert_called_once_with(mock_current_stream.return_value)
+        mock_stream_context.assert_called_once_with(dedicated_stream)
+        mock_current_stream.return_value.wait_stream.assert_called_once_with(dedicated_stream)
+
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.HAVE_FSDP2", False)
     @patch("megatron.training.models.dist_utils.get_model_config")
@@ -615,6 +713,9 @@ class TestDdpWrapFullParamLayout:
         self.pg = _make_pg()
         self.pg.dp_cp.size.return_value = 4
         self.pg.expt_dp.size.return_value = 2
+        # Single optimizer instance, so the intra-instance groups match the full groups.
+        self.pg.intra_dp_cp.size.return_value = 4
+        self.pg.intra_expt_dp.size.return_value = 2
         self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
         self._opt = self._opt_patcher.start()
         self._opt.compute_full_param_layout.return_value = "LAYOUT"
@@ -860,6 +961,27 @@ class TestUnimodalBuildDistributedModels:
                 self.pg,
                 self.transformer_config.virtual_pipeline_model_parallel_size,
                 ModelType.encoder_or_decoder,
+            )
+        finally:
+            self._stop_patches()
+
+    def test_prepare_existing_chunks_runs_lifecycle_without_building_stages(self):
+        param = Mock()
+        self.mock_model.parameters.return_value = [param]
+        mocks = self._standard_patches()
+        prebuilt_chunks = [self.mock_model]
+        try:
+            result = prepare_existing_model_chunks_for_distributed_training(
+                prebuilt_chunks, self.transformer_config, self.pg, wrap_with_ddp=False
+            )
+
+            assert result is prebuilt_chunks
+            mocks["bvps"].assert_not_called()
+            mocks["tp_attr"].assert_called_once_with(param)
+            mocks["print"].assert_called_once_with(prebuilt_chunks, pg_collection=self.pg)
+            self.mock_model.cuda.assert_called_once()
+            mocks["mp_wrap"].assert_called_once_with(
+                prebuilt_chunks, self.transformer_config, Float16Module
             )
         finally:
             self._stop_patches()

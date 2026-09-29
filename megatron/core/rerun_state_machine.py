@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import datetime
-import inspect
 import logging
 import math
 import os
@@ -955,13 +955,6 @@ class RerunStateMachine:
     def _get_validation_call_info(self, message: str) -> Call:
         """Internal method to get the context about the caller to validate_result()."""
 
-        frame = inspect.currentframe()
-        assert frame is not None
-        assert frame.f_back is not None
-        frame = frame.f_back.f_back
-        assert frame is not None
-        filename: str = inspect.getframeinfo(frame).filename
-        lineno: int = frame.f_lineno
         rank: int = safe_get_rank()
         caller = Caller(message=message, rank=rank)
         self.validation_counts[caller] += 1
@@ -1016,7 +1009,7 @@ class RerunStateMachine:
                         self.stats[caller].combine(
                             [s.get(caller) for s in stats_list[1:] if s.get(caller)]
                         )
-                        logger.info(f"  From {caller.filename}, line {caller.lineno}:")
+                        logger.info(f"  From validation call '{caller.message}':")
                         logger.info(f"    {self.stats[caller].print_stats()}")
                 else:
                     for caller, stats in self.stats.items():
@@ -1024,7 +1017,7 @@ class RerunStateMachine:
             else:
                 logger.info("Stats on computation determinism in validation calls")
                 for caller, stats in self.stats.items():
-                    logger.info(f"  From {caller.filename}, line {caller.lineno}:")
+                    logger.info(f"  From validation call '{caller.message}':")
                     logger.info(f"    {stats.print_stats()}")
 
     def _log_validation_error_to_file(
@@ -1152,7 +1145,9 @@ class RerunDataIterator:
             return n
         n = next(self.iterable)
         if get_rerun_state_machine().get_mode() != RerunMode.DISABLED:
-            self.saved_microbatches.append(n)
+            # Shallow-copy so downstream dict-entry mutations do not
+            # corrupt the saved snapshot used for replay.
+            self.saved_microbatches.append(copy.copy(n))
         return n
 
     def rewind(self) -> None:

@@ -3,6 +3,7 @@
 import asyncio
 import socket
 import struct
+from collections.abc import Iterable
 
 import torch.distributed as dist
 
@@ -15,6 +16,62 @@ except ImportError:
 
     zmq = MagicMock()
     HAVE_ZMQ = False
+
+
+class RankedPubSub:
+    """Create PUB/SUB sockets with rank-identified subscription readiness."""
+
+    def __init__(self, readiness_topic_prefix: bytes):
+        self.readiness_topic_prefix = readiness_topic_prefix
+
+    def _readiness_topic(self, rank: int) -> bytes:
+        return self.readiness_topic_prefix + struct.pack("!I", rank)
+
+    @staticmethod
+    def create_publisher(zmq_context: zmq.Context) -> zmq.Socket:
+        """Create an XPUB socket that exposes every subscription notification."""
+        publisher_socket = zmq_context.socket(zmq.XPUB)
+        publisher_socket.setsockopt(zmq.XPUB_VERBOSE, 1)
+        return publisher_socket
+
+    def create_subscriber(self, zmq_context: zmq.Context, address: str, rank: int) -> zmq.Socket:
+        """Create a connected SUB socket with a rank-specific readiness topic."""
+        subscriber_socket = zmq_context.socket(zmq.SUB)
+        subscriber_socket.connect(address)
+        # Subscribe to readiness before the empty collective topic so XPUB
+        # receives an explicit identity command for this rank.
+        subscriber_socket.setsockopt(zmq.SUBSCRIBE, self._readiness_topic(rank))
+        subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        return subscriber_socket
+
+    def wait_for_subscribers(
+        self, publisher_socket: zmq.Socket, ranks: Iterable[int], *, timeout_ms: int = 60_000
+    ) -> None:
+        """Wait until the XPUB socket reports every distinct rank as subscribed."""
+        topics_by_rank = {rank: self._readiness_topic(rank) for rank in ranks}
+        expected_topics = set(topics_by_rank.values())
+        subscribed_topics = set()
+        publisher_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        try:
+            while subscribed_topics != expected_topics:
+                notification = publisher_socket.recv()
+                event, topic = notification[:1], notification[1:]
+                if topic not in expected_topics:
+                    continue
+                if event == b"\x01":
+                    subscribed_topics.add(topic)
+                elif event == b"\x00":
+                    subscribed_topics.discard(topic)
+        except zmq.Again as exc:
+            missing_ranks = [
+                rank for rank, topic in topics_by_rank.items() if topic not in subscribed_topics
+            ]
+            raise RuntimeError(
+                f"Timed out waiting for ZMQ subscribers for prefix "
+                f"{self.readiness_topic_prefix!r}; missing ranks: {missing_ranks}"
+            ) from exc
+        finally:
+            publisher_socket.setsockopt(zmq.RCVTIMEO, -1)
 
 
 class AsyncZMQCommunicator:
@@ -41,10 +98,17 @@ class AsyncZMQCommunicator:
             hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
                 If None, defaults to socket.gethostname().
         """
+        # Normalize None to the default (world) group. get_rank/get_world_size
+        # already treat None this way, but get_process_group_ranks below does
+        # not accept None, so resolve it once here for all three calls.
+        if process_group is None:
+            process_group = dist.group.WORLD
+
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.is_leader = self.rank == 0
-        # Get the global rank of the leader (first rank in the process group)
+        broadcast_pub_sub = RankedPubSub(b"AsyncZMQCommunicator.broadcast:")
+        # Get the global rank of the leader (first rank in the process group).
         src_rank = dist.get_process_group_ranks(process_group)[0]
 
         if self.is_leader:
@@ -53,7 +117,7 @@ class AsyncZMQCommunicator:
             self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
             gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            self.bcast_sock = zmq_context.socket(zmq.PUB)
+            self.bcast_sock = broadcast_pub_sub.create_publisher(zmq_context)
             self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
             bcast_socket_addr = self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
@@ -68,9 +132,14 @@ class AsyncZMQCommunicator:
             gather_socket_addr, bcast_socket_addr = bcast_output
             self.gather_sock = zmq_context.socket(zmq.PUSH)
             self.gather_sock.connect(gather_socket_addr)
-            self.bcast_sock = zmq_context.socket(zmq.SUB)
-            self.bcast_sock.connect(bcast_socket_addr)
-            self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+            self.bcast_sock = broadcast_pub_sub.create_subscriber(
+                zmq_context, bcast_socket_addr, self.rank
+            )
+
+        # Wait until every ProcessGroup peer has subscribed to the leader.
+        # Rank-specific topics make duplicate reconnect notifications idempotent.
+        if self.is_leader:
+            broadcast_pub_sub.wait_for_subscribers(self.bcast_sock, range(1, self.world_size))
 
     async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.

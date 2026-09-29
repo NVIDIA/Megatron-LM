@@ -123,11 +123,20 @@ class Linear(torch.nn.Linear):
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
+        parallel_mode: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,  # Not used
     ):
+        if parallel_mode not in (None, "duplicated"):
+            raise ValueError(
+                f"{type(self).__name__} only supports parallel_mode='duplicated' or None"
+            )
+        if parallel_mode == "duplicated" and tp_group is not None:
+            raise ValueError("duplicated Linear should not have tp_group set")
+
         self.config = config
-        self.tp_group = tp_group
+        self.parallel_mode = parallel_mode
+        self.tp_group = None if parallel_mode == "duplicated" else tp_group
 
         self._return_bias = skip_bias_add and bias
 
@@ -150,11 +159,19 @@ class Linear(torch.nn.Linear):
         for param in self.parameters():
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, "allreduce", self.config.expert_model_parallel_size == 1)
+                use_expert_groups = (
+                    self.config.expert_model_parallel_size > 1
+                    or self.config.expert_tensor_parallel_size
+                    != self.config.tensor_model_parallel_size
+                    or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
+                )
+                setattr(param, "allreduce", not use_expert_groups)
             else:
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
                 setattr(param, "sequence_parallel", self.config.sequence_parallel)
+                if parallel_mode == "duplicated":
+                    setattr(param, "tensor_model_parallel", False)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""

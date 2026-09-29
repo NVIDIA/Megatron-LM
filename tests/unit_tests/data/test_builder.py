@@ -22,6 +22,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -63,6 +64,27 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents
         file_prefixes.append(file_prefix_path)
 
     return file_prefixes
+
+
+def test_multimodal_builder_add_document_default_modes():
+    # add_document documents modes as defaulting to None. On a multimodal builder
+    # that default must assign one mode (0) per item, matching the sequence
+    # lengths - not crash. Regression test for `[0] * lengths` (list * list).
+    with tempfile.TemporaryDirectory() as temp_dir:
+        builder = IndexedDatasetBuilder(
+            os.path.join(temp_dir, "mm.bin"), dtype=numpy.int32, multimodal=True
+        )
+
+        builder.add_document(numpy.array([1, 2, 3, 4, 5], dtype=numpy.int32), [3, 2])
+        builder.add_document(numpy.array([6, 7], dtype=numpy.int32), [2])
+
+        assert builder.sequence_lengths == [3, 2, 2]
+        assert builder.sequence_modes == [0, 0, 0]
+        assert len(builder.sequence_modes) == len(builder.sequence_lengths)
+
+        # Explicit modes are still honored.
+        builder.add_document(numpy.array([8], dtype=numpy.int32), [1], modes=[4])
+        assert builder.sequence_modes == [0, 0, 0, 4]
 
 
 def do_setup(odir):
@@ -117,7 +139,7 @@ def test_builder():
         def build_low_level_dataset(
             dataset_path: str, config: BlendedMegatronDatasetConfig
         ) -> LowLevelDataset:
-            return numpy.load(dataset_path)
+            return safe_numpy_load(dataset_path)
 
         def __len__(self) -> int:
             return len(self.sample_index)

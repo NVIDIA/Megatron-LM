@@ -10,8 +10,10 @@ import torch
 
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -59,9 +61,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -124,7 +126,13 @@ class SharedExpertsBuilder(Protocol):
 class RouterInterface(Protocol):
     """Interface for the router used in an MoELayer."""
 
-    def forward(self, input: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        input: torch.Tensor,
+        /,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
 
         Returns:
@@ -144,7 +152,13 @@ class RouterBuilder(Protocol):
     """Protocol for building a Router."""
 
     def __call__(
-        self, /, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None
+        self,
+        /,
+        *,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection | None,
+        is_mtp_layer: bool = False,
+        hash_moe_layer_threshold: int | None = None,
     ) -> RouterInterface: ...
 
 
@@ -225,6 +239,7 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
@@ -257,8 +272,13 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router.
         self.router = self.submodules.router(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
+        if layer_number is not None:
+            self.router.set_layer_number(layer_number)
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -270,6 +290,17 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
+            linear_gtp_kwargs = {}
+            if linear_cls is TELinear:
+                linear_gtp_kwargs = {
+                    "gtp_remat_group": gtp_remat_group,
+                    "gtp_replica_group": pg_collection.dp_cp,
+                }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -281,7 +312,14 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                **linear_gtp_kwargs,
             )
+            if self.config.moe_use_norm_before_up_proj:
+                self.fc2_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -293,7 +331,13 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+                **linear_gtp_kwargs,
             )
+            if linear_cls is TELinear:
+                # The duplicated operation has no TP execution group. TELinear uses
+                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
+                self.fc1_latent_proj._tp_group = pg_collection.tp
+                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -346,13 +390,15 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            if config.inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
                 assert HAVE_FLASHINFER, (
-                    "inference_grouped_gemm_backend='auto'"
-                    "requires flashinfer-python. "
+                    "inference_grouped_gemm_backend='flashinfer' requires flashinfer-python. "
                     "Install flashinfer-python or set "
-                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                    "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
+                fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
+                if config.fp8 and fp8_recipe == "mxfp8":
+                    require_flashinfer_routed_mxfp8()
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
                 # when using the FlashInfer backend. The flashinfer-jit-cache package
@@ -361,14 +407,14 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif config.inference_grouped_gemm_backend == 'torch':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif config.inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
@@ -435,13 +481,23 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
-        producing routing probabilities and a mapping.
+        producing routing probabilities and a mapping. The input padding mask is batch-first;
+        routing consumes it sequence-first to align with ``hidden_states``.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
+        probs, routing_map = apply_module(self.router)(
+            hidden_states, padding_mask, input_ids=input_ids
+        )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -546,8 +602,17 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
+            # these kwargs).
+            output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()
+            expert_kwargs = {}
+            if output_buffer is not None:
+                expert_kwargs["output_buffer"] = output_buffer
+            if grad_input_buffer is not None:
+                expert_kwargs["grad_input_buffer"] = grad_input_buffer
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
@@ -573,6 +638,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.config.moe_use_norm_before_up_proj:
+                output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
@@ -600,6 +667,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -611,9 +679,11 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [bsz, seq_length]. True = padding,
+                                                   False = valid. Defaults to None.
+            input_ids (torch.Tensor, optional): Token IDs with shape
+                [batch_size, seq_length]. Required by hash routing.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -634,16 +704,13 @@ class MoELayer(BaseMoELayer):
             else:
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:

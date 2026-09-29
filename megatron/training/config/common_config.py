@@ -25,8 +25,10 @@ class RNGConfig:
 class ProfilingConfig:
     """Configuration settings for profiling the training process."""
 
-    use_nsys_profiler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--profile"], "dest": "profile"}})
-    """Enable nsys profiling. When using this option, nsys options should be specified in
+    use_nsys_profiler: bool = False
+    """Enable nsys profiling, mutually exclusive with use_pytorch_profiler.
+    The legacy CLI --profile selects nsys unless --use-pytorch-profiler is also set.
+    When using this option, nsys options should be specified in
     commandline. An example nsys commandline is
     `nsys profile -s none -t nvtx,cuda -o <path/to/output_file> --force-overwrite true
     --capture-range=cudaProfilerApi --capture-range-end=stop`.
@@ -39,7 +41,9 @@ class ProfilingConfig:
     """Global step to stop profiling."""
 
     use_pytorch_profiler: bool = False
-    """Use the built-in pytorch profiler. Useful if you wish to view profiles in tensorboard."""
+    """Use the built-in pytorch profiler, mutually exclusive with use_nsys_profiler.
+    The legacy CLI requires both --profile and --use-pytorch-profiler to select this backend.
+    Useful if you wish to view profiles in tensorboard."""
 
     pytorch_profiler_collect_shapes: bool = False
     """Collect tensor shape in pytorch profiler."""
@@ -65,6 +69,16 @@ class ProfilingConfig:
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
+
+    def validate(self) -> None:
+        """Validate profiler settings before training runtime initialization."""
+        # Match torch.profiler.schedule's active-window requirement. Inactive
+        # options and CUDA-profiler windows retain their existing CLI behavior.
+        if self.use_nsys_profiler and self.use_pytorch_profiler:
+            raise ValueError("use_nsys_profiler and use_pytorch_profiler are mutually exclusive")
+        if self.use_pytorch_profiler:
+            if self.profile_step_end <= self.profile_step_start:
+                raise ValueError("PyTorch profiling requires profile_step_end > profile_step_start")
 
 
 @dataclass(kw_only=True)

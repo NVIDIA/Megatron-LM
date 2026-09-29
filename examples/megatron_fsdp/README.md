@@ -49,7 +49,7 @@ USE_UV=0 bash examples/megatron_fsdp/train_llama3_8b_fsdp_h100_fp8.sh
 | `SHARDING_STRATEGY` | `optim_grads_params` | FSDP sharding strategy (ZeRO-3). Options: `no_shard`, `optim`, `optim_grads`, `optim_grads_params`. |
 | `OUTER_SHARDING_STRATEGY` | `no_shard` | DP-Outer sharding strategy for HSDP/HFSDP. Options: `no_shard`, `optim`. |
 | `MASTER_ADDR` | `localhost` | Master node address for distributed training. |
-| `MASTER_PORT` | `6000` | Master node port. |
+| `MASTER_PORT` | `29500` | Master node port. |
 | `NODE_RANK` | `0` | Rank of the current node. |
 
 #### Configuration Summary

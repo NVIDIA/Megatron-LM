@@ -3,7 +3,7 @@
 
 Exit code:
   0 — all metrics within tolerance
-  1 — at least one regression OR an improvement large enough to require baseline refresh
+  1 — incompatible metadata, a regression, or an improvement requiring baseline refresh
 
 For throughput-style metrics:
   - Fail when measured < baseline * (1 - tol).        ← regression
@@ -31,6 +31,7 @@ import yaml
 
 THROUGHPUT_METRICS = {"throughput_tok_per_sec"}
 LATENCY_METRICS = {"avg_latency_ms", "p50_latency_ms", "p99_latency_ms", "tpot_ms_per_tok"}
+COMPARISON_METADATA = ("dataset", "batch_size", "num_output_tokens", "num_iters")
 
 
 def _check(
@@ -78,11 +79,27 @@ def main() -> int:
     ap.add_argument(
         "--config", required=True, help="Path to model_config.yaml (for tolerance + metrics list)."
     )
+    ap.add_argument(
+        "--platform",
+        required=True,
+        help="Hardware platform key (e.g. h100, gb200). baseline_values.json is a "
+        "{platform: {batch_key: {metrics}}} mapping; this picks the subtree to compare against.",
+    )
     args = ap.parse_args()
 
     results = json.loads(Path(args.results).read_text())
-    baseline = json.loads(Path(args.baseline).read_text())
+    full_baseline = json.loads(Path(args.baseline).read_text())
     config = yaml.safe_load(Path(args.config).read_text())
+
+    if args.platform not in full_baseline:
+        available = ", ".join(sorted(full_baseline.keys())) or "<none>"
+        print(
+            f"ERROR: no baseline for platform '{args.platform}' in {args.baseline}. "
+            f"Recorded platforms: {available}.\n"
+            f"  Run once with RECORD_BASELINE=1 on a '{args.platform}' node to bootstrap."
+        )
+        return 1
+    baseline = full_baseline[args.platform]
 
     tol = float(config.get("TOLERANCE_PCT", 10)) / 100.0
     upper_tol = float(config.get("UPPER_TOLERANCE_PCT", 20)) / 100.0
@@ -96,13 +113,43 @@ def main() -> int:
     print(f"Metrics: {metrics}")
 
     all_ok = True
+    metadata_failed = False
+    numeric_failed = False
+    for batch_key in sorted(results.keys() - baseline.keys()):
+        print(f"FAIL: {batch_key} present in results but missing from baseline")
+        all_ok = False
+        metadata_failed = True
     for batch_key, baseline_entry in baseline.items():
         if batch_key not in results:
             print(f"FAIL: {batch_key} present in baseline but missing from results")
             all_ok = False
+            metadata_failed = True
             continue
         print(f"\n[{batch_key}]")
         measured_entry = results[batch_key]
+        metadata_ok = True
+        metadata_fields: tuple[str, ...] = COMPARISON_METADATA
+        if baseline_entry.get("dataset") == "synthetic":
+            metadata_fields += ("num_input_tokens_avg",)
+        for field in metadata_fields:
+            missing = [
+                name
+                for name, entry in (("results", measured_entry), ("baseline", baseline_entry))
+                if field not in entry
+            ]
+            if missing:
+                print(f"FAIL: metadata {field!r} missing from {' and '.join(missing)}")
+                metadata_ok = False
+            elif measured_entry[field] != baseline_entry[field]:
+                print(
+                    f"FAIL: metadata {field!r} differs: "
+                    f"results={measured_entry[field]!r}, baseline={baseline_entry[field]!r}"
+                )
+                metadata_ok = False
+        if not metadata_ok:
+            metadata_failed = True
+            all_ok = False
+            continue
         for metric in metrics:
             if metric not in baseline_entry or metric not in measured_entry:
                 continue
@@ -116,9 +163,15 @@ def main() -> int:
                 upper_tol=upper_tol if higher_is_better else None,
             )
             all_ok = all_ok and ok
+            numeric_failed = numeric_failed or not ok
             print(line)
 
     print()
+    if metadata_failed:
+        print("INCOMPARABLE: results and baseline metadata differ — see above.")
+        if numeric_failed:
+            print("REGRESSION: one or more comparable metrics outside tolerance — see above.")
+        return 1
     if all_ok:
         print("OK: all metrics within tolerance.")
         return 0

@@ -47,6 +47,7 @@ def _make_gpt_args(
     args.hidden_size = hidden_size
     args.num_attention_heads = num_attention_heads
     args.seq_length = seq_length
+    args.decoder_seq_length = None
     args.padded_vocab_size = padded_vocab_size
     args.swiglu = swiglu
     args.ffn_hidden_size = ffn_hidden_size if ffn_hidden_size is not None else 4 * hidden_size
@@ -96,6 +97,7 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_head_dim = 64
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
+    args.gdp_num_householder = 3
     return args
 
 
@@ -148,6 +150,15 @@ class TestBSHDBackwardCompat:
         )
 
         assert default_flops == explicit_flops
+
+    def test_multimodal_defaults_use_decoder_sequence_length(self):
+        multimodal_args = _make_gpt_args(seq_length=256)
+        multimodal_args.decoder_seq_length = 4096
+        language_args = _make_gpt_args(seq_length=4096)
+
+        assert num_floating_point_operations(
+            multimodal_args, batch_size=8
+        ) == num_floating_point_operations(language_args, batch_size=8)
 
 
 class TestTHDScaling:
@@ -253,6 +264,36 @@ class TestHybridTHDScaling:
         expected_delta_per_layer_per_unit_sum = 2 * kv * n * 3  # *3 for fwd+bwd
         expected_delta = num_attn_layers * expected_delta_per_layer_per_unit_sum * bshd_sum
         assert flops_doubled - flops_bshd == expected_delta
+
+
+class TestGatedDeltaProductFlops:
+    """GDP FLOPs must use the Householder count from the model configuration."""
+
+    def test_householder_count_changes_flops(self):
+        args = _make_hybrid_args()
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
+        batch_size = 4
+
+        flops_m3 = num_floating_point_operations(args, batch_size)
+        args.gdp_num_householder = 4
+        flops_m4 = num_floating_point_operations(args, batch_size)
+
+        total_tokens = batch_size * args.seq_length
+        d_inner = args.mamba_num_heads * args.mamba_head_dim
+        group_state_dim = args.mamba_num_groups * args.mamba_state_dim
+        forward_delta_per_layer = (
+            2
+            * total_tokens
+            * (
+                args.hidden_size * (d_inner + group_state_dim + args.mamba_num_heads)
+                + 4 * (d_inner + group_state_dim)
+            )
+            + 4 * total_tokens * d_inner * args.mamba_state_dim
+        )
+        num_gdp_layers = 2
+        expected_delta = 3 * num_gdp_layers * forward_delta_per_layer
+
+        assert flops_m4 - flops_m3 == expected_delta
 
 
 class TestPaddingRemoval:

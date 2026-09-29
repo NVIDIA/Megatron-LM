@@ -1,16 +1,57 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
+import ipaddress
 import json
 import logging
+import socket
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import warnings
+from functools import partial
 
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+_MEDIA_FETCH_TIMEOUT_S = 5.0
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
+_MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
+_MEDIA_FETCH_USER_AGENT = "megatron-inference"
+
+from megatron.core.inference.config import MultimodalPromptConfig
+from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    prepare_multimodal_data,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+from megatron.core.inference.utils import model_eos_token_ids
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
+
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import (
+    StreamingChatParser,
+    json_safe_logprobs,
+    json_safe_top_n_logprobs,
+    openai_stream,
+)
+from .common import (
+    abort_requests,
+    attach_stage_metadata,
+    collect_stage_metadata,
+    generation_config_sampling_defaults,
+    log_sampling_defaults_once,
+    resolve_sampling_default,
+    validate_offload_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +115,12 @@ def _get_field(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _get_non_none(obj, key, default):
+    """Returns the value from the object or default if the key is missing or None."""
+    val = obj.get(key)
+    return default if val is None else val
 
 
 def _try_parse_jsonish(value):
@@ -225,10 +272,171 @@ def _coerce_arguments_mapping(arguments):
     return {}
 
 
-def _sanitize_messages_for_template(messages):
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects so a 3xx to a private address can't bypass the
+    pre-fetch allowlist check."""
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        """Turn a 3xx redirect into an HTTPError so the fetch fails closed."""
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirects disabled for image_url fetches", headers, fp
+        )
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
+    """Extract size-bounded bytes from an OpenAI-style media URL.
+
+    Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
+    plain ``http(s)://`` URLs.
+    """
+    if url.startswith("data:"):
+        # Base64 encodes each three input bytes as four characters. Bound the
+        # complete request before splitting or decoding it; 256 characters is
+        # ample for the data-URL metadata preceding the comma.
+        max_encoded_chars = 4 * ((max_bytes + 2) // 3)
+        if len(url) > max_encoded_chars + 256:
+            raise ValueError(f"Media data URL exceeds {max_bytes} byte limit")
+        try:
+            metadata, b64_data = url.split(",", 1)
+        except ValueError as exc:
+            raise ValueError(f"Malformed media data URL: {url[:40]!r}") from exc
+        if len(b64_data) > max_encoded_chars:
+            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
+        data = base64.b64decode(b64_data)
+        if len(data) > max_bytes:
+            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
+        return data
+    if url.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.hostname:
+            raise ValueError(f"Invalid media URL: {url[:40]!r}")
+        try:
+            ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
+        except (socket.gaierror, ValueError) as exc:
+            raise ValueError(f"Cannot resolve media URL host: {parsed.hostname}") from exc
+        # Refuse SSRF-prone destinations (loopback, RFC1918, link-local,
+        # multicast, reserved, unspecified). Public addresses only.
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"Refusing to fetch media from non-public address: {parsed.hostname}")
+        req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
+        with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
+            data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"Media at {parsed.hostname} exceeds {max_bytes} byte limit")
+        return data
+    raise ValueError(f"Unsupported media URL scheme: {url[:40]!r}")
+
+
+def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptConfig):
+    """Extract media bytes and replace structured blocks with internal slots.
+
+    Remote image fetching is blocking, so callers must run this function off
+    the event loop.
+    """
+    if not isinstance(messages, list):
+        return messages, [], [], []
+
+    rewritten = []
+    image_bytes_list: list[bytes] = []
+    video_bytes_list: list[bytes] = []
+    media_slots = []
+
+    def add_slot(modality, message_index):
+        """Preserve a media block's position while the chat template renders text.
+
+        The actual bytes travel separately. After rendering,
+        _tokenize_with_media_slots_sync replaces this sentinel with the
+        model-specific MediaPromptSpec tokens.
+        """
+        sentinel = f"__MCORE_MEDIA_SLOT_{len(media_slots)}__"
+        media_slots.append((sentinel, modality, message_index))
+        return {"type": "text", "text": sentinel}
+
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            rewritten.append(message)
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+
+        new_chunks = []
+        found_modalities = set()
+        for chunk in content:
+            if isinstance(chunk, dict) and chunk.get("type") == "image_url":
+                url = chunk.get("image_url", {}).get("url", "")
+                if not url:
+                    continue
+                try:
+                    image_bytes_list.append(
+                        _extract_media_url_bytes(url, max_bytes=_MAX_IMAGE_BYTES)
+                    )
+                except Exception as e:
+                    # Dropping the image would answer the request as if it were
+                    # text-only, handing the client a confident answer about an
+                    # image the model never saw. Surface it as a 400 instead.
+                    raise ValueError(f"Failed to load image_url: {e}") from e
+                new_chunks.append(add_slot("image", message_index))
+                found_modalities.add("image")
+            elif isinstance(chunk, dict) and chunk.get("type") in {"video_url", "input_video"}:
+                video_value = chunk.get("video_url") or chunk.get("video")
+                url = video_value.get("url", "") if isinstance(video_value, dict) else video_value
+                if not isinstance(url, str) or not url.startswith("data:"):
+                    raise ValueError("Megatron chat video inputs must be base64 data URLs.")
+                try:
+                    video_bytes_list.append(
+                        _extract_media_url_bytes(url, max_bytes=_MAX_VIDEO_BYTES)
+                    )
+                except Exception as e:
+                    raise ValueError(f"Failed to load video_url: {e}") from e
+                new_chunks.append(add_slot("video", message_index))
+                found_modalities.add("video")
+            else:
+                new_chunks.append(chunk)
+
+        if found_modalities:
+            input_markers = {
+                prompt_config.get_spec(modality).input_marker for modality in found_modalities
+            } - {None}
+            for index, chunk in enumerate(new_chunks):
+                if isinstance(chunk, dict) and chunk.get("type") == "text":
+                    chunk = dict(chunk)
+                    for marker in input_markers:
+                        chunk["text"] = str(chunk.get("text", "")).replace(marker, "")
+                    new_chunks[index] = chunk
+            msg_copy = dict(message)
+            msg_copy["content"] = new_chunks
+            rewritten.append(msg_copy)
+        else:
+            rewritten.append(message)
+
+    if image_bytes_list and video_bytes_list:
+        raise ValueError("Mixing image and video blocks in one request is not supported.")
+    return rewritten, image_bytes_list, video_bytes_list, media_slots
+
+
+def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
-    This only normalizes tool-call argument payloads inside each message:
+    This lowers structured media content according to the model prompt contract
+    and normalizes tool-call argument payloads inside each message:
     - messages[*].tool_calls[*].function.arguments is coerced to a dict.
 
     Example transformation:
@@ -243,7 +451,13 @@ def _sanitize_messages_for_template(messages):
     if not isinstance(messages, list):
         return messages
     sanitized = []
-    for message in messages:
+    media_modalities_by_message = {}
+    media_sentinels_by_message = {}
+    for _sentinel, modality, message_index in media_slots:
+        media_modalities_by_message.setdefault(message_index, set()).add(modality)
+        media_sentinels_by_message.setdefault(message_index, set()).add(_sentinel)
+
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             sanitized.append(message)
             continue
@@ -261,7 +475,26 @@ def _sanitize_messages_for_template(messages):
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
-            msg_copy["content"] = "".join(text_chunks)
+            if prompt_config is not None and prompt_config.content_part_order == "media_first":
+                media_sentinels = media_sentinels_by_message.get(message_index, set())
+                media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
+                non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
+                text_chunks = media_chunks + non_media_chunks
+            separator = ""
+            message_modalities = media_modalities_by_message.get(message_index, set())
+            if message_modalities:
+                if prompt_config is None:
+                    raise ValueError("Media content normalization requires a prompt config.")
+                separators = {
+                    prompt_config.get_spec(modality).content_part_separator
+                    for modality in message_modalities
+                }
+                if len(separators) != 1:
+                    raise ValueError(
+                        "Media types in one message must use the same content-part separator."
+                    )
+                separator = separators.pop()
+            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
@@ -317,47 +550,184 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
-def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
-    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+# Keys a client may never supply via `chat_template_kwargs`.
+#
+# `chat_template` replaces the Jinja template that the server renders for the
+# request. The template is server/tokenizer configuration (`--chat-template` or
+# the tokenizer's own template), never request data. Honoring a caller-supplied
+# template lets an unauthenticated POST hand us arbitrary Jinja that we then
+# compile and render synchronously: the sandbox blocks attribute escapes, but it
+# does not bound work, so nested `range()` loops or unbounded string
+# multiplication pin the worker and stall every other in-flight request on it.
+_DISALLOWED_CHAT_TEMPLATE_KWARGS = frozenset({"chat_template"})
 
-    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
-    Before applying the chat template, we must inline those tags back into content.
+
+def _sanitize_chat_template_kwargs(raw_kwargs):
+    """Drop request-supplied `chat_template_kwargs` entries that are not caller-controllable.
+
+    Returns a new dict; the caller's object is never mutated. Non-dict input
+    (including `None`) yields an empty dict.
     """
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        reasoning_content = message.pop("reasoning_content", None)
-        if reasoning_content is not None:
-            content = message.get("content") or ""
-            message["content"] = f"<think>{reasoning_content}</think>{content}"
-    return messages
+    if not isinstance(raw_kwargs, dict):
+        if raw_kwargs is not None:
+            logger.warning("Ignoring non-dict chat_template_kwargs: %s", type(raw_kwargs).__name__)
+        return {}
+
+    sanitized = {k: v for k, v in raw_kwargs.items() if k not in _DISALLOWED_CHAT_TEMPLATE_KWARGS}
+    rejected = sorted(set(raw_kwargs) - set(sanitized))
+    if rejected:
+        logger.warning(
+            "Ignoring disallowed chat_template_kwargs key(s) from request: %s. "
+            "The chat template is server configuration; use --chat-template to set it.",
+            ", ".join(rejected),
+        )
+    return sanitized
 
 
 def _replace_prefix_tokens(
-    eos_token_id,
+    eos_token_ids,
     previous_turn_token_ids,
-    retokeenized_previous_turn_token_ids,
+    retokenized_previous_turn_token_ids,
     current_turn_token_ids,
 ):
     """Replace the token ids that are associated with the previous turn with the actual tokens
     from the previous generation (rather than the ones from the chat template application)."""
 
-    # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids[-1] == eos_token_id:
-        previous_turn_token_ids = previous_turn_token_ids[:-1]
+    if not previous_turn_token_ids:
+        return current_turn_token_ids
 
-    # Find the last EOS token id in the previous turn token ids
-    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
-        if current_turn_token_ids[i] == eos_token_id:
-            last_eos_token_id_index = i
-            break
+    eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
 
-    # Replace the current turn token ids with the tokens from the previous generation
-    current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
+    # Find the boundary of the current sequence's prompt.
+    current_turn_additional_token_ids = _suffix_tokens_after_prefix(
+        eos_token_ids, retokenized_previous_turn_token_ids, current_turn_token_ids
+    )
+    if previous_turn_token_ids[-1] in eos_token_ids:
+        # Preserve the exact EOS emitted previously. The rendered suffix begins
+        # with its own boundary EOS, which may be a different accepted EOS ID.
+        current_turn_additional_token_ids = current_turn_additional_token_ids[1:]
 
     # Return the previous turn token ids + the current turn token ids
     return previous_turn_token_ids + current_turn_additional_token_ids
+
+
+def _has_previous_turn_tokens(last_assistant_message):
+    """True when the last assistant message carries the token ids of a previous
+    Megatron-Inference response, so the endpoint can replace the prefix with the exact prior turn here.
+    Dataset-provided conversation history won't have these fields."""
+    if last_assistant_message is None:
+        return False
+    prompt_token_ids = last_assistant_message.get("prompt_token_ids")
+    generation_token_ids = last_assistant_message.get("generation_token_ids")
+    # Check that we have non-empty prompt or generation tokens.
+    return (
+        isinstance(prompt_token_ids, list)
+        and isinstance(generation_token_ids, list)
+        and bool(prompt_token_ids or generation_token_ids)
+    )
+
+
+def _last_assistant_message(template_messages):
+    """Return ``(index, message)`` of the last assistant turn, or ``(None, None)``."""
+    for i in reversed(range(len(template_messages))):
+        if template_messages[i]["role"] == "assistant":
+            return i, template_messages[i]
+    return None, None
+
+
+def _replace_prefix_tokens_metadata(eos_token_ids, template_prefix_token_ids, offload_params):
+    """Ship the rendered prior-turn tokens so the engine's RequestPromptPreparer can replace the
+    prefix with the exact prior tokens itself (NeMo RL's ``replace_prefix_tokens``)."""
+    return {
+        **offload_params,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: list(template_prefix_token_ids),
+        PREFIX_EOS_TOKEN_ID_FIELD: _serialize_eos_token_ids(eos_token_ids),
+    }
+
+
+def _expanded_prefix_stitching_metadata(prefix_media_count, expanded_prefix_token_count):
+    """Mark the exact, already-expanded prefix so the engine only expands the tokens after it."""
+    return {
+        PREFIX_MEDIA_COUNT_FIELD: prefix_media_count,
+        PREFIX_EXPANDED_TOKEN_COUNT_FIELD: expanded_prefix_token_count,
+    }
+
+
+def _normalize_eos_token_ids(eos_token_ids):
+    """Normalize one or more EOS IDs to a validated set."""
+    if type(eos_token_ids) is int:
+        eos_token_ids = [eos_token_ids]
+    if (
+        not isinstance(eos_token_ids, (list, tuple, set, frozenset))
+        or not eos_token_ids
+        or not all(type(token_id) is int for token_id in eos_token_ids)
+    ):
+        raise ValueError("EOS token IDs must be a non-empty integer or collection of integers.")
+    return frozenset(eos_token_ids)
+
+
+def _serialize_eos_token_ids(eos_token_ids):
+    """Serialize one or more EOS IDs as a JSON-compatible list."""
+    return sorted(_normalize_eos_token_ids(eos_token_ids))
+
+
+def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, current_tokens):
+    """Return the current-turn suffix, beginning at the prefix's final EOS."""
+    # Count the number of EOS tokens in the retokenized prefix.
+    eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
+    eos_count = sum(token_id in eos_token_ids for token_id in template_prefix_token_ids)
+    if eos_count <= 0:
+        raise ValueError(
+            "Could not locate an EOS-delimited previous turn: the chat template's turn "
+            f"terminator is not among the model EOS token IDs {sorted(eos_token_ids)}."
+        )
+
+    # Scan current_tokens from beginning to end. Return the suffix after eos_count
+    # EOS tokens have been seen.
+    # This guards against changes in templating or even upstream modification of
+    # the prefix tokens to ensure we retrieve the current turn's suffix / prompt.
+    seen_eos = 0
+    for position, token_id in enumerate(current_tokens):
+        if token_id in eos_token_ids:
+            seen_eos += 1
+            if seen_eos == eos_count:
+                return current_tokens[position:]
+    raise ValueError(
+        f"Expected {eos_count} EOS token(s) before the new turn, but found only {seen_eos}."
+    )
+
+
+def _contains_model_media_token(token_ids, tokenizer, prompt_config):
+    """Whether exact prior model tokens still reference image/video embeddings."""
+    if not isinstance(token_ids, list) or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return False
+
+    media_token_ids = set()
+    for modality in ("image", "video"):
+        spec = prompt_config.get_spec(modality)
+        token_id = tokenizer.convert_tokens_to_ids(spec.model_token)
+        if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
+            media_token_ids.add(int(token_id))
+    return any(type(token_id) is int and token_id in media_token_ids for token_id in token_ids)
+
+
+def _apply_chat_template_sync(
+    tokenizer, messages, tools, chat_template_kwargs, add_generation_prompt=True
+):
+    """Apply the chat template and coerce to `list[int]`, for use in a worker thread.
+
+    The coercion runs here too: it walks every token, so leaving it on the event loop
+    would keep part of the stall this offload exists to remove.
+    """
+    return _coerce_to_token_id_list(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            **chat_template_kwargs,
+        )
+    )
 
 
 def _coerce_to_token_id_list(result):
@@ -389,6 +759,75 @@ def _coerce_to_token_id_list(result):
     return list(result)
 
 
+def _tokenize_with_media_slots_sync(
+    chat_tok,
+    messages,
+    media_slots,
+    prompt_config,
+    *,
+    tools,
+    chat_template_kwargs,
+    add_generation_prompt=True,
+):
+    """Render a chat template and lower internal media slots to model tokens.
+
+    Synchronous, and run whole on the frontend's tokenize executor rather than
+    piecewise. Rendering is only the first of 3N+1 tokenizer calls for N media
+    slots -- each slot encodes the text before it, then the model token's prefix
+    and suffix -- and awaiting just the render left the rest on the event loop,
+    where they stall every other request this replica owns.
+
+    One hop to the executor also means one thread touches the tokenizer for the
+    whole request. HF tokenizers are not thread-safe, and this runs on the
+    executor's private copy.
+    """
+    rendered = chat_tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+        **chat_template_kwargs,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError("Multimodal chat template rendering must return a string.")
+
+    positioned_slots = []
+    for sentinel, modality, _message_index in media_slots:
+        if rendered.count(sentinel) != 1:
+            raise ValueError(f"Chat template did not preserve media slot {sentinel}.")
+        positioned_slots.append((rendered.index(sentinel), sentinel, modality))
+
+    prompt_tokens = []
+    cursor = 0
+    for position, sentinel, modality in sorted(positioned_slots):
+        prompt_tokens.extend(
+            _coerce_to_token_id_list(chat_tok(rendered[cursor:position], add_special_tokens=False))
+        )
+        spec = prompt_config.get_spec(modality)
+        resolved_id = (
+            chat_tok.convert_tokens_to_ids(spec.model_token)
+            if hasattr(chat_tok, "convert_tokens_to_ids")
+            else None
+        )
+        if resolved_id == getattr(chat_tok, "unk_token_id", None):
+            resolved_id = None
+        if resolved_id is None:
+            raise ValueError(f"Tokenizer does not define media token {spec.model_token!r}.")
+        prompt_tokens.extend(
+            _coerce_to_token_id_list(chat_tok(spec.prefix, add_special_tokens=False))
+        )
+        prompt_tokens.append(int(resolved_id))
+        prompt_tokens.extend(
+            _coerce_to_token_id_list(chat_tok(spec.suffix, add_special_tokens=False))
+        )
+        cursor = position + len(sentinel)
+
+    prompt_tokens.extend(
+        _coerce_to_token_id_list(chat_tok(rendered[cursor:], add_special_tokens=False))
+    )
+    return prompt_tokens
+
+
 try:
     import orjson
 
@@ -402,15 +841,36 @@ try:
 
     bp = Blueprint('chat_completions_api', __name__)
 
-    def apply_parsers(message_text, tools, parsers_list, tools_requested):
+    def apply_parsers(
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None, finished=True
+    ):
         """Runs CPU-intensive text parsing."""
-        meta = {}
         for parser in parsers_list:
             if parser not in PARSER_MAPPING:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
+        implicit_reasoning_end_markers = (
+            tuple(
+                marker
+                for parser_name in parsers_list
+                for marker in getattr(
+                    PARSER_MAPPING[parser_name], "implicit_reasoning_end_markers", ()
+                )
+            )
+            if tools_requested
+            else ()
+        )
+
+        meta = {}
+        for parser in parsers_list:
             prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
+            parsed_text, new_info = PARSER_MAPPING[parser].parse(
+                message_text,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                implicit_reasoning_end_markers=implicit_reasoning_end_markers,
+                finished=finished,
+            )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
                     new_info.get("tool_calls", []), tools=tools
@@ -437,143 +897,296 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        offload_params = req.get("offload_params")
+        offload_params_error = validate_offload_params(offload_params)
+        if offload_params_error is not None:
+            return Response(offload_params_error, status=400)
+        prevent_retokenization = req.get(
+            "prevent_retokenization", not current_app.config.get('eval_mode', False)
+        )
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
         tools_requested = bool(tools) and tool_choice != "none"
         messages = req.get("messages")
-        chat_template_kwargs = req.get("chat_template_kwargs", {})
-        if not isinstance(chat_template_kwargs, dict):
-            logger.warning(
-                "Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__
-            )
-            chat_template_kwargs = {}
+        chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
         # --- 1. Parse Messages ---
         if not messages:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
-        template_messages = _sanitize_messages_for_template(messages)
-        template_messages = _reconstruct_reasoning_content(template_messages)
+        prompt_config = current_app.config['multimodal_prompt_config']
+        # Extract structured media before template sanitization. Remote image
+        # fetches block, so keep this work off the event loop.
+        try:
+            messages, image_bytes_list, video_bytes_list, media_slots = await asyncio.to_thread(
+                _extract_multimodal_from_messages, messages, prompt_config
+            )
+        except ValueError as error:
+            return Response(str(error), status=400)
+        multi_modal_data = None
+        if image_bytes_list:
+            multi_modal_data = {"image": image_bytes_list}
+        elif video_bytes_list:
+            multi_modal_data = {"video": video_bytes_list}
+        template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
         template_tools = _sanitize_tools_for_template(tools)
 
+        # The exact tokens of the previous turn can come from one of two places, never both:
+        #  - the last assistant message, when the client echoed back the token ids of a
+        #    previous Megatron-Inference response (prefix replaced here), or
+        #  - a store the engine's RequestPromptPreparer can reach, when the client sent
+        #    offload_params (prefix replaced in the engine; we ship what the preparer needs).
+        last_assistant_message_idx, last_assistant_message = _last_assistant_message(
+            template_messages
+        )
+        has_previous_turn_tokens = _has_previous_turn_tokens(last_assistant_message)
+        if has_previous_turn_tokens and offload_params is not None:
+            return Response(
+                "prompt_token_ids/generation_token_ids on the last assistant message and "
+                "'offload_params' are mutually exclusive prefix sources",
+                status=400,
+            )
+        use_exact_prefix_stitching = prevent_retokenization and has_previous_turn_tokens
+        use_offloaded_prefix_stitching = (
+            offload_params is not None and last_assistant_message is not None
+        )
+        use_prefix_stitching = use_exact_prefix_stitching or use_offloaded_prefix_stitching
+
+        # Inject the server-configured chat template (e.g. pretraining.jinja for
+        # VLM checkpoints). Loaded once at server startup from --chat-template
+        # into app.config. This is the only path by which a template reaches the
+        # renderer -- requests cannot override it (see
+        # _sanitize_chat_template_kwargs).
+        server_chat_template = current_app.config.get('chat_template', None)
+        if server_chat_template:
+            chat_template_kwargs['chat_template'] = server_chat_template
+
+        # Prefer the underlying HF tokenizer for chat-template application when
+        # reachable. The vision tokenizer's apply_chat_template is a stub, and
+        # the text wrapper just forwards anyway; reaching the HF tokenizer lets
+        # us pass tokenize/add_generation_prompt/chat_template directly.
+        hf_tok = getattr(getattr(tokenizer, '_tokenizer', None), 'tokenizer', None)
+        chat_tok = hf_tok if hf_tok is not None else tokenizer
+
+        # Same resolution against the private copy the worker thread applies the
+        # template with; `chat_tok` above is only read for the capability checks.
+        # Falls back to the shared tokenizer when no private copy is registered:
+        # callers that build the app config directly do not set one, and the copy
+        # is a thread-safety isolation measure rather than a correctness one.
+        tokenize_tok = current_app.config.get('tokenizer_copy', tokenizer)
+        tokenize_hf_tok = getattr(getattr(tokenize_tok, '_tokenizer', None), 'tokenizer', None)
+        tokenize_chat_tok = tokenize_hf_tok if tokenize_hf_tok is not None else tokenize_tok
+
         try:
-            if (
-                hasattr(tokenizer, 'apply_chat_template')
-                and getattr(tokenizer, "chat_template", None) is not None
+            if hasattr(chat_tok, 'apply_chat_template') and (
+                getattr(chat_tok, "chat_template", None) is not None
+                or chat_template_kwargs.get('chat_template') is not None
             ):
-                prompt_tokens = _coerce_to_token_id_list(
-                    tokenizer.apply_chat_template(
-                        template_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=template_tools,
-                        **chat_template_kwargs,
+                # Template render + tokenization is synchronous and CPU-bound, so
+                # run it off the event loop. This is a latency mitigation, not a
+                # DoS defense: Jinja rendering is pure Python and holds the GIL,
+                # so an expensive template still degrades the loop badly (it just
+                # no longer hangs it outright). Request-supplied templates are
+                # rejected in _sanitize_chat_template_kwargs -- that is the actual
+                # fix. The real win here is the tokenizer half, which drops into
+                # Rust and releases the GIL for long conversations.
+                #
+                # Both paths go through the dedicated single-worker executor
+                # rather than asyncio.to_thread: the default executor is shared
+                # process-wide, so tokenization would queue behind unrelated work
+                # and vice versa, and its worker count would admit many concurrent
+                # Jinja renders that contend for the GIL with the very loop this
+                # offload protects. The executor also owns a private tokenizer
+                # copy, since HF tokenizers are not thread-safe.
+                if media_slots:
+                    prompt_tokens = await asyncio.get_running_loop().run_in_executor(
+                        current_app.config.get('tokenize_executor'),
+                        partial(
+                            _tokenize_with_media_slots_sync,
+                            tokenize_chat_tok,
+                            template_messages,
+                            media_slots,
+                            prompt_config,
+                            tools=template_tools,
+                            chat_template_kwargs=chat_template_kwargs,
+                            add_generation_prompt=True,
+                        ),
                     )
-                )
+                else:
+                    prompt_tokens = await asyncio.get_running_loop().run_in_executor(
+                        current_app.config.get('tokenize_executor'),
+                        partial(
+                            _apply_chat_template_sync,
+                            tokenize_chat_tok,
+                            template_messages,
+                            template_tools,
+                            chat_template_kwargs,
+                        ),
+                    )
 
-                if req.get("prevent_retokenization", True):
-                    # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
+                if use_prefix_stitching:
+                    # Replace the re-rendered prefix with the exact tokens of the previous turn.
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
+                    messages_to_last_assistant_message = template_messages[
+                        : last_assistant_message_idx + 1
+                    ]
+                    previous_media_slots = [
+                        slot for slot in media_slots if slot[2] <= last_assistant_message_idx
+                    ]
+                    if (
+                        use_exact_prefix_stitching
+                        and not previous_media_slots
+                        and _contains_model_media_token(
+                            last_assistant_message["prompt_token_ids"],
+                            tokenize_chat_tok,
+                            prompt_config,
+                        )
+                    ):
+                        raise ValueError(
+                            "The exact previous prompt contains media tokens, but its image/video "
+                            "payload is missing from message history. Preserve prior media content "
+                            "when using prevent_retokenization."
+                        )
+                    eos_token_ids = set(model_eos_token_ids(tokenizer))
+                    if getattr(tokenizer, "eos_id", None) is not None:
+                        eos_token_ids.add(tokenizer.eos_id)
+                    assert eos_token_ids, "Your tokenizer must have an EOS token ID!"
 
-                    # Find the last assistant message
-                    last_assistant_message_idx = None
-                    for i in reversed(range(len(template_messages))):
-                        if template_messages[i]["role"] == "assistant":
-                            last_assistant_message_idx = i
-                            break
-
-                    last_assistant_message = (
-                        template_messages[last_assistant_message_idx]
-                        if last_assistant_message_idx is not None
-                        else None
+                    warnings.warn(
+                        "Avoiding prefix retokenization."
+                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
                     )
 
-                    # Only proceed if the last assistant message has the token IDs from a previous generation.
-                    # Dataset-provided conversation history won't have these fields.
-                    if (
-                        last_assistant_message is not None
-                        and "prompt_token_ids" in last_assistant_message
-                        and "generation_token_ids" in last_assistant_message
-                    ):
-                        eos_token_id = tokenizer.eos_id
-                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-                        warnings.warn(
-                            "Avoiding prefix retokenization."
-                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                    # Get the templated tokenization of just the previous generation.
+                    if previous_media_slots:
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config.get('tokenize_executor'),
+                                partial(
+                                    _tokenize_with_media_slots_sync,
+                                    tokenize_chat_tok,
+                                    messages_to_last_assistant_message,
+                                    previous_media_slots,
+                                    prompt_config,
+                                    tools=template_tools,
+                                    chat_template_kwargs=chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
+                            )
                         )
-
-                        messages_to_last_assistant_message = template_messages[
-                            : last_assistant_message_idx + 1
-                        ]
-
-                        # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            tokenizer.apply_chat_template(
-                                messages_to_last_assistant_message,
-                                tokenize=True,
-                                add_generation_prompt=False,
-                                tools=template_tools,
-                                **chat_template_kwargs,
+                    else:
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config.get('tokenize_executor'),
+                                partial(
+                                    _apply_chat_template_sync,
+                                    tokenize_chat_tok,
+                                    messages_to_last_assistant_message,
+                                    template_tools,
+                                    chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
                             )
                         )
 
-                        # Replace the prefix tokens with the tokens from the previous generation.
-                        # If prior token IDs are unavailable, fall back to normal retokenized prompt
-                        # instead of failing the request.
-                        prompt_token_ids = last_assistant_message.get("prompt_token_ids")
-                        generation_token_ids = last_assistant_message.get("generation_token_ids")
-
-                        if isinstance(prompt_token_ids, list) and isinstance(
-                            generation_token_ids, list
-                        ):
-                            previous_turn_token_ids = prompt_token_ids + generation_token_ids
-                            prompt_tokens = _replace_prefix_tokens(
-                                eos_token_id,
-                                previous_turn_token_ids,
-                                retokenized_previous_turn_token_ids,
-                                prompt_tokens,
-                            )
-                        else:
-                            logger.warning(
-                                "Last assistant message missing prompt_token_ids/"
-                                "generation_token_ids; skipping prefix replacement."
+                    if use_offloaded_prefix_stitching:
+                        # Offloaded tokens are stitched in engine via RequestPromptPreparer.
+                        offload_params = _replace_prefix_tokens_metadata(
+                            eos_token_ids, retokenized_previous_turn_token_ids, offload_params
+                        )
+                        if previous_media_slots:
+                            # Multimodal post-expansion stitching requires the expanded prefix
+                            # length from RequestPromptPreparer and a compact / pre-expansion suffix.
+                            # PREFIX_MEDIA_COUNT_FIELD signals multimodal expansion and is
+                            # used to figure out how many subsequent media tokens to expand.
+                            offload_params[PREFIX_MEDIA_COUNT_FIELD] = len(previous_media_slots)
+                    else:
+                        # Not offloaded. Just stitch here.
+                        previous_turn_token_ids = (
+                            last_assistant_message["prompt_token_ids"]
+                            + last_assistant_message["generation_token_ids"]
+                        )
+                        prompt_tokens = _replace_prefix_tokens(
+                            eos_token_ids,
+                            previous_turn_token_ids,
+                            retokenized_previous_turn_token_ids,
+                            prompt_tokens,
+                        )
+                        if previous_media_slots:
+                            # The previous turn is already expanded. The engine only
+                            # expands the media tokens after it.
+                            offload_params = _expanded_prefix_stitching_metadata(
+                                len(previous_media_slots), len(previous_turn_token_ids)
                             )
 
             else:
+                if media_slots:
+                    raise ValueError("Multimodal chat requests require a chat template.")
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
                 )
                 prompt_tokens = tokenizer.tokenize(
                     "\n".join([message["content"] for message in messages])
                 )
+        except ValueError as e:
+            logger.error(f"{traceback.format_exc()}")
+            return Response(f"Invalid 'messages': {e}", status=400)
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return Response(f"Error processing 'messages': {e}", status=500)
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            # For a field the request omits: an explicitly configured server default
+            # wins, then the model's generation_config.json, then the previous
+            # hardcoded fallback.
+            gen_defaults = generation_config_sampling_defaults(tokenizer)
+            cfg = current_app.config
+            temperature = float(
+                _get_non_none(
+                    req,
+                    "temperature",
+                    resolve_sampling_default(
+                        cfg, gen_defaults, "temperature", 'default_temperature', 1.0
+                    ),
+                )
+            )
+            top_p = float(
+                _get_non_none(
+                    req,
+                    "top_p",
+                    resolve_sampling_default(cfg, gen_defaults, "top_p", 'default_top_p', 1.0),
+                )
+            )
+            top_k = int(
+                _get_non_none(
+                    req,
+                    "top_k",
+                    resolve_sampling_default(cfg, gen_defaults, "top_k", 'default_top_k', 0),
+                )
+            )
+            log_sampling_defaults_once(
+                tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
+            )
+            n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
                 top_k = 1
                 top_p = 0.0
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            return_log_probs = bool(_get_non_none(req, "logprobs", False))
+            top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0
+            skip_prompt_log_probs = bool(_get_non_none(req, "skip_prompt_log_probs", True))
+            add_BOS = bool(_get_non_none(req, "add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle
             # BOS ourselves, matching the logic in tokenize_prompt().
             if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
+                prompt_length = len(prompt_tokens)
                 start_idx = 0
                 while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
                     start_idx += 1
@@ -583,7 +1196,29 @@ try:
                 if add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
+                if offload_params and PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params:
+                    # BOS changes happen inside the expanded prefix.
+                    offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] += (
+                        len(prompt_tokens) - prompt_length
+                    )
+
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+            ignore_eos = bool(req.get("ignore_eos", False))
+
+            # Does the client want the prompt tokens echoed back? Only then does the
+            # engine need to keep the prompt_tokens tensor on the response payload.
+            # return_tokenized_data (implied by prevent_retokenization) needs the ids;
+            # return_raw_text needs the ids to detokenize the prompt into raw_text.
+            return_tokenized_data = (
+                req.get("return_tokenized_data", False) or prevent_retokenization
+            )
+            return_raw_text = req.get("return_raw_text", False)
+            return_prompt_tokens = return_tokenized_data or return_raw_text
+
+            # OpenAI-style "stop" may be a string or list of strings; normalize.
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -592,20 +1227,136 @@ try:
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
+                stop_words=stop,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                termination_id=-1 if ignore_eos else None,
+                return_prompt_tokens=return_prompt_tokens,
+                streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
+                # This frontend detokenizes its own output below. Keeping it off the
+                # coordinator matters because that is one process shared by all DP ranks.
+                detokenize_generations=False,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        # Hash and serialize shared media once before fanning one prompt out to
+        # multiple independently sampled choices. Each request still carries
+        # its own media payload, while coordinator affinity keeps equivalent
+        # requests on the engine that owns the cached vision embedding.
+        prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
+        stream_requested = bool(req.get("stream", False))
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for _ in range(n)
+                ]
+            except ValueError as error:
+                return Response(str(error), status=400)
+
+            streams = [
+                client.add_request_streaming(
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=prepared_multimodal_data,
+                    offload_params=offload_params,
+                )
+                for _ in range(n)
+            ]
+            chat_parsers = None
+            if parsers:
+                marker_prefixes = (
+                    tuple(
+                        marker
+                        for parser_name in parsers
+                        for marker in getattr(PARSER_MAPPING[parser_name], "streaming_markers", ())
+                    )
+                    if tools_requested
+                    else ()
+                )
+
+                def parse_streaming_text(text, finished=False):
+                    parsed_text, metadata = apply_parsers(
+                        text,
+                        tools,
+                        parsers,
+                        tools_requested,
+                        chat_template_kwargs=chat_template_kwargs,
+                        finished=finished,
+                    )
+                    metadata["tool_calls"] = _maybe_filter_parallel_tool_calls(
+                        metadata.get("tool_calls", []), parallel_tool_calls
+                    )
+                    return parsed_text, metadata
+
+                is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
+                chat_parsers = [
+                    StreamingChatParser(
+                        parse_streaming_text,
+                        marker_prefixes=marker_prefixes,
+                        named_tool_choice=is_named_tool_choice,
+                    )
+                    for _ in range(n)
+                ]
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    streams,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=True,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    chat_parsers=chat_parsers,
+                ),
+                content_type="text/event-stream",
+            )
+            response.timeout = None
+            return response
+
+        # add_request_with_id, not add_request: a non-streaming response writes
+        # nothing to the socket while generating, so a disconnect is never
+        # discovered as a broken pipe. Aborting needs the request ids.
+        #
+        # Submitted one at a time rather than in a comprehension so a failure on
+        # admission k -- a zmq send error, or multimodal serialization on a
+        # malformed payload -- can abort the k-1 already in flight. Left to
+        # escape they would generate to their token limit holding batch slots,
+        # the same leak the abort below the gather closes.
+        request_ids = []
+        tasks = []
+        try:
+            for _ in range(n):
+                request_id, future = client.add_request_with_id(
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=prepared_multimodal_data,
+                    offload_params=offload_params,
+                )
+                request_ids.append(request_id)
+                tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return Response(f"Error submitting request: {e}", status=500)
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
@@ -654,25 +1405,48 @@ try:
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
+        cached_tokens_counts = []
 
+        # return_tokenized_data / return_raw_text / return_prompt_tokens were computed
+        # at submit time (above) and drive both the response shape here and whether the
+        # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
+        response_uid = None
+        response_metadata = {}
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
+            if response_uid is None:
+                response_uid = result["uid"]
+            collect_stage_metadata(response_metadata, result)
 
-            prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
-            text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
+            text_output = TextGenerationController.detokenize(
+                tokenizer,
+                result["generated_tokens"],
+                remove_EOD=not sampling_params.detokenize_stop_sequence,
+            )
+            # The engine always reports prompt_length (for usage), but drops the
+            # prompt_tokens tensor unless return_prompt_tokens was set.
+            prompt_tokens_count = result.get("prompt_length")
+            if prompt_tokens_count is None:
+                prompt_tokens_out = result["prompt_tokens"]
+                prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
+            cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
+            # Under payload offload the engine dropped the per-token log probs from the reply
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
             logprobs_content = None
-            if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
+            if sampling_params.return_log_probs and not payload_offloaded:
+                token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
 
                 # Get top_n_logprobs if available
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs')
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('generated_top_n_logprobs') or []
+                )
 
                 logprobs_content = []
                 for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
@@ -703,7 +1477,11 @@ try:
 
             if parsers:
                 message_text, metadata = apply_parsers(
-                    message_text, tools, parsers, tools_requested
+                    message_text,
+                    tools,
+                    parsers,
+                    tools_requested,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
 
             normalized_tool_calls = metadata.get("tool_calls", [])
@@ -728,13 +1506,17 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            # Replicate data in the message field for compatibility.
-            message["prompt_token_ids"] = result["prompt_tokens"]
-            message["generation_token_ids"] = result["generated_tokens"]
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
-            message["policy_epoch"] = result["policy_epoch"]
-            message["kv_cache_epoch"] = result["kv_cache_epoch"]
-            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
+            if return_tokenized_data and not payload_offloaded:
+                # Wire contract matches vLLM: prompt_token_ids are model-input tokens
+                # (post vision/video expansion).
+                message["prompt_token_ids"] = result["prompt_tokens"]
+                message["generation_token_ids"] = result["generated_tokens"]
+            if return_raw_text and not payload_offloaded:
+                prompt_str = tokenizer.detokenize(result["prompt_tokens"])
+                message["raw_text"] = prompt_str + text_output
+            if not payload_offloaded:
+                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -751,16 +1533,14 @@ try:
             else:
                 finish_reason = "stop"
 
+            # Choice-level prompt/generation_token_ids, generation_log_probs and
+            # raw_text were duplicates of message-level data (or reconstructable);
+            # dropped to match vLLM's response shape and cut payload size.
             choice_data = {
                 "index": request_idx,
                 "message": message,
-                "prompt_token_ids": result["prompt_tokens"],
-                "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
-                "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
+                "logprobs": {"content": logprobs_content} if logprobs_content is not None else None,
                 "finish_reason": finish_reason,
             }
             if current_app.config['verbose']:
@@ -774,7 +1554,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if choice_data["generation_log_probs"] is None:
+            if not payload_offloaded and result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
@@ -783,8 +1563,9 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "id": response_uid,
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",
@@ -793,8 +1574,10 @@ try:
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
+        attach_stage_metadata(response, response_metadata)
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

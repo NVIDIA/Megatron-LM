@@ -7,17 +7,25 @@ import dataclasses
 import json
 import os
 import re
-import torch
 import types
-import yaml
+
+import torch
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 from itertools import chain, starmap
 from types import SimpleNamespace
 
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.training.argument_utils import _mfsdp_v2_disables_pipeline_output_dealloc
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -28,8 +36,9 @@ def env_constructor(loader, node):
         assert os.environ.get(group) is not None, f"environment variable {group} in yaml not found"
         value = value.replace(f"${{{group}}}", os.environ.get(group))
     return value
-yaml.add_implicit_resolver("!pathex", env_pattern)
-yaml.add_constructor("!pathex", env_constructor)
+if HAVE_YAML:
+    yaml.add_implicit_resolver("!pathex", env_pattern)
+    yaml.add_constructor("!pathex", env_constructor)
 
 
 str_dtype_to_torch = {
@@ -128,9 +137,20 @@ def validate_yaml(args, defaults={}):
 
     # num_layers_per_virtual_pipeline_stage is not insde model parallel for checkpointing
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.model_parallel.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
-            'interleaved schedule'
+        # Mirror the two-branch check in arguments.py: with p2p communication
+        # overlap enabled a pipeline-parallel size of 2 is fine, but without it
+        # the size must exceed 2 to avoid issuing multiple p2p sends/recvs
+        # between the same pair of ranks in one communication batch.
+        if getattr(args.model_parallel, 'overlap_p2p_comm', False):
+            assert args.model_parallel.pipeline_model_parallel_size > 1, \
+                'When interleaved schedule is used, pipeline-model-parallel size ' \
+                'should be greater than 1'
+        else:
+            assert args.model_parallel.pipeline_model_parallel_size > 2, \
+                'When interleaved schedule is used and p2p communication overlap is ' \
+                'disabled, pipeline-model-parallel size should be greater than 2 to ' \
+                'avoid having multiple p2p sends and recvs between same 2 ranks per ' \
+                'communication batch'
         assert args.language_model.num_layers % args.model_parallel.transformer_pipeline_model_parallel_size == 0, \
             'number of layers should be divisible by the pipeline parallel size'
         num_layers_per_pipeline_stage = args.language_model.num_layers // args.model_parallel.transformer_pipeline_model_parallel_size
@@ -388,13 +408,15 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
+    # Read the distributed-init args before the rebind below hides them.
+    disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
     
     # Hardcoded 
-    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['deallocate_pipeline_outputs'] = not disable_pipeline_output_dealloc
     kw_args['pipeline_dtype'] = kw_args['params_dtype']
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
     
@@ -428,6 +450,11 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
+    if not HAVE_YAML:
+        raise ImportError(
+            "PyYAML is required to load YAML arguments. "
+            "Install via `pip install pyyaml`."
+        )
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
         # Convert to nested namespace

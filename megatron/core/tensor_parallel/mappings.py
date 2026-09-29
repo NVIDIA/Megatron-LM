@@ -3,7 +3,11 @@
 import torch
 
 from megatron.core.parallel_state import get_global_memory_buffer
-from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.utils import (
+    get_pg_size,
+    get_tensor_model_parallel_group_if_none,
+    is_torch_min_version,
+)
 
 from .utils import split_tensor_along_last_dim
 
@@ -28,7 +32,11 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    # Note: If input_ is contiguous, it is mutated in-place.
+    # If not, a new contiguous tensor is created and returned;
+    # callers must use the returned value to ensure the reduced result is captured.
+    input_ = input_.contiguous()
+    torch.distributed.all_reduce(input_, group=group)
 
     return input_
 
@@ -506,6 +514,8 @@ def scatter_to_tensor_model_parallel_region(input_, group=None):
 def gather_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: AG, backward: split <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if get_pg_size(group) == 1:
+        return input_
     return _GatherFromModelParallelRegion.apply(input_, group)
 
 

@@ -12,9 +12,8 @@ MAX_TOKENS = 16
 MAX_KV_BLOCKS = 8
 MAX_MAMBA_CHUNKS = 3
 
-TOKEN_VIEWS_LONG = ("token_to_input_ids", "token_to_pos_ids")
+TOKEN_VIEWS_LONG = ("token_to_input_ids", "token_to_pos_ids", "token_to_block_idx")
 TOKEN_VIEWS_INT32 = (
-    "token_to_block_idx",
     "token_to_local_position_within_kv_block",
     "token_to_request_idx",
     "token_to_position_in_request",
@@ -27,8 +26,8 @@ REQUEST_VIEWS_INT32 = (
     "active_request_last_token_idxs",
 )
 REQUEST_VIEWS_FLOAT32 = ("temperature", "top_p")
-MAMBA_VIEWS = (
-    "mamba_batch_indices_decode",
+MAMBA_VIEWS_INT64 = ("mamba_batch_indices_decode",)
+MAMBA_VIEWS_INT32 = (
     "mamba_batch_indices_prefill",
     "mamba_seq_idx",
     "mamba_cu_seqlens",
@@ -38,6 +37,7 @@ MAMBA_VIEWS = (
     "mamba_conv_seq_idx",
     "mamba_conv_seq_start",
 )
+MAMBA_VIEWS = MAMBA_VIEWS_INT64 + MAMBA_VIEWS_INT32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ContextGPUView allocates CUDA tensors")
@@ -87,6 +87,26 @@ class TestContextGPUView:
             for name in MAMBA_VIEWS:
                 assert getattr(v, name) is None
         else:
-            for name in MAMBA_VIEWS:
+            for name in MAMBA_VIEWS_INT64:
+                assert getattr(v, name) is not None
+                assert getattr(v, name).dtype == torch.int64
+            for name in MAMBA_VIEWS_INT32:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int32
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_mamba_decode_indices_dtype(self, dtype):
+        """The runtime-selected decode dtype must not change the remaining layout."""
+        v = ContextGPUView(
+            max_requests=MAX_REQUESTS,
+            max_tokens=MAX_TOKENS,
+            max_kv_blocks=MAX_KV_BLOCKS,
+            device=torch.device("cuda"),
+            max_mamba_chunks=MAX_MAMBA_CHUNKS,
+            mamba_decode_indices_dtype=dtype,
+        )
+
+        assert v.mamba_batch_indices_decode.dtype == dtype
+        assert v.mamba_batch_indices_decode.shape == (MAX_REQUESTS,)
+        assert v.mamba_batch_indices_prefill.dtype == torch.int32
+        assert v.mamba_conv_seq_start.shape == (MAX_TOKENS,)
