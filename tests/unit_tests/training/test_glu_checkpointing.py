@@ -13,6 +13,7 @@ from megatron.training.glu_checkpointing import (
     prepare_glu_checkpoint_for_load,
     prepare_glu_checkpoint_for_save,
     validate_glu_checkpoint_backend,
+    validate_glu_optimizer_format,
     validate_glu_optimizer_layout,
 )
 
@@ -77,6 +78,45 @@ def _saved_layout(routed=None, shared=None, tp=1, etp=1):
         "tensor_model_parallel_size": tp,
         "expert_tensor_parallel_size": etp,
     }
+
+
+def test_factory_owned_routed_rows_are_not_converted_twice():
+    args = _args(routed=32)
+    args.moe_grouped_gemm = True
+    args.moe_single_grouped_weight = False
+    # A genuine BF16 GTP4 local shape can be 48 rows, not divisible by 2B.
+    weight = _canonical((48, 128))
+    checkpoint = {"model": {ROUTED + "weight0": weight}}
+    for prepare in (prepare_glu_checkpoint_for_load, prepare_glu_checkpoint_for_save):
+        result = prepare(checkpoint, args)
+        assert result["model"][ROUTED + "weight0"] is weight
+
+
+@pytest.mark.parametrize("format", ["dp_reshardable", "fully_sharded_model_space"])
+def test_factory_optimizer_rejects_bucket_or_partial_flat_state(format):
+    args = _args(routed=32)
+    args.moe_grouped_gemm = True
+    args.moe_single_grouped_weight = False
+    args.use_distributed_optimizer = True
+    with pytest.raises(NotImplementedError, match="model-only"):
+        validate_glu_optimizer_format(args, {"distrib_optim_sharding_type": format})
+    validate_glu_optimizer_format(args, {"distrib_optim_sharding_type": "fully_reshardable"})
+    # A model-only load must not be blocked by the optimizer's requested format.
+    validate_glu_optimizer_layout({}, args, loading_optimizer=False)
+
+
+def test_non_glu_gtp_keeps_existing_optimizer_format():
+    args = _args()
+    args.moe_grouped_gemm = True
+    args.moe_single_grouped_weight = False
+    args.use_distributed_optimizer = True
+    args.expert_gtp_weight_remat_size = 2
+    args.swiglu = False
+    validate_glu_optimizer_format(args)
+    # GTP still needs semantic gate/up intervals when GLU interleave is off.
+    args.swiglu = True
+    with pytest.raises(NotImplementedError, match="fully_reshardable"):
+        validate_glu_optimizer_format(args)
 
 
 @pytest.mark.parametrize("size", [2, 32])
@@ -273,16 +313,15 @@ def test_two_load_save_round_trips_do_not_double_interleave():
 
 
 @pytest.mark.parametrize("target_size", [2, 4, None])
-def test_legacy_native_layout_is_interpreted_from_source_args(target_size):
+def test_canonical_layout_does_not_depend_on_source_interleave_args(target_size):
     canonical = _canonical((16, 3))
-    source_runtime = _interleaved(canonical, 2)
-    checkpoint = {"model": {ROUTED + "weight0": source_runtime}, "args": _args(routed=2)}
+    checkpoint = {"model": {ROUTED + "weight0": canonical}, "args": _args(routed=2)}
 
     loaded = prepare_glu_checkpoint_for_load(checkpoint, _args(routed=target_size))
 
     expected = canonical if target_size is None else _interleaved(canonical, target_size)
     torch.testing.assert_close(loaded["model"][ROUTED + "weight0"], expected, rtol=0, atol=0)
-    torch.testing.assert_close(source_runtime, _interleaved(canonical, 2), rtol=0, atol=0)
+    torch.testing.assert_close(checkpoint["model"][ROUTED + "weight0"], canonical, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("source_size,target_size", [(None, 2), (2, None), (2, 4)])
@@ -322,10 +361,9 @@ def test_contiguous_optimizer_does_not_add_new_tp_resharding_restriction():
     validate_glu_optimizer_layout(checkpoint, _args(tp=2, etp=2), loading_optimizer=True)
 
 
-def test_legacy_interleaved_model_cannot_be_resharded_even_without_optimizer():
+def test_canonical_model_resharding_does_not_infer_legacy_layout():
     checkpoint = {"args": _args(routed=2)}
-    with pytest.raises(ValueError):
-        validate_glu_optimizer_layout(checkpoint, _args(routed=2, etp=2), loading_optimizer=False)
+    validate_glu_optimizer_layout(checkpoint, _args(routed=2, etp=2), loading_optimizer=False)
 
 
 @pytest.mark.parametrize("single_weight", [False, True])

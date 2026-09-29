@@ -247,8 +247,13 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         # Reproduce the pre-fix behavior using the same real checkpoint loader and model.
         with monkeypatch.context() as missing_conversion:
             missing_conversion.setattr(
-                checkpointing, "prepare_glu_checkpoint_for_load", lambda state, args: state
+                checkpointing,
+                "prepare_glu_checkpoint_for_load",
+                lambda state, args, **kwargs: state,
             )
+            # Indexed routed tensors now convert inside the Core factory. Disable
+            # that conversion as well to retain the original negative control.
+            missing_conversion.setattr(experts.config, "moe_mlp_glu_interleave_size", None)
             checkpointing.load_checkpoint(model, optimizer, scheduler, strict=True)
         optimizer.quantize_and_sync_model_params_from_main_params()
         _assert_parameters(experts, canonical)

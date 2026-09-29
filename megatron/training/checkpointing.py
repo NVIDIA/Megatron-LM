@@ -70,6 +70,7 @@ from .glu_checkpointing import (
     prepare_glu_checkpoint_for_load,
     prepare_glu_checkpoint_for_save,
     validate_glu_checkpoint_backend,
+    validate_glu_optimizer_format,
     validate_glu_optimizer_layout,
 )
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -868,7 +869,7 @@ def save_checkpoint(
             )
 
         validate_glu_checkpoint_backend(state_dict, args, ckpt_format=ckpt_format)
-        state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
+        state_dict = prepare_glu_checkpoint_for_save(state_dict, args, ckpt_format=ckpt_format)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -1730,6 +1731,7 @@ def generate_state_dict(
     if not args.no_save_optim:
         if optimizer is not None and not optimizer.is_stub_optimizer:
             if args.ckpt_format == 'torch_dist':
+                validate_glu_optimizer_format(args, (optim_sd_kwargs or {}).get('metadata'))
                 optimizer_sd = optimizer.sharded_state_dict(
                     state_dict,
                     **(
@@ -3038,7 +3040,7 @@ def load_checkpoint(
     # Legacy checkpoints are first read here. Convert the state dict itself so
     # --load-main-params-from-ckpt observes the same rows as model.load_state_dict.
     validate_glu_layout(state_dict, release)
-    state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
+    state_dict = prepare_glu_checkpoint_for_load(state_dict, args, ckpt_format=ckpt_format)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
