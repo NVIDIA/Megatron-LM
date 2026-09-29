@@ -36,6 +36,7 @@ from megatron.core.inference.utils import (
     InferenceMode,
     detokenize_tokens,
     get_attention_mask,
+    model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
@@ -397,20 +398,12 @@ class TextGenerationController(MTPControllerMixin):
         already covers that case, so behavior is unchanged and a client that deliberately
         narrowed `termination_id` is not silently widened back to `tokenizer.eod`.
         """
-        ids = set()
-        eod = getattr(tokenizer, "eod", None)
-        if eod is not None:
-            ids.add(int(eod))
-        gen_cfg = getattr(tokenizer, "generation_config", None)
-        if isinstance(gen_cfg, dict):
-            eos = gen_cfg.get("eos_token_id")
-            if isinstance(eos, int) and not isinstance(eos, bool):
-                ids.add(eos)
-            elif isinstance(eos, (list, tuple)):
-                ids.update(int(e) for e in eos if isinstance(e, int) and not isinstance(e, bool))
-        result = frozenset(ids) if len(ids) > 1 else frozenset()
+        ids = model_eos_token_ids(tokenizer)
+        result = ids if len(ids) > 1 else frozenset()
         is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
         if is_rank0:
+            eod = getattr(tokenizer, "eod", None)
+            gen_cfg = getattr(tokenizer, "generation_config", None)
             gen_cfg_eos = gen_cfg.get("eos_token_id") if isinstance(gen_cfg, dict) else None
             logging.info(
                 "Inference termination EOS ids: tokenizer.eod=%s, "
