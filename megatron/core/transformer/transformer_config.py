@@ -1385,6 +1385,38 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
+    moe_inference_training_forward: bool = False
+    """Run the training MoE forward through the inference expert kernel that
+    inference_grouped_gemm_backend selects, keeping TE for the backward.
+
+    For train/generation parity in RL, not throughput. Matching an inference
+    kernel's arithmetic by hand does not scale: each backend rounds where it
+    rounds, and reproducing that in the training path is a per-kernel effort that
+    silently rots. Running the inference kernel in the value pass makes the
+    forward equal by construction, for any backend.
+
+    The value pass saves no intermediates, so the backward comes from the MoE-layer
+    recompute pass, which runs the ordinary TE path. Gradients are therefore TE's
+    while the value is the inference kernel's. In BF16 the two differ only by
+    rounding; under MXFP8 the value is quantized and the gradient is that of the
+    BF16 function, a straight-through estimator. That is a training-recipe
+    decision, which is why this is opt-in rather than a default.
+
+    Requires transformer_impl='inference_optimized' and selective recompute of
+    'moe'. Supported backends: 'vllm' and 'torch'."""
+
+    moe_inference_training_max_tokens_per_rank: Optional[int] = None
+    """Upper bound on the tokens one rank feeds a moe_inference_training_forward pass.
+
+    Only read with the NVLS dispatcher. It gathers through symmetric-memory
+    buffers, which are allocated once and cannot grow, so they have to be sized
+    for the largest pass before the first one runs. Left unset, they are sized
+    from the first pass the layer sees, which is only right if that pass is the
+    largest -- a log-prob microbatch padded to 512 tokens and a later one padded
+    to 576 is enough to break it. Set it from the microbatch bound (log-prob
+    batch size times max sequence length). It acts as a floor, so a larger first
+    pass still wins."""
+
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -2036,6 +2068,105 @@ class TransformerConfig(ModelParallelConfig):
                         "batch_invariant_mode with inference-optimized MoE and expert "
                         "parallelism requires inference_moe_token_dispatcher_type='nvls'."
                     )
+
+        if self.moe_inference_training_forward:
+            # Checked before the backend so a non-inference_optimized config gets
+            # the message that actually applies to it.
+            if self.transformer_impl != 'inference_optimized':
+                raise ValueError(
+                    "moe_inference_training_forward requires "
+                    "transformer_impl='inference_optimized', which is what builds the "
+                    f"inference-capable expert module; got '{self.transformer_impl}'."
+                )
+            # inference_grouped_gemm_backend is only converted from str to enum
+            # above when the inference-optimized branch runs, so accept either.
+            backend = self.inference_grouped_gemm_backend
+            if isinstance(backend, InferenceGroupedGemmBackend):
+                backend = backend.value
+            # 'flashinfer' is left out: its routed kernel reads a shuffled Major-K
+            # copy derived from the parameters rather than a view of them, so it
+            # needs a per-forward rebuild written before it can run the value
+            # pass, and would otherwise read weights the optimizer has moved.
+            # Torch and vLLM share one value pass because they share the
+            # concatenated weights and, under MXFP8, the kernel.
+            _supported = (
+                InferenceGroupedGemmBackend.VLLM.value,
+                InferenceGroupedGemmBackend.TORCH.value,
+            )
+            if backend not in _supported:
+                raise ValueError(
+                    f"moe_inference_training_forward supports "
+                    f"inference_grouped_gemm_backend in {_supported}; got '{backend}'. "
+                    "The value pass has to read the kernel's weights from the live "
+                    "parameters every forward, and only those backends have that "
+                    "implemented."
+                )
+            # The value pass saves no intermediates, so there is nothing to build a
+            # backward from unless the layer is recomputed.
+            if self.recompute_granularity != 'selective' or (
+                self.recompute_modules is not None and 'moe' not in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_inference_training_forward requires "
+                    "recompute_granularity='selective' with 'moe' in recompute_modules: "
+                    "the value pass stores no activations, so the backward must come "
+                    "from a recompute pass."
+                )
+            # MoELayer.moe_layer_recompute additionally excludes local CUDA graphs, so
+            # this combination would run the value pass with no recompute behind it
+            # and leave the experts without a backward graph.
+            if self.cuda_graph_impl == 'local':
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "cuda_graph_impl='local', which disables MoE-layer recompute."
+                )
+            # The value/recompute switch lives in MoELayer.forward. The overlapped
+            # 1F1B schedule calls the layer's stages directly and never reaches it,
+            # so it would silently run the TE path on both passes.
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "overlap_moe_expert_parallel_comm: the overlapped schedule does "
+                    "not go through MoELayer.forward, where the value pass is chosen."
+                )
+            # Parity requires generation and the training value pass to route each
+            # token to the same experts. InferenceTopKRouter only takes its
+            # inference path while InferenceMode is active, so the value pass runs
+            # the training router. Both reach the same selection function with the
+            # same arguments, but the training router applies these first, and each
+            # of them changes which experts are picked. Rejected rather than
+            # tolerated because the loss of parity is otherwise silent.
+            balancing = self.moe_router_load_balancing_type
+            balancing = balancing if isinstance(balancing, list) else [balancing]
+            unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
+            if unsupported:
+                raise ValueError(
+                    f"moe_inference_training_forward does not support "
+                    f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
+                    "routes with plain top-k, so the training forward would select "
+                    "different experts."
+                )
+            if self.moe_input_jitter_eps is not None:
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "moe_input_jitter_eps: jitter perturbs the router input in "
+                    "training only, so the two forwards would route differently."
+                )
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "moe_router_force_load_balancing / moe_router_force_biased, which "
+                    "overwrite the training router's logits."
+                )
+            # moe_expert_capacity_factor would also break parity, but it needs no
+            # check here: this path requires transformer_impl='inference_optimized',
+            # which already rejects it as non-dropless above.
+
+        if (
+            self.moe_inference_training_max_tokens_per_rank is not None
+            and self.moe_inference_training_max_tokens_per_rank <= 0
+        ):
+            raise ValueError("moe_inference_training_max_tokens_per_rank must be positive.")
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
