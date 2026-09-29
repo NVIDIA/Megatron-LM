@@ -1,5 +1,19 @@
 # Megatron-LM Tests
 
+## A2A Overlap Test Isolation
+
+The two-chunk schedule tests in `unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`
+use a per-case fixture to own their distributed process groups. MCore's
+`destroy_model_parallel()` clears NCCL group references without unregistering those
+groups from PyTorch, so repeated parameterized cases must explicitly destroy the
+groups they create. The fixture preserves the default group and pre-existing groups,
+includes groups created by in-test TP reinitialization, and finalizes NCCL EP before
+destroying its borrowed communicator. Cached flex buffers are also released before
+their groups. The fixture collects model/plan cycles after the
+test helpers return and checks that no new registered groups remain. This keeps
+communication memory bounded across the full dispatcher, precision, MTP, and
+recompute matrix.
+
 ## Updating Functional Test Golden Values
 
 When adding new functional tests, it may be necessary to update the golden values used to verify if the test is
