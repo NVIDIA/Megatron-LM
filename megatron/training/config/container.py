@@ -38,6 +38,57 @@ from megatron.training.models import GPTModelConfig, Serializable, HybridModelCo
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
+
+def _finalize_model_config(model_config: object, logger: LoggerConfig) -> None:
+    """Derive logging inputs for native models and legacy transformer configs."""
+    if model_config is None:
+        return
+    if isinstance(model_config, (GPTModelConfig, HybridModelConfig)):
+        model_config = model_config.transformer
+    if isinstance(model_config, TransformerConfig):
+        model_config.log_max_attention_logit = logger.log_max_attention_logit
+        model_config.barrier_with_L1_time = logger.barrier_with_L1_time
+        return
+
+    from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+
+    if isinstance(model_config, MimoModelConfig):
+        _finalize_mimo_specs(
+            (
+                model_config.language_model_spec,
+                model_config.modality_submodules_spec,
+                model_config.language_model_input_projections_spec,
+            ),
+            logger,
+        )
+
+
+def _finalize_mimo_specs(specs: tuple[object, ...], logger: LoggerConfig) -> None:
+    """Visit only MiMo's module specs, not topology or arbitrary dataclasses."""
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    seen = set()
+
+    def visit(spec: object) -> None:
+        if id(spec) in seen:
+            return
+        seen.add(id(spec))
+        if isinstance(spec, TransformerConfig):
+            _finalize_model_config(spec, logger)
+        elif isinstance(spec, ModuleSpec):
+            visit(spec.params)
+            visit(spec.submodules)
+        elif isinstance(spec, dict):
+            for value in spec.values():
+                visit(value)
+        elif isinstance(spec, (list, tuple)):
+            for value in spec:
+                visit(value)
+
+    for spec in specs:
+        visit(spec)
+
+
 @dataclass(kw_only=True)
 class ConfigContainerBase:
     """
@@ -47,44 +98,7 @@ class ConfigContainerBase:
     """
 
     def finalize(self) -> None:
-        """Derive model and optimizer inputs from their owning run configurations."""
-        self.finalize_model_config(getattr(self, "model", None))
-        optimizer = getattr(self, "optimizer", None)
-        if optimizer is not None:
-            self.finalize_optimizer_config(optimizer)
-
-    def finalize_model_config(self, model_config: Any) -> None:
-        """Derive logging inputs, including configs in nested multimodal specs.
-
-        Legacy providers can construct configs after the run container is built;
-        they use the same derivation at their shared config-construction boundary.
-        """
-        seen = set()
-
-        def visit(config):
-            if id(config) in seen:
-                return
-            seen.add(id(config))
-            if isinstance(config, TransformerConfig):
-                config.log_max_attention_logit = self.logger.log_max_attention_logit
-                config.barrier_with_L1_time = self.logger.barrier_with_L1_time
-            elif is_dataclass(config) and not isinstance(config, type):
-                for config_field in dataclass_fields(config):
-                    if not config_field.name.startswith("_"):
-                        visit(getattr(config, config_field.name))
-            elif isinstance(config, dict):
-                for value in config.values():
-                    visit(value)
-            elif isinstance(config, (list, tuple)):
-                for value in config:
-                    visit(value)
-
-        visit(model_config)
-
-    def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> None:
-        """Derive logging inputs for native and legacy optimizer construction."""
-        optimizer.log_num_zeros_in_grad = self.logger.log_num_zeros_in_grad
-        optimizer.barrier_with_L1_time = self.logger.barrier_with_L1_time
+        """Finalize cross-config dependencies defined by concrete containers."""
 
     def validate(self) -> None:
         """Run each sub-config's explicit validation before runtime initialization."""
@@ -307,6 +321,20 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
 
+    def finalize(self) -> None:
+        """Derive model and optimizer inputs from the training configuration."""
+        self.finalize_model_config(self.model)
+        self.finalize_optimizer_config(self.optimizer)
+
+    def finalize_model_config(self, model_config: object) -> None:
+        """Derive logging inputs, including models built by legacy providers."""
+        _finalize_model_config(model_config, self.logger)
+
+    def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> None:
+        """Derive logging inputs for native and legacy optimizer construction."""
+        optimizer.log_num_zeros_in_grad = self.logger.log_num_zeros_in_grad
+        optimizer.barrier_with_L1_time = self.logger.barrier_with_L1_time
+
 
 @dataclass(kw_only=True)
 class InferenceConfigContainer(ConfigContainerBase):
@@ -338,3 +366,11 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+
+    def finalize(self) -> None:
+        """Derive model inputs without requiring training-only configurations."""
+        self.finalize_model_config(self.model)
+
+    def finalize_model_config(self, model_config: object) -> None:
+        """Derive logging inputs, including models built by legacy providers."""
+        _finalize_model_config(model_config, self.logger)

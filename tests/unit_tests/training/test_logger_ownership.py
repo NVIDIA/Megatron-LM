@@ -4,7 +4,7 @@
 
 import sys
 from argparse import ArgumentParser, Namespace
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -403,6 +403,89 @@ def test_finalization_is_idempotent_and_updates_derived_configs(run_config, enab
     assert run_config.model.transformer.barrier_with_L1_time is enabled
     assert run_config.optimizer.log_num_zeros_in_grad is enabled
     assert run_config.optimizer.barrier_with_L1_time is enabled
+
+
+def test_base_finalization_does_not_require_logger():
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.config.container import ConfigContainerBase
+
+    @dataclass
+    class CustomContainer(ConfigContainerBase):
+        model: TransformerConfig
+        optimizer: OptimizerConfig
+
+    model = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    optimizer = OptimizerConfig()
+    before = (model.log_max_attention_logit, optimizer.log_num_zeros_in_grad)
+    ConfigContainerBase().finalize()
+    CustomContainer(model=model, optimizer=optimizer).finalize()
+    assert (model.log_max_attention_logit, optimizer.log_num_zeros_in_grad) == before
+
+
+@pytest.mark.parametrize('model_type', ['gpt', 'hybrid', 'legacy'])
+def test_inference_finalization_does_not_require_optimizer(model_type):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+    )
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    model = None
+    if model_type != 'legacy':
+        config_cls = GPTModelConfig if model_type == 'gpt' else HybridModelConfig
+        model = config_cls(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            vocab_size=128,
+            seq_length=16,
+        )
+    cfg = InferenceConfigContainer(
+        model=model,
+        checkpoint=CheckpointConfig(),
+        inference=InferenceSetupConfig(),
+        logger=LoggerConfig(log_max_attention_logit=True, barrier_with_L1_time=False),
+    )
+    cfg.finalize()
+    cfg.finalize()
+    assert not hasattr(cfg, 'optimizer')
+    if model is not None:
+        assert model.transformer.log_max_attention_logit is True
+        assert model.transformer.barrier_with_L1_time is False
+    override = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    cfg.finalize_model_config(override)
+    assert override.log_max_attention_logit is True
+    assert override.barrier_with_L1_time is False
+
+
+def test_mimo_finalization_ignores_non_model_state(run_config):
+    from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+    from megatron.core.transformer import TransformerConfig
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    @dataclass
+    class Metadata:
+        transformer: TransformerConfig
+
+    active = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    ignored = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    spec = ModuleSpec(
+        module=Mock,
+        params={'config': active, 'metadata': Metadata(ignored)},
+        metainfo={'config': ignored},
+    )
+    spec.submodules = {'shared': [spec, spec]}
+    model = MimoModelConfig(
+        language_model_spec=spec, module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: Metadata(ignored)}
+    )
+    run_config.logger.log_max_attention_logit = True
+    run_config.finalize_model_config(model)
+    assert active.log_max_attention_logit is True
+    assert ignored.log_max_attention_logit is False
+    run_config.finalize_model_config(Metadata(ignored))
+    assert ignored.log_max_attention_logit is False
 
 
 def test_explicit_transformer_override_does_not_replace_native_model(run_config):
