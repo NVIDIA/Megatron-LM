@@ -350,15 +350,9 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
+        # Keep BF16 overrides on the TE ops path. _fused_forward applies the resolved
+        # precision context, and TE selects either a joint fusion or its basic operations.
+        self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
             _require_te_tanh_clamp_support(self.config)
@@ -370,8 +364,8 @@ class TEGroupedMLP(MegatronModule):
         # describe the same thing for the two GroupedMLP paths: the fused TE op-fuser path
         # exposes only the input of the whole fc1 -> act -> fc2 block, the unfused path exposes
         # the fc1 input and the activation input separately. The config accepts either spelling
-        # (they are mutually exclusive there); each instance maps it onto its own path, so a
-        # model mixing fused (quantized) and unfused (e.g. bf16 MTP) experts offloads both.
+        # (they are mutually exclusive there); each instance maps it onto its own path.
+        # BF16 overrides retain the TE ops path and offload the whole block input as well.
         offloading = self.config.fine_grained_activation_offloading
         self.offload_expert_fc1 = offloading and "expert_fc1" in self.config.offload_modules
         self.offload_moe_act = offloading and "moe_act" in self.config.offload_modules

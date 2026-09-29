@@ -428,9 +428,8 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             fp8_recipe='mxfp8',
             fp8_param=True,
             moe_router_padding_for_quantization=True,
-            # Fused FP8 EGTP backward requires native FP8 weights when re-gathering.
-            # The op fuser does not honor the BF16 override's execution policy yet;
-            # keep that MTP parameter-storage override in the unsharded-expert case.
+            # Cover mixed BF16/MXFP8 experts without EGTP and joint MXFP8 fusion with EGTP.
+            # BF16 MTP experts retain the op-fuser path and execute its basic operations.
             quant_recipe=recipe if egtp_size == 1 else None,
             mtp_num_layers=2,
             mtp_use_repeated_layer=True,
@@ -507,7 +506,11 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                 assert is_mxfp8tensor(layer.experts.linear_fc1.weight0) == (
                     egtp_size > 1 or 'mtp' not in name
                 )
+                assert layer.experts._with_fused_impl
                 for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
+                    assert linear.will_execute_quantized(True) == (
+                        egtp_size > 1 or 'mtp' not in name
+                    )
                     for weight in linear.parameters():
                         assert getattr(weight, 'is_gtp_weight_remat', False) == (egtp_size > 1)
                         assert (
@@ -521,7 +524,6 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                     dispatch = manager.plan_dispatch
 
                     expected_alignment = moe_utils.get_align_size_for_quantization(layer.config)
-                    assert layer.experts._with_fused_impl == (egtp_size > 1 or 'mtp' not in name)
 
                     def record(
                         *args,
@@ -560,20 +562,24 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                 if virtual:
                     managers = [layer.token_dispatcher._comm_manager for _, layer in experts]
                     assert len({id(manager.planner) for manager in managers}) == 1
-                    for (_, layer), manager in zip(experts, managers):
+                    for (name, layer), manager in zip(experts, managers):
                         assert manager.pad_multiple == manager._alignment
                         assert (manager.tokens_per_expert % manager._alignment == 0).all()
                         assert manager.tokens_per_expert.sum() <= manager.rank_capacity
-                        assert (
-                            layer.experts._fused_ops is not None
-                        ) == layer.experts._with_fused_impl
-                        if layer.experts._with_fused_impl:
-                            (sequence,) = layer.experts._fused_ops
+                        assert layer.experts._fused_ops is not None
+                        (sequence,) = layer.experts._fused_ops
+                        forward_ops = [
+                            op for group in sequence._module_groups for op, _ in group._forward_ops
+                        ]
+                        if egtp_size > 1 or 'mtp' not in name:
                             assert any(
                                 type(op).__name__ == 'GroupedMLP_CuTeGEMMUnary'
-                                for group in sequence._module_groups
-                                for op, _ in group._forward_ops
+                                for op in forward_ops
                             ), 'MXFP8 must execute the fused CuTeDSL MLP'
+                        else:
+                            assert len(forward_ops) == 3 and all(
+                                op is sequence[index] for index, op in enumerate(forward_ops)
+                            ), 'BF16 MTP must execute the three basic TE operations'
                 gtp.wait_for_gtp_grad_reduction_on_current_stream()
                 model.finish_grad_sync()
                 torch.cuda.synchronize()
