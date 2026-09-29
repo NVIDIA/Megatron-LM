@@ -23,7 +23,14 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    LayerConfigItem,
+    LayerPatternItem,
+    flatten_layer_type_list,
     get_layer_type_list_from_layer_config_list,
+    get_layer_type_physical_count,
+    is_layer_group,
+    layer_type_list_to_str,
+    validate_layer_group,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -81,6 +88,17 @@ class HybridStackSubmodules:
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
+def _is_layer_type_entry(layer_type) -> bool:
+    """Return whether a ``layer_type_list`` entry is a layer symbol or a bracketed group."""
+    if isinstance(layer_type, str):
+        return len(layer_type) == 1
+    return (
+        isinstance(layer_type, tuple)
+        and len(layer_type) > 0
+        and all(isinstance(symbol, str) and len(symbol) == 1 for symbol in layer_type)
+    )
+
+
 class HybridStack(MegatronModule):
     """
     Constructor for the HybridStack class.
@@ -90,15 +108,23 @@ class HybridStack(MegatronModule):
         submodules (HybridStackSubmodules): the submodules for the stack
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        layer_type_list (list[str], optional): This argument exists for backwards-compatibility
-            reasons, allowing callers to construct ``HybridStack`` directly with layer symbols.
+        layer_type_list (list[LayerPatternItem], optional): This argument exists for
+            backwards-compatibility reasons, allowing callers to construct ``HybridStack``
+            directly with layer symbols (bracketed groups as tuples of symbols).
             It is immediately converted to independent per-layer configs.
-        layer_config_list (Sequence[TransformerConfig], optional): per-layer configs for this
-            pipeline segment. When provided by HybridModel, pipeline stage selection has already
-            been done via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
-            ``layer_config_list`` must be provided.
-        pp_layer_offset (int, optional): the global layer offset for this pipeline
+        layer_config_list (Sequence[LayerConfigItem], optional): per-layer configs for this
+            pipeline segment. A tuple of configs denotes a bracketed group (e.g. ``[M*E]``)
+            that is built as one nested ``HybridStack`` logical layer. When provided by
+            HybridModel, pipeline stage selection has already been done via '|' separators
+            in the pattern. Exactly one of ``layer_type_list`` or ``layer_config_list`` must
+            be provided.
+        pp_layer_offset (int, optional): the global physical layer offset for this pipeline
             segment. Defaults to 0.
+        logical_layer_offset (int, optional): the global logical layer offset for this
+            pipeline segment; bracketed groups count as one logical layer. Used for
+            checkpoint keys. Defaults to ``pp_layer_offset`` for legacy direct callers.
+        is_layer_group_stack (bool, optional): whether this stack is the nested stack built
+            for a bracketed group. Defaults to False.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
         post_process (bool, optional): whether to include an output layer.
@@ -112,6 +138,9 @@ class HybridStack(MegatronModule):
         mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
+        layer_number_offset (int, optional): global physical layer offset for this
+            stack's first layer. Defaults to ``pp_layer_offset``. Nested groups use
+            their own numbering offset while retaining the pipeline's cache offset.
     """
 
     def __init__(
@@ -119,7 +148,7 @@ class HybridStack(MegatronModule):
         config: TransformerConfig,
         submodules: HybridStackSubmodules,
         pre_process: bool = True,
-        layer_type_list: list[str] | None = None,
+        layer_type_list: list[LayerPatternItem] | None = None,
         pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -130,22 +159,32 @@ class HybridStack(MegatronModule):
         mtp_layer_number: Optional[int] = None,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
-        layer_config_list: Sequence[TransformerConfig] | None = None,
+        layer_config_list: Sequence[LayerConfigItem] | None = None,
         boundary_layout: CPLayout | None = None,
+        layer_number_offset: int | None = None,
+        logical_layer_offset: int | None = None,
+        is_layer_group_stack: bool = False,
+        transformer_sharded_keys: bool = False,
     ) -> None:
         """
         Args:
+            transformer_sharded_keys (bool): emit ``TransformerBlock``-style sharded
+                checkpoint keys (``final_layernorm`` instead of ``final_norm``) so the
+                checkpoint is interchangeable with a ``GPTModel`` one. Only set for
+                bracketed-group patterns, whose logical layers map one-to-one onto
+                transformer layers; leaving it off keeps the historical hybrid keys so
+                existing non-grouped hybrid checkpoints stay loadable.
             name (str | None): module instance name passed top-down from its paranet module
         """
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
-            if any(
-                not isinstance(layer_symbol, str) or len(layer_symbol) != 1
-                for layer_symbol in layer_type_list
-            ):
-                raise ValueError("Each entry in layer_type_list must be a single layer symbol")
-            segment = ''.join(layer_type_list)
+            if any(not _is_layer_type_entry(layer_type) for layer_type in layer_type_list):
+                raise ValueError(
+                    "Each entry in layer_type_list must be a single layer symbol or a tuple of "
+                    "single layer symbols (a bracketed group)"
+                )
+            segment = layer_type_list_to_str(layer_type_list)
             warnings.warn(
                 "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
                 DeprecationWarning,
@@ -154,6 +193,11 @@ class HybridStack(MegatronModule):
             layer_config_list = validate_segment_layers(segment, config)
 
         for layer_config in layer_config_list:
+            if is_layer_group(layer_config):
+                validate_layer_group(
+                    [layer_utils.get_layer_symbol_from_config(config) for config in layer_config]
+                )
+        for layer_config in flatten_layer_type_list(layer_config_list):
             layer_utils.validate_tp_comm_overlap(
                 layer_config,
                 layer_utils.get_layer_symbol_from_config(layer_config),
@@ -170,6 +214,12 @@ class HybridStack(MegatronModule):
             self.config.linear_cp_layout if boundary_layout is None else boundary_layout
         )
         self.mtp_layer_number = mtp_layer_number
+        logical_layer_offset = (
+            pp_layer_offset if logical_layer_offset is None else logical_layer_offset
+        )
+        self.logical_layer_offset = logical_layer_offset
+        self.is_layer_group_stack = is_layer_group_stack
+        self.transformer_sharded_keys = transformer_sharded_keys
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -185,19 +235,25 @@ class HybridStack(MegatronModule):
         self._mhc_block_end_plan: Optional[List[bool]] = None
 
         self.layer_config_list = layer_config_list
+        has_layer_groups = any(is_layer_group(layer_config) for layer_config in layer_config_list)
+        if has_layer_groups and (
+            self.config.enable_mhc_connections
+            or self.config.wide_residual is not None
+            or self.config.moe_shortcut_connection
+        ):
+            raise NotImplementedError(
+                "Bracketed HybridStack layer groups are not supported with enable_mhc_connections, "
+                "wide residuals, or MoE shortcuts."
+            )
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
             type(layer_config) is layer_utils.MambaLayerConfig
             and layer_config.linear_cp_mode == "chunkwise"
-            for layer_config in self.layer_config_list
+            for layer_config in flatten_layer_type_list(self.layer_config_list)
         )
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
             layer_layouts = tuple(
-                (
-                    layer_config.attention_cp_layout
-                    if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
-                    else layer_config.linear_cp_layout
-                )
+                self._get_layer_cp_layout(layer_config, boundary_layout)
                 for layer_config in self.layer_config_list
             )
             self._cp_layout_manager = ContextParallelLayoutManager(
@@ -210,20 +266,55 @@ class HybridStack(MegatronModule):
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
+        # ``i`` is the logical layer index within this stack (module-list index and the
+        # ``name=...layers.{i}`` suffix). ``physical_layer_offset`` is the physical layer
+        # counter used for ``layer_number`` and the FP8/FP4 contexts; it advances by more
+        # than one for bracketed groups, which hold several physical layers.
+        physical_layer_offset = (
+            pp_layer_offset if layer_number_offset is None else layer_number_offset
+        )
         for i, layer_config in enumerate(self.layer_config_list):
-            layer_number = i + 1 + pp_layer_offset
-            if layer_config.fp8:
+            layer_number = physical_layer_offset + 1
+            if is_layer_group(layer_config):
+                # The nested stack applies its own per-layer quantization contexts.
+                quant_init_context = nullcontext()
+            elif layer_config.fp8:
                 quant_init_context = get_fp8_context(
-                    layer_config, i + pp_layer_offset, is_init=True
+                    layer_config, physical_layer_offset, is_init=True
                 )
             elif layer_config.fp4:
                 quant_init_context = get_fp4_context(
-                    layer_config, i + pp_layer_offset, is_init=True
+                    layer_config, physical_layer_offset, is_init=True
                 )
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if type(layer_config) is layer_utils.MambaLayerConfig:
+                if is_layer_group(layer_config):
+                    # A bracketed group (e.g. ``[M*E]``) is one logical layer built as a
+                    # nested HybridStack over its physical layers. It restores the outer
+                    # stack's boundary CP layout on exit.
+                    layer = HybridStack(
+                        config=self.config,
+                        submodules=submodules,
+                        pre_process=True,
+                        layer_config_list=list(layer_config),
+                        pp_layer_offset=pp_layer_offset,
+                        layer_number_offset=physical_layer_offset,
+                        logical_layer_offset=logical_layer_offset + len(self.layers),
+                        is_layer_group_stack=True,
+                        transformer_sharded_keys=transformer_sharded_keys,
+                        post_layer_norm=False,
+                        post_process=False,
+                        device=device,
+                        dtype=dtype,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        mtp_layer_number=mtp_layer_number,
+                        hash_moe_layer_threshold=hash_moe_layer_threshold,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                        boundary_layout=boundary_layout,
+                    )
+                elif type(layer_config) is layer_utils.MambaLayerConfig:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=layer_config,
@@ -354,6 +445,7 @@ class HybridStack(MegatronModule):
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
+            physical_layer_offset += get_layer_type_physical_count(layer_config)
 
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
@@ -433,6 +525,28 @@ class HybridStack(MegatronModule):
         router = getattr(getattr(inner_layer, "mlp", None), "router", None)
         return bool(getattr(router, "is_hash_layer", False))
 
+    @property
+    def final_layernorm(self):
+        """Alias for ``final_norm`` matching the attribute name on TransformerBlock.
+
+        Lets generic decoder consumers (e.g. ``GPTModel.PostProcessNode``) discover the
+        final norm via the same attribute name they use for non-hybrid decoders, while
+        keeping ``final_norm`` as the registered submodule for local state-dict compatibility.
+        """
+        return getattr(self, "final_norm", None)
+
+    @staticmethod
+    def _get_layer_cp_layout(layer_config: LayerConfigItem, boundary_layout: CPLayout) -> CPLayout:
+        """Return the CP layout the outer stack must provide for one logical layer."""
+        if is_layer_group(layer_config):
+            # A bracketed group runs as a nested HybridStack that manages the layout
+            # transitions of its own layers and restores ``boundary_layout`` on exit, so
+            # the outer stack hands the group its input in the boundary layout.
+            return boundary_layout
+        if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS:
+            return layer_config.attention_cp_layout
+        return layer_config.linear_cp_layout
+
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -449,6 +563,11 @@ class HybridStack(MegatronModule):
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
         for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
+            if is_layer_group(layer_config):
+                state_shapes = layer.mamba_state_shapes_per_request()
+                if state_shapes is not None:
+                    return state_shapes
+                continue
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:
@@ -508,6 +627,10 @@ class HybridStack(MegatronModule):
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -515,6 +638,7 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        _checkpointed_forward_in_parent: bool = False,
     ):
         """
         Forward function of the HybridStack class.
@@ -532,6 +656,14 @@ class HybridStack(MegatronModule):
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
+            rotary_pos_cos / rotary_pos_sin / rotary_pos_cos_sin (Tensor, optional):
+                precomputed rotary embeddings forwarded to transformer layers (flash-decode /
+                fused-rope inference paths). Defaults to None.
+            sequence_len_offset (Tensor, optional): precomputed per-sample sequence offsets
+                for static-batching inference. Computed here when None.
+            _checkpointed_forward_in_parent (bool): set by ``checkpointed_forward`` when the
+                enclosing stack already checkpoints this nested group stack, so the group
+                must not checkpoint its layers a second time.
         Returns:
             Tensor: the output tensor.
         """
@@ -585,7 +717,9 @@ class HybridStack(MegatronModule):
             inference_context.max_seqlen = inference_context.max_sequence_length
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
-        if (
+        if sequence_len_offset is not None:
+            pass
+        elif (
             (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context
             and inference_context.is_static_batching()
@@ -634,7 +768,11 @@ class HybridStack(MegatronModule):
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and not _checkpointed_forward_in_parent
+            ):
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -649,6 +787,8 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                    cp_layout_plan=cp_layout_plan,
                 )
             else:
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
@@ -691,11 +831,29 @@ class HybridStack(MegatronModule):
                         # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
                         # Layers have 1-indexed layer numbers attribute.
-                        inner_quant_context = get_inner_quant_context(
-                            layer_config, layer.layer_number - 1
+                        inner_quant_context = (
+                            nullcontext()
+                            if is_layer_group(layer_config)
+                            else get_inner_quant_context(layer_config, layer.layer_number - 1)
                         )
                         with inner_quant_context:
-                            if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                            if isinstance(layer, HybridStack):
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    rotary_pos_cos=rotary_pos_cos,
+                                    rotary_pos_sin=rotary_pos_sin,
+                                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                    sequence_len_offset=sequence_len_offset,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    padding_mask=padding_mask,
+                                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                                    cp_layout_plan=cp_layout_plan,
+                                    input_ids=input_ids,
+                                )
+                            elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
@@ -705,6 +863,12 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=padding_mask,
                                 )
+                                if rotary_pos_cos is not None:
+                                    layer_kwargs["rotary_pos_cos"] = rotary_pos_cos
+                                if rotary_pos_sin is not None:
+                                    layer_kwargs["rotary_pos_sin"] = rotary_pos_sin
+                                if rotary_pos_cos_sin is not None:
+                                    layer_kwargs["rotary_pos_cos_sin"] = rotary_pos_cos_sin
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                                 if mhc_manager is not None and isinstance(
@@ -796,18 +960,55 @@ class HybridStack(MegatronModule):
             dict: The sharded state dictionary for the current object.
         """
 
+        return self._sharded_state_dict(
+            prefix=prefix,
+            sharded_offsets=sharded_offsets,
+            metadata=metadata,
+            sharded_layer_prefix=None,
+        )
+
+    def _sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Optional[tuple] = None,
+        metadata: Optional[dict] = None,
+        sharded_layer_prefix: Optional[str] = None,
+    ) -> ShardedStateDict:
+        """Build the sharded state dict using logical (bracketed-group aware) layer keys.
+
+        ``sharded_layer_prefix`` is the ``<prefix>layers.`` prefix of the outermost stack;
+        a nested group stack publishes all of its physical layers under the outer stack's
+        logical layer index so a ``[*-]`` group produces the same keys as one transformer
+        layer (``layers.N.self_attention.*`` and ``layers.N.mlp.*``).
+        """
         sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
+        if sharded_layer_prefix is None:
+            sharded_layer_prefix = layer_prefix
 
-        for local_layer_idx, layer in enumerate(self.layers):
-
-            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
-            state_dict_prefix = (
-                f'{layer_prefix}{local_layer_idx}.'  # module list index in HybridStack
+        for local_layer_idx, (layer_config, layer) in enumerate(
+            zip(self.layer_config_list, self.layers, strict=True)
+        ):
+            state_dict_prefix = f'{layer_prefix}{local_layer_idx}.'  # module list index
+            logical_layer_idx = (
+                self.logical_layer_offset
+                if self.is_layer_group_stack
+                else self.logical_layer_offset + local_layer_idx
             )
 
-            sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
+            if is_layer_group(layer_config):
+                sharded_state_dict.update(
+                    layer._sharded_state_dict(
+                        state_dict_prefix,
+                        sharded_offsets,
+                        metadata,
+                        sharded_layer_prefix=sharded_layer_prefix,
+                    )
+                )
+                continue
+
+            sharded_prefix = f'{sharded_layer_prefix}{logical_layer_idx}.'
             sharded_pp_offset = []
 
             layer_sharded_state_dict = layer.sharded_state_dict(
@@ -821,15 +1022,20 @@ class HybridStack(MegatronModule):
         # Add modules other than self.layers
         for name, module in self.named_children():
             if not module is self.layers:
-                sharded_state_dict.update(
-                    sharded_state_dict_default(
-                        module,
-                        f'{prefix}{name}.',
-                        sharded_offsets,
-                        metadata,
-                        tp_group=self.tp_group,
-                    )
+                module_prefix = f'{prefix}{name}.'
+                module_sharded_state_dict = sharded_state_dict_default(
+                    module, module_prefix, sharded_offsets, metadata, tp_group=self.tp_group
                 )
+                # The registered submodule stays ``final_norm`` (local state-dict keys
+                # are unchanged), but grouped stacks publish the sharded key under
+                # TransformerBlock's ``final_layernorm`` name so their checkpoints
+                # cross-load with GPTModel. Non-grouped stacks keep ``final_norm`` so
+                # hybrid checkpoints written before this feature still load.
+                if name == 'final_norm' and self.transformer_sharded_keys:
+                    replace_prefix_for_sharding(
+                        module_sharded_state_dict, module_prefix, f'{prefix}final_layernorm.'
+                    )
+                sharded_state_dict.update(module_sharded_state_dict)
 
         local_state_dict: dict = {}
         self._save_to_state_dict(local_state_dict, '', keep_vars=True)
