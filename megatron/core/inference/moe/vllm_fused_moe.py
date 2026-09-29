@@ -337,18 +337,22 @@ class VllmFusedMoeBuffers:
 def _init_sorted_ids_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
+    counts_ptr,
     max_sorted,
     max_blocks,
+    NUM_COUNTS: tl.constexpr,
     SENTINEL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Initialize sorted_token_ids to SENTINEL and expert_ids to -1."""
+    """Initialize indirection tables and, optionally, local-expert counters."""
     pid = tl.program_id(0)
     block_start = pid * BLOCK
-    if block_start < max_sorted or block_start < max_blocks:
+    if block_start < max_sorted or block_start < max_blocks or block_start < NUM_COUNTS:
         offs = block_start + tl.arange(0, BLOCK)
         tl.store(sorted_token_ids_ptr + offs, SENTINEL, mask=offs < max_sorted)
         tl.store(expert_ids_ptr + offs, -1, mask=offs < max_blocks)
+        if NUM_COUNTS > 0:
+            tl.store(counts_ptr + offs, 0, mask=offs < NUM_COUNTS)
 
 
 @triton.jit
@@ -412,6 +416,7 @@ def _moe_align_block_size_cuda_graphable(
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
+    fuse_counter_init: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build indirection tables for the vLLM kernel, fully on-device.
 
@@ -425,6 +430,7 @@ def _moe_align_block_size_cuda_graphable(
         num_local_experts: experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor.
+        fuse_counter_init: Zero counters in the indirection initializer, before counting.
 
     Returns:
         sorted_token_ids: [max_sorted] int32 indirection table.
@@ -443,14 +449,30 @@ def _moe_align_block_size_cuda_graphable(
     )
     expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
 
+    zeroed_counts = (
+        torch.empty(num_local_experts, dtype=torch.int32, device=device) if fuse_counter_init else None
+    )
     INIT_BLOCK = 1024
-    init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
+    init_grid = _ceil_div(max(max_sorted, max_blocks, num_local_experts), INIT_BLOCK)
     _init_sorted_ids_kernel[(init_grid,)](
-        sorted_token_ids, expert_ids, max_sorted, max_blocks, SENTINEL=sentinel, BLOCK=INIT_BLOCK
+        sorted_token_ids,
+        expert_ids,
+        zeroed_counts,
+        max_sorted,
+        max_blocks,
+        NUM_COUNTS=num_local_experts if fuse_counter_init else 0,
+        SENTINEL=sentinel,
+        BLOCK=INIT_BLOCK,
     )
 
+    # A separate, stream-ordered launch is necessary before atomic counting.
     tokens_per_expert = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
+        routing_map,
+        local_expert_start,
+        num_local_experts,
+        valid_tokens,
+        persistent=True,
+        zeroed_counts=zeroed_counts,
     )
     exclusive_offsets, inclusive_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=block_size
@@ -695,6 +717,7 @@ def vllm_fused_moe(
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
+    fuse_counter_init: bool = True,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -722,6 +745,8 @@ def vllm_fused_moe(
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
             the square, bounding the activation output by ``s ** 2``. Only supported for
             SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
+        fuse_counter_init: Zero expert counters in the indirection initializer. Set False
+            to retain the unfused reference path for exactness checks.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -752,7 +777,12 @@ def vllm_fused_moe(
         config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
-        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
+        routing_map,
+        config['BLOCK_SIZE_M'],
+        num_local_experts,
+        local_expert_start,
+        valid_tokens,
+        fuse_counter_init=fuse_counter_init,
     )
     num_valid = max_tokens * topk
 
