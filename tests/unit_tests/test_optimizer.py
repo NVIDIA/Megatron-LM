@@ -1082,6 +1082,65 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
     distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
 
 
+def test_set_main_param_and_optimizer_states_missing_key():
+    """Test _set_main_param_and_optimizer_states handles missing keys in incoming tensors.
+
+    When using native torch.optim.AdamW (no Apex/TE), load_state_dict injects a
+    per-parameter 'step' tensor into the optimizer state. During dp_zero checkpoint
+    loading, the scattered tensors dict only contains keys from optimizer_state_keys
+    (e.g. 'param', 'exp_avg', 'exp_avg_sq') and does NOT include 'step'. The copy
+    loop must skip keys that are present in dst_tensors but absent from the incoming
+    tensors dict, instead of raising KeyError.
+    """
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=True
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a training step to populate optimizer state (exp_avg, exp_avg_sq).
+    input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    # Access the underlying distrib_optimizer.
+    distrib_optim = optim.chained_optimizers[0]
+
+    # Inject a per-parameter 'step' tensor into optimizer state, mimicking what
+    # load_state_dict() does for native torch AdamW (HAVE_APEX_OR_TE=False).
+    inner_optimizer = distrib_optim.optimizer
+    for param in inner_optimizer.state:
+        inner_optimizer.state[param]['step'] = torch.tensor(1.0, dtype=torch.float)
+
+    # Simulate dp_zero scatter: the incoming tensors dict only has the keys from
+    # optimizer_state_keys, NOT 'step'.
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    # Build a tensors dict WITHOUT 'step', as dp_zero scatter would.
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    tensors.pop('step', None)
+
+                    # This must not raise KeyError on the missing 'step' key.
+                    distrib_optim._set_main_param_and_optimizer_states(model_param, tensors)
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("precision", ['bf16', 'fp32'])
 def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
