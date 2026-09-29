@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+from dataclasses import fields
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -8,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed.checkpoint
+import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -31,9 +33,12 @@ from megatron.training.checkpointing import (
     read_metadata,
     save_checkpoint,
 )
+from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 
 class MockModel(MegatronModule):
@@ -599,10 +604,20 @@ def test_load_base_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
-def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
+def test_save_checkpoint(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, run_config
+):
     """Test save_checkpoint."""
     args = create_args
     args.ckpt_format = ckpt_format
+    profiling = ProfilingConfig(
+        use_nsys_profiler=True, profile_ranks=[0], memory_snapshot_path="owned.pickle"
+    )
+    run_config.profiling = profiling
+    # Runtime config owns these fields, even if the legacy namespace disagrees.
+    args.profile = False
+    args.profile_ranks = [99]
+    args.memory_snapshot_path = "stale.pickle"
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -659,6 +674,16 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
+        # Legacy args remain unchanged; the run config records the effective policy.
+        assert state["args"].profile is False and state["args"].profile_ranks == [99]
+        assert state["args"].memory_snapshot_path == "stale.pickle"
+        with open(ckpt_dir / "run_config.yaml") as f:
+            saved_config = yaml.safe_load(f)
+        for field in fields(profiling):
+            assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
+        assert args.profile is False and args.profile_ranks == [99]
+        assert args.memory_snapshot_path == "stale.pickle"
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])

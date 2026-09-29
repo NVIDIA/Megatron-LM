@@ -3098,8 +3098,11 @@ def _add_rl_args(parser):
 def _add_training_args(parser):
     from megatron.training.config import ProfilingConfig, TrainingConfig
 
-    prof_factory = ArgumentGroupFactory(ProfilingConfig)
+    prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["use_nsys_profiler"])
     prof_group = prof_factory.build_group(parser, "profiling")
+    prof_group.add_argument('--profile', action='store_true', 
+                       help='Enable nsys profiling. When using this option, nsys '
+                       'options should be specified in commandline.')
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")
