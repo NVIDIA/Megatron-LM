@@ -4,8 +4,8 @@
 
 ``TransformerConfig.__post_init__`` resolves ``moe_router_aux_loss_fusion`` when it is
 unset, but ``apply_determinism_to_args`` runs on the argparse Namespace before any config
-exists, so it re-derives the same fallback. These tests pin the two derivations together:
-the guard must reject exactly the arg combinations whose config ends up with the fusion on.
+exists, so it re-derives the same fallback. The guard rejects effective aux-loss fusion
+only when TE lacks a deterministic implementation, without changing the requested flags.
 """
 
 import argparse
@@ -13,6 +13,7 @@ import argparse
 import pytest
 import torch
 
+from megatron.core.extensions import transformer_engine as te_extensions
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.determinism import (
     ARG_VALUES_REQUIRED_FOR_DETERMINISM,
@@ -25,8 +26,10 @@ def restore_torch_determinism():
     """apply_determinism_to_args flips a torch global on the paths that don't raise."""
     was_enabled = torch.are_deterministic_algorithms_enabled()
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    was_fill = torch.utils.deterministic.fill_uninitialized_memory
     yield
     torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
+    torch.utils.deterministic.fill_uninitialized_memory = was_fill
 
 
 def make_args(**kwargs):
@@ -42,23 +45,33 @@ def make_args(**kwargs):
 @pytest.mark.internal
 @pytest.mark.parametrize("router_fusion", [False, True])
 @pytest.mark.parametrize("aux_loss_fusion", [None, False, True])
-def test_guard_agrees_with_config_resolution(router_fusion, aux_loss_fusion):
-    """The guard rejects exactly the args whose config resolves the fusion on.
+@pytest.mark.parametrize("te_supports_deterministic", [False, True])
+def test_guard_agrees_with_config_resolution(
+    monkeypatch, router_fusion, aux_loss_fusion, te_supports_deterministic
+):
+    """An inherited or explicit fusion request requires deterministic TE support.
 
     Unset is the case that matters: it inherits ``moe_router_fusion``, so dropping the
-    fallback here would let ``--moe-router-fusion --deterministic-mode`` through.
+    fallback here would let unsupported ``--moe-router-fusion`` combinations through.
     """
+    monkeypatch.setattr(
+        te_extensions, "te_supports_deterministic_moe_aux_loss", lambda: te_supports_deterministic
+    )
     fusion_flags = dict(moe_router_fusion=router_fusion, moe_router_aux_loss_fusion=aux_loss_fusion)
     config = TransformerConfig(
         num_layers=1, hidden_size=8, num_attention_heads=1, num_moe_experts=4, **fusion_flags
     )
 
-    if config.moe_router_aux_loss_fusion:
+    args = make_args(**fusion_flags)
+    requested_args = vars(args).copy()
+    if config.moe_router_aux_loss_fusion and not te_supports_deterministic:
         with pytest.raises(AssertionError, match="moe_router_aux_loss_fusion"):
-            apply_determinism_to_args(make_args(**fusion_flags))
+            apply_determinism_to_args(args)
     else:
         # Opting out explicitly keeps fused TopK routing available under determinism.
-        apply_determinism_to_args(make_args(**fusion_flags))
+        apply_determinism_to_args(args)
+        assert torch.are_deterministic_algorithms_enabled()
+    assert vars(args) == requested_args
 
 
 @pytest.mark.internal

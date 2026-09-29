@@ -31,6 +31,7 @@ try:
     from megatron.core.extensions.transformer_engine import (
         fused_moe_aux_loss as _fused_moe_aux_loss,
     )
+    from megatron.core.extensions.transformer_engine import te_supports_deterministic_moe_aux_loss
 
     HAVE_ROUTER_FUSION = (
         _fused_compute_score_for_moe_aux_loss is not None and _fused_moe_aux_loss is not None
@@ -462,25 +463,35 @@ class TestRouterAuxLoss:
         reason="CUDA or TE fused router ops not available",
     )
     @pytest.mark.parametrize("aux_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
-    def test_aux_loss_fusion_equivalence(self, aux_type):
-        # Compare fused vs unfused aux loss path to ensure numerical equivalence
-        router_ref = self.new_router(
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_aux_loss_fusion_equivalence(self, aux_type, deterministic):
+        if deterministic and not te_supports_deterministic_moe_aux_loss():
+            pytest.skip("TE does not support deterministic fused MoE aux loss")
+
+        # FP32 parameters and inputs expose small gradient errors that BF16 can hide.
+        router_kwargs = dict(
             moe_router_load_balancing_type=aux_type,
             moe_aux_loss_coeff=1.0,
             moe_router_dtype="fp32",
-            moe_router_fusion=False,
+            deterministic_mode=deterministic,
+            bf16=False,
+            params_dtype=torch.float32,
+        )
+        router_ref = self.new_router(
+            **router_kwargs, moe_router_fusion=False, moe_router_aux_loss_fusion=False
         ).cuda()
         router_fused = self.new_router(
-            moe_router_load_balancing_type=aux_type,
-            moe_aux_loss_coeff=1.0,
-            moe_router_dtype="fp32",
-            moe_router_fusion=True,
+            **router_kwargs, moe_router_fusion=True, moe_router_aux_loss_fusion=True
         ).cuda()
+        # dataclasses.replace would otherwise retain the default config's resolved False
+        # for aux fusion, silently testing only fused TopK routing.
+        assert router_fused.config.moe_router_fusion
+        assert router_fused.config.moe_router_aux_loss_fusion
 
         with torch.no_grad():
             router_fused.weight.copy_(router_ref.weight)
 
-        hidden_states = torch.randn((32, 2, router_ref.config.hidden_size)).cuda().bfloat16()
+        hidden_states = torch.randn((4096, 2, router_ref.config.hidden_size), device="cuda")
 
         # Map aux type to its tracker key
         loss_name_map = {
@@ -490,32 +501,45 @@ class TestRouterAuxLoss:
         }
         loss_name = loss_name_map[aux_type]
 
-        # Unfused
-        clear_aux_losses_tracker()
-        router_ref.weight.grad = None
-        scores_ref, routing_ref = router_ref(hidden_states)
-        # Backward zeros to isolate aux-loss-only gradient contribution
-        scores_ref.backward(torch.zeros_like(scores_ref))
-        grad_ref = router_ref.weight.grad.clone()
-        tracker = get_moe_layer_wise_logging_tracker()
-        aux_loss_ref = tracker[loss_name]["values"][0]
-        reduce_from_tensor_model_parallel_region(aux_loss_ref, router_ref.tp_cp_group)
+        def run(router):
+            clear_aux_losses_tracker()
+            if aux_type == "global_aux_loss":
+                router.reset_global_aux_loss_tracker()
+            router.weight.grad = None
+            inputs = hidden_states.detach().clone().requires_grad_(True)
+            scores, routing = router(inputs)
+            # Backward zeros isolate the aux-loss contribution through fused score backward.
+            scores.backward(torch.zeros_like(scores))
+            return {
+                "scores": scores.detach().clone(),
+                "routing": routing.detach().clone(),
+                "loss": get_moe_layer_wise_logging_tracker()[loss_name]["values"][0].clone(),
+                "input_grad": inputs.grad.clone(),
+                "weight_grad": router.weight.grad.clone(),
+            }
 
-        # Fused
-        clear_aux_losses_tracker()
-        router_fused.weight.grad = None
-        scores_fused, routing_fused = router_fused(hidden_states)
-        scores_fused.backward(torch.zeros_like(scores_fused))
-        grad_fused = router_fused.weight.grad.clone()
-        tracker = get_moe_layer_wise_logging_tracker()
-        aux_loss_fused = tracker[loss_name]["values"][0]
-        reduce_from_tensor_model_parallel_region(aux_loss_fused, router_fused.tp_cp_group)
+        try:
+            reference = run(router_ref)
+            fused = run(router_fused)
 
-        # Checks
-        assert torch.equal(routing_ref, routing_fused)
-        torch.testing.assert_close(scores_ref, scores_fused, rtol=2.0e-2, atol=1.0e-3)
-        torch.testing.assert_close(aux_loss_ref, aux_loss_fused)
-        torch.testing.assert_close(grad_ref, grad_fused)
+            assert torch.equal(reference["routing"], fused["routing"])
+            for name in ("scores", "loss", "input_grad", "weight_grad"):
+                torch.testing.assert_close(reference[name], fused[name], rtol=1e-4, atol=1e-8)
+            assert torch.count_nonzero(fused["input_grad"]) > 0
+            assert torch.count_nonzero(fused["weight_grad"]) > 0
+
+            if deterministic:
+                # Check the logged scalar too: backward does not consume its numeric value,
+                # so replaying only the router output/gradients would miss the atomic race.
+                for _ in range(3):
+                    replay = run(router_fused)
+                    for name, expected in fused.items():
+                        assert torch.equal(
+                            expected.contiguous().reshape(-1).view(torch.uint8),
+                            replay[name].contiguous().reshape(-1).view(torch.uint8),
+                        ), f"{aux_type}: {name} changed across deterministic replays"
+        finally:
+            clear_aux_losses_tracker()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(

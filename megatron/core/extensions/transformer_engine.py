@@ -11,6 +11,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -3948,6 +3949,21 @@ else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+
+
+@lru_cache(maxsize=1)
+def te_supports_deterministic_moe_aux_loss() -> bool:
+    """Whether the installed TE aux-loss API accepts a deterministic execution request."""
+    if fused_moe_aux_loss is None:
+        return False
+    try:
+        parameter = inspect.signature(fused_moe_aux_loss).parameters.get("deterministic")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def set_save_original_input(module):

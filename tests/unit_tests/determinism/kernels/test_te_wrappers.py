@@ -17,6 +17,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions import transformer_engine as te_extensions
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -56,6 +57,50 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.fixture
+def aux_loss_capability_cache():
+    """Keep mocked TE APIs from changing subsequent integration-test dispatch."""
+    helper = te_extensions.te_supports_deterministic_moe_aux_loss
+    helper.cache_clear()
+    yield helper
+    helper.cache_clear()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "api,expected",
+    [
+        pytest.param(None, False, id="missing"),
+        pytest.param(lambda probs: None, False, id="legacy"),
+        pytest.param(lambda **kwargs: None, False, id="kwargs_only"),
+        pytest.param(lambda deterministic=False: None, True, id="explicit"),
+        pytest.param(lambda *, deterministic=False: None, True, id="keyword_only"),
+        pytest.param(lambda deterministic=False, /: None, False, id="positional_only"),
+    ],
+)
+def test_moe_aux_loss_deterministic_capability(
+    monkeypatch, aux_loss_capability_cache, api, expected
+):
+    monkeypatch.setattr(te_extensions, "fused_moe_aux_loss", api)
+    assert aux_loss_capability_cache() is expected
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("error", [TypeError, ValueError])
+def test_moe_aux_loss_uninspectable_api(monkeypatch, aux_loss_capability_cache, error):
+    def unavailable_signature():
+        raise error("signature unavailable")
+
+    class Uninspectable:
+        __signature__ = property(lambda self: unavailable_signature())
+
+        def __call__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(te_extensions, "fused_moe_aux_loss", Uninspectable())
+    assert not aux_loss_capability_cache()
 
 
 def _config(**overrides):
