@@ -443,6 +443,7 @@ class MegatronOptimizer(ABC):
                     grad_norm,
                     use_decoupled_grad=self._uses_decoupled_grad(main_params),
                 )
+                _set_polyak_clip_coeff(self, clip_grad, grad_norm)
             for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                 group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
                 if group_grad_norm is None:
@@ -876,6 +877,18 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
+
+
+def _set_polyak_clip_coeff(optimizer, clip_grad: float, grad_norm) -> None:
+    """Tell a ScheduleFree+ inner optimizer how much its gradients were just scaled by clipping.
+
+    Its Polyak step divides the loss by gradient statistics; computed from clipped gradients
+    they shrink with the clip coefficient while the loss does not, inflating the step by the
+    grad norm. The optimizer divides the statistics by this coefficient to undo that.
+    """
+    inner = getattr(optimizer, 'optimizer', None)
+    if hasattr(inner, 'set_grad_clip_coeff'):
+        inner.set_grad_clip_coeff(min(1.0, clip_grad / (float(grad_norm) + 1.0e-6)))
 
 
 def _strip_module_prefix(name: str) -> str:
@@ -2018,6 +2031,7 @@ class ChainedOptimizer(MegatronOptimizer):
                         total_norm=grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
                     )
+                    _set_polyak_clip_coeff(optimizer, optimizer.config.clip_grad, grad_norm)
                 for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                     group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
                     if group_grad_norm is None:

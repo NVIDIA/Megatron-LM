@@ -305,6 +305,38 @@ class OptimizerConfig:
     """Second beta coefficient for Lion optimizer (used in momentum EMA update).
     Defaults to 0.98."""
 
+    # ScheduleFree+ (AdamC + Schedule-Free + Polyak step size). Uses adam_beta1/adam_beta2/
+    # adam_eps for the inner update; lr is a multiplier on the Polyak step size.
+    sfplus_beta: float = 0.9
+    """Schedule-Free interpolation weight: y = beta * x + (1 - beta) * z."""
+
+    sfplus_beta_max: float = 0.965
+    """Final Schedule-Free beta when annealing (see sfplus_beta_anneal_steps)."""
+
+    sfplus_beta_anneal_steps: int = 0
+    """Steps over which 1 - beta is log-linearly annealed to 1 - sfplus_beta_max. 0 = fixed."""
+
+    sfplus_r: float = 0.0
+    """Power of the step index in the Schedule-Free averaging weights."""
+
+    sfplus_weight_lr_power: float = 2.0
+    """Power of the running max learning rate in the Schedule-Free averaging weights."""
+
+    sfplus_c_warmup: int = 0
+    """Initial steps during which the average x tracks z exactly (no averaging)."""
+
+    sfplus_polyak_beta: float = 0.9
+    """EMA coefficient for the gradient L1 norm in the Polyak step size denominator."""
+
+    sfplus_muon_rms: float = 0.2
+    """ScheduleFree+ with Muon: per-element RMS of the Muon update of hidden matrices before the
+    step size (0.2 matches AdamW's typical update RMS, so one Polyak step serves both)."""
+
+    sfplus_muon_weight_decay: Optional[float] = None
+    """ScheduleFree+ with Muon: AdamC-form weight decay (z -= lr**2 * wd * y) for the Muon
+    matrices, which settle at a different weight norm than AdamC params for the same decay.
+    None uses weight_decay. Parameters Megatron excludes from weight decay stay undecayed."""
+
     soap_shampoo_beta: float = 0.95
     """The beta parameter for the Shampoo preconditioner."""
 

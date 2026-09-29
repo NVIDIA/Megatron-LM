@@ -20,7 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -88,6 +88,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.optimizer.schedulefree_plus import ScheduleFreePlusAdamC
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
@@ -2199,35 +2200,37 @@ def pretrain(
                 training_model=rl_training_model,
             )
         else:
-            evaluate_and_print_results(
-                prefix, forward_step_func,
-                valid_data_iterator, model,
-                iteration, process_non_loss_data_func, model_cfg,
-                verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
-                non_loss_data_func=non_loss_data_func,
-                pg_collection=pg_collection, p2p_communicator=p2p_communicator,
-                callback_manager=callback_manager,
-                is_test=False,
-            )
+            with sfplus_eval_weights(model, optimizer):
+                evaluate_and_print_results(
+                    prefix, forward_step_func,
+                    valid_data_iterator, model,
+                    iteration, process_non_loss_data_func, model_cfg,
+                    verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
+                    non_loss_data_func=non_loss_data_func,
+                    pg_collection=pg_collection, p2p_communicator=p2p_communicator,
+                    callback_manager=callback_manager,
+                    is_test=False,
+                )
 
     if args.do_test:
         prefix = f'iteration {iteration} on test set'
-        evaluate_and_print_results(
-            prefix,
-            forward_step_func,
-            test_data_iterator,
-            model,
-            iteration,
-            process_non_loss_data_func,
-            model_cfg,
-            verbose=True,
-            write_to_tensorboard=not cfg_container.validation.skip_train,
-            non_loss_data_func=non_loss_data_func,
-            pg_collection=pg_collection,
-            p2p_communicator=p2p_communicator,
-            callback_manager=callback_manager,
-            is_test=True,
-        )
+        with sfplus_eval_weights(model, optimizer):
+            evaluate_and_print_results(
+                prefix,
+                forward_step_func,
+                test_data_iterator,
+                model,
+                iteration,
+                process_non_loss_data_func,
+                model_cfg,
+                verbose=True,
+                write_to_tensorboard=not cfg_container.validation.skip_train,
+                non_loss_data_func=non_loss_data_func,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
+                callback_manager=callback_manager,
+                is_test=True,
+            )
 
     wandb_writer = get_wandb_writer()
     if wandb_writer:
@@ -3057,6 +3060,11 @@ def setup_model_and_optimizer(
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
+            # ScheduleFree+ checkpoints hold the averaged weights x as the model weights (see
+            # save_checkpoint_and_time); rebuild the training point y from x and z.
+            sfplus_optimizers = _sfplus_optimizers(optimizer)
+            if sfplus_optimizers:
+                _sfplus_set_weights(model, optimizer, sfplus_optimizers, eval_mode=False)
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -3420,6 +3428,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     samples_seen_in_iteration = _get_samples_seen_in_iteration(
         losses_reduced, args, model_pg_collection
     )
+
+    # ScheduleFree+'s Polyak step size needs the loss at the current weights: the mean
+    # per-token loss over the global batch, the same value that is logged as 'lm loss'.
+    sfplus_optimizers = _sfplus_optimizers(optimizer)
+    if sfplus_optimizers:
+        loss_sum_and_tokens = torch.vstack(
+            [x['lm loss'].view(-1) for x in losses_reduced]
+        ).sum(dim=0).float()
+        torch.distributed.all_reduce(
+            loss_sum_and_tokens,
+            group=getattr(model_pg_collection, 'dp_cp_gtp_remat', None) or model_pg_collection.dp_cp,
+        )
+        global_loss = (loss_sum_and_tokens[0] / loss_sum_and_tokens[1]).item()
+        for opt in sfplus_optimizers:
+            opt.optimizer.set_function_value(global_loss)
 
     # Update parameters.
 
@@ -4181,6 +4204,68 @@ def force_param_sync(model_chunks, optimizer=None) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _sfplus_optimizers(optimizer):
+    """Megatron optimizers in `optimizer` whose inner optimizer is ScheduleFree+."""
+    if optimizer is None:
+        return []
+    return [
+        opt
+        for opt in getattr(optimizer, 'chained_optimizers', [optimizer])
+        if isinstance(getattr(opt, 'optimizer', None), ScheduleFreePlusAdamC)
+    ]
+
+
+def _sfplus_set_weights(model, optimizer, sfplus_optimizers, eval_mode):
+    """Load x (eval_mode) or y (train mode) into the main params and the model weights."""
+    for opt in sfplus_optimizers:
+        if eval_mode:
+            opt.optimizer.eval()
+        else:
+            opt.optimizer.train()
+        opt._copy_main_params_to_model_params()
+    if any(isinstance(opt, DistributedOptimizer) for opt in sfplus_optimizers):
+        # Each rank only updated its own shard; all-gather the full weights.
+        force_param_sync(model, optimizer=optimizer)
+
+
+def _sfplus_last_stats(optimizer):
+    """Statistics from the last ScheduleFree+ step ({} for other optimizers)."""
+    sfplus_optimizers = _sfplus_optimizers(optimizer)
+    return sfplus_optimizers[0].optimizer.last_stats if sfplus_optimizers else {}
+
+
+def _log_sfplus_stats(stats, iteration):
+    """Write ScheduleFree+ step statistics to TensorBoard and W&B."""
+    args = get_args()
+    if iteration % args.tensorboard_log_interval != 0:
+        return
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
+    if writer:
+        for key, value in stats.items():
+            writer.add_scalar(f'sfplus/{key}', value, iteration)
+    if wandb_writer:
+        wandb_writer.log({f'sfplus/{key}': value for key, value in stats.items()}, iteration)
+
+
+@contextmanager
+def sfplus_eval_weights(model, optimizer):
+    """Evaluate ScheduleFree+ at its averaged weights x, then restore the training point y.
+
+    Forward pre-hooks must be disabled (as they are around evaluation), so that the param
+    all-gathers here are synchronous. A no-op for other optimizers.
+    """
+    sfplus_optimizers = _sfplus_optimizers(optimizer)
+    if not sfplus_optimizers:
+        yield
+        return
+    _sfplus_set_weights(model, optimizer, sfplus_optimizers, eval_mode=True)
+    try:
+        yield
+    finally:
+        _sfplus_set_weights(model, optimizer, sfplus_optimizers, eval_mode=False)
+
+
 def save_checkpoint_and_time(
     iteration,
     model,
@@ -4257,8 +4342,11 @@ def save_checkpoint_and_time(
             # Gate on the full data-distribution group so gtp_remat peers do not each report.
             report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
 
-        # Save checkpoint.
-        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
+        # Save checkpoint. ScheduleFree+ saves its averaged weights x as the model weights, so
+        # that eval-only runs and conversions get the model to evaluate; z and x are in the
+        # optimizer state, from which the training point y is rebuilt on load.
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}), \
+                sfplus_eval_weights(model, optimizer):
             save_checkpoint(
                 iteration,
                 model,
@@ -5322,6 +5410,11 @@ def train(
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:
                 learning_rate = None
+            sfplus_stats = _sfplus_last_stats(optimizer)
+            if sfplus_stats:
+                # The scheduler LR is only a warmup multiplier; log the step size actually used.
+                learning_rate = sfplus_stats['effective_lr']
+                _log_sfplus_stats(sfplus_stats, iteration)
             # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
             # uninstrumented per-iteration overhead outside the train_step span.
             with _otel_managed_span('step', 'megatron.train.log', is_goodput_span=True):
@@ -5395,14 +5488,15 @@ def train(
                     training_model=rl_training_model,
                 )
             else:
-                evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
-                                       config, verbose=False, write_to_tensorboard=True,
-                                       non_loss_data_func=non_loss_data_func,
-                                       pg_collection=pg_collection,
-                                       p2p_communicator=p2p_communicator,
-                                       callback_manager=callback_manager, is_test=False)
+                with sfplus_eval_weights(model, optimizer):
+                    evaluate_and_print_results(prefix, forward_step_func,
+                                           valid_data_iterator, model,
+                                           iteration, process_non_loss_data_func,
+                                           config, verbose=False, write_to_tensorboard=True,
+                                           non_loss_data_func=non_loss_data_func,
+                                           pg_collection=pg_collection,
+                                           p2p_communicator=p2p_communicator,
+                                           callback_manager=callback_manager, is_test=False)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters

@@ -816,7 +816,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def optimizer_state_keys(self):
         """Return the optimizer's tensor state keys, e.g., ('exp_avg', 'exp_avg_sq') for Adam
         or ('exp_avg',) for Lion."""
-        _OPTIMIZER_STATE_KEYS = {"lion": ("exp_avg",)}
+        _OPTIMIZER_STATE_KEYS = {
+            "lion": ("exp_avg",),
+            "sfplus": ("exp_avg", "exp_avg_sq", "z", "x"),
+        }
         optimizer_name = self.config.optimizer
         # When Muon is the top-level optimizer, the DistributedOptimizer wrapping
         # scalar parameters uses muon_scalar_optimizer (e.g., Lion) as the actual

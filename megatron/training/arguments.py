@@ -1800,9 +1800,30 @@ def validate_args(args, defaults={}):
         )
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
+    if args.optimizer in ('sfplus', 'sfplus_muon'):
+        # ScheduleFree+ runs inside the standard (distributed) optimizer path. Its Polyak step
+        # needs the loss before the step (only the last pipeline stage has it) and global
+        # gradient sums; params duplicated across TP ranks would be counted more than once.
+        assert args.pipeline_model_parallel_size == 1, 'sfplus requires pipeline parallel size 1'
+        assert args.tensor_model_parallel_size == 1, 'sfplus requires tensor parallel size 1'
+        assert args.context_parallel_size == 1, 'sfplus requires context parallel size 1'
+        assert not args.fp16, 'sfplus supports bf16 and fp32, not fp16 loss scaling'
+        assert not args.optimizer_cpu_offload, 'sfplus does not support optimizer CPU offload'
+        assert not args.use_precision_aware_optimizer, \
+            'sfplus does not support the precision-aware optimizer'
+        assert not args.use_megatron_fsdp and not args.use_torch_fsdp2, \
+            'sfplus does not support FSDP'
+        # Checkpoints are written with the averaged weights swapped in, and swapped back
+        # right after save_checkpoint returns, before an async save would copy them.
+        assert not args.async_save, 'sfplus does not support --async-save'
+        if args.optimizer == 'sfplus_muon':
+            # Muon orthogonalizes whole matrices; the distributed optimizer shards them.
+            assert not args.use_distributed_optimizer, \
+                'sfplus_muon requires the non-distributed optimizer'
+
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    if args.optimizer not in ('sgd', 'adam', 'sfplus', 'sfplus_muon'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -2806,6 +2827,30 @@ def _add_regularization_args(parser):
                        help='Second beta coefficient for Lion optimizer '
                        '(used in momentum EMA update). Default: 0.98.')
 
+    group.add_argument('--sfplus-beta', type=float, default=0.9,
+                       help='ScheduleFree+: interpolation y = beta * x + (1 - beta) * z.')
+    group.add_argument('--sfplus-beta-max', type=float, default=0.965,
+                       help='ScheduleFree+: final beta when annealing.')
+    group.add_argument('--sfplus-beta-anneal-steps', type=int, default=0,
+                       help='ScheduleFree+: steps over which 1 - beta is log-linearly '
+                       'annealed to 1 - sfplus_beta_max. 0 keeps beta fixed.')
+    group.add_argument('--sfplus-r', type=float, default=0.0,
+                       help='ScheduleFree+: power of the step index in the averaging weights.')
+    group.add_argument('--sfplus-weight-lr-power', type=float, default=2.0,
+                       help='ScheduleFree+: power of the max LR in the averaging weights.')
+    group.add_argument('--sfplus-c-warmup', type=int, default=0,
+                       help='ScheduleFree+: initial steps during which the average tracks z '
+                       '(the paper suggests 2x the LR warmup).')
+    group.add_argument('--sfplus-polyak-beta', type=float, default=0.9,
+                       help='ScheduleFree+: EMA coefficient for the gradient L1 norm in the '
+                       'Polyak step size.')
+    group.add_argument('--sfplus-muon-rms', type=float, default=0.2,
+                       help='ScheduleFree+ with Muon (--optimizer sfplus_muon): per-element RMS '
+                       'of the Muon update of hidden matrices before the step size.')
+    group.add_argument('--sfplus-muon-weight-decay', type=float, default=None,
+                       help='ScheduleFree+ with Muon: AdamC-form weight decay for the Muon '
+                       'matrices (default: --weight-decay).')
+
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
                        'None (default): apply weight decay to 1D weights and biases.'
@@ -3068,7 +3113,8 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon',
+                                'sfplus', 'sfplus_muon'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

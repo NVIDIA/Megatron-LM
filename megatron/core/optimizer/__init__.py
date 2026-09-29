@@ -87,6 +87,8 @@ from .optimizer_config import (
     ParamWithNamePredicate,
     SGDOptimizerConfig,
 )
+from .schedulefree_plus import ScheduleFreePlusAdamC
+from .schedulefree_plus_muon import ScheduleFreePlusMuon
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +626,44 @@ def _get_megatron_optimizer_based_on_param_groups(
                         if len(opt.state[p]) == 0:
                             opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
 
+        elif config.optimizer in ('sfplus', 'sfplus_muon'):
+            sfplus_kwargs = dict(
+                lr=config.lr,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+                sf_beta=config.sfplus_beta,
+                sf_beta_max=config.sfplus_beta_max,
+                sf_beta_anneal_steps=config.sfplus_beta_anneal_steps,
+                r=config.sfplus_r,
+                weight_lr_power=config.sfplus_weight_lr_power,
+                c_warmup=config.sfplus_c_warmup,
+                polyak_beta=config.sfplus_polyak_beta,
+            )
+            if config.optimizer == 'sfplus':
+                optimizer = ScheduleFreePlusAdamC(param_groups, **sfplus_kwargs)
+            else:
+                if config.muon_split_qkv:
+                    # Megatron's fused QKV weight stacks [q, k, v] rows per query group.
+                    qkv_split = tuple(_get_qkv_split_shapes(model_chunks[0].config))
+                    for model_chunk in model_chunks:
+                        for name, param in model_chunk.named_parameters():
+                            if name.endswith('self_attention.linear_qkv.weight'):
+                                param.sfplus_qkv_split = qkv_split
+                optimizer = ScheduleFreePlusMuon(
+                    param_groups,
+                    muon_momentum=config.muon_momentum,
+                    muon_nesterov=config.muon_nesterov,
+                    muon_ns_steps=config.muon_num_ns_steps,
+                    muon_coefficient_type=config.muon_coefficient_type,
+                    muon_rms=config.sfplus_muon_rms,
+                    muon_weight_decay=config.sfplus_muon_weight_decay,
+                    **sfplus_kwargs,
+                )
+
+            def init_state_fn(opt, config=None):
+                opt.init_state()
+
         elif config.optimizer == 'sgd':
             optimizer = SGD(
                 param_groups,
@@ -701,6 +741,10 @@ def _get_megatron_optimizer_based_on_param_groups(
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
     setattr(optimizer, 'expert_tp_group', expert_tp_group)
+
+    # ScheduleFree+ sums its gradient statistics over the same ranks as the grad norm.
+    if isinstance(getattr(optimizer, 'optimizer', None), ScheduleFreePlusAdamC):
+        optimizer.optimizer.reduce_group = optimizer.get_grad_stats_parallel_group()
 
     return optimizer
 
@@ -1063,7 +1107,7 @@ def get_megatron_optimizer(
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd', 'sfplus', 'sfplus_muon'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
