@@ -280,7 +280,9 @@ def get_tokens_per_expert_and_token_count(
     if reduce_groups is None:
         reduce_groups = (reduce_group,)
 
-    global_tokens_per_expert = local_tokens_per_expert
+    # The reduction all-reduces contiguous tensors in place; reduce a copy so
+    # local_tokens_per_expert keeps this rank's counts for local_num_tokens below.
+    global_tokens_per_expert = local_tokens_per_expert.clone()
     reduce_world_size = 1
     for group in reduce_groups:
         global_tokens_per_expert = reduce_from_tensor_model_parallel_region(

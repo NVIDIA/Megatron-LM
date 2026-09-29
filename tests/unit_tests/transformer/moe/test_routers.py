@@ -141,6 +141,39 @@ def test_token_count_reduction_composes_runtime_cp_and_tp(monkeypatch):
     assert total_tokens == 12
 
 
+def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatch):
+    """The TP reduction all-reduces contiguous tensors in place. Local valid-token
+    counts must stay per-rank; otherwise downstream per-token-loss scaling re-reduces
+    an already-global count (2x at runtime CP2)."""
+    import megatron.core.tensor_parallel.mappings as mappings
+
+    class _Group:
+        def size(self):
+            return 2
+
+    cp_group = _Group()
+    # The peer CP rank holds 2 valid tokens (one per expert); this rank holds 1.
+    peer_tokens_per_expert = torch.tensor([1, 1])
+
+    def _in_place_all_reduce(tensor, group=None):
+        assert group is cp_group
+        tensor.add_(peer_tokens_per_expert)
+
+    # Drive the real reduce_from_tensor_model_parallel_region -> _reduce path and fake
+    # only the collective, preserving its in-place semantics.
+    monkeypatch.setattr(mappings, "get_tensor_model_parallel_group_if_none", lambda g: g)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _in_place_all_reduce)
+    routing_map = torch.tensor([[True, False], [False, False]])  # second token is padding
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=cp_group, topk=1, with_padding_mask=True
+    )
+
+    assert torch.equal(tokens_per_expert, torch.tensor([2, 1]))
+    assert local_tokens == 1
+    assert total_tokens == 3
+
+
 def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
     router = TopKRouter.__new__(TopKRouter)
     object.__setattr__(router, "topk", 2)
