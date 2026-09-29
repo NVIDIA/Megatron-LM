@@ -289,11 +289,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
 
 
-def _extract_media_url_bytes(url: str) -> bytes:
-    """Extract size-bounded bytes from an OpenAI-style media URL.
+def _extract_media_url_bytes(url: str, *, max_fetch_bytes: int | None = None) -> bytes:
+    """Extract bytes from an OpenAI-style media URL.
 
     Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
-    plain ``http(s)://`` URLs.
+    plain ``http(s)://`` URLs. Data URLs are already bounded by the server's
+    request-body limit; remote responses bypass it, so ``max_fetch_bytes``
+    bounds them instead.
     """
     if url.startswith("data:"):
         try:
@@ -322,18 +324,22 @@ def _extract_media_url_bytes(url: str) -> bytes:
             raise ValueError(f"Refusing to fetch media from non-public address: {parsed.hostname}")
         req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
         with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
-            return response.read()
+            if max_fetch_bytes is None:
+                return response.read()
+            data = response.read(max_fetch_bytes + 1)
+        if len(data) > max_fetch_bytes:
+            raise ValueError(f"Media at {parsed.hostname} exceeds {max_fetch_bytes} byte limit")
+        return data
     raise ValueError(f"Unsupported media URL scheme: {url[:40]!r}")
 
 
 def _extract_multimodal_from_messages(
-    messages,
-    prompt_config: MultimodalPromptConfig,
+    messages, prompt_config: MultimodalPromptConfig, max_fetch_bytes: int | None = None
 ):
     """Extract media bytes and replace structured blocks with internal slots.
 
     Remote image fetching is blocking, so callers must run this function off
-    the event loop.
+    the event loop. ``max_fetch_bytes`` bounds each remote media response.
     """
     if not isinstance(messages, list):
         return messages, [], [], []
@@ -372,7 +378,9 @@ def _extract_multimodal_from_messages(
                 if not url:
                     continue
                 try:
-                    image_bytes_list.append(_extract_media_url_bytes(url))
+                    image_bytes_list.append(
+                        _extract_media_url_bytes(url, max_fetch_bytes=max_fetch_bytes)
+                    )
                 except Exception as e:
                     # Dropping the image would answer the request as if it were
                     # text-only, handing the client a confident answer about an
@@ -386,7 +394,9 @@ def _extract_multimodal_from_messages(
                 if not isinstance(url, str) or not url.startswith("data:"):
                     raise ValueError("Megatron chat video inputs must be base64 data URLs.")
                 try:
-                    video_bytes_list.append(_extract_media_url_bytes(url))
+                    video_bytes_list.append(
+                        _extract_media_url_bytes(url, max_fetch_bytes=max_fetch_bytes)
+                    )
                 except Exception as e:
                     raise ValueError(f"Failed to load video_url: {e}") from e
                 new_chunks.append(add_slot("video", message_index))
@@ -900,12 +910,14 @@ try:
             return Response("'messages' must be a list", status=400)
         prompt_config = current_app.config['multimodal_prompt_config']
         # Extract structured media before template sanitization. Remote image
-        # fetches block, so keep this work off the event loop.
+        # fetches block, so keep this work off the event loop. Remote responses
+        # bypass Quart's request-body limit, so apply the same bound to them.
         try:
             messages, image_bytes_list, video_bytes_list, media_slots = await asyncio.to_thread(
                 _extract_multimodal_from_messages,
                 messages,
                 prompt_config,
+                current_app.config.get('MAX_CONTENT_LENGTH'),
             )
         except ValueError as error:
             return Response(str(error), status=400)

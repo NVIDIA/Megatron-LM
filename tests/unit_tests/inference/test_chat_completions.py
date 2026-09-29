@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import re
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -41,6 +42,109 @@ def test_extract_media_data_url():
     url = f"data:video/mp4;base64,{base64.b64encode(payload).decode()}"
 
     assert _extract_media_url_bytes(url) == payload
+
+
+def test_extract_media_data_url_ignores_fetch_limit():
+    # Data URLs arrive in the request body, which Quart already bounds.
+    payload = b"x" * 64
+    url = f"data:image/png;base64,{base64.b64encode(payload).decode()}"
+
+    assert _extract_media_url_bytes(url, max_fetch_bytes=4) == payload
+
+
+class _FakeMediaResponse:
+    def __init__(self, data):
+        self._data = data
+        self.read_sizes = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return self._data if size is None or size < 0 else self._data[:size]
+
+
+@pytest.fixture
+def fake_remote_media(monkeypatch):
+    module = sys.modules[_extract_media_url_bytes.__module__]
+    response = _FakeMediaResponse(b"")
+    monkeypatch.setattr(module.socket, "gethostbyname", lambda host: "93.184.216.34")
+    monkeypatch.setattr(module._no_redirect_opener, "open", lambda req, timeout: response)
+    return response
+
+
+@pytest.mark.parametrize(
+    ("max_fetch_bytes", "expected_read_size"), [(None, -1), (5, 6)], ids=["unbounded", "at_limit"]
+)
+def test_extract_media_remote_url_reads_within_fetch_limit(
+    fake_remote_media, max_fetch_bytes, expected_read_size
+):
+    fake_remote_media._data = b"image"
+
+    data = _extract_media_url_bytes("https://example.com/cat.png", max_fetch_bytes=max_fetch_bytes)
+
+    assert data == b"image"
+    assert fake_remote_media.read_sizes == [expected_read_size]
+
+
+def test_extract_media_remote_url_rejects_response_over_fetch_limit(fake_remote_media):
+    fake_remote_media._data = b"image!"
+
+    with pytest.raises(ValueError, match="example.com exceeds 5 byte limit"):
+        _extract_media_url_bytes("https://example.com/cat.png", max_fetch_bytes=5)
+    # Reading one byte past the limit detects oversize without buffering the rest.
+    assert fake_remote_media.read_sizes == [6]
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA=="}},
+    ],
+    ids=["image", "video"],
+)
+def test_extract_multimodal_forwards_fetch_limit_to_media_urls(block):
+    url = block[block["type"]]["url"]
+    messages = [{"role": "user", "content": [block]}]
+    with mock.patch(
+        f"{_extract_media_url_bytes.__module__}._extract_media_url_bytes", return_value=b"media"
+    ) as extract:
+        _, image_bytes_list, video_bytes_list, _ = _extract_multimodal_from_messages(
+            messages, MultimodalPromptConfig(), max_fetch_bytes=123
+        )
+
+    assert image_bytes_list + video_bytes_list == [b"media"]
+    extract.assert_called_once_with(url, max_fetch_bytes=123)
+
+
+@pytest.mark.asyncio
+async def test_chat_endpoint_bounds_remote_media_by_max_content_length():
+    quart = pytest.importorskip("quart")
+    module = sys.modules[_extract_media_url_bytes.__module__]
+    app = quart.Quart(__name__)
+    app.config.update(
+        MAX_CONTENT_LENGTH=2**30,
+        client=None,
+        tokenizer=None,
+        parsers=None,
+        multimodal_prompt_config=MultimodalPromptConfig(),
+    )
+    app.register_blueprint(module.bp)
+
+    with mock.patch.object(
+        module, "_extract_multimodal_from_messages", side_effect=ValueError("stop here")
+    ) as extract:
+        response = await app.test_client().post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+
+    assert response.status_code == 400
+    assert extract.call_args.args[2] == 2**30
 
 
 def test_replace_prefix_tokens_metadata_ships_the_rendered_prefix_and_eos():
