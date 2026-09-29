@@ -75,6 +75,7 @@ def test_sampling_params_maps_greedy_and_limits():
     assert selected_logprobs.return_log_probs
     assert selected_logprobs.top_n_logprobs == 0
     assert selected_logprobs.skip_prompt_log_probs
+    assert not selected_logprobs.detokenize_generations
 
     with pytest.raises(ValueError, match="selected-token logprobs only"):
         build_sampling_params({"token_ids": [1], "output_options": {"logprobs": 1}})
@@ -119,7 +120,7 @@ async def test_start_uses_parent_event_socket_and_base_client(tmp_path):
 
         client_class.assert_called_once_with("tcp://127.0.0.1:5555", deserialize=False)
         client.start.assert_called_once()
-        receiver_class.assert_called_once_with(engine._on_engine_event, "127.0.0.1")
+        receiver_class.assert_called_once_with(engine._on_engine_event, "127.0.0.1", bind_port=None)
         event_receiver.start.assert_called_once()
         assert engine_config.model == "/cache/model-metadata"
         assert engine_config.served_model_name == "served"
@@ -131,6 +132,39 @@ async def test_start_uses_parent_event_socket_and_base_client(tmp_path):
             engine._process_monitor.cancel()
             await asyncio.gather(engine._process_monitor, return_exceptions=True)
         await asyncio.gather(*engine._log_tasks)
+
+
+@pytest.mark.asyncio
+async def test_external_start_waits_without_launching_subprocess(tmp_path):
+    config = _config()
+    config.engine_launch_mode = "external"
+    config.parent_event_host = "node-0"
+    config.parent_event_port = 5556
+    config.nproc_per_node = None
+    config.megatron_root = str(tmp_path / "not-mounted-in-parent")
+    engine = MegatronLLMEngine(config)
+    client = SimpleNamespace(start=MagicMock())
+    event_receiver = SimpleNamespace(start=MagicMock(return_value="tcp://node-0:5556"))
+    engine._wait_for_readiness = AsyncMock(return_value=_endpoint().to_dict())
+    create_subprocess = AsyncMock()
+
+    with (
+        patch("asyncio.create_subprocess_exec", create_subprocess),
+        patch(
+            "megatron.inference.integrations.dynamo.llm_engine.InferenceClient", return_value=client
+        ),
+        patch(
+            "megatron.inference.integrations.dynamo.llm_engine.EngineEventReceiver",
+            return_value=event_receiver,
+        ) as receiver_class,
+    ):
+        await engine.start(worker_id=0)
+
+    receiver_class.assert_called_once_with(engine._on_engine_event, "node-0", bind_port=5556)
+    create_subprocess.assert_not_awaited()
+    assert engine._process is None
+    assert engine._process_monitor is None
+    assert not engine._log_tasks
 
 
 @pytest.mark.asyncio

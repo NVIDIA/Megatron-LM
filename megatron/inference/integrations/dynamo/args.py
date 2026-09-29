@@ -21,21 +21,18 @@ class Config:
     request_plane: str
     event_plane: str | None
     role: str
-    nproc_per_node: int
+    nproc_per_node: int | None
     coordinator_host: str | None
     coordinator_port: int | None
     worker_id_file: str | None
     megatron_root: str
     drain_timeout: float
     megatron_argv: list[str]
-    launcher: str = "local"
-    nnodes: int = 1
-    master_addr: str | None = None
-    master_port: int | None = None
-    slurm_nodelist: str | None = None
+    engine_launch_mode: str = "local"
     engine_start_timeout: float = 1800.0
     engine_shutdown_timeout: float = 30.0
     parent_event_host: str = "127.0.0.1"
+    parent_event_port: int | None = None
     endpoint_types: str = "chat,completions"
 
 
@@ -80,20 +77,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--event-plane", default="nats")
     add_engine_service_args(parser)
     parser.add_argument(
-        "--launcher",
-        choices=["local", "slurm"],
+        "--engine-launch-mode",
+        choices=["local", "external"],
         default="local",
-        help="Launch the owned Megatron rank group locally or through a SLURM job step.",
+        help=(
+            "Launch a one-node Megatron rank group from this worker, or wait for an engine "
+            "service launched by the deployment system."
+        ),
     )
-    parser.add_argument("--nnodes", type=int, default=1)
-    parser.add_argument("--nproc-per-node", type=int, required=True)
-    parser.add_argument("--master-addr", default=None)
-    parser.add_argument("--master-port", type=int, default=None)
-    parser.add_argument(
-        "--slurm-nodelist",
-        default=None,
-        help="Optional SLURM node list reserved for this complete Megatron replica.",
-    )
+    parser.add_argument("--nproc-per-node", type=int, default=None)
     parser.add_argument(
         "--worker-id-file",
         default=None,
@@ -108,27 +100,22 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default="127.0.0.1",
         help="Interface or hostname for the parent-owned engine event socket.",
     )
+    parser.add_argument(
+        "--parent-event-port",
+        type=int,
+        default=None,
+        help="Fixed engine-event port required when --engine-launch-mode=external.",
+    )
     args = parser.parse_args(dynamo_argv)
 
-    if args.nproc_per_node < 1:
+    if args.nproc_per_node is not None and args.nproc_per_node < 1:
         parser.error("--nproc-per-node must be at least 1")
-    if args.nnodes < 1:
-        parser.error("--nnodes must be at least 1")
-    if args.launcher == "local" and args.nnodes != 1:
-        parser.error("--launcher local only supports --nnodes 1")
-    if args.launcher == "slurm" and (not args.master_addr or args.master_port is None):
-        parser.error("--launcher slurm requires --master-addr and --master-port")
-    if args.master_port is not None and not 1 <= args.master_port <= 65535:
-        parser.error("--master-port must be between 1 and 65535")
-    if (
-        args.launcher == "slurm"
-        and args.nnodes > 1
-        and args.parent_event_host in {"127.0.0.1", "::1", "localhost"}
-    ):
-        parser.error(
-            "multi-node --launcher slurm requires --parent-event-host to be a routable "
-            "address on the Dynamo parent host"
-        )
+    if args.engine_launch_mode == "local" and args.nproc_per_node is None:
+        parser.error("--engine-launch-mode local requires --nproc-per-node")
+    if args.engine_launch_mode == "external" and args.parent_event_port is None:
+        parser.error("--engine-launch-mode external requires --parent-event-port")
+    if args.parent_event_port is not None and not 1 <= args.parent_event_port <= 65535:
+        parser.error("--parent-event-port must be between 1 and 65535")
     if args.engine_start_timeout <= 0:
         parser.error("--engine-start-timeout must be positive")
     if args.engine_shutdown_timeout <= 0:
@@ -151,12 +138,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         request_plane=args.request_plane,
         event_plane=args.event_plane,
         role=args.role,
-        launcher=args.launcher,
-        nnodes=args.nnodes,
+        engine_launch_mode=args.engine_launch_mode,
         nproc_per_node=args.nproc_per_node,
-        master_addr=args.master_addr,
-        master_port=args.master_port,
-        slurm_nodelist=args.slurm_nodelist,
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
         worker_id_file=args.worker_id_file,
@@ -166,5 +149,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         engine_start_timeout=args.engine_start_timeout,
         engine_shutdown_timeout=args.engine_shutdown_timeout,
         parent_event_host=args.parent_event_host,
+        parent_event_port=args.parent_event_port,
         endpoint_types=args.endpoint_types,
     )

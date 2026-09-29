@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import queue
-import shlex
 import signal
 import sys
 import threading
@@ -89,6 +88,7 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     params.top_n_logprobs = 0
     params.return_log_probs = token_logprobs == 0
     params.skip_prompt_log_probs = True
+    params.detokenize_generations = False
     params.add_attributes({})
     if params.temperature == 0.0:
         params.top_k = 1
@@ -97,7 +97,7 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
 
 
 class MegatronLLMEngine(LLMEngine):
-    """Unified Dynamo backend for one self-owned Megatron DP replica."""
+    """Unified Dynamo backend for one Megatron DP replica."""
 
     def __init__(self, config: Config, registration_model: str | None = None) -> None:
         self.config = config
@@ -159,29 +159,38 @@ class MegatronLLMEngine(LLMEngine):
 
     async def start(self, worker_id: int) -> EngineConfig:
         self.worker_id = int(worker_id)
-        if not os.path.isdir(self.config.megatron_root):
+        if self.config.engine_launch_mode == "local" and not os.path.isdir(
+            self.config.megatron_root
+        ):
             raise FileNotFoundError(f"Megatron root does not exist: {self.config.megatron_root}")
 
         try:
             self._event_receiver = EngineEventReceiver(
-                self._on_engine_event, self.config.parent_event_host
+                self._on_engine_event,
+                self.config.parent_event_host,
+                bind_port=self.config.parent_event_port,
             )
             parent_event_address = self._event_receiver.start()
-            command = self._engine_command(parent_event_address)
-            logger.info("Launching owned Megatron engine: %s", " ".join(command))
-            self._process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=self.config.megatron_root,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            assert self._process.stdout is not None
-            assert self._process.stderr is not None
-            self._log_tasks = [
-                asyncio.create_task(self._forward_logs(self._process.stdout, logging.INFO)),
-                asyncio.create_task(self._forward_logs(self._process.stderr, logging.WARNING)),
-            ]
+            if self.config.engine_launch_mode == "local":
+                command = self._engine_command(parent_event_address)
+                logger.info("Launching owned Megatron engine: %s", " ".join(command))
+                self._process = await asyncio.create_subprocess_exec(
+                    *command,
+                    cwd=self.config.megatron_root,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+                assert self._process.stdout is not None
+                assert self._process.stderr is not None
+                self._log_tasks = [
+                    asyncio.create_task(self._forward_logs(self._process.stdout, logging.INFO)),
+                    asyncio.create_task(self._forward_logs(self._process.stderr, logging.WARNING)),
+                ]
+            else:
+                logger.info(
+                    "Waiting for an externally launched Megatron engine at %s", parent_event_address
+                )
             return await self._complete_startup()
         except BaseException:
             try:
@@ -191,7 +200,7 @@ class MegatronLLMEngine(LLMEngine):
             raise
 
     async def _complete_startup(self) -> EngineConfig:
-        """Finish startup after the owned engine subprocess has launched."""
+        """Finish startup after the engine service reports readiness."""
 
         readiness = await self._wait_for_readiness()
         endpoint = InferenceEngineEndpoint.from_dict(readiness)
@@ -201,7 +210,8 @@ class MegatronLLMEngine(LLMEngine):
             connect_timeout_seconds=min(30.0, self.config.engine_start_timeout),
         )
         self._engine_endpoint = endpoint
-        self._process_monitor = asyncio.create_task(self._monitor_process())
+        if self._process is not None:
+            self._process_monitor = asyncio.create_task(self._monitor_process())
         identity = {
             "worker_id": self.worker_id,
             "namespace": self.config.namespace,
@@ -234,47 +244,26 @@ class MegatronLLMEngine(LLMEngine):
         )
 
     def _engine_command(self, parent_event_address: str) -> list[str]:
-        command = [sys.executable, "-m", "torch.distributed.run"]
-        if self.config.launcher == "local":
-            command.extend(["--standalone", f"--nproc-per-node={self.config.nproc_per_node}"])
-        else:
-            command.extend(
-                [
-                    f"--nnodes={self.config.nnodes}",
-                    f"--nproc-per-node={self.config.nproc_per_node}",
-                    "--node-rank=__SLURM_NODE_RANK__",
-                    f"--master-addr={self.config.master_addr}",
-                    f"--master-port={self.config.master_port}",
-                ]
-            )
-        command.extend(
-            [
-                "--module",
-                "megatron.inference.integrations.dynamo.engine_service",
-                "--dynamo-parent-event-address",
-                parent_event_address,
-                "--role",
-                self.config.role,
-            ]
-        )
+        if self.config.nproc_per_node is None:
+            raise RuntimeError("Local engine launch requires nproc_per_node")
+        command = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc-per-node={self.config.nproc_per_node}",
+            "--module",
+            "megatron.inference.integrations.dynamo.engine_service",
+            "--dynamo-parent-event-address",
+            parent_event_address,
+            "--role",
+            self.config.role,
+        ]
         if self.config.coordinator_host is not None:
             command.extend(["--coordinator-host", self.config.coordinator_host])
         if self.config.coordinator_port is not None:
             command.extend(["--coordinator-port", str(self.config.coordinator_port)])
         command.extend(self.config.megatron_argv)
-        if self.config.launcher == "slurm":
-            shell_command = shlex.join(command).replace("__SLURM_NODE_RANK__", '"${SLURM_NODEID}"')
-            srun_command = [
-                "srun",
-                f"--nodes={self.config.nnodes}",
-                f"--ntasks={self.config.nnodes}",
-                "--ntasks-per-node=1",
-                f"--gpus-per-node={self.config.nproc_per_node}",
-                "--kill-on-bad-exit=1",
-            ]
-            if self.config.slurm_nodelist is not None:
-                srun_command.append(f"--nodelist={self.config.slurm_nodelist}")
-            return srun_command + ["bash", "-c", f"exec {shell_command}"]
         return command
 
     async def _forward_logs(self, stream: asyncio.StreamReader, level: int) -> None:
@@ -288,17 +277,16 @@ class MegatronLLMEngine(LLMEngine):
                 return self._ready_messages.get_nowait()
             except queue.Empty:
                 pass
-            if self._process is None:
-                raise RuntimeError("Megatron process disappeared during startup")
-            if self._process.returncode is not None:
-                raise RuntimeError(
-                    "Megatron engine exited before readiness "
-                    f"with code {self._process.returncode}"
-                )
+            if self.config.engine_launch_mode == "local":
+                if self._process is None:
+                    raise RuntimeError("Megatron process disappeared during startup")
+                if self._process.returncode is not None:
+                    raise RuntimeError(
+                        "Megatron engine exited before readiness "
+                        f"with code {self._process.returncode}"
+                    )
             if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError(
-                    "Timed out waiting for the owned Megatron engine to become ready"
-                )
+                raise TimeoutError("Timed out waiting for the Megatron engine to become ready")
             await asyncio.sleep(0.05)
 
     async def _monitor_process(self) -> None:

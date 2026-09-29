@@ -30,9 +30,7 @@ class EngineEventReporter:
             return
         self.engine.context.dynamo_helper.add_kv_event_listener(self.observe)
         self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="megatron-engine-event-reporter",
+            target=self._run, daemon=True, name="megatron-engine-event-reporter"
         )
         self._thread.start()
         result = self._ready.get()
@@ -83,18 +81,19 @@ class EngineEventReporter:
 class EngineEventReceiver:
     """Own the parent endpoint receiving rank-zero engine events."""
 
-    def __init__(self, callback: Callable[[str, dict], None], bind_host: str) -> None:
+    def __init__(
+        self, callback: Callable[[str, dict], None], bind_host: str, bind_port: int | None = None
+    ) -> None:
         self.callback = callback
         self.bind_host = bind_host
+        self.bind_port = bind_port
         self._stop = threading.Event()
         self._ready = queue.Queue(maxsize=1)
         self._thread = None
 
     def start(self) -> str:
         self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="megatron-engine-event-receiver",
+            target=self._run, daemon=True, name="megatron-engine-event-receiver"
         )
         self._thread.start()
         result = self._ready.get()
@@ -112,7 +111,10 @@ class EngineEventReceiver:
             socket = context.socket(zmq.PULL)
             socket.setsockopt(zmq.LINGER, 0)
             socket.setsockopt(zmq.RCVTIMEO, 100)
-            socket.bind_to_random_port(f"tcp://{self.bind_host}")
+            if self.bind_port is None:
+                socket.bind_to_random_port(f"tcp://{self.bind_host}")
+            else:
+                socket.bind(f"tcp://{self.bind_host}:{self.bind_port}")
             self._ready.put(socket.getsockopt_string(zmq.LAST_ENDPOINT))
             while not self._stop.is_set():
                 try:

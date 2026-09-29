@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -9,6 +10,7 @@ import pytest
 
 pytest.importorskip("dynamo")
 
+from megatron.inference.integrations.dynamo import engine_service
 from megatron.inference.integrations.dynamo.args import parse_args
 from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
 from megatron.inference.integrations.dynamo.main import main
@@ -30,26 +32,18 @@ def _argv():
     ]
 
 
-def _slurm_argv():
+def _external_argv():
     return [
         "--role",
         "aggregated",
         "--model",
         "model-meta",
-        "--launcher",
-        "slurm",
-        "--nnodes",
-        "2",
-        "--nproc-per-node",
-        "4",
-        "--master-addr",
-        "node-0",
-        "--master-port",
-        "29500",
-        "--slurm-nodelist",
-        "node-[0-1]",
+        "--engine-launch-mode",
+        "external",
         "--parent-event-host",
-        "10.0.0.10",
+        "node-0",
+        "--parent-event-port",
+        "5556",
         "--",
         "--load",
         "/checkpoints/model path",
@@ -69,32 +63,26 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
     ]
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        _argv()[:-6] + ["--nnodes", "2", "--", "--load", "/checkpoint"],
-        [
-            "--model",
-            "model-meta",
-            "--launcher",
-            "slurm",
-            "--nnodes",
-            "2",
-            "--nproc-per-node",
-            "4",
-            "--master-addr",
-            "node-0",
-            "--master-port",
-            "29500",
-            "--",
-            "--load",
-            "/checkpoint",
-        ],
-    ],
-)
-def test_multi_node_launcher_configuration_is_validated(argv):
+def test_local_launch_requires_process_count():
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "model-meta", "--", "--load", "/checkpoint"])
+
+
+def test_external_launch_requires_fixed_parent_event_port():
+    argv = _external_argv()
+    del argv[argv.index("--parent-event-port") : argv.index("--parent-event-port") + 2]
+
     with pytest.raises(SystemExit):
         parse_args(argv)
+
+
+def test_external_launch_accepts_deployment_managed_engine():
+    config = parse_args(_external_argv())
+
+    assert config.engine_launch_mode == "external"
+    assert config.nproc_per_node is None
+    assert config.parent_event_host == "node-0"
+    assert config.parent_event_port == 5556
 
 
 def test_disaggregated_role_requires_coordinator_address():
@@ -133,28 +121,21 @@ def test_owned_engine_command_targets_megatron_only_service():
     assert command[-4:] == ["--load", "/checkpoints/model", "--tensor-model-parallel-size", "2"]
 
 
-def test_slurm_engine_command_launches_one_torchrun_agent_per_node():
-    engine = MegatronLLMEngine(parse_args(_slurm_argv()))
-    command = engine._engine_command("tcp://10.0.0.10:5556")
+@pytest.mark.asyncio
+async def test_engine_service_skips_prompt_log_probs_before_engine_construction(monkeypatch):
+    args = SimpleNamespace(return_log_probs=False, skip_prompt_log_probs=False, role="aggregated")
 
-    assert command[:5] == [
-        "srun",
-        "--nodes=2",
-        "--ntasks=2",
-        "--ntasks-per-node=1",
-        "--gpus-per-node=4",
-    ]
-    assert "--kill-on-bad-exit=1" in command
-    assert "--nodelist=node-[0-1]" in command
-    assert command[-3:-1] == ["bash", "-c"]
-    payload = command[-1]
-    assert "--nnodes=2" in payload
-    assert "--nproc-per-node=4" in payload
-    assert '--node-rank="${SLURM_NODEID}"' in payload
-    assert "--master-addr=node-0" in payload
-    assert "--master-port=29500" in payload
-    assert "megatron.inference.integrations.dynamo.engine_service" in payload
-    assert "'/checkpoints/model path'" in payload
+    def build_engine(*, engine_class):
+        assert engine_class is not None
+        assert args.return_log_probs
+        assert args.skip_prompt_log_probs
+        raise RuntimeError("configuration observed")
+
+    monkeypatch.setattr(engine_service, "get_args", lambda: args)
+    monkeypatch.setattr(engine_service, "get_dynamic_inference_engine", build_engine)
+
+    with pytest.raises(RuntimeError, match="configuration observed"):
+        await engine_service._serve()
 
 
 @pytest.mark.asyncio
@@ -207,9 +188,14 @@ async def test_readiness_reports_early_child_failure():
 
 
 @pytest.mark.asyncio
-async def test_readiness_message_is_received():
-    engine = MegatronLLMEngine(parse_args(_argv()))
+async def test_external_readiness_does_not_require_child_process():
+    engine = MegatronLLMEngine(parse_args(_external_argv()))
     expected = {"coordinator_address": "tcp://127.0.0.1:5000"}
-    engine._process = SimpleNamespace(returncode=None)
-    engine._on_engine_event("ready", expected)
+
+    async def report_ready():
+        await asyncio.sleep(0)
+        engine._on_engine_event("ready", expected)
+
+    task = asyncio.create_task(report_ready())
     assert await engine._wait_for_readiness() == expected
+    await task

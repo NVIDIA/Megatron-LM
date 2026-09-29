@@ -31,6 +31,7 @@ def _extra_args(parser):
 async def _serve() -> None:
     args = get_args()
     args.return_log_probs = True
+    args.skip_prompt_log_probs = True
     disaggregated = args.role in ("prefill", "decode")
     engine_class = DynamoDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
     engine = get_dynamic_inference_engine(engine_class=engine_class)
