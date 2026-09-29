@@ -124,7 +124,7 @@ class FsdpParameterGroup:
     _main_grad_is_stale: bool
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
-    grad_divisor: int
+    grad_divisor: float
 
     def __init__(
         self,
@@ -135,7 +135,7 @@ class FsdpParameterGroup:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: int = 1,
+        grad_divisor: float = 1.0,
         use_symmetric_memory: bool = False,
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
