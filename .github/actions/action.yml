@@ -185,6 +185,9 @@ runs:
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+        TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -201,6 +204,16 @@ runs:
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
               EFFECTIVE_MODE=enforce
+              # Check if source mapping forces this bucket to run fully.
+              git fetch --depth=1 origin "$TARGET_BRANCH" 2>/dev/null || true
+              SM_OUTPUT=$(python tests/unit_tests/testmon_cache.py source-mapping \
+                --root . --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+                --base-ref "origin/$TARGET_BRANCH" 2>/dev/null) || true
+              if [[ "$SM_OUTPUT" == "force_full=true" ]]; then
+                EFFECTIVE_MODE=full
+                FALLBACK_REASON="source mapping triggered full run for this bucket"
+                echo "::notice::Source mapping forces full run for bucket $BUCKET."
+              fi
             else
               EFFECTIVE_MODE=full
               FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"

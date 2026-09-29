@@ -192,7 +192,7 @@ def forced_full_buckets(root: Path, changed_files: list[str], platform: str) -> 
 def _changed_files(root: Path, base_ref: str) -> list[str]:
     """Get repo-relative paths of files changed between *base_ref* and HEAD."""
     result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=ACDMRT", f"{base_ref}...HEAD"],
+        ["git", "diff", "--name-only", "--diff-filter=ACDMRT", f"{base_ref}..HEAD"],
         cwd=root,
         capture_output=True,
         text=True,
