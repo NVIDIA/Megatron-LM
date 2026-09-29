@@ -14,6 +14,18 @@ if [[ ! "${MOK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
     exit 1
 fi
 
+# ALL includes both GPU architectures supported by the pinned source.
+export MOK_ARCH="${MOK_ARCH:-ALL}"
+case "${MOK_ARCH}" in
+    ALL) MOK_CUBINS=(sm_100a sm_103a) ;;
+    SM100) MOK_CUBINS=(sm_100a) ;;
+    SM103) MOK_CUBINS=(sm_103a) ;;
+    *)
+        echo "Unsupported MOK_ARCH '${MOK_ARCH}'; expected ALL, SM100 or SM103" >&2
+        exit 1
+        ;;
+esac
+
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
@@ -25,8 +37,6 @@ git -C "${WORK_DIR}" apply --check "${PATCH_FILE}"
 git -C "${WORK_DIR}" apply "${PATCH_FILE}"
 bash "${WORK_DIR}/scripts/prepare_thunderkittens.sh"
 
-# The CI Blackwell lane is GB200 (SM100). MoK also supports an explicit SM103 build.
-export MOK_ARCH="${MOK_ARCH:-SM100}"
 export NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
 export MOK_NVCC="${NVCC}"
 # Docker builds have no GPU driver. Stubs are link inputs, never runtime libraries.
@@ -46,4 +56,6 @@ PY
 )
 "${CUDA_HOME:-/usr/local/cuda}/bin/cuobjdump" --list-elf "${MOK_EXTENSION}" > "${WORK_DIR}/cubins.txt"
 cat "${WORK_DIR}/cubins.txt"
-grep -q "sm_${MOK_ARCH#SM}" "${WORK_DIR}/cubins.txt"
+for MOK_CUBIN in "${MOK_CUBINS[@]}"; do
+    grep -Fq ".${MOK_CUBIN}.cubin" "${WORK_DIR}/cubins.txt"
+done

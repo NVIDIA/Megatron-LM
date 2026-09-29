@@ -50,7 +50,8 @@ EOF
 FROM base AS mok-wheel
 RUN uv venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
 ARG MOK_COMMIT=a2ad2d0ce2366c1817d15498cdbaf8ead5966117
-ARG MOK_ARCH=SM100
+# Include both GPU architectures supported by the pinned MoK source by default.
+ARG MOK_ARCH=ALL
 RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mok.sh \
     --mount=type=bind,source=docker/patches/mok.patch,target=/opt/mok.patch \
     MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok.patch /opt/mok-wheels
