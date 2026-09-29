@@ -410,6 +410,13 @@ it** — a different collective over a different process group, so enable either
   via the `DistributedWeight.grad_buffer` protocol, Megatron-native linears via an `out=` matmul
   (when the wgrad dtype matches `main_grad`). The untied embedding's wgrad is materialized by
   `F.embedding`'s own backward and pays one copy into the buffer.
+- **The pool never shrinks**, so it is permanently sized by the *peak* number of send buffers live
+  at once. A weight with several backwards per iteration (MTP's repeated block) can reach its next
+  wgrad while its previous send is still in flight, which would raise that peak for good — every
+  buffer the pool holds is live at the peak, whatever its size. Instead `get_wgrad_tensor` waits
+  out its own reduce-scatter and reuses the buffer, giving up one overlap to avoid a permanent
+  allocation. The wait is skipped under CUDA-graph capture, where the branch would bake into the
+  graph.
 - **FP32-accumulation interplay.** A registered pool takes precedence over §2.6 on its group:
   NVLS symmetric reduce-scatters accumulate in fp32 in-switch (NCCL's `multimem.ld_reduce` uses
   `.acc::f32` for bf16), so the group keeps the symmetric reduce-scatter and the fp32-accum
@@ -720,6 +727,13 @@ The chain stays a plain linear list — one slot per weight, no branching. MTP i
 
 - **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
 
+  **`output_layer` is the exception**: its consumes sum into one buffer *before* the collective —
+  **one reduce-scatter per iteration**, not one per consume per microbatch. The count is learned
+  in iteration 1; the backward fence closes the window and fires DDP grad-ready once. **Off under
+  `--step-batch-size-schedule`**, where a rising count fires grad-ready twice and drops a
+  contribution. It is the only opt-in — TE-backed weights (`eh_proj`, the replayed layer) never
+  reach the hook.
+
 - **The deferred finalize is conditional.** Normally a weight finalizes its chain *successor's* reduce-scatter, hiding that latency behind the next backward. Once backward stops following chain order, the successor may not have started one yet, so the finalize runs only when something is actually in flight.
 
 The first rule always applies. The other two apply only under `async_reduction`; with it off, every wgrad reduce-scatters and accumulates inline.
@@ -866,8 +880,10 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 **Whenever you add or change a GTP_remat/EGTP_remat feature, run the GTP_remat unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
 
 ```bash
-# 4 GPUs. GTP_remat requires TransformerEngine >= 2.19.
-torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v
+# 4 GPUs. GTP_remat requires TransformerEngine >= 2.19. -m "not flaky_in_dev" matches CI's
+# dev filter and excludes test_gtp_partial_cg.py's flake under shared-process load
+# (suspected but unconfirmed cuBLASLt algorithm-selection sensitivity).
+torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v -m "not flaky_in_dev"
 ```
 
 | Test file | What it guards |
@@ -886,7 +902,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_muon_qkv.py` | Layout-invariant split-QKV (§1.6): the decision uses the across-shards row count (with the production shape that a shard-local test rejected), the split runs after the all-gather so the GTP_remat shard equals TP1's result restricted to this rank's rows, and `blockwise`/`distributed` fall back to whole-matrix Newton–Schulz bitwise, warning once. |
 | `test_gtp_recompute_chain.py` | Recompute-chain buffers (§3.1): adjacent nodes never share a gather buffer, dense and grouped, plus dgrad/wgrad parity vs no-recompute. |
-| `test_gtp_mtp.py` | GTP_remat + MTP shared weights (§3.5), 14 cases over `mtp_use_repeated_layer` × dense/MoE. Both MTP hazards are silent, so each needs its own guard: the async reduce-scatter path is compared numerically against the sync path on an identical model/sharding/batch, and all-gathers issued are tallied against consumes to catch a consume reading a buffer nothing gathered into. |
+| `test_gtp_mtp.py` | GTP_remat + MTP shared weights (§3.5), 28 cases over `mtp_use_repeated_layer` × dense/MoE. Guards three silent hazards: a stale gather, a dropped reduce-scatter, and a wrong `output_layer` consume count under pre-RS wgrad accumulation. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
 | `test_gtp_ddp_param_sync_race.py` | Parameter-readiness ordering (§3.2): GTP_remat's ahead-of-consume prefetch must not read a bucket DDP has not published. Structural and numerical (stale-value) guards on the default one-weight-ahead chain, the grouped-expert one-block-ahead chain, and the recompute exclusion. |
 | `test_gtp_custom_pgs.py` | `pg_collection` plumbing: a custom `gtp_remat` group (permuted ranks, same size) must give the same fwd/bwd results as the MPU groups — catches modules reading `parallel_state` instead of the collection passed to them. |

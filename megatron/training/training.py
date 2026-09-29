@@ -56,6 +56,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -162,6 +163,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
+from megatron.training.kernel_warmup import warmup_training_kernels
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -192,6 +194,8 @@ from .global_vars import (
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
+    get_run_config,
+    set_run_config,
 )
 from .params_distance import ParamsDistanceFromStart
 from .theoretical_memory_usage import report_theoretical_memory
@@ -1213,18 +1217,18 @@ def num_floating_point_operations(
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
-            # Calculate number of dense and MoE Transformer MLPs.
+            # The attention pattern describes only the main decoder layers.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
                     0 if ((i + 1) % args.linear_attention_freq == 0)
-                    else 1 for i in range(num_layers)
+                    else 1 for i in range(args.num_layers)
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+                assert len(linear_attention_pattern) == args.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
+                    f"expected {args.num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
@@ -1239,7 +1243,10 @@ def num_floating_point_operations(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            # MTP repeats the last decoder layer's attention type, not the pattern.
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if is_gated_delta_net_variant(args.experimental_attention_variant):
@@ -1551,6 +1558,42 @@ def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
     return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
 
 
+def _get_train_full_dataset_sample_count(args, dataset_provider):
+    """Measure the training horizon without restoring a temporary dataloader.
+
+    Opt-in providers must accept ``restore_dataloader_state=False`` and expose
+    the finite loader through ``_dataloader`` on ranks that own training data.
+    Actual restoration happens after model setup resolves the checkpoint iteration.
+    """
+    if not getattr(dataset_provider, 'supports_train_full_dataset', False):
+        raise ValueError(
+            "--train-full-dataset requires a dataset provider that declares "
+            "supports_train_full_dataset"
+        )
+    if args.train_iters is not None or args.train_samples is not None:
+        raise ValueError(
+            "--train-full-dataset cannot be combined with --train-iters or --train-samples"
+        )
+
+    train_data_iterator, _, _ = dataset_provider(None, restore_dataloader_state=False)
+    local_num_samples = (
+        len(train_data_iterator._dataloader)
+        if hasattr(train_data_iterator, '_dataloader')
+        else None
+    )
+    total_num_samples = reduce_max_stat_across_model_parallel_group(
+        _reduce_sum_across_data_parallel_group(
+            local_num_samples,
+            with_context_parallel=getattr(
+                args, 'deduplicate_dataloader_across_context_parallel', False
+            ),
+        )
+    )
+    if total_num_samples is None:
+        raise ValueError("--train-full-dataset resolved to an empty training dataset")
+    return int(total_num_samples)
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1614,6 +1657,8 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    cfg_container.validate()
+
     callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
@@ -1646,11 +1691,14 @@ def pretrain(
 
     timestamp_after_initialize_megatron = time.time()
 
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
+    set_run_config(cfg_container)
     timers = get_timers()
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
-    # set_jit_fusion_options() below, where program_start/main_entry/pretrain_entry
+    # kernel warmup below, where program_start/main_entry/pretrain_entry
     # and the other startup timestamps are all available -- see the block right
     # after those are extracted from _STARTUP_TIMESTAMPS.
 
@@ -1663,6 +1711,24 @@ def pretrain(
         append_to_progress_log(args.save, "Starting job")
 
     set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
+
+    # MIMO hands a per-module collection, which holds one ProcessGroupCollection
+    # per module and has no tp of its own. The cross-entropy warmup is vocab
+    # parallel, so it belongs to the language model's tensor-parallel group;
+    # a rank carrying only encoders warms its own module's shapes instead.
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        warmup_pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else next(iter(pg_collection))
+        )
+        warmup_tp_group = warmup_pg_collection.tp
+    elif pg_collection is not None:
+        warmup_tp_group = pg_collection.tp
+    else:
+        warmup_tp_group = mpu.get_tensor_model_parallel_group()
+    warmup_training_kernels(args, warmup_tp_group)
+    print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1874,39 +1940,10 @@ def pretrain(
     callback_manager.trigger("on_setup_start")
 
     if args.train_full_dataset:
-        if not getattr(
-            train_valid_test_dataset_provider, 'supports_train_full_dataset', False
-        ):
-            raise ValueError(
-                "--train-full-dataset requires a dataset provider that declares "
-                "supports_train_full_dataset"
-            )
-        if args.train_iters is not None or args.train_samples is not None:
-            raise ValueError(
-                "--train-full-dataset cannot be combined with --train-iters or --train-samples"
-            )
-
         # The scheduler must know the training horizon before model and optimizer setup.
-        # External multimodal providers expose the underlying finite loader through
-        # ``_dataloader`` even though their public iterator is cyclic.
-        args.iteration = 0
-        train_data_iterator, _, _ = train_valid_test_dataset_provider(None)
-        local_num_samples = (
-            len(train_data_iterator._dataloader)
-            if hasattr(train_data_iterator, '_dataloader')
-            else None
+        args.train_samples = _get_train_full_dataset_sample_count(
+            args, train_valid_test_dataset_provider
         )
-        total_num_samples = reduce_max_stat_across_model_parallel_group(
-            _reduce_sum_across_data_parallel_group(
-                local_num_samples,
-                with_context_parallel=getattr(
-                    args, 'deduplicate_dataloader_across_context_parallel', False
-                ),
-            )
-        )
-        if total_num_samples is None:
-            raise ValueError("--train-full-dataset resolved to an empty training dataset")
-        args.train_samples = int(total_num_samples)
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -2419,25 +2456,45 @@ def wrap_model_chunks_with_ddp(
                 )
 
     # Wrap each chunk.
+    # MFSDP v2 rejects ``disable_bucketing=True`` (see
+    # FullyShardedDataParallelV2._validate_config) and does not use the classic per-chunk
+    # disabling that the DDP/distributed-optimizer path relies on to size only the first
+    # chunk's parameter layout. Each VPP chunk is sharded independently over its own
+    # FsdpModule, so bucketing must stay enabled for every chunk; otherwise a multi-chunk
+    # (VPP) wrap sets ``disable_bucketing=True`` on non-first chunks and fails validation.
+    #
+    # For MFSDP v2 the adapter joins whatever FsdpContext is already active and only opens
+    # one when none is (see ``current_fully_shard_context``), so opening one ambient context
+    # around the loop below puts every chunk of this call on the same context, sharing
+    # communication streams and prefetch orders. This scope owns the single finalize call.
+    is_mfsdp_v2 = (
+        DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
+    ) and ddp_config.megatron_fsdp_version == 2
+    construction_context = (
+        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+        if is_mfsdp_v2
+        else nullcontext()
+    )
     wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
-    ):
-        chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-            chunk_kwargs["pg_collection"] = pg_collection
-        if layout is not None:
-            chunk_kwargs["full_param_layout"] = layout
-        wrapped.append(
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
+    with construction_context:
+        for chunk, layout, disable_bucketing in zip(
+            model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+        ):
+            chunk_kwargs = {}
+            # TorchFSDP takes process_group, not pg_collection.
+            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+                chunk_kwargs["pg_collection"] = pg_collection
+            if layout is not None:
+                chunk_kwargs["full_param_layout"] = layout
+            wrapped.append(
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=chunk,
+                    disable_bucketing=False if is_mfsdp_v2 else disable_bucketing,
+                    **chunk_kwargs,
+                )
             )
-        )
     return wrapped
 
 
@@ -2847,6 +2904,8 @@ def setup_model_and_optimizer(
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -3637,6 +3696,9 @@ def training_log(
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -3837,6 +3899,8 @@ def training_log(
             main_pattern = parsed_pattern.main_pattern or ""
             mtp_pattern = parsed_pattern.mtp_pattern or ""
             main_moe_layers = main_pattern.count(Symbols.MOE)
+            # Hybrid hash counts select leading MoE positions, excluding MTP.
+            num_hash_layers = min(main_moe_layers, max(args.moe_num_hash_layers, 0))
             mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
             if parsed_pattern.mtp_num_depths > 0 and mtp_moe_layers_per_depth > 0:
                 mtp_moe_layers = (
@@ -3859,6 +3923,8 @@ def training_log(
             else:
                 raise ValueError(f"Invalid moe_layer_freq: {args.moe_layer_freq}")
             main_moe_layers = sum(moe_layer_pattern)
+            # Other stacks select hash routing by transformer-layer number.
+            num_hash_layers = sum(moe_layer_pattern[: max(args.moe_num_hash_layers, 0)])
             mtp_moe_layers = 0
             if args.mtp_num_layers and moe_layer_pattern[-1]:
                 mtp_moe_layers = 1 if args.mtp_use_repeated_layer else args.mtp_num_layers
@@ -3877,6 +3943,7 @@ def training_log(
             num_layers=layers,
             num_moe_layers=num_moe_layers,
             moe_layer_freq=args.moe_layer_freq,
+            num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
@@ -3920,10 +3987,10 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        should_prof_rank = (args.profile_ranks == [] or safe_get_rank() in args.profile_ranks)  # [] is all ranks
-        if args.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
+        should_prof_rank = (cfg.profiling.profile_ranks == [] or safe_get_rank() in cfg.profiling.profile_ranks)  # [] is all ranks
+        if cfg.profiling.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
-            base, ext = os.path.splitext(args.memory_snapshot_path)
+            base, ext = os.path.splitext(cfg.profiling.memory_snapshot_path)
             snapshot_filename = f"{base}_{rank}{ext}"
             torch.cuda.memory._dump_snapshot(snapshot_filename)
 
@@ -4471,6 +4538,9 @@ def post_training_step_callbacks(
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
     if args.train_sync_interval and iteration % args.train_sync_interval == 0:
@@ -4503,15 +4573,15 @@ def post_training_step_callbacks(
 
     # Profiling.
     if (
-        args.profile
-        and iteration == args.profile_step_end
-        and (len(args.profile_ranks) == 0 or
-             torch.distributed.get_rank() in args.profile_ranks)
+        (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
+        and iteration == cfg.profiling.profile_step_end
+        and (len(cfg.profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
         # Disable NVTX range when profiling ends.
-        if args.nvtx_ranges:
+        if cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(False)
-        if args.use_pytorch_profiler:
+        if cfg.profiling.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
             if prof.execution_trace_observer is not None:
@@ -4681,6 +4751,9 @@ def train(
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
     timers = get_timers()
 
     fault_injector_kwargs = {}
@@ -4994,12 +5067,11 @@ def train(
     prof = None
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
-        args.profile
-        and (len(args.profile_ranks) == 0 or
-             torch.distributed.get_rank() in args.profile_ranks)
-        and args.use_pytorch_profiler
+        cfg.profiling.use_pytorch_profiler
+        and (len(cfg.profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
-        if args.pytorch_profiler_collect_chakra:
+        if cfg.profiling.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
             et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
@@ -5011,14 +5083,14 @@ def train(
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
-                wait=max(args.profile_step_start - 1, 0),
-                warmup=1 if args.profile_step_start > 0 else 0,
-                active=args.profile_step_end - args.profile_step_start,
+                wait=max(cfg.profiling.profile_step_start - 1, 0),
+                warmup=1 if cfg.profiling.profile_step_start > 0 else 0,
+                active=cfg.profiling.profile_step_end - cfg.profiling.profile_step_start,
                 repeat=1,
             ),
             on_trace_ready=trace_handler,
-            record_shapes=args.pytorch_profiler_collect_shapes,
-            with_stack=args.pytorch_profiler_collect_callstack,
+            record_shapes=cfg.profiling.pytorch_profiler_collect_shapes,
+            with_stack=cfg.profiling.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
         )
         prof.start()
@@ -5080,18 +5152,18 @@ def train(
         # trace instead of accreting into a run-long one. Must be the first thing in
         # the pass so everything below nests under the current interval root.
         _maybe_reroot_otel_interval()
-        if (args.profile
-            and (len(args.profile_ranks) == 0 or
-                 torch.distributed.get_rank() in args.profile_ranks)):
+        if ((cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
+            and (len(cfg.profiling.profile_ranks) == 0 or
+                 torch.distributed.get_rank() in cfg.profiling.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.
-            if iteration == args.profile_step_start and args.nvtx_ranges:
+            if iteration == cfg.profiling.profile_step_start and cfg.profiling.nvtx_ranges:
                 configure_nvtx_profiling(True)
-            if args.use_pytorch_profiler:
+            if cfg.profiling.use_pytorch_profiler:
                 prof.step()
-            elif iteration == args.profile_step_start:
+            elif iteration == cfg.profiling.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                if args.record_shapes:
-                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
+                if cfg.profiling.record_shapes:
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=cfg.profiling.record_shapes)
                     nsys_nvtx_context.__enter__()
 
         # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
@@ -5816,19 +5888,11 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1].clamp(min=1)
-                            val = val.mean()
-                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
-                            val /= torch.distributed.get_world_size(group=eval_dp_cp_group)
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else :
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
-                            total_loss_dict[key] += val
+                        # Preserve loss sums and valid-token counts across microbatches,
+                        # DP/CP ranks, and iterations. SFT masks can make counts unequal.
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(val, group=eval_dp_cp_group)
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
@@ -5874,7 +5938,7 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / denominator.clamp(min=1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
