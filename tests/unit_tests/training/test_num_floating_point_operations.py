@@ -12,6 +12,7 @@ from megatron.training.training import num_floating_point_operations
 def _make_args(**overrides):
     args = SimpleNamespace(
         attention_output_gate=True,
+        decoder_seq_length=None,
         experimental_attention_variant="gdn",
         ffn_hidden_size=16,
         group_query_attention=True,
