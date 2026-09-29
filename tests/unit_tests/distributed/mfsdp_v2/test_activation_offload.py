@@ -6,7 +6,6 @@ Run under torchrun; use multiple GPUs to exercise distributed sharding.
 This isolates attention offload; it does not exercise MoE/HybridEP or paged stash.
 """
 
-import gc
 from collections.abc import Iterator
 
 import pytest
@@ -28,20 +27,16 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def _reset_offload():
-    torch.cuda.synchronize()
-    PipelineOffloadManager.reset_instance()
-    gc.collect()
-
-
 @pytest.fixture(scope="function")
 def offload_pg_collection(distributed_setup) -> Iterator[ProcessGroupCollection]:
     """Set up model parallelism and clean up offload state after each case."""
     # Run the shared setup first so DBuffer's symmetric-memory queries cannot
     # lock in the default backend before the rest of this bucket selects NCCL.
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    # Keep the singleton's warmup caches and offload statistics local to each test.
+    PipelineOffloadManager.reset_instance()
     yield ProcessGroupCollection.use_mpu_process_groups()
-    _reset_offload()
+    PipelineOffloadManager.reset_instance()
     Utils.destroy_model_parallel()
     # Utils clears MCore references but leaves some c10d groups alive (#6897).
     # Release their NCCL communicators while preserving the default group.
@@ -54,7 +49,6 @@ def _build_model(
     pg_collection: ProcessGroupCollection, *, offload: bool
 ) -> tuple[FullyShardedDataParallel, MegatronOptimizer]:
     """Build an identically initialized model and optimizer for each offload setting."""
-    _reset_offload()
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
     config = MLATransformerConfig(
