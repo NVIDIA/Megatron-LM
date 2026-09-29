@@ -656,6 +656,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "deterministic cuDNN attention backward is also exercised by packed CP2 strict replay.",
+    ),
+    KernelEntry(
         name="csa_teacher_lse",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
@@ -678,8 +692,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
-        "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
-        "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+        "test_dsv4_packed_cp.py adds strict BF16 full-width attention/indexer replay for "
+        "ratios 0/4/128, plus numerical CP parity; this is not full-model CP qualification.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

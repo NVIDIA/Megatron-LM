@@ -268,6 +268,7 @@ def compute_cp_indexer_topk(
     topk_width: int,
     indexer_softmax_scale: float,
     max_seqlen_q: int,
+    deterministic: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
@@ -305,6 +306,7 @@ def compute_cp_indexer_topk(
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
+        deterministic=deterministic,
     )
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 

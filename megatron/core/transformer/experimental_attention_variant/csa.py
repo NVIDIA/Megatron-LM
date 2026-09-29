@@ -1119,6 +1119,7 @@ class CompressedSparseAttention(MegatronModule):
                 sparse_loss=self.config.dsa_indexer_use_sparse_loss,
                 kv_offset=compressed_offset,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1140,6 +1141,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.indexer.index_topk,
                 self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
@@ -1157,6 +1159,7 @@ class CompressedSparseAttention(MegatronModule):
                 flat_indices,
                 self.softmax_scale,
                 topk_length=flat_topk_length,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
         else:
@@ -1174,7 +1177,12 @@ class CompressedSparseAttention(MegatronModule):
 
             nvtx_range_push("sparse_attn_kernel")
             output = csa_sparse_attn(
-                query, kv_full, self.attn_sink.float(), flat_indices, self.softmax_scale
+                query,
+                kv_full,
+                self.attn_sink.float(),
+                flat_indices,
+                self.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1571,6 +1579,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.index_topk,
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
+                    deterministic=self.config.deterministic_mode,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
@@ -1679,6 +1688,7 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_rs_state,
                 self.window_size,
                 kv_reconstruction_parts,
+                self.config.deterministic_mode,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
@@ -1699,6 +1709,7 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=topk_length,
             kv_reconstruction_parts=kv_reconstruction_parts,
             q_padding_mask=q_padding_mask,
+            deterministic=self.config.deterministic_mode,
         )
         if training_with_grad and indexer is not None:
             # Zero loss or a pack without compressed keys still needs explicit
