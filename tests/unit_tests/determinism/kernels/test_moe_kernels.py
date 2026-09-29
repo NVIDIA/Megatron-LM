@@ -441,6 +441,85 @@ class TestMoEModules:
             build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
         )
 
+    @pytest.mark.skipif(
+        not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 parameter storage needs Blackwell",
+    )
+    def test_mxfp8_training_stack_replays(self):
+        """The training value pass re-quantizes TE MXFP8 weights bit-exactly on every forward.
+
+        Unlike the load-time conversion generation uses, this runs every step, so a
+        nondeterministic dequantize or quantize would move the logprobs between two
+        identical forwards.
+        """
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        seeded()
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+        num_experts = 4
+        module = torch.nn.Module()
+        module.num_local_experts = num_experts
+        module.linear_fc1 = torch.nn.Module()
+        for expert in range(num_experts):
+            weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+            setattr(
+                module.linear_fc1,
+                f"weight{expert}",
+                torch.nn.Parameter(quantizer(weight), requires_grad=False),
+            )
+
+        def build_stack(_unused):
+            stack = InferenceGroupedMLP._mxfp8_training_stack(module, "linear_fc1", "triton")
+            return stack.data.view(torch.uint8), stack.scale.view(torch.uint8)
+
+        # The stack is derived from the module's parameters, not from an argument; the
+        # placeholder keeps the harness's call convention.
+        assert_replays_bit_exact(
+            build_stack,
+            (torch.zeros(1, device="cuda"),),
+            backward=False,
+            what="MXFP8 training-stack quantization",
+        )
+
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_inference_kernel_value_pass_replays(self, backend):
+        """``moe_inference_training_forward``: value pass, recompute and backward replay.
+
+        The value pass runs the inference expert kernel and the backward comes from
+        the TE recompute, so this covers both kernels and the switch between them in
+        one fwd+bwd. The NCCL dispatcher only: the NVLS arm depends on a symmetric
+        heap that is process-wide state, which a replay harness cannot reset.
+        """
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+        )
+        from tests.unit_tests.inference.test_inference_training_forward import (
+            _build_layer,
+            _config,
+            _hidden,
+            _skip_unless_supported,
+        )
+
+        _skip_unless_supported(backend, "nccl")
+        self._init(ep=Utils.world_size)
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
+        seeded()
+        config = _config(
+            inference_grouped_gemm_backend=backend,
+            inference_moe_token_dispatcher_type="nccl",
+            moe_inference_training_forward=True,
+        )
+        layer = _build_layer(config)
+        hidden = _hidden(config, seed=1, tokens=512).requires_grad_()
+        with deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                layer, (hidden,), replays=3, contention=True, what=f"value pass[{backend}]"
+            )
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])
     def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser):
