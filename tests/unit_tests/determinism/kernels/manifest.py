@@ -357,7 +357,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates.",
+        "histogram accumulation and bias updates. Fused aux loss uses TE's "
+        "fixed-order reduction when explicitly requested or torch deterministic algorithms is enabled; "
+        "the default atomic branch is a negative control.",
     ),
     KernelEntry(
         name="moe_router",
@@ -365,9 +367,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+            "tests/unit_tests/transformer/moe/test_aux_loss.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
+        "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
