@@ -28,6 +28,11 @@ from megatron.core.activations import squared_relu
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    disable_batch_invariant_mode,
+    enable_batch_invariant_mode,
+)
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -45,6 +50,12 @@ NUM_EXPERTS = 16
 # difference that topk=8 can.
 ROUTER_TOPK = 8
 LOCAL_TOKENS = 8
+# Generation decodes a few tokens per rank while a training forward takes a whole
+# microbatch, so RL parity rests on a token's output not depending on how many
+# others shared the launch. Every other test here uses one count on both sides and
+# so cannot see that.
+GEN_TOKENS = 8
+TRAIN_TOKEN_COUNTS = (512, 2048)
 
 pytestmark = [
     pytest.mark.internal,
@@ -367,3 +378,198 @@ class TestSymmetricHeapSizing:
         with torch.no_grad():
             out, _ = layer(_hidden(config, seed=0, tokens=self.LARGE))
         assert torch.isfinite(out).all()
+
+
+def _install_te_mxfp8_expert_params(layer):
+    """Put the expert weights in TE MXFP8 storage, the way ``fp8_param`` does.
+
+    By hand rather than through ``config.fp8`` because the code under test reads
+    the storage on the live parameters rather than the config --
+    ``_expert_params_use_te_mxfp8`` asks ``_has_mxfp8_storage`` of each weight.
+    Setting the config flags instead would additionally put the whole layer,
+    attention and projections included, into fp8 autocast, which is a much larger
+    change than the one being tested and would make a failure hard to attribute
+    to the expert weight path.
+
+    Deterministic, so calling it on two layers holding equal BF16 weights leaves
+    them holding equal MXFP8 ones.
+    """
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    experts = layer.experts
+    for linear_name in ("linear_fc1", "linear_fc2"):
+        linear = getattr(experts, linear_name)
+        for i in range(experts.num_local_experts):
+            weight = getattr(linear, f"weight{i}")
+            setattr(
+                linear,
+                f"weight{i}",
+                torch.nn.Parameter(quantizer(weight.data.to(torch.bfloat16)), requires_grad=False),
+            )
+
+
+def _mxfp8_layer_pair(gen_config, train_config, max_tokens=LOCAL_TOKENS):
+    """Generation and training layers holding the same weights, in their own MXFP8 forms.
+
+    The asymmetry is the point of the parity claim. Generation converts once at
+    load, replacing TE's MXFP8 parameters with MCore ``MXFP8Tensor``s. Training
+    keeps the TE ones and re-derives the stacks from them every forward.
+    """
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+    gen_layer = _build_layer(gen_config, for_inference=True, max_tokens=max_tokens).eval()
+    train_layer = _build_layer(train_config).eval()
+    # Before either conversion, while the parameters still hold plain BF16: once
+    # generation's runs it has deleted the nn.Parameters this reads.
+    _copy_expert_weights(gen_layer, train_layer)
+    _install_te_mxfp8_expert_params(gen_layer)
+    _install_te_mxfp8_expert_params(train_layer)
+    assert train_layer.experts._expert_params_use_te_mxfp8(), (
+        "the training layer is not on the MXFP8 branch, so this test would compare the "
+        "concatenated-weights path instead and pass without covering anything"
+    )
+    quantize_model_to_mxfp8(gen_layer, backend="triton")
+    return gen_layer, train_layer
+
+
+class TestMxfp8TrainGenParity:
+    """(2b) The value pass reproduces generation bitwise from MXFP8 weights.
+
+    The BF16 test above cannot see the part that differs under MXFP8: generation
+    holds MCore ``MXFP8Tensor``s quantized once at load, while training holds TE's
+    parameters and quantizes into a scratch stack on every forward. Nothing checks
+    that those land on the same bits except this, and
+    ``test_mxfp8_utils.test_training_mxfp8_stack_matches_generation``, which
+    compares the two helper functions on a stub and never builds a layer, runs a
+    forward, or exercises the kernel selection and routing the weights feed.
+
+    What this still does not cover, and should be read as excluded rather than
+    implied: the refit. Both layers here start from the same TE MXFP8 parameters,
+    whereas in RL generation's weights arrive over the wire as BF16 slices and are
+    quantized on the receiver. The training pass quantizes the whole local
+    parameter instead, and MXFP8 scales are per 32-element block, so the two need
+    not land on the same bits. That asymmetry needs its own test.
+    """
+
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_training_forward_matches_generation_forward(self, backend, dispatcher):
+        _skip_unless_supported(backend, dispatcher)
+        gen_config, train_config = _generation_and_training_configs(backend, dispatcher)
+        gen_layer, train_layer = _mxfp8_layer_pair(gen_config, train_config)
+
+        hidden = _hidden(train_config, seed=1)
+        with torch.no_grad(), InferenceMode.active():
+            gen_out, _ = gen_layer(hidden)
+        with torch.no_grad():
+            train_out, _ = train_layer(hidden)
+
+        differing = _elements_that_differ(train_out, gen_out)
+        assert differing == 0, (
+            f"mxfp8 train/gen parity broken on {backend}/{dispatcher}: "
+            f"{differing}/{train_out.numel()} elements differ. Same weights and the same "
+            "kernel, so this is the quantization route or the stacked layout, not rounding"
+        )
+
+
+@pytest.fixture
+def batch_invariant():
+    """Batch-invariant mode, which is global kernel patching: on before any layer is built,
+    off again afterwards, or it would silently change the next test."""
+    enable_batch_invariant_mode(backend="te_native")
+    yield
+    disable_batch_invariant_mode()
+
+
+class TestMxfp8TokenCountParity:
+    """Does a token's MXFP8 expert output depend on how many tokens shared the launch?
+
+    The other parity tests hand both sides the same token count, so they cannot see
+    this. In RL they never match: generation decodes a few tokens per step and the
+    training log-prob pass takes a whole microbatch. Parity then holds only if the
+    kernel's result for a token is independent of batch size, which is a property
+    of tile selection and of how the tokens land in each expert's group, not of the
+    weights.
+
+    Two comparisons, so a failure says which side moved:
+
+    * generation wide vs generation chunked -- the kernel alone. A mismatch here
+      means the kernel is not batch-invariant, whatever the training path does.
+    * training wide vs generation chunked -- the production case.
+
+    Batch-invariant mode only. That is what the recipe runs, and without it the
+    router alone is allowed to wobble with batch size.
+    """
+
+    @staticmethod
+    def _configs(backend):
+        try:
+            return _generation_and_training_configs(
+                backend,
+                "nvls",
+                attention_backend=AttnBackend.flash,
+                flash_attention_version=3,
+                attention_dropout=0.0,
+                batch_invariant_mode=True,
+                batch_invariant_backend="te_native",
+            )
+        except (ValueError, AssertionError, ImportError) as error:
+            pytest.skip(f"batch-invariant mode is unavailable in this environment: {error}")
+
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_training_forward_matches_chunked_generation(self, backend, batch_invariant):
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+        )
+
+        _skip_unless_supported(backend, "nvls")
+        if backend == "torch" and not HAVE_DEEPGEMM_BF16:
+            # Production does not need this: it reaches the MXFP8 branch through
+            # fp8_param. This test installs MXFP8 on the parameters without the
+            # config flags, so the config asks for a DeepGEMM the real recipe never uses.
+            pytest.skip("batch-invariant torch experts need DeepGEMM bf16 grouped-GEMM bindings")
+
+        gen_config, train_config = self._configs(backend)
+        # The symmetric heap is sized once, for the widest forward either side will
+        # make; the training pass reuses generation's rather than growing it.
+        gen_layer, train_layer = _mxfp8_layer_pair(
+            gen_config, train_config, max_tokens=max(TRAIN_TOKEN_COUNTS)
+        )
+
+        results = []
+        for count in TRAIN_TOKEN_COUNTS:
+            hidden = _hidden(train_config, seed=count, tokens=count)
+            with torch.no_grad(), InferenceMode.active():
+                gen_wide, _ = gen_layer(hidden)
+                gen_chunked = torch.cat(
+                    [
+                        gen_layer(hidden[start : start + GEN_TOKENS])[0]
+                        for start in range(0, count, GEN_TOKENS)
+                    ],
+                    dim=0,
+                )
+            with torch.no_grad():
+                train_wide, _ = train_layer(hidden)
+            results.append(
+                (
+                    count,
+                    _elements_that_differ(gen_wide, gen_chunked),
+                    _elements_that_differ(train_wide, gen_chunked),
+                )
+            )
+
+        # Asserted after every count has run, so one failure does not hide the
+        # numbers for the others.
+        for count, kernel_differs, production_differs in results:
+            assert kernel_differs == 0, (
+                f"{backend}: generation output depends on batch size at {count} vs "
+                f"{GEN_TOKENS} tokens ({kernel_differs} elements differ). The kernel is not "
+                "batch-invariant, independent of the training path."
+            )
+            assert production_differs == 0, (
+                f"{backend}: training at {count} tokens differs from generation at "
+                f"{GEN_TOKENS} ({production_differs} elements differ) although the kernel "
+                "itself is batch-invariant."
+            )

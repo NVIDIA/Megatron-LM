@@ -1027,11 +1027,94 @@ class TestPermuteAndQuantizeMxfp8:
             ), f"Offset {i}={offs[i].item()} not aligned to {alignment}"
 
 
-def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
+def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features, num_experts=1):
     linear = torch.nn.Module()
-    weight = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
-    linear.weight0 = torch.nn.Parameter(quantizer(weight), requires_grad=False)
+    for expert in range(num_experts):
+        weight = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        setattr(linear, f"weight{expert}", torch.nn.Parameter(quantizer(weight), requires_grad=False))
     return linear
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameter storage requires Blackwell",
+)
+def test_training_mxfp8_stack_matches_generation():
+    """The training value pass must quantize to the bits generation would have used.
+
+    Generation converts once at load: ``quantize_model_to_mxfp8`` replaces each
+    TE parameter with an MCore ``MXFP8Tensor``, which ``_stack_mxfp8_linear_weight``
+    then stacks. Training cannot do that -- the conversion deletes the
+    ``nn.Parameter`` it replaces -- so ``_mxfp8_training_stack`` re-derives the
+    same stack from the live parameters every forward.
+
+    The claim is that both take the same route (dequantize the TE storage, then
+    ``MXFP8Tensor.from_bf16``) and therefore land on the same bits. This is the
+    whole basis for MXFP8 train/generation parity, and it is not obviously true:
+    the two read the parameter through different helpers, and the conversion
+    dequantizes ``val`` where the training helper dequantizes ``val.data``.
+    Bitwise, because the point is reproducing generation exactly rather than
+    approximating it.
+
+    Only the Triton backend is exercised: ``resolve_mxfp8_backend`` maps every
+    grouped-GEMM backend -- torch, vLLM and FlashInfer alike -- onto MCore's
+    canonical Triton/cuBLAS layout, so it is the only value this helper can be
+    called with.
+    """
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    backend = "triton"
+    num_experts = 4
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+
+    def stub():
+        # Same weights on both routes: seeded so the two stubs draw identically.
+        torch.manual_seed(1234)
+        module = torch.nn.Module()
+        module.num_local_experts = num_experts
+        module.linear_fc1 = _make_te_mxfp8_expert_linear(quantizer, 128, 256, num_experts)
+        return module
+
+    # Training: quantize the live TE parameters, leaving them in place.
+    training = InferenceGroupedMLP._mxfp8_training_stack(stub(), "linear_fc1", backend)
+
+    # Generation: convert the parameters first, then stack what is left behind.
+    generation_module = stub()
+    quantize_model_to_mxfp8(generation_module, backend=backend)
+    generation = InferenceGroupedMLP._stack_mxfp8_linear_weight(
+        generation_module, "linear_fc1", backend
+    )
+
+    # Synchronize before comparing: a quantize kernel that failed to launch
+    # reports asynchronously, and without this the two routes would compare
+    # equal on buffers neither kernel wrote.
+    torch.cuda.synchronize()
+
+    # Compared as bytes. Both fields are single-byte types, and the scale is
+    # E8M0 on the Triton backend -- an exponent-only format with no arithmetic,
+    # which torch.testing.assert_close cannot subtract. Reinterpreting is also
+    # the literal reading of "bitwise", so this is the comparison the claim
+    # wants rather than a way around the dtype.
+    def as_bytes(tensor):
+        return tensor if tensor.dtype == torch.uint8 else tensor.view(torch.uint8)
+
+    assert training.data.dtype == generation.data.dtype
+    assert training.scale.dtype == generation.scale.dtype
+    assert training.data.shape == generation.data.shape
+    assert training.scale.shape == generation.scale.shape
+    # A mismatch here means the value pass feeds the kernel different weights
+    # than generation, which is the parity claim failing at its root.
+    torch.testing.assert_close(
+        as_bytes(training.data), as_bytes(generation.data), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        as_bytes(training.scale), as_bytes(generation.scale), atol=0, rtol=0
+    )
 
 
 @pytest.mark.launch_on_gb200
