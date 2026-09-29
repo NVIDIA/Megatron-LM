@@ -66,302 +66,462 @@ def _destroy_model_parallel():
             torch.distributed.destroy_process_group(group)
 
 
-class TestMcoreAdapterDense:
-    """Exercise a dense MCore transformer block over two data-parallel ranks."""
+@pytest.fixture
+def dense_process_group_collection(distributed_setup):
+    """Set up dense model parallelism and clean up its process groups afterward."""
+    Utils.initialize_model_parallel(1, 1)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_parallel_cuda_manual_seed(1234)
+    yield pg_collection
+    _destroy_model_parallel()
 
-    def setup_method(self):
-        Utils.initialize_model_parallel(1, 1)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
 
-    def teardown_method(self):
-        _destroy_model_parallel()
-
-    @pytest.mark.launch_on_gb200
-    @pytest.mark.skipif(
-        torch.cuda.get_device_capability()[0] < 10,
-        reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+)
+def test_mxfp8_parameters(dense_process_group_collection):
+    """The MCore adapter preserves MXFP8 parameters when FP8 gather is enabled."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=256,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
     )
-    def test_mxfp8_parameters(self, distributed_setup):
-        """The MCore adapter preserves MXFP8 parameters when FP8 gather is enabled."""
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            ffn_hidden_size=256,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            fp8="hybrid",
-            fp8_recipe="mxfp8",
-            fp8_param=True,
-        )
 
-        block = TransformerBlock(
-            config=config, spec=get_gpt_layer_with_transformer_engine_spec()
-        ).to(device="cuda", dtype=config.params_dtype)
-        model = FullyShardedDataParallel(
+    block = TransformerBlock(config=config, spec=get_gpt_layer_with_transformer_engine_spec()).to(
+        device="cuda", dtype=config.params_dtype
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            fp8_param_gather=True,
+        ),
+        module=block,
+        pg_collection=dense_process_group_collection,
+    )
+    # FSDP installs DTensor shards; check the parameters used for compute.
+    parameters = []
+    for module in model.module.modules():
+        if not isinstance(module, FsdpModule):
+            continue
+        for group in module.parameter_groups:
+            for parameter in group.fsdp_parameters:
+                parameters.append(parameter.unsharded)
+    assert any(isinstance(p, MXFP8Tensor) for p in parameters)
+
+
+def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(dense_process_group_collection):
+    """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
+
+    def initialize_to_constant(weight):
+        return torch.nn.init.constant_(weight, 0.25)
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        init_method=initialize_to_constant,
+        output_layer_init_method=initialize_to_constant,
+        # The FSDP adapter uses this flag to materialize and initialize meta parameters.
+        init_model_with_meta_device=True,
+    )
+    with torch.device("meta"):
+        meta_layer = TransformerLayer(
             config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                fp8_param_gather=True,
-            ),
-            module=block,
-            pg_collection=self.pg_collection,
+            submodules=get_gpt_layer_with_transformer_engine_spec().submodules,
+            layer_number=1,
+            add_layer_offset=False,
         )
-        # FSDP installs DTensor shards; check the parameters used for compute.
-        parameters = []
-        for module in model.module.modules():
-            if not isinstance(module, FsdpModule):
-                continue
-            for group in module.parameter_groups:
-                for parameter in group.fsdp_parameters:
-                    parameters.append(parameter.unsharded)
-        assert any(isinstance(p, MXFP8Tensor) for p in parameters)
+    meta_parameters = list(meta_layer.parameters())
+    assert meta_parameters
+    assert all(parameter.is_meta for parameter in meta_parameters)
 
-    def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
-        """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
+    wrapped = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=meta_layer,
+        fsdp_unit_modules=[TransformerLayer],
+        pg_collection=dense_process_group_collection,
+    )
 
-        def initialize_to_constant(weight):
-            return torch.nn.init.constant_(weight, 0.25)
+    assert isinstance(wrapped.module, FsdpModule)
 
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=16,
-            num_attention_heads=4,
-            init_method=initialize_to_constant,
-            output_layer_init_method=initialize_to_constant,
-            # The FSDP adapter uses this flag to materialize and initialize meta parameters.
-            init_model_with_meta_device=True,
-        )
-        with torch.device("meta"):
-            meta_layer = TransformerLayer(
-                config=config,
-                submodules=get_gpt_layer_with_transformer_engine_spec().submodules,
-                layer_number=1,
-                add_layer_offset=False,
-            )
-        meta_parameters = list(meta_layer.parameters())
-        assert meta_parameters
-        assert all(parameter.is_meta for parameter in meta_parameters)
+    parameters = dict(wrapped.module.named_parameters())
+    assert parameters
+    for name, parameter in parameters.items():
+        local_parameter = parameter.to_local()
 
-        wrapped = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-            ),
-            module=meta_layer,
-            fsdp_unit_modules=[TransformerLayer],
-            pg_collection=self.pg_collection,
+        # Some parameters use module-specific initializers, so only check those
+        # initialized by the configured init method.
+        if name.endswith("bias") or "layernorm" in name or "layer_norm" in name:
+            continue
+        torch.testing.assert_close(
+            local_parameter,
+            torch.full_like(local_parameter, 0.25),
+            rtol=0,
+            atol=0,
+            msg=f"{name} was not initialized to 0.25",
         )
 
-        assert isinstance(wrapped.module, FsdpModule)
 
-        parameters = dict(wrapped.module.named_parameters())
-        assert parameters
-        for name, parameter in parameters.items():
-            local_parameter = parameter.to_local()
+def test_wraps_fsdp_unit_modules_before_root(dense_process_group_collection):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    layer = _build_layer(config)
+    model = torch.nn.Sequential(layer, torch.nn.Linear(config.hidden_size, config.hidden_size))
+    model = model.to(device="cuda", dtype=config.params_dtype)
 
-            # Some parameters use module-specific initializers, so only check those
-            # initialized by the configured init method.
-            if name.endswith("bias") or "layernorm" in name or "layer_norm" in name:
-                continue
-            torch.testing.assert_close(
-                local_parameter,
-                torch.full_like(local_parameter, 0.25),
-                rtol=0,
-                atol=0,
-                msg=f"{name} was not initialized to 0.25",
-            )
+    wrapped = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=model,
+        fsdp_unit_modules=[TransformerLayer],
+        pg_collection=dense_process_group_collection,
+    )
 
-    def test_wraps_fsdp_unit_modules_before_root(self):
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
-        layer = _build_layer(config)
-        model = torch.nn.Sequential(layer, torch.nn.Linear(config.hidden_size, config.hidden_size))
-        model = model.to(device="cuda", dtype=config.params_dtype)
+    assert isinstance(wrapped.module, FsdpModule)
+    assert isinstance(wrapped.module[0], FsdpModule)
 
-        wrapped = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-            ),
-            module=model,
-            fsdp_unit_modules=[TransformerLayer],
-            pg_collection=self.pg_collection,
-        )
+    # Post-order wrapping gives the selected TransformerLayer its own parameter group;
+    # the root FSDP unit should own only the parameters of the remaining Linear module.
+    child_parameter_names = {
+        name
+        for group in wrapped.module[0].parameter_groups
+        for parameter in group.fsdp_parameters
+        for name in parameter.fqns
+    }
+    root_parameter_names = {
+        name
+        for group in wrapped.module.parameter_groups
+        for parameter in group.fsdp_parameters
+        for name in parameter.fqns
+    }
+    assert child_parameter_names
+    assert root_parameter_names == {"1.weight", "1.bias"}
 
-        assert isinstance(wrapped.module, FsdpModule)
-        assert isinstance(wrapped.module[0], FsdpModule)
 
-        # Post-order wrapping gives the selected TransformerLayer its own parameter group;
-        # the root FSDP unit should own only the parameters of the remaining Linear module.
-        child_parameter_names = {
-            name
-            for group in wrapped.module[0].parameter_groups
-            for parameter in group.fsdp_parameters
-            for name in parameter.fqns
-        }
-        root_parameter_names = {
-            name
-            for group in wrapped.module.parameter_groups
-            for parameter in group.fsdp_parameters
-            for name in parameter.fqns
-        }
-        assert child_parameter_names
-        assert root_parameter_names == {"1.weight", "1.bias"}
+def test_nccl_ub_enables_symmetric_memory(dense_process_group_collection, monkeypatch):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+        device="cuda", dtype=config.params_dtype
+    )
+    fully_shard_context_calls = []
+    original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
 
-    def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-        )
-        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
-            device="cuda", dtype=config.params_dtype
-        )
-        fully_shard_context_calls = []
-        original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
+    def record_fully_shard_context(*args, **kwargs):
+        fully_shard_context_calls.append(kwargs["use_symmetric_memory"])
+        return original_fully_shard_context(*args, **kwargs)
 
-        def record_fully_shard_context(*args, **kwargs):
-            fully_shard_context_calls.append(kwargs["use_symmetric_memory"])
-            return original_fully_shard_context(*args, **kwargs)
+    monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
+    FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+            nccl_ub=True,
+        ),
+        module=model,
+        pg_collection=dense_process_group_collection,
+    )
 
-        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
-        FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                data_parallel_sharding_strategy="optim_grads_params",
-                nccl_ub=True,
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
-        )
+    assert fully_shard_context_calls == [True]
 
-        assert fully_shard_context_calls == [True]
 
-    def test_build_train_and_step(self):
-        """Match eager training against an MFSDP v2 train-and-step sequence."""
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
-        reference_model = _build_block(config)
-        model = _build_block(config)
-        model.load_state_dict(reference_model.state_dict())
-        # The reference TransformerBlock cannot use the DistributedOptimizer path, which
-        # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
-        # every model chunk to expose ddp_config.
-        reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
-        )
+def test_build_train_and_step(dense_process_group_collection):
+    """Match eager training against an MFSDP v2 train-and-step sequence."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    reference_model = _build_block(config)
+    model = _build_block(config)
+    model.load_state_dict(reference_model.state_dict())
+    # The reference TransformerBlock cannot use the DistributedOptimizer path, which
+    # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
+    # every model chunk to expose ddp_config.
+    reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=model,
+        pg_collection=dense_process_group_collection,
+    )
 
-        reference_optimizer_config = OptimizerConfig(
+    reference_optimizer_config = OptimizerConfig(
+        optimizer="adam",
+        lr=1.0e-3,
+        weight_decay=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_distributed_optimizer=False,
+        # TODO(#7074): Exercise nonzero clipping after MFSDP v2 precision-aware
+        # clipping is fixed.
+        clip_grad=0.0,
+    )
+    reference_optimizer = get_megatron_optimizer(reference_optimizer_config, [reference_model])
+    optimizer = get_megatron_optimizer(
+        replace(
+            reference_optimizer_config,
+            use_precision_aware_optimizer=True,
+            # Exercise MFSDP v2's precision-aware optimizer with BF16 moment state.
+            exp_avg_dtype=torch.bfloat16,
+            exp_avg_sq_dtype=torch.bfloat16,
+        ),
+        [model],
+    )
+    assert isinstance(optimizer, FullyShardedOptimizer)
+    optimizer.reload_model_params()
+
+    steps = [
+        [
+            torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        for _ in range(10)
+    ]
+
+    def run(model, optimizer) -> torch.Tensor:
+        losses = []
+        for microbatches in steps:
+            optimizer.zero_grad(set_to_none=True)
+            microbatch_losses = []
+            for batch in microbatches:
+                output = model(hidden_states=batch, attention_mask=None)
+                loss = output.float().square().mean()
+                (loss / len(microbatches)).backward()
+                microbatch_losses.append(loss.detach())
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(torch.stack(microbatch_losses).mean())
+        return torch.stack(losses)
+
+    reference_losses = run(reference_model, reference_optimizer)
+    losses = run(model, optimizer)
+
+    for state in optimizer.optimizer.state.values():
+        assert state["exp_avg"].dtype == torch.bfloat16
+        assert state["exp_avg_sq"].dtype == torch.bfloat16
+    torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+
+
+def test_fused_sgd_casts_mismatched_grads(dense_process_group_collection):
+    """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            megatron_fsdp_main_params_dtype=torch.float32,
+            megatron_fsdp_main_grads_dtype=torch.bfloat16,
+        ),
+        module=_build_block(config),
+        pg_collection=dense_process_group_collection,
+    )
+    optimizer_config = OptimizerConfig(
+        optimizer="sgd",
+        lr=1.0e-3,
+        weight_decay=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_distributed_optimizer=False,
+        clip_grad=0.0,
+    )
+    optimizer = get_megatron_optimizer(optimizer_config, [model])
+
+    optimizer.zero_grad(set_to_none=True)
+    output = model(
+        hidden_states=torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16),
+        attention_mask=None,
+    )
+    output.float().square().mean().backward()
+
+    success, _, _ = optimizer.step()
+    assert success
+
+
+@pytest.mark.parametrize("use_precision_aware_optimizer", [False, True])
+def test_gradient_clipping_reaches_global_norm(
+    dense_process_group_collection, use_precision_aware_optimizer
+):
+    """MFSDP v2 reports the true global gradient norm and clips the gradients to it.
+
+    Main gradients are kept in the main-weight dtype so that clipping is measurable on
+    parameter.grad: _copy_model_grads_to_main_grads otherwise installs a dtype-cast copy
+    for non-precision-aware optimizers, clip_grad_norm scales that copy, and
+    step_with_ready_grads restores the original afterwards.
+    """
+    clip_grad = 1.0
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            megatron_fsdp_main_grads_dtype=torch.float32,
+        ),
+        module=_build_block(config),
+        pg_collection=dense_process_group_collection,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
             optimizer="adam",
             lr=1.0e-3,
             weight_decay=0.0,
             bf16=True,
             params_dtype=torch.bfloat16,
             use_distributed_optimizer=False,
-            # TODO(#7074): Exercise nonzero clipping after MFSDP v2 precision-aware
-            # clipping is fixed.
-            clip_grad=0.0,
-        )
-        reference_optimizer = get_megatron_optimizer(reference_optimizer_config, [reference_model])
-        optimizer = get_megatron_optimizer(
-            replace(
-                reference_optimizer_config,
-                use_precision_aware_optimizer=True,
-                # Exercise MFSDP v2's precision-aware optimizer with BF16 moment state.
-                exp_avg_dtype=torch.bfloat16,
-                exp_avg_sq_dtype=torch.bfloat16,
-            ),
-            [model],
-        )
-        assert isinstance(optimizer, FullyShardedOptimizer)
-        optimizer.reload_model_params()
+            clip_grad=clip_grad,
+            use_precision_aware_optimizer=use_precision_aware_optimizer,
+        ),
+        [model],
+    )
 
-        steps = [
-            [
-                torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-                for _ in range(2)
-            ]
-            for _ in range(10)
-        ]
+    def global_norm(local_tensors) -> float:
+        squared_norm = torch.zeros(1, dtype=torch.float32, device="cuda")
+        for local_tensor in local_tensors:
+            squared_norm += local_tensor.float().square().sum()
+        torch.distributed.all_reduce(squared_norm)
+        return squared_norm.sqrt().item()
 
-        def run(model, optimizer) -> torch.Tensor:
-            losses = []
-            for microbatches in steps:
-                optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = []
-                for batch in microbatches:
-                    output = model(hidden_states=batch, attention_mask=None)
-                    loss = output.float().square().mean()
-                    (loss / len(microbatches)).backward()
-                    microbatch_losses.append(loss.detach())
-                success, _, _ = optimizer.step()
-                assert success
-                losses.append(torch.stack(microbatch_losses).mean())
-            return torch.stack(losses)
+    optimizer.zero_grad(set_to_none=True)
+    output = model(
+        hidden_states=(
+            torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16)
+            .view(1, 1, -1)
+            .expand(8, 2, -1)
+            * (torch.distributed.get_rank() + 1)
+        ),
+        attention_mask=None,
+    )
+    output.float().square().sum().backward()
 
-        reference_losses = run(reference_model, reference_optimizer)
-        losses = run(model, optimizer)
+    parameters = [
+        parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
+    ]
+    assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
+    expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+    assert (
+        expected_pre_clip_norm > clip_grad
+    ), "Test gradients must exceed the clipping threshold to exercise clipping."
 
-        for state in optimizer.optimizer.state.values():
-            assert state["exp_avg"].dtype == torch.bfloat16
-            assert state["exp_avg_sq"].dtype == torch.bfloat16
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+    success, pre_clip_norm, _ = optimizer.step()
 
-    def test_fused_sgd_casts_mismatched_grads(self):
-        """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
+    assert success
+    torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
+    torch.testing.assert_close(
+        global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
+    )
+
+
+@pytest.fixture
+def cuda_graph_process_group_collection(distributed_setup):
+    """Yield process groups with TE RNG tracking, then reset graph state and groups."""
+    Utils.initialize_model_parallel(1, 1)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
+    yield pg_collection
+    # The wrappers store capture state globally. Reset it so the next test captures its
+    # own work instead of replaying this test's graph.
+    OptimizerCudaGraphWrapper.curr_iteration = 0
+    OptimizerCudaGraphWrapper.cuda_graph = None
+    OptimizerCudaGraphWrapper.result = None
+    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+    _destroy_model_parallel()
+
+
+def test_full_iteration_and_optimizer_cuda_graph_match_eager(cuda_graph_process_group_collection):
+    """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
+    eager_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    graph_config = replace(eager_config, cuda_graph_impl="full_iteration")
+
+    def build_model_and_optimizer(
+        config: TransformerConfig, enable_cuda_graph: bool
+    ) -> tuple[torch.nn.Module, FullyShardedOptimizer]:
+        model = _build_block(config)
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -369,66 +529,14 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
-                megatron_fsdp_main_params_dtype=torch.float32,
-                megatron_fsdp_main_grads_dtype=torch.bfloat16,
-            ),
-            module=_build_block(config),
-            pg_collection=self.pg_collection,
-        )
-        optimizer_config = OptimizerConfig(
-            optimizer="sgd",
-            lr=1.0e-3,
-            weight_decay=0.0,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            use_distributed_optimizer=False,
-            clip_grad=0.0,
-        )
-        optimizer = get_megatron_optimizer(optimizer_config, [model])
-
-        optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
-        )
-        output.float().square().mean().backward()
-
-        success, _, _ = optimizer.step()
-        assert success
-
-    @pytest.mark.parametrize("use_precision_aware_optimizer", [False, True])
-    def test_gradient_clipping_reaches_global_norm(self, use_precision_aware_optimizer):
-        """MFSDP v2 reports the true global gradient norm and clips the gradients to it.
-
-        Main gradients are kept in the main-weight dtype so that clipping is measurable on
-        parameter.grad: _copy_model_grads_to_main_grads otherwise installs a dtype-cast copy
-        for non-precision-aware optimizers, clip_grad_norm scales that copy, and
-        step_with_ready_grads restores the original afterwards.
-        """
-        clip_grad = 1.0
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
+                # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
+                # params. Capturable FusedAdam in the TE revision under test requires
+                # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
                 megatron_fsdp_main_grads_dtype=torch.float32,
+                megatron_fsdp_cuda_graph_mode=enable_cuda_graph,
             ),
-            module=_build_block(config),
-            pg_collection=self.pg_collection,
+            module=model,
+            pg_collection=cuda_graph_process_group_collection,
         )
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
@@ -438,619 +546,506 @@ class TestMcoreAdapterDense:
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 use_distributed_optimizer=False,
-                clip_grad=clip_grad,
-                use_precision_aware_optimizer=use_precision_aware_optimizer,
+                # TODO(#7074): Exercise nonzero clipping after MFSDP v2 precision-aware
+                # clipping is fixed.
+                clip_grad=0.0,
+                optimizer_cuda_graph=enable_cuda_graph,
+                use_precision_aware_optimizer=True,
+                # Exercise MFSDP v2's precision-aware optimizer with BF16 moment state.
+                exp_avg_dtype=torch.bfloat16,
+                exp_avg_sq_dtype=torch.bfloat16,
             ),
             [model],
         )
-
-        def global_norm(local_tensors) -> float:
-            squared_norm = torch.zeros(1, dtype=torch.float32, device="cuda")
-            for local_tensor in local_tensors:
-                squared_norm += local_tensor.float().square().sum()
-            torch.distributed.all_reduce(squared_norm)
-            return squared_norm.sqrt().item()
-
-        optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=(
-                torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16)
-                .view(1, 1, -1)
-                .expand(8, 2, -1)
-                * (torch.distributed.get_rank() + 1)
-            ),
-            attention_mask=None,
-        )
-        output.float().square().sum().backward()
-
-        parameters = [
-            parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
-        ]
-        assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
-        expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
-        assert (
-            expected_pre_clip_norm > clip_grad
-        ), "Test gradients must exceed the clipping threshold to exercise clipping."
-
-        success, pre_clip_norm, _ = optimizer.step()
-
-        assert success
-        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
-        torch.testing.assert_close(
-            global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
-        )
-
-
-class TestMcoreAdapterCudaGraph:
-    """Exercise MFSDP v2 full-iteration and optimizer CUDA graphs together."""
-
-    def setup_method(self):
-        Utils.initialize_model_parallel(1, 1)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
-
-    def teardown_method(self):
-        # The wrappers store capture state globally. Reset it so the next test captures its
-        # own work instead of replaying this test's graph.
-        OptimizerCudaGraphWrapper.curr_iteration = 0
-        OptimizerCudaGraphWrapper.cuda_graph = None
-        OptimizerCudaGraphWrapper.result = None
-        FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-        FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
-        FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
-        _destroy_model_parallel()
-
-    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self):
-        """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
-        eager_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=16,
-            num_attention_heads=4,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
-        graph_config = replace(eager_config, cuda_graph_impl="full_iteration")
-
-        def build_model_and_optimizer(
-            config: TransformerConfig, enable_cuda_graph: bool
-        ) -> tuple[torch.nn.Module, FullyShardedOptimizer]:
-            model = _build_block(config)
-            model = FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
-                    # params. Capturable FusedAdam in the TE revision under test requires
-                    # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
-                    megatron_fsdp_main_grads_dtype=torch.float32,
-                    megatron_fsdp_cuda_graph_mode=enable_cuda_graph,
-                ),
-                module=model,
-                pg_collection=self.pg_collection,
-            )
-            optimizer = get_megatron_optimizer(
-                OptimizerConfig(
-                    optimizer="adam",
-                    lr=1.0e-3,
-                    weight_decay=0.0,
-                    bf16=True,
-                    params_dtype=torch.bfloat16,
-                    use_distributed_optimizer=False,
-                    # TODO(#7074): Exercise nonzero clipping after MFSDP v2 precision-aware
-                    # clipping is fixed.
-                    clip_grad=0.0,
-                    optimizer_cuda_graph=enable_cuda_graph,
-                    use_precision_aware_optimizer=True,
-                    # Exercise MFSDP v2's precision-aware optimizer with BF16 moment state.
-                    exp_avg_dtype=torch.bfloat16,
-                    exp_avg_sq_dtype=torch.bfloat16,
-                ),
-                [model],
-            )
-            assert isinstance(optimizer, FullyShardedOptimizer)
-            optimizer.reload_model_params()
-            if enable_cuda_graph:
-                # The factory makes FusedAdam capturable, while training installs this wrapper.
-                optimizer.step = OptimizerCudaGraphWrapper(
-                    optimizer.step, cuda_graph_warmup_steps=1
-                )
-            return model, optimizer
-
-        # FullCudaGraphWrapper requires this keyword-only schedule callback signature.
-        def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
-            assert seq_length is None
-            assert not forward_only
-            microbatch_losses = []
-            for _ in range(num_microbatches):
-                batch = next(data_iterator[0])
-                # Pipeline schedules receive model chunks as a list, including with PP=1.
-                output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / num_microbatches).backward()
-                microbatch_losses.append({"loss": loss.detach()})
-            return microbatch_losses
-
-        steps = [
-            [
-                torch.randn(8, 2, eager_config.hidden_size, device="cuda", dtype=torch.bfloat16)
-                for _ in range(2)
-            ]
-            for _ in range(10)
-        ]
-
-        def run(model, optimizer, forward_backward) -> torch.Tensor:
-            losses = []
-            for microbatches in steps:
-                optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = forward_backward(
-                    model=[model],
-                    data_iterator=[iter([{"hidden_states": batch} for batch in microbatches])],
-                    num_microbatches=len(microbatches),
-                    # FullCudaGraphWrapper requires the production schedule arguments.
-                    seq_length=None,
-                    forward_only=False,
-                )
-                success, _, _ = optimizer.step()
-                assert success
-                losses.append(torch.stack([entry["loss"] for entry in microbatch_losses]).mean())
-            return torch.stack(losses)
-
-        eager_model, eager_optimizer = build_model_and_optimizer(
-            eager_config, enable_cuda_graph=False
-        )
-        graph_model, graph_optimizer = build_model_and_optimizer(
-            graph_config, enable_cuda_graph=True
-        )
-        graph_model.load_state_dict(eager_model.state_dict())
-
-        eager_losses = run(eager_model, eager_optimizer, forward_backward)
-        cuda_graph_forward_backward = FullCudaGraphWrapper(
-            forward_backward, cuda_graph_warmup_steps=1
-        )
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
-            graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
-
-        graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
-        assert graph_launches == 2 * (len(steps) - 1)
-        assert FullCudaGraphWrapper.cuda_graph["training"] is not None
-        # Verify that both runs use the requested BF16 moment state rather than silently
-        # allocating FP32 state, so the comparison isolates CUDA-graph execution.
-        for optimizer in (eager_optimizer, graph_optimizer):
-            for state in optimizer.optimizer.state.values():
-                assert state["exp_avg"].dtype == torch.bfloat16
-                assert state["exp_avg_sq"].dtype == torch.bfloat16
-        torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
-
-
-class TestMcoreAdapterExpertParallel:
-    """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
-
-    def setup_method(self):
-        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if self.world_size < 2 or self.world_size % 2:
-            pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
-        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        assert self.pg_collection.ep.size() == 2
-        assert self.pg_collection.expt_dp.size() == self.world_size // 2
-        self.reference_group = torch.distributed.new_group(
-            [torch.distributed.get_rank()], use_local_synchronization=True
-        )
-        self.reference_pg_collection = ProcessGroupCollection(
-            tp=self.reference_group,
-            expt_tp=self.reference_group,
-            cp=self.reference_group,
-            pp=self.reference_group,
-            tp_cp=self.reference_group,
-            tp_dp_cp=self.reference_group,
-            ep=self.reference_group,
-            tp_ep=self.reference_group,
-            expt_dp=self.reference_group,
-            dp=self.reference_group,
-            dp_cp=self.reference_group,
-            embd=None,
-            pos_embd=None,
-        )
-        model_parallel_cuda_manual_seed(1234)
-
-    def teardown_method(self):
-        _destroy_model_parallel()
-
-    def test_build_train_step_and_clip(self):
-        """Shard experts over expert-DP and clip their combined gradients."""
-        # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
-        # initialization instead uses the globally configured EP=2 rank in its RNG seed.
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            expert_model_parallel_size=2,
-            moe_layer_freq=[0, 1],
-            moe_token_dispatcher_type="alltoall",
-            moe_router_topk=2,
-            moe_grouped_gemm=True,
-            moe_ffn_hidden_size=128,
-            add_bias_linear=False,
-            use_cpu_initialization=True,
-            params_dtype=torch.float32,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            gradient_accumulation_fusion=False,
-            attention_backend=AttnBackend.unfused,
-        )
-        # Pair CPU initialization with an explicit common seed for the reference and EP model.
-        torch.manual_seed(123)
-        reference_config = replace(config, expert_model_parallel_size=1)
-        reference_model = HybridModel(
-            config=reference_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=8,
-            hybrid_layer_pattern="*E",
-            pg_collection=self.reference_pg_collection,
-        ).cuda()
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=8,
-            hybrid_layer_pattern="*E",
-            pg_collection=self.pg_collection,
-        ).cuda()
-        model.load_state_dict(reference_model.state_dict(), strict=False)
-        for model_layer, reference_layer in zip(
-            model.decoder.layers, reference_model.decoder.layers
-        ):
-            if not isinstance(model_layer, MoETransformerLayer):
-                continue
-            for fc in ("linear_fc1", "linear_fc2"):
-                model_fc = getattr(model_layer.mlp.experts, fc)
-                reference_fc = getattr(reference_layer.mlp.experts, fc)
-                for local, global_ in enumerate(model_layer.mlp.local_expert_indices):
-                    for parameter_name in ("weight", "bias"):
-                        model_parameter = getattr(model_fc, f"{parameter_name}{local}", None)
-                        reference_parameter = getattr(
-                            reference_fc, f"{parameter_name}{global_}", None
-                        )
-                        if model_parameter is not None:
-                            model_parameter.data.copy_(reference_parameter.data)
-        reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                fsdp_all_gather_in_start_param_sync=False,
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
-        )
-        assert isinstance(model.module, FsdpModule)
-        assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
-
-        optimizer_config = OptimizerConfig(
-            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
-        )
-        reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-        optimizer = get_megatron_optimizer(optimizer_config, [model])
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
+        if enable_cuda_graph:
+            # The factory makes FusedAdam capturable, while training installs this wrapper.
+            optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
+        return model, optimizer
 
-        local_batch_size = 2
-        torch.manual_seed(4321)
-        input_ids = torch.randint(0, 128, (self.world_size * local_batch_size, 8), device="cuda")
-        position_ids = torch.arange(8, device="cuda").repeat(self.world_size * local_batch_size, 1)
-        targets = torch.randn(self.world_size * local_batch_size, 8, 128, device="cuda")
-        input_slice = slice(
-            torch.distributed.get_rank() * local_batch_size,
-            (torch.distributed.get_rank() + 1) * local_batch_size,
-        )
-        reference_losses = []
-        for _ in range(5):
-            reference_optimizer.zero_grad(set_to_none=True)
-            reference_loss = torch.nn.functional.mse_loss(
-                reference_model(
-                    input_ids=input_ids, position_ids=position_ids, attention_mask=None
-                ),
-                targets,
-            )
-            reference_loss.backward()
-            reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
-            assert reference_success
-            assert (
-                reference_pre_clip_norm > optimizer_config.clip_grad
-            ), "Reference gradients must exceed the clipping threshold to exercise clipping."
-            reference_losses.append(reference_loss.detach())
+    # FullCudaGraphWrapper requires this keyword-only schedule callback signature.
+    def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
+        assert seq_length is None
+        assert not forward_only
+        microbatch_losses = []
+        for _ in range(num_microbatches):
+            batch = next(data_iterator[0])
+            # Pipeline schedules receive model chunks as a list, including with PP=1.
+            output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
+            loss = output.float().square().mean()
+            (loss / num_microbatches).backward()
+            microbatch_losses.append({"loss": loss.detach()})
+        return microbatch_losses
 
+    steps = [
+        [
+            torch.randn(8, 2, eager_config.hidden_size, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        for _ in range(10)
+    ]
+
+    def run(model, optimizer, forward_backward) -> torch.Tensor:
         losses = []
-        for _ in range(5):
+        for microbatches in steps:
             optimizer.zero_grad(set_to_none=True)
-            loss = torch.nn.functional.mse_loss(
-                model(
-                    input_ids=input_ids[input_slice],
-                    position_ids=position_ids[input_slice],
-                    attention_mask=None,
-                ),
-                targets[input_slice],
+            microbatch_losses = forward_backward(
+                model=[model],
+                data_iterator=[iter([{"hidden_states": batch} for batch in microbatches])],
+                num_microbatches=len(microbatches),
+                # FullCudaGraphWrapper requires the production schedule arguments.
+                seq_length=None,
+                forward_only=False,
             )
-            loss.backward()
             success, _, _ = optimizer.step()
             assert success
-            loss = loss.detach()
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
-            losses.append(loss)
-
-        losses = torch.stack(losses)
-        reference_losses = torch.stack(reference_losses)
-        if torch.distributed.get_rank() == 0:
-            logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
-            logger.info("MFSDP v2 EP reference loss curve: %s", reference_losses.tolist())
-        assert torch.isfinite(losses).all()
-        assert torch.isfinite(reference_losses).all()
-        assert losses[-1] < losses[0]
-        torch.testing.assert_close(losses, reference_losses)
-
-
-class TestMcoreAdapterHybrid:
-    """Exercise MFSDP v2 over a hybrid data-parallel domain (an outer DP axis)."""
-
-    def teardown_method(self):
-        _destroy_model_parallel()
-
-    @staticmethod
-    def _config() -> TransformerConfig:
-        return TransformerConfig(
-            num_layers=2,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
-
-    @staticmethod
-    def _train(config, instances, outer_strategy, steps=3, microbatches=1):
-        """Train over the already-initialized DP topology and return per-step losses.
-
-        With ``microbatches`` > 1 each step accumulates gradients, and every microbatch
-        but the last runs inside ``no_sync`` -- which is how MCore's schedules tell a
-        data-parallel wrapper which backward finalizes gradients.
-
-        ``instances`` must match what initialize_model_parallel was given: it selects the
-        adapter's mesh, while the process groups it maps onto come from the caller.
-        """
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                num_distributed_optimizer_instances=instances,
-                outer_dp_sharding_strategy=outer_strategy,
-            ),
-            module=_build_block(config),
-            pg_collection=pg_collection,
-        )
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                optimizer="sgd",
-                lr=1.0e-2,
-                weight_decay=0.0,
-                bf16=True,
-                params_dtype=torch.bfloat16,
-                use_distributed_optimizer=False,
-                clip_grad=0.0,
-            ),
-            [model],
-        )
-        losses = []
-        for step in range(steps):
-            optimizer.zero_grad(set_to_none=True)
-            step_losses = []
-            for index in range(microbatches):
-                # Only the last microbatch finalizes gradients, so it runs outside no_sync.
-                sync_context = (
-                    contextlib.nullcontext() if index == microbatches - 1 else model.no_sync()
-                )
-                with sync_context:
-                    # Rank-dependent but step-deterministic input, so every configuration
-                    # sees the same global batch however the domain is split. Microbatches
-                    # differ so that dropping any of them changes the result.
-                    hidden = torch.arange(
-                        1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
-                    ).view(1, 1, -1).expand(8, 2, -1) * (
-                        torch.distributed.get_rank() + 1 + step + index
-                    )
-                    loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
-                    loss.backward()
-                step_losses.append(loss.detach())
-            success, _, _ = optimizer.step()
-            assert success
-            # No update happens until optimizer.step(), so every microbatch in a step sees
-            # the same parameters; averaging them matches what train_step reports.
-            losses.append(torch.stack(step_losses).float().mean())
+            losses.append(torch.stack([entry["loss"] for entry in microbatch_losses]).mean())
         return torch.stack(losses)
 
-    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
-    def test_hybrid_placements(self, outer_strategy):
-        """The outer axis takes its strategy's placement; the inner axis stays ZeRO-3."""
-        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
-        config = self._config()
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                num_distributed_optimizer_instances=2,
-                outer_dp_sharding_strategy=outer_strategy,
-            ),
-            module=_build_block(config),
-            pg_collection=pg_collection,
+    eager_model, eager_optimizer = build_model_and_optimizer(eager_config, enable_cuda_graph=False)
+    graph_model, graph_optimizer = build_model_and_optimizer(graph_config, enable_cuda_graph=True)
+    graph_model.load_state_dict(eager_model.state_dict())
+
+    eager_losses = run(eager_model, eager_optimizer, forward_backward)
+    cuda_graph_forward_backward = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=1)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
+
+    graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
+    assert graph_launches == 2 * (len(steps) - 1)
+    assert FullCudaGraphWrapper.cuda_graph["training"] is not None
+    # Verify that both runs use the requested BF16 moment state rather than silently
+    # allocating FP32 state, so the comparison isolates CUDA-graph execution.
+    for optimizer in (eager_optimizer, graph_optimizer):
+        for state in optimizer.optimizer.state.values():
+            assert state["exp_avg"].dtype == torch.bfloat16
+            assert state["exp_avg_sq"].dtype == torch.bfloat16
+    torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
+
+
+@pytest.fixture
+def expert_and_reference_process_group_collections(distributed_setup):
+    """Yield EP=2 process groups and singleton reference groups, then clean them up."""
+    world_size = distributed_setup.world_size
+    if world_size < 2 or world_size % 2:
+        pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert pg_collection.ep.size() == 2
+    assert pg_collection.expt_dp.size() == world_size // 2
+    reference_group = torch.distributed.new_group(
+        [torch.distributed.get_rank()], use_local_synchronization=True
+    )
+    reference_pg_collection = ProcessGroupCollection(
+        tp=reference_group,
+        expt_tp=reference_group,
+        cp=reference_group,
+        pp=reference_group,
+        tp_cp=reference_group,
+        tp_dp_cp=reference_group,
+        ep=reference_group,
+        tp_ep=reference_group,
+        expt_dp=reference_group,
+        dp=reference_group,
+        dp_cp=reference_group,
+        embd=None,
+        pos_embd=None,
+    )
+    model_parallel_cuda_manual_seed(1234)
+    yield pg_collection, reference_pg_collection
+    _destroy_model_parallel()
+
+
+def test_build_train_step_and_clip(
+    expert_and_reference_process_group_collections, distributed_setup
+):
+    """Shard experts over expert-DP and clip their combined gradients."""
+    pg_collection, reference_pg_collection = expert_and_reference_process_group_collections
+    world_size = distributed_setup.world_size
+    # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
+    # initialization instead uses the globally configured EP=2 rank in its RNG seed.
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_layer_freq=[0, 1],
+        moe_token_dispatcher_type="alltoall",
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=128,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    # Pair CPU initialization with an explicit common seed for the reference and EP model.
+    torch.manual_seed(123)
+    reference_config = replace(config, expert_model_parallel_size=1)
+    reference_model = HybridModel(
+        config=reference_config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E",
+        pg_collection=reference_pg_collection,
+    ).cuda()
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E",
+        pg_collection=pg_collection,
+    ).cuda()
+    model.load_state_dict(reference_model.state_dict(), strict=False)
+    for model_layer, reference_layer in zip(model.decoder.layers, reference_model.decoder.layers):
+        if not isinstance(model_layer, MoETransformerLayer):
+            continue
+        for fc in ("linear_fc1", "linear_fc2"):
+            model_fc = getattr(model_layer.mlp.experts, fc)
+            reference_fc = getattr(reference_layer.mlp.experts, fc)
+            for local, global_ in enumerate(model_layer.mlp.local_expert_indices):
+                for parameter_name in ("weight", "bias"):
+                    model_parameter = getattr(model_fc, f"{parameter_name}{local}", None)
+                    reference_parameter = getattr(reference_fc, f"{parameter_name}{global_}", None)
+                    if model_parameter is not None:
+                        model_parameter.data.copy_(reference_parameter.data)
+    reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            fsdp_all_gather_in_start_param_sync=False,
+        ),
+        module=model,
+        pg_collection=pg_collection,
+    )
+    assert isinstance(model.module, FsdpModule)
+    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+
+    optimizer_config = OptimizerConfig(
+        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+    )
+    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
+    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    assert isinstance(optimizer, FullyShardedOptimizer)
+    optimizer.reload_model_params()
+
+    local_batch_size = 2
+    torch.manual_seed(4321)
+    input_ids = torch.randint(0, 128, (world_size * local_batch_size, 8), device="cuda")
+    position_ids = torch.arange(8, device="cuda").repeat(world_size * local_batch_size, 1)
+    targets = torch.randn(world_size * local_batch_size, 8, 128, device="cuda")
+    input_slice = slice(
+        torch.distributed.get_rank() * local_batch_size,
+        (torch.distributed.get_rank() + 1) * local_batch_size,
+    )
+    reference_losses = []
+    for _ in range(5):
+        reference_optimizer.zero_grad(set_to_none=True)
+        reference_loss = torch.nn.functional.mse_loss(
+            reference_model(input_ids=input_ids, position_ids=position_ids, attention_mask=None),
+            targets,
         )
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
-        )
-        output.float().square().sum().backward()
+        reference_loss.backward()
+        reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
+        assert reference_success
+        assert (
+            reference_pre_clip_norm > optimizer_config.clip_grad
+        ), "Reference gradients must exceed the clipping threshold to exercise clipping."
+        reference_losses.append(reference_loss.detach())
 
-        expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
-        graded = [p for p in model.parameters() if p.grad is not None]
-        assert graded, "no gradients to inspect"
-        for parameter in graded:
-            assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-            assert parameter.grad.placements == (expected_outer, Shard(0))
-
-    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
-    def test_hybrid_matches_single_instance_accumulating(self, outer_strategy):
-        """Splitting the DP domain must not change the math under gradient accumulation.
-
-        HSDP/HFSDP keep the DP-outer axis Partial between microbatches and reduce it on
-        the last backward, so the adapter has to mark the earlier ones through no_sync.
-        When it does not, every backward finalizes that axis and the accumulation buffer
-        is dropped, leaving only the last microbatch's gradient: the losses then drift
-        away from the single-instance reference within a couple of steps.
-        """
-        config = self._config()
-        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
-        reference = self._train(config, instances=1, outer_strategy="no_shard", microbatches=2)
-        _destroy_model_parallel()
-
-        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
-        hybrid = self._train(config, instances=2, outer_strategy=outer_strategy, microbatches=2)
-        assert torch.isfinite(reference).all()
-        torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
-
-    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
-    def test_hybrid_matches_single_instance(self, outer_strategy):
-        """Splitting the DP domain must not change the math: same losses as one instance."""
-        config = self._config()
-        # The instance count is fixed by initialize_model_parallel, so comparing two
-        # topologies means initializing twice. teardown_method destroys the second.
-        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
-        reference = self._train(config, instances=1, outer_strategy="no_shard")
-        _destroy_model_parallel()
-
-        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
-        hybrid = self._train(config, instances=2, outer_strategy=outer_strategy)
-        assert torch.isfinite(reference).all()
-        torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
-
-    @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
-    @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
-    def test_moe_with_independent_hybrid_placements(
-        self, dense_outer_strategy, expert_outer_strategy
-    ):
-        """Dense and expert parameters use different placements on the same hybrid mesh."""
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size < 4 or world_size % 4:
-            pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
-
-        Utils.initialize_model_parallel(
-            1, 1, expert_model_parallel_size=2, num_distributed_optimizer_instances=2
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(1234)
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            expert_model_parallel_size=2,
-            moe_layer_freq=[0, 1],
-            moe_token_dispatcher_type="alltoall",
-            moe_router_topk=2,
-            moe_grouped_gemm=True,
-            moe_ffn_hidden_size=128,
-            add_bias_linear=False,
-            use_cpu_initialization=True,
-            params_dtype=torch.float32,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            gradient_accumulation_fusion=False,
-            attention_backend=AttnBackend.unfused,
-        )
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                num_distributed_optimizer_instances=2,
-                outer_dp_sharding_strategy=dense_outer_strategy,
-                expert_outer_dp_sharding_strategy=expert_outer_strategy,
-            ),
-            module=HybridModel(
-                config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
-                vocab_size=128,
-                max_sequence_length=8,
-                hybrid_layer_pattern="*E",
-                pg_collection=pg_collection,
-            ).cuda(),
-            pg_collection=pg_collection,
-        )
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                optimizer="sgd",
-                lr=1.0e-3,
-                weight_decay=0.0,
-                use_distributed_optimizer=False,
-                clip_grad=0.0,
-            ),
-            [model],
-        )
-
+    losses = []
+    for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
-        input_ids = torch.randint(0, 128, (2, 8), device="cuda")
-        position_ids = torch.arange(8, device="cuda").repeat(2, 1)
-        output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
-        output.float().square().mean().backward()
+        loss = torch.nn.functional.mse_loss(
+            model(
+                input_ids=input_ids[input_slice],
+                position_ids=position_ids[input_slice],
+                attention_mask=None,
+            ),
+            targets[input_slice],
+        )
+        loss.backward()
         success, _, _ = optimizer.step()
         assert success
+        loss = loss.detach()
+        torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+        losses.append(loss)
 
-        mesh_dim_names = {
-            parameter.grad.device_mesh.mesh_dim_names
-            for parameter in model.parameters()
-            if parameter.grad is not None
-        }
-        assert mesh_dim_names == {("dp_outer", "dp_shard")}
+    losses = torch.stack(losses)
+    reference_losses = torch.stack(reference_losses)
+    if torch.distributed.get_rank() == 0:
+        logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
+        logger.info("MFSDP v2 EP reference loss curve: %s", reference_losses.tolist())
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(reference_losses).all()
+    assert losses[-1] < losses[0]
+    torch.testing.assert_close(losses, reference_losses)
 
-        dense_parameters = []
-        expert_parameters = []
-        for name, parameter in model.named_parameters():
-            if parameter.grad is None:
-                continue
-            # In this model, expert weights live under mlp.experts; router weights are dense.
-            if "experts" in name:
-                expert_parameters.append((name, parameter))
-            else:
-                dense_parameters.append((name, parameter))
-        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
-        for name, parameter in dense_parameters:
-            assert parameter.grad.placements == (dense_outer, Shard(0)), name
 
-        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
-        for name, parameter in expert_parameters:
-            assert parameter.grad.placements == (expert_outer, Shard(0)), name
+@pytest.fixture
+def model_parallel_cleanup(distributed_setup):
+    """Initialize distributed state and clean up the topology created by each test."""
+    yield
+    _destroy_model_parallel()
+
+
+def _hybrid_config() -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+
+
+def _train_hybrid(config, instances, outer_strategy, steps=3, microbatches=1):
+    """Train over the already-initialized DP topology and return per-step losses.
+
+    With ``microbatches`` > 1 each step accumulates gradients, and every microbatch
+    but the last runs inside ``no_sync`` -- which is how MCore's schedules tell a
+    data-parallel wrapper which backward finalizes gradients.
+
+    ``instances`` must match what initialize_model_parallel was given: it selects the
+    adapter's mesh, while the process groups it maps onto come from the caller.
+    """
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_parallel_cuda_manual_seed(1234)
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            num_distributed_optimizer_instances=instances,
+            outer_dp_sharding_strategy=outer_strategy,
+        ),
+        module=_build_block(config),
+        pg_collection=pg_collection,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer="sgd",
+            lr=1.0e-2,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        ),
+        [model],
+    )
+    losses = []
+    for step in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        step_losses = []
+        for index in range(microbatches):
+            # Only the last microbatch finalizes gradients, so it runs outside no_sync.
+            sync_context = (
+                contextlib.nullcontext() if index == microbatches - 1 else model.no_sync()
+            )
+            with sync_context:
+                # Rank-dependent but step-deterministic input, so every configuration
+                # sees the same global batch however the domain is split. Microbatches
+                # differ so that dropping any of them changes the result.
+                hidden = torch.arange(
+                    1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+                ).view(1, 1, -1).expand(8, 2, -1) * (
+                    torch.distributed.get_rank() + 1 + step + index
+                )
+                loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
+                loss.backward()
+            step_losses.append(loss.detach())
+        success, _, _ = optimizer.step()
+        assert success
+        # No update happens until optimizer.step(), so every microbatch in a step sees
+        # the same parameters; averaging them matches what train_step reports.
+        losses.append(torch.stack(step_losses).float().mean())
+    return torch.stack(losses)
+
+
+@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+def test_hybrid_placements(model_parallel_cleanup, outer_strategy):
+    """The outer axis takes its strategy's placement; the inner axis stays ZeRO-3."""
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_parallel_cuda_manual_seed(1234)
+    config = _hybrid_config()
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            num_distributed_optimizer_instances=2,
+            outer_dp_sharding_strategy=outer_strategy,
+        ),
+        module=_build_block(config),
+        pg_collection=pg_collection,
+    )
+    output = model(
+        hidden_states=torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16),
+        attention_mask=None,
+    )
+    output.float().square().sum().backward()
+
+    expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
+    graded = [p for p in model.parameters() if p.grad is not None]
+    assert graded, "no gradients to inspect"
+    for parameter in graded:
+        assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+        assert parameter.grad.placements == (expected_outer, Shard(0))
+
+
+@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+def test_hybrid_matches_single_instance_accumulating(model_parallel_cleanup, outer_strategy):
+    """Splitting the DP domain must not change the math under gradient accumulation.
+
+    HSDP/HFSDP keep the DP-outer axis Partial between microbatches and reduce it on
+    the last backward, so the adapter has to mark the earlier ones through no_sync.
+    When it does not, every backward finalizes that axis and the accumulation buffer
+    is dropped, leaving only the last microbatch's gradient: the losses then drift
+    away from the single-instance reference within a couple of steps.
+    """
+    config = _hybrid_config()
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
+    reference = _train_hybrid(config, instances=1, outer_strategy="no_shard", microbatches=2)
+    _destroy_model_parallel()
+
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+    hybrid = _train_hybrid(config, instances=2, outer_strategy=outer_strategy, microbatches=2)
+    assert torch.isfinite(reference).all()
+    torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
+
+
+@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+def test_hybrid_matches_single_instance(model_parallel_cleanup, outer_strategy):
+    """Splitting the DP domain must not change the math: same losses as one instance."""
+    config = _hybrid_config()
+    # The instance count is fixed by initialize_model_parallel, so comparing two
+    # topologies means initializing twice. The model_parallel_cleanup fixture destroys the second.
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
+    reference = _train_hybrid(config, instances=1, outer_strategy="no_shard")
+    _destroy_model_parallel()
+
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+    hybrid = _train_hybrid(config, instances=2, outer_strategy=outer_strategy)
+    assert torch.isfinite(reference).all()
+    torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
+
+
+@pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
+@pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+def test_moe_with_independent_hybrid_placements(
+    model_parallel_cleanup, dense_outer_strategy, expert_outer_strategy
+):
+    """Dense and expert parameters use different placements on the same hybrid mesh."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < 4 or world_size % 4:
+        pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
+
+    Utils.initialize_model_parallel(
+        1, 1, expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    torch.manual_seed(123)
+    model_parallel_cuda_manual_seed(1234)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_layer_freq=[0, 1],
+        moe_token_dispatcher_type="alltoall",
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=128,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            num_distributed_optimizer_instances=2,
+            outer_dp_sharding_strategy=dense_outer_strategy,
+            expert_outer_dp_sharding_strategy=expert_outer_strategy,
+        ),
+        module=HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=pg_collection,
+        ).cuda(),
+        pg_collection=pg_collection,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer="sgd",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        ),
+        [model],
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+    input_ids = torch.randint(0, 128, (2, 8), device="cuda")
+    position_ids = torch.arange(8, device="cuda").repeat(2, 1)
+    output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+    output.float().square().mean().backward()
+    success, _, _ = optimizer.step()
+    assert success
+
+    mesh_dim_names = {
+        parameter.grad.device_mesh.mesh_dim_names
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    }
+    assert mesh_dim_names == {("dp_outer", "dp_shard")}
+
+    dense_parameters = []
+    expert_parameters = []
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        # In this model, expert weights live under mlp.experts; router weights are dense.
+        if "experts" in name:
+            expert_parameters.append((name, parameter))
+        else:
+            dense_parameters.append((name, parameter))
+    dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+    for name, parameter in dense_parameters:
+        assert parameter.grad.placements == (dense_outer, Shard(0)), name
+
+    expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+    for name, parameter in expert_parameters:
+        assert parameter.grad.placements == (expert_outer, Shard(0)), name
