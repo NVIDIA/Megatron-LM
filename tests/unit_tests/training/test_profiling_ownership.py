@@ -398,6 +398,7 @@ def test_training_log_memory_snapshot_without_profiling_args(
     from megatron.training import training
 
     args, config = cli_config("--log-interval", "1", "--micro-batch-size", "1")
+    run_config.logger.log_interval = 1
     run_config.profiling = config
     config.record_memory_history = enabled
     config.profile_ranks = ranks
