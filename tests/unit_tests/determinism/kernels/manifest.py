@@ -672,7 +672,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
         ),
-        tests=(K + "test_csa_packed_kernels.py",),
+        tests=(
+            K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+        ),
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
