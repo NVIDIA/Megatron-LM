@@ -35,12 +35,19 @@ COMPATIBILITY_FILES = (
     "tests/unit_tests/find_test_cases.py",
     "tests/unit_tests/testmon_selector.py",
     "tests/unit_tests/testmon_cache.py",
+    "tests/unit_tests/testmon_source_mapping.yml",
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
     "tests/test_utils/recipes/h100/unit-tests.yaml",
     "tests/test_utils/recipes/gb200/unit-tests.yaml",
 )
+SOURCE_MAPPING_FILE = "tests/unit_tests/testmon_source_mapping.yml"
+RECIPE_GLOB = "tests/test_utils/recipes/*/unit-tests.yaml"
+_SOURCE_IGNORE_DIRS = frozenset(
+    {"__pycache__", ".pytest_cache", ".git", ".tox", ".mypy_cache", ".nox"}
+)
+_SOURCE_IGNORE_SUFFIXES = frozenset({".pyc", ".pyo"})
 COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
 DATABASE_TABLES = {
     "metadata",
@@ -99,12 +106,192 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _load_yaml(path: Path):
+    """Load a YAML file, falling back to a minimal parser when PyYAML is unavailable."""
+    text = path.read_text()
+    try:
+        from yaml import safe_load
+
+        return safe_load(text)
+    except ImportError:
+        return _parse_mapping_yaml(text)
+
+
+def _parse_mapping_yaml(text: str) -> dict:
+    """Parse testmon_source_mapping.yml without PyYAML.
+
+    Handles only the block-style mapping format used by this file: a top-level
+    ``mappings`` key containing a sequence of rules with ``source_dirs`` and
+    ``test_buckets``.
+    """
+    mappings: list[dict] = []
+    rule: dict | None = None
+    section: str | None = None
+    platform: str | None = None
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip()
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        comment = stripped.find(" #")
+        if comment > 0:
+            stripped = stripped[:comment].rstrip()
+        if stripped == "mappings:":
+            continue
+        if stripped == "- source_dirs:":
+            rule = {"source_dirs": [], "test_buckets": {}}
+            mappings.append(rule)
+            section = "source_dirs"
+            platform = None
+        elif section == "source_dirs" and stripped.startswith("- "):
+            if rule is None:
+                raise ValueError(f"line {lineno}: list item outside a rule")
+            rule["source_dirs"].append(stripped[2:].strip())
+        elif stripped == "test_buckets:" and rule is not None:
+            section = "test_buckets"
+            platform = None
+        elif (
+            section == "test_buckets"
+            and stripped.endswith(":")
+            and not stripped.startswith("- ")
+            and rule is not None
+        ):
+            platform = stripped[:-1].strip()
+            rule["test_buckets"].setdefault(platform, [])
+        elif section == "test_buckets" and stripped.startswith("- ") and platform is not None:
+            if rule is None:
+                raise ValueError(f"line {lineno}: list item outside a rule")
+            rule["test_buckets"][platform].append(stripped[2:].strip())
+        else:
+            raise ValueError(f"line {lineno}: unexpected content in source mapping")
+    return {"mappings": mappings}
+
+
+def _discover_recipe_platforms(root: Path) -> frozenset[str]:
+    """Extract supported platform names from unit-test recipe files."""
+    platforms: set[str] = set()
+    for recipe in sorted(root.glob(RECIPE_GLOB)):
+        match = re.search(r"^\s+platforms:\s+(\S+)", recipe.read_text(), re.MULTILINE)
+        if match:
+            platforms.add(match.group(1))
+    if not platforms:
+        raise ValueError("no unit-test recipe platforms discovered")
+    return frozenset(platforms)
+
+
+def _validate_source_dir(root: Path, source_dir: str) -> Path:
+    """Validate and resolve a source directory path within the repository."""
+    if (
+        not source_dir
+        or "\0" in source_dir
+        or source_dir.startswith("/")
+        or ".." in source_dir.split("/")
+    ):
+        raise ValueError(f"unsafe source directory path: {source_dir!r}")
+    resolved = (root / source_dir).resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise ValueError(f"source directory escapes repository root: {source_dir!r}")
+    if (root / source_dir).is_symlink():
+        raise ValueError(f"source directory is a symlink: {source_dir!r}")
+    return resolved
+
+
+def _fingerprint_source_dirs(root: Path, source_dirs: list[str]) -> dict[str, str]:
+    """Recursively hash all files under the given source directories."""
+    root_resolved = root.resolve()
+    fingerprints: dict[str, str] = {}
+    for source_dir in sorted(set(source_dirs)):
+        resolved = _validate_source_dir(root, source_dir)
+        if not resolved.is_dir():
+            continue
+        for path in sorted(resolved.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            rel = path.relative_to(root_resolved)
+            if any(part in _SOURCE_IGNORE_DIRS for part in rel.parts):
+                continue
+            if path.suffix in _SOURCE_IGNORE_SUFFIXES:
+                continue
+            try:
+                fingerprints[str(rel)] = _digest(path)
+            except OSError as error:
+                raise ValueError(f"unreadable source file: {rel}") from error
+    return fingerprints
+
+
+def _load_source_mapping(root: Path, valid_platforms: frozenset[str] | None = None) -> list[dict]:
+    """Load and validate the source mapping configuration."""
+    path = root / SOURCE_MAPPING_FILE
+    if not path.is_file():
+        return []
+    data = _load_yaml(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"source mapping must be a YAML mapping: {path}")
+    mappings = data.get("mappings")
+    if mappings is None:
+        return []
+    if not isinstance(mappings, list):
+        raise ValueError(f"'mappings' must be a sequence: {path}")
+    if valid_platforms is None:
+        valid_platforms = _discover_recipe_platforms(root)
+    for i, rule in enumerate(mappings):
+        if not isinstance(rule, dict):
+            raise ValueError(f"mapping rule {i}: must be a mapping")
+        dirs = rule.get("source_dirs")
+        if not isinstance(dirs, list) or not dirs:
+            raise ValueError(f"mapping rule {i}: 'source_dirs' must be a non-empty list")
+        for d in dirs:
+            if not isinstance(d, str):
+                raise ValueError(f"mapping rule {i}: source directory must be a string")
+            _validate_source_dir(root, d)
+        buckets = rule.get("test_buckets")
+        if not isinstance(buckets, dict):
+            raise ValueError(f"mapping rule {i}: 'test_buckets' must be a mapping")
+        for platform_name, bucket_list in buckets.items():
+            if platform_name not in valid_platforms:
+                raise ValueError(
+                    f"mapping rule {i}: unknown platform {platform_name!r} "
+                    f"(discovered: {sorted(valid_platforms)})"
+                )
+            if not isinstance(bucket_list, list):
+                raise ValueError(f"mapping rule {i}: buckets for {platform_name!r} must be a list")
+    return mappings
+
+
+def _source_mapping_identity(
+    root: Path, bucket: str, recipe_platform: str, valid_platforms: frozenset[str] | None = None
+) -> dict | None:
+    """Compute source-mapping fingerprints for a bucket and platform.
+
+    Returns ``None`` when no mapping rules apply to this combination.
+    """
+    mappings = _load_source_mapping(root, valid_platforms)
+    if not mappings:
+        return None
+    matched_dirs: set[str] = set()
+    for rule in mappings:
+        platform_buckets = rule.get("test_buckets", {}).get(recipe_platform, [])
+        if bucket in platform_buckets:
+            matched_dirs.update(rule.get("source_dirs", []))
+    if not matched_dirs:
+        return None
+    return {
+        "source_dirs": sorted(matched_dirs),
+        "fingerprints": _fingerprint_source_dirs(root, sorted(matched_dirs)),
+    }
+
+
 def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
-    if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
-        raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
+    valid_platforms = _discover_recipe_platforms(root)
+    if recipe_platform not in valid_platforms:
+        raise ValueError(
+            f"unsupported Testmon platform: {recipe_platform} "
+            f"(discovered: {sorted(valid_platforms)})"
+        )
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
@@ -121,6 +308,9 @@ def cache_identity(
         "tag": "latest",
         "inputs": inputs,
     }
+    source_mapping = _source_mapping_identity(root, bucket, recipe_platform, valid_platforms)
+    if source_mapping is not None:
+        contract["source_mapping"] = source_mapping
     bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
     return {
         "compatibility": contract,

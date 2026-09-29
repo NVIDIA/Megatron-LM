@@ -39,7 +39,13 @@ def source_tree(tmp_path):
     ):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(name)
+        if name.endswith("unit-tests.yaml"):
+            platform = "dgx_h100" if "/h100/" in name else "dgx_gb200"
+            path.write_text(f"spec:\n  platforms: {platform}\nproducts: []\n")
+        elif name == cache.SOURCE_MAPPING_FILE:
+            path.write_text("mappings:\n")
+        else:
+            path.write_text(name)
     return root
 
 
@@ -439,3 +445,315 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
         check=False,
     )
     assert (result.returncode == 0) is allowed
+
+
+# ---------------------------------------------------------------------------
+# Source mapping tests
+# ---------------------------------------------------------------------------
+
+MAPPED_BUCKET = "tests/unit_tests/distributed/mfsdp_v2/**/*.py"
+UNMAPPED_BUCKET = "tests/unit_tests/models/**/*.py"
+
+
+def _write_mapping(root, mappings):
+    (root / cache.SOURCE_MAPPING_FILE).write_text(
+        yaml.dump({"mappings": mappings}, default_flow_style=False)
+    )
+
+
+def _make_mapped_source_tree(source_tree, *, bucket=MAPPED_BUCKET, platform="dgx_h100"):
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": ["megatron/core/mapped"],
+                "test_buckets": {platform: [bucket]},
+            }
+        ],
+    )
+    mapped = source_tree / "megatron/core/mapped"
+    mapped.mkdir(parents=True, exist_ok=True)
+    (mapped / "module.py").write_text("def func(): pass")
+    (mapped / "config.json").write_text('{"key": "value"}')
+    sub = mapped / "sub"
+    sub.mkdir()
+    (sub / "nested.c").write_text("int main() {}")
+    return source_tree
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["edit", "add", "delete", "rename", "remove_dir"],
+)
+def test_source_mapping_change_triggers_incompatible_identity(source_tree, mutation):
+    _make_mapped_source_tree(source_tree)
+    before = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert "source_mapping" in before["compatibility"]
+    mapped = source_tree / "megatron/core/mapped"
+    if mutation == "edit":
+        (mapped / "module.py").write_text("def func(): return 1")
+    elif mutation == "add":
+        (mapped / "new_file.rs").write_text("fn main() {}")
+    elif mutation == "delete":
+        (mapped / "config.json").unlink()
+    elif mutation == "rename":
+        (mapped / "module.py").rename(mapped / "renamed.py")
+    elif mutation == "remove_dir":
+        shutil.rmtree(mapped)
+    after = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert after["cache_prefix"] == before["cache_prefix"]
+    assert after["compatibility"] != before["compatibility"]
+    assert after["compatibility"]["source_mapping"] != before["compatibility"]["source_mapping"]
+
+
+def test_source_mapping_multiple_sources_and_platforms(source_tree):
+    (source_tree / "src/a").mkdir(parents=True)
+    (source_tree / "src/a/x.py").write_text("a")
+    (source_tree / "src/b").mkdir(parents=True)
+    (source_tree / "src/b/y.py").write_text("b")
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": ["src/a", "src/b"],
+                "test_buckets": {
+                    "dgx_h100": [MAPPED_BUCKET],
+                    "dgx_gb200": [BUCKET],
+                },
+            }
+        ],
+    )
+    h100 = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert set(h100["compatibility"]["source_mapping"]["source_dirs"]) == {"src/a", "src/b"}
+    gb200 = cache.cache_identity(source_tree, BUCKET, "dgx_gb200", IMAGE_ID)
+    assert set(gb200["compatibility"]["source_mapping"]["source_dirs"]) == {"src/a", "src/b"}
+
+
+def test_source_mapping_additive_duplicate_rules(source_tree):
+    (source_tree / "src/a").mkdir(parents=True)
+    (source_tree / "src/a/x.py").write_text("a")
+    (source_tree / "src/b").mkdir(parents=True)
+    (source_tree / "src/b/y.py").write_text("b")
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": ["src/a"],
+                "test_buckets": {"dgx_h100": [MAPPED_BUCKET]},
+            },
+            {
+                "source_dirs": ["src/b"],
+                "test_buckets": {"dgx_h100": [MAPPED_BUCKET]},
+            },
+        ],
+    )
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    sm = identity["compatibility"]["source_mapping"]
+    assert sorted(sm["source_dirs"]) == ["src/a", "src/b"]
+    assert "src/a/x.py" in sm["fingerprints"]
+    assert "src/b/y.py" in sm["fingerprints"]
+
+
+def test_source_mapping_unchanged_sources_preserve_identity(source_tree):
+    _make_mapped_source_tree(source_tree)
+    before = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    (source_tree / "megatron/core/ordinary.py").write_text("unrelated")
+    after = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert after["compatibility"]["source_mapping"] == before["compatibility"]["source_mapping"]
+
+
+def test_source_mapping_unrelated_source_preserves_identity(source_tree):
+    _make_mapped_source_tree(source_tree)
+    before = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    (source_tree / "megatron/core/mapped/module.py").write_text("changed")
+    after = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert after["compatibility"]["source_mapping"] != before["compatibility"]["source_mapping"]
+    unmapped_before = cache.cache_identity(source_tree, UNMAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert "source_mapping" not in unmapped_before["compatibility"]
+
+
+def test_source_mapping_omitted_platform(source_tree):
+    _make_mapped_source_tree(source_tree, platform="dgx_h100")
+    identity = cache.cache_identity(source_tree, BUCKET, "dgx_gb200", IMAGE_ID)
+    assert "source_mapping" not in identity["compatibility"]
+
+
+def test_source_mapping_empty_bucket_list(source_tree):
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": ["megatron/core"],
+                "test_buckets": {"dgx_h100": []},
+            }
+        ],
+    )
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert "source_mapping" not in identity["compatibility"]
+
+
+@pytest.mark.parametrize(
+    "content,error_fragment",
+    [
+        ("not_a_mapping", "source mapping must be a YAML mapping"),
+        ('mappings: "invalid"', "'mappings' must be a sequence"),
+        ("mappings:\n  - not_a_dict", "must be a mapping"),
+        ("mappings:\n  - source_dirs: []\n    test_buckets: {}", "non-empty list"),
+        (
+            "mappings:\n  - source_dirs: [src]\n    test_buckets:\n      fake_platform: []",
+            "unknown platform",
+        ),
+    ],
+)
+def test_source_mapping_invalid_config(source_tree, content, error_fragment):
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(content)
+    with pytest.raises(ValueError, match=error_fragment):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "../escape", "src/../../escape", "src/\x00bad"],
+)
+def test_source_mapping_unsafe_paths(source_tree, path):
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": [path],
+                "test_buckets": {"dgx_h100": [MAPPED_BUCKET]},
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="unsafe|escapes"):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_source_mapping_symlink_rejected(source_tree):
+    real = source_tree / "real_dir"
+    real.mkdir()
+    (real / "file.py").write_text("content")
+    link = source_tree / "link_dir"
+    link.symlink_to(real)
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": ["link_dir"],
+                "test_buckets": {"dgx_h100": [MAPPED_BUCKET]},
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_source_mapping_unreadable_file(source_tree):
+    _make_mapped_source_tree(source_tree)
+    unreadable = source_tree / "megatron/core/mapped/locked.bin"
+    unreadable.write_text("secret")
+    unreadable.chmod(0o000)
+    try:
+        with pytest.raises(ValueError, match="unreadable"):
+            cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    finally:
+        unreadable.chmod(0o644)
+
+
+def test_source_mapping_ignores_pycache_and_bytecode(source_tree):
+    _make_mapped_source_tree(source_tree)
+    mapped = source_tree / "megatron/core/mapped"
+    pycache = mapped / "__pycache__"
+    pycache.mkdir()
+    (pycache / "module.cpython-312.pyc").write_bytes(b"bytecode")
+    (mapped / "compiled.pyc").write_bytes(b"bytecode")
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    fps = identity["compatibility"]["source_mapping"]["fingerprints"]
+    assert not any("__pycache__" in k or k.endswith(".pyc") for k in fps)
+
+
+def test_source_mapping_baseline_comparison(source_tree):
+    _make_mapped_source_tree(source_tree)
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    directory = source_tree.parent / "assets_dir/testmon"
+    for phase in cache.PHASES:
+        path = directory / phase / ".testmondata"
+        path.parent.mkdir(parents=True)
+        database = DB(str(path))
+        database.con.close()
+        cache.record_phase(directory, phase)
+    cache.finalize(directory, identity, "b" * 40, "123-1")
+    manifest = cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
+    assert manifest["identity"]["source_mapping"] == identity["compatibility"]["source_mapping"]
+    (source_tree / "megatron/core/mapped/module.py").write_text("changed")
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    with pytest.raises(ValueError, match="compatibility"):
+        cache.validate_cache(directory, consumer, identity["cache_prefix"] + "123-1")
+
+
+def test_source_mapping_older_baseline_rejected(source_tree):
+    identity_old = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert "source_mapping" not in identity_old["compatibility"]
+    directory = source_tree.parent / "assets_dir/testmon"
+    for phase in cache.PHASES:
+        path = directory / phase / ".testmondata"
+        path.parent.mkdir(parents=True)
+        database = DB(str(path))
+        database.con.close()
+        cache.record_phase(directory, phase)
+    cache.finalize(directory, identity_old, "b" * 40, "123-1")
+    _make_mapped_source_tree(source_tree)
+    identity_new = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert "source_mapping" in identity_new["compatibility"]
+    with pytest.raises(ValueError, match="compatibility"):
+        cache.validate_cache(directory, identity_new, identity_old["cache_prefix"] + "123-1")
+
+
+def test_source_mapping_unmapped_bucket_unaffected(source_tree):
+    _make_mapped_source_tree(source_tree)
+    before = cache.cache_identity(source_tree, UNMAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert "source_mapping" not in before["compatibility"]
+    (source_tree / "megatron/core/mapped/module.py").write_text("changed")
+    after = cache.cache_identity(source_tree, UNMAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert before["compatibility"] == after["compatibility"]
+
+
+def test_discover_recipe_platforms(source_tree):
+    platforms = cache._discover_recipe_platforms(source_tree)
+    assert platforms == frozenset({"dgx_h100", "dgx_gb200"})
+
+
+def test_discover_recipe_platforms_empty(tmp_path):
+    with pytest.raises(ValueError, match="no unit-test recipe platforms"):
+        cache._discover_recipe_platforms(tmp_path)
+
+
+def test_parse_mapping_yaml_roundtrip():
+    text = (ROOT / cache.SOURCE_MAPPING_FILE).read_text()
+    from_yaml = yaml.safe_load(text)
+    from_fallback = cache._parse_mapping_yaml(text)
+    assert from_fallback == from_yaml
+
+
+def test_source_mapping_nonexistent_source_dir(source_tree):
+    _write_mapping(
+        source_tree,
+        [
+            {
+                "source_dirs": ["does/not/exist"],
+                "test_buckets": {"dgx_h100": [MAPPED_BUCKET]},
+            }
+        ],
+    )
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    sm = identity["compatibility"]["source_mapping"]
+    assert sm["source_dirs"] == ["does/not/exist"]
+    assert sm["fingerprints"] == {}
+
+
+def test_source_mapping_includes_all_file_types(source_tree):
+    _make_mapped_source_tree(source_tree)
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    fps = identity["compatibility"]["source_mapping"]["fingerprints"]
+    extensions = {Path(k).suffix for k in fps}
+    assert {".py", ".json", ".c"} <= extensions

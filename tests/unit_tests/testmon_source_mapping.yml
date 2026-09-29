@@ -1,0 +1,23 @@
+# Source-directory-to-test-bucket mappings for selective unit testing.
+#
+# Some execution paths (e.g. CUDA autograd callbacks) may not be recorded by
+# Testmon's tracing.  When any file under a mapped source directory changes,
+# the listed test buckets run in full regardless of Testmon's deselection.
+#
+# This supplements tracing only for mapped paths; it does not repair tracing.
+# Older baselines produced before these mappings existed may require
+# regeneration after this file is first introduced.
+#
+# Fields:
+#   source_dirs  - repository-relative directories to fingerprint recursively;
+#                  a change in ANY listed directory triggers ALL targets
+#   test_buckets - per-platform lists of unit-test bucket strings; each string
+#                  must match a recipe test_case value exactly; platform names
+#                  are discovered from tests/test_utils/recipes/*/unit-tests.yaml
+
+mappings:
+  - source_dirs:
+      - megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/distributed/mfsdp_v2/**/*.py
