@@ -586,8 +586,9 @@ class TestGPTModelTEQuantizationConfig:
         ("decoder.layers.0.mlp.experts", "mtp.layers.0.mtp_model_layer.mlp.experts"),
         ids=("decoder", "mtp"),
     )
-    def test_late_bf16_override_executes_basic_ops_under_mxfp8(
-        self, monkeypatch, experts_path
+    @pytest.mark.parametrize("late_override", (False, True), ids=("constructor", "late"))
+    def test_bf16_override_executes_basic_ops_under_mxfp8(
+        self, monkeypatch, record_property, experts_path, late_override
     ) -> None:
         """Full GPT construction must apply exact-path overrides to real expert ops."""
         import inspect
@@ -613,6 +614,20 @@ class TestGPTModelTEQuantizationConfig:
 
         monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         linear_paths = [f"{experts_path}.linear_fc{idx}" for idx in (1, 2)]
+        precision_recipe = RecipeConfig.from_config_dict(
+            {
+                "matchers": {
+                    path: {"type": "glob", "enabled": True, "pattern": path, "config": "bf16"}
+                    for path in linear_paths
+                },
+                "configs": {
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    }
+                },
+            }
+        )
         config = TransformerConfig(
             num_layers=1,
             hidden_size=128,
@@ -634,20 +649,7 @@ class TestGPTModelTEQuantizationConfig:
             fp8_param=False,
             moe_grouped_gemm=True,
             use_transformer_engine_op_fuser=True,
-            quant_recipe=RecipeConfig.from_config_dict(
-                {
-                    "matchers": {
-                        path: {"type": "glob", "enabled": True, "pattern": path, "config": "bf16"}
-                        for path in linear_paths
-                    },
-                    "configs": {
-                        "bf16": {
-                            "transformer_engine_config_type": "TEQuantizationParams",
-                            "training_recipe": {},
-                        }
-                    },
-                }
-            ),
+            quant_recipe=None if late_override else precision_recipe,
         )
         decoder_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
         model = GPTModel(
@@ -661,10 +663,25 @@ class TestGPTModelTEQuantizationConfig:
         ).cuda()
         modules = dict(model.named_modules())
         experts = modules[experts_path]
+        if late_override:
+            from megatron.core.quantization.utils import get_quant_config_or_none
+
+            # Exercise the post-construction finish_init contract independently of
+            # GPTModel's current constructor-name propagation.
+            for path in linear_paths:
+                assert modules[path].te_quant_params is None
+                modules[path].finish_init(get_quant_config_or_none(path, precision_recipe))
         for path in linear_paths:
             assert modules[path].te_quant_params is not None
             assert not modules[path].will_execute_quantized(True)
+        assert experts._with_fused_impl, "BF16 must remain on the TE ops path"
         original_params = dict(experts.named_parameters())
+        # Default GPT initialization yields tiny outputs for which a fixed absolute
+        # tolerance can hide accidental FP8 computation. Keep GEMM scales near one.
+        torch.manual_seed(456)
+        with torch.no_grad():
+            for weight in original_params.values():
+                weight.normal_(std=weight.shape[-1] ** -0.5)
 
         # Spy on real basic-op execution. A fused quantized kernel bypasses these calls,
         # while a lost override makes the recorded context True even without joint fusion.
@@ -676,9 +693,13 @@ class TestGPTModelTEQuantizationConfig:
             return real_fuser_forward(op, *args, **kwargs)
 
         monkeypatch.setattr(GroupedLinear, "fuser_forward", record_basic_op_context)
-        tokens_per_expert = torch.tensor([256, 256], dtype=torch.int64, device="cuda")
-        inputs = torch.randn(512, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-        probs = torch.rand(512, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        split_sizes = (256, 512)
+        tokens_per_expert = torch.tensor(split_sizes, dtype=torch.int64, device="cuda")
+        num_tokens = sum(split_sizes)
+        inputs = torch.randn(
+            num_tokens, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        probs = torch.rand(num_tokens, dtype=torch.bfloat16, device="cuda", requires_grad=True)
         reference_inputs = inputs.detach().clone().requires_grad_()
         reference_probs = probs.detach().clone().requires_grad_()
         reference_weights = {
@@ -688,8 +709,10 @@ class TestGPTModelTEQuantizationConfig:
 
         # Independent BF16 reference with the same per-expert weights and router scales.
         reference_outputs = []
-        for expert_idx in range(2):
-            rows = slice(256 * expert_idx, 256 * (expert_idx + 1))
+        offset = 0
+        for expert_idx, count in enumerate(split_sizes):
+            rows = slice(offset, offset + count)
+            offset += count
             projected = F.linear(
                 reference_inputs[rows], reference_weights[f"linear_fc1.weight{expert_idx}"]
             )
@@ -706,21 +729,36 @@ class TestGPTModelTEQuantizationConfig:
             output, bias = experts(inputs, tokens_per_expert, probs)
             assert FP8GlobalStateManager.is_fp8_enabled(), "The override leaked into its caller"
         assert bias is None
-        assert basic_op_contexts == [False, False]
-        torch.testing.assert_close(output, reference_output, rtol=2e-2, atol=2e-3)
+
+        def assert_bf16_close(actual, expected, label):
+            actual, expected = actual.detach(), expected.detach()
+            assert torch.isfinite(actual).all()
+            reference_rms = expected.float().square().mean().sqrt().clamp_min(1e-12)
+            relative_rms = (
+                actual.float() - expected.float()
+            ).square().mean().sqrt() / reference_rms
+            record_property(f"{label}_relative_rms", relative_rms.item())
+            assert (
+                relative_rms < 1e-2
+            ), f"{label}: BF16 relative RMS error {relative_rms.item():.6f}"
+            torch.testing.assert_close(
+                actual, expected, rtol=2e-2, atol=5e-3 * reference_rms.item()
+            )
+
+        assert_bf16_close(output, reference_output, "output")
 
         # Run backward outside autocast so its precision must come from the saved forward.
         grad_output = torch.randn_like(output)
         output.backward(grad_output)
         reference_output.backward(grad_output)
-        torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=2e-2, atol=2e-3)
-        torch.testing.assert_close(probs.grad, reference_probs.grad, rtol=2e-2, atol=2e-3)
+        assert_bf16_close(inputs.grad, reference_inputs.grad, "input_gradient")
+        assert_bf16_close(probs.grad, reference_probs.grad, "probability_gradient")
         for name, weight in experts.named_parameters():
             assert weight is original_params[name]
             assert weight.grad is not None
-            torch.testing.assert_close(
-                weight.grad, reference_weights[name].grad, rtol=2e-2, atol=2e-3
-            )
+            assert_bf16_close(weight.grad, reference_weights[name].grad, name)
+        # Keep this after numerical checks: a lost override must fail numerically too.
+        assert basic_op_contexts == [False, False]
 
     @pytest.mark.parametrize(
         ("transformer_impl", "recipe_storage"),
