@@ -91,7 +91,7 @@ class _TiedModel(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -101,7 +101,7 @@ def test_post_wrap_assign_true_load_raises(distributed_setup):
     checkpoint = nn.Linear(4, 4, bias=False, device=device).state_dict()
     model = nn.Linear(4, 4, bias=False, device=device)
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     with pytest.raises(RuntimeError, match=r"load_state_dict\(assign=True\)"):
         model.load_state_dict(checkpoint, assign=True)
@@ -117,8 +117,8 @@ def _build_sharded(
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
     with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
@@ -132,8 +132,8 @@ def _build_packed_sharded(
     """Shard a :class:`_PackedModel`, whose packing no canonical ``Shard(0)`` split describes."""
     model = _PackedModel().to(device=device)
     with fully_shard_context(device=device):
-        fully_shard(model.block, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.linear, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.block, mesh=mesh, placements=_default_placements())
+        fully_shard(model.linear, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(optimizer)
     return model, optimizer
@@ -154,7 +154,7 @@ def _build_tied_sharded(
             nn.init.zeros_(parameter)
     # A tied weight cannot belong to two FsdpModules, so the parent owns the whole group.
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(optimizer)
     return model, optimizer
@@ -298,10 +298,10 @@ def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Mod
 
 
 @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_checkpoint_roundtrip_flat_dp(
+def test_checkpoint_roundtrip_default_placements(
     distributed_setup, tmp_path_dist_ckpt: Path, param_dtype: torch.dtype
 ) -> None:
-    """Saving then loading a flat-DP sharded model+optimizer restores state bit-exactly.
+    """Saving then loading a sharded model+optimizer restores state bit-exactly.
 
     The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so with >=2
     ranks the per-rank shards do not tile like canonical ``Shard(0)`` (e.g. one rank owns no bias

@@ -73,7 +73,7 @@ jobs:
       is-maintainer: true
       source-sha: ${{ github.sha }}
       lts: false
-      timeout-minutes: 120
+      timeout-minutes: 180
       verify-cache: true
       publish-target-cache: true
 
