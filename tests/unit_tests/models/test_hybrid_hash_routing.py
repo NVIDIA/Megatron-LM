@@ -401,6 +401,34 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(
     assert torch.equal(decoder.kwargs["padding_mask"], padding_mask[:, :2])
 
 
+@pytest.mark.parametrize("pre_process", [True, False])
+@pytest.mark.parametrize("cuda_graph_impl,flash_decode", [("local", False), ("none", True)])
+def test_hybrid_preprocess_static_inference_without_token_ids(
+    pre_process, cuda_graph_impl, flash_decode
+):
+    hidden_states = torch.randn(4, 2, 8)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            sequence_parallel=False, cuda_graph_impl=cuda_graph_impl, flash_decode=flash_decode
+        ),
+        pre_process=pre_process,
+        position_embedding_type="none",
+        decoder=SimpleNamespace(input_tensor=hidden_states),
+    )
+    inference_context = SimpleNamespace(is_static_batching=lambda: True, sequence_len_offset=7)
+
+    with InferenceMode.active():
+        *_, sequence_len_offset, _ = HybridModel._preprocess(
+            model,
+            input_ids=None,
+            position_ids=None,
+            decoder_input=hidden_states if pre_process else None,
+            inference_context=inference_context,
+        )
+
+    torch.testing.assert_close(sequence_len_offset, torch.tensor([7, 7], dtype=torch.int32))
+
+
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
     moe = RecordingMoE()
     layer = SimpleNamespace(
