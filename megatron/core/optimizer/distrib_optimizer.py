@@ -6,6 +6,7 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
+from copy import deepcopy
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -73,6 +74,13 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+
+def _has_no_optimizer_load_state_dict_hooks(optimizer):
+    """Fail closed if PyTorch changes its private load-hook registries."""
+    pre_hooks = getattr(optimizer, "_optimizer_load_state_dict_pre_hooks", None)
+    post_hooks = getattr(optimizer, "_optimizer_load_state_dict_post_hooks", None)
+    return pre_hooks is not None and post_hooks is not None and not pre_hooks and not post_hooks
 
 
 class Range:
@@ -833,6 +841,47 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
         return dtype_map.get(key, torch.float32)
 
+    def _can_reuse_precision_aware_checkpoint_state(self):
+        """Whether the inner TE loader can be skipped without converting tensor state.
+
+        FP32 moments and masters (or raw int16 BF16 master remainders) need no
+        conversion. Require both the configured and actual optimizer representation.
+        Quantized primary parameters, custom subclasses, and load hooks retain the public loader.
+        Format-specific parameter-state restoration still runs in load_state_dict().
+        """
+        return (
+            USING_TE_OPTIMIZER
+            # Subclasses may depend on their own load_state_dict implementation.
+            and type(self.optimizer) is Adam
+            and self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config.exp_avg_dtype == torch.float32
+            and self.config.exp_avg_sq_dtype == torch.float32
+            and self.config.main_params_dtype == torch.float32
+            and getattr(self.optimizer, "master_weights", False)
+            and getattr(self.optimizer, "exp_avg_dtype", None) == torch.float32
+            and getattr(self.optimizer, "exp_avg_sq_dtype", None) == torch.float32
+            and getattr(self.optimizer, "master_weight_dtype", None) == torch.float32
+            and callable(self.init_state_fn)
+            and _has_no_optimizer_load_state_dict_hooks(self.optimizer)
+            # The CLI defaults to a delayed FP8 recipe even for BF16 training.
+            # Check actual primary storage instead of excluding that recipe.
+            and not any(
+                self._is_distopt_quantized_param(param) or is_nvfp4tensor(param)
+                for param in self.model_param_group_index_map
+            )
+        )
+
+    def _load_optimizer_param_groups_without_state(self, state_dict_param_groups):
+        """Restore already matched group metadata without recasting live TE state."""
+        restored_groups = deepcopy(state_dict_param_groups)
+        for current_group, restored_group in zip(
+            self.optimizer.param_groups, restored_groups, strict=True
+        ):
+            restored_group["params"] = current_group["params"]
+            if "param_names" in current_group and "param_names" not in restored_group:
+                restored_group["param_names"] = current_group["param_names"]
+        self.optimizer.param_groups = restored_groups
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -898,19 +947,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def load_state_dict(self, state_dict):
         """Load the state dict.
 
-        As detailed in state_dict(), the state dict contains all non-
-        parameter-related variables. This method is notably longer than
-        state_dict(), because the Torch optimizers state has yet to be
-        allocated at this point, and so we must do a cross referencing between
-        the optimizers state (and the ordering it expects for parameter state)
-        and this DP rank's shards. The optimizer at this point does not contain
-        any tensor dimension information, so we must get these dimensions from
-        the DP shards mapped during DistributedOptimizer.__init__().
+        Checkpoint loading can call this twice: first while constructing sharded
+        targets, then after DCP has read the checkpoint. Eligible precision-aware
+        TE optimizers allocate their final tensor state once and restore only group
+        metadata here, bypassing redundant reconstruction by the inner loader.
+        Other optimizers retain the public loader and, when needed, placeholders
+        sized from the DP shards mapped by DistributedOptimizer.__init__().
 
-        The tensor parameter state is loaded via load_parameter_state(), and
-        so this method also must populate the loaded state dict with dummy
-        tensor data (i.e., via torch.empty() below). This will be overwritten
-        during load_parameter_state().
+        Parameter-state restoration remains format-specific. dp_reshardable targets
+        can alias live TE state; fully_reshardable instead loads intermediate CPU
+        buffers and copies their slices through its parameter-state loader. Those
+        loaders still run below, or separately through load_parameter_state().
 
         ** Note: Torch optimizer's state structure. **
         The Torch optimizer stores its state in two levels. The top level is a
@@ -938,12 +985,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
+            elif self._can_reuse_precision_aware_checkpoint_state():
+                # Allocate final storage once, before building checkpoint targets.
+                self.init_state_fn(self.optimizer, self.config)
 
         # Get the Torch optimizer's state dict.
-        # - This 'inner' optimizer at this point is unallocated, and only
-        #   contains an integer ordering of parameters within each group, and
-        #   the ordering of parameters within its flattened parameter state
-        #   list.
+        # Its parameter indexes define the ordering expected by the inner loader,
+        # whether or not tensor state has already been initialized.
 
         # Pair each current param_group with its saved counterpart by identifier tuple.
         # Construction order isn't part of the checkpoint, so we match by a tuple of
@@ -1053,10 +1101,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
-        # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        # TE's public loader casts through PyTorch and then rebuilds the state.
+        # Avoid those copies for supported representations. Recheck eligibility:
+        # an initializer may have registered hooks or changed the representation.
+        if self._can_reuse_precision_aware_checkpoint_state():
+            self._load_optimizer_param_groups_without_state(state_dict_param_groups)
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
