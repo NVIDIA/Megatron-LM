@@ -817,10 +817,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=first_job_mock_metadata,
         ):
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
-        expected_loaded_metadata = {
-            **first_job_mock_metadata,
-            'checkpoint_version': 3.1,
-        }
+        expected_loaded_metadata = {**first_job_mock_metadata, 'checkpoint_version': 3.1}
 
         second_job_mock_metadata = {
             **base_metadata,
