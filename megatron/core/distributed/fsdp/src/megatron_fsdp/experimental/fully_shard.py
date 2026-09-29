@@ -121,7 +121,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    grad_divisor: int = 1,
+    grad_divisor: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
 ) -> None:
@@ -147,6 +147,10 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
+
+            For per-token loss, ``grad_divisor=1 / mesh.size()`` cancels mesh averaging
+            so gradients are summed. Normalize once by the global token count after
+            accumulating all microbatches and before clipping or updating weights.
         schedule_policy: Communication scheduling policy for this FSDP module.
         register_hooks: Whether to register the automatic forward and backward execution
             hooks on ``module``. Disable this when an external scheduler invokes the

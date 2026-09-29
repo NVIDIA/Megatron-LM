@@ -196,7 +196,7 @@ class FsdpModule:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: int = 1,
+        grad_divisor: float = 1.0,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,

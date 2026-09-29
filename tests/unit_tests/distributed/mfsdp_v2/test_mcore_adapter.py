@@ -3,6 +3,7 @@
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
 import contextlib
+import copy
 import logging
 import os
 from dataclasses import replace
@@ -15,8 +16,12 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
+)
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -30,6 +35,7 @@ from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapp
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -1054,3 +1060,212 @@ class TestMcoreAdapterHybrid:
         expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
         for name, parameter in expert_parameters:
             assert parameter.grad.placements == (expert_outer, Shard(0)), name
+
+
+class _TokenGradientExperts(MoELayer):
+    """Exercise the adapter's expert mesh without token-dispatch kernels."""
+
+    def __init__(self) -> None:
+        torch.nn.Module.__init__(self)
+        self.experts = torch.nn.Linear(8, 8, bias=False)
+        self.experts.weight.allreduce = False
+
+    def forward(self, value):
+        """Process this rank's expert inputs."""
+        return self.experts(value)
+
+
+class _TokenGradientModel(torch.nn.Module):
+    """Own root, child-unit, and expert parameters with different gradient layouts."""
+
+    def __init__(self, config: TransformerConfig, expert_rank: int) -> None:
+        super().__init__()
+        self.config = config
+        self.gain = torch.nn.Parameter(torch.ones(8))
+        torch.manual_seed(1234)
+        self.dense = torch.nn.Sequential(torch.nn.Linear(8, 8, bias=False), torch.nn.Tanh())
+        torch.manual_seed(4321 + expert_rank)
+        self.moe = _TokenGradientExperts()
+
+    def forward(self, value):
+        """Use all parameter groups, including on masked-out batches."""
+        return self.gain * self.moe(self.dense(value))
+
+
+def _clear_token_gradient_test_caches() -> None:
+    """Drop DTensor layouts that retain process groups across topology changes."""
+    DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding.cache_clear()
+    clear_cpp_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
+    if clear_cpp_cache is not None:
+        clear_cpp_cache()
+
+
+class TestMcoreAdapterTokenGradients:
+    """Compare normalization, clipping, and updates with an unsharded reference."""
+
+    def setup_method(self):
+        """Discard layouts referring to groups destroyed by an earlier test."""
+        _clear_token_gradient_test_caches()
+
+    def teardown_method(self):
+        """Release every model-parallel process group allocated by a test."""
+        _clear_token_gradient_test_caches()
+        _destroy_model_parallel()
+
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("per_token", [False, True], ids=["rank_mean", "token_mean"])
+    def test_scaling_clipping_and_updates(self, distributed_setup, cp_size, ep_size, per_token):
+        """Check every gradient and three AdamW updates after two accumulated chunks.
+
+        The reference uses ordinary tensors and SUM all-reduces. It normalizes by
+        either the global valid-token count or the number of ranks, independently of
+        MFSDP's mesh averaging and additional divisor. Different EP ranks own different
+        expert weights; only their expert-DP peers contribute to each expert gradient.
+        """
+        world_size = distributed_setup.world_size
+        if world_size % cp_size or world_size % ep_size:
+            pytest.skip("This topology needs a world size divisible by CP and EP.")
+        Utils.initialize_model_parallel(
+            context_parallel_size=cp_size, expert_model_parallel_size=ep_size
+        )
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            context_parallel_size=cp_size,
+            expert_model_parallel_size=ep_size,
+            num_moe_experts=ep_size,
+            calculate_per_token_loss=per_token,
+        )
+        reference = _TokenGradientModel(config, torch.distributed.get_rank(groups.ep)).cuda()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.float32,
+                megatron_fsdp_grad_comm_dtype=torch.float32,
+            ),
+            module=copy.deepcopy(reference),
+            fsdp_unit_modules=[torch.nn.Sequential],
+            pg_collection=groups,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                use_distributed_optimizer=False,
+                clip_grad=0.1,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=groups,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+        reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=1.0e-3, weight_decay=0.0)
+        reference_parameters = dict(reference.named_parameters())
+
+        for step in range(3):
+            optimizer.zero_grad()
+            reference_optimizer.zero_grad()
+            local_tokens = torch.zeros((), device="cuda", dtype=torch.int64)
+            for chunk in range(2):
+                rank = distributed_setup.rank
+                torch.manual_seed(7000 + 100 * step + 10 * rank + chunk)
+                count = 3 + rank + chunk
+                value = torch.randn(count, 8, device="cuda")
+                target = torch.randn_like(value)
+                # Exercise one empty rank, then an entirely empty step. Multiplying
+                # the loss by zero still produces gradients for every parameter.
+                valid = 0 if step == 2 or (step == 1 and rank == world_size - 1) else count
+                mask = (torch.arange(count, device="cuda") < valid).float().unsqueeze(1)
+                local_tokens += valid
+                with model.no_sync() if chunk == 0 else contextlib.nullcontext():
+                    ((model(value) - target).square() * mask).sum().backward()
+                ((reference(value) - target).square() * mask).sum().backward()
+
+            global_tokens = local_tokens.clone()
+            torch.distributed.all_reduce(global_tokens, group=groups.dp_cp)
+            denominator = max(global_tokens.item(), 1) if per_token else world_size
+            finalize_model_grads(
+                [model], local_tokens if per_token and step != 0 else None, pg_collection=groups
+            )
+            if per_token and step == 0:
+                # External SFT callers pass a Python scalar; the standard finalizer
+                # exercises the device-scalar path on the remaining steps.
+                model.scale_gradients(1.0 / denominator)
+
+            reference_norm_squared = torch.zeros((), device="cuda")
+            for name, parameter in reference_parameters.items():
+                group = groups.expt_dp if ep_size > 1 and "experts" in name else groups.dp_cp
+                torch.distributed.all_reduce(parameter.grad, group=group)
+                parameter.grad.div_(denominator)
+                # Count each distinct reference weight once, regardless of replicas.
+                if torch.distributed.get_rank(group) == 0:
+                    reference_norm_squared += parameter.grad.square().sum()
+            torch.distributed.all_reduce(reference_norm_squared, group=groups.dp_cp)
+            reference_norm = reference_norm_squared.sqrt()
+
+            for name, parameter in model.module.named_parameters():
+                torch.testing.assert_close(
+                    uneven_dtensor_to_full_tensor(parameter.grad),
+                    reference_parameters[name].grad,
+                    rtol=2.0e-5,
+                    atol=2.0e-5,
+                )
+            torch.testing.assert_close(optimizer.get_grad_norm(), reference_norm)
+            if global_tokens.item() > 0:
+                assert reference_norm > optimizer.config.clip_grad
+
+            clip_scale = (optimizer.config.clip_grad / (reference_norm + 1.0e-6)).clamp(max=1.0)
+            for parameter in reference.parameters():
+                parameter.grad.mul_(clip_scale)
+            reference_optimizer.step()
+            success, norm, _ = optimizer.step()
+            assert success
+            torch.testing.assert_close(torch.as_tensor(norm, device="cuda"), reference_norm)
+            for name, parameter in model.module.named_parameters():
+                torch.testing.assert_close(
+                    uneven_dtensor_to_full_tensor(parameter.grad),
+                    reference_parameters[name].grad,
+                    rtol=2.0e-5,
+                    atol=2.0e-5,
+                )
+                torch.testing.assert_close(
+                    uneven_dtensor_to_full_tensor(parameter),
+                    reference_parameters[name],
+                    rtol=2.0e-5,
+                    atol=2.0e-5,
+                )
+
+    @pytest.mark.parametrize("pipeline_size,instances", [(2, 1), (1, 2)])
+    def test_per_token_rejects_unvalidated_topologies(self, pipeline_size, instances):
+        """Keep the initial per-token support limited to PP=1 and one DP sharding axis."""
+        Utils.initialize_model_parallel()
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            pipeline_model_parallel_size=pipeline_size,
+            pipeline_dtype=torch.float32,
+            calculate_per_token_loss=True,
+        )
+        with pytest.raises(ValueError, match="per-token loss currently requires PP=1"):
+            FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=False,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    num_distributed_optimizer_instances=instances,
+                ),
+                module=torch.nn.Linear(8, 8).cuda(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )

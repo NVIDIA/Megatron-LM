@@ -655,6 +655,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
+        # Per-token loss supplies token sums, then finalize_model_grads() divides by
+        # the global token count. Cancel MFSDP's mesh averaging in that case.
+        dense_grad_divisor = 1.0 / dp_mesh.size() if config.calculate_per_token_loss else 1.0
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -680,8 +683,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         with construction_context:
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
-                # Their gradients need the EP divisor because the same expert receives
-                # contributions after dispatch from every EP rank.
+                # With averaged losses, the EP divisor accounts for contributions
+                # dispatched from every EP rank. Per-token losses instead cancel
+                # mesh averaging and use the global token count after accumulation.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
@@ -690,7 +694,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            grad_divisor=config.expert_model_parallel_size,
+                            grad_divisor=(
+                                1.0 / expert_dp_mesh.size()
+                                if config.calculate_per_token_loss
+                                else config.expert_model_parallel_size
+                            ),
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
@@ -705,12 +713,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
+                        grad_divisor=dense_grad_divisor,
                         **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                grad_divisor=dense_grad_divisor,
+                **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
 
@@ -821,8 +834,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
-        if config.calculate_per_token_loss:
-            raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
+        if config.calculate_per_token_loss and (
+            config.pipeline_model_parallel_size != 1
+            or ddp_config.num_distributed_optimizer_instances != 1
+        ):
+            raise ValueError(
+                "MFSDP v2 per-token loss currently requires PP=1 and a single optimizer instance."
+            )
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
         if config.fp8 and config.fp8_recipe != "mxfp8":
@@ -864,6 +882,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """
         with microbatch(self.module.context, is_last=False):
             yield
+
+    @torch.no_grad()
+    def scale_gradients(self, scaling_factor: float | torch.Tensor) -> None:
+        """Scale finalized gradient shards before clipping and the optimizer step.
+
+        Args:
+            scaling_factor: Multiplier, usually the reciprocal global token count.
+                Accepts a Python scalar or a scalar tensor from finalize_model_grads().
+        """
+        grads = []
+        for parameter in self.parameters():
+            if parameter.grad is not None:
+                if any(placement.is_partial() for placement in parameter.grad.placements):
+                    raise RuntimeError("MFSDP v2 gradient scaling requires finalized gradients.")
+                grads.append(parameter.grad.to_local())
+        if grads:
+            torch._foreach_mul_(grads, scaling_factor)
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
