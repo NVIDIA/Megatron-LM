@@ -407,8 +407,8 @@ def test_mhc_recompute_graph_slots_preserve_two_outstanding_microbatches(
     "field,explicit_zero_hidden",
     [("pre_mix", False), ("global_kv", False), ("indexer_k", False), ("indexer_k", True)],
 )
-@pytest.mark.parametrize("joint_backward", [False, True])
-def test_mhc_recompute_graph_side_output_only_backward(
+@pytest.mark.parametrize("graph_mode", ["disabled", "capture_body", "joint"])
+def test_mhc_recompute_side_output_only_backward(
     monkeypatch,
     request,
     checkpoints,
@@ -416,17 +416,18 @@ def test_mhc_recompute_graph_side_output_only_backward(
     layout,
     field,
     explicit_zero_hidden,
-    joint_backward,
+    graph_mode,
 ):
-    """A graph side-output triggers the producer's graph-external mHC checkpoint."""
-    if joint_backward and field == "indexer_k" and not explicit_zero_hidden:
+    """Side-output backward preserves mHC checkpoints, including the eager fallback."""
+    if graph_mode == "joint" and field == "indexer_k" and not explicit_zero_hidden:
         request.node.add_marker(
             pytest.mark.xfail(
                 strict=True,
                 raises=AssertionError,
                 reason=(
-                    "With aux loss and multiple Full owners, isolated indexer K objectives "
-                    "receive TE zero hidden gradients that activate an earlier Full owner's aux loss"
+                    "Isolated indexer K objectives with aux loss across joint layer graphs "
+                    "are unsupported: zero hidden gradients activate upstream aux loss. "
+                    "Use cuda_graph_impl='none' for this objective."
                 ),
             )
         )
@@ -435,9 +436,14 @@ def test_mhc_recompute_graph_side_output_only_backward(
     config = _config(coefficient=0.3 if field == "indexer_k" else 0.0)
     reference = _stack(config)
     expected_stacks, _ = _stacks(reference, config, (7,), layout)
-    graph_config = _graph_config(_recompute_config(config, 3), layout)
-    stacks, _ = _stacks(reference, graph_config, (7,), layout)
-    _install_eager_graph_callables(stacks, joint_backward=joint_backward)
+    actual_config = _recompute_config(config, 3)
+    if graph_mode != "disabled":
+        actual_config = _graph_config(actual_config, layout)
+    stacks, _ = _stacks(reference, actual_config, (7,), layout)
+    if graph_mode == "disabled":
+        assert actual_config.cuda_graph_impl == "none"
+    else:
+        _install_eager_graph_callables(stacks, joint_backward=graph_mode == "joint")
     params, _ = _packed_microbatch(0) if layout == "thd" else (None, None)
     shape = (14, 1) if layout == "thd" else (9, 2)
     hidden = torch.randn(*shape, config.hidden_size, requires_grad=True)

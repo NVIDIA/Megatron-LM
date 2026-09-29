@@ -5,6 +5,11 @@
 Only tensors consumed or produced by the current layer cross its graph boundary.
 Each capture invocation reconstructs fresh Python state. Replay publishes graph
 outputs to the caller's forward-local state before the ordinary layer continuation.
+
+Isolated indexer-K objectives with auxiliary loss across joint layer graphs are
+unsupported: synthetic zero hidden gradients can activate upstream auxiliary losses.
+Set cuda_graph_impl="none" before constructing the model for these partial-backward
+workloads. Normal main-loss training uses the joint graph path.
 """
 
 from typing import Any, Callable, Mapping
