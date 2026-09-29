@@ -62,7 +62,11 @@ def _assert_relative_rms_close(
 def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) -> SimpleNamespace:
     """Build the minimal state needed to exercise GDN backend selection."""
     stub = SimpleNamespace(
-        config=SimpleNamespace(deterministic_mode=deterministic_mode, gdn_kernel_backend=backend),
+        config=SimpleNamespace(
+            deterministic_mode=deterministic_mode,
+            gdn_kernel_backend=backend,
+            gdn_pre_gated_delta_rule_fusion=False,
+        ),
         num_value_heads=2,
         qk_dim_local_tp=64,
         v_dim_local_tp=128,
