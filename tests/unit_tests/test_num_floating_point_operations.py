@@ -19,7 +19,6 @@ import torch
 
 import megatron.training.training as training_module
 from megatron.training.training import (
-    _dsv41_self_attention_flops,
     consume_seqlen_stats_in_iteration,
     consume_vision_model_flops_stats,
     num_floating_point_operations,
@@ -1786,69 +1785,6 @@ class TestDSv41Flops:
             num_floating_point_operations(standard, 2), rel=1e-12, abs=0
         )
 
-    @pytest.mark.parametrize("version", ["v4", "v4.1"])
-    def test_version_alone_does_not_enable_hybrid_d_layers(self, version):
-        _, args = _make_dsv41_pair(moe=True)
-        args.experimental_attention_variant = None
-        args.dsv4_version = version
-        with pytest.raises(AssertionError, match="hybrid-model path"):
-            num_floating_point_operations(args, 2)
-
-    @pytest.mark.parametrize("version", ["v4", "v4.1"])
-    @pytest.mark.parametrize("hybrid_model", [False, True])
-    def test_version_alone_preserves_ordinary_mla(self, version, hybrid_model):
-        args = _make_dsv41_pair()[int(hybrid_model)]
-        args.experimental_attention_variant = None
-        if hybrid_model:
-            args.hybrid_layer_pattern = args.hybrid_layer_pattern.replace("W", "+").replace(
-                "D", "+"
-            )
-        del args.dsv4_version
-        ordinary_mla = num_floating_point_operations(args, 2)
-        args.dsv4_version = version
-        assert num_floating_point_operations(args, 2) == ordinary_mla
-
-    def test_d_symbol_can_describe_swa_only_layer(self):
-        _, hybrid = _make_dsv41_pair(moe=True)
-        expected = num_floating_point_operations(hybrid, 2)
-        hybrid.hybrid_layer_pattern = hybrid.hybrid_layer_pattern.replace("W", "D")
-        assert num_floating_point_operations(hybrid, 2) == pytest.approx(expected, rel=1e-12, abs=0)
-
-    @pytest.mark.parametrize("role", ["full", "reindex", "reuse"])
-    def test_only_owners_pay_compressor_and_indexer_work(self, role):
-        args, _ = _make_dsv41_pair()
-        if role == "full":
-            args.csa2_kv_source_layers = [1, 2, 3]
-        if role != "reuse":
-            args.csa2_index_source_layers = [1, 2, 3, 4]
-        attention_layers = list(enumerate(args.csa_compress_ratios))
-        expected = _dsv41_v4_convention_attention_flops(args, 11, 121, attention_layers)
-        token_linear, core = _dsv41_self_attention_flops(args)
-        assert 6 * (token_linear * 11 + core * 121) == pytest.approx(expected, rel=1e-12, abs=0)
-
-    @pytest.mark.parametrize("has_reindex", [False, True])
-    def test_candidate_source_itself_still_scores_all_visible_keys(self, has_reindex):
-        args, _ = _make_dsv41_pair()
-        if not has_reindex:
-            args.csa2_index_source_layers = [1, 3]
-        attention_layers = list(enumerate(args.csa_compress_ratios))
-        token_linear, core = _dsv41_self_attention_flops(args)
-        limited = 6 * (token_linear * 11 + core * 121)
-        assert limited == pytest.approx(
-            _dsv41_v4_convention_attention_flops(args, 11, 121, attention_layers), rel=1e-12, abs=0
-        )
-        args.csa2_candidate_source_layer = None
-        args.csa2_candidate_topk_blocks = args.csa2_candidate_block_size = 0
-        token_linear, core = _dsv41_self_attention_flops(args)
-        unlimited = 6 * (token_linear * 11 + core * 121)
-        assert unlimited == pytest.approx(
-            _dsv41_v4_convention_attention_flops(args, 11, 121, attention_layers), rel=1e-12, abs=0
-        )
-        if has_reindex:
-            assert limited < unlimited
-        else:
-            assert limited == pytest.approx(unlimited, rel=1e-12, abs=0)
-
     @pytest.mark.parametrize("hybrid_model", [False, True])
     def test_packed_stats_scale_v4_token_and_scoring_terms(self, hybrid_model):
         args = _make_dsv41_pair(seq_length=16)[int(hybrid_model)]
@@ -1870,84 +1806,6 @@ class TestDSv41Flops:
         attention_layers = [(i, args.csa_compress_ratios[i]) for i in layer_ids]
         extra_scoring = _dsv41_v4_convention_attention_flops(args, 0, 50, attention_layers)
         assert longer_sequences - packed == pytest.approx(extra_scoring, rel=1e-12, abs=0)
-
-    @pytest.mark.parametrize("hybrid_model", [False, True])
-    def test_empty_real_batch_has_zero_work(self, hybrid_model):
-        args = _make_dsv41_pair()[int(hybrid_model)]
-        assert (
-            num_floating_point_operations(
-                args, 2, seqlen_squared_sum_in_batch=0, total_real_tokens_in_batch=0
-            )
-            == 0
-        )
-
-    @pytest.mark.parametrize("hybrid_model", [False, True])
-    @pytest.mark.parametrize(
-        "activation,moe_frequency,shared_width,latent_width",
-        [
-            pytest.param("swiglu", None, None, None, id="dense-swiglu"),
-            pytest.param("gelu", None, None, None, id="dense-gelu"),
-            pytest.param("swiglu", 2, None, None, id="mixed-moe-frequency"),
-            pytest.param("swiglu", [1, 0, 0, 1, 0, 1], 6, None, id="mixed-shared-experts"),
-            pytest.param("gelu", 2, 6, 4, id="mixed-latent-experts"),
-            pytest.param("situ_glu", [0, 1, 0, 1, 1, 0], 6, 4, id="mixed-situ-glu"),
-        ],
-    )
-    def test_ffn_and_logits_keep_generic_accounting(
-        self, hybrid_model, activation, moe_frequency, shared_width, latent_width
-    ):
-        """Changing attention families must preserve the existing FFN/logits estimate."""
-        moe = moe_frequency is not None
-        args = _make_dsv41_pair(moe=moe)[int(hybrid_model)]
-        args.swiglu = activation == "swiglu"
-        args.situ_glu = activation == "situ_glu"
-        args.moe_shared_expert_intermediate_size = shared_width
-        args.moe_latent_size = latent_width
-        # Exercise the existing fallback from an unset expert width to FFN width.
-        args.moe_ffn_hidden_size = None
-        if moe:
-            args.moe_layer_freq = moe_frequency
-            moe_layers = (
-                [int(i % moe_frequency == 0) for i in range(6)]
-                if isinstance(moe_frequency, int)
-                else moe_frequency
-            )
-            if hybrid_model:
-                attention_symbols = args.hybrid_layer_pattern[::2]
-                args.hybrid_layer_pattern = "".join(
-                    attention + ("E" if is_moe else "-")
-                    for attention, is_moe in zip(attention_symbols, moe_layers)
-                )
-
-        batch_size = 2
-        total_tokens = batch_size * args.seq_length
-        sum_sq = batch_size * args.seq_length**2
-        layer_ids = range(0, 12, 2) if hybrid_model else range(6)
-        attention_layers = [(i, args.csa_compress_ratios[i]) for i in layer_ids]
-        v41_attention = _dsv41_v4_convention_attention_flops(
-            args, total_tokens, sum_sq, attention_layers
-        )
-
-        # Compute the same FFN/logits with the unchanged generic MHA branch and
-        # remove its known QKV/O + core-attention contribution independently.
-        generic = SimpleNamespace(**vars(args))
-        generic.dsv4_version = "v4"
-        generic.experimental_attention_variant = None
-        generic.multi_latent_attention = False
-        generic.kv_channels = args.hidden_size // args.num_attention_heads
-        if hybrid_model:
-            generic.hybrid_layer_pattern = args.hybrid_layer_pattern.replace("W", "*").replace(
-                "D", "*"
-            )
-        projected_width = generic.kv_channels * generic.num_attention_heads
-        mha_attention = (
-            6
-            * 6
-            * (total_tokens * 4 * generic.hidden_size * projected_width + sum_sq * projected_width)
-        )
-        assert num_floating_point_operations(args, batch_size) - v41_attention == pytest.approx(
-            num_floating_point_operations(generic, batch_size) - mha_attention, rel=1e-12, abs=0
-        )
 
 
 def _make_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_loss=False):

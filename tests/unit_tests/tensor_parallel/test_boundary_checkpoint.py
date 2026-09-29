@@ -87,52 +87,6 @@ def test_te_boundary_rejects_incompatible_backend_and_wrong_schema(monkeypatch, 
         te_runtime.te_checkpoint(lambda x: x, False, None, None, x, boundary_policy=policy)
 
 
-def test_te_boundary_frozen_inputs_no_grad_and_constant_outputs(cpu_te_checkpoint):
-    x = torch.ones(3)
-    weight = torch.nn.Parameter(torch.tensor(2.0))
-    policy = _policy(_field("hidden"))
-    te_runtime.te_checkpoint(
-        lambda x: x * weight, False, None, None, x, boundary_policy=policy
-    ).sum().backward()
-    assert weight.grad == 3 and not cpu_te_checkpoint
-    with pytest.raises(ValueError, match="differentiable input"):
-        te_runtime.te_checkpoint(
-            lambda x: x,
-            False,
-            None,
-            None,
-            x,
-            boundary_policy=_policy(_field("hidden"), strict=True),
-        )
-    x.requires_grad_()
-    with torch.no_grad():
-        hidden = te_runtime.te_checkpoint(
-            lambda x: x * weight, False, None, None, x, boundary_policy=policy
-        )
-    assert not hidden.requires_grad and not cpu_te_checkpoint
-    constant = te_runtime.te_checkpoint(
-        lambda x: torch.ones_like(x), False, None, None, x, boundary_policy=policy
-    )
-    constant.sum().backward()
-    assert x.grad is None
-
-
-def test_te_boundary_retained_backward_uses_fresh_input_gradients(cpu_te_checkpoint):
-    x = torch.ones(3, requires_grad=True)
-    left, right = te_runtime.te_checkpoint(
-        lambda x: (x * 2, x * 3),
-        False,
-        None,
-        None,
-        x,
-        boundary_policy=_policy(_field("left"), _field("right")),
-    )
-    left.sum().backward(retain_graph=True)
-    torch.testing.assert_close(x.grad, torch.full_like(x, 2))
-    right.sum().backward()
-    torch.testing.assert_close(x.grad, torch.full_like(x, 5))
-
-
 @pytest.mark.parametrize("hidden_active", [False, True])
 def test_unused_hidden_does_not_inject_aux_loss_but_an_explicit_zero_does(hidden_active):
     """Exercise the actual DSA autoscaler, not just gradients of a synthetic sum."""

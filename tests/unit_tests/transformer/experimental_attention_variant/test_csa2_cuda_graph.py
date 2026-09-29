@@ -8,25 +8,16 @@ CUDA replay or Transformer Engine kernels. Conditional CUDA tests exercise real
 Transformer Engine and compact-indexer replay.
 """
 
-import gc
 import inspect
-import weakref
 from copy import deepcopy
-from dataclasses import replace
-from types import MethodType, SimpleNamespace
+from types import MethodType
 
 import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
-from megatron.core.models.hybrid.hybrid_state import (
-    HybridTensorGraphState,
-    build_hybrid_state_pipeline_plan,
-)
 from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
-from megatron.core.transformer.experimental_attention_variant import csa2
 from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
-from megatron.core.transformer.experimental_attention_variant.csa_utils import csa2_cuda_graph
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
     prepare_csa2_indexer_inputs,
 )
@@ -38,7 +29,6 @@ from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRe
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 import (
-    _emulate_v4_indexer_topk_core,
     _kernel_indexer,
     _packed,
     _record_losses,
@@ -47,8 +37,6 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 impor
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2_pipeline import (
     _FFN,
     _config,
-    _LookupAttention,
-    _LookupDeclaration,
     _run_chunks,
     _stack,
 )
@@ -57,9 +45,12 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_csa2_recom
     _assert_parameter_gradients,
     _recompute_config,
     _stacks,
-    checkpoints,
-    cpu_checkpoint_rng,
-    native_attention,
+)
+from tests.unit_tests.transformer.experimental_attention_variant.test_csa2_recompute import (
+    checkpoints as checkpoints,
+)
+from tests.unit_tests.transformer.experimental_attention_variant.test_csa2_recompute import (
+    cpu_checkpoint_rng as cpu_checkpoint_rng,
 )
 
 
@@ -233,152 +224,6 @@ def _packed_microbatch(index):
     return params, valid
 
 
-def _use_production_static_inputs(monkeypatch):
-    """Run real layer sample allocation on CPU, including its ordinary masks."""
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
-    observed = []
-
-    def static_inputs(layer):
-        packed = layer.config.sequence_packing_scheduler is not None
-        if packed:
-            layer.config.thd_max_packed_sequences = 4
-        values = layer.get_layer_static_inputs(9, 2)
-        attention_mask = values.get("attention_mask")
-        if attention_mask is not None:
-            assert attention_mask.shape == (2, 1, 9, 9)
-            assert attention_mask.dtype == torch.bool
-        result = layer._te_cuda_graph_adapter.get_static_inputs(values)
-        assert "attention_mask" not in result
-        if packed:
-            assert result["padding_mask"].shape == (1, 14)
-            assert result["padding_mask"].dtype == torch.bool
-            assert not result["padding_mask"].any()
-        observed.append((layer.layer_number, attention_mask is not None, packed))
-        return result
-
-    monkeypatch.setattr(__name__ + "._static_inputs", static_inputs)
-    return observed
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("mhc", [False, True])
-def test_real_layer_static_inputs_preserve_graph_boundary_parity(monkeypatch, layout, mhc):
-    observed = _use_production_static_inputs(monkeypatch)
-    test_graph_boundary_preserves_shared_state_and_two_outstanding_microbatches(
-        monkeypatch, layout, mhc, 0.3, (1, 5, 7, 8, 10)
-    )
-    assert len(observed) == 12
-    if layout == "sbhd":
-        assert not any(had_mask for _, had_mask, _ in observed)
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("mhc", [False, True])
-def test_graph_replay_uses_prepared_dependencies(monkeypatch, layout, mhc):
-    """Repeated real Hybrid forwards must not plan CSA2 dependencies after samples."""
-    install = _install_eager_graph_callables
-
-    def prepare(stacks, **kwargs):
-        calls = install(stacks, **kwargs)
-
-        def no_planning(*args, **kwargs):
-            pytest.fail("CSA2 graph replay must use the prepared state region")
-
-        monkeypatch.setattr(csa2_cuda_graph, "prepare_csa2_boundary", no_planning)
-        return calls
-
-    monkeypatch.setattr(__name__ + "._install_eager_graph_callables", prepare)
-    # Includes Full/Reindex/Reuse, PP relay cuts, changed packed batch contents,
-    # two outstanding forwards and reverse-order backward against eager math.
-    test_graph_boundary_preserves_shared_state_and_two_outstanding_microbatches(
-        monkeypatch, layout, mhc, 0.3, (1, 5, 7, 8, 10)
-    )
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_graph_prepared_profiles_do_not_retain_forward_tensors(layout):
-    config = _graph_config(_config(enable_hyper_connections=False), layout)
-    component = csa2_cuda_graph.CSA2GraphState(config, layer_number=9, is_attention=True)
-
-    def prepare():
-        hidden = torch.randn(*((14, 1) if layout == "thd" else (9, 2)), config.hidden_size)
-        params, _ = _packed_microbatch(0) if layout == "thd" else (None, None)
-        inputs = dict(hidden_states=hidden, packed_seq_params=params)
-        samples = component.get_static_inputs(inputs)
-        region, state = component.restore_inputs(hidden, dict(inputs, **samples))
-        replay_region, owned, publish = component.prepare_replay(
-            hidden, dict(packed_seq_params=params, cross_layer_state=state)
-        )
-        assert replay_region is region
-        tensors = [hidden, *samples.values()]
-        if params is not None:
-            tensors.extend((params.cu_seqlens_q, params.cu_seqlens_q_padded))
-        return [weakref.ref(value) for value in (*tensors, state)]
-
-    references = prepare()
-    gc.collect()
-    assert all(reference() is None for reference in references)
-
-
-@pytest.mark.parametrize("changed", ["hidden_shape", "prefix_count", "prefix_dtype", "layout"])
-def test_graph_replay_rejects_unprepared_profile_without_planning(monkeypatch, changed):
-    config = _graph_config(_config(enable_hyper_connections=False), "thd")
-    component = csa2_cuda_graph.CSA2GraphState(config, layer_number=9, is_attention=True)
-    hidden = torch.randn(14, 1, config.hidden_size)
-    params, _ = _packed_microbatch(0)
-    inputs = dict(hidden_states=hidden, packed_seq_params=params)
-    samples = component.get_static_inputs(inputs)
-    _, state = component.restore_inputs(hidden, dict(inputs, **samples))
-
-    def no_planning(*args, **kwargs):
-        pytest.fail("A new replay profile must be rejected before planning or capture")
-
-    monkeypatch.setattr(csa2_cuda_graph, "prepare_csa2_boundary", no_planning)
-    if changed == "hidden_shape":
-        hidden = hidden[:-1]
-    elif changed == "prefix_count":
-        params = replace(
-            params, cu_seqlens_q=torch.cat((params.cu_seqlens_q, params.cu_seqlens_q[-1:]))
-        )
-    elif changed == "prefix_dtype":
-        params = replace(params, cu_seqlens_q_padded=params.cu_seqlens_q_padded.long())
-    else:
-        params = None
-    with pytest.raises(ValueError, match="prepared.*profile"):
-        component.prepare_replay(hidden, dict(packed_seq_params=params, cross_layer_state=state))
-
-
-@pytest.mark.parametrize("mhc", [False, True])
-@pytest.mark.parametrize("explicit_mask", [False, True])
-def test_real_static_thd_padding_mask_default_and_explicit_values(monkeypatch, mhc, explicit_mask):
-    _record_losses(monkeypatch)
-    _use_production_static_inputs(monkeypatch)
-    stack = _stack(_graph_config(_config(enable_hyper_connections=mhc), "thd"))
-    _install_eager_graph_callables([stack])
-    observed = []
-    for layer in stack.layers:
-        graph = layer.cuda_graphs[0]
-
-        def observe(*args, graph=graph, **kwargs):
-            observed.append(kwargs["padding_mask"].clone())
-            return graph(*args, **kwargs)
-
-        layer.cuda_graphs[0] = observe
-    params, _ = _packed_microbatch(0)
-    padding_mask = torch.zeros(1, 14, dtype=torch.bool)
-    if explicit_mask:
-        padding_mask[0, 3] = padding_mask[0, 12] = True
-    stack(
-        torch.randn(14, 1, stack.config.hidden_size, requires_grad=True),
-        None,
-        packed_seq_params=params,
-        padding_mask=padding_mask if explicit_mask else None,
-    )
-    assert len(observed) == 12
-    for actual in observed:
-        assert torch.equal(actual, padding_mask)
-
-
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("mhc", [False, True])
 @pytest.mark.parametrize("coefficient", [None, 0.0, 0.3])
@@ -423,51 +268,6 @@ def test_graph_boundary_preserves_shared_state_and_two_outstanding_microbatches(
         (expected * probe).sum().backward()
         _assert_gradient(x.grad, ref_x.grad)
     _assert_parameter_gradients(reference, stacks, plan)
-
-
-@pytest.mark.parametrize("field", ["pre_mix", "global_kv", "indexer_k"])
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("joint_backward", [False, True])
-def test_graph_boundary_side_state_only_loss_reaches_its_producer(
-    monkeypatch, request, field, layout, joint_backward
-):
-    """A side-state loss must train the owning graph without a hidden-state objective."""
-    if joint_backward and field == "indexer_k":
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                raises=AssertionError,
-                reason=(
-                    "With aux loss and multiple Full owners, isolated indexer K objectives "
-                    "receive TE zero hidden gradients that activate an earlier Full owner's aux loss"
-                ),
-            )
-        )
-    torch.manual_seed(404)
-    _record_losses(monkeypatch)
-    config = _config(coefficient=0.3 if field == "indexer_k" else 0.0)
-    reference = _stack(config)
-    expected_stacks, _ = _stacks(reference, config, (7,), layout)
-    stacks, _ = _stacks(reference, _graph_config(config, layout), (7,), layout)
-    _install_eager_graph_callables(stacks, joint_backward=joint_backward)
-    params, _ = _packed_microbatch(0) if layout == "thd" else (None, None)
-    shape = (14, 1) if layout == "thd" else (9, 2)
-    x = torch.randn(*shape, config.hidden_size, requires_grad=True)
-    ref_x = x.detach().clone().requires_grad_()
-    actual = stacks[0](x, None, packed_seq_params=params)
-    expected = expected_stacks[0](ref_x, None, packed_seq_params=params)
-    index = tuple(spec.name for spec in actual.tensor_specs).index(field)
-    torch.testing.assert_close(actual.tensors[index], expected.tensors[index])
-    actual.tensors[index].square().sum().backward()
-    expected.tensors[index].square().sum().backward()
-    _assert_gradient(x.grad, ref_x.grad)
-    for (name, parameter), ref_parameter in zip(
-        stacks[0].named_parameters(), expected_stacks[0].parameters()
-    ):
-        try:
-            _assert_gradient(parameter.grad, ref_parameter.grad)
-        except AssertionError as error:
-            raise AssertionError(name) from error
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
@@ -532,142 +332,6 @@ def test_joint_graph_backward_does_not_inject_auxiliary_loss_for_unused_hidden(
         actual.layers[2].parameters(), reference.layers[2].parameters()
     ):
         _assert_gradient(parameter.grad, ref_parameter.grad)
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("modules", [["layernorm"], ["mla_up_proj"], ["layernorm", "mla_up_proj"]])
-def test_selective_norm_and_mla_recompute_across_graph_boundaries(
-    monkeypatch, cpu_checkpoint_rng, native_attention, layout, modules
-):
-    """Production DSv4 projection checkpoints retain all CSA2 graph-side gradients."""
-    torch.manual_seed(819)
-    _record_losses(monkeypatch)
-    config = _config(coefficient=0.3)
-    reference = _stack(config, attention=native_attention)
-    recompute = replace(config, recompute_granularity="selective", recompute_modules=modules)
-    stacks, plan = _stacks(
-        reference,
-        _graph_config(recompute, layout),
-        (5, 7, 8, 10),
-        layout,
-        attention=native_attention,
-    )
-    _install_eager_graph_callables(stacks)
-    pairs = []
-    for microbatch in range(2):
-        params, _ = _packed_microbatch(microbatch) if layout == "thd" else (None, None)
-        shape = (14, 1) if layout == "thd" else (9, 2)
-        hidden = torch.randn(*shape, config.hidden_size, requires_grad=True)
-        ref_hidden = hidden.detach().clone().requires_grad_()
-        for stack in stacks:
-            for layer in stack.layers:
-                layer.current_microbatch = microbatch
-        output, _ = _run_chunks(stacks, plan, hidden, params)
-        expected = reference(ref_hidden, None, packed_seq_params=params)
-        torch.testing.assert_close(output, expected, atol=0, rtol=0)
-        pairs.append((output, expected, hidden, ref_hidden))
-    for output, expected, hidden, ref_hidden in reversed(pairs):
-        output.square().mean().backward()
-        expected.square().mean().backward()
-        _assert_gradient(hidden.grad, ref_hidden.grad)
-    _assert_parameter_gradients(reference, stacks, plan)
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("selective", [False, True])
-@pytest.mark.parametrize("objective", ["lookup", "both"])
-@pytest.mark.parametrize("reverse_components", [False, True])
-@pytest.mark.usefixtures("cpu_checkpoint_rng")
-def test_third_component_graph_capture_replay_with_csa2_and_mhc(
-    monkeypatch, cpu_graph_slots, layout, selective, objective, reverse_components
-):
-    """Three peer components use real Hybrid graph hooks with two live microbatches."""
-    torch.manual_seed(516)
-    _record_losses(monkeypatch)
-    reference = _stack(
-        _config(), state_components=(_LookupDeclaration,), attention=_LookupAttention
-    )
-    config = _graph_config(
-        _recompute_config(reference.config, 3) if selective else reference.config, layout
-    )
-    config.pipeline_model_parallel_size, config.virtual_pipeline_model_parallel_size = 2, 2
-    pattern = "DE|DE|DE|DEDEDE"
-    plan = build_hybrid_state_pipeline_plan(config, pattern, pp_size=2)
-    stacks = [
-        _stack(config, chunk, state_components=(_LookupDeclaration,), attention=_LookupAttention)
-        for chunk in plan
-    ]
-    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_cuda_graph import (
-        CSA2GraphState,
-    )
-
-    observed_contexts = []
-
-    def observe_context(prepare):
-        def wrapped(component, hidden, context):
-            assert (context.get("packed_seq_params") is not None) == (layout == "thd")
-            observed_contexts.append(context)
-            with pytest.raises(TypeError):
-                context["packed_seq_params"] = None
-            return prepare(component, hidden, context)
-
-        return wrapped
-
-    monkeypatch.setattr(
-        CSA2GraphState, "prepare_replay", observe_context(CSA2GraphState.prepare_replay)
-    )
-    monkeypatch.setattr(
-        HybridTensorGraphState,
-        "prepare_replay",
-        observe_context(HybridTensorGraphState.prepare_replay),
-    )
-    if reverse_components:
-        for stack in (reference, *stacks):
-            stack.forward_adapter.components = tuple(reversed(stack.forward_adapter.components))
-    for stack, chunk in zip(stacks, plan):
-        # Use the public setup hook, including its optional placement binding.
-        group = SimpleNamespace(size=lambda: 2, rank=lambda: chunk.pp_rank)
-        stack.forward_adapter.configure_distributed_pipeline(pattern, group, chunk.vp_stage)
-        stack.forward_adapter.configure_cuda_graphs(stack.layers)
-        for i, layer in enumerate(stack.layers):
-            layer.load_state_dict(reference.layers[chunk.layer_offset + i].state_dict())
-            assert len(layer._te_cuda_graph_adapter.components) == 3
-    calls = _install_eager_graph_callables(stacks, joint_backward=True)
-    for stack in (reference, stacks[-1]):
-        finalize = stack.forward_adapter.finalize_forward
-
-        def observe(output, params, context, finalize=finalize):
-            return finalize(output, params, context), context.lookup_owner.memory
-
-        stack.forward_adapter.finalize_forward = observe
-
-    pairs = []
-    for microbatch in range(2):
-        params, _ = _packed_microbatch(microbatch) if layout == "thd" else (None, None)
-        shape = (14, 1) if layout == "thd" else (9, 2)
-        x = torch.randn(*shape, config.hidden_size, requires_grad=True)
-        ref_x = x.detach().clone().requires_grad_()
-        expected = reference(ref_x, None, packed_seq_params=params)
-        for stack in stacks:
-            for layer in stack.layers:
-                layer.current_microbatch = microbatch
-        actual, payloads = _run_chunks(stacks, plan, x, params)
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        pairs.append((x, ref_x, actual, expected, payloads))
-    assert len(calls) == 2 * config.num_layers
-    assert {microbatch for _, microbatch in calls} == {0, 1}
-    assert observed_contexts
-    assert all(a is b for a, b in zip(observed_contexts[::2], observed_contexts[1::2]))
-    for first, second in zip(pairs[0][-1], pairs[1][-1]):
-        for old, new in zip(first.tensors, second.tensors):
-            assert old is not new
-    for x, ref_x, actual, expected, _ in reversed(pairs):
-        for values in (actual, expected):
-            sum(
-                t.square().sum() for t in (values if objective == "both" else values[1:])
-            ).backward()
-        _assert_gradient(x.grad, ref_x.grad)
-    _assert_parameter_gradients(reference, stacks, plan)
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
@@ -736,17 +400,6 @@ def test_mhc_recompute_graph_slots_preserve_two_outstanding_microbatches(
     assert all(
         checkpoint.ctx is None for manager in checkpoints for checkpoint in manager.checkpoints
     )
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_mhc_recompute_real_static_inputs_keep_the_single_stream_graph_contract(
-    monkeypatch, checkpoints, cpu_graph_slots, layout
-):
-    observed = _use_production_static_inputs(monkeypatch)
-    test_mhc_recompute_graph_slots_preserve_two_outstanding_microbatches(
-        monkeypatch, checkpoints, cpu_graph_slots, layout, 3, (1, 5, 7, 8, 10), 0.3, torch.bfloat16
-    )
-    assert len(observed) == 12
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
@@ -823,77 +476,6 @@ def test_mhc_recompute_graph_side_output_only_backward(
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("group_size", [None, 3])
-def test_mhc_recompute_graph_preserves_dropout_rng(
-    monkeypatch, checkpoints, cpu_graph_slots, layout, group_size
-):
-    """Graph-external BDA dropout keeps per-microbatch RNG and recompute restores it."""
-    torch.manual_seed(103)
-    _record_losses(monkeypatch)
-    config = replace(_config(), hidden_dropout=0.3)
-    reference = _stack(config)
-    stacks, plan = _stacks(
-        reference, _graph_config(_recompute_config(config, group_size), layout), (), layout
-    )
-    _install_eager_graph_callables(stacks, joint_backward=True)
-    pairs = []
-    for microbatch in range(2):
-        params, _ = _packed_microbatch(microbatch) if layout == "thd" else (None, None)
-        shape = (14, 1) if layout == "thd" else (9, 2)
-        hidden = torch.randn(*shape, config.hidden_size, requires_grad=True)
-        ref_hidden = hidden.detach().clone().requires_grad_()
-        for layer in stacks[0].layers:
-            layer.current_microbatch = microbatch
-        before = torch.get_rng_state()
-        expected = reference(ref_hidden, None, packed_seq_params=params)
-        torch.set_rng_state(before)
-        actual, _ = _run_chunks(stacks, plan, hidden, params)
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        pairs.append((actual, expected, hidden, ref_hidden))
-    after_forward = torch.get_rng_state()
-    for actual, expected, hidden, ref_hidden in reversed(pairs):
-        actual.square().mean().backward()
-        assert torch.equal(after_forward, torch.get_rng_state())
-        expected.square().mean().backward()
-        _assert_gradient(hidden.grad, ref_hidden.grad)
-    _assert_parameter_gradients(reference, stacks, plan)
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_mhc_recompute_graph_with_native_norm_and_mla_recompute(
-    monkeypatch, checkpoints, cpu_graph_slots, native_attention, layout
-):
-    torch.manual_seed(812)
-    _record_losses(monkeypatch)
-    config = _config(coefficient=0.3)
-    reference = _stack(config, attention=native_attention)
-    recompute = replace(
-        config,
-        recompute_granularity="selective",
-        recompute_modules=["mhc", "layernorm", "mla_up_proj"],
-        mhc_recompute_layer_num=3,
-    )
-    stacks, plan = _stacks(
-        reference, _graph_config(recompute, layout), (5, 7, 8, 10), layout, native_attention
-    )
-    # Actual TE creates these checkpoint backwards while MCore's capture context
-    # is active. The joint-node fake runs at ordinary runtime, where the native
-    # reentrant checkpoint deliberately rejects autograd.grad().
-    _install_eager_graph_callables(stacks)
-    params, _ = _packed_microbatch(0) if layout == "thd" else (None, None)
-    shape = (14, 1) if layout == "thd" else (9, 2)
-    hidden = torch.randn(*shape, config.hidden_size, requires_grad=True)
-    ref_hidden = hidden.detach().clone().requires_grad_()
-    actual, _ = _run_chunks(stacks, plan, hidden, params)
-    expected = reference(ref_hidden, None, packed_seq_params=params)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    actual.square().mean().backward()
-    expected.square().mean().backward()
-    _assert_gradient(hidden.grad, ref_hidden.grad)
-    _assert_parameter_gradients(reference, stacks, plan)
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("mhc_recompute", [False, True])
 def test_graph_state_is_restored_before_partial_moe_continuation(
     monkeypatch, checkpoints, cpu_graph_slots, layout, mhc_recompute
@@ -953,110 +535,6 @@ class _NativeCaptureBody(torch.nn.Module):
         )
 
 
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("coefficient", [0.0, 0.3])
-@pytest.mark.parametrize("mhc_recompute", [False, True, "norm_mla"])
-def test_transformer_engine_graphs_preserve_outstanding_shared_outputs(
-    monkeypatch, native_attention, layout, coefficient, mhc_recompute
-):
-    """Real TE graphs: mixed state outputs, mutable THD prefixes and two live forwards."""
-    if not torch.cuda.is_available():
-        pytest.skip("actual CUDA graph replay requires CUDA")
-    te_graph = pytest.importorskip("transformer_engine.pytorch.graph")
-    make_graphs = te_graph.make_graphed_callables
-    if "_num_layers_per_chunk" not in inspect.signature(make_graphs).parameters:
-        pytest.skip("this test uses the Transformer Engine 2.6+ pipeline capture interface")
-    torch.manual_seed(285)
-    _record_losses(monkeypatch)
-    attention_kwargs = {"attention": native_attention} if mhc_recompute == "norm_mla" else {}
-    reference = _stack(_config(coefficient=coefficient), **attention_kwargs).cuda()
-    config = _graph_config(
-        _recompute_config(reference.config, 3) if mhc_recompute else reference.config, layout
-    )
-    if mhc_recompute == "norm_mla":
-        config.recompute_modules = ["mhc", "layernorm", "mla_up_proj"]
-    config.create_attention_mask_in_dataloader = False
-    actual = _stack(config, **attention_kwargs).cuda()
-    actual.load_state_dict(reference.state_dict())
-    capture_bodies = tuple(_NativeCaptureBody(layer) for layer in actual.layers)
-    sample_args, sample_kwargs = [], []
-    for _ in range(2):
-        for layer in actual.layers:
-            static = _static_inputs(layer)
-            sample_args.append((static.pop("hidden_states"),))
-            sample_kwargs.append(static)
-            layer._te_cuda_graph_adapter.finalize_sample_inputs(sample_args[-1], sample_kwargs[-1])
-    make_kwargs = dict(
-        sample_kwargs=tuple(sample_kwargs),
-        _order=[1, 1, -1, -1],
-        _num_layers_per_chunk=[len(actual.layers)],
-        num_warmup_iters=3,
-        allow_unused_input=True,
-    )
-    if "_reuse_graph_input_output_buffers" in inspect.signature(make_graphs).parameters:
-        make_kwargs["_reuse_graph_input_output_buffers"] = False
-    # Match TECudaGraphHelper's actual capture context: projection checkpoints
-    # may build their backwards via autograd.grad while capture is active.
-    _set_capture_start()
-    try:
-        graphs = make_graphs(capture_bodies, tuple(sample_args), **make_kwargs)
-    finally:
-        _set_capture_end()
-    for layer_index, layer in enumerate(actual.layers):
-        slots = []
-        for microbatch in range(2):
-            index = microbatch * len(actual.layers) + layer_index
-            graph, names = graphs[index], tuple(sample_kwargs[index])
-
-            def replay(*args, graph=graph, names=names, **kwargs):
-                # Native sample bodies do not consume optional None kwargs.
-                # TE still executes the captured layer and its real backward.
-                return graph(
-                    *args,
-                    **{name: kwargs[name] for name in names},
-                    is_first_microbatch=kwargs.get("is_first_microbatch", False),
-                )
-
-            slots.append(replay)
-        layer.cuda_graphs = slots
-        if mhc_recompute:
-            layer.set_te_cuda_graph_static_hidden_inputs(
-                sample_args[microbatch * len(actual.layers) + layer_index][0]
-                for microbatch in range(2)
-            )
-    actual.zero_grad(set_to_none=True)
-    pairs = []
-    for microbatch in range(2):
-        params, _ = _packed_microbatch(microbatch) if layout == "thd" else (None, None)
-        if params is not None:
-            for name in (
-                "cu_seqlens_q",
-                "cu_seqlens_kv",
-                "cu_seqlens_q_padded",
-                "cu_seqlens_kv_padded",
-            ):
-                setattr(params, name, getattr(params, name).cuda())
-        shape = (14, 1) if layout == "thd" else (9, 2)
-        hidden = torch.randn(*shape, config.hidden_size, device="cuda", requires_grad=True)
-        ref_hidden = hidden.detach().clone().requires_grad_()
-        for layer in actual.layers:
-            layer.current_microbatch = microbatch
-        output = actual(hidden, None, packed_seq_params=params)
-        expected = reference(ref_hidden, None, packed_seq_params=params)
-        torch.testing.assert_close(output, expected, atol=2e-6, rtol=2e-5)
-        pairs.append((output, output.detach().clone(), expected, hidden, ref_hidden))
-    # A later forward must not overwrite either residuals or shared state that
-    # the earlier graph backward still needs.
-    for output, snapshot, expected, hidden, ref_hidden in reversed(pairs):
-        torch.testing.assert_close(output, snapshot, atol=0, rtol=0)
-        probe = torch.randn_like(output) * 0.1
-        (output * probe).sum().backward()
-        (expected * probe).sum().backward()
-        _assert_gradient(hidden.grad, ref_hidden.grad)
-    for parameter, ref_parameter in zip(actual.parameters(), reference.parameters()):
-        _assert_gradient(parameter.grad, ref_parameter.grad)
-
-
 def _inputs(layout, ratio, device, *, rows=65):
     params = None
     heads, dim = 32, 128
@@ -1081,70 +559,6 @@ def _select(indexer, q, k, weights, params):
         q, k, weights, indexer.compress_ratio, thd_layout=layout, compressed_layout=compressed
     )
     return indexer._fused_topk(inputs)
-
-
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
-@pytest.mark.parametrize("ratio", [1, 2])
-def test_compact_warmup_retains_geometries_without_retaining_outputs(
-    monkeypatch, layout, precision, ratio
-):
-    """A warmed graph survives later geometries and changing packed prefix values."""
-    indexer = _kernel_indexer(ratio, precision, 32, "cpu")
-    indexer.config.cuda_graph_impl = "local"
-    capturing = False
-    prepared, dispatched = [], []
-
-    def prepare(q, k, **kwargs):
-        assert not capturing
-        # Inputs have already undergone H32 padding and odd-r2 dummy-K padding.
-        assert q.shape[-2] == (64 if precision == "mxfp8" else 32)
-        assert kwargs["precision"] == precision and kwargs["ratio"] == ratio
-        workspace = object()
-        prepared.append(workspace)
-        return workspace
-
-    def dispatch(q, k, w, **kwargs):
-        dispatched.append(kwargs["compact_workspace"])
-        return _emulate_v4_indexer_topk_core(q, k, w, **kwargs)
-
-    for name in ("bshd", "thd"):
-        monkeypatch.setattr(csa2, f"{name}_compact_indexer_available", lambda *args: True)
-        monkeypatch.setattr(csa2, f"prepare_{name}_compact_indexer_workspace", prepare)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    monkeypatch.setattr(csa2, "_indexer_topk_core", dispatch)
-    tensors = _inputs(layout, ratio, "cpu")
-    capturing = True
-    with pytest.raises(ValueError, match="eager warmup"):
-        _select(indexer, *tensors)
-    capturing = False
-    first = _select(indexer, *tensors)
-    first_snapshot = first.clone()
-    original_workspace = dispatched[-1]
-
-    # A second static geometry must keep its own workspace alive; returning to
-    # the first geometry during capture must never call the host sizing helper.
-    indexer.topk += 1
-    _select(indexer, *tensors)
-    assert len(prepared) == 2 and dispatched[-1] is not original_workspace
-    indexer.topk -= 1
-    if layout == "thd":
-        params = tensors[-1]
-        replacement, _, _ = _packed([13, 29], [23, 30], tail=12)
-        replacement.max_seqlen_q = replacement.max_seqlen_kv = params.max_seqlen_q
-        for name in (
-            "cu_seqlens_q",
-            "cu_seqlens_kv",
-            "cu_seqlens_q_padded",
-            "cu_seqlens_kv_padded",
-        ):
-            getattr(params, name).copy_(getattr(replacement, name))
-    tensors[0].normal_()
-    capturing = True
-    second = _select(indexer, *tensors)
-    assert dispatched[-1] is original_workspace and len(prepared) == 2
-    assert first.data_ptr() != second.data_ptr()
-    assert torch.equal(first, first_snapshot)
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])

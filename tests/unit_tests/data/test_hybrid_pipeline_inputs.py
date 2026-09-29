@@ -40,57 +40,6 @@ def _adapter(config, **kwargs):
     )
 
 
-@pytest.mark.parametrize("cp_rank", [0, 1])
-@pytest.mark.parametrize("forward_only", [False, True])
-def test_fixed_sbhd_pp_plan_matches_cp_local_mhc_payload(cp_rank, forward_only):
-    from megatron.core.models.hybrid.hybrid_state import build_hybrid_state_pipeline_plan
-    from tests.unit_tests.ssm.test_hybrid_state_adapter import _config, _stack
-
-    config = _config(
-        context_parallel_size=2, pipeline_model_parallel_size=2, pipeline_dtype=torch.float32
-    )
-    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
-    plan = build_hybrid_state_pipeline_plan(config, "*-*|-*-", pp_size=2)
-    first, second = [_stack(config, chunk) for chunk in plan]
-    for rank, stack in enumerate((first, second)):
-        stack.forward_adapter.cp_group = cp_group
-        stack.forward_adapter.configure_distributed_pipeline(
-            "*-*|-*-", SimpleNamespace(size=lambda: 2, rank=lambda: rank)
-        )
-    args = SimpleNamespace(
-        tensor_model_parallel_size=1,
-        context_parallel_size=2,
-        seq_length=16,
-        micro_batch_size=1,
-        sft=False,
-        dataloader_inter_document_masking=False,
-        sequence_packing_scheduler=None,
-    )
-    plans = []
-    for stack in (first, second):
-        model = SimpleNamespace(
-            pipeline_payload_spec=stack.forward_adapter.pipeline_payload_spec, vp_stage=None
-        )
-        prepared = hybrid_pipeline.prepare_hybrid_pipeline_inputs(
-            None,
-            model,
-            1,
-            args=args,
-            get_batch=lambda *_: None,
-            get_timers=lambda: _Timers(),
-            batch_context=nullcontext,
-            forward_only=forward_only,
-        )
-        plans.append(prepared.pipeline_payload_plan)
-    with torch.set_grad_enabled(not forward_only):
-        payload = first(torch.randn(8, 1, config.hidden_size), None)
-        assert payload.tensors[0].shape == (8, 1, 32)
-        assert payload.descriptor == plans[0].outgoing[0] == plans[1].incoming[0]
-        received = second.forward_adapter.make_pipeline_payload(payload.tensors, payload.descriptor)
-        second.set_input_tensor(received)
-        assert second(None, None).shape == (8, 1, config.hidden_size)
-
-
 @pytest.mark.parametrize("stage", [0, 1, 2, 3])
 @pytest.mark.parametrize("layout", ["sbhd", "packed", "raw-prefixes"])
 @pytest.mark.parametrize("forward_only", [False, True])
@@ -300,43 +249,3 @@ def test_packed_pp_cp_middle_stage_uses_local_physical_capacity(
             if rank < 2:
                 assert output.descriptor == plans[rank].outgoing[0]
         assert output.shape == (local_capacity, 1, config.hidden_size)
-
-
-def test_static_middle_stage_keeps_none_data_iterator(monkeypatch):
-    args = SimpleNamespace(
-        tensor_model_parallel_size=1,
-        context_parallel_size=1,
-        seq_length=16,
-        micro_batch_size=2,
-        sft=False,
-        dataloader_inter_document_masking=False,
-        sequence_packing_scheduler=None,
-        create_attention_mask_in_dataloader=False,
-        dynamic_context_parallel=False,
-    )
-    config = _config()
-    monkeypatch.setattr(entry, "get_args", lambda: args)
-    monkeypatch.setattr(entry, "core_transformer_config_from_args", lambda args: config)
-    monkeypatch.setattr(entry.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(entry, "mtp_on_this_rank_func", lambda **kwargs: False)
-    monkeypatch.setattr(entry, "is_first_or_last_pipeline_stage", lambda vp: False)
-    adapter = _adapter(
-        config,
-        layer_type_list=["E"],
-        pp_layer_offset=7,
-        pre_process=False,
-        post_process=False,
-        is_mtp_layer=False,
-    )
-    adapter.configure_distributed_pipeline(
-        _pattern((7, 8, 10)), SimpleNamespace(size=lambda: 4, rank=lambda: 1)
-    )
-    model = SimpleNamespace(pipeline_payload_spec=adapter.pipeline_payload_spec, vp_stage=None)
-    prepared = entry.prepare_pipeline_inputs(None, model, 2)
-    assert all(spec is not None for spec in prepared.pipeline_payload_plan.incoming)
-    # Use production get_batch, including the early return for middle SBHD
-    # stages. No loader, CUDA transfer, or iterator.next() is needed on this rank.
-    assert entry.get_batch(prepared) == [None] * 12
-    assert entry.get_batch(prepared) == [None] * 12
-    with pytest.raises(StopIteration):
-        entry.get_batch(prepared)

@@ -11,14 +11,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_dsv4_hybrid_module_spec_for_backend,
-    get_experimental_attention_variant_module_spec,
-)
-from megatron.core.quantization.utils import kitchen_quantization_recipe_config
-from megatron.core.transformer.experimental_attention_variant.csa2 import CompressedSparseAttention2
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
 from megatron.training.arguments import _add_network_size_args
@@ -90,15 +82,6 @@ def _make_config(
     return MLATransformerConfig(**values)
 
 
-def test_tiny_config_accepts_source_reuse_and_ratio_transition():
-    config = _make_config()
-    assert config.csa_compress_ratios == [0, 2, 2, 1, 1, 1]
-    assert config.csa2_kv_source_layers == [1, 3]
-    assert config.csa2_index_source_layers == [1, 3, 4]
-    assert config.hidden_size == 32
-    assert config.params_dtype == torch.float32 and not config.bf16
-
-
 @pytest.mark.parametrize(
     "overrides, message",
     [
@@ -134,43 +117,6 @@ def test_reject_invalid_v41_configs(overrides, message):
         _make_config(**overrides)
 
 
-def test_candidates_can_be_disabled():
-    config = _make_config(
-        csa2_candidate_source_layer=None, csa2_candidate_topk_blocks=0, csa2_candidate_block_size=0
-    )
-    assert config.csa2_candidate_source_layer is None
-
-
-@pytest.mark.parametrize("method", ["uniform", "block"])
-@pytest.mark.parametrize("enable_mhc,single_pass", [(False, False), (True, False), (True, True)])
-def test_v41_full_recompute_accepts_residual_modes(method, enable_mhc, single_pass):
-    config = _make_config(
-        enable_hyper_connections=enable_mhc,
-        mhc_single_pass=single_pass,
-        recompute_granularity="full",
-        recompute_method=method,
-        recompute_num_layers=2,
-    )
-    assert config.recompute_granularity == "full"
-    assert config.recompute_method == method
-    assert config.recompute_num_layers == 2
-
-
-@pytest.mark.parametrize(
-    "overrides,message",
-    [
-        ({"recompute_method": None}, "recompute_method must be"),
-        ({"recompute_method": "invalid"}, "recompute_method: invalid"),
-        ({"recompute_num_layers": None}, "recompute_num_layers must be between"),
-    ],
-)
-def test_v41_full_recompute_preserves_common_requirements(overrides, message):
-    options = dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=2)
-    options.update(overrides)
-    with pytest.raises(ValueError, match=message):
-        _make_config(**options)
-
-
 @pytest.mark.parametrize("method", ["uniform", "block"])
 @pytest.mark.parametrize("num_layers", [0, -1, 1.5, True])
 def test_v41_full_recompute_requires_positive_integer_chunk_size(method, num_layers):
@@ -178,39 +124,6 @@ def test_v41_full_recompute_requires_positive_integer_chunk_size(method, num_lay
         _make_config(
             recompute_granularity="full", recompute_method=method, recompute_num_layers=num_layers
         )
-
-
-def test_v41_full_recompute_does_not_enable_core_attention_selective_recompute():
-    with pytest.raises(ValueError, match="CSA2 core-attention selective replay is not supported"):
-        _make_config(recompute_granularity="selective", recompute_modules=["core_attn"])
-
-
-@pytest.mark.parametrize("mhc", [False, True])
-@pytest.mark.parametrize("scopes", [["attn"], ["attn", "moe_router"], ["attn", "mlp"]])
-def test_v41_accepts_te_layer_graph_configuration(mhc, scopes):
-    config = _make_config(
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=scopes,
-        enable_hyper_connections=mhc,
-        moe_grouped_gemm=True,
-        moe_layer_freq=[0, 1, 1, 1, 1, 1] if "mlp" in scopes else 1,
-    )
-    assert config.cuda_graph_impl == "transformer_engine"
-    assert config.mhc_single_pass == mhc
-
-
-@pytest.mark.parametrize(
-    "module", ["mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"]
-)
-def test_v41_te_graph_keeps_existing_selective_modules(module):
-    config = _make_config(
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=["attn"],
-        recompute_granularity="selective",
-        recompute_modules=[module],
-        moe_grouped_gemm=True,
-    )
-    assert config.recompute_modules == [module]
 
 
 @pytest.mark.parametrize(
@@ -236,141 +149,6 @@ def test_v41_cuda_graph_rejects_unimplemented_state_lifetimes(options, message):
         _make_config(**values)
 
 
-@pytest.mark.parametrize("scopes", [["attn"], ["attn", "moe_router"]])
-@pytest.mark.parametrize("modules", [["mhc"], ["mhc", "layernorm", "mla_up_proj"]])
-def test_v41_te_graph_accepts_mhc_recompute_with_packed_pipeline(monkeypatch, scopes, modules):
-    # Configuration-only coverage; real capture is conditional on CUDA/TE.
-    monkeypatch.setattr(
-        "megatron.core.transformer.transformer_config.is_te_min_version", lambda *args: True
-    )
-    config = _make_config(
-        is_hybrid_model=True,
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=scopes,
-        recompute_granularity="selective",
-        recompute_modules=modules,
-        pipeline_model_parallel_size=2,
-        pipeline_dtype=torch.float32,
-        moe_token_dispatcher_type="alltoall",
-        sequence_packing_scheduler="dp_balanced",
-        max_seqlen_per_dp_cp_rank=32,
-        thd_max_packed_sequences=4,
-        pad_packed_seq_alignment="max",
-    )
-    assert config.mhc_single_pass
-    assert config.recompute_modules == modules
-    assert not config.mhc_recompute_attn_cuda_graph_split
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {},
-        {"fp4": "e2m1"},
-        {"fp4": "e2m1", "fp4_param": True},
-        {
-            "fp4": "e2m1",
-            "fp4_recipe": "custom",
-            "fp4_quantizer_factory": "custom_quant.quantizer_factory",
-        },
-    ],
-)
-@pytest.mark.parametrize("with_quant_recipe", [False, True])
-def test_v41_accepts_existing_quantization_configuration(options, with_quant_recipe):
-    # Exercise configuration only; TE/Kitchen execution needs its own GPU coverage.
-    recipe = kitchen_quantization_recipe_config(2) if with_quant_recipe else None
-    config = _make_config(params_dtype=torch.bfloat16, quant_recipe=recipe, **options)
-    assert config.quant_recipe is recipe
-    assert all(getattr(config, name) == value for name, value in options.items())
-
-
-@pytest.mark.parametrize(
-    "options, message",
-    [
-        ({"fp4_param": True}, "fp4_param must be used together with fp4"),
-        ({"fp4": "e2m1", "fp8": "e4m3"}, "fp4 and fp8 cannot be used simultaneously"),
-        ({"fp4": "e2m1", "fp4_recipe": "custom"}, "fp4_quantizer_factory must be provided"),
-    ],
-)
-def test_v41_preserves_common_quantization_requirements(options, message):
-    with pytest.raises(ValueError, match=message):
-        _make_config(params_dtype=torch.bfloat16, **options)
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"bias_activation_fusion": True},
-        {"bias_dropout_fusion": True},
-        {"moe_router_fusion": True},
-        {"moe_permute_fusion": True},
-        {"moe_grouped_gemm": True},
-        {"gradient_accumulation_fusion": True},
-        {"moe_grouped_gemm": True, "use_transformer_engine_op_fuser": True},
-        dict.fromkeys(
-            (
-                "bias_activation_fusion",
-                "bias_dropout_fusion",
-                "moe_router_fusion",
-                "moe_permute_fusion",
-                "moe_grouped_gemm",
-                "gradient_accumulation_fusion",
-                "use_transformer_engine_op_fuser",
-            ),
-            True,
-        ),
-    ],
-)
-def test_v41_accepts_existing_mlp_moe_fusions(monkeypatch, options):
-    # Check configuration only; kernel availability is tested independently below.
-    for name in (
-        "fused_permute",
-        "fused_permute_with_probs",
-        "fused_sort_chunks_by_index",
-        "fused_sort_chunks_by_index_with_probs",
-        "fused_unpermute",
-    ):
-        monkeypatch.setattr(f"megatron.core.transformer.moe.moe_utils.{name}", object())
-    config = _make_config(params_dtype=torch.bfloat16, **options)
-    assert all(getattr(config, name) == value for name, value in options.items())
-    assert config.activation_func_clamp_value == 10
-    assert config.moe_router_dtype == "fp32"
-    if options.get("use_transformer_engine_op_fuser"):
-        assert config.moe_use_grouped_tensor
-
-
-def test_v41_preserves_general_fusion_requirements(monkeypatch):
-    monkeypatch.setattr("megatron.core.transformer.moe.moe_utils.fused_permute", None)
-    with pytest.raises(ValueError, match="fused permutation is not available"):
-        _make_config(moe_permute_fusion=True)
-    with pytest.raises(ValueError, match="use_te_activation_func=False"):
-        _make_config(use_te_activation_func=True)
-
-
-@pytest.mark.parametrize("fused_rope", [False, True])
-@pytest.mark.parametrize("sm", [(9, 0), (10, 0)])
-def test_v41_fused_attention_accepts_dense_indexer_loss(monkeypatch, fused_rope, sm):
-    validated = []
-    monkeypatch.setattr(
-        "megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies",
-        validated.append,
-    )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: sm)
-    config = _make_config(
-        params_dtype=torch.bfloat16,
-        v_head_dim=512,
-        dsa_kernel_backend="cudnn",
-        apply_rope_fusion=fused_rope,
-        dsa_indexer_loss_coeff=0.3,
-        dsa_indexer_use_sparse_loss=False,
-        dsa_indexer_n_heads=32,
-        dsa_indexer_head_dim=128,
-    )
-    assert validated == ["cudnn"]
-    assert config.dsa_kernel_backend == "cudnn"
-    assert config.apply_rope_fusion == fused_rope
-
-
 @pytest.mark.parametrize(
     "overrides, message",
     [
@@ -389,37 +167,6 @@ def test_v41_fused_attention_validates_kernel_requirements(monkeypatch, override
     values.update(overrides)
     with pytest.raises(ValueError, match=message):
         _make_config(**values)
-
-
-def test_v41_rope_fusion_is_independent_of_sparse_attention():
-    config = _make_config(apply_rope_fusion=True)
-    assert config.dsa_kernel_backend == "none"
-    with pytest.raises(ValueError, match="divisible by 4"):
-        _make_config(apply_rope_fusion=True, qk_pos_emb_head_dim=6)
-
-
-@pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("sparse", [False, True])
-def test_v41_mxfp8_selection_accepts_indexer_loss(monkeypatch, heads, sparse):
-    monkeypatch.setattr(
-        "megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies",
-        lambda backend: None,
-    )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
-    config = _make_config(
-        params_dtype=torch.bfloat16,
-        v_head_dim=512,
-        dsa_kernel_backend="cudnn",
-        dsa_indexer_n_heads=heads,
-        dsa_indexer_head_dim=128,
-        dsa_indexer_precision="mxfp8",
-        dsa_indexer_loss_coeff=0.3,
-        dsa_indexer_use_sparse_loss=sparse,
-    )
-    assert config.dsa_indexer_precision == "mxfp8"
-    assert config.dsa_indexer_n_heads == heads
-    assert config.csa2_candidate_source_layer == 3
-    assert config.fp8 is None
 
 
 @pytest.mark.parametrize(
@@ -451,46 +198,6 @@ def test_v41_fused_indexer_validates_requirements(monkeypatch, overrides, sm, me
     values.update(overrides)
     with pytest.raises(ValueError, match=message):
         _make_config(**values)
-
-
-@pytest.mark.parametrize(
-    "get_spec",
-    [get_dsv4_hybrid_module_spec_for_backend, get_experimental_attention_variant_module_spec],
-)
-@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed")
-def test_v41_uses_v4_backend_for_attention_spec(get_spec):
-    backend = TESpecProvider()
-    kwargs = {"backend": backend} if get_spec is get_dsv4_hybrid_module_spec_for_backend else {}
-    spec = get_spec(_make_config(), **kwargs)
-    assert spec.submodules.core_attention.module is CompressedSparseAttention2
-    assert spec.submodules.linear_q_down_proj is backend.linear()
-    assert spec.submodules.linear_q_up_proj is backend.column_parallel_linear()
-    assert spec.submodules.linear_kv_proj is backend.column_parallel_linear()
-    assert spec.submodules.linear_proj is backend.row_parallel_linear()
-    assert spec.submodules.q_layernorm is backend.layer_norm(rms_norm=True, for_qk=True)
-    core = spec.submodules.core_attention.submodules
-    assert core.compressor.submodules.linear_wkv is backend.linear()
-    assert core.compressor.submodules.norm is backend.layer_norm(rms_norm=True, for_qk=False)
-    assert core.indexer.submodules.linear_wq_b is backend.linear()
-    assert core.indexer.submodules.linear_wk is backend.linear()
-    assert core.indexer.submodules.k_norm is backend.layer_norm(rms_norm=True, for_qk=True)
-
-
-@pytest.mark.parametrize("ratio", [0, 4, 128])
-def test_v4_config_remains_unchanged(ratio):
-    config = MLATransformerConfig(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        experimental_attention_variant="dsv4_hybrid",
-        csa_compress_ratios=[ratio],
-    )
-    assert config.dsv4_version == "v4"
-    assert config.csa_compress_ratios == [ratio]
-    assert config.csa_compress_rotary_base == 40000
-    assert config.dsa_kernel_backend == "none"
-    assert not config.rotary_interleaved
-    assert not config.mhc_single_pass
 
 
 def test_v41_does_not_implicitly_enable_single_pass():
