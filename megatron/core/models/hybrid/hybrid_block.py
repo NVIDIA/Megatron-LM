@@ -731,8 +731,13 @@ class HybridStack(MegatronModule):
                                 if residual_stream_recompute_context is not None:
                                     if isinstance(layer, HyperConnectionHybridLayer):
                                         raise TypeError(
-                                            "Residual-stream recomputation does not support "
-                                            "HyperConnectionHybridLayer."
+                                            "'residual_stream' recomputation cannot be applied to "
+                                            "HyperConnectionHybridLayer. Wide residuals replay "
+                                            "connection reads, connected norms, and writes "
+                                            "through ResidualStreamRecomputeContext, while mHC "
+                                            "uses its own mhc_recompute_manager. For mHC, select "
+                                            "'mhc' in recompute_modules and configure "
+                                            "mhc_recompute_layer_num instead."
                                         )
                                     layer_kwargs["residual_stream_recompute_context"] = (
                                         residual_stream_recompute_context
