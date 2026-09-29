@@ -267,6 +267,13 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Train/generation parity mode: the inference expert kernel produces the
+        # layer output and the recompute pass produces the backward graph, so the
+        # two passes of the same checkpointed forward run different expert
+        # implementations and different token dispatchers. Which inference kernel
+        # is inference_grouped_gemm_backend's choice; nothing here depends on it.
+        self.inference_training_forward = config.moe_inference_training_forward
+        self._inference_pass_is_value = False
 
         self.tp_group = pg_collection.tp
 
@@ -450,6 +457,18 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
+        # The dispatcher for the value pass of a parity-mode training forward: the
+        # inference one, unconditionally, because the whole construction is "run
+        # what generation runs" and a dispatcher that is merely equivalent is not
+        # the same thing as the same one. Under NVLS that matters for more than
+        # bookkeeping: the two combines reduce across EP ranks through different
+        # collectives, and only the NVLS one has a batch-invariant ordered path.
+        self._parity_token_dispatcher = self._inference_token_dispatcher
+        # Sized and allocated on the first value pass rather than here: the
+        # training token count is a property of the microbatch, not of the
+        # config, and the layer does not see one until it is handed a tensor.
+        self._parity_dispatcher_type = dispatcher_type
+
         # Wire shared-expert overlap into the inference dispatcher (NVLS only).
         # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
         # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
@@ -469,6 +488,56 @@ class MoELayer(BaseMoELayer):
         # Inference only: side-stream shared-expert output for latent-MoE + NVLS overlap
         # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
         self._latent_shared_expert_output: Optional[torch.Tensor] = None
+
+    def _allocate_parity_symmetric_buffers(self, hidden_states):
+        """Give the parity value pass the symmetric heap NVLS dispatch needs.
+
+        Generation gets these from the inference context, which sizes them from
+        ``max_tokens``. A training step has no context, but the context was only
+        ever the caller: the allocation needs a token count, a topk, a hidden
+        size and a process group, and a training step knows all four.
+
+        Sized from the larger of the live tensor and
+        ``moe_inference_training_max_tokens_per_rank``. The buffers cannot grow,
+        and microbatches are padded to their own longest sequence, so the first
+        one is not in general the largest; the config supplies the bound the
+        first one cannot. Allocated once and then checked, rather than
+        re-checked collectively every pass, so the steady state costs nothing:
+        the first call happens on every rank together because the class
+        attribute starts unset everywhere, and the assertion afterwards is local
+        and fires on all ranks at once for the same oversized batch, which fails
+        cleanly instead of deadlocking half the group inside a collective.
+        """
+        local_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        if NVLSAllGatherVDispatcher._symm_rsv is not None:
+            assert local_tokens <= NVLSAllGatherVDispatcher._per_rank_worst_case_token_count, (
+                f"parity value pass has {local_tokens} tokens but the symmetric buffers were "
+                f"sized for {NVLSAllGatherVDispatcher._per_rank_worst_case_token_count}. "
+                "Symmetric memory is allocated once and cannot grow. Set "
+                "moe_inference_training_max_tokens_per_rank to the largest microbatch "
+                "(log-prob batch size x max sequence length) so it is sized for that "
+                "instead of for whichever pass ran first."
+            )
+            return
+
+        # Reduced across the EP group rather than assumed equal. Symmetric
+        # memory is allocated collectively and every rank must ask for the same
+        # size, so a ragged microbatch would otherwise hang here rather than
+        # report anything.
+        floor = self.config.moe_inference_training_max_tokens_per_rank or 0
+        wanted = torch.tensor(
+            [max(local_tokens, floor)], device=hidden_states.device, dtype=torch.int64
+        )
+        torch.distributed.all_reduce(wanted, op=torch.distributed.ReduceOp.MAX, group=self.ep_group)
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=int(wanted.item()),
+            topk=self.config.moe_router_topk,
+            # Latent MoE moves latent-dim tokens through the dispatcher, so the
+            # buffer is that wide and not hidden_size. Same choice the inference
+            # context makes.
+            hidden_size=self.config.moe_latent_size or self.config.hidden_size,
+            ep_group=self.ep_group,
+        )
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
@@ -596,7 +665,19 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
+        # The inference kernels do their own routing, so they need the routing map
+        # rather than pre-permuted tokens. True for inference and for the value pass
+        # of the parity-mode training forward.
+        #
+        # This has to agree with the branch the experts themselves take, so it asks
+        # the same question they do rather than keying on the dispatcher class: the
+        # parity dispatcher is the ordinary all-gather, which is also what the
+        # training path can be using.
+        needs_routing_map = hasattr(self, "_inference_token_dispatcher") and (
+            InferenceMode.is_active()
+            or (self._inference_forward_applies() and not self.experts._in_inference_recompute)
+        )
+        if needs_routing_map:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -707,10 +788,57 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            # Whether this invocation is the value pass, kept across the block
+            # below because that block consumes _inference_pass_is_value and the
+            # routing conversion after `route` still needs to know.
+            value_pass = False
+            if self._inference_forward_applies():
+                # The value pass runs generation's dispatcher, the recompute pass
+                # training's, because the recompute is what has to build wgrad
+                # through the ordinary path.
+                use_inference = self._inference_pass_is_value
+                value_pass = use_inference
+                if use_inference:
+                    # The all-gather dispatchers read a per-step valid-tokens
+                    # scalar that the inference context normally allocates. In a
+                    # training step nothing has, and the kernels do read it, so
+                    # allocate it once here rather than leaving them to find an
+                    # uninitialised buffer.
+                    if NCCLAllGatherDispatcher._valid_tokens_tensor is None:
+                        NCCLAllGatherDispatcher.allocate_buffers()
+                    if self._parity_dispatcher_type == 'nvls':
+                        self._allocate_parity_symmetric_buffers(hidden_states)
+                self.token_dispatcher = (
+                    self._parity_token_dispatcher
+                    if use_inference
+                    else self._training_token_dispatcher
+                )
+                self.shared_expert_overlap = (
+                    False if use_inference else self.config.moe_shared_expert_overlap
+                )
+                self.experts._in_inference_recompute = not use_inference
+                # Consumed: any later invocation of this closure is a recompute.
+                self._inference_pass_is_value = False
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
+                    if value_pass:
+                        # Generation's router hands the dispatcher [tokens, topk]
+                        # indices; training's TopKRouter returns a boolean
+                        # [tokens, num_experts] map and dense probs. The value
+                        # pass runs the training router, so convert here, before
+                        # the dispatcher sees either.
+                        #
+                        # Not merely cosmetic: the NVLS dispatcher gathers
+                        # through fixed-size symmetric buffers sized to topk, so
+                        # a dense map arrives as a width mismatch rather than a
+                        # wrong answer. The NCCL dispatcher sizes itself from the
+                        # tensor and tolerates the dense form, but would then be
+                        # gathering something generation never gathers.
+                        routing_map, probs = self.experts._dense_routing_to_topk(
+                            routing_map, probs
+                        )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
@@ -749,6 +877,11 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        # Mark the next custom_forward invocation as the output-producing pass.
+        # custom_forward clears this, so the recompute triggered from backward
+        # takes the TE path.
+        self._inference_pass_is_value = self._inference_forward_applies()
+
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -768,6 +901,24 @@ class MoELayer(BaseMoELayer):
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
+
+    def _inference_forward_applies(self) -> bool:
+        """Whether this module's forward should route expert compute through the inference kernel.
+
+        Deliberately not conditioned on ``self.training``. The pass that has to
+        match generation is the log-prob forward, and RL frameworks run that
+        under ``model.eval()`` -- gating on training mode would quietly send
+        exactly that pass down the TE path and leave it away from generation by
+        the amount this mode exists to close.
+
+        Eval needs no recompute to pair with: without grad there is no backward
+        to rebuild, so the single ``custom_forward`` call is the value pass.
+
+        ``InferenceMode`` is excluded because the inference engine reaches the
+        kernel through the inference dispatcher and the experts' own inference
+        path, which owns its weights separately.
+        """
+        return self.inference_training_forward and not InferenceMode.is_active()
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""

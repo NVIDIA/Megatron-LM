@@ -1,13 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Construction-time validation for ``moe_inference_training_forward``.
+"""Construction-time validation and kernel selection for ``moe_inference_training_forward``.
 
 Not a parity test. These are the checks that fail at ``TransformerConfig``
 construction rather than in arithmetic -- the backend allow-list, the recompute
 requirement, the settings that would change which experts the value pass picks --
 because they are cheap to get wrong and expensive to discover: a rejected setting
 found ten minutes into a two-node job is the failure this file exists to move to
-the first second.
+the first second. Also pins the rule that picks the kernel, which both generation
+and the value pass read.
 
 Config-only and single-rank, so it needs no GPU. The bitwise question, whether the
 training value pass reproduces generation, needs EP ranks and a generation forward
@@ -132,6 +133,52 @@ class TestMaxTokensPerRank:
     def test_rejects_a_non_positive_bound(self, bound):
         with pytest.raises(ValueError, match="must be positive"):
             _config(moe_inference_training_max_tokens_per_rank=bound)
+
+
+class TestGroupedGemmKernelSelection:
+    """Which kernel the torch/vLLM expert compute runs, per backend and precision.
+
+    Generation and the training value pass have to reach the same one. The
+    interesting case is vLLM under MXFP8: its Triton kernel has no MXFP8 layout,
+    so generation falls back to MCore's scaled grouped GEMM. A value pass that
+    kept calling the vLLM kernel there would run a different forward than
+    generation while every config check passed -- exactly the silent bias this
+    path exists to remove.
+
+    Pinned on the predicate both callers read, so a truth table here is the
+    whole selection rule rather than a sample of it.
+    """
+
+    @staticmethod
+    def _select(backend, uses_mxfp8):
+        from types import SimpleNamespace
+
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        stub = SimpleNamespace(inference_grouped_gemm_backend=InferenceGroupedGemmBackend(backend))
+        return InferenceGroupedMLP._uses_mcore_grouped_gemm(stub, uses_mxfp8)
+
+    @pytest.mark.parametrize(
+        "backend,uses_mxfp8,expect_mcore",
+        [
+            ('vllm', False, False),
+            ('vllm', True, True),
+            ('torch', False, True),
+            ('torch', True, True),
+        ],
+    )
+    def test_selection(self, backend, uses_mxfp8, expect_mcore):
+        assert self._select(backend, uses_mxfp8) is expect_mcore
+
+    def test_vllm_defaults_to_its_own_kernel_before_the_weights_are_built(self):
+        """Generation's ``_uses_mxfp8_weights`` is None until a build sets it.
+
+        Both callers resolve the flag before selecting, so None should not reach
+        here; it falls to the vLLM kernel rather than raising because that is the
+        BF16 default, and a crash on an unreachable state would be noise.
+        """
+        assert self._select('vllm', None) is False
 
 
 class TestMxfp8Recipe:
