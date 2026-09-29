@@ -647,11 +647,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
-            current_batch_size = input_ids.shape[0]
-            sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
+            # Caller-supplied embeddings and later PP stages may omit token IDs.
+            hidden_states = (
+                decoder_input if decoder_input is not None else self.decoder.input_tensor
+            )
+            sequence_len_offset = torch.full(
+                (hidden_states.shape[1],),
+                inference_context.sequence_len_offset,
                 dtype=torch.int32,
-                device='cuda',
+                device=hidden_states.device,
             )
         else:
             sequence_len_offset = None
