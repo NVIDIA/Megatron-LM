@@ -117,28 +117,37 @@ def _build_model(
     return model, optimizer
 
 
+def _generate_batches(num_steps: int) -> list[list[dict[str, torch.Tensor]]]:
+    """Generate deterministic per-rank inputs for each step and microbatch."""
+    seq_length, microbatches = 128, 2
+    generator = torch.Generator(device="cuda").manual_seed(2026 + torch.distributed.get_rank())
+    positions = torch.arange(seq_length, device="cuda").unsqueeze(0)
+    return [
+        [
+            {
+                "tokens": torch.randint(
+                    0, 256, (1, seq_length), device="cuda", generator=generator
+                ),
+                "position_ids": positions,
+            }
+            for _ in range(microbatches)
+        ]
+        for _ in range(num_steps)
+    ]
+
+
 def _train(
     model: torch.nn.Module,
     optimizer: MegatronOptimizer,
     pg_collection: ProcessGroupCollection,
     *,
-    num_steps: int = 6,
+    batches: list[list[dict[str, torch.Tensor]]],
 ) -> torch.Tensor:
-    """Run optimizer steps and return per-microbatch losses on the GPU."""
-    seq_length, microbatches = 128, 2
-    generator = torch.Generator(device="cuda").manual_seed(2026 + torch.distributed.get_rank())
-    batches = [
-        [
-            {"tokens": torch.randint(0, 256, (1, seq_length), device="cuda", generator=generator)}
-            for _ in range(microbatches)
-        ]
-        for _ in range(num_steps)
-    ]
-    positions = torch.arange(seq_length, device="cuda").unsqueeze(0)
+    """Train on the supplied batches and return per-microbatch losses on the GPU."""
 
     def forward_step(data_iterator, model):
         batch = next(data_iterator)
-        output = model(batch["tokens"], positions, None)
+        output = model(batch["tokens"], batch["position_ids"], None)
 
         def loss_func(output):
             loss = output.float().square().mean()
@@ -148,14 +157,15 @@ def _train(
 
     losses = []
     for batch in batches:
+        micro_batch_size, seq_length = batch[0]["tokens"].shape
         optimizer.zero_grad(set_to_none=True)
         result = forward_backward_no_pipelining(
             forward_step_func=forward_step,
             data_iterator=[iter(batch)],
             model=[model],
-            num_microbatches=microbatches,
+            num_microbatches=len(batch),
             seq_length=seq_length,
-            micro_batch_size=1,
+            micro_batch_size=micro_batch_size,
             forward_only=False,
             pg_collection=pg_collection,
         )
@@ -169,11 +179,12 @@ def test_mla_activation_offload_matches_baseline(
     offload_pg_collection: ProcessGroupCollection,
 ) -> None:
     """Compare training losses without profiling either run."""
+    batches = _generate_batches(num_steps=6)
     model, optimizer = _build_model(offload_pg_collection, offload=False)
-    baseline_losses = _train(model, optimizer, offload_pg_collection)
+    baseline_losses = _train(model, optimizer, offload_pg_collection, batches=batches)
     del model, optimizer
     model, optimizer = _build_model(offload_pg_collection, offload=True)
-    offloaded_losses = _train(model, optimizer, offload_pg_collection)
+    offloaded_losses = _train(model, optimizer, offload_pg_collection, batches=batches)
     torch.testing.assert_close(offloaded_losses, baseline_losses, rtol=1e-3, atol=1e-6)
 
 
@@ -182,13 +193,14 @@ def test_mla_activation_offload_transfers(
     offload_pg_collection: ProcessGroupCollection, offload: bool
 ) -> None:
     """Check that activation transfers occur only when offloading is enabled."""
+    batches = _generate_batches(num_steps=1)
     model, optimizer = _build_model(offload_pg_collection, offload=offload)
     # One warmup discovers offload groups; profile the next iteration.
-    _train(model, optimizer, offload_pg_collection, num_steps=1)
+    _train(model, optimizer, offload_pg_collection, batches=batches)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     ) as profiler:
-        _train(model, optimizer, offload_pg_collection, num_steps=1)
+        _train(model, optimizer, offload_pg_collection, batches=batches)
     # Filter device copies first; their names identify the transfer direction.
     memcpy_events = [
         event
