@@ -10,6 +10,7 @@ modes don't depend on parallelism degree):
                        the runner's ``_reset_quantizer_state`` between runs
                        A and B (per-module ``fp8_meta`` carries amax across
                        forward passes).
+* ``fp8-blockwise``  — blockwise FP8 scaling.
 * ``fp8-mxfp8``      — Blackwell-only microscaling FP8; capability-skipped on Hopper.
 * ``fp4-nvfp4``      — Blackwell-only NVFP4 block scaling; capability-skipped on Hopper.
 """
@@ -30,6 +31,7 @@ RUNNER = make_gpt_runner(supports_pp=False)
 _QUANT_RECIPES = [
     pytest.param({"fp8": "hybrid", "fp8_recipe": "tensorwise"}, id="fp8-tensorwise"),
     pytest.param({"fp8": "hybrid", "fp8_recipe": "delayed"}, id="fp8-delayed"),
+    pytest.param({"fp8": "hybrid", "fp8_recipe": "blockwise"}, id="fp8-blockwise"),
     pytest.param(
         {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
         id="fp8-mxfp8",
