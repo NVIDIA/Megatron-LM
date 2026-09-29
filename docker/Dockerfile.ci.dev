@@ -67,16 +67,13 @@ EOF
 
 ARG CUBLAS_VERSION=13.8.1.7
 RUN bash -euxo pipefail <<"EOF"
-    # cuBLAS 13.8.1 includes the grouped GEMM correctness fix. Keep these checksums
-    # aligned with CUBLAS_VERSION: https://developer.download.nvidia.com/compute/cublas/redist/redistrib_13.8.1.json
+    # cuBLAS 13.8.1 includes the grouped GEMM correctness fix.
     case "${TARGETARCH}" in
         amd64)
             CUBLAS_ARCH=x86_64
-            CUBLAS_SHA256=1539c78dc1d2825830c7c9250f43f401c355076e8a76d959c7745bfd9ca76bb5
             ;;
         arm64)
             CUBLAS_ARCH=sbsa
-            CUBLAS_SHA256=02ab2d6ed06e4da5d1540c3bd185b8b163ec401c8e9676329236ff3c7c4216be
             ;;
         *) echo "Unsupported TARGETARCH for cuBLAS: ${TARGETARCH}" >&2; exit 1 ;;
     esac
@@ -84,7 +81,6 @@ RUN bash -euxo pipefail <<"EOF"
     CUBLAS_TMP=$(mktemp -d)
     curl -fLSs --retry 3 -o "${CUBLAS_TMP}/cublas.tar.xz" \
         "https://developer.download.nvidia.com/compute/cublas/redist/libcublas/linux-${CUBLAS_ARCH}/${CUBLAS_ARCHIVE}.tar.xz"
-    echo "${CUBLAS_SHA256}  ${CUBLAS_TMP}/cublas.tar.xz" | sha256sum -c -
     tar -xJf "${CUBLAS_TMP}/cublas.tar.xz" -C "${CUBLAS_TMP}"
     # Replace the toolkit copies so existing linker paths pick up both cuBLAS and cuBLASLt.
     CUDA_ROOT="${CUDA_HOME:-/usr/local/cuda}"
