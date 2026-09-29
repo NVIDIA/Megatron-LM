@@ -8,6 +8,7 @@ import transformer_engine as te
 
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
@@ -55,6 +56,41 @@ def _make_pg_collection():
 def _num_physical_layers(layer_pattern: str) -> int:
     """Number of physical layers in a segment pattern (bracketed groups flattened)."""
     return len(layer_pattern.replace(Symbols.GROUP_START, '').replace(Symbols.GROUP_END, ''))
+
+
+@pytest.mark.parametrize("pp_layer_offset", [0, 5])
+def test_shortcut_checkpoint_keys_preserve_physical_layer_offsets(pp_layer_offset):
+    """Collapsed shortcut pairs must not renumber following layers or truncate saving."""
+
+    class CheckpointLayer(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.layer_number = layer_number
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def sharded_state_dict(self, prefix, sharded_offsets, metadata):
+            key = f'{prefix}weight'
+            return {key: ShardedTensor.from_rank_offsets(key, self.weight)}
+
+    # Two shortcut pairs followed by a normal layer: five physical layers become
+    # three executable modules, whose storage positions remain 0, 2, and 4.
+    block = HybridStack.__new__(HybridStack)
+    torch.nn.Module.__init__(block)
+    block.layers = torch.nn.ModuleList(
+        [CheckpointLayer(pp_layer_offset + index + 1) for index in (0, 2, 4)]
+    )
+    block.layer_config_list = [object() for _ in range(5)]
+    block._execution_layer_indices = [0, 2, 4]
+    block._execution_layer_config_list = [block.layer_config_list[index] for index in (0, 2, 4)]
+    block.logical_layer_offset = pp_layer_offset
+    block.is_layer_group_stack = False
+    block.transformer_sharded_keys = False
+
+    sharded_state_dict = block.sharded_state_dict(prefix='decoder.')
+    assert set(sharded_state_dict) == {f'decoder.layers.{index}.weight' for index in range(3)}
+    assert [value.key for value in sharded_state_dict.values()] == [
+        f'decoder.layers.{pp_layer_offset + index}.weight' for index in (0, 2, 4)
+    ]
 
 
 def test_wide_residual_spec_preserves_unmodified_stack_submodules():

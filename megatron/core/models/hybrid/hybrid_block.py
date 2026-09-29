@@ -1079,14 +1079,22 @@ class HybridStack(MegatronModule):
         if sharded_layer_prefix is None:
             sharded_layer_prefix = layer_prefix
 
-        for local_layer_idx, (layer_config, layer) in enumerate(
-            zip(self.layer_config_list, self.layers, strict=True)
+        for local_layer_idx, (source_layer_idx, layer_config, layer) in enumerate(
+            zip(
+                self._execution_layer_indices,
+                self._execution_layer_config_list,
+                self.layers,
+                strict=True,
+            )
         ):
             state_dict_prefix = f'{layer_prefix}{local_layer_idx}.'  # module list index
+            # Shortcut blocks collapse adjacent physical layers, while bracketed groups
+            # already occupy one logical slot. Keep the index from before shortcut
+            # grouping so both the shortcut and subsequent layers retain their old keys.
             logical_layer_idx = (
                 self.logical_layer_offset
                 if self.is_layer_group_stack
-                else self.logical_layer_offset + local_layer_idx
+                else self.logical_layer_offset + source_layer_idx
             )
 
             if is_layer_group(layer_config):
