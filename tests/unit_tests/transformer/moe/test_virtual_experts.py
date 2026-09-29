@@ -796,6 +796,18 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             for parameter in layer.experts.parameters():
                 assert not is_mxfp8tensor(parameter)
                 assert parameter.dtype == torch.bfloat16
+            if virtual:
+                for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
+                    assert linear.num_gemms == 4
+                    assert set(dict(linear.named_parameters(recurse=False))) == {
+                        "weight0",
+                        "weight1",
+                    }
+                    assert not any(
+                        key.startswith(("weight2", "weight3")) for key in linear.state_dict()
+                    )
+                    sharded = linear.sharded_state_dict(metadata={"dp_cp_group": pg.dp_cp})
+                    assert not any(key.startswith(("weight2", "weight3")) for key in sharded)
             # Force traffic to opposite EP owners on successive uses of the same layer.
             # Distinct per-rank inputs expose dropped or duplicated contributions.
             with torch.no_grad():
@@ -833,6 +845,23 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
                 x.requires_grad_()
                 y, bias = layer(x)
                 assert bias is None
+                if virtual and not use_op_fuser:
+                    for fc_layer, linear in enumerate(
+                        (layer.experts.linear_fc1, layer.experts.linear_fc2)
+                    ):
+                        runtime_weights = layer.experts._virtual_experts.runtime_weights(fc_layer)
+                        assert not hasattr(linear, "_runtime_weights")
+                        assert all(
+                            getattr(linear, f"weight{index}") is weight
+                            for index, weight in enumerate(runtime_weights)
+                        )
+                        registered = {id(param) for param in linear.parameters(recurse=False)}
+                        assert all(id(weight) not in registered for weight in runtime_weights)
+                        assert linear._parameters["weight2"] is None
+                        assert linear._parameters["weight3"] is None
+                        assert not any(
+                            key.startswith(("weight2", "weight3")) for key in linear.state_dict()
+                        )
                 inputs.append(x)
                 outputs.append(y)
                 upstreams.append(torch.randn(y.shape, device='cuda', dtype=y.dtype, generator=rng))
