@@ -378,6 +378,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
             "MATCHED_KEY": "" if restore == "miss" else identity["cache_prefix"] + "123-1",
             "CACHE_HIT": "false",
+            "TARGET_BRANCH": "main",
             "RUNNER_TEMP": str(runtime_dir),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),

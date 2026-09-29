@@ -267,16 +267,10 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--identity", type=Path, required=True)
         if command == "validate":
             child.add_argument("--matched-key", required=True)
+            child.add_argument("--base-ref", default="")
         else:
             child.add_argument("--source-sha", required=True)
             child.add_argument("--generation", required=True)
-    sm_parser = subparsers.add_parser("source-mapping")
-    sm_parser.add_argument("--root", type=Path, default=Path("."))
-    sm_parser.add_argument("--bucket", required=True)
-    sm_parser.add_argument("--platform", required=True)
-    sm_group = sm_parser.add_mutually_exclusive_group(required=True)
-    sm_group.add_argument("--base-ref")
-    sm_group.add_argument("--changed-files-stdin", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "identity":
@@ -285,22 +279,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cache_prefix={identity['cache_prefix']}")
         elif args.command == "finalize":
             finalize(args.cache_dir, _read_json(args.identity), args.source_sha, args.generation)
-        elif args.command == "source-mapping":
-            spec = importlib.util.spec_from_file_location(
-                "testmon_source_mapping", Path(__file__).with_name("testmon_source_mapping.py")
-            )
-            sm = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(sm)
-            if args.base_ref:
-                files = sm._changed_files(args.root, args.base_ref)
-            else:
-                files = [line.strip() for line in sys.stdin if line.strip()]
-            buckets = sm.forced_full_buckets(args.root, files, args.platform)
-            if args.bucket in buckets:
-                print("force_full=true")
-            else:
-                print("force_full=false")
-            return 0
         else:
             identity = _read_json(args.identity)
             manifest = validate_cache(args.cache_dir, identity, args.matched_key)
@@ -314,6 +292,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"Baseline image: {manifest.get('image_id', 'unknown')}; "
                 f"current image: {identity['image_id']}"
             )
+            if args.base_ref:
+                spec = importlib.util.spec_from_file_location(
+                    "testmon_source_mapping", Path(__file__).with_name("testmon_source_mapping.py")
+                )
+                sm = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(sm)
+                bucket = identity["compatibility"]["bucket"]
+                platform = identity["compatibility"]["platform"]
+                files = sm._changed_files(Path("."), args.base_ref)
+                if bucket in sm.forced_full_buckets(Path("."), files, platform):
+                    raise ValueError(f"source mapping forces full run for bucket {bucket}")
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Testmon cache: {error}", file=sys.stderr)
         return 1
