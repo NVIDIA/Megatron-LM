@@ -1123,8 +1123,8 @@ wheels = [
 
 [[package]]
 name = "deep-gemm"
-version = "2.5.0+local"
-source = { git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480#714dd1a4a980f7937a74343d19a8eba4fe321480" }
+version = "2.8.0+local"
+source = { git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=66081d4c9c7d7c44f13fea402e5b622aa0f409c2#66081d4c9c7d7c44f13fea402e5b622aa0f409c2" }
 
 [[package]]
 name = "defusedxml"
@@ -2527,7 +2527,7 @@ requires-dist = [
 provides-extras = ["training", "mlm", "dev", "inference", "otel", "lts", "te", "ssm"]
 
 [package.metadata.requires-dev]
-batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" }]
+batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=66081d4c9c7d7c44f13fea402e5b622aa0f409c2" }]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
@@ -2559,7 +2559,7 @@ linting = [
     { name = "ruff", specifier = "~=0.9.0" },
 ]
 no-pypi-wheels = [
-    { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" },
+    { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=66081d4c9c7d7c44f13fea402e5b622aa0f409c2" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev" },
 ]
