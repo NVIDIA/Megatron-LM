@@ -717,6 +717,9 @@ class TestFusedPreGatedDeltaRule:
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
             deterministic_mode=deterministic_mode,
+            # deterministic_mode no longer implies the torch kernel; the backend must be
+            # named explicitly, so keep this helper on the kernel each mode used before.
+            gdn_kernel_backend="torch" if deterministic_mode else "fla",
             gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
