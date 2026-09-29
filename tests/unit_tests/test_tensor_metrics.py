@@ -1135,7 +1135,10 @@ def test_router_padding_metrics_reduce_uneven_populations_end_to_end(all_padding
                     router._maintain_float32_expert_bias = lambda: None
                     router.apply_input_jitter = lambda tensor: tensor
                     router.gating = lambda tensor: logits
-                    router.routing = lambda tensor, padding_mask=None: (tensor, None)
+                    router.routing = lambda tensor, padding_mask=None, input_ids=None: (
+                        tensor,
+                        None,
+                    )
 
                     def observe(owner, name, kind, tensor, tp_dim, sequence_dim, batch_dim):
                         values.append(

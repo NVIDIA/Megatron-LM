@@ -14,6 +14,7 @@ from megatron.core.models.hybrid.shortcut_block import (
 )
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -77,6 +78,10 @@ class _FakeNorm:
 
 
 class _FakeMoE(torch.nn.Module):
+    is_moe_layer = True
+    _maybe_unflatten_for_moe = TransformerLayer._maybe_unflatten_for_moe
+    _maybe_reflatten_from_moe = TransformerLayer._maybe_reflatten_from_moe
+
     def __init__(self, config, *, layer_number: int = 2):
         super().__init__()
         self.config = config
@@ -91,14 +96,6 @@ class _FakeMoE(torch.nn.Module):
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
-
-    @staticmethod
-    def _maybe_unflatten_for_moe(hidden_states, padding_mask, packed_seq_params):
-        return hidden_states, padding_mask, None
-
-    @staticmethod
-    def _maybe_reflatten_from_moe(output, packed_seq_params, mbs):
-        return output
 
 
 @pytest.mark.parametrize(
@@ -289,13 +286,14 @@ def test_group_layers_rejects_pair_split_across_pipeline_stages():
         )
 
 
-def test_shared_experts_propagates_the_layers_residual_and_mlp_state():
+@pytest.mark.parametrize("tokens_per_sample", [None, 2])
+def test_shared_experts_propagates_the_layers_residual_and_mlp_state(tokens_per_sample):
     """The layer owns the unpack and the payload; the block must carry both through."""
     config = _shortcut_config()
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False)
 
-    hidden_states = torch.ones(2, 1, config.hidden_size)
+    hidden_states = torch.arange(4 * config.hidden_size).float().reshape(4, 1, config.hidden_size)
     normalized = hidden_states * 2
     # Distinct objects, so reusing hidden_states or dropping the payload is detectable.
     layer_residual = hidden_states.clone()
@@ -307,9 +305,16 @@ def test_shared_experts_propagates_the_layers_residual_and_mlp_state():
     )
     moe_layer.mlp.shared_experts_compute = lambda states: states
 
-    shared_expert_output, _, residual, mlp_state = block._moe_shared_experts(hidden_states)
+    packed = SimpleNamespace(tokens_per_sample=tokens_per_sample)
+    shared_expert_output, mbs, residual, mlp_state = block._moe_shared_experts(
+        hidden_states, packed_seq_params=packed
+    )
+    expected = normalized
+    if tokens_per_sample is not None:
+        expected = normalized.view(2, 2, config.hidden_size).transpose(0, 1).contiguous()
+    assert mbs == (None if tokens_per_sample is None else 2)
 
-    assert torch.equal(shared_expert_output, normalized)
+    assert torch.equal(shared_expert_output, expected)
     assert residual is layer_residual
     assert mlp_state is layer_mlp_state
 

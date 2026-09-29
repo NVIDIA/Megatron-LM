@@ -167,6 +167,36 @@ def test_build_communicator_wires_bridge_receive_shape(
         assert shape_fns is None
 
 
+@pytest.mark.parametrize("skip_shape_exchange", [False, True])
+def test_llm_only_communicator_has_no_encoder_bridges(monkeypatch, skip_shape_exchange):
+    import examples.mimo.model_providers.nemotron_moe_vlm as provider
+
+    language_grid = object()
+    topology = SimpleNamespace(grids={MIMO_LANGUAGE_MODULE_KEY: language_grid})
+    language_config = SimpleNamespace(hidden_size=2688, params_dtype=torch.bfloat16)
+    # No vision configuration is needed when the topology contains only the LLM.
+    args = SimpleNamespace(mimo_llm_only=True, mimo_bridge_skip_shape_exchange=skip_shape_exchange)
+    monkeypatch.setattr(
+        provider,
+        "language_model_spec",
+        lambda args, pg_collection, grid: SimpleNamespace(params={"config": language_config}),
+    )
+    communicator_cls = provider.MultiModulePipelineCommunicator
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(communicator_cls, "_build_rank_module_info_map", lambda self: None)
+
+    communicator = build_nemotron_communicator(args, topology)
+
+    assert communicator.module_to_grid_map == topology.grids
+    assert communicator.topology == {MIMO_LANGUAGE_MODULE_KEY: []}
+    assert communicator.config is language_config
+    assert communicator.bridge_comms == []
+    assert communicator.module_output_ndim == {}
+    assert communicator.bridge_comm_dtypes == {}
+    assert communicator.bridge_recv_shape_fns == {}
+    assert communicator.bridge_requires_backward == {}
+
+
 # --- Config parity gate (requires torch; runs in CI) ----------------------
 
 pytest.importorskip("torch")
@@ -575,3 +605,51 @@ def test_language_rank_placement_uses_language_parallelism():
 
 # A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs
 # TE + a distributed init and is left to the cog functional check.
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("use_groups", [False, True])
+def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
+    from types import SimpleNamespace
+
+    from examples.mimo.model_providers import nemotron_moe_vlm as provider
+
+    # Deliberately disagree with the grid to catch inheritance of stock CP.
+    args = SimpleNamespace(
+        mimo_llm_ep=1,
+        mimo_llm_expt_tp=1,
+        vocab_size=64,
+        seq_length=32,
+        hybrid_layer_pattern="*",
+        logit_dtype=None,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_base_config",
+        lambda args: SimpleNamespace(context_parallel_size=8, calculate_per_token_loss=True),
+    )
+    grid = SimpleNamespace(shape=[1, cp_size, 1], dim_names=["tp", "cp", "pp"])
+    groups = None
+    if use_groups:
+        groups = SimpleNamespace(
+            **{
+                name: SimpleNamespace(size=lambda size=size: size, rank=lambda: 0)
+                for name, size in {"tp": 1, "cp": cp_size, "pp": 1, "ep": 1, "expt_tp": 1}.items()
+            }
+        )
+        monkeypatch.setattr(provider, "get_pg_size", lambda pg: pg.size())
+        monkeypatch.setattr(provider, "get_pg_rank", lambda pg: pg.rank())
+    spec = provider.language_model_spec(args, groups, grid)
+    assert spec.params["config"].context_parallel_size == cp_size
+
+
+def test_encoder_and_projection_do_not_inherit_language_cp():
+    from examples.mimo.model_providers.nemotron_moe_vlm import nemotron_projection_config
+    from examples.mimo.model_providers.radio_encoder import radio_vision_config
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    args.context_parallel_size = 2
+    vision = radio_vision_config(args, tp_size=1, pp_size=1)
+    projection = nemotron_projection_config(args, tp_size=1, projection_input_size=5120)
+    assert vision.context_parallel_size == 1
+    assert projection.context_parallel_size == 1
