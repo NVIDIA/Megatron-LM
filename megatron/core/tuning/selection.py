@@ -100,22 +100,12 @@ def estimate_config_cost(cfg):
     return (block_product * stages, warps)
 
 
-def filter_configs_by_block_sizes(configs):
-    """Filter configs by ``TRITON_AUTOTUNE_BLOCK_*`` environment overrides.
-
-    Each variable names a kernel kwarg: ``TRITON_AUTOTUNE_BLOCK_SIZE_M`` selects
-    configs whose ``BLOCK_SIZE_M`` matches. Returns ``None`` when no override
-    applies or nothing matches, so the caller falls through to its normal rule.
-    """
-    prefix = "TRITON_AUTOTUNE_"
-    env_filters = {}
-    for env_key, env_val in os.environ.items():
-        if env_key.startswith(prefix + "BLOCK") and env_val:
-            env_filters[env_key[len(prefix) :]] = int(env_val)
-    if not env_filters:
+def filter_configs_by_block_sizes(configs, block_sizes=()):
+    """Match explicit kernel block-size arguments against live candidates."""
+    if not block_sizes:
         return None
     matching = configs
-    for key, target in sorted(env_filters.items()):
+    for key, target in sorted(dict(block_sizes).items()):
         matching = [c for c in matching if c.kwargs.get(key) == target]
     return matching[:1] if matching else None
 
@@ -125,24 +115,26 @@ def cheapest(configs):
     return min(configs, key=estimate_config_cost)
 
 
-def deterministic_choice(autotuner, candidates, args, kwargs, *, table=None, on_miss="min_cost"):
+def deterministic_choice(
+    autotuner, candidates, args, kwargs, *, table=None, on_miss="min_cost", block_sizes=()
+):
     """Pick one config, preferring a tuned entry, never measuring.
 
     Order: the tuned table entry for this kernel and shape, then an explicit
-    ``TRITON_AUTOTUNE_BLOCK_*`` override, then the cheapest config.
+    block-size override, then the cheapest config.
     """
     name = kernel_name(autotuner)
     if table is not None:
         tuned = table.lookup(name, tuning_key(autotuner, args, kwargs), candidates)
         if tuned is not None:
             return tuned
-    filtered = filter_configs_by_block_sizes(candidates)
+    filtered = filter_configs_by_block_sizes(candidates, block_sizes)
     if filtered:
         return filtered[0]
     if on_miss == "error":
         raise RuntimeError(
             f"No tuned config for triton kernel {name!r} on {arch_tag()} and "
-            "MCORE_AUTOTUNE_ON_MISS=error. Record a table, or allow the "
+            "on_miss='error'. Record a table, or allow the "
             "deterministic min-cost fallback."
         )
     if name not in _untuned_kernels_warned:
@@ -150,7 +142,7 @@ def deterministic_choice(autotuner, candidates, args, kwargs, *, table=None, on_
         warnings.warn(
             f"No pre-tuned config for triton kernel {name!r} on {arch_tag()}; using the "
             "cheapest config, which is deterministic but may be slower. Record a table "
-            "with MCORE_AUTOTUNE_RECORD to recover the throughput."
+            "with AutotunePolicy(mode='record', record_path=...) to recover the throughput."
         )
     return cheapest(candidates)
 
@@ -178,11 +170,13 @@ def autotune_configs(configs):
     is still timed, so the cached winner varies per process, per GPU and per
     cache directory.
     """
+    from megatron.core.tuning.interception import active_policy
     from megatron.core.tuning.policy import use_deterministic_mode
 
     if not configs or not use_deterministic_mode():
         return configs
-    filtered = filter_configs_by_block_sizes(configs)
+    policy = active_policy()
+    filtered = filter_configs_by_block_sizes(configs, policy.block_sizes if policy else ())
     if filtered:
         return filtered
     return [cheapest(configs)]

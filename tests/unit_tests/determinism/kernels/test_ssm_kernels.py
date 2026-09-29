@@ -14,7 +14,7 @@ instead of FLA.
 
 Autotuning is the mechanism that can break replay here: ``megatron.core.tuning`` pins a
 single config, while ``ops/common/determinism.py`` selects a zero-initialised, ordered-sum
-workspace when ``MAMBA_DETERMINISTIC`` (or ``torch.use_deterministic_algorithms``) is on.
+workspace when the explicit deterministic policy (or ``torch.use_deterministic_algorithms``) is on.
 Each kernel is replayed in that mode, including with Triton's autotune cache enabled.
 """
 
@@ -256,19 +256,19 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
     "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
     "model owners; not gated until root-caused.",
 )
-def test_chunk_gated_delta_product_varlen_replays():
+def test_chunk_gated_delta_product_varlen_replays(monkeypatch):
     from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 
-    # The deterministic policy must have pinned the autotuners at import; otherwise the
-    # replay would measure Triton's timing-based config search, not the kernels.
+    def forbid_benchmark(*args, **kwargs):
+        pytest.fail("deterministic GDP execution benchmarked a config")
+
+    # Runtime pinning also covers early imports and restores the full candidate list.
     for kernel in (
         chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64,
         chunk_o.chunk_fwd_kernel_o,
     ):
-        configs = getattr(kernel, "configs", None)
-        if configs is not None and len(configs) != 1:
-            pytest.skip("GDP autotuners were imported before the deterministic policy was set")
+        monkeypatch.setattr(kernel, "_bench", forbid_benchmark)
 
     seeded()
     T, H, K, V, M = 4096, 16, 128, 128, 2

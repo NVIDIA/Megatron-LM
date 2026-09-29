@@ -16,18 +16,22 @@ Typical use::
 
     from megatron.core.tuning import AutotunePolicy, install
 
-    install(AutotunePolicy.from_env())      # once, during framework init
+    install(AutotunePolicy(mode="pinned", verify_every=10))
+
+Model callers can instead pass ``triton_autotune=AutotunePolicy(...)`` to
+``TransformerConfig``. Without an explicit policy mode, recording and model or
+PyTorch deterministic settings determine the mode.
 
 Recording a table for a new architecture::
 
-    MCORE_AUTOTUNE_RECORD=/tmp/rec  torchrun ... pretrain.py ...
+    torchrun ... pretrain_gpt.py ... --triton-autotune-record-path /tmp/rec
     python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
-    MCORE_AUTOTUNE_MODE=pinned MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning torchrun ...
+    torchrun ... --triton-autotune-mode pinned --triton-autotune-table-path ./tables
 
 Seeing what a run actually did::
 
-    MCORE_AUTOTUNE_ENUMERATE=1 ...     # every multi-config autotuner reached
-    MCORE_AUTOTUNE_VERIFY=1 ...        # compare observed choices at each step
+    --triton-autotune-enumerate          # every multi-config autotuner reached
+    --triton-autotune-verify-every 1     # compare observed choices at each step
 """
 
 from megatron.core.tuning.interception import (
@@ -35,7 +39,7 @@ from megatron.core.tuning.interception import (
     choice_digest,
     choice_log,
     install,
-    install_from_env,
+    install_from_config,
     maybe_verify_choices,
     verify_choices,
 )
@@ -53,7 +57,7 @@ __all__ = [
     "choice_digest",
     "choice_log",
     "install",
-    "install_from_env",
+    "install_from_config",
     "maybe_verify_choices",
     "set_deterministic_mode",
     "use_deterministic_mode",

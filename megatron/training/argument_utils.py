@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
+from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -324,6 +325,40 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
+def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy | None:
+    """Build a typed policy from flat CLI controls or a nested Python/YAML config."""
+    options = {
+        name: getattr(args, f'triton_autotune_{name}', None)
+        for name in (
+            'mode',
+            'modules',
+            'table_path',
+            'record_path',
+            'on_miss',
+            'verify_every',
+            'verify_strict',
+            'enumerate_autotuners',
+            'chaos',
+            'block_sizes',
+        )
+    }
+    options = {name: value for name, value in options.items() if value is not None}
+    if options:
+        return AutotunePolicy(**options)
+
+    policy = getattr(args, 'triton_autotune', None)
+    if policy is None or isinstance(policy, AutotunePolicy):
+        return policy
+    if isinstance(policy, (Namespace, types.SimpleNamespace)):
+        policy = vars(policy)
+    if not isinstance(policy, dict):
+        raise TypeError('triton_autotune must be an AutotunePolicy or a mapping.')
+    policy = dict(policy)
+    if isinstance(policy.get('block_sizes'), (Namespace, types.SimpleNamespace)):
+        policy['block_sizes'] = vars(policy['block_sizes'])
+    return AutotunePolicy(**policy)
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -435,6 +470,8 @@ def core_transformer_config_from_args(args, config_class=None):
     wide_residual = _wide_residual_config_from_args(args)
     if wide_residual is not None or 'wide_residual' not in kw_args:
         kw_args['wide_residual'] = wide_residual
+
+    kw_args['triton_autotune'] = _triton_autotune_config_from_args(args)
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."

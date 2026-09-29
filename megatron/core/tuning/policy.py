@@ -17,9 +17,8 @@ module holds the intent; :mod:`megatron.core.tuning.interception` carries it out
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -31,9 +30,6 @@ def use_deterministic_mode() -> bool:
     """Whether deterministic behaviour is requested for kernel selection."""
     if _deterministic_override is not None:
         return _deterministic_override
-    env = os.environ.get('MAMBA_DETERMINISTIC')
-    if env:
-        return env[0] == '1'
     return torch.are_deterministic_algorithms_enabled()
 
 
@@ -43,21 +39,13 @@ def set_deterministic_mode(value):
     _deterministic_override = value
 
 
-def _env(*names: str, default: str = "") -> str:
-    """First set value among ``names``, so old variable names keep working."""
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return default
-
-
 @dataclass(frozen=True)
 class AutotunePolicy:
     """How to choose Triton kernel configs.
 
     Attributes:
-        mode: ``auto`` leaves Triton alone. ``pinned`` replaces the candidate
+        mode: ``None`` derives the mode from recording and determinism settings.
+            ``auto`` leaves Triton alone. ``pinned`` replaces the candidate
             list with one entry chosen without measuring anything. ``record``
             lets Triton benchmark as usual and captures the winners, so a table
             can be built; a recording run is deliberately not reproducible.
@@ -68,6 +56,8 @@ class AutotunePolicy:
         record_path: Where a ``record`` run writes its per-rank captures.
         on_miss: What to do when no table entry matches. ``min_cost`` is still
             deterministic, just possibly slower; ``error`` refuses to guess.
+        block_sizes: Explicit ``BLOCK_*`` kernel arguments to match when the
+            table misses. Accepts a mapping or pairs; stored as immutable pairs.
         verify_every: Cross-rank agreement check cadence, in steps. 0 disables.
             Honoured by the training loop through
             :func:`megatron.core.tuning.maybe_verify_choices`.
@@ -77,67 +67,62 @@ class AutotunePolicy:
             control for divergence detectors; never for real runs.
     """
 
-    mode: Literal["auto", "pinned", "record"] = "auto"
-    modules: tuple[str, ...] = ("mamba_ssm", "transformer_engine")
-    table_path: tuple[Path, ...] = ()
+    mode: Literal["auto", "pinned", "record"] | None = None
+    modules: tuple[str, ...] = ("mamba_ssm", "transformer_engine", "megatron.core.ssm.ops")
+    table_path: tuple[str, ...] = ()
     record_path: str | None = None
     on_miss: Literal["min_cost", "error"] = "min_cost"
+    block_sizes: tuple[tuple[str, int], ...] = ()
     verify_every: int = 0
     verify_strict: bool = False
     enumerate_autotuners: bool = False
     chaos: bool = False
 
     def __post_init__(self):
-        if self.mode not in ("auto", "pinned", "record"):
+        if self.mode not in (None, "auto", "pinned", "record"):
             raise ValueError(f"Unknown autotune mode: {self.mode!r}")
         if self.on_miss not in ("min_cost", "error"):
             raise ValueError(f"Unknown autotune miss policy: {self.on_miss!r}")
         if self.verify_every < 0:
             raise ValueError("Autotune verification cadence must be nonnegative")
         if self.mode == "record" and not self.record_path:
-            raise ValueError("Record mode requires MCORE_AUTOTUNE_RECORD or record_path")
+            raise ValueError("Record mode requires record_path")
+        if isinstance(self.modules, str) or isinstance(self.table_path, str):
+            raise TypeError("modules and table_path must be sequences, not strings")
+        object.__setattr__(self, "modules", tuple(self.modules))
+        object.__setattr__(self, "table_path", tuple(str(path) for path in self.table_path))
+        if self.record_path is not None:
+            object.__setattr__(self, "record_path", str(self.record_path))
+        pairs = (
+            self.block_sizes.items() if isinstance(self.block_sizes, Mapping) else self.block_sizes
+        )
+        pairs = tuple(pairs)
+        for name, value in pairs:
+            if not isinstance(name, str) or not name.startswith("BLOCK"):
+                raise ValueError(f"Invalid block-size argument: {name!r}")
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"Block size {name!r} must be a positive integer")
+        if len(dict(pairs)) != len(pairs):
+            raise ValueError("Block-size arguments must be unique")
+        object.__setattr__(
+            self, "block_sizes", tuple(sorted((name, value) for name, value in pairs))
+        )
 
-    @classmethod
-    def from_env(cls, *, deterministic: bool = False) -> "AutotunePolicy":
-        """Build a policy from the environment.
+    def resolve(self, *, deterministic: bool = False) -> "AutotunePolicy":
+        """Resolve an omitted mode, leaving explicit configuration unchanged.
 
-        Deterministic mode implies ``pinned``; an explicit ``MCORE_AUTOTUNE_MODE``
-        wins over that, so a determinism run can still be put into ``record``.
+        A recording path implies ``record``. Otherwise, model/PyTorch
+        deterministic mode implies ``pinned``; ordinary execution uses ``auto``.
         """
-        record_path = _env("MCORE_AUTOTUNE_RECORD", "MCORE_DET_TUNE_RECORD") or None
-        explicit = _env("MCORE_AUTOTUNE_MODE")
-        if explicit:
-            mode = explicit
-        elif record_path:
+        if self.mode is not None:
+            return self
+        if self.record_path:
             mode = "record"
         elif deterministic or use_deterministic_mode():
             mode = "pinned"
         else:
             mode = "auto"
-
-        modules = tuple(
-            prefix.strip()
-            for prefix in _env(
-                "MCORE_AUTOTUNE_MODULES",
-                "DET_AUTOTUNE_PIN_MODULES",
-                default="mamba_ssm,transformer_engine",
-            ).split(",")
-            if prefix.strip()
-        )
-        table_path = tuple(
-            Path(p).expanduser() for p in _env("MCORE_AUTOTUNE_TABLE_PATH").split(os.pathsep) if p
-        )
-        return cls(
-            mode=mode,
-            modules=modules,
-            table_path=table_path,
-            record_path=record_path,
-            on_miss=_env("MCORE_AUTOTUNE_ON_MISS", default="min_cost"),
-            verify_every=int(_env("MCORE_AUTOTUNE_VERIFY", "DET_AUTOTUNE_VERIFY", default="0")),
-            verify_strict=_env("MCORE_AUTOTUNE_VERIFY_STRICT", "DET_AUTOTUNE_VERIFY_STRICT") == "1",
-            enumerate_autotuners=_env("MCORE_AUTOTUNE_ENUMERATE", "DET_AUTOTUNE_ENUMERATE") == "1",
-            chaos=_env("MCORE_AUTOTUNE_CHAOS", "DET_AUTOTUNE_CHAOS") == "1",
-        )
+        return replace(self, mode=mode)
 
     @property
     def intercepts(self) -> bool:
@@ -147,4 +132,4 @@ class AutotunePolicy:
         only the interception records, so either one needs the patch even in
         ``auto`` mode — where it observes the timed choice without changing it.
         """
-        return self.mode != "auto" or self.enumerate_autotuners or self.verify_every > 0
+        return self.mode not in (None, "auto") or self.enumerate_autotuners or self.verify_every > 0

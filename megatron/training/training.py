@@ -189,12 +189,12 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
-    get_run_config,
     set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -5292,7 +5292,7 @@ def train(
         iteration += 1
 
         # Cross-rank agreement on Triton autotune choices, at the cadence
-        # MCORE_AUTOTUNE_VERIFY asks for. Off unless that is set; a step boundary
+        # AutotunePolicy.verify_every asks for. Off by default; a step boundary
         # is where every rank arrives, which the collective inside requires.
         maybe_verify_choices(iteration)
 

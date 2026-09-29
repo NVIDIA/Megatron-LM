@@ -116,9 +116,13 @@ def initialize_megatron(
     # Training scripts do not necessarily build a TransformerConfig before the
     # first Triton kernel runs, so install the autotune policy here too. It is
     # idempotent, and does nothing unless the policy asks for an interception.
-    from megatron.core.tuning import install_from_env
+    from megatron.core.tuning import install_from_config
+    from megatron.training.argument_utils import _triton_autotune_config_from_args
 
-    install_from_env()
+    install_from_config(
+        _triton_autotune_config_from_args(args),
+        deterministic=getattr(args, 'deterministic_mode', False),
+    )
 
     def finish_mpu_init():
         args = get_args()

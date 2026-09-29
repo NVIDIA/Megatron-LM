@@ -3,7 +3,6 @@
 """Bit-exact replay through the Triton autotuner policy and architecture tables."""
 
 import inspect
-import os
 from weakref import WeakKeyDictionary
 
 import pytest
@@ -27,16 +26,13 @@ def isolated_policy(monkeypatch):
     monkeypatch.setattr(interception, "_installed", False)
     monkeypatch.setattr(interception, "_policy", None)
     monkeypatch.setattr(interception, "_explicit_policy", False)
+    monkeypatch.setattr(interception, "_configured_policy", None)
     for name in ("_tables", "_choice_log", "_tune_records"):
         monkeypatch.setattr(interception, name, {})
     monkeypatch.setattr(interception, "_selected_configs", WeakKeyDictionary())
     monkeypatch.setattr(interception, "_enumerated", set())
     monkeypatch.setattr(selection, "_untuned_kernels_warned", set())
     monkeypatch.setattr(interception.atexit, "register", lambda *_: None)
-    monkeypatch.delenv("MCORE_AUTOTUNE_TABLE_PATH", raising=False)
-    for name in os.environ:
-        if name.startswith("TRITON_AUTOTUNE_BLOCK"):
-            monkeypatch.delenv(name)
 
 
 @pytest.mark.parametrize("use_table", [False, True], ids=["min_cost", "tuned_table"])
@@ -77,6 +73,7 @@ def test_pinned_reduction_replays(isolated_policy, monkeypatch, tmp_path, use_ta
         )
     )
 
+    assert interception.active_policy().table_path == (str(tmp_path),)
     seeded()
     for columns in (257, 1021):
         values = torch.randn(256, columns, device="cuda", dtype=torch.float32)

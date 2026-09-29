@@ -1,161 +1,178 @@
-# Triton autotune policy
+# Triton autotune configuration policy
 
-Triton's autotuner normally selects configurations by benchmarking. Independent
-processes can choose different configurations for the same inputs. For kernels
-whose tiling changes floating-point accumulation, this can change their results.
-Caching the measured winner does not make independent cold runs choose alike.
+Independent timing-based autotuning can choose different tilings on different
+ranks or cold runs. Those tilings can change floating-point reduction order.
+Pinning chooses a configuration without benchmarking; it does not establish
+determinism inside the kernel or across the whole training job.
 
-This package can select one configuration without benchmarking. It controls
-configuration selection; it does not make an otherwise nondeterministic kernel
-or an entire training run deterministic.
+## Configure through Python or training arguments
 
-## Selection and integration
-
-For kernels in scope, `pinned` mode first runs the kernel's existing Triton
-pruning rules, then selects from the remaining candidates:
-
-1. A matching table entry for the current GPU architecture, kernel and tuning key.
-2. A matching `TRITON_AUTOTUNE_BLOCK_*` fallback override.
-3. The smallest estimated block/stage cost, with a warning, unless `on_miss=error`.
-
-The selected **live** `triton.Config` object retains its launch hook. The adapter
-temporarily supplies a one-entry candidate list to the original `Autotuner.run`,
-then restores both the list and argument state, including when the launch fails.
-This skips benchmarking and timing-cache lookup even on older Triton versions
-that still benchmark a singleton returned by `early_config_prune`.
-
-After a successful launch, the adapter caches the selected live config per
-autotuner, GPU architecture, and tuning key (including tensor dtypes). Repeated
-calls reuse it without pruning or selecting again; launch hooks still run on
-every call. Changing the installed policy clears this cache. As with Triton's
-normal autotuning cache, inputs that affect pruning must be represented in the
-kernel's tuning key. Configure block-size environment overrides before launching
-kernels; changing them during a run does not invalidate cached choices.
-
-The static fallback is reproducible for the same candidates and inputs. Its cost
-estimate is not a throughput model, and it cannot predict every compile-time
-resource failure. An invalid selection raises; it never retries with timing.
-
-Framework initialization calls `install_from_env()` from
-`initialize_megatron` and `TransformerConfig.__post_init__`. The latter also
-passes `TransformerConfig.deterministic_mode`. Installation does not query CUDA;
-tables load on the first pinned kernel invocation for the current device.
-Once a model requests pinning, a later component's default configuration does
-not disable it. An explicit `MCORE_AUTOTUNE_MODE` still overrides that default.
-
-For explicit control:
+The policy is a first-class model configuration. Library callers use:
 
 ```python
-from megatron.core.tuning import AutotunePolicy, install
+from megatron.core.transformer import TransformerConfig
+from megatron.core.tuning import AutotunePolicy
 
-install(AutotunePolicy(mode="pinned", modules=("mamba_ssm", "transformer_engine")))
+config = TransformerConfig(
+    num_layers=2,
+    hidden_size=128,
+    num_attention_heads=4,
+    deterministic_mode=True,
+    triton_autotune=AutotunePolicy(
+        table_path=("/path/to/tables",),
+        on_miss="error",
+        verify_every=10,
+        verify_strict=True,
+    ),
+)
 ```
 
-The policy is process-wide. Configure it during initialization, before launching
-kernels. An explicit `install(policy)` takes precedence over subsequent framework
-initialization calls. Reinstalling a policy reuses the adapter, flushes pending
-recordings, and starts fresh diagnostics. The adapter does not add thread-safety
-to Triton's mutable autotuner state.
+Standalone kernel callers can instead call `install(AutotunePolicy(...))` before
+launching kernels. An explicit `install(policy)` takes precedence over framework
+initialization. Framework initialization calls `install_from_config()` from
+`initialize_megatron` and `TransformerConfig.__post_init__`; installation does
+not query CUDA. Architecture tables load on the first pinned kernel invocation.
 
-By default, the adapter covers `mamba_ssm` and `transformer_engine` and their
-submodules. Other packages retain their normal selection. Override the scope
-with `MCORE_AUTOTUNE_MODULES`. Megatron's in-tree SSM kernels separately use the
-legacy `autotune_configs()` decoration-time helper; their candidate lists are
-reduced when deterministic mode is already enabled at import time.
+The policy is process-wide. A later component without a policy preserves the
+configured policy, and its default `deterministic_mode=False` does not undo an
+earlier request for pinning. An explicitly configured mode takes precedence.
+Changing the effective policy clears selected configurations, tables, and
+diagnostics. The adapter does not add thread-safety to Triton's mutable state.
+
+Training accepts the corresponding `--triton-autotune-*` arguments. Legacy
+`--yaml-cfg` users can put the policy under `language_model.triton_autotune`:
+
+```yaml
+language_model:
+  deterministic_mode: true
+  triton_autotune:
+    table_path: ["/path/to/tables"]
+    on_miss: error
+    verify_every: 10
+    verify_strict: true
+```
+
+Autotune CLI arguments cannot be combined with `--yaml-cfg`; put the options in
+the YAML policy instead. Model configuration retains the nested policy for
+normal configuration serialization.
+
+## Selection and scope
+
+For each pinned invocation, the adapter first applies the kernel's pruning rules
+and selects from the remaining live candidates:
+
+1. A matching architecture-table entry.
+2. A matching `block_sizes` configuration override.
+3. The lowest static-cost candidate, or an error when `on_miss="error"`.
+
+The adapter temporarily supplies a singleton candidate list to the original
+`Autotuner.run`, then restores the list and argument state, even after failure.
+This skips timing and Triton's tuning-cache lookup, including versions that
+benchmark a singleton returned by `early_config_prune`. Live config hooks are
+preserved.
+
+After a successful launch, the selected config is cached per autotuner, GPU
+architecture, and tuning key (including tensor dtypes). Repeated calls skip
+pruning and selection; launch hooks still run every time. Inputs that affect
+pruning must be represented in the kernel's tuning key. Changing `block_sizes`
+requires installing a new policy, which invalidates cached selections.
+
+The static fallback is reproducible for identical candidates and inputs. Its
+cost estimate is not a throughput model and cannot predict every compile-time
+resource failure. Invalid selections raise; they never retry with timing.
+
+By default the adapter covers `mamba_ssm`, `transformer_engine`, and
+`megatron.core.ssm.ops`, including submodules. This also covers in-tree SSM
+kernels imported before model configuration. Override `modules` to include
+another package; this replaces the default list. In-tree SSM kernels also use
+`autotune_configs()` at decoration time. That helper uses the explicit deterministic-mode setter or
+PyTorch's deterministic flag and, if already installed, the policy's block sizes.
+An import-time singleton cannot later recover its discarded candidates.
 
 ## Modes and precedence
 
 | Mode | Behavior |
 |---|---|
+| `None` (default) | Derive from recording and determinism settings. |
 | `auto` | Triton chooses normally; optional diagnostics observe its choices. |
 | `pinned` | Select one valid candidate without timing. |
-| `record` | Triton chooses normally and the adapter records the winners. |
+| `record` | Triton chooses normally and the adapter records winners. |
 
-An explicit `MCORE_AUTOTUNE_MODE` wins. Otherwise, a recording path selects
-`record`; otherwise, deterministic mode selects `pinned`. The default is `auto`.
-A recording run can therefore benchmark even when deterministic algorithms are
-otherwise enabled. Invalid modes and a recording mode without a path raise.
+An explicit mode wins. Otherwise, `record_path` selects `record`; otherwise,
+model or PyTorch deterministic mode selects `pinned`; ordinary execution uses
+`auto`. Recording intentionally permits benchmarking and requires a file prefix.
 
 ## Recording and using a table
 
 ```bash
-# Record the actual workload. The variable is a file prefix, not a directory.
-MCORE_AUTOTUNE_RECORD=/tmp/rec torchrun ... pretrain.py ...
+# Record representative workload shapes; the recording path is a file prefix.
+uv run python -m torch.distributed.run ... pretrain_gpt.py ... \
+    --triton-autotune-mode record --triton-autotune-record-path /tmp/rec
 
-# Merge rec.rank0.json, rec.rank1.json, etc. by majority vote.
-python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
+# Inspect disagreements and combine per-rank captures by majority vote.
+uv run python -m megatron.core.tuning report /tmp/rec.rank*.json
+uv run python -m megatron.core.tuning merge /tmp/rec.rank*.json \
+    -o ~/.mcore/tuning/sm103.json
 
-# Pin using the recorded table, also outside deterministic mode.
-MCORE_AUTOTUNE_MODE=pinned MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning torchrun ... pretrain.py ...
-
-# Inspect disagreements before merging.
-python -m megatron.core.tuning report /tmp/rec.rank*.json
+# Use the recorded selections without benchmarking.
+uv run python -m torch.distributed.run ... pretrain_gpt.py ... \
+    --triton-autotune-mode pinned --triton-autotune-table-path ~/.mcore/tuning
 ```
 
-Record on the target architecture and with the intended package versions and
-workload. Majority vote resolves ties by serialized configuration. It selects
-the most frequently observed winner; it does not measure a globally optimal
-configuration. Captures are written at normal process exit, so abnormal
-termination can lose them.
+Record on the target architecture with the intended package versions and
+workload, keeping the kernel's candidates available. Some external libraries
+reduce candidates at import time; recording cannot restore them. Captures are
+written on normal process exit, so abnormal termination can lose them. Merge in
+the recording environment so recorded package versions describe that environment.
 
-Some external packages reduce their candidate lists at import time. With the
-current `mamba_ssm` helper, `TRITON_CACHE_AUTOTUNING=1` preserves those candidates
-when `MAMBA_DETERMINISTIC=1`. The adapter can record a singleton, but cannot recover
-candidates that an external decorator already discarded.
+Tables are named for their architecture, such as `sm100.json` or `sm103.json`.
+The first matching file in `table_path` wins; packaged files are searched last.
+Files do not overlay one another, so preserve existing entries when extending
+a table. The merge command combines raw captures and overwrites its output.
 
-Tables are JSON files named for their architecture, such as `sm100.json` or
-`sm103.json`. User directories take precedence over bundled files. Each entry
-contains `kwargs`, `num_warps`, `num_stages`, `num_ctas`, `maxnreg`, and
-`ir_override`; legacy entries use defaults for the last three fields. Lookup
-matches all these options against valid live candidates instead of constructing
-a new configuration. An unmatched entry falls back according to the policy.
+Entries store `kwargs`, `num_warps`, `num_stages`, `num_ctas`, `maxnreg`, and
+`ir_override`. Lookup matches these against live candidates, preserving their
+hooks; it cannot introduce new candidate configurations. Unmatched entries
+follow `on_miss`. Majority vote resolves ties by serialized configuration and
+does not establish global performance optimality. A version mismatch warns;
+bundled tables have empty version metadata and provide no compatibility proof.
 
-Version metadata describes the environment that writes the merged table. Merge
-inside the recording environment if those versions are to describe the recording.
-The bundled tables have empty version fields, so they cannot establish package
-compatibility or performance provenance. A version mismatch warns; candidate
-membership is still checked at use time.
-
-## Comparing choices across ranks
+## Diagnostics and configuration reference
 
 `verify_choices(group=None)` compares each rank's most recently observed config
-for a `(architecture, qualified kernel name, tuning key)`. Ranks that did not
-execute a key are excluded from that key's comparison: pipeline stages and
-expert ranks need not run the same kernels or shapes. Agreement does not prove
-equal kernel coverage, cross-run repeatability, or numerical equality.
+for matching architecture, qualified kernel name, and tuning key. Ranks that did
+not execute a key are excluded from that comparison. Agreement does not prove
+equal coverage, cross-run repeatability, or numerical equality.
 
-Call the check where every member of the group participates, such as a step
-boundary. Calling it from individual kernels can deadlock. Megatron training
-calls `maybe_verify_choices(iteration)` every step; `MCORE_AUTOTUNE_VERIFY=N`
-enables a check every `N` steps. Other callers can pass an explicit process group.
+Call verification where all group members participate, such as a step boundary.
+Megatron training calls `maybe_verify_choices(iteration)` every step;
+`verify_every=N` enables checks every N steps. `verify_strict=True` raises on
+disagreement. Enumeration reports executing multi-config autotuners and whether
+they are pinned. Chaos mode deliberately makes ranks choose different configs;
+use it only as a diagnostic in pinned mode.
 
-The check warns on conflicting observed configurations, or raises with
-`MCORE_AUTOTUNE_VERIFY_STRICT=1`. Enumeration reports which multi-config kernels
-actually execute and whether the active policy pins them. Chaos mode chooses
-rank-dependent configurations as a diagnostic positive control; it requires
-`pinned` mode and can make results differ deliberately.
-
-## Environment variables
-
-| Variable | Meaning |
+| `AutotunePolicy` field | Training argument |
 |---|---|
-| `MCORE_AUTOTUNE_MODE` | `auto`, `pinned`, or `record`. |
-| `MCORE_AUTOTUNE_MODULES` | Comma-separated package/module prefixes. |
-| `MCORE_AUTOTUNE_TABLE_PATH` | Search directories, separated by the platform path separator; `~` expands. |
-| `MCORE_AUTOTUNE_RECORD` | File prefix for per-rank recordings. |
-| `MCORE_AUTOTUNE_ON_MISS` | `min_cost` (default), or `error` if no table/override matches. |
-| `MCORE_AUTOTUNE_VERIFY` | Check cadence in steps; `0` disables. |
-| `MCORE_AUTOTUNE_VERIFY_STRICT` | `1` raises on disagreement. |
-| `MCORE_AUTOTUNE_ENUMERATE` | `1` reports multi-config kernels as they execute. |
-| `MCORE_AUTOTUNE_CHAOS` | `1` enables rank-dependent choices in pinned mode. |
-| `TRITON_AUTOTUNE_BLOCK_*` | Fallback kernel-kwarg selection when the table misses. |
+| `mode` | `--triton-autotune-mode {auto,pinned,record}` |
+| `modules` | `--triton-autotune-modules mamba_ssm transformer_engine megatron.core.ssm.ops my_package` |
+| `table_path` | `--triton-autotune-table-path /tables/first /tables/second` |
+| `record_path` | `--triton-autotune-record-path /tmp/rec` |
+| `on_miss` | `--triton-autotune-on-miss {min_cost,error}` |
+| `block_sizes` | `--triton-autotune-block-sizes BLOCK_C=512 BLOCK_S=1` |
+| `verify_every` | `--triton-autotune-verify-every 10` |
+| `verify_strict` | `--triton-autotune-verify-strict` |
+| `enumerate_autotuners` | `--triton-autotune-enumerate` |
+| `chaos` | `--triton-autotune-chaos` |
 
-The earlier `DET_AUTOTUNE_*` and `MCORE_DET_TUNE_RECORD` names remain accepted.
+The earlier tuning environment variables (`MCORE_AUTOTUNE_*`, `DET_AUTOTUNE_*`,
+`MCORE_DET_TUNE_RECORD`, and `TRITON_AUTOTUNE_BLOCK_*`) are no longer read. The
+policy also does not read `MAMBA_DETERMINISTIC`; external libraries may still
+have their own environment controls. Distributed launcher rank metadata remains
+used for per-rank recordings and diagnostics.
 
 ## Upstream path
 
-A supported selection/pruning hook in the owning packages is preferable to a
-process-wide adapter. Triton's `prune_configs_by` API provides a place for this
-policy, but older versions still benchmark the one surviving candidate. Until
-the supported dependency range consistently skips that benchmark and external
-packages expose the policy, `interception.py` contains the compatibility shim.
+Package-owned selection/pruning hooks are preferable to a process-wide adapter.
+Triton's `prune_configs_by` supplies a hook, but older versions still benchmark
+a sole surviving candidate. Until supported dependencies consistently skip that
+benchmark and expose policy hooks, `interception.py` provides the adapter.

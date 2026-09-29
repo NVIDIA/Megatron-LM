@@ -3,6 +3,7 @@
 """Test Triton's real Autotuner, with focused CUDA and distributed coverage."""
 
 import inspect
+import json
 from unittest.mock import Mock
 from weakref import WeakKeyDictionary
 
@@ -23,6 +24,7 @@ def isolated_policy(monkeypatch):
     monkeypatch.setattr(interception, "_installed", False)
     monkeypatch.setattr(interception, "_policy", None)
     monkeypatch.setattr(interception, "_explicit_policy", False, raising=False)
+    monkeypatch.setattr(interception, "_configured_policy", None, raising=False)
     monkeypatch.setattr(interception, "_tables", {}, raising=False)
     monkeypatch.setattr(interception, "_selected_configs", WeakKeyDictionary(), raising=False)
     monkeypatch.setattr(interception, "_choice_log", {})
@@ -31,8 +33,6 @@ def isolated_policy(monkeypatch):
     monkeypatch.setattr(selection, "_untuned_kernels_warned", set())
     monkeypatch.setattr(selection, "arch_tag", lambda: "test_arch")
     monkeypatch.setattr(interception.atexit, "register", lambda *_: None)
-    for name in ("MCORE_AUTOTUNE_MODE", "MCORE_AUTOTUNE_RECORD", "MCORE_DET_TUNE_RECORD"):
-        monkeypatch.delenv(name, raising=False)
 
 
 def make_tuner(*, prune=None, fail=False, module="mamba_ssm.ops.triton.test"):
@@ -77,6 +77,29 @@ def test_install_is_cuda_lazy(isolated_policy, monkeypatch):
 
     monkeypatch.setattr(selection, "arch_tag", unexpected_device_query)
     assert interception.install(AutotunePolicy(mode="pinned"))
+
+
+def test_model_config_pins_in_tree_tuner_created_before_install(isolated_policy, monkeypatch):
+    import torch
+
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.tuning import policy as tuning_policy
+
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", None)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
+    tuner, hooks = make_tuner(module="megatron.core.ssm.ops.gdp.chunk_h")
+    original_configs = tuner.configs
+    assert selection.autotune_configs(original_configs) is original_configs
+    assert len(original_configs) == 2
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+
+    TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1, deterministic_mode=True)
+
+    assert tuner.run(None, 128) == 32
+    assert tuner.run(None, 128) == 32
+    assert hooks == [32, 32]
+    assert tuner.configs is original_configs
+    assert tuner.nargs is None
 
 
 def test_pinning_honours_pruning_per_shape_and_preserves_hooks(isolated_policy, monkeypatch):
@@ -186,6 +209,23 @@ def test_pinned_cache_invalidates_only_when_policy_changes(isolated_policy, monk
     assert hooks == [32, 32, 128, 128]
 
 
+def test_pinned_cache_invalidates_when_block_sizes_change(isolated_policy, monkeypatch):
+    tuner, hooks = make_tuner()
+    choosing = Mock(wraps=selection.deterministic_choice)
+    monkeypatch.setattr(selection, "deterministic_choice", choosing)
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(mode="pinned", block_sizes=(("BLOCK_SIZE", 32),)))
+    assert tuner.run(None, 128) == 32
+    assert tuner.run(None, 128) == 32
+    assert choosing.call_count == 1
+
+    interception.install(AutotunePolicy(mode="pinned", block_sizes=(("BLOCK_SIZE", 128),)))
+    assert tuner.run(None, 128) == 128
+    assert tuner.run(None, 128) == 128
+    assert choosing.call_count == 2
+    assert hooks == [32, 32, 128, 128]
+
+
 def test_pinning_restores_state_after_launch_failure(isolated_policy, monkeypatch):
     tuner, _ = make_tuner(fail=True)
     original_configs = tuner.configs
@@ -233,12 +273,38 @@ def test_install_can_upgrade_an_observer_to_pinning(isolated_policy, monkeypatch
     assert interception.active_policy().mode == "pinned"
 
 
-def test_environment_install_respects_explicit_policy(isolated_policy, monkeypatch):
+def test_framework_install_respects_explicit_policy(isolated_policy):
     policy = AutotunePolicy(mode="pinned", modules=("my_kernels",))
     interception.install(policy)
-    monkeypatch.setenv("MCORE_AUTOTUNE_MODE", "auto")
-    interception.install_from_env()
+    interception.install_from_config(AutotunePolicy(mode="auto"))
     assert interception.active_policy() == policy
+
+
+def test_framework_install_preserves_configured_policy_for_default_components(isolated_policy):
+    policy = AutotunePolicy(mode="pinned", modules=("my_kernels",), verify_every=3)
+    interception.install_from_config(policy)
+    interception.install_from_config()
+    assert interception.active_policy() == policy
+
+
+def test_framework_determinism_preserves_configured_controls(isolated_policy):
+    policy = AutotunePolicy(modules=("my_kernels",), verify_every=3)
+    interception.install_from_config(policy)
+    interception.install_from_config(deterministic=True)
+    assert interception.active_policy() == policy.resolve(deterministic=True)
+
+
+def test_in_tree_selection_uses_explicit_block_sizes(isolated_policy, monkeypatch):
+    from megatron.core.tuning.policy import set_deterministic_mode
+
+    tuner, _ = make_tuner()
+    interception.install(AutotunePolicy(mode="pinned", block_sizes=(("BLOCK_SIZE", 128),)))
+    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE", "32")
+    set_deterministic_mode(True)
+    try:
+        assert selection.autotune_configs(tuner.configs) == [tuner.configs[1]]
+    finally:
+        set_deterministic_mode(None)
 
 
 def test_module_scope_respects_package_boundaries(isolated_policy, monkeypatch):
@@ -261,6 +327,10 @@ def test_record_mode_keeps_autotuning_and_captures_the_winner(
     assert tuner.run(None, 128) == 128
     record = interception._tune_records["test_arch"]["test_kernel"]["size=128"]
     assert record["kwargs"]["BLOCK_SIZE"] == 128
+    monkeypatch.setenv("RANK", "3")
+    interception._dump_records()
+    recorded = json.loads((tmp_path / "rec.rank3.json").read_text())
+    assert recorded["test_arch"]["test_kernel"]["size=128"] == record
 
 
 def test_table_distinguishes_all_launch_options(isolated_policy):
@@ -284,8 +354,7 @@ def test_transformer_config_requests_pinning(isolated_policy, monkeypatch):
     assert interception.active_policy().mode == "pinned"
     TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
     assert interception.active_policy().mode == "pinned"
-    monkeypatch.setenv("MCORE_AUTOTUNE_MODE", "auto")
-    interception.install_from_env()
+    interception.install_from_config(AutotunePolicy(mode="auto"))
     assert interception.active_policy().mode == "auto"
 
 

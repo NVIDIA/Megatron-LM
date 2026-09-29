@@ -6,9 +6,9 @@ A tuned table lets a pinned run use the *fastest* config instead of the cheapest
 one while staying a pure function of its inputs. Tables live as JSON so adding
 an architecture is a file drop, not a source edit and a rebuild:
 
-    MCORE_AUTOTUNE_RECORD=/tmp/rec  torchrun ... pretrain.py ...
+    torchrun ... pretrain_gpt.py ... --triton-autotune-record-path /tmp/rec
     python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
-    MCORE_AUTOTUNE_MODE=pinned MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning torchrun ...
+    torchrun ... --triton-autotune-mode pinned --triton-autotune-table-path ./tables
 
 Each file records one architecture plus the provenance needed to notice when it
 has gone stale::
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import collections
 import json
-import os
 import warnings
 from pathlib import Path
 
@@ -92,8 +91,6 @@ class TunedTable:
 
 def _search_dirs(extra) -> list:
     dirs = [Path(p).expanduser() for p in (extra or ())]
-    env = os.environ.get("MCORE_AUTOTUNE_TABLE_PATH", "")
-    dirs += [Path(p).expanduser() for p in env.split(os.pathsep) if p]
     dirs.append(_PACKAGED)
     return dirs
 

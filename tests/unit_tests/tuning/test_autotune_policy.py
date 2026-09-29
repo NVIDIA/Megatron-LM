@@ -7,12 +7,17 @@ they need neither a GPU nor a working triton install.
 """
 
 import json
+from dataclasses import FrozenInstanceError
 
 import pytest
 
 from megatron.core.tuning import selection
 from megatron.core.tuning import table as table_mod
-from megatron.core.tuning.policy import AutotunePolicy, set_deterministic_mode
+from megatron.core.tuning.policy import (
+    AutotunePolicy,
+    set_deterministic_mode,
+    use_deterministic_mode,
+)
 
 
 class _Config:
@@ -129,46 +134,137 @@ def test_inert_outside_deterministic_mode():
         set_deterministic_mode(None)
 
 
-def test_policy_from_env_modes(monkeypatch):
-    """Deterministic mode implies pinned; an explicit mode or a record path wins."""
-    for var in ("MCORE_AUTOTUNE_MODE", "MCORE_AUTOTUNE_RECORD", "MCORE_DET_TUNE_RECORD"):
-        monkeypatch.delenv(var, raising=False)
-    set_deterministic_mode(False)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_deterministic_mode_ignores_mamba_environment(monkeypatch, deterministic):
+    import torch
+
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "0" if deterministic else "1")
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: deterministic)
+    set_deterministic_mode(None)
+    assert use_deterministic_mode() is deterministic
+    set_deterministic_mode(not deterministic)
     try:
-        assert AutotunePolicy.from_env().mode == "auto"
-        set_deterministic_mode(True)
-        assert AutotunePolicy.from_env().mode == "pinned"
-        monkeypatch.setenv("MCORE_AUTOTUNE_RECORD", "/tmp/rec")
-        assert AutotunePolicy.from_env().mode == "record"
-        monkeypatch.setenv("MCORE_AUTOTUNE_MODE", "auto")
-        assert AutotunePolicy.from_env().mode == "auto"
+        assert use_deterministic_mode() is (not deterministic)
     finally:
         set_deterministic_mode(None)
 
 
-def test_policy_accepts_legacy_env_names(monkeypatch):
-    """Old DET_AUTOTUNE_* names keep working so existing scripts do not break."""
-    monkeypatch.delenv("MCORE_AUTOTUNE_MODULES", raising=False)
-    monkeypatch.setenv("DET_AUTOTUNE_PIN_MODULES", "mamba_ssm")
-    monkeypatch.setenv("DET_AUTOTUNE_ENUMERATE", "1")
-    policy = AutotunePolicy.from_env()
-    assert policy.modules == ("mamba_ssm",)
-    assert policy.enumerate_autotuners
-    assert policy.intercepts
+def test_policy_resolves_explicit_modes():
+    """Deterministic mode implies pinned; an explicit mode or a record path wins."""
+    set_deterministic_mode(False)
+    try:
+        assert AutotunePolicy().resolve().mode == "auto"
+        assert AutotunePolicy().resolve(deterministic=True).mode == "pinned"
+        assert AutotunePolicy(record_path="/tmp/rec").resolve(deterministic=True).mode == "record"
+        assert AutotunePolicy(mode="auto").resolve(deterministic=True).mode == "auto"
+        assert AutotunePolicy(mode="pinned", record_path="/tmp/rec").resolve().mode == "pinned"
+        set_deterministic_mode(True)
+        assert AutotunePolicy().resolve().mode == "pinned"
+    finally:
+        set_deterministic_mode(None)
+
+
+def test_policy_ignores_tuning_environment(monkeypatch):
+    """Tuning controls, including former aliases, are exclusively configuration values."""
+    for name, value in {
+        "MCORE_AUTOTUNE_MODE": "record",
+        "MCORE_AUTOTUNE_RECORD": "/tmp/ignored",
+        "MCORE_DET_TUNE_RECORD": "/tmp/ignored-legacy",
+        "MCORE_AUTOTUNE_MODULES": "ignored",
+        "DET_AUTOTUNE_PIN_MODULES": "ignored-legacy",
+        "MCORE_AUTOTUNE_TABLE_PATH": "/tmp/ignored-table",
+        "MCORE_AUTOTUNE_ON_MISS": "error",
+        "MCORE_AUTOTUNE_VERIFY": "17",
+        "DET_AUTOTUNE_VERIFY": "19",
+        "MCORE_AUTOTUNE_VERIFY_STRICT": "1",
+        "DET_AUTOTUNE_VERIFY_STRICT": "1",
+        "MCORE_AUTOTUNE_ENUMERATE": "1",
+        "DET_AUTOTUNE_ENUMERATE": "1",
+        "MCORE_AUTOTUNE_CHAOS": "1",
+        "DET_AUTOTUNE_CHAOS": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    set_deterministic_mode(False)
+    try:
+        assert AutotunePolicy().resolve() == AutotunePolicy(mode="auto")
+    finally:
+        set_deterministic_mode(None)
+
+
+def test_policy_normalizes_explicit_options_without_mutable_aliases(tmp_path):
+    modules = ["custom.kernels"]
+    paths = [tmp_path]
+    blocks = {"BLOCK_SIZE_M": 128}
+    policy = AutotunePolicy(
+        modules=modules,
+        table_path=paths,
+        record_path=tmp_path / "record",
+        on_miss="error",
+        verify_every=5,
+        verify_strict=True,
+        enumerate_autotuners=True,
+        chaos=True,
+        block_sizes=blocks,
+    ).resolve()
+    assert policy == AutotunePolicy(
+        mode="record",
+        modules=("custom.kernels",),
+        table_path=(str(tmp_path),),
+        record_path=str(tmp_path / "record"),
+        on_miss="error",
+        verify_every=5,
+        verify_strict=True,
+        enumerate_autotuners=True,
+        chaos=True,
+        block_sizes=(("BLOCK_SIZE_M", 128),),
+    )
+    modules.append("other.kernels")
+    paths.append(tmp_path / "other")
+    blocks["BLOCK_SIZE_M"] = 32
+    assert policy.modules == ("custom.kernels",)
+    assert policy.table_path == (str(tmp_path),)
+    assert policy.block_sizes == (("BLOCK_SIZE_M", 128),)
+    with pytest.raises(FrozenInstanceError):
+        policy.mode = "auto"
 
 
 @pytest.mark.parametrize(
-    "options", [{"mode": "typo"}, {"on_miss": "typo"}, {"verify_every": -1}, {"mode": "record"}]
+    "options",
+    [
+        {"mode": "typo"},
+        {"on_miss": "typo"},
+        {"verify_every": -1},
+        {"mode": "record"},
+        {"block_sizes": (("NOT_A_BLOCK", 32),)},
+        {"block_sizes": (("BLOCK_SIZE", 0),)},
+        {"block_sizes": (("BLOCK_SIZE", -1),)},
+        {"block_sizes": (("BLOCK_SIZE", "32"),)},
+    ],
 )
 def test_policy_rejects_invalid_options(options):
     with pytest.raises(ValueError):
         AutotunePolicy(**options)
 
 
-def test_explicit_block_override_satisfies_strict_selection(monkeypatch):
-    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "128")
+def test_explicit_block_override_satisfies_strict_selection():
     tuner = _Autotuner([CHEAP, FAST])
-    assert selection.deterministic_choice(tuner, tuner.configs, (), {}, on_miss="error") is FAST
+    assert (
+        selection.deterministic_choice(
+            tuner, tuner.configs, (), {}, on_miss="error", block_sizes=(("BLOCK_SIZE_M", 128),)
+        )
+        is FAST
+    )
+
+
+def test_block_size_environment_is_ignored(monkeypatch, restore_state):
+    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "not-an-integer")
+    tuner = _Autotuner([CHEAP, FAST])
+    assert selection.deterministic_choice(tuner, tuner.configs, (), {}) is CHEAP
+    set_deterministic_mode(True)
+    try:
+        assert selection.autotune_configs([FAST, CHEAP]) == [CHEAP]
+    finally:
+        set_deterministic_mode(None)
 
 
 def test_merge_records_uses_majority_vote(tmp_path):
@@ -195,6 +291,14 @@ def test_table_write_and_load_round_trip(tmp_path):
     assert loaded.provenance["source"] == "unit test"
 
 
+def test_table_search_uses_only_explicit_paths(monkeypatch, tmp_path):
+    kernels = {"_fake_kernel": {"*": selection.config_data(FAST)}}
+    table_mod.write("test_arch", kernels, tmp_path / "test_arch.json")
+    monkeypatch.setenv("MCORE_AUTOTUNE_TABLE_PATH", str(tmp_path))
+    assert not table_mod.load("test_arch")
+    assert table_mod.load("test_arch", table_path=(tmp_path,)).kernels == kernels
+
+
 def test_packaged_tables_are_loadable():
     """The shipped tables must parse and be non-empty for the architectures we ship."""
     for arch in ("sm100", "sm103"):
@@ -203,14 +307,11 @@ def test_packaged_tables_are_loadable():
         assert table.provenance["arch"] == arch
 
 
-def test_verify_cadence_requires_the_interception(monkeypatch):
-    """MCORE_AUTOTUNE_VERIFY alone installs the patch: the check reads its log."""
-    for var in ("MCORE_AUTOTUNE_MODE", "MCORE_AUTOTUNE_RECORD", "MCORE_DET_TUNE_RECORD"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("MCORE_AUTOTUNE_VERIFY", "5")
+def test_verify_cadence_requires_the_interception():
+    """Explicit verification cadence installs the adapter so choices are recorded."""
     set_deterministic_mode(False)
     try:
-        policy = AutotunePolicy.from_env()
+        policy = AutotunePolicy(verify_every=5).resolve()
         assert policy.verify_every == 5
         # auto mode leaves the choice to Triton, but the interception is still
         # what records it, so there is nothing to compare across ranks without it.

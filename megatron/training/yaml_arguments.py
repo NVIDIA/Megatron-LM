@@ -25,7 +25,10 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
-from megatron.training.argument_utils import _mfsdp_v2_disables_pipeline_output_dealloc
+from megatron.training.argument_utils import (
+    _mfsdp_v2_disables_pipeline_output_dealloc,
+    _triton_autotune_config_from_args,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -412,6 +415,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
+    args.triton_autotune = _triton_autotune_config_from_args(args)
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
     
@@ -465,4 +469,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

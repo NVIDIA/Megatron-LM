@@ -24,6 +24,7 @@ from megatron.core.tuning.policy import AutotunePolicy, use_deterministic_mode
 _installed = False
 _policy: AutotunePolicy | None = None
 _explicit_policy = False
+_configured_policy: AutotunePolicy | None = None
 _tables: dict = {}
 # Keep each autotuner's live configs (and hooks) separate, even for equal names.
 _selected_configs: WeakKeyDictionary = WeakKeyDictionary()
@@ -141,7 +142,7 @@ def verify_choices(group=None) -> bool:
 def maybe_verify_choices(iteration: int, group=None) -> bool | None:
     """Run :func:`verify_choices` if the policy asks for a check at ``iteration``.
 
-    This is the cadence behind ``MCORE_AUTOTUNE_VERIFY``; the training loop calls
+    This is the cadence behind ``AutotunePolicy.verify_every``; the training loop calls
     it once per step and the policy decides whether anything happens. Returns
     ``None`` when no check ran, so a caller can tell "agreed" from "not asked".
     """
@@ -156,13 +157,14 @@ def install(policy: AutotunePolicy | None = None) -> bool:
     """Apply a process-wide policy, replacing any previously selected policy.
 
     Install once during initialization, before kernels execute. An explicit
-    policy takes precedence over subsequent framework ``install_from_env``
+    policy takes precedence over subsequent framework ``install_from_config``
     calls. Repeated calls reuse the same adapter rather than nesting patches.
     """
-    global _explicit_policy
+    global _explicit_policy, _configured_policy
 
     _explicit_policy = policy is not None
-    return _install(policy or AutotunePolicy.from_env())
+    _configured_policy = None
+    return _install((policy or AutotunePolicy()).resolve())
 
 
 def _install(policy: AutotunePolicy) -> bool:
@@ -241,6 +243,7 @@ def _install(policy: AutotunePolicy) -> bool:
                         kwargs,
                         table=_tables[arch],
                         on_miss=policy.on_miss,
+                        block_sizes=policy.block_sizes,
                     )
             # Triton only benchmarks when more than one candidate remains, so a
             # single-entry list skips the timing loop entirely.
@@ -260,14 +263,20 @@ def _install(policy: AutotunePolicy) -> bool:
     return True
 
 
-def install_from_env(*, deterministic: bool = False) -> bool:
+def install_from_config(
+    policy: AutotunePolicy | None = None, *, deterministic: bool = False
+) -> bool:
     """Resolve framework defaults unless a caller supplied an explicit policy."""
+    global _configured_policy
+
     if _explicit_policy:
         return _installed
+    if policy is not None:
+        _configured_policy = policy
     # A later component's default False must not undo another model's request.
-    # An explicit MCORE_AUTOTUNE_MODE still takes precedence in from_env().
+    # An explicit configured mode still takes precedence in resolve().
     deterministic = deterministic or (_policy is not None and _policy.mode == "pinned")
-    return _install(AutotunePolicy.from_env(deterministic=deterministic))
+    return _install((_configured_policy or AutotunePolicy()).resolve(deterministic=deterministic))
 
 
 __all__ = [
@@ -275,7 +284,7 @@ __all__ = [
     "choice_digest",
     "choice_log",
     "install",
-    "install_from_env",
+    "install_from_config",
     "maybe_verify_choices",
     "use_deterministic_mode",
     "verify_choices",

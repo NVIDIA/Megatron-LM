@@ -33,6 +33,7 @@ from megatron.core.transformer.enums import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from megatron.core.tuning import AutotunePolicy
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -1304,6 +1305,14 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # miscellaneous
     ####################
+    triton_autotune: Optional[AutotunePolicy] = None
+    """Optional process-wide Triton configuration-selection policy.
+
+    None follows ``deterministic_mode``: deterministic runs pin configurations,
+    otherwise Triton autotunes normally. An explicit policy can also record or
+    select configurations for modules outside the default scope.
+    """
+
     clone_scatter_output_in_embedding: bool = True
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
     to facilitate garbage collection of input."""
@@ -1697,9 +1706,9 @@ class TransformerConfig(ModelParallelConfig):
         # Autotuner class, so it only has to be installed before the first kernel
         # call, not before the decorators are evaluated; every model goes through
         # a config, and install() is idempotent.
-        from megatron.core.tuning import install_from_env
+        from megatron.core.tuning import install_from_config
 
-        install_from_env(deterministic=self.deterministic_mode)
+        install_from_config(self.triton_autotune, deterministic=self.deterministic_mode)
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
