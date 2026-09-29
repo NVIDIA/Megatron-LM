@@ -193,6 +193,7 @@ from .global_vars import (
     get_timers,
     get_wandb_writer,
 )
+from .params_distance import ParamsDistanceFromStart
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
     append_to_progress_log,
@@ -4248,6 +4249,28 @@ def _log_sfplus_stats(stats, iteration):
         wandb_writer.log({f'sfplus/{key}': value for key, value in stats.items()}, iteration)
 
 
+def _log_params_distance(distances, iteration):
+    """Write --log-params-distance-from-start to stdout, TensorBoard and W&B."""
+    if distances is None:
+        return
+    distance, relative = distances
+    print_rank_last(
+        f' iteration {iteration:8d} | params distance from start: {distance:.4f} '
+        f'| relative: {relative:.6f}'
+    )
+    metrics = {
+        'params-distance-from-start': distance,
+        'params-distance-from-start-relative': relative,
+    }
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
+    if writer:
+        for key, value in metrics.items():
+            writer.add_scalar(key, value, iteration)
+    if wandb_writer:
+        wandb_writer.log(metrics, iteration)
+
+
 @contextmanager
 def sfplus_eval_weights(model, optimizer):
     """Evaluate ScheduleFree+ at its averaged weights x, then restore the training point y.
@@ -4887,6 +4910,10 @@ def train(
     should_exit = False
     exit_code = 0
     is_first_iteration = True
+    params_distance = None
+    if args.log_params_distance_from_start:
+        assert args.save, '--log-params-distance-from-start requires --save'
+        params_distance = ParamsDistanceFromStart(model, args.save, iteration)
 
     if args.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
@@ -5406,6 +5433,14 @@ def train(
                 # cost span (it stalls the critical path), unlike passive monitors.
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
                     params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
+            if params_distance is not None and (
+                is_first_iteration or iteration % args.log_interval == 0
+            ):
+                # With an overlapped param all-gather, each rank has only updated its own shard
+                # of the model weights so far; gather the rest, as before a checkpoint save.
+                if should_disable_forward_pre_hook(args):
+                    force_param_sync(model, optimizer=optimizer)
+                _log_params_distance(params_distance.compute(), iteration)
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:

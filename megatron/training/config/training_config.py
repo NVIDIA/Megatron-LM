@@ -250,6 +250,11 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_params_distance_from_start: bool = False
+    """If set, log the L2 distance of the parameters from those this run started from (e.g. the
+    pretrained checkpoint a finetune loads). The starting parameters are saved under --save on
+    the first launch, so resumed runs keep measuring from the same point."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 
