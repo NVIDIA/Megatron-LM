@@ -1,4 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -24,6 +25,7 @@ from megatron.core.ssm.gated_delta_product import (
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
@@ -72,6 +74,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     TransformerLayerSubmodules,
 )
+from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 
 # This should be private and should not be used outside of this file.
 moe = get_moe_module_spec(
@@ -579,6 +582,55 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
         moe_layer=hybrid_inference_stack_spec.submodules.moe_layer,
         mtp_block_spec=hybrid_inference_stack_spec.submodules.mtp_block_spec,
     ),
+)
+
+
+def _get_wide_residual_hybrid_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Build a static HybridStack spec whose layers explicitly own wide connections."""
+
+    submodules = stack_spec.submodules
+
+    def layer_spec(module: type, spec: ModuleSpec | type | None) -> ModuleSpec | type | None:
+        if spec is None:
+            return None
+        if spec is IdentityOp:
+            return spec
+        if not isinstance(spec, ModuleSpec):
+            raise TypeError(f"Expected a ModuleSpec or IdentityOp, got {spec!r}.")
+        return replace(spec, module=module)
+
+    return replace(
+        stack_spec,
+        submodules=replace(
+            submodules,
+            mamba_layer=layer_spec(WideResidualMambaLayer, submodules.mamba_layer),
+            gdn_layer=layer_spec(WideResidualTransformerLayer, submodules.gdn_layer),
+            gdn2_layer=layer_spec(WideResidualTransformerLayer, submodules.gdn2_layer),
+            attention_layer=layer_spec(WideResidualTransformerLayer, submodules.attention_layer),
+            dsa_layer=layer_spec(WideResidualTransformerLayer, submodules.dsa_layer),
+            csa_layer=layer_spec(WideResidualTransformerLayer, submodules.csa_layer),
+            csa_qk_layernorm_layer=layer_spec(
+                WideResidualTransformerLayer, submodules.csa_qk_layernorm_layer
+            ),
+            mla_layer=layer_spec(WideResidualTransformerLayer, submodules.mla_layer),
+            mla_fused_down_proj_layer=layer_spec(
+                WideResidualTransformerLayer, submodules.mla_fused_down_proj_layer
+            ),
+            mlp_layer=layer_spec(WideResidualTransformerLayer, submodules.mlp_layer),
+            moe_layer=layer_spec(WideResidualTransformerLayer, submodules.moe_layer),
+        ),
+    )
+
+
+wide_residual_hybrid_stack_spec = _get_wide_residual_hybrid_stack_spec(hybrid_stack_spec)
+wide_residual_gated_delta_product_stack_spec = _get_wide_residual_hybrid_stack_spec(
+    gated_delta_product_stack_spec
+)
+wide_residual_hybrid_inference_stack_spec = _get_wide_residual_hybrid_stack_spec(
+    hybrid_inference_stack_spec
+)
+wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybrid_stack_spec(
+    gated_delta_product_inference_stack_spec
 )
 
 
