@@ -1646,7 +1646,7 @@ _DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 
 
 def _requires_native_deterministic_indexer_grad_w(q_idx_bshd: Tensor) -> bool:
-    """cuDNN's sparse-indexer dW merges per-thread partials with shared-memory atomics on SM90 only."""
+    """cuDNN sparse-indexer dW uses shared-memory atomics to merge partials on SM90 only."""
     if not q_idx_bshd.is_cuda:
         return False
     return torch.cuda.get_device_capability(q_idx_bshd.device) == (9, 0)
@@ -1679,7 +1679,9 @@ def _deterministic_sparse_indexer_grads_wk(
     """Recompute the sparse-indexer dK (and optionally dW) without floating-point atomics.
 
     Same math as ``cudnn.DSA.indexer_backward_wrapper`` (KL backward normalised by ``B * S_q``;
-    ``topk_indices`` are flattened ``(B, S_k)`` ids, negatives are padding). The per-key reduction
+    ``topk_indices`` are local to each batch element, negatives are padding). Packed THD
+    callers use a single synthetic batch, so their flat key ids are already batch-local.
+    The per-key reduction
     over the (query, slot) contributions uses torch's deterministic ``index_add_`` when
     ``torch.use_deterministic_algorithms(True)`` is active (sort-based, fixed order) and otherwise a
     stable sort + prefix sum with gathers at fixed boundaries; both give a fixed summation order.
@@ -1687,7 +1689,8 @@ def _deterministic_sparse_indexer_grads_wk(
     duplicates of one id serially, and causal Top-K leaves a large fraction of the slots padded.
     """
     batch, sq, indexer_heads, indexer_dim = q_idx_bshd.shape
-    total_keys = k_idx_bsd.size(0) * k_idx_bsd.size(1)
+    keys_per_batch = k_idx_bsd.size(1)
+    total_keys = k_idx_bsd.size(0) * keys_per_batch
     topk = topk_indices.size(2)
     if total_keys == 0 or batch * sq == 0 or topk == 0:
         grad_w = torch.zeros_like(w_bsh) if compute_grad_w else None
@@ -1705,13 +1708,17 @@ def _deterministic_sparse_indexer_grads_wk(
     chunk_rows = _deterministic_indexer_dk_chunk_rows(indexer_heads, indexer_dim, topk)
     # Dummy rows that absorb the (zero) contributions of padding slots.
     pad_rows = min(4096, chunk_rows * topk)
-    grad_k_ext = torch.zeros((total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32)
+    grad_k_ext = torch.zeros(
+        (total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32
+    )
     grad_w_flat = (
         torch.empty(w_flat.shape, device=w_flat.device, dtype=torch.float32)
         if compute_grad_w
         else None
     )
-    pad_ids = total_keys + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
+    pad_ids = (
+        total_keys + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
+    )
     key_ids = None
     for row_start in range(0, rows, chunk_rows):
         row_end = min(row_start + chunk_rows, rows)
@@ -1719,7 +1726,14 @@ def _deterministic_sparse_indexer_grads_wk(
         q_chunk = q_flat[row_start:row_end].float()
         w_chunk = w_flat[row_start:row_end].float()
         indices_chunk = topk_flat[row_start:row_end].long()
-        valid = (indices_chunk >= 0) & (indices_chunk < total_keys)
+        valid = (indices_chunk >= 0) & (indices_chunk < keys_per_batch)
+        if batch > 1:
+            # SBHD Top-K ids are local to each sample, whereas k_flat and grad_k_ext
+            # concatenate samples. Chunk boundaries need not align with sample boundaries.
+            batch_offsets = (
+                torch.arange(row_start, row_end, device=device, dtype=torch.int64) // sq
+            ) * keys_per_batch
+            indices_chunk = indices_chunk + batch_offsets.unsqueeze(-1)
         flat_idx = torch.where(
             valid.reshape(-1), indices_chunk.reshape(-1), pad_ids[: n_rows * topk]
         )
