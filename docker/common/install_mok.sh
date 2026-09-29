@@ -1,0 +1,58 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+#!/bin/bash
+
+set -euxo pipefail
+
+PROJECT_FILE="${1:?Usage: install_mok.sh <pyproject.toml> <patch>}"
+PATCH_FILE=$(realpath "${2:?Usage: install_mok.sh <pyproject.toml> <patch>}")
+PYTHON="${UV_PROJECT_ENVIRONMENT:-/opt/venv}/bin/python"
+
+# Use the same immutable integration source as the mok extra.
+MOK_SOURCE=$("${PYTHON}" - "${PROJECT_FILE}" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as project_file:
+    source = tomllib.load(project_file)["tool"]["uv"]["sources"]["mixture-of-kittens"]
+print(source["git"], source["rev"])
+PY
+)
+read -r MOK_REPOSITORY MOK_REVISION <<< "${MOK_SOURCE}"
+if [[ ! "${MOK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "MoK must be pinned to a full Git commit in ${PROJECT_FILE}" >&2
+    exit 1
+fi
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "${WORK_DIR}"' EXIT
+
+git init "${WORK_DIR}"
+git -C "${WORK_DIR}" remote add origin "${MOK_REPOSITORY}"
+git -C "${WORK_DIR}" fetch --depth 1 origin "${MOK_REVISION}"
+git -C "${WORK_DIR}" checkout --detach "${MOK_REVISION}"
+git -C "${WORK_DIR}" apply --check "${PATCH_FILE}"
+git -C "${WORK_DIR}" apply "${PATCH_FILE}"
+bash "${WORK_DIR}/scripts/prepare_thunderkittens.sh"
+
+# The CI Blackwell lane is GB200 (SM100). MoK also supports an explicit SM103 build.
+export MOK_ARCH="${MOK_ARCH:-SM100}"
+export NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
+export MOK_NVCC="${NVCC}"
+# Docker builds have no GPU driver. Stubs are link inputs, never runtime libraries.
+export LIBRARY_PATH="${CUDA_HOME:-/usr/local/cuda}/lib64/stubs${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+uv pip install --python "${PYTHON}" --no-build-isolation --no-deps --no-cache "${WORK_DIR}"
+
+# Inspect the installed wheel without loading libcuda on GPU-less image builders.
+MOK_EXTENSION=$("${PYTHON}" - <<'PY'
+from importlib.metadata import distribution
+from sysconfig import get_config_var
+
+extension = distribution("mixture-of-kittens").locate_file("mok/_C" + get_config_var("EXT_SUFFIX"))
+assert extension.is_file(), f"MoK native extension missing: {extension}"
+print(extension)
+PY
+)
+"${CUDA_HOME:-/usr/local/cuda}/bin/cuobjdump" --list-elf "${MOK_EXTENSION}" > "${WORK_DIR}/cubins.txt"
+cat "${WORK_DIR}/cubins.txt"
+grep -q "sm_${MOK_ARCH#SM}" "${WORK_DIR}/cubins.txt"
