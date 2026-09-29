@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Emerging optimizers need all-reduced gradients unless their state is layer-wise."""
+"""Distributed Muon requires layer-wise optimizer state."""
 
 import pytest
 import torch
@@ -25,49 +25,28 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _model(distributed, bf16=True, instances=1, expert=False):
+def _model(distributed, bf16=True):
     config = TransformerConfig(num_layers=1, num_attention_heads=1, hidden_size=8)
     dtype = torch.bfloat16 if bf16 else torch.float32
     torch.manual_seed(123)
     module = torch.nn.Linear(8, 8, device='cuda', dtype=dtype)
-    if expert:
-        for param in module.parameters():
-            param.allreduce = False
     return DistributedDataParallel(
-        config,
-        DistributedDataParallelConfig(
-            use_distributed_optimizer=distributed, num_distributed_optimizer_instances=instances
-        ),
-        module,
+        config, DistributedDataParallelConfig(use_distributed_optimizer=distributed), module
     )
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason='emerging-optimizers is required')
-@pytest.mark.parametrize('optimizer', ['muon', 'adaptive_muon', 'soap', 'lion'])
-@pytest.mark.parametrize('optimizer_dist', [False, True])
-@pytest.mark.parametrize('sharded_chunk', [0, 1])
-def test_reject_reduce_scatter_without_layer_wise(optimizer, optimizer_dist, sharded_chunk):
-    """The actual DDP layout matters, including mismatched flags and later chunks."""
-    if Utils.world_size < 2:
-        pytest.skip('Partial gradients require more than one DP rank')
-    models = [_model(False) for _ in range(sharded_chunk)] + [_model(True)]
-    config = OptimizerConfig(
-        optimizer=optimizer, lr=0.01, bf16=True, use_distributed_optimizer=optimizer_dist
-    )
-    with pytest.raises(ValueError, match=f"model chunk {sharded_chunk}.*reduce-scatter"):
-        get_megatron_optimizer(config, models)
-
-
-@pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason='emerging-optimizers is required')
-def test_reject_expert_reduce_scatter_without_layer_wise():
-    """Expert buffers must be checked even when no dense parameters are present."""
-    if Utils.world_size < 2:
-        pytest.skip('Partial gradients require more than one expert-DP rank')
-    model = _model(True, expert=True)
-    assert not model.bucket_groups
-    assert model.expert_parallel_bucket_groups
-    with pytest.raises(ValueError, match='model chunk 0.*reduce-scatter'):
-        get_megatron_optimizer(OptimizerConfig(optimizer='muon', lr=0.01, bf16=True), [model])
+@pytest.mark.parametrize('bf16', [False, True])
+def test_distributed_muon_requires_layer_wise(bf16):
+    """Muon cannot use the standard distributed optimizer without layer-wise mode."""
+    model = _model(True, bf16)
+    config = OptimizerConfig(optimizer='muon', lr=0.01, bf16=bf16, use_distributed_optimizer=True)
+    with pytest.raises(
+        AssertionError,
+        match='Muon with use_distributed_optimizer=True requires '
+        'use_layer_wise_distributed_optimizer=True',
+    ):
+        get_megatron_optimizer(config, [model])
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason='emerging-optimizers is required')
@@ -97,7 +76,8 @@ def test_non_layer_wise_muon_all_reduce_step(bf16):
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason='emerging-optimizers is required')
 @pytest.mark.parametrize('legacy_alias', [False, True])
 @pytest.mark.parametrize('layout', [False, True])
-def test_layer_wise_muon_remains_supported(legacy_alias, layout):
+@pytest.mark.parametrize('optimizer_dist', [False, True])
+def test_layer_wise_muon_remains_supported(legacy_alias, layout, optimizer_dist):
     """Explicit layer-wise mode and its deprecated alias accept either supported layout."""
     if layout:
         from megatron.training.training import wrap_model_chunks_with_ddp
@@ -117,6 +97,7 @@ def test_layer_wise_muon_remains_supported(legacy_alias, layout):
         lr=0.01,
         bf16=True,
         use_layer_wise_distributed_optimizer=not legacy_alias,
+        use_distributed_optimizer=optimizer_dist,
     )
     optimizer = get_megatron_optimizer(config, models)
     layer_wise = optimizer.chained_optimizers[0] if layout else optimizer
@@ -134,30 +115,3 @@ def test_standard_optimizers_remain_supported(optimizer_name, distributed):
     )
     optimizer = get_megatron_optimizer(config, [model])
     assert isinstance(optimizer.chained_optimizers[0], DistributedOptimizer) == distributed
-
-
-@pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason='emerging-optimizers is required')
-@pytest.mark.parametrize('singleton_instances', [False, True])
-def test_singleton_reduce_scatter_remains_supported(singleton_instances):
-    """A one-rank reduce-scatter shard contains the entire gradient buffer."""
-    instances = Utils.world_size if singleton_instances else 1
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1 if singleton_instances else Utils.world_size,
-        num_distributed_optimizer_instances=instances,
-    )
-    model = _model(True, instances=instances)
-    config = OptimizerConfig(optimizer='muon', lr=0.01, bf16=True, clip_grad=0.0)
-    optimizer = get_megatron_optimizer(config, [model])
-    torch.manual_seed(789 + Utils.rank)
-    model(torch.randn(4, 8, device='cuda', dtype=torch.bfloat16)).float().sum().backward()
-    expected = [param.main_grad.clone() for param in model.parameters()]
-    if singleton_instances:
-        for grad in expected:
-            torch.distributed.all_reduce(grad)
-    # DDP applies 1/DP scaling before its collective.
-    for grad in expected:
-        grad.div_(instances)
-    model.finish_grad_sync()
-    for param, grad in zip(model.parameters(), expected):
-        torch.testing.assert_close(param.main_grad, grad, rtol=0, atol=0)
-    assert optimizer.step()[0]
