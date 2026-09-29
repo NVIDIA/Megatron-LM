@@ -28,21 +28,29 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.fixture(scope="function")
-def offload_pg_collection(distributed_setup) -> Iterator[ProcessGroupCollection]:
-    """Set up model parallelism and clean up offload state after each case."""
+def process_group_collection(distributed_setup) -> Iterator[ProcessGroupCollection]:
+    """Create process groups for TP=PP=1 and destroy them after the test."""
     # Run the shared setup first so DBuffer's symmetric-memory queries cannot
     # lock in the default backend before the rest of this bucket selects NCCL.
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-    # Start each test with a fresh offload manager.
-    PipelineOffloadManager.reset_instance()
     yield ProcessGroupCollection.use_mpu_process_groups()
-    PipelineOffloadManager.reset_instance()
     Utils.destroy_model_parallel()
     # Utils clears MCore references but leaves some c10d groups alive (#6897).
     # Release their NCCL communicators while preserving the default group.
     for group in list(_world.pg_map):
         if group is not torch.distributed.group.WORLD:
             torch.distributed.destroy_process_group(group)
+
+
+@pytest.fixture(scope="function")
+def offload_manager(distributed_setup) -> Iterator[PipelineOffloadManager]:
+    """Reset the offload manager before and after each test."""
+    # distributed_setup selects this rank's CUDA device before the manager creates streams.
+    # The shared manager remembers which activations are copied to CPU together.
+    # Reset it so each test runs warmup for its own model.
+    PipelineOffloadManager.reset_instance()
+    yield PipelineOffloadManager.get_instance()
+    PipelineOffloadManager.reset_instance()
 
 
 def _build_model(
@@ -170,31 +178,33 @@ def _train(
 
 
 def test_mla_activation_offload_matches_baseline(
-    offload_pg_collection: ProcessGroupCollection,
+    process_group_collection: ProcessGroupCollection, offload_manager: PipelineOffloadManager
 ) -> None:
     """Compare training losses without profiling either run."""
     batches = _generate_batches(num_steps=6)
-    model, optimizer = _build_model(offload_pg_collection, offload=False)
-    baseline_losses = _train(model, optimizer, offload_pg_collection, batches=batches)
+    model, optimizer = _build_model(process_group_collection, offload=False)
+    baseline_losses = _train(model, optimizer, process_group_collection, batches=batches)
     del model, optimizer
-    model, optimizer = _build_model(offload_pg_collection, offload=True)
-    offloaded_losses = _train(model, optimizer, offload_pg_collection, batches=batches)
+    model, optimizer = _build_model(process_group_collection, offload=True)
+    offloaded_losses = _train(model, optimizer, process_group_collection, batches=batches)
     torch.testing.assert_close(offloaded_losses, baseline_losses, rtol=1e-3, atol=1e-6)
 
 
 @pytest.mark.parametrize("offload", [False, True], ids=["disabled", "enabled"])
 def test_mla_activation_offload_transfers(
-    offload_pg_collection: ProcessGroupCollection, offload: bool
+    process_group_collection: ProcessGroupCollection,
+    offload_manager: PipelineOffloadManager,
+    offload: bool,
 ) -> None:
     """Check that activation transfers occur only when offloading is enabled."""
     batches = _generate_batches(num_steps=1)
-    model, optimizer = _build_model(offload_pg_collection, offload=offload)
-    # One warmup discovers offload groups; profile the next iteration.
-    _train(model, optimizer, offload_pg_collection, batches=batches)
+    model, optimizer = _build_model(process_group_collection, offload=offload)
+    # Warm up once to identify the activations to offload, then profile the next iteration.
+    _train(model, optimizer, process_group_collection, batches=batches)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     ) as profiler:
-        _train(model, optimizer, offload_pg_collection, batches=batches)
+        _train(model, optimizer, process_group_collection, batches=batches)
     # Filter device copies first; their names identify the transfer direction.
     memcpy_events = [
         event
@@ -206,9 +216,8 @@ def test_mla_activation_offload_transfers(
         for direction in ("DtoH", "HtoD")
     }
     if offload:
-        manager = PipelineOffloadManager.get_instance()
         for name in ("core_attn", "attn_proj"):
-            assert manager.offload_summary_bytes.get(name, 0) > 0, name
+            assert offload_manager.offload_summary_bytes.get(name, 0) > 0, name
         assert all(count > 0 for count in transfer_counts.values()), transfer_counts
     else:
         assert all(count == 0 for count in transfer_counts.values()), transfer_counts
