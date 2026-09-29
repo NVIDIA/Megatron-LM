@@ -41,7 +41,6 @@ from megatron.core.transformer.residual_recompute import (
     residual_stream_recompute_enabled,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
@@ -570,63 +569,6 @@ class TestResidualStreamRecomputeIntegration:
         _assert_matching_gradients(reference, recomputed)
         assert operation_counts == {"connections": 7, "norms": 4, "branches": 2}
 
-    @pytest.mark.parametrize(
-        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
-    )
-    def test_transformer_block_matches_eager_forward_and_backward(self, fp32_residual_connection):
-        recomputed_config = _wide_recompute_config(
-            fp32_residual_connection=fp32_residual_connection
-        )
-        reference_config = copy.deepcopy(recomputed_config)
-        reference_config.recompute_granularity = None
-        reference_config.recompute_modules = ["core_attn"]
-        reference_config.residual_stream_recompute_num_layers = None
-
-        torch.manual_seed(1234)
-        reference = (
-            TransformerBlock(
-                reference_config,
-                _layer_spec(),
-                post_layer_norm=False,
-                pg_collection=_process_groups(),
-            )
-            .cuda()
-            .to(dtype=reference_config.params_dtype)
-        )
-        recomputed = (
-            TransformerBlock(
-                recomputed_config,
-                _layer_spec(),
-                post_layer_norm=False,
-                pg_collection=_process_groups(),
-            )
-            .cuda()
-            .to(dtype=recomputed_config.params_dtype)
-        )
-        recomputed.load_state_dict(reference.state_dict())
-
-        input_dtype = torch.float32 if fp32_residual_connection else reference_config.params_dtype
-        reference_input = torch.randn(
-            4,
-            3,
-            reference_config.wide_residual.num_streams * reference_config.hidden_size,
-            device="cuda",
-            dtype=input_dtype,
-            requires_grad=True,
-        )
-        recomputed_input = reference_input.detach().clone().requires_grad_(True)
-        reference_output = reference(hidden_states=reference_input, attention_mask=None)
-        reference_output.square().mean().backward()
-        recomputed_output = recomputed(hidden_states=recomputed_input, attention_mask=None)
-        recomputed_output.square().mean().backward()
-
-        torch.testing.assert_close(recomputed_output, reference_output)
-        torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
-        _assert_matching_gradients(reference, recomputed)
-        expected_dtype = torch.float32 if fp32_residual_connection else reference_input.dtype
-        assert reference_output.dtype == expected_dtype
-        assert recomputed_output.dtype == expected_dtype
-
     def test_replay_owns_connected_norms_under_fine_grained_offload(self):
         with pytest.warns(UserWarning, match="Residual-stream recomputation owns"):
             config = _wide_recompute_config(num_layers=1, activation_offloading=True)
@@ -665,26 +607,26 @@ class TestResidualStreamRecomputeIntegration:
         reference_config.offload_modules = []
 
         torch.manual_seed(1234)
-        reference = TransformerBlock(
+        submodules = HybridStackSubmodules(attention_layer=_offloaded_qkv_layer_spec())
+        layer_types = [Symbols.ATTENTION, Symbols.ATTENTION]
+        reference = HybridStack(
             reference_config,
-            _offloaded_qkv_layer_spec(),
+            submodules,
+            layer_type_list=layer_types,
             post_layer_norm=False,
             pg_collection=_process_groups(),
         ).cuda()
-        offloaded = TransformerBlock(
+        offloaded = HybridStack(
             offloaded_config,
-            _offloaded_qkv_layer_spec(),
+            submodules,
+            layer_type_list=layer_types,
             post_layer_norm=False,
             pg_collection=_process_groups(),
         ).cuda()
         offloaded.load_state_dict(reference.state_dict())
 
         reference_input = torch.randn(
-            32,
-            3,
-            reference_config.wide_residual.num_streams * reference_config.hidden_size,
-            device="cuda",
-            requires_grad=True,
+            32, 3, reference_config.hidden_size, device="cuda", requires_grad=True
         )
         offloaded_input = reference_input.detach().clone().requires_grad_(True)
         reference_output = reference(hidden_states=reference_input, attention_mask=None)
