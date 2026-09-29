@@ -911,6 +911,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states,
                 operation="read",
                 fp32_residual_connection=self.config.fp32_residual_connection,
+                branch_input_dtype=self.config.params_dtype,
             )
 
         self.attn_norm_manager = self.off_interface(
@@ -1130,6 +1131,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states,
                 operation="read",
                 fp32_residual_connection=self.config.fp32_residual_connection,
+                branch_input_dtype=self.config.params_dtype,
             )
 
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
@@ -1413,6 +1415,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
+
         residual_connection = self._get_mlp_residual_connection()
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
