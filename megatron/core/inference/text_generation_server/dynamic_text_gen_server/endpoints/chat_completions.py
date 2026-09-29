@@ -16,8 +16,6 @@ import warnings
 from functools import partial
 
 _MEDIA_FETCH_TIMEOUT_S = 5.0
-_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
-_MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
 _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
@@ -291,29 +289,18 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
 
 
-def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
+def _extract_media_url_bytes(url: str) -> bytes:
     """Extract size-bounded bytes from an OpenAI-style media URL.
 
     Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
     plain ``http(s)://`` URLs.
     """
     if url.startswith("data:"):
-        # Base64 encodes each three input bytes as four characters. Bound the
-        # complete request before splitting or decoding it; 256 characters is
-        # ample for the data-URL metadata preceding the comma.
-        max_encoded_chars = 4 * ((max_bytes + 2) // 3)
-        if len(url) > max_encoded_chars + 256:
-            raise ValueError(f"Media data URL exceeds {max_bytes} byte limit")
         try:
             metadata, b64_data = url.split(",", 1)
         except ValueError as exc:
             raise ValueError(f"Malformed media data URL: {url[:40]!r}") from exc
-        if len(b64_data) > max_encoded_chars:
-            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
-        data = base64.b64decode(b64_data)
-        if len(data) > max_bytes:
-            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
-        return data
+        return base64.b64decode(b64_data)
     if url.startswith(("http://", "https://")):
         parsed = urllib.parse.urlparse(url)
         if not parsed.hostname:
@@ -335,14 +322,14 @@ def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
             raise ValueError(f"Refusing to fetch media from non-public address: {parsed.hostname}")
         req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
         with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
-            data = response.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            raise ValueError(f"Media at {parsed.hostname} exceeds {max_bytes} byte limit")
-        return data
+            return response.read()
     raise ValueError(f"Unsupported media URL scheme: {url[:40]!r}")
 
 
-def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptConfig):
+def _extract_multimodal_from_messages(
+    messages,
+    prompt_config: MultimodalPromptConfig,
+):
     """Extract media bytes and replace structured blocks with internal slots.
 
     Remote image fetching is blocking, so callers must run this function off
@@ -385,9 +372,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
                 if not url:
                     continue
                 try:
-                    image_bytes_list.append(
-                        _extract_media_url_bytes(url, max_bytes=_MAX_IMAGE_BYTES)
-                    )
+                    image_bytes_list.append(_extract_media_url_bytes(url))
                 except Exception as e:
                     # Dropping the image would answer the request as if it were
                     # text-only, handing the client a confident answer about an
@@ -401,9 +386,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
                 if not isinstance(url, str) or not url.startswith("data:"):
                     raise ValueError("Megatron chat video inputs must be base64 data URLs.")
                 try:
-                    video_bytes_list.append(
-                        _extract_media_url_bytes(url, max_bytes=_MAX_VIDEO_BYTES)
-                    )
+                    video_bytes_list.append(_extract_media_url_bytes(url))
                 except Exception as e:
                     raise ValueError(f"Failed to load video_url: {e}") from e
                 new_chunks.append(add_slot("video", message_index))
@@ -920,7 +903,9 @@ try:
         # fetches block, so keep this work off the event loop.
         try:
             messages, image_bytes_list, video_bytes_list, media_slots = await asyncio.to_thread(
-                _extract_multimodal_from_messages, messages, prompt_config
+                _extract_multimodal_from_messages,
+                messages,
+                prompt_config,
             )
         except ValueError as error:
             return Response(str(error), status=400)

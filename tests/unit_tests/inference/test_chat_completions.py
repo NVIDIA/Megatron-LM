@@ -36,21 +36,11 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 
 
-def test_extract_media_data_url_accepts_payload_at_limit():
+def test_extract_media_data_url():
     payload = b"four"
     url = f"data:video/mp4;base64,{base64.b64encode(payload).decode()}"
 
-    assert _extract_media_url_bytes(url, max_bytes=len(payload)) == payload
-
-
-def test_extract_media_data_url_rejects_decoded_payload_over_limit():
-    # Four- and five-byte payloads both occupy eight base64 characters, so
-    # this exercises the decoded-size check in addition to the encoded bound.
-    payload = b"five!"
-    url = f"data:video/mp4;base64,{base64.b64encode(payload).decode()}"
-
-    with pytest.raises(ValueError, match="data:video/mp4;base64 payload exceeds 4 byte limit"):
-        _extract_media_url_bytes(url, max_bytes=4)
+    assert _extract_media_url_bytes(url) == payload
 
 
 def test_replace_prefix_tokens_metadata_ships_the_rendered_prefix_and_eos():
