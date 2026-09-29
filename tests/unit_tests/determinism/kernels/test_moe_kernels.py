@@ -519,6 +519,12 @@ class TestMoEModules:
             pytest.param(
                 "alltoall",
                 1,
+                {"moe_shared_expert_intermediate_size": 2048},
+                id="alltoall-native-shared-expert",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
                 {
                     "moe_num_hash_layers": 1,
                     "hash_moe_vocab_size": 128,
