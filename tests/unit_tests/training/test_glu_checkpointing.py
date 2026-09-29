@@ -46,6 +46,30 @@ def _canonical(shape):
     return torch.arange(torch.tensor(shape).prod().item(), dtype=torch.float32).reshape(shape)
 
 
+def _fc1_state(weights, biases, single_weight, single_bias):
+    """Store weights and biases independently as grouped or per-expert tensors."""
+    state = {}
+    for name, tensors, single in (
+        ("weight", weights, single_weight),
+        ("bias", biases, single_bias),
+    ):
+        if single:
+            state[ROUTED + name] = tensors
+        else:
+            state.update(
+                {ROUTED + f"{name}{expert}": tensor for expert, tensor in enumerate(tensors)}
+            )
+    return state
+
+
+def _expert_fc1(state, expert, single_weight, single_bias):
+    weight = (
+        state[ROUTED + "weight"][expert] if single_weight else state[ROUTED + f"weight{expert}"]
+    )
+    bias = state[ROUTED + "bias"][expert] if single_bias else state[ROUTED + f"bias{expert}"]
+    return weight, bias
+
+
 def _saved_layout(routed=None, shared=None, tp=1, etp=1):
     return {
         "model": "contiguous",
@@ -56,44 +80,61 @@ def _saved_layout(routed=None, shared=None, tp=1, etp=1):
 
 
 @pytest.mark.parametrize("size", [2, 32])
-def test_loaded_fc1_preserves_complete_swiglu_mlp_output(size):
+@pytest.mark.parametrize("single_weight", [False, True])
+@pytest.mark.parametrize("single_bias", [False, True])
+def test_loaded_fc1_preserves_complete_swiglu_mlp_output(size, single_weight, single_bias):
     """The checkpoint conversion must preserve FC1 activation and FC2 semantics."""
-    hidden = 3
+    experts, hidden = 3, 3
     intermediate = 2 * size
-    fc1 = torch.linspace(-1, 1, 2 * intermediate * hidden).reshape(-1, hidden)
+    fc1 = torch.linspace(-1, 1, experts * 2 * intermediate * hidden).reshape(
+        experts, 2 * intermediate, hidden
+    )
+    bias = torch.linspace(0.1, 0.7, experts * 2 * intermediate).reshape(experts, -1)
     fc2 = torch.linspace(-0.5, 0.8, hidden * intermediate).reshape(hidden, intermediate)
-    inputs = torch.linspace(-0.7, 0.9, 5 * hidden).reshape(-1, hidden)
+    inputs = torch.linspace(-0.7, 0.9, experts * 5 * hidden).reshape(experts, 5, hidden)
     loaded = prepare_glu_checkpoint_for_load(
-        {"model": {ROUTED + "weight0": fc1}}, _args(routed=size)
+        {"model": _fc1_state(fc1, bias, single_weight, single_bias)}, _args(routed=size)
     )
 
-    gate, up = torch.nn.functional.linear(inputs, fc1).chunk(2, dim=-1)
-    expected = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, fc2)
-    projected = torch.nn.functional.linear(inputs, loaded["model"][ROUTED + "weight0"])
-    blocks = projected.reshape(inputs.shape[0], intermediate // size, 2, size)
-    actual_gate = blocks[:, :, 0, :].flatten(1)
-    actual_up = blocks[:, :, 1, :].flatten(1)
-    actual = torch.nn.functional.linear(torch.nn.functional.silu(actual_gate) * actual_up, fc2)
+    for expert in range(experts):
+        gate, up = torch.nn.functional.linear(inputs[expert], fc1[expert], bias[expert]).chunk(
+            2, dim=-1
+        )
+        expected = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, fc2)
+        loaded_weight, loaded_bias = _expert_fc1(
+            loaded["model"], expert, single_weight, single_bias
+        )
+        projected = torch.nn.functional.linear(inputs[expert], loaded_weight, loaded_bias)
+        blocks = projected.reshape(inputs.shape[1], intermediate // size, 2, size)
+        actual_gate = blocks[:, :, 0, :].flatten(1)
+        actual_up = blocks[:, :, 1, :].flatten(1)
+        actual = torch.nn.functional.linear(torch.nn.functional.silu(actual_gate) * actual_up, fc2)
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # Reordered GEMM rows can change bias-add rounding by an FP32 ulp.
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
 
 
-@pytest.mark.parametrize(
-    "suffix,shape,axis",
-    [("weight0", (8, 3), 0), ("bias0", (8,), 0), ("weight", (3, 8, 3), 1), ("bias", (3, 8), 1)],
-)
-def test_indexed_and_single_weight_and_bias_use_channel_axis(suffix, shape, axis):
-    original = _canonical(shape)
-    checkpoint = {"model": {ROUTED + suffix: original}}
+@pytest.mark.parametrize("single_weight", [False, True])
+@pytest.mark.parametrize("single_bias", [False, True])
+def test_weight_and_bias_combinations_use_channel_axis(single_weight, single_bias):
+    originals = _fc1_state(
+        _canonical((3, 8, 3)), _canonical((3, 8)) + 1, single_weight, single_bias
+    )
+    snapshots = {key: tensor.clone() for key, tensor in originals.items()}
+    checkpoint = {"model": originals}
     loaded = prepare_glu_checkpoint_for_load(checkpoint, _args(routed=2))
 
-    torch.testing.assert_close(
-        loaded["model"][ROUTED + suffix], _interleaved(original, 2, axis), rtol=0, atol=0
-    )
+    for key, original in originals.items():
+        axis = 1 if key in (ROUTED + "weight", ROUTED + "bias") else 0
+        torch.testing.assert_close(
+            loaded["model"][key], _interleaved(original, 2, axis), rtol=0, atol=0
+        )
     saved = prepare_glu_checkpoint_for_save(loaded, _args(routed=2))
-    torch.testing.assert_close(saved["model"][ROUTED + suffix], original, rtol=0, atol=0)
-    assert checkpoint["model"][ROUTED + suffix] is original
-    torch.testing.assert_close(original, _canonical(shape), rtol=0, atol=0)
+    assert saved["model"].keys() == originals.keys()
+    for key, original in originals.items():
+        torch.testing.assert_close(saved["model"][key], snapshots[key], rtol=0, atol=0)
+        assert checkpoint["model"][key] is original
+        torch.testing.assert_close(original, snapshots[key], rtol=0, atol=0)
 
 
 def test_save_restores_canonical_model_without_mutating_master_or_moments():
@@ -288,28 +329,34 @@ def test_legacy_interleaved_model_cannot_be_resharded_even_without_optimizer():
 
 
 @pytest.mark.parametrize("single_weight", [False, True])
-def test_adam_update_and_resume_match_canonical_and_uninterrupted_training(single_weight):
+@pytest.mark.parametrize("single_bias", [False, True])
+def test_adam_update_and_resume_match_canonical_and_uninterrupted_training(
+    single_weight, single_bias
+):
     """Real FP32 parameters and Adam moments keep their channel ownership on resume."""
     size, experts, hidden, intermediate = 2, 3, 3, 4
     canonical = torch.linspace(-0.6, 0.8, experts * 2 * intermediate * hidden).reshape(
         experts, 2 * intermediate, hidden
     )
+    canonical_bias = torch.linspace(0.1, 0.7, experts * 2 * intermediate).reshape(experts, -1)
     inputs = torch.linspace(-0.7, 0.9, experts * 5 * hidden).reshape(experts, 5, hidden)
     fc2 = torch.linspace(-0.5, 0.8, hidden * intermediate).reshape(hidden, intermediate)
-    keys = [ROUTED + "weight"] if single_weight else [ROUTED + f"weight{i}" for i in range(experts)]
-    axis = 1 if single_weight else 0
-    source_tensors = [canonical] if single_weight else list(canonical.unbind(0))
-    reference = [torch.nn.Parameter(t.clone()) for t in source_tensors]
-    runtime = [torch.nn.Parameter(_interleaved(t, size, axis)) for t in source_tensors]
-    reference_optimizer = torch.optim.Adam(reference, lr=0.002)
-    runtime_optimizer = torch.optim.Adam(runtime, lr=0.002)
+    source = _fc1_state(canonical, canonical_bias, single_weight, single_bias)
+    axes = {key: 1 if key in (ROUTED + "weight", ROUTED + "bias") else 0 for key in source}
+    reference = {key: torch.nn.Parameter(tensor.clone()) for key, tensor in source.items()}
+    runtime = {
+        key: torch.nn.Parameter(_interleaved(tensor, size, axes[key]))
+        for key, tensor in source.items()
+    }
+    reference_optimizer = torch.optim.Adam(reference.values(), lr=0.002)
+    runtime_optimizer = torch.optim.Adam(runtime.values(), lr=0.002)
 
     def step(parameters, optimizer, interleaved):
         optimizer.zero_grad(set_to_none=True)
-        weights = parameters[0].unbind(0) if single_weight else parameters
         losses = []
-        for expert, weight in enumerate(weights):
-            projected = torch.nn.functional.linear(inputs[expert], weight)
+        for expert in range(experts):
+            weight, bias = _expert_fc1(parameters, expert, single_weight, single_bias)
+            projected = torch.nn.functional.linear(inputs[expert], weight, bias)
             if interleaved:
                 blocks = projected.reshape(5, intermediate // size, 2, size)
                 gate, up = blocks[:, :, 0, :].flatten(1), blocks[:, :, 1, :].flatten(1)
@@ -330,31 +377,32 @@ def test_adam_update_and_resume_match_canonical_and_uninterrupted_training(singl
     checkpoint = deepcopy(
         prepare_glu_checkpoint_for_save(
             {
-                "model": {key: parameter.detach() for key, parameter in zip(keys, runtime)},
+                "model": {key: parameter.detach() for key, parameter in runtime.items()},
                 "optimizer": runtime_optimizer.state_dict(),
             },
             args,
         )
     )
-    for key, parameter in zip(keys, reference):
+    for key, parameter in reference.items():
         torch.testing.assert_close(checkpoint["model"][key], parameter)
     validate_glu_optimizer_layout(checkpoint, args, loading_optimizer=True)
     loaded = prepare_glu_checkpoint_for_load(checkpoint, args)
-    resumed = [torch.nn.Parameter(loaded["model"][key].clone()) for key in keys]
-    resumed_optimizer = torch.optim.Adam(resumed, lr=0.002)
+    resumed = {key: torch.nn.Parameter(loaded["model"][key].clone()) for key in source}
+    resumed_optimizer = torch.optim.Adam(resumed.values(), lr=0.002)
     resumed_optimizer.load_state_dict(loaded["optimizer"])
 
     expected_loss = step(reference, reference_optimizer, False)
     torch.testing.assert_close(step(runtime, runtime_optimizer, True), expected_loss)
     torch.testing.assert_close(step(resumed, resumed_optimizer, True), expected_loss)
-    resumed_model = prepare_glu_checkpoint_for_save({"model": dict(zip(keys, resumed))}, args)[
-        "model"
-    ]
-    for key, expected, uninterrupted, restored in zip(keys, reference, runtime, resumed):
+    resumed_model = prepare_glu_checkpoint_for_save({"model": resumed}, args)["model"]
+    for key, expected in reference.items():
+        uninterrupted, restored = runtime[key], resumed[key]
         torch.testing.assert_close(resumed_model[key], expected)
         torch.testing.assert_close(restored, uninterrupted, rtol=0, atol=0)
         for moment in ("exp_avg", "exp_avg_sq"):
-            expected_moment = _interleaved(reference_optimizer.state[expected][moment], size, axis)
+            expected_moment = _interleaved(
+                reference_optimizer.state[expected][moment], size, axes[key]
+            )
             torch.testing.assert_close(resumed_optimizer.state[restored][moment], expected_moment)
             torch.testing.assert_close(
                 resumed_optimizer.state[restored][moment],
