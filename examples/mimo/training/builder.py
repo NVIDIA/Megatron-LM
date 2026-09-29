@@ -19,32 +19,14 @@ from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer import MegatronModule, TransformerConfig
+from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args, get_run_config
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
-from megatron.core.transformer.spec_utils import ModuleSpec
 
 _LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000
-
-
-def _set_model_logging(spec) -> None:
-    """Project logging policy into nested MIMO specs before any modules are built."""
-    cfg = get_run_config()
-    if isinstance(spec, TransformerConfig):
-        spec.log_max_attention_logit = cfg.logger.log_max_attention_logit
-        spec.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
-    elif isinstance(spec, ModuleSpec):
-        _set_model_logging(spec.params)
-        _set_model_logging(spec.submodules)
-    elif isinstance(spec, dict):
-        for value in spec.values():
-            _set_model_logging(value)
-    elif isinstance(spec, (list, tuple)):
-        for value in spec:
-            _set_model_logging(value)
 
 
 @dataclass(kw_only=True)
@@ -111,13 +93,11 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
                 raise ValueError(f"provider defines no encoder spec/token for module {name!r}")
             pg = active_pg if name == active_name else None
             modality_submodules_spec[name] = provider.encoder_specs[name](args, pg, grid)
-            _set_model_logging(modality_submodules_spec[name])
             special_token_ids[name] = provider_token_ids[name]
 
         language_model_spec = provider.language_spec(
             args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
         )
-        _set_model_logging(language_model_spec)
         language_input_projections = {}
         for name, factory in provider.language_input_projection_specs.items():
             spec = factory(
@@ -127,7 +107,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
                 language_model_spec,
             )
             if spec is not None:
-                _set_model_logging(spec)
                 language_input_projections[name] = spec
 
         mimo_config = MimoModelConfig(
@@ -137,6 +116,8 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             special_token_ids=special_token_ids,
             module_to_grid_map=topology.grids,
         )
+        cfg = get_run_config()
+        cfg.finalize_model_config(mimo_config)
         return MimoModel(
             mimo_config,
             cp_group=active_pg.cp if is_language else None,

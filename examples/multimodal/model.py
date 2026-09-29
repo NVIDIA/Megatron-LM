@@ -24,7 +24,7 @@ from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.argument_utils import get_transformer_config
 
 
 def model_provider(
@@ -108,12 +108,7 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = config or core_transformer_config_from_args(get_args())
-    from megatron.training.global_vars import get_run_config
-
-    cfg = get_run_config()
-    base_config.log_max_attention_logit = cfg.logger.log_max_attention_logit
-    base_config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+    base_config = get_transformer_config(args, config)
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = not getattr(args, "no_calculate_per_token_loss", False)

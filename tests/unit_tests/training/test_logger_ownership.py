@@ -313,11 +313,14 @@ def test_mimo_projects_logging_before_module_construction(monkeypatch, enabled, 
 
 
 @pytest.mark.parametrize('enabled', [False, True])
-@pytest.mark.parametrize('source', ['args', 'yaml', 'provided'])
+@pytest.mark.parametrize('source', ['args', 'yaml', 'provided', 'native'])
 def test_legacy_gpt_logging_preserves_config_factory(monkeypatch, source, enabled, run_config):
     run_config.logger.log_max_attention_logit = enabled
     run_config.logger.barrier_with_L1_time = enabled
     import gpt_builders
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training import argument_utils, yaml_arguments
+    from megatron.training.models import GPTModelConfig
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -325,11 +328,15 @@ def test_legacy_gpt_logging_preserves_config_factory(monkeypatch, source, enable
     del args.log_max_attention_logit
     del args.barrier_with_L1_time
     args.yaml_cfg = 'model.yaml' if source == 'yaml' else None
-    config = Namespace(log_max_attention_logit=not enabled)
+    config = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    config.log_max_attention_logit = not enabled
+    config.barrier_with_L1_time = not enabled
+    if source == 'native':
+        run_config.model = GPTModelConfig(transformer=config, vocab_size=128, seq_length=16)
     from_args = Mock(return_value=config)
     from_yaml = Mock(return_value=config)
-    monkeypatch.setattr(gpt_builders, 'core_transformer_config_from_args', from_args)
-    monkeypatch.setattr(gpt_builders, 'core_transformer_config_from_yaml', from_yaml)
+    monkeypatch.setattr(argument_utils, 'core_transformer_config_from_args', from_args)
+    monkeypatch.setattr(yaml_arguments, 'core_transformer_config_from_yaml', from_yaml)
     monkeypatch.setattr(gpt_builders, '_get_transformer_layer_spec', Mock())
     model = Mock()
 
@@ -375,6 +382,86 @@ def test_teacher_logging_inherits_owned_policy_with_explicit_yaml_override(
     assert teacher.log_max_attention_logit is expected
     assert teacher.barrier_with_L1_time is expected
     assert vars(args) == before
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_finalization_is_idempotent_and_updates_derived_configs(run_config, enabled):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        vocab_size=128,
+        seq_length=16,
+    )
+    run_config.logger.log_max_attention_logit = enabled
+    run_config.logger.barrier_with_L1_time = enabled
+    run_config.logger.log_num_zeros_in_grad = enabled
+    run_config.finalize()
+    run_config.finalize()
+    assert run_config.model.transformer.log_max_attention_logit is enabled
+    assert run_config.model.transformer.barrier_with_L1_time is enabled
+    assert run_config.optimizer.log_num_zeros_in_grad is enabled
+    assert run_config.optimizer.barrier_with_L1_time is enabled
+
+
+def test_explicit_transformer_override_does_not_replace_native_model(run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.argument_utils import get_transformer_config
+    from megatron.training.models import GPTModelConfig
+
+    native = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    override = TransformerConfig(num_layers=4, hidden_size=64, num_attention_heads=4)
+    run_config.model = GPTModelConfig(transformer=native, vocab_size=128, seq_length=16)
+    run_config.logger.log_max_attention_logit = True
+
+    assert get_transformer_config(Namespace(), override) is override
+    assert override.log_max_attention_logit is True
+    assert run_config.model.transformer is native
+    assert native.num_layers == 2
+
+
+@pytest.mark.parametrize('provider', ['gpt', 'hybrid'])
+@pytest.mark.parametrize('existing_model', ['matching', 'different', 'absent'])
+def test_inference_reuses_matching_config_and_preserves_provider_override(
+    monkeypatch, run_config, provider, existing_model
+):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.inference import utils
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    config_cls = GPTModelConfig if provider == 'gpt' else HybridModelConfig
+    other_cls = HybridModelConfig if provider == 'gpt' else GPTModelConfig
+
+    def make_config(cls):
+        return cls(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            vocab_size=128,
+            seq_length=16,
+        )
+
+    existing = (
+        None
+        if existing_model == 'absent'
+        else make_config(config_cls if existing_model == 'matching' else other_cls)
+    )
+    run_config.model = existing
+    run_config.logger.log_max_attention_logit = True
+    created = make_config(config_cls)
+    factory = Mock(return_value=created)
+    monkeypatch.setattr(utils, f'{provider}_config_from_args', factory)
+    builder = Mock()
+    monkeypatch.setattr(
+        utils, 'GPTModelBuilder' if provider == 'gpt' else 'HybridModelBuilder', builder
+    )
+
+    utils.get_model_builder(Namespace(model_provider=provider))
+
+    expected = existing if existing_model == 'matching' else created
+    builder.assert_called_once_with(expected)
+    assert factory.call_count == (existing_model != 'matching')
+    assert expected.transformer.log_max_attention_logit is True
+    assert run_config.model is existing
 
 
 @pytest.mark.parametrize('enabled', [False, True])

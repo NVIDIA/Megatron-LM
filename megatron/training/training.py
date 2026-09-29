@@ -1653,6 +1653,7 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    cfg_container.finalize()
     cfg_container.validate()
 
     callback_manager = normalize_callbacks(callbacks)
@@ -2900,6 +2901,7 @@ def setup_model_and_optimizer(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     cfg = cfg_container if cfg_container is not None else get_run_config()
+    cfg.finalize()
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -2920,18 +2922,13 @@ def setup_model_and_optimizer(
 
             start_memory_history_recording(cfg_container.profiling)
 
-            cfg = cfg_container
-            model_config = cfg.model
-            if hasattr(model_config, "transformer"):
-                model_config.transformer.log_max_attention_logit = cfg.logger.log_max_attention_logit
-                model_config.transformer.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
-            builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
+            builder_cls = cfg.model.get_builder_cls()
+            builder = builder_cls(cfg.model)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
             _add_model_freeze_pre_wrap_hook(
-                model_config,
+                cfg.model,
                 freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
             )
@@ -3018,8 +3015,7 @@ def setup_model_and_optimizer(
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
-        config.log_num_zeros_in_grad = cfg.logger.log_num_zeros_in_grad
-        config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+        cfg.finalize_optimizer_config(config)
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (

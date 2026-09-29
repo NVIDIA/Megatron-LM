@@ -2,22 +2,15 @@
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training import print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.argument_utils import get_transformer_config
 from model_provider import count_parameters_in_layer
-from megatron.training.global_vars import get_run_config
 
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building Hybrid model ...')
-    if config is None:
-        config = core_transformer_config_from_args(args, TransformerConfig)
-
-    cfg = get_run_config()
-    config.log_max_attention_logit = cfg.logger.log_max_attention_logit
-    config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+    config = get_transformer_config(args, config)
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec
         assert (

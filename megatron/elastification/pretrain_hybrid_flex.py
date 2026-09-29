@@ -51,9 +51,10 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import get_transformer_config
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 # modelopt distillation
 try:
@@ -118,10 +119,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         return model
 
     print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(args, TransformerConfig)
-    cfg = get_run_config()
-    config.log_max_attention_logit = cfg.logger.log_max_attention_logit
-    config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+    config = get_transformer_config(args, config)
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 

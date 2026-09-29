@@ -16,6 +16,7 @@ except ImportError:
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
@@ -44,6 +45,46 @@ class ConfigContainerBase:
 
     Provides sub-config validation and YAML/Dict serialization and deserialization.
     """
+
+    def finalize(self) -> None:
+        """Derive model and optimizer inputs from their owning run configurations."""
+        self.finalize_model_config(getattr(self, "model", None))
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            self.finalize_optimizer_config(optimizer)
+
+    def finalize_model_config(self, model_config: Any) -> None:
+        """Derive logging inputs, including configs in nested multimodal specs.
+
+        Legacy providers can construct configs after the run container is built;
+        they use the same derivation at their shared config-construction boundary.
+        """
+        seen = set()
+
+        def visit(config):
+            if id(config) in seen:
+                return
+            seen.add(id(config))
+            if isinstance(config, TransformerConfig):
+                config.log_max_attention_logit = self.logger.log_max_attention_logit
+                config.barrier_with_L1_time = self.logger.barrier_with_L1_time
+            elif is_dataclass(config) and not isinstance(config, type):
+                for config_field in dataclass_fields(config):
+                    if not config_field.name.startswith("_"):
+                        visit(getattr(config, config_field.name))
+            elif isinstance(config, dict):
+                for value in config.values():
+                    visit(value)
+            elif isinstance(config, (list, tuple)):
+                for value in config:
+                    visit(value)
+
+        visit(model_config)
+
+    def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> None:
+        """Derive logging inputs for native and legacy optimizer construction."""
+        optimizer.log_num_zeros_in_grad = self.logger.log_num_zeros_in_grad
+        optimizer.barrier_with_L1_time = self.logger.barrier_with_L1_time
 
     def validate(self) -> None:
         """Run each sub-config's explicit validation before runtime initialization."""

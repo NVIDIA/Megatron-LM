@@ -18,7 +18,7 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 from megatron.inference.text_generation import generate_and_post_process
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.argument_utils import get_transformer_config
 from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
@@ -40,12 +40,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
-    from megatron.training.global_vars import get_run_config
-
-    cfg = get_run_config()
-    config.log_max_attention_logit = cfg.logger.log_max_attention_logit
-    config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+    config = get_transformer_config(args)
 
     if args.spec is None:
         if args.transformer_impl == 'local':
