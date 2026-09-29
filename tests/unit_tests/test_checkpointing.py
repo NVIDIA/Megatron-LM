@@ -537,6 +537,10 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=first_job_mock_metadata,
         ):
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+        expected_loaded_metadata = {
+            **first_job_mock_metadata,
+            'checkpoint_version': 3.1,
+        }
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -549,7 +553,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
             load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
-            assert optimizer._called_metadata[-1] == first_job_mock_metadata
+            assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
@@ -558,7 +562,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         assert optimizer._called_metadata == model._called_metadata
         assert optimizer._called_metadata == [
             first_job_mock_metadata,
-            first_job_mock_metadata,
+            expected_loaded_metadata,
             second_job_mock_metadata,
         ]
 
