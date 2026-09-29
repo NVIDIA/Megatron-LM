@@ -917,7 +917,7 @@ try:
                 _extract_multimodal_from_messages,
                 messages,
                 prompt_config,
-                current_app.config.get('MAX_CONTENT_LENGTH'),
+                current_app.config.get("MAX_CONTENT_LENGTH"),
             )
         except ValueError as error:
             return Response(str(error), status=400)

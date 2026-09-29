@@ -53,7 +53,7 @@ def test_extract_media_data_url_ignores_fetch_limit():
 
 
 class _FakeMediaResponse:
-    def __init__(self, data):
+    def __init__(self, data) -> None:
         self._data = data
         self.read_sizes = []
 
