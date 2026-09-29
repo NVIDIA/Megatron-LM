@@ -1025,22 +1025,26 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ).routing_key_chunk
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
-        full_k_index = None
         with _triton_dispatch_enabled(use_triton):
             with torch.no_grad():
-                if cache_indexer_k:
-                    full_k_index = _project_simplified_k_index_block(
-                        hidden_states,
-                        0,
-                        hidden_states.size(0),
-                        linear_k_weight,
-                        index_head_dim,
-                        index_rotary_dim,
-                        rotary_pos_emb,
-                        rotary_interleaved,
-                        use_indexer_rope,
-                        simplified_input_norm,
-                    )
+                # Project the indexer K once for the whole sequence. Routing would otherwise
+                # reproject the causal prefix inside every query tile: at sequence 131072 with a
+                # query chunk of 8192 that is sixteen prefixes totalling 8.5 sequences of work,
+                # for keys whose values do not depend on the tile. cache_indexer_k decides only
+                # whether this survives into the backward pass, below; the forward projects once
+                # either way.
+                full_k_index = _project_simplified_k_index_block(
+                    hidden_states,
+                    0,
+                    hidden_states.size(0),
+                    linear_k_weight,
+                    index_head_dim,
+                    index_rotary_dim,
+                    rotary_pos_emb,
+                    rotary_interleaved,
+                    use_indexer_rope,
+                    simplified_input_norm,
+                )
                 output, indexer_loss = _simplified_sparse_forward_impl(
                     query,
                     key,
@@ -1066,7 +1070,9 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     full_k_index=full_k_index,
                 )
 
-        cached_k = full_k_index if full_k_index is not None else key.new_empty((0,))
+        # Retaining it costs seq * batch * index_head_dim for the whole span between this
+        # layer's forward and its backward; recomputing it costs one projection there.
+        cached_k = full_k_index if cache_indexer_k else key.new_empty((0,))
         ctx.save_for_backward(
             query, key, value, hidden_states, linear_q_weight, linear_k_weight, cached_k
         )
@@ -1100,6 +1106,24 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         )
         full_k_index = cached_k if cached_k.numel() > 0 else None
         sq, batch_size, num_query_heads, _ = query.shape
+        if full_k_index is None:
+            # Not retained from the forward, so project it once here for the same reason the
+            # forward does: the tile loop below would otherwise reproject the causal prefix per
+            # tile. This is the recompute the empty cached_k asked for, done once rather than
+            # once per tile, and it is released when this backward returns.
+            with torch.no_grad():
+                full_k_index = _project_simplified_k_index_block(
+                    hidden_states,
+                    0,
+                    hidden_states.size(0),
+                    linear_k_weight,
+                    ctx.index_head_dim,
+                    ctx.index_rotary_dim,
+                    ctx.rotary_pos_emb,
+                    ctx.rotary_interleaved,
+                    ctx.use_indexer_rope,
+                    ctx.simplified_input_norm,
+                )
         grad_output = grad_output.reshape(sq, batch_size, num_query_heads, value.size(-1))
         grad_query = _grad_accumulator(query) if ctx.needs_input_grad[0] else None
         grad_key = _grad_accumulator(key) if ctx.needs_input_grad[1] else None
@@ -1258,22 +1282,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                 ctx.use_indexer_rope,
                                 ctx.simplified_input_norm,
                             )
-                        selected_score_k_index = None
-                        if full_k_index is not None:
-                            selected_score_k_index = full_k_index
-                        else:
-                            selected_score_k_index = _project_simplified_k_index_block(
-                                hidden_states,
-                                0,
-                                q_end,
-                                linear_k_weight,
-                                ctx.index_head_dim,
-                                ctx.index_rotary_dim,
-                                ctx.rotary_pos_emb,
-                                ctx.rotary_interleaved,
-                                ctx.use_indexer_rope,
-                                ctx.simplified_input_norm,
-                            )
+                        # Projected once above, whether it came from ctx or was rebuilt here.
+                        selected_score_k_index = full_k_index
                         if ctx.selected_scores_cache is not None:
                             selected_scores = ctx.selected_scores_cache[chunk_idx]
                         elif routing_scores is not None:
@@ -1882,21 +1892,21 @@ def dsa_min_memory_gqa_forward_only(
         query_chunk_size = plan.query_chunk
         key_chunk_size = plan.routing_key_chunk
         linear_k_weight = _module_weight(indexer.linear_k)
-        full_k_index = None
         with torch.no_grad(), _triton_dispatch_enabled(use_triton):
-            if cache_indexer_k:
-                full_k_index = _project_simplified_k_index_block(
-                    hidden_states,
-                    0,
-                    hidden_states.size(0),
-                    linear_k_weight,
-                    indexer.index_head_dim,
-                    indexer.index_rotary_dim,
-                    indexer.rotary_pos_emb,
-                    getattr(indexer.config, "rotary_interleaved", False),
-                    use_indexer_rope,
-                    simplified_input_norm,
-                )
+            # Project once, as the training forward does. Nothing is retained on this path --
+            # there is no backward to feed -- so cache_indexer_k has nothing left to decide.
+            full_k_index = _project_simplified_k_index_block(
+                hidden_states,
+                0,
+                hidden_states.size(0),
+                linear_k_weight,
+                indexer.index_head_dim,
+                indexer.index_rotary_dim,
+                indexer.rotary_pos_emb,
+                getattr(indexer.config, "rotary_interleaved", False),
+                use_indexer_rope,
+                simplified_input_norm,
+            )
             output, _ = _simplified_sparse_forward_impl(
                 query,
                 key,
