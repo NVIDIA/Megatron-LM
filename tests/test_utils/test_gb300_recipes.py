@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import pathlib
+import re
+
 import pytest
 
 from tests.test_utils.python_scripts import recipe_parser
@@ -62,6 +65,25 @@ def test_gb300_manifests_mount_required_data_only_on_jhb(workloads):
                     }
                 }
             }
+
+
+def test_gb300_recipes_reference_existing_goldens(workloads):
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    for workload in workloads:
+        if workload["type"] != "basic":
+            continue
+        spec = workload["spec"]
+        reference = re.search(r'"GOLDEN_VALUES_PATH=([^"]+)"', spec["script"])
+        assert reference is not None
+        path = repo_root / reference.group(1).format(**spec)
+        assert path.is_file(), path
+        if spec["test_case"] in {
+            "deepseek_proxy_mfsdp_v1_ep2",
+            "nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200",
+        }:
+            assert path.name == "golden_values_dev_dgx_gb300.json"
+        else:
+            assert path.name == "golden_values_dev_dgx_gb200.json"
 
 
 def test_gb200_recipes_keep_cluster_default_mounts():

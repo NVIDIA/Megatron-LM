@@ -15,6 +15,7 @@ spec:
   gpus: 4
   n_repeat: 5
   platforms: dgx_gb300
+  golden_platform: dgx_gb200
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -53,7 +54,7 @@ spec:
 
     export GPUS_PER_NODE={gpus}
 
-    # Keep the GB200 reference until GB300 baselines are validated.
+    # Reuse GB200 references except for cases with validated GB300 baselines.
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
@@ -63,7 +64,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_dgx_gb200.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{golden_platform}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
@@ -90,3 +91,4 @@ products:
         scope: [L2]
         cadence: [nightly]
         platforms: [dgx_gb300]
+        golden_platform: [dgx_gb300]
