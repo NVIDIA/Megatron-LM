@@ -1678,6 +1678,15 @@ class TransformerConfig(ModelParallelConfig):
                 self.experimental_attention_variant
             )
 
+        # Likewise fold the deprecated moe_router_padding_for_fp8 alias into
+        # moe_router_padding_for_quantization before any check below reads it.
+        if self.moe_router_padding_for_fp8:
+            warnings.warn(
+                "--moe-router-padding-for-fp8 is going to be deprecated. "
+                "Use --moe-router-padding-for-quantization instead."
+            )
+            self.moe_router_padding_for_quantization = True
+
         if self.dsa_kernel_backend is None:
             self.dsa_kernel_backend = (
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
@@ -3126,14 +3135,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
-        if self.moe_router_padding_for_fp8:
-            # enable moe_router_padding_for_quantization
-            warnings.warn(
-                "--moe-router-padding-for-fp8 is going to be deprecated. "
-                "Use --moe-router-padding-for-quantization instead."
-            )
-            self.moe_router_padding_for_quantization = True
-
         if self.moe_router_padding_for_quantization:
             if self.fp8 is None and self.fp4 is None:
                 raise ValueError(
@@ -3336,7 +3337,7 @@ class TransformerConfig(ModelParallelConfig):
                         ), 'moe cuda graph is only supported with drop-padding MoE.'
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
-                            or self.moe_router_padding_for_fp8
+                            or self.moe_router_padding_for_quantization
                         ):
                             assert CudaGraphModule.moe_preprocess not in self.cuda_graph_modules, (
                                 'moe_preprocess cuda graph is not supported when there are '
