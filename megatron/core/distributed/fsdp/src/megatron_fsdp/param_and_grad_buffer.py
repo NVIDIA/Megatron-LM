@@ -248,6 +248,8 @@ class BucketingPolicy:
         expert_data_parallel_sharding_strategy (Optional[str]): The strategy used for
             sharding expert parameters. When None, data_parallel_sharding_strategy
             applies to every parameter.
+        fsdp_unit_filter (Optional[Callable]): Instance filter applied after a module
+            matches fsdp_unit_modules.
 
     Note:
         This policy is used to configure the bucketing behavior in FSDP training.
@@ -257,6 +259,7 @@ class BucketingPolicy:
     fsdp_unit_modules: List[torch.nn.Module] = dataclasses.field(default_factory=list)
     data_parallel_sharding_strategy: str = "no_shard"
     expert_data_parallel_sharding_strategy: Optional[str] = None
+    fsdp_unit_filter: Optional[Callable[[torch.nn.Module], bool]] = None
 
 
 class BufferDistribution(NamedTuple):
@@ -1822,11 +1825,13 @@ def _get_parameter_groups(
         for m in module.modules():
             # Skip nested FSDP module, i.e. FSDP modules already have their
             # sub-module parameters registered.
-            if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
+            if any(is_submodule(m, fsdp_module) for fsdp_module in fsdp_modules):
                 continue
             # If the sub-module is a FSDP unit module, add its parameter (names)
             # to the list of FSDP units.
-            if isinstance(m, tuple(policy.fsdp_unit_modules)):
+            if isinstance(m, tuple(policy.fsdp_unit_modules)) and (
+                policy.fsdp_unit_filter is None or policy.fsdp_unit_filter(m)
+            ):
                 fsdp_units.append([param_to_name[p] for p in m.parameters()])
                 fsdp_modules.append(m)
 

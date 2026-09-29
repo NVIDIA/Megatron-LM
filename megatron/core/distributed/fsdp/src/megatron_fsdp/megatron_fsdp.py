@@ -149,6 +149,8 @@ class MegatronFSDP(torch.nn.Module):
             should be treated as an FSDP Unit, i.e. the minimum releasable model unit.
             It affects the granularity of the communication parameter grouping and
             triggers aggregate collective communication in FP8 mixed precision training.
+        fsdp_unit_filter (Optional[Callable]): Instance filter applied to modules matching
+            fsdp_unit_modules, for both communication buckets and parameter lifecycle hooks.
         device (torch.device): Target device for the sharded model. Used to migrate
             all model parameters to an expected device. If init_model_with_meta_device=True,
             this argument is ignored.
@@ -217,7 +219,6 @@ class MegatronFSDP(torch.nn.Module):
         ddp_config: DistributedDataParallelConfig = None,
         mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         fsdp_unit_modules: Optional[List[torch.nn.Module] | List[str]] = None,
-        fsdp_unit_filter: Optional[Callable[[torch.nn.Module], bool]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
         calculate_per_token_loss: bool = False,
@@ -232,6 +233,7 @@ class MegatronFSDP(torch.nn.Module):
         enable_fine_grained_param_gather_backward_hook: bool = False,
         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
+        fsdp_unit_filter: Optional[Callable[[torch.nn.Module], bool]] = None,
     ):
         super().__init__()
         # If device is not specified, use the current device.
@@ -436,6 +438,7 @@ class MegatronFSDP(torch.nn.Module):
             bucketing_policy=BucketingPolicy(
                 suggested_bucket_size=self.bucket_size,
                 fsdp_unit_modules=self.fsdp_unit_modules,
+                fsdp_unit_filter=self.fsdp_unit_filter,
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
                 expert_data_parallel_sharding_strategy=(
                     self.ddp_config.expert_data_parallel_sharding_strategy

@@ -31,8 +31,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
+    BucketingPolicy,
     BucketStatus,
     PrefetchOrder,
+    _get_parameter_groups,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -63,6 +65,42 @@ MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
 # Needed for `torch.distributed.checkpoint.{save,load}` because
 # multiple processes need to write to the same directory.
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
+
+
+@pytest.mark.parametrize("filter_outer", [False, True])
+@pytest.mark.parametrize("grouped_layers", [0, 1, 2])
+def test_nested_fsdp_unit_bucketing(filter_outer, grouped_layers):
+    """Filtered wrappers leave separate child units; default selection keeps the outer."""
+
+    class Stack(torch.nn.Module):
+        def __init__(self, *layers, is_group=False):
+            super().__init__()
+            self.layers = torch.nn.ModuleList(layers)
+            self.is_group = is_group
+
+    first = torch.nn.Linear(2, 2)
+    second = torch.nn.Linear(2, 2)
+    if grouped_layers >= 1:
+        first = Stack(first, is_group=True)
+    if grouped_layers == 2:
+        second = Stack(second, is_group=True)
+    outer = Stack(first, second)
+    model = torch.nn.Sequential(outer)
+    policy = BucketingPolicy(
+        fsdp_unit_modules=[Stack, torch.nn.Linear],
+        fsdp_unit_filter=(
+            (lambda module: getattr(module, "is_group", True)) if filter_outer else None
+        ),
+        data_parallel_sharding_strategy="optim_grads_params",
+    )
+    groups, param_to_group, _ = _get_parameter_groups(model, policy, {})
+
+    def unit_ids(module):
+        return {groups[param_to_group[param]].fsdp_unit_id for param in module.parameters()}
+
+    assert unit_ids(first) == {0}
+    assert unit_ids(second) == ({1} if filter_outer else {0})
+    assert {group.fsdp_unit_id for group in groups} == ({0, 1} if filter_outer else {0})
 
 
 def test_all_gather_pipeline_prefetch_size():

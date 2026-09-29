@@ -229,6 +229,21 @@ class TestFSDPHybridOverlap:
                 f"got {_count_fsdp_units(test_fsdp)}"
             )
 
+            # Hook selection and bucketing must use the same units. Otherwise
+            # the outer stack's bucket can be released while a sibling group
+            # still needs its parameters during an overlapped microbatch.
+            for wrapper in (ref_fsdp, test_fsdp):
+                buffer = wrapper.module.param_and_grad_buffer
+                unit_ids = []
+                for group in wrapper.module.module.decoder.layers:
+                    group_ids = {
+                        buffer.parameter_groups[buffer.param_to_param_group[param]].fsdp_unit_id
+                        for param in group.parameters()
+                    }
+                    assert len(group_ids) == 1 and None not in group_ids
+                    unit_ids.extend(group_ids)
+                assert len(set(unit_ids)) == expected_units
+
             rank = torch.distributed.get_rank()
             for step in range(NUM_STEPS):
                 if hasattr(ref_fsdp, "set_is_first_microbatch"):
