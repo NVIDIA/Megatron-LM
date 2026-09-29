@@ -18,6 +18,7 @@ from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.determinism.configs import hybrid_base
 from tests.unit_tests.determinism.utils import (
     assert_bit_exact,
@@ -77,13 +78,26 @@ def _conv_backward(x, weight, bias, grad):
     return torch.autograd.grad(out, (x, weight, bias), grad_outputs=grad)
 
 
-def _build_mixer(deterministic_mode=True):
+def _build_mixer(deterministic_mode=True, delay_wgrad_compute=False):
     """A bare MambaMixer on the suite's shared hybrid config."""
-    Utils.initialize_model_parallel()
-    model_parallel_cuda_manual_seed(123)
-    config = TransformerConfig(
-        **(hybrid_base() | {"num_layers": 1, "deterministic_mode": deterministic_mode})
+    overrides = {"num_layers": 1, "deterministic_mode": deterministic_mode}
+    if delay_wgrad_compute:
+        # Delayed projection wgrad is enabled by the EP-overlap configuration,
+        # even though this test isolates a single dense Mamba mixer. It runs
+        # no EP communication or overlap streams, so it needs no connection-count override.
+        overrides.update(
+            delay_wgrad_compute=True,
+            overlap_moe_expert_parallel_comm=True,
+            expert_model_parallel_size=2,
+            num_moe_experts=2,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+        )
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=overrides.get("expert_model_parallel_size", 1)
     )
+    model_parallel_cuda_manual_seed(123)
+    config = TransformerConfig(**(hybrid_base() | overrides))
     mixer = MambaMixer(
         config,
         hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
@@ -170,15 +184,21 @@ class TestMambaMixerDeterminism:
 
     @requires_deterministic_conv1d
     @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
-    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout):
+    @pytest.mark.parametrize("delay_wgrad_compute", [False, True])
+    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout, delay_wgrad_compute):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
         ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
-        the conv weight gradient, so a failure points at the convolution.
+        the conv weight gradient. The delayed arm also covers projection gradients completed
+        through ``MambaMixer.backward_dw`` after the regular backward pass.
         """
+        if delay_wgrad_compute and (Utils.world_size < 2 or Utils.world_size % 2):
+            pytest.skip("Delayed projection wgrad config requires a world size divisible by EP=2")
+        if delay_wgrad_compute and not is_te_min_version("2.3.0"):
+            pytest.skip("Delayed projection wgrad requires TE >= 2.3.0")
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
-        mixer = _build_mixer()
+        mixer = _build_mixer(delay_wgrad_compute=delay_wgrad_compute)
         hidden_size = mixer.config.hidden_size
         micro_batch = _MICRO_BATCH if packed_layout == "none" else 1
         packed_seq_params = None
@@ -207,6 +227,16 @@ class TestMambaMixerDeterminism:
         def fwd_bwd():
             output, _ = mixer(hidden_states, packed_seq_params=packed_seq_params)
             output.backward(grad)
+            if delay_wgrad_compute:
+                # Prove that the callback completes deferred work, so replay
+                # cannot pass merely because both runs omitted projection grads.
+                for projection in (mixer.in_proj, mixer.out_proj):
+                    assert projection.weight.grad is None
+                mixer.backward_dw()
+                for projection in (mixer.in_proj, mixer.out_proj):
+                    assert projection.weight.grad is not None
+                    assert torch.isfinite(projection.weight.grad).all()
+                    assert torch.count_nonzero(projection.weight.grad) > 0
             return output.detach().clone(), collect_grads([mixer])
 
         state = capture_rng_state()
