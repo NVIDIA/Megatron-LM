@@ -60,25 +60,6 @@ def experimental(request):
     config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
 
 
-@pytest.fixture
-def te_rng_tracker(monkeypatch):
-    """Provide seeded graph-safe RNG without leaking MCore or TE tracker state."""
-    te_distributed = pytest.importorskip("transformer_engine.pytorch.distributed")
-    from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
-    from megatron.core.tensor_parallel import random as rng
-
-    torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
-    previous = te_distributed.get_all_rng_states()
-    tracker = TECudaRNGStatesTracker()
-    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER", tracker)
-    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER_INITIALIZED", True)
-    try:
-        tracker.add(rng._MODEL_PARALLEL_RNG_TRACKER_NAME, 123)
-        yield tracker
-    finally:
-        te_distributed.set_all_rng_states(previous)
-
-
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0
@@ -160,3 +141,22 @@ def reset_env_vars():
     # After the test, restore the original environment
     os.environ.clear()
     os.environ.update(original_env)
+
+
+@pytest.fixture
+def te_rng_tracker(monkeypatch):
+    """Provide seeded graph-safe RNG without leaking MCore or TE tracker state."""
+    te_distributed = pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+    from megatron.core.tensor_parallel import random as rng
+
+    torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+    previous = te_distributed.get_all_rng_states()
+    tracker = TECudaRNGStatesTracker()
+    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER", tracker)
+    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER_INITIALIZED", True)
+    try:
+        tracker.add(rng._MODEL_PARALLEL_RNG_TRACKER_NAME, 123)
+        yield tracker
+    finally:
+        te_distributed.set_all_rng_states(previous)
