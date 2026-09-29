@@ -116,6 +116,40 @@ def wait_for_pipeline_completion(
         signal.signal(signal.SIGALRM, previous_handler)
 
 
+def build_workload_manifest(
+    workload: Dict, cluster: str, scope: str
+) -> jetclient.JETWorkloadManifest:
+    """Build a manifest with the mounts needed by the GB300 comparison tests."""
+    if (
+        cluster == "dgxgb300_oci-jhb"
+        and scope == "gb300-comparison"
+        and workload["type"] == "basic"
+    ):
+        # Workload launcher overrides replace the mounts dictionary. Root
+        # custom_config merges it instead, retaining unused dataset mounts that
+        # prevent containers from starting when their sources are absent on JHB.
+        launcher_name = f"name:{cluster}"
+        launchers = workload.get("launchers", {})
+        workload = {
+            **workload,
+            "launchers": {
+                **launchers,
+                launcher_name: {
+                    **launchers.get(launcher_name, {}),
+                    "mounts": {
+                        "/lustre/fsw/coreai_dlalgo_mcore": (
+                            "/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/"
+                        ),
+                        "/mnt/artifacts": (
+                            "/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci"
+                        ),
+                    },
+                },
+            },
+        }
+    return jetclient.JETWorkloadManifest(**workload)
+
+
 def launch_and_wait_for_completion(
     test_case: str,
     environment: str,
@@ -145,7 +179,7 @@ def launch_and_wait_for_completion(
                 customer="mcore", gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
             ).workloads.submit(
                 workloads=[
-                    jetclient.JETWorkloadManifest(**workload)
+                    build_workload_manifest(workload, cluster, scope)
                     for workload in recipe_parser.load_workloads(
                         test_case=test_case,
                         n_repeat=n_repeat,
