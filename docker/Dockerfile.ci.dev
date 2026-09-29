@@ -20,7 +20,8 @@ ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
     apt-get update
-    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime
+    # DeepGEMM/DeepJIT requires elfutils/libdwfl.h for its exception support.
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime libdw-dev
     apt-get clean
     python -m venv /opt/jet
     ARCH=$(uname -m)
