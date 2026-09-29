@@ -199,6 +199,11 @@ def main():
         help="CLUSTER_GB200 pipeline variable (override the default cluster)",
     )
     parser.add_argument(
+        "--cluster-gb300",
+        default=None,
+        help="CLUSTER_GB300 pipeline variable (opt in to GB300 workloads)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print actions without executing git push or pipeline trigger",
@@ -242,6 +247,7 @@ def main():
         ("CLUSTER_A100", args.cluster_a100),
         ("CLUSTER_H100", args.cluster_h100),
         ("CLUSTER_GB200", args.cluster_gb200),
+        ("CLUSTER_GB300", args.cluster_gb300),
     ]:
         if val is not None:
             pipeline_vars[var] = val

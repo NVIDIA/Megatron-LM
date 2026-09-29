@@ -175,13 +175,12 @@ functional:configure:
         --output-path "functional-test-job-lts-GB200.yaml" \
         ${RELEASE_ARGS[@]}
     - |
-      # Keep the GB200 recipe topology and goldens for this hardware comparison.
-      if [[ "$FUNCTIONAL_TEST_SCOPE" == "gb300-comparison" && -n "$CLUSTER_GB300" ]]; then
+      if [[ -n "$CLUSTER_GB300" ]]; then
         export PYTHONPATH=$(pwd)
         python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
           ${ARGS[@]} \
           --environment dev \
-          --platform dgx_gb200 \
+          --platform dgx_gb300 \
           --cluster "$CLUSTER_GB300" \
           --output-path "functional-test-job-dev-GB300.yaml"
       fi
@@ -423,8 +422,7 @@ functional:run_dev_dgx_gb200:
     ENVIRONMENT: dev
     CLUSTER: GB200
 
-# Only the five comparison recipes are selected; normal suites retain their
-# current cluster placement and do not submit additional GB300 workloads.
+# GB300 recipes select the tests for this opt-in platform.
 functional:run_dev_dgx_gb300:
   extends: [.functional_run]
   variables:
@@ -433,7 +431,7 @@ functional:run_dev_dgx_gb300:
   rules:
     - if: $BUILD == "no"
       when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "gb300-comparison" && $CLUSTER_GB300 != ""
+    - if: $FUNCTIONAL_TEST == "yes" && $CLUSTER_GB300 != ""
       when: on_success
     - when: never
 

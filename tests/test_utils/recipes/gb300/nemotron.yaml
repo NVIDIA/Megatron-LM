@@ -2,6 +2,11 @@ type: basic
 format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
+launchers:
+  name:dgxgb300_oci-jhb:
+    mounts:
+      /lustre/fsw/coreai_dlalgo_mcore: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/
+      /mnt/artifacts: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci
 spec:
   name: "{test_case}_{environment}_{platforms}"
   model: nemotron
@@ -10,8 +15,8 @@ spec:
   gpus: 4
   segment: 2
   n_repeat: 5
-  time_limit_override: 5400
-  platforms: dgx_gb200
+  time_limit_override: 10800
+  platforms: dgx_gb300
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -49,6 +54,7 @@ spec:
 
     export GPUS_PER_NODE={gpus}
 
+    # Keep the GB200 reference until GB300 baselines are validated.
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
@@ -58,7 +64,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_hybrid.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_dgx_gb200.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
@@ -72,4 +78,4 @@ products:
       - environment: [dev]
         scope: [L2]
         cadence: [nightly]
-        platforms: [dgx_gb200]
+        platforms: [dgx_gb300]

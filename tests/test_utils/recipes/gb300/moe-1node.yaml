@@ -2,16 +2,19 @@ type: basic
 format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
+launchers:
+  name:dgxgb300_oci-jhb:
+    mounts:
+      /lustre/fsw/coreai_dlalgo_mcore: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/
+      /mnt/artifacts: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci
 spec:
   name: "{test_case}_{environment}_{platforms}"
-  model: nemotron
+  model: moe
   build: mcore-pyt-{environment}
-  nodes: 2
+  nodes: 1
   gpus: 4
-  segment: 2
   n_repeat: 5
-  time_limit_override: 5400
-  platforms: dgx_gb200
+  platforms: dgx_gb300
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -45,10 +48,12 @@ spec:
     unset RO_API_TOKEN
     set -euo pipefail
     : "${{RUN_ID:=pr-$$}}"
+    ls
     cd /opt/megatron-lm
 
     export GPUS_PER_NODE={gpus}
 
+    # Keep the GB200 reference until GB300 baselines are validated.
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
@@ -56,20 +61,20 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
-        "TRAINING_SCRIPT_PATH=pretrain_hybrid.py"
+        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_dgx_gb200.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh "${{ARGUMENTS[@]}}"
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200]
+  - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]
     products:
       - environment: [dev]
         scope: [L2]
         cadence: [nightly]
-        platforms: [dgx_gb200]
+        platforms: [dgx_gb300]
