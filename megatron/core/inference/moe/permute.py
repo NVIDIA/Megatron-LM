@@ -122,6 +122,7 @@ def compute_local_tokens_per_expert(
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     persistent: bool = False,
+    zeroed_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Count tokens routed to each local expert.
 
@@ -133,10 +134,18 @@ def compute_local_tokens_per_expert(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens
             this iteration. Fixed address; value updated each step before graph replay.
         persistent: use persistent-grid kernel variant (fewer CTAs, looped).
+        zeroed_counts: Optional contiguous int32 output buffer, already zeroed on the
+            current stream. The caller must zero it before every invocation or graph replay.
     """
     max_pairs = routing_map.numel()
     topk = routing_map.shape[1]
-    tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
+    if zeroed_counts is None:
+        tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
+    else:
+        assert zeroed_counts.shape == (num_local_experts,)
+        assert zeroed_counts.dtype == torch.int32 and zeroed_counts.device == routing_map.device
+        assert zeroed_counts.is_contiguous()
+        tokens_per_expert = zeroed_counts
     BLOCK = 1024
     if persistent:
         num_sms = _get_num_sms(routing_map.device)
