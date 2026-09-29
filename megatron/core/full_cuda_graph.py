@@ -184,25 +184,47 @@ class FullCudaGraphWrapper:
 
     def _run_forward_backward(self, training_str, *args, **kwargs):
         """Run one fixed workspace sequence for eager warmup or graph capture."""
-        if os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") != "1":
+        use_mxfp8_vmm = os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+        use_nvfp4_vmm = os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+        if not use_mxfp8_vmm and not use_nvfp4_vmm:
             return self.forward_backward_func(*args, **kwargs)
 
-        from transformer_engine.pytorch.tensor.localized_mxfp8 import (
-            begin_mxfp8_vmm_workspace_iteration,
-            end_mxfp8_vmm_workspace_iteration,
-        )
+        iteration_hooks = []
+        if use_mxfp8_vmm:
+            from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+                begin_mxfp8_vmm_workspace_iteration,
+                end_mxfp8_vmm_workspace_iteration,
+            )
 
-        begin_mxfp8_vmm_workspace_iteration(training_str)
+            iteration_hooks.append(
+                (begin_mxfp8_vmm_workspace_iteration, end_mxfp8_vmm_workspace_iteration)
+            )
+        if use_nvfp4_vmm:
+            from transformer_engine.pytorch.tensor.localized_nvfp4 import (
+                begin_nvfp4_vmm_workspace_iteration,
+                end_nvfp4_vmm_workspace_iteration,
+            )
+
+            iteration_hooks.append(
+                (begin_nvfp4_vmm_workspace_iteration, end_nvfp4_vmm_workspace_iteration)
+            )
+
+        started_hooks = []
         try:
+            for begin_iteration, end_iteration in iteration_hooks:
+                begin_iteration(training_str)
+                started_hooks.append(end_iteration)
             result = self.forward_backward_func(*args, **kwargs)
         except Exception:
-            end_mxfp8_vmm_workspace_iteration(validate=False)
+            for end_iteration in reversed(started_hooks):
+                end_iteration(validate=False)
             raise
         # Validation is forward-only, so no backward callback will release
         # leases retained by modules that still report training=True. All GPU
         # consumers are ordered before this iteration boundary; return any
         # remaining leases to the validation pool for the next warmup/capture.
-        end_mxfp8_vmm_workspace_iteration(validate=training_str != 'validation')
+        for end_iteration in reversed(started_hooks):
+            end_iteration(validate=training_str != 'validation')
         return result
 
     def __call__(self, *args, **kwargs):
@@ -231,7 +253,10 @@ class FullCudaGraphWrapper:
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
-            if os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1":
+            if (
+                os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+                or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+            ):
                 # Eager train-step warmups leave ordinary QKV allocations in
                 # PyTorch's cache. Raw VMM cuMemCreate calls cannot consume
                 # those reserved blocks, so return unused storage first.
@@ -301,7 +326,10 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
         gc.collect()
         if (
-            os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+            (
+                os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+                or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+            )
             and FullCudaGraphWrapper.cuda_graph['training'] is None
             and FullCudaGraphWrapper.cuda_graph['validation'] is None
         ):
@@ -313,7 +341,11 @@ class FullCudaGraphWrapper:
             from transformer_engine.pytorch.tensor.localized_mxfp8 import (
                 clear_mxfp8_vmm_workspace_pools,
             )
+            from transformer_engine.pytorch.tensor.localized_nvfp4 import (
+                clear_nvfp4_vmm_workspace_pools,
+            )
 
             clear_mla_vmm_scratch_buffers()
-            clear_captured_vmm_allocations()
             clear_mxfp8_vmm_workspace_pools()
+            clear_nvfp4_vmm_workspace_pools()
+            clear_captured_vmm_allocations()

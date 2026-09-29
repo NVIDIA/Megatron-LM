@@ -804,14 +804,25 @@ def delete_cuda_graphs():
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
     torch.cuda.empty_cache()
-    if os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1":
+    if (
+        os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+        or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+    ):
         torch.cuda.synchronize()
         from megatron.core.fusions.fused_mla_yarn_rope_apply import (
             clear_mla_vmm_scratch_buffers,
         )
+        from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+            clear_mxfp8_vmm_workspace_pools,
+        )
+        from transformer_engine.pytorch.tensor.localized_nvfp4 import (
+            clear_nvfp4_vmm_workspace_pools,
+        )
         from transformer_engine.pytorch.tensor.vmm import clear_captured_vmm_allocations
 
         clear_mla_vmm_scratch_buffers()
+        clear_mxfp8_vmm_workspace_pools()
+        clear_nvfp4_vmm_workspace_pools()
         clear_captured_vmm_allocations()
 
     CudaGraphManager.global_mempool = None
@@ -2918,14 +2929,25 @@ class TECudaGraphHelper:
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
 
-        if graphs_not_reset == 0 and os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1":
+        if graphs_not_reset == 0 and (
+            os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+            or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+        ):
             torch.cuda.synchronize()
             from megatron.core.fusions.fused_mla_yarn_rope_apply import (
                 clear_mla_vmm_scratch_buffers,
             )
+            from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+                clear_mxfp8_vmm_workspace_pools,
+            )
+            from transformer_engine.pytorch.tensor.localized_nvfp4 import (
+                clear_nvfp4_vmm_workspace_pools,
+            )
             from transformer_engine.pytorch.tensor.vmm import clear_captured_vmm_allocations
 
             clear_mla_vmm_scratch_buffers()
+            clear_mxfp8_vmm_workspace_pools()
+            clear_nvfp4_vmm_workspace_pools()
             clear_captured_vmm_allocations()
 
         log_on_each_pipeline_stage(
@@ -3082,7 +3104,10 @@ def set_current_microbatch(model, microbatch_id):
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
-    if os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1":
+    if (
+        os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+        or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+    ):
         from transformer_engine.pytorch.tensor.vmm import set_vmm_current_microbatch
 
         set_vmm_current_microbatch(microbatch_id)
