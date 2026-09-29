@@ -1303,6 +1303,8 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_experts=self.ep_size * self.num_runtime_experts,
             config=config,
         )
+        # MoonEP owns its dropless route budget, but HybridEP still needs static-capacity mode.
+        self.moe_expert_rank_capacity_factor = 1.0
 
     def setup_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor):
         """Plan the router's ``[num_tokens, topk]`` routes and start the weight push; HybridEP's

@@ -906,6 +906,12 @@ def FullyShardedDataParallel(
     This is a factory function, not a wrapper type. Use the explicit V1 or V2
     implementation classes for type checks.
     """
+    if config.moe_virtual_expert_load_balance:
+        raise ValueError(
+            "MoonEP does not support Megatron-FSDP v1 or v2: virtual-expert gradients require "
+            "eager, stable expert main_grad buffers and DDP accumulation semantics. "
+            "Use regular DDP or the distributed optimizer instead."
+        )
     fsdp_class = (
         FullyShardedDataParallelV2
         if ddp_config.megatron_fsdp_version == 2

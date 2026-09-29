@@ -313,9 +313,12 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 
 Virtual-expert load balancing requires fixed local token counts across its EP group, per-expert
-`weight0..weightN` parameters in BF16 or native MXFP8 storage, grouped GEMM with the Transformer
-Engine op fuser, and FP32 router probabilities. If `moe_expert_rank_capacity_factor` is omitted,
-it defaults to `1.0` for this mode. It retains the standard HybridEP activation semantics while
+`weight0..weightN` parameters in BF16 or native MXFP8 storage, grouped-tensor GEMM, and FP32
+router probabilities. `moe_expert_rank_capacity_factor` must be unset and `moe_paged_stash` must
+be disabled. MoonEP requires eagerly allocated expert `main_grad` buffers from regular DDP or the
+distributed optimizer; Megatron-FSDP v1 and v2 are rejected when wrapping the model. MoonEP selects
+HybridEP's static-capacity mode internally and computes a dropless budget that includes per-expert
+padding. It retains the standard HybridEP activation semantics while
 using a deterministic planner to map routes to native or virtual-expert slots; virtual-expert slots are
 populated asynchronously from the optimizer-owned weights and reduced back into their owners
 after expert backward. Virtual-expert gradients use FP32 transport and storage by default. With
