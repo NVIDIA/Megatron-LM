@@ -47,25 +47,21 @@ def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
     assert all_reduce_groups == [tp_group, tp_group, tp_group]
 
 
-def test_language_module_unfused_loss_passes_tp_group(monkeypatch):
+def test_language_module_loss_calls_the_selected_cross_entropy():
+    """The loss uses the target the backend picked at construction, with no branch left here."""
     tp_group = _FakeTPGroup()
     captured = {}
 
-    def fake_vocab_parallel_cross_entropy(logits, labels, label_smoothing=0.0, tp_group=None):
+    def fake_vocab_parallel_cross_entropy(logits, labels, tp_group=None):
         captured["logits"] = logits
         captured["labels"] = labels
-        captured["label_smoothing"] = label_smoothing
         captured["tp_group"] = tp_group
         return torch.zeros_like(labels, dtype=logits.dtype)
 
-    monkeypatch.setattr(
-        language_module_module.tensor_parallel,
-        "vocab_parallel_cross_entropy",
-        fake_vocab_parallel_cross_entropy,
-    )
-
     module = SimpleNamespace(
-        config=SimpleNamespace(cross_entropy_loss_fusion=False), tp_group=tp_group
+        config=SimpleNamespace(cross_entropy_loss_fusion=False),
+        tp_group=tp_group,
+        vocab_parallel_cross_entropy=fake_vocab_parallel_cross_entropy,
     )
     labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
     logits = torch.randn(3, 2, 4)
@@ -76,7 +72,6 @@ def test_language_module_unfused_loss_passes_tp_group(monkeypatch):
 
     assert captured["logits"] is logits
     assert captured["tp_group"] is tp_group
-    assert captured["label_smoothing"] == 0.0
     torch.testing.assert_close(captured["labels"], labels.transpose(0, 1).contiguous())
     assert loss.shape == labels.shape
 

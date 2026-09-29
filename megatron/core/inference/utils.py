@@ -6,15 +6,44 @@ import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
 import torch
 
-from megatron.core.utils import get_model_config
+from megatron.core.utils import accepts_parameter, get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+def detokenize_tokens(
+    tokenizer: Any, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+) -> str:
+    """Convert token IDs to text using the inference detokenization policy.
+
+    Args:
+        tokenizer: Tokenizer that supplies ``detokenize`` and optionally ``eod``.
+        tokens: Token IDs to detokenize.
+        remove_EOD: Remove trailing EOD tokens before detokenization.
+        skip_special_tokens: Pass special-token removal through when supported.
+
+    Returns:
+        The decoded text.
+    """
+    if not tokens:
+        return ""
+
+    if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+        while tokens and tokens[-1] == tokenizer.eod:
+            tokens = tokens[:-1]
+    if not tokens:
+        return ""
+
+    if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+        return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+    return tokenizer.detokenize(tokens)
 
 
 class InferenceMode:

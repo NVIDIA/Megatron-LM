@@ -60,19 +60,26 @@ def test_validate_nccl_version():
         _validate_nccl_version(_nccl_with_version(2, 30, 4))
 
 
-def test_hybrid_group_uses_registered_nccl_cuda_backend(monkeypatch):
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("use_default_group", [False, True])
+@pytest.mark.parametrize("backend_name", ["gloo", "undefined"])
+def test_hybrid_group_uses_registered_nccl_cuda_backend(
+    monkeypatch, use_default_group, backend_name
+):
     cuda_backend = SimpleNamespace(_get_backend_name=lambda: "nccl")
     group = SimpleNamespace(_get_backend=lambda device: cuda_backend)
-    monkeypatch.setattr(dist, "get_backend", lambda _group: "gloo")
+    monkeypatch.setattr(dist, "get_backend", lambda _group: backend_name)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dist, "group", SimpleNamespace(WORLD=group))
 
-    assert _has_nccl_cuda_backend(group)
+    assert _has_nccl_cuda_backend(None if use_default_group else group)
 
     def get_missing_backend(_device):
         raise RuntimeError("no CUDA backend")
 
     gloo_only_group = SimpleNamespace(_get_backend=get_missing_backend)
-    assert not _has_nccl_cuda_backend(gloo_only_group)
+    monkeypatch.setattr(dist, "group", SimpleNamespace(WORLD=gloo_only_group))
+    assert not _has_nccl_cuda_backend(None if use_default_group else gloo_only_group)
 
 
 def test_validate_role_roster_accepts_source_first_disjoint_meshes():
@@ -298,13 +305,36 @@ def _has_nccl_m2n_python_package() -> bool:
         return False
 
 
+@pytest.fixture
+def nccl_m2n_host_proxy(monkeypatch: pytest.MonkeyPatch):
+    """Use host-proxy GIN for native M2N correctness tests on Blackwell.
+
+    The dedicated GB200 CI bucket gives these tests a fresh process before NCCL
+    initializes. Monkeypatch restores the environment after each test, but NCCL
+    caches its transport settings, so process isolation is still required.
+    """
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+        pytest.skip("Native NCCL M2N coverage runs on the Blackwell CI lane")
+
+    monkeypatch.setenv("NCCL_GIN_TYPE", "2")
+    monkeypatch.setenv("NCCL_NET_PLUGIN", "none")
+    monkeypatch.setenv("NCCL_GIN_PLUGIN", "none")
+    monkeypatch.setenv("NCCL_RMA_PLUGIN", "none")
+
+
 @pytest.mark.skipif(
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
-def test_nccl_m2n_reshards_parameter_between_tensor_dimensions():
-    """Exercise direct TP shard-to-shard M2N transfer on GPUs."""
+@pytest.mark.usefixtures("nccl_m2n_host_proxy")
+@pytest.mark.launch_on_gb200
+def test_nccl_m2n_reshards_parameter_between_tensor_dimensions(monkeypatch: pytest.MonkeyPatch):
+    """Exercise packed TP shard-to-shard M2N transfer on GPUs."""
     Utils.initialize_distributed()
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+        pytest.skip("Native NCCL M2N coverage runs on the GIN-enabled Blackwell CI lane")
+
+    monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "PACK")
     world_size = dist.get_world_size()
     if world_size < 2 or world_size % 2:
         pytest.skip("NCCL M2N integration test requires an even distributed world size >= 2")
@@ -366,6 +396,131 @@ def test_nccl_m2n_reshards_parameter_between_tensor_dimensions():
             first_col, first_col + cols_per_dst, dtype=torch.float32, device="cuda"
         ).view(1, -1)
         local_ok = torch.equal(dst_tensor, row_ids * 1000 + col_ids)
+
+    service.close()
+    status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")
+    dist.all_reduce(status, op=dist.ReduceOp.MIN)
+    assert status.item() == 1
+
+
+@pytest.mark.skipif(
+    not _has_nccl_m2n_python_package(),
+    reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
+)
+@pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm", "flashinfer"])
+@pytest.mark.usefixtures("nccl_m2n_host_proxy")
+@pytest.mark.launch_on_gb200
+def test_nccl_m2n_refits_selective_mxfp8_from_te(
+    grouped_gemm_backend: str, monkeypatch: pytest.MonkeyPatch
+):
+    """Keep non-expert weights BF16 while refitting TE MXFP8 experts through M2N."""
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+
+    Utils.initialize_distributed()
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+        pytest.skip("MXFP8 integration requires a Blackwell GPU")
+
+    world_size = dist.get_world_size()
+    if world_size < 2 or world_size % 2:
+        pytest.skip("NCCL M2N integration test requires an even distributed world size >= 2")
+
+    monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "PACK")
+    rank = dist.get_rank()
+    mesh_size = world_size // 2
+    src_ranks = tuple(range(mesh_size))
+    dst_ranks = tuple(range(mesh_size, world_size))
+    is_source = rank in src_ranks
+    local_mesh_rank = rank if is_source else rank - mesh_size
+    local_rows, columns = 64, 128
+    local_shape = (local_rows, columns)
+    global_shape = (mesh_size * local_rows, columns)
+    selected_names = (
+        "decoder.layers.1.mlp.experts.linear_fc1.weight0",
+        "decoder.layers.1.mlp.experts.linear_fc2.weight0",
+    )
+    bf16_name = "decoder.layers.1.self_attention.linear_qkv.weight"
+
+    def make_weight(parameter_index: int) -> torch.Tensor:
+        rows = torch.arange(
+            local_mesh_rank * local_rows,
+            (local_mesh_rank + 1) * local_rows,
+            dtype=torch.float32,
+            device="cuda",
+        ).view(-1, 1)
+        columns_ = torch.arange(columns, dtype=torch.float32, device="cuda").view(1, -1)
+        return (parameter_index + rows / local_rows + columns_ / columns).to(torch.bfloat16)
+
+    storage_backend = resolve_mxfp8_backend(grouped_gemm_backend)
+    assert storage_backend == "triton"
+    quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    source_tensors = {}
+    destination_tensors = {}
+    persistent_buffers = {}
+    expected_buffers = {}
+    for parameter_index, name in enumerate(selected_names):
+        bf16_weight = make_weight(parameter_index)
+        te_weight = quantizer(bf16_weight)
+        if is_source:
+            source_tensors[name] = te_weight
+        else:
+            persistent_buffers[name] = MXFP8Tensor.from_bf16(
+                torch.zeros_like(bf16_weight), backend=storage_backend
+            )
+            expected_buffers[name] = MXFP8Tensor.from_bf16(
+                te_weight.dequantize(), backend=storage_backend
+            )
+
+    expected_bf16 = make_weight(len(selected_names))
+    if is_source:
+        source_tensors[bf16_name] = expected_bf16
+    else:
+        destination_tensors[bf16_name] = torch.zeros_like(expected_bf16)
+
+    specs = [
+        TensorReshardSpec(
+            resolved_name=name,
+            src_ranks=src_ranks,
+            dst_ranks=dst_ranks,
+            global_shape=global_shape,
+            src_local_shape=local_shape,
+            dst_local_shape=local_shape,
+            dtype=torch.bfloat16,
+            src_shard_dim=0,
+            dst_shard_dim=0,
+            src_param_name=name if is_source else None,
+            dst_param_name=name if not is_source else None,
+        )
+        for name in (*selected_names, bf16_name)
+    ]
+    transform = (
+        None
+        if is_source
+        else MXFP8ReshardTransform(
+            convertible_params=set(selected_names),
+            persistent_buffers=persistent_buffers,
+            backend=storage_backend,
+        )
+    )
+    plan = ReshardPlan(send_ops=[], recv_ops=[], tensor_reshard_specs=specs)
+    service = NCCLM2NCopyService()
+    service.set_model_roles(is_source=is_source, is_destination=not is_source)
+
+    assert service.execute_plan(plan, source_tensors, destination_tensors, transform=transform)
+    torch.cuda.synchronize()
+
+    local_ok = True
+    if not is_source:
+        local_ok = torch.equal(destination_tensors[bf16_name], expected_bf16)
+        for name, expected in expected_buffers.items():
+            actual = persistent_buffers[name]
+            local_ok = local_ok and torch.equal(actual.data, expected.data)
+            local_ok = local_ok and torch.equal(
+                actual.scale.view(torch.uint8), expected.scale.view(torch.uint8)
+            )
 
     service.close()
     status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")

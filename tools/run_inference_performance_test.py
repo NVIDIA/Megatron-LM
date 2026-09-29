@@ -11,10 +11,7 @@ import torch
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequestRecord,
-    InferenceRequest,
-)
+from megatron.core.inference.inference_request import DynamicInferenceRequest, InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -41,6 +38,7 @@ from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
@@ -135,7 +133,7 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step()
+        result = inference_engine.step_modern()
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -153,7 +151,7 @@ def generate_dynamic(
 def main():
     """Main program."""
 
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
             'no_load_rng': True,
@@ -162,6 +160,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()
@@ -229,10 +228,11 @@ def main():
         )
     else:
         prompts = [request.prompt_tokens for request in requests]
-        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
+        results: List[DynamicInferenceRequest] = inference_engine.generate(
             prompts=prompts, sampling_params=sampling_params
         )
-        results: List[InferenceRequest] = [record.merge() for record in records]
+        for result in results:
+            result.finalize_text(tokenizer)
 
     end_time = time.perf_counter()
     latency = end_time - start_time
@@ -255,7 +255,7 @@ def main():
                 'memory_usage_GB': memory_allocated / (1024**3),
             }
             if args.prompts is not None:
-                result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
+                result_dict['generated_output'] = result.generated_text
             print(result_dict)
 
     total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests

@@ -54,7 +54,7 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      When None, `data_parallel_sharding_strategy` applies to all parameters."""
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -209,12 +209,14 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         for field_name in [
             "data_parallel_sharding_strategy",
             "expert_data_parallel_sharding_strategy",
         ]:
             strategy = getattr(self, field_name)
-            if strategy is not None and strategy not in VALID_SHARDING_STRATEGIES:
+            if strategy not in VALID_SHARDING_STRATEGIES:
                 raise ValueError(
                     f"[Megatron-FSDP] Invalid {field_name}: {strategy}. "
                     f"Valid values are {VALID_SHARDING_STRATEGIES}."
