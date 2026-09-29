@@ -27,8 +27,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -57,15 +57,18 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import initialize_runtime_services
 from model_provider import model_provider
 
 try:
@@ -349,20 +352,35 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
                 # attention only computes work for real tokens within each chunk.
                 update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-                cu_seqlens_for_params = (
+                physical_cu_seqlens = (
                     cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-                )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+                )
+                uses_cuda_graph = getattr(args, 'cuda_graph_impl', 'none') != 'none'
+                # Preserve the established eager path, which feeds physical offsets to TE.
+                # CUDA graphs need logical and physical offsets as separate fixed-shape inputs.
+                qkv_cu_seqlens = cu_seqlens if uses_cuda_graph else physical_cu_seqlens
+                padded_cu_seqlens_for_params = (
+                    physical_cu_seqlens if uses_cuda_graph else cu_seqlens_padded
+                )
+                # CUDA graphs capture max_seqlen as a Python constant. Keep it static in
+                # graph mode; eager execution retains the per-microbatch value.
+                max_seqlen_for_params = (
+                    args.seq_length if uses_cuda_graph else int(max_seqlen.item())
+                )
                 packed_seq_params = PackedSeqParams(
                     qkv_format="thd",
-                    cu_seqlens_q=cu_seqlens_for_params,
-                    cu_seqlens_kv=cu_seqlens_for_params,
-                    cu_seqlens_q_padded=cu_seqlens_padded,
-                    cu_seqlens_kv_padded=cu_seqlens_padded,
-                    max_seqlen_q=int(max_seqlen.item()),
-                    max_seqlen_kv=int(max_seqlen.item()),
+                    # TE needs both logical token boundaries and physical padded slots.
+                    cu_seqlens_q=qkv_cu_seqlens,
+                    cu_seqlens_kv=qkv_cu_seqlens,
+                    cu_seqlens_q_padded=padded_cu_seqlens_for_params,
+                    cu_seqlens_kv_padded=padded_cu_seqlens_for_params,
+                    max_seqlen_q=max_seqlen_for_params,
+                    max_seqlen_kv=max_seqlen_for_params,
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=hybrid_cp_group,
                     tokens_per_sample=args.seq_length,
+                    # Keep eager warmup, capture, and replay on the same TE THD branch.
+                    pad_between_seqs=True if uses_cuda_graph else None,
                 )
 
     timers('batch-generator').stop()

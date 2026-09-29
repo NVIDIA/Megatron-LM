@@ -1462,7 +1462,9 @@ def validate_args(args, defaults={}):
 
     if args.hybrid_context_parallel:
         assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
+        assert args.cuda_graph_impl == 'none', (
+            'Hybrid context parallelism not supported with CUDA Graph'
+        )
         assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
@@ -1759,6 +1761,27 @@ def validate_args(args, defaults={}):
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
                 f'must be >= single sequence max length ({args.seq_length})'
             )
+
+    if args.cuda_graph_impl != 'none' and args.sequence_packing_scheduler is not None:
+        raise AssertionError(
+            'CUDA graphs do not support the variable-token-count sequence packing scheduler.'
+        )
+
+    uses_fixed_shape_packed_sequences = (
+        getattr(args, 'cuda_graph_max_packed_seqs', None) is not None
+        or args.sft
+        or args.dataloader_inter_document_masking
+        or args.rl_use_sequence_packing
+    )
+    if args.cuda_graph_impl != 'none' and uses_fixed_shape_packed_sequences:
+        assert args.cuda_graph_impl == 'transformer_engine', (
+            'Packed-sequence training CUDA graphs currently require '
+            '--cuda-graph-impl transformer_engine.'
+        )
+        assert args.micro_batch_size == 1, (
+            'Packed-sequence CUDA graphs require --micro-batch-size 1. '
+            'Packed eager execution continues to support larger microbatches.'
+        )
 
     # Data blend checks
     assert args.mock_data + \
@@ -2185,6 +2208,15 @@ def _add_inference_args(parser):
                        'it is transformed to an empty list in validate_args. The deprecated values '
                        '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
                        'to the new API in validate_args.')
+    group.add_argument('--cuda-graph-max-packed-seqs', type=int, default=None,
+                       help='Maximum number of packed sequences per micro-batch for Transformer '
+                       'Engine CUDA graph capture. cu_seqlens tensors are padded to this size+1 '
+                       'for fixed-shape graph inputs. Smaller values improve flash_attn_varlen '
+                       'performance (fewer zero-length sequence entries). Default: uses '
+                       'CUDA_GRAPH_MAX_PACKED_SEQS '
+                       '(2048) from packed_seq_params.py. Set to the actual max sequences in your '
+                       'dataset for best performance (e.g. 64 for seq_len=32768 with typical SFT '
+                       'data).')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
@@ -2460,6 +2492,7 @@ def _add_network_size_args(parser):
         "moe_aux_loss_coeff",
         "cp_comm_type",
         "cuda_graph_modules",
+        "cuda_graph_max_packed_seqs",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
