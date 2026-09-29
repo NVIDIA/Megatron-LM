@@ -138,6 +138,10 @@ te = [
     "transformer-engine[pytorch,core_cu13]",
 ]
 
+mok = [
+    "mixture-of-kittens; sys_platform == 'linux'",
+]
+
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
