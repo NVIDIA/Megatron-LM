@@ -174,6 +174,7 @@ class TestFSDPHybridOverlap:
             if not is_causal_conv1d_min_version("1.6.0"):
                 pytest.skip("deterministic Mamba needs causal-conv1d >= 1.6.0")
             monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+            monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
             backend = get_valid_flex_dispatcher_backend()
