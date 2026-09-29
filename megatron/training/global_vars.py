@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 from argparse import Namespace
+from dataclasses import asdict
 from datetime import timedelta
 
 import torch
@@ -277,6 +278,15 @@ def _build_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
+    # Resolve the declared model field once, before any args-to-config conversion.
+    # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
+    if (
+        getattr(args, 'moe_num_hash_layers', 0) > 0
+        and getattr(args, 'hash_moe_vocab_size', None) is None
+    ):
+        args.hash_moe_vocab_size = _GLOBAL_TOKENIZER.vocab_size
+        if getattr(args, 'yaml_cfg', None) is not None:
+            args.language_model.hash_moe_vocab_size = args.hash_moe_vocab_size
     return _GLOBAL_TOKENIZER
 
 
@@ -320,8 +330,9 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        from megatron.training.argument_utils import rng_args_snapshot
-        wandb_config = vars(rng_args_snapshot(args))
+        cfg = get_run_config()
+        # Keep legacy metadata keys while serializing owned RNG settings directly.
+        wandb_config = {**vars(args), **asdict(cfg.rng)}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.

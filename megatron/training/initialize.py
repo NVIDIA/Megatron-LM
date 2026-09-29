@@ -6,6 +6,7 @@ import os
 import random
 import time
 import warnings
+from dataclasses import fields
 from datetime import timedelta
 from typing import Optional
 
@@ -511,12 +512,15 @@ def _set_random_seed(
 
 def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
-    from megatron.training.argument_utils import rng_args_snapshot
-    args = rng_args_snapshot(get_args())
+    args = get_args()
+    cfg = get_run_config()
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+            if not hasattr(cfg.rng, arg):
+                writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+        for field in fields(cfg.rng):
+            writer.add_text(field.name, str(getattr(cfg.rng, field.name)), global_step=args.iteration)
 
 
 def set_jit_fusion_options(tp_size=None):

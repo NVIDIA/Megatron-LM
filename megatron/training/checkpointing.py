@@ -13,6 +13,7 @@ import sys
 import threading
 import types
 from argparse import Namespace
+from dataclasses import asdict
 from datetime import datetime
 from enum import Enum, auto
 from logging import DEBUG, getLogger
@@ -58,7 +59,7 @@ from megatron.core.utils import (
     resolve_gtp_pad_for_alignment,
     unwrap_model,
 )
-from megatron.training.argument_utils import _default_config_from_args, rng_args_snapshot
+from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer
 
@@ -113,6 +114,14 @@ _LOADED_ITERATION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+
+_WIDE_RESIDUAL_ARG_DEFAULTS = (
+    ('wide_residual_num_streams', None),
+    ('wide_residual_streamwise_sigmoid_init_scale', 0.01),
+    ('wide_residual_learned_retention', False),
+    ('wide_residual_retention_init', 0.999),
+    ('wide_residual_retention_max_forget', 0.10),
+)
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
@@ -192,11 +201,13 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
-def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
+def check_checkpoint_args(
+    checkpoint_args, skip_args: set[str] | None = None, *, checkpoint_config: dict | None = None
+):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
     cfg = get_run_config()
-    args = rng_args_snapshot(get_args())
+    args = get_args()
     skip_args = skip_args or set()
 
     def _compare(arg_name, old_arg_name=None, default=None):
@@ -224,14 +235,34 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
+    if getattr(args, 'wide_residual_num_streams', None) is not None or hasattr(
+        checkpoint_args, 'wide_residual_num_streams'
+    ):
+        for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+            if arg_name in skip_args:
+                continue
+            checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(args, arg_name, default)
+            assert checkpoint_value == args_value, (
+                f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
+                f'the input argument value ({args_value}).'
+            )
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
         if not args.use_dist_ckpt:
             _compare('padded_vocab_size')
         _compare('tokenizer_type')
-    if cfg.rng.data_parallel_random_init:
-        _compare('data_parallel_random_init')
+    if cfg.rng.data_parallel_random_init and 'data_parallel_random_init' not in skip_args:
+        saved_rng = checkpoint_config.get('rng', {}) if checkpoint_config is not None else {}
+        if 'data_parallel_random_init' in saved_rng:
+            saved_dp_random_init = saved_rng['data_parallel_random_init']
+        else:
+            # Older checkpoints predate run_config.yaml.
+            saved_dp_random_init = checkpoint_args.data_parallel_random_init
+        assert saved_dp_random_init == cfg.rng.data_parallel_random_init, (
+            'data_parallel_random_init value from checkpoint does not match cfg.rng.'
+        )
     if args.phase_transition_iterations:
         _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
@@ -831,7 +862,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                rng_args_snapshot(args),
+                args,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -997,6 +1028,9 @@ def save_checkpoint(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
             if ckpt_type == CheckpointType.LOCAL:
+                # Local checkpoints have no YAML sidecar; persist the owned RNG policy here.
+                cfg = get_run_config()
+                state_dict['rng_config'] = asdict(cfg.rng)
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1122,8 +1156,46 @@ def save_checkpoint(
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
+                # Save run_config.yaml
+                checkpoint_name = get_checkpoint_name(
+                    save_dir,
+                    release=release,
+                    iteration=iteration,
+                    return_base_dir=True,
+                )
+                if iteration > 0:
+                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+
+                    run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+
+                    # NOTE(@maanug-nv): this try-except is a temporary safeguard for
+                    # unit tests that do not create a config container.
+                    # in the future, run_config.to_yaml() should always run.
+                    try:
+                        run_config = get_run_config()
+                    except AssertionError as e:
+                        if str(e) != 'run config is not initialized.':
+                            raise
+                        warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+                    else:
+                        run_config.to_yaml(run_config_filename)
+
+                # Save tokenizer files for torch_dist checkpoints (if enabled)
+                if (
+                    args.save_tokenizer_assets
+                    and args.ckpt_format == 'torch_dist'
+                    and iteration > 0
+                ):
+                    config = _default_config_from_args(TokenizerConfig, args)
+                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
+                if args.log_progress and args.async_save:
+                    append_to_progress_log(
+                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                    )
+
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
+
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
                     f'checkpoint from iteration {int(iteration):7d} to {args.save} '
@@ -1131,21 +1203,6 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
-                # Save tokenizer files for torch_dist checkpoints (if enabled)
-                if (
-                    args.save_tokenizer_assets
-                    and args.ckpt_format == 'torch_dist'
-                    and iteration > 0
-                ):
-                    checkpoint_name = get_checkpoint_name(
-                        save_dir, iteration=iteration, return_base_dir=True
-                    )
-                    config = _default_config_from_args(TokenizerConfig, args)
-                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if args.log_progress and args.async_save:
-                    append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
-                    )
 
                 if save_retain_interval is not None:
                     if (
@@ -2379,12 +2436,19 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('activation_func_tanh_clamp_scale', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+
+    # Restore wide-residual architecture settings. The enabling argument has a None
+    # default and remains command-line overridable; concrete-default controls follow
+    # the checkpoint in the same way as other fixed model settings above.
+    for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+        _set_arg(arg_name, force=default is not None)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
@@ -2586,6 +2650,7 @@ def load_checkpoint(
     cfg = get_run_config()
     args = get_args()
     load_dir = getattr(args, load_arg)
+    loading_pretrained_checkpoint = False
 
     # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
     # and auto-resume the data position by feeding this run's own progress tracker -- written to
@@ -2613,6 +2678,7 @@ def load_checkpoint(
         if not checkpoint_exists(load_dir):
             raise FileNotFoundError('No checkpoint found in load directory or pretrained directory')
         args.finetune = True
+        loading_pretrained_checkpoint = True
 
     model = unwrap_model(ddp_model)
 
@@ -2793,6 +2859,8 @@ def load_checkpoint(
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+        if loading_pretrained_checkpoint and getattr(args, 'allow_llm_only_checkpoint', False):
+            sharded_sd_metadata['load_from_llm_only_checkpoint'] = True
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
@@ -2826,7 +2894,7 @@ def load_checkpoint(
                 for m in model:
                     stack.enter_context(m.hide_loss_modules())
             load_kwargs['sharded_state_dict'] = generate_state_dict(
-                rng_args_snapshot(args),
+                args,
                 model,
                 gen_sd_optim,
                 gen_sd_opt_param_scheduler,
@@ -2923,7 +2991,7 @@ def load_checkpoint(
 
         try:
             state_dict = generate_state_dict(
-                rng_args_snapshot(args),
+                args,
                 model=model,
                 optimizer=gen_sd_optim,
                 opt_param_scheduler=gen_sd_opt_param_scheduler,
@@ -2988,7 +3056,26 @@ def load_checkpoint(
         # architecture-preserving load. Keep every other resume-time argument
         # compatibility check.
         skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        check_checkpoint_args(checkpoint_args, skip_args=skip_args)
+        checkpoint_config = None
+        if ckpt_type == CheckpointType.LOCAL:
+            if 'rng_config' in state_dict:
+                checkpoint_config = {'rng': state_dict['rng_config']}
+        else:
+            from megatron.training.utils.checkpoint_utils import (
+                get_checkpoint_run_config_filename,
+                read_run_config,
+            )
+
+            checkpoint_dir = (
+                os.path.dirname(os.path.dirname(checkpoint_name))
+                if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+            )
+            config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+            if maybe_msc.os.path.exists(config_filename):
+                checkpoint_config = read_run_config(config_filename)
+        check_checkpoint_args(
+            checkpoint_args, skip_args=skip_args, checkpoint_config=checkpoint_config
+        )
         args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
         args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)

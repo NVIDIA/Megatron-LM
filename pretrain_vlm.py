@@ -123,9 +123,13 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
     if config is None:
-        from megatron.training.argument_utils import rng_args_snapshot
+        from megatron.training.global_vars import get_run_config
 
-        language_transformer_config = core_transformer_config_from_args(rng_args_snapshot(get_args()))
+        cfg = get_run_config()
+        language_transformer_config = core_transformer_config_from_args(
+            get_args(), inference_sampling_seed=cfg.rng.seed,
+            inference_rng_tracker=cfg.rng.inference_rng_tracker,
+        )
     else:
         language_transformer_config = config
     if args.decoder_num_layers is not None:

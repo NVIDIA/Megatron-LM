@@ -9,6 +9,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
 import torch
+from megatron.training.global_vars import get_run_config
 from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
@@ -22,7 +23,6 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
-from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 from megatron.training.argument_utils import inference_cfg_container_from_args
@@ -41,9 +41,12 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    from megatron.training.argument_utils import rng_args_snapshot
 
-    config = core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
 
     if args.spec is None:
         if args.transformer_impl == 'local':

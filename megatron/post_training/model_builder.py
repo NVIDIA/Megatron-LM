@@ -27,11 +27,11 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.training.global_vars import get_run_config
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
-from megatron.training.argument_utils import rng_args_snapshot
 
 
 @dataclass(kw_only=True)
@@ -137,7 +137,12 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
             )  # Useful for cases like QAD
             config_path = None
 
-    args_dict = vars(rng_args_snapshot(args))
+    cfg = get_run_config()
+    args_dict = vars(args).copy()
+    # Inherit current RNG settings before explicit teacher YAML overrides.
+    args_dict.update(seed=cfg.rng.seed, te_rng_tracker=cfg.rng.te_rng_tracker,
+                     inference_rng_tracker=cfg.rng.inference_rng_tracker,
+                     data_parallel_random_init=cfg.rng.data_parallel_random_init)
 
     if config_path is not None:
         with open(config_path) as f:
@@ -293,7 +298,11 @@ def modelopt_gpt_hybrid_builder(
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    config = core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:

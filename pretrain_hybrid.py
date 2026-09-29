@@ -59,7 +59,6 @@ from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
-    rng_args_snapshot,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
@@ -105,7 +104,11 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
 
     if args.sequence_packing_scheduler is not None:
         (
@@ -368,7 +371,11 @@ def forward_step(data_iterator, model: HybridModel):
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:

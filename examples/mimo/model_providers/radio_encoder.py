@@ -65,9 +65,15 @@ def _dtype(args: argparse.Namespace):
 
 def _base_config(args: argparse.Namespace) -> TransformerConfig:
     """Stock config from CLI args; the per-tower override helpers deepcopy this."""
-    from megatron.training.argument_utils import core_transformer_config_from_args, rng_args_snapshot
+    from megatron.training.argument_utils import core_transformer_config_from_args
+    from megatron.training.global_vars import get_run_config
 
-    return core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
+    return config
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:

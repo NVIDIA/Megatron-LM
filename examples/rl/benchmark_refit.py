@@ -19,12 +19,12 @@ from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopySer
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.training.global_vars import get_run_config
 from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
-from megatron.training.argument_utils import rng_args_snapshot
 from megatron.training.initialize import initialize_megatron
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -67,7 +67,11 @@ def model_provider(pre_process=True, post_process=True, parallel_output=False,
     """Build the model."""
     args = get_args()
     if config is None:
-        config = core_transformer_config_from_args(rng_args_snapshot(args))
+        cfg = get_run_config()
+        config = core_transformer_config_from_args(
+            args, inference_sampling_seed=cfg.rng.seed,
+            inference_rng_tracker=cfg.rng.inference_rng_tracker,
+        )
 
     return gpt_builder(
         args=args,
@@ -248,7 +252,11 @@ def benchmark_collocated():
         use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
     )
 
-    dst_config = core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    dst_config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
     if args.num_experts:
         dst_config.expert_model_parallel_size = dst_ep
     dst_config.tensor_model_parallel_size = dst_tp
@@ -360,7 +368,11 @@ def benchmark_non_collocated():
     else:  # is_dst_rank
         # Build destination model
         print_rank_0("Building destination model...")
-        dst_config = core_transformer_config_from_args(rng_args_snapshot(args))
+        cfg = get_run_config()
+        dst_config = core_transformer_config_from_args(
+            args, inference_sampling_seed=cfg.rng.seed,
+            inference_rng_tracker=cfg.rng.inference_rng_tracker,
+        )
         if args.num_experts:
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp

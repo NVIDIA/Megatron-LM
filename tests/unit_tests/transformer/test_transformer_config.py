@@ -2,6 +2,7 @@
 
 import pytest
 
+from megatron.core.activations import squared_relu
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -308,6 +309,24 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
             num_attention_heads=4,
             gdp_num_householder=num_householder,
         )
+
+
+def test_squared_relu_tanh_clamp_allows_te_op_fuser():
+    """Whether the fused path can clamp depends on the installed TE; TEGroupedMLP decides."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        activation_func=squared_relu,
+        use_fused_weighted_squared_relu=True,
+        activation_func_tanh_clamp_scale=16.0,
+        use_transformer_engine_op_fuser=True,
+    )
+
+    assert config.activation_func_tanh_clamp_scale == 16.0
+    assert config.use_transformer_engine_op_fuser is True
 
 
 def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:

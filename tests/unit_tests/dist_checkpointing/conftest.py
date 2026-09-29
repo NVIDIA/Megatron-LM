@@ -13,12 +13,6 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 0
 
 
-@pytest.fixture(autouse=True)
-def checkpoint_run_config(run_config):
-    """Checkpoint-runtime tests use the run-owned RNG policy."""
-    return run_config
-
-
 @pytest.fixture(scope='session', autouse=True)
 def disable_msc():
     MultiStorageClientFeature.disable()
@@ -28,3 +22,9 @@ def disable_msc():
 @pytest.fixture(scope="class")
 def tmp_dir_per_class(tmp_path_factory):
     return tmp_path_factory.mktemp("data")
+
+
+@pytest.fixture(autouse=True)
+def checkpoint_run_config(run_config):
+    """Checkpoint saves read their metadata settings from the run config."""
+    return run_config

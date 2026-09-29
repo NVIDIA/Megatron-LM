@@ -27,7 +27,7 @@ from megatron.core.models.T5.t5_spec import (
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args, rng_args_snapshot
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
@@ -95,7 +95,11 @@ def model_provider(
     args = get_args()
     
     if config is None:
-        config = core_transformer_config_from_args(rng_args_snapshot(args))
+        cfg = get_run_config()
+        config = core_transformer_config_from_args(
+            args, inference_sampling_seed=cfg.rng.seed,
+            inference_rng_tracker=cfg.rng.inference_rng_tracker,
+        )
 
     encoder_config = deepcopy(config)
     encoder_config.num_layers = args.encoder_num_layers

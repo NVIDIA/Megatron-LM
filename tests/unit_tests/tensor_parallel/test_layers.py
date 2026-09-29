@@ -1,12 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
+    _wgrad_gemm,
     copy_gtp_attributes,
     gtp_local_pad_zero_count,
     linear_with_frozen_weight,
@@ -159,6 +162,70 @@ def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
 
     with pytest.raises(RuntimeError, match="supplied weight's shape is"):
         layer(torch.zeros(2, 4), weight=weight)
+
+
+@pytest.mark.parametrize(
+    "inference_optimized,inference_active,expected",
+    [(True, True, "inference"), (True, False, "default"), (False, True, "default")],
+)
+def test_column_parallel_linear_gather_tensor_parallel_output_dispatch(
+    inference_optimized, inference_active, expected
+):
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    layer.use_inference_optimized_all_gather = inference_optimized
+    output_parallel = torch.zeros(2, 8)
+    gathered = {"inference": torch.ones(2, 16), "default": torch.full((2, 16), 2.0)}
+
+    with (
+        mock.patch.object(InferenceMode, "_is_active", inference_active),
+        mock.patch(
+            "megatron.core.tensor_parallel.inference_layers."
+            "inference_all_gather_from_tensor_model_parallel_region",
+            return_value=gathered["inference"],
+        ) as inference_gather,
+        mock.patch(
+            "megatron.core.tensor_parallel.layers.gather_from_tensor_model_parallel_region",
+            return_value=gathered["default"],
+        ) as default_gather,
+    ):
+        assert layer.gather_tensor_parallel_output(output_parallel, barrier_before=True) is (
+            gathered[expected]
+        )
+        if expected == "inference":
+            assert inference_gather.call_args.kwargs == {"barrier_before": True}
+        # forward(gather_output=True) must take the same path.
+        for inference_tp_ag_barrier in (False, True):
+            output, _bias = layer(
+                torch.zeros(2, 4),
+                weight=torch.zeros(8, 4),
+                runtime_gather_output=True,
+                inference_tp_ag_barrier=inference_tp_ag_barrier,
+            )
+            assert output is gathered[expected]
+            if expected == "inference":
+                assert inference_gather.call_args.kwargs == {
+                    "barrier_before": inference_tp_ag_barrier
+                }
+
+    if expected == "inference":
+        assert inference_gather.call_count == 3 and default_gather.call_count == 0
+        assert inference_gather.call_args.args[1:] == (layer.tp_group, layer.config)
+    else:
+        assert default_gather.call_count == 3 and inference_gather.call_count == 0
+        assert default_gather.call_args.kwargs == {"group": layer.tp_group}
+
+    # Omitting the argument keeps forward's gather barrier-free.
+    with (
+        mock.patch.object(InferenceMode, "_is_active", inference_active),
+        mock.patch(
+            "megatron.core.tensor_parallel.inference_layers."
+            "inference_all_gather_from_tensor_model_parallel_region",
+            return_value=gathered["inference"],
+        ) as inference_gather,
+    ):
+        layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), runtime_gather_output=True)
+    if expected == "inference":
+        assert inference_gather.call_args.kwargs == {"barrier_before": False}
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -418,3 +485,49 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
     )
 
     Utils.destroy_model_parallel()
+
+
+class TestWgradGemmAccumulate:
+    """``_wgrad_gemm(accumulate=True)`` adds into ``out`` instead of overwriting it.
+
+    This is what lets a weight consumed several times in one backward (MTP replays the block per
+    depth, and embedding/output_layer are shared across them) build its total wgrad in one buffer:
+    the first consume overwrites -- which doubles as the zero-fill -- and the rest accumulate.
+    Without it the caller needs a second full-size buffer, which at vocab scale is multiple GB.
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_overwrite_then_accumulate(self):
+        torch.manual_seed(1234)
+        tokens, out_features, in_features = 64, 32, 16
+        grad_output = torch.randn(tokens, out_features, dtype=torch.bfloat16, device="cuda")
+        total_input = torch.randn(tokens, in_features, dtype=torch.bfloat16, device="cuda")
+        # fp32 out from bf16 inputs is the real GTP case: main_grad is fp32 while the
+        # activations are bf16, which is why this path widens through the GEMM epilogue.
+        out = torch.full((out_features, in_features), 7.0, dtype=torch.float32, device="cuda")
+
+        # accumulate=False must overwrite, so the pre-existing 7.0 is gone.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=False)
+        first = out.clone()
+        assert not torch.allclose(first, torch.full_like(first, 7.0))
+
+        # accumulate=True over identical inputs must double it.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=True)
+        torch.testing.assert_close(out, first * 2, rtol=1e-5, atol=1e-5)
+
+        # A third accumulation keeps adding, so N consumes sum to N x.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=True)
+        torch.testing.assert_close(out, first * 3, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_default_is_overwrite(self):
+        """Default must stay overwrite - every existing caller relies on it."""
+        torch.manual_seed(1234)
+        grad_output = torch.randn(32, 16, dtype=torch.bfloat16, device="cuda")
+        total_input = torch.randn(32, 8, dtype=torch.bfloat16, device="cuda")
+        out = torch.zeros(16, 8, dtype=torch.float32, device="cuda")
+
+        _wgrad_gemm(out, grad_output, total_input)
+        once = out.clone()
+        _wgrad_gemm(out, grad_output, total_input)
+        torch.testing.assert_close(out, once, rtol=0, atol=0)

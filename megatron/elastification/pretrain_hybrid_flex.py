@@ -48,7 +48,7 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args, rng_args_snapshot
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
@@ -122,7 +122,11 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         return model
 
     print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(rng_args_snapshot(args), TransformerConfig)
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, TransformerConfig, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
@@ -180,7 +184,11 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(rng_args_snapshot(args))
+    cfg = get_run_config()
+    config = core_transformer_config_from_args(
+        args, inference_sampling_seed=cfg.rng.seed,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
+    )
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()

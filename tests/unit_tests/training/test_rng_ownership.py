@@ -3,14 +3,13 @@
 """Behavioral coverage for RNG policy after legacy argument construction."""
 
 from argparse import ArgumentParser, Namespace
-from dataclasses import fields
+from dataclasses import asdict, fields
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from megatron.training import arguments, checkpointing, initialize
-from megatron.training.argument_utils import rng_args_snapshot, rng_config_from_args
+from megatron.training import arguments, checkpointing, global_vars, initialize
 from megatron.training.config.common_config import RNGConfig
 
 
@@ -40,13 +39,21 @@ def test_tracker_resolution_matches_cli_policy(monkeypatch, graph, transformer, 
 
 
 @pytest.mark.parametrize("deleted", [False, True])
-def test_detached_metadata_uses_owner_without_modifying_live_args(deleted, run_config):
+def test_wandb_metadata_uses_owner_without_modifying_live_args(
+    monkeypatch, tmp_path, deleted, run_config
+):
     args = Namespace(
         seed=1,
         te_rng_tracker=False,
         inference_rng_tracker=False,
         data_parallel_random_init=False,
         iteration=17,
+        wandb_project="project",
+        wandb_exp_name="run",
+        wandb_save_dir=str(tmp_path),
+        wandb_entity=None,
+        rank=0,
+        world_size=1,
     )
     rng = RNGConfig(
         seed=987, te_rng_tracker=True, inference_rng_tracker=True, data_parallel_random_init=True
@@ -56,10 +63,16 @@ def test_detached_metadata_uses_owner_without_modifying_live_args(deleted, run_c
         for item in fields(RNGConfig):
             delattr(args, item.name)
     original = vars(args).copy()
-    snapshot = rng_args_snapshot(args)
-    assert snapshot is not args
-    assert snapshot.iteration == 17
-    assert rng_config_from_args(snapshot) == rng
+    import sys
+
+    wandb = SimpleNamespace(init=Mock())
+    monkeypatch.setitem(sys.modules, "wandb", wandb)
+    monkeypatch.setattr(global_vars, "_GLOBAL_WANDB_WRITER", None)
+    global_vars._set_wandb_writer(args)
+    metadata = wandb.init.call_args.kwargs["config"]
+    assert metadata["iteration"] == 17
+    for name, value in asdict(rng).items():
+        assert metadata[name] == value
     assert vars(args) == original
 
 
@@ -116,8 +129,11 @@ def test_parallel_seed_offsets_are_unchanged(monkeypatch, dp_random):
 
 
 @pytest.mark.parametrize("seed", [None, 0, -1])
-def test_invalid_seed_still_rejected_at_seeding_not_config_construction(seed):
+def test_invalid_seed_rejected_by_container_validation(seed, run_config):
     rng = RNGConfig(seed=seed)
+    run_config.rng = rng
+    with pytest.raises(ValueError, match="positive integer"):
+        run_config.validate()
     with pytest.raises(ValueError, match="positive integer"):
         initialize._set_random_seed(rng.seed)
 
@@ -150,25 +166,65 @@ def test_checkpoint_gather_uses_owner_without_global_args(monkeypatch, dp_random
 
 @pytest.mark.parametrize("current_dp", [False, True])
 @pytest.mark.parametrize("saved_dp", [False, True])
+@pytest.mark.parametrize("saved_config_dp", [None, False, True])
 def test_checkpoint_policy_retains_current_run_precedence(
-    monkeypatch, current_dp, saved_dp, run_config
+    monkeypatch, current_dp, saved_dp, saved_config_dp, run_config
 ):
     args = _args_without_rng()
     args.use_dist_ckpt = False
-    run_config.rng = RNGConfig(seed=123, data_parallel_random_init=saved_dp)
-    checkpoint_args = rng_args_snapshot(args)
+    checkpoint_args = Namespace(**vars(args), seed=123, data_parallel_random_init=saved_dp)
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)
     rng = RNGConfig(seed=987, data_parallel_random_init=current_dp)
     run_config.rng = rng
-    if current_dp and not saved_dp:
+    checkpoint_config = (
+        None if saved_config_dp is None else {"rng": {"data_parallel_random_init": saved_config_dp}}
+    )
+    effective_saved_dp = saved_dp if saved_config_dp is None else saved_config_dp
+    if current_dp and not effective_saved_dp:
         with pytest.raises(AssertionError, match="data_parallel_random_init"):
-            checkpointing.check_checkpoint_args(checkpoint_args)
+            checkpointing.check_checkpoint_args(
+                checkpoint_args, checkpoint_config=checkpoint_config
+            )
     else:
-        checkpointing.check_checkpoint_args(checkpoint_args)
+        checkpointing.check_checkpoint_args(checkpoint_args, checkpoint_config=checkpoint_config)
     assert rng.seed == 987
     assert rng.data_parallel_random_init == current_dp
     assert not hasattr(args, "seed")
+
+
+@pytest.mark.parametrize("model_kind", ["gpt", "hybrid"])
+def test_native_builder_preserves_explicit_inference_policy(monkeypatch, model_kind, run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training import training
+    from megatron.training.models import gpt, hybrid
+
+    config_cls = gpt.GPTModelConfig if model_kind == "gpt" else hybrid.HybridModelConfig
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=32, num_attention_heads=4, inference_sampling_seed=777
+    )
+    run_config.model = config_cls(transformer=transformer, vocab_size=128, seq_length=16)
+    run_config.rng = RNGConfig(seed=987, inference_rng_tracker=True)
+    args = _args_without_rng()
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "_add_model_freeze_pre_wrap_hook", Mock())
+    monkeypatch.setattr("megatron.training.utils.start_memory_history_recording", Mock())
+
+    class ObservedModel(Exception):
+        pass
+
+    def construct(model_config):
+        assert model_config.transformer.inference_sampling_seed == 777
+        assert model_config.transformer.inference_rng_tracker is False
+        raise ObservedModel
+
+    monkeypatch.setattr(config_cls, "get_builder_cls", lambda self: construct)
+    with pytest.raises(ObservedModel):
+        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
 
 
 def test_tensorboard_records_owned_rng_values(monkeypatch, run_config):
