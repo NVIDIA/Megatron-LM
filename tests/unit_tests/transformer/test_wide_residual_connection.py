@@ -621,6 +621,22 @@ class TestWideResidualStaticConstruction:
                 pg_collection=_process_groups(),
             )
 
+    def test_static_subclass_is_rejected_for_mtp_auxiliary_stacks(self):
+        layer_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
+            submodules=TransformerLayerSubmodules(self_attention=_ActiveBranch),
+        )
+
+        with pytest.raises(ValueError, match="MTP auxiliary stacks"):
+            build_module(
+                layer_spec,
+                config=_wide_config(),
+                layer_number=1,
+                is_mtp_layer=True,
+                add_layer_offset=False,
+                pg_collection=_process_groups(),
+            )
+
     @pytest.mark.parametrize(
         "config_overrides",
         [

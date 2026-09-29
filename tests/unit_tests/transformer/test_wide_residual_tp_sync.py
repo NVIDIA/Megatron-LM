@@ -11,11 +11,8 @@ from megatron.core import parallel_state
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
 )
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_mtp_block_spec,
-    get_gpt_wide_residual_layer_local_spec,
-)
-from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -95,15 +92,12 @@ def test_wide_residual_mtp_runs_with_tensor_parallelism_and_matching_controller_
         residual_stream_recompute_num_layers=1,
         wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
     )
-    layer_spec = get_gpt_wide_residual_layer_local_spec()
-    model = GPTModel(
+    model = HybridModel(
         config=config,
-        transformer_layer_spec=layer_spec,
-        mtp_block_spec=get_gpt_mtp_block_spec(
-            config=config, spec=layer_spec, use_transformer_engine=False
-        ),
+        hybrid_stack_spec=wide_residual_hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=4,
+        hybrid_layer_pattern="**/*",
         position_embedding_type="none",
     ).cuda()
     input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
@@ -126,7 +120,9 @@ def test_wide_residual_mtp_runs_with_tensor_parallelism_and_matching_controller_
         gathered_grads, controller_grad, group=parallel_state.get_tensor_model_parallel_group()
     )
 
-    assert type(model.mtp.layers[0].mtp_model_layer) is TransformerLayer
-    assert model.mtp.layers[0].mtp_model_layer._get_self_attention_residual_connection() is None
+    mtp_stack = model.mtp.layers[0].mtp_model_layer
+    assert type(mtp_stack.layers[0]) is TransformerLayer
+    assert mtp_stack.layers[0]._get_self_attention_residual_connection() is None
+    assert not mtp_stack.uses_wide_residual_stream
     assert model.mtp.layers[0].eh_proj.weight.grad is not None
     assert all(torch.equal(grad, gathered_grads[0]) for grad in gathered_grads[1:])

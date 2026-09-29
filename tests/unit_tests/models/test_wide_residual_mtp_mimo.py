@@ -6,11 +6,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_mtp_block_spec,
-    get_gpt_wide_residual_layer_local_spec,
-)
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid import hybrid_block as hybrid_block_module
 from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -94,57 +89,6 @@ class TestWideResidualMTPAndMIMO:
     @pytest.mark.parametrize(
         "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
     )
-    def test_gpt_mtp_keeps_auxiliary_layer_at_backbone_width(self, fp32_residual_connection):
-        config = _wide_config(
-            num_layers=2,
-            hidden_size=64,
-            mtp_num_layers=2,
-            fp32_residual_connection=fp32_residual_connection,
-        )
-        layer_spec = get_gpt_wide_residual_layer_local_spec()
-        model = _move_model_to_configured_dtype(
-            GPTModel(
-                config=config,
-                transformer_layer_spec=layer_spec,
-                mtp_block_spec=get_gpt_mtp_block_spec(
-                    config=config, spec=layer_spec, use_transformer_engine=False
-                ),
-                vocab_size=128,
-                max_sequence_length=4,
-                position_embedding_type="none",
-            ),
-            config,
-        )
-        input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
-        position_ids = torch.arange(4, device="cuda").unsqueeze(0).expand(2, -1)
-        labels = input_ids.roll(-1, dims=1)
-        loss_mask = torch.ones_like(labels, dtype=torch.float32)
-
-        loss = model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=None,
-            labels=labels,
-            loss_mask=loss_mask,
-        )
-        loss.mean().backward()
-
-        mtp_layer = model.mtp.layers[0]
-        assert model.decoder.residual_stream_readout is not None
-        assert type(model.decoder.layers[0]) is WideResidualTransformerLayer
-        assert model.decoder.layers[0].residual_connection_self_attn is not None
-        assert len(model.mtp.layers) == 1
-        assert type(mtp_layer.mtp_model_layer) is TransformerLayer
-        assert mtp_layer.mtp_model_layer._get_self_attention_residual_connection() is None
-        assert mtp_layer.mtp_model_layer._get_mlp_residual_connection() is None
-        assert mtp_layer.eh_proj.weight.grad is not None
-        assert model.embedding.word_embeddings.weight.grad is not None
-        assert model.decoder.residual_stream_readout.exit_map.logit.grad is not None
-        assert loss.shape == input_ids.shape
-
-    @pytest.mark.parametrize(
-        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
-    )
     def test_hybrid_mtp_replays_only_the_main_wide_decoder(
         self, monkeypatch, fp32_residual_connection
     ):
@@ -220,14 +164,14 @@ class TestWideResidualMTPAndMIMO:
         config = _wide_config(
             num_layers=1, hidden_size=64, fp32_residual_connection=fp32_residual_connection
         )
-        layer_spec = get_gpt_wide_residual_layer_local_spec()
         language_spec = ModuleSpec(
-            module=GPTModel,
+            module=HybridModel,
             params={
                 "config": config,
-                "transformer_layer_spec": layer_spec,
+                "hybrid_stack_spec": wide_residual_hybrid_stack_spec,
                 "vocab_size": 128,
                 "max_sequence_length": 4,
+                "hybrid_layer_pattern": "*",
                 "position_embedding_type": "none",
             },
         )

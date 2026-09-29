@@ -474,6 +474,7 @@ def test_modality_configs_do_not_inherit_language_fp32_residuals():
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import mamba_stack_spec
     from megatron.core.models.mamba.mamba_model import MambaModel
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
@@ -487,6 +488,19 @@ def test_language_model_spec_builds_mamba():
     assert spec.params["config"].expert_tensor_parallel_size == 2
     assert spec.params["max_sequence_length"] == args.seq_length
     assert spec.params["logit_dtype"] is None
+    assert spec.params["mamba_stack_spec"] is mamba_stack_spec
+
+
+def test_language_model_spec_selects_static_wide_residual_stack():
+    """Wide-residual language configs select the matching static HybridStack spec."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L) + ["--wide-residual", "3"])
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["config"].wide_residual.num_streams == 3
+    assert spec.params["mamba_stack_spec"] is wide_residual_hybrid_stack_spec
 
 
 @pytest.mark.parametrize(
