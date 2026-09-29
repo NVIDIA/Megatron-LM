@@ -26,6 +26,7 @@ from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
     _gdp_split_names,
     _hybrid_layer_index_map,
     _merge_deltaproduct_projections,
+    _parse_deltaproduct_subkey,
     _renumber_hybrid_layers,
     _renumber_param_group_map,
 )
@@ -254,6 +255,58 @@ class TestMergeDeltaProductProjections:
         del tensors[f"{pre}.a"]
         with pytest.raises(NotImplementedError, match="Refusing to guess"):
             _merge_deltaproduct_projections(tensors)
+
+
+class TestParseDeltaProductSubKey:
+    """The parse step that replaced a single four-group regex: same contract, but the
+    rejection cases are now worth pinning directly rather than only through the merge."""
+
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            (
+                "decoder.layers.3.mixer.in_proj.weight.V1",
+                ("decoder.layers.3.mixer.in_proj.weight", "in_proj", "V1", ""),
+            ),
+            (
+                "decoder.layers.3.mixer.conv1d.bias.Q",
+                ("decoder.layers.3.mixer.conv1d.bias", "conv1d", "Q", ""),
+            ),
+            (
+                "optimizer.state.decoder.layers.3.mixer.in_proj.weight.z.exp_avg",
+                (
+                    "optimizer.state.decoder.layers.3.mixer.in_proj.weight",
+                    "in_proj",
+                    "z",
+                    ".exp_avg",
+                ),
+            ),
+            (
+                "decoder.layers.3.mixer.in_proj.weight.b10.exp_avg_sq.step",
+                (
+                    "decoder.layers.3.mixer.in_proj.weight",
+                    "in_proj",
+                    "b10",
+                    ".exp_avg_sq.step",
+                ),
+            ),
+        ],
+    )
+    def test_recognised_sub_keys(self, key, expected):
+        assert _parse_deltaproduct_subkey(key) == expected
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "decoder.layers.3.mixer.in_proj.weight",  # already fused: no section
+            "decoder.layers.3.mixer.in_proj.weight.x",  # Mamba-2 section, not DeltaProduct
+            "decoder.layers.3.mixer.in_proj.weight.query",  # GatedDeltaNet section
+            "decoder.layers.3.mixer.out_proj.weight.V0",  # not a fused projection
+            "decoder.layers.3.mixer.in_proj.weight.V",  # householder index required
+        ],
+    )
+    def test_rejected_keys(self, key):
+        assert _parse_deltaproduct_subkey(key) is None
 
 
 class TestMergeLeavesOtherMixersAlone:

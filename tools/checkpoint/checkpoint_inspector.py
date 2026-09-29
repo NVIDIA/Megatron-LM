@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 import re
 import shutil
+from collections.abc import Iterable
 from typing import Optional
 import tempfile
 
@@ -415,7 +416,7 @@ def convert_checkpoint(
 
     state_dict = {}
     for key, md in metadata.state_dict_metadata.items():
-        if key.split("/", 1)[0] == _COMMON_STATE_KEY:
+        if key.split("/", maxsplit=1)[0] == _COMMON_STATE_KEY:
             # Non-sharded state (args, iteration, ...) is stored inside the torch_dist
             # store as a single ShardedObject. It is read separately below via
             # load_common_state_dict() and flattened into the fsdp_dtensor namespace;
@@ -671,11 +672,11 @@ def convert_checkpoint(
             # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
             # Bind to distinct names: `key`/`value` are the outer while-loop's variables
             # and are still needed below for the param-group lookup.
-            for _skey, _sval in list(split_tensors.items()):
-                if is_swiglu_key(_skey):
-                    swiglu_w_and_v = split_swiglu_weight(_skey, _sval)
+            for split_key, split_value in list(split_tensors.items()):
+                if is_swiglu_key(split_key):
+                    swiglu_w_and_v = split_swiglu_weight(split_key, split_value)
                     split_tensors.update(swiglu_w_and_v)
-                    del split_tensors[_skey]
+                    del split_tensors[split_key]
                     _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
@@ -1047,20 +1048,62 @@ def convert_torch_dist_to_fsdp_dtensor(
 # Gated DeltaProduct stores one checkpoint key per section of its fused
 # ``in_proj``/``conv1d`` parameters. ``named_parameters()`` (and therefore the
 # fsdp_dtensor layout) keeps them fused; only ``sharded_state_dict`` splits them.
+# Structural half: everything up to and including the fused parameter name, then the
+# remainder. The remainder is picked apart in Python below rather than in the pattern.
 _GDP_PARAM_RE = re.compile(
-    r"^(?P<param>.*\.(?P<kind>in_proj|conv1d)\.(?:weight|bias))"
-    r"\.(?P<name>z|a|Q|[VKb]\d+)"
-    r"(?P<tail>(?:\.\w+)*)$"
+    r"^(?P<param>.*\.(?P<kind>in_proj|conv1d)\.(?:weight|bias))\.(?P<rest>.+)$"
 )
 
+# Section names emitted by ``sharded_state_dict``: the input gate ``z``, the decay
+# ``a``, the query ``Q``, and a ``V<i>``/``K<i>``/``b<i>`` triple per householder
+# reflection. Anything else under a fused projection is not a DeltaProduct section.
+_GDP_SECTION_RE = re.compile(r"^(?:z|a|Q|[VKb]\d+)$")
 
-def _gdp_split_names(num_householder, is_conv):
+
+def _parse_deltaproduct_subkey(key: str) -> Optional[tuple[str, str, str, str]]:
+    """Pick a Gated DeltaProduct sub-key apart into its four meaningful pieces.
+
+    Returns ``(param, kind, section, tail)``, or ``None`` when *key* is not a fused
+    projection sub-key at all::
+
+        "decoder.layers.3.mixer.in_proj.weight.V1"
+            -> ("decoder.layers.3.mixer.in_proj.weight", "in_proj", "V1", "")
+        "optimizer.state.exp_avg.decoder.layers.3.mixer.conv1d.weight.K0"
+            -> ("optimizer.state.exp_avg....conv1d.weight", "conv1d", "K0", "")
+        "decoder.layers.3.mixer.in_proj.weight.z.exp_avg"
+            -> ("decoder.layers.3.mixer.in_proj.weight", "in_proj", "z", ".exp_avg")
+
+    ``tail`` is whatever follows the section (an optimizer state name, or empty for a
+    model weight) and is re-appended verbatim to the fused key, so a parameter and its
+    optimizer states merge into their own separate fused tensors.
+    """
+    match = _GDP_PARAM_RE.match(key)
+    if match is None:
+        return None
+    section, _, tail = match.group("rest").partition(".")
+    if not _GDP_SECTION_RE.match(section):
+        return None
+    return match.group("param"), match.group("kind"), section, f".{tail}" if tail else ""
+
+
+def _gdp_split_names(num_householder: int, is_conv: bool) -> list[str]:
     """Sub-key order for a Gated DeltaProduct fused projection.
 
     Mirrors ``_get_in_proj_checkpoint_split_layout`` / ``_get_conv_checkpoint_split_layout``
     in megatron/core/ssm/gated_delta_product.py. The fused tensor is exactly the
     concatenation of these sections along dim 0, in this order, so the order is the
     contract between the two directions — do not sort it.
+
+    Args:
+        num_householder: number of householder reflections the mixer composes per step
+            (``gdp_num_householder``). DeltaProduct generalises DeltaNet by applying this
+            many rank-one updates per token instead of one, and the mixer therefore
+            projects one ``V<i>``/``K<i>``/``b<i>`` section per reflection while the
+            shared sections (``z``, ``Q``, ``a``) stay single. The count is what makes
+            the section list — and so the concatenation order — well defined.
+        is_conv: whether the layout is for ``conv1d`` rather than ``in_proj``. The short
+            convolution sees only the sections it mixes over time (``V*``, ``K*``, ``Q``);
+            the gate, the betas and the decay never reach it.
     """
     v = [f"V{i}" for i in range(num_householder)]
     k = [f"K{i}" for i in range(num_householder)]
@@ -1070,7 +1113,9 @@ def _gdp_split_names(num_householder, is_conv):
     return ["z"] + v + k + ["Q"] + b + ["a"]
 
 
-def _merge_deltaproduct_projections(tensors):
+def _merge_deltaproduct_projections(
+    tensors: dict[str, torch.Tensor]
+) -> tuple[dict[str, torch.Tensor], int, dict[str, str]]:
     """Merge Gated DeltaProduct ``in_proj``/``conv1d`` sub-keys back into fused params.
 
     The inverse of ``GatedDeltaProductMixer.sharded_state_dict``: torch_dist stores
@@ -1087,16 +1132,15 @@ def _merge_deltaproduct_projections(tensors):
     """
     groups = {}
     for key in tensors:
-        m = _GDP_PARAM_RE.match(key)
-        if m is None:
+        parsed = _parse_deltaproduct_subkey(key)
+        if parsed is None:
             continue
+        param, kind, section, tail = parsed
         # Scope to ``.mixer.``: GatedDeltaNet splits self_attention.in_proj.weight into
         # query/key/value/z/beta/alpha, which also yields a bare ``.z`` sub-key.
-        if ".mixer." not in m.group("param"):
+        if ".mixer." not in param:
             continue
-        groups.setdefault((m.group("param"), m.group("tail"), m.group("kind")), {})[
-            m.group("name")
-        ] = key
+        groups.setdefault((param, tail, kind), {})[section] = key
 
     if not groups:
         return tensors, 0, {}
@@ -1105,7 +1149,7 @@ def _merge_deltaproduct_projections(tensors):
     n_merged = 0
     merged_keys = {}  # sub-key -> fused key, for the param-group fixup
     for (param, tail, kind), members in groups.items():
-        num_householder = sum(1 for name in members if re.fullmatch(r"V\d+", name))
+        num_householder = sum(1 for section in members if re.fullmatch(r"V\d+", section))
         # Mamba-2 splits mixer.in_proj.weight into z,x,B,C,dt, of which only ``z``
         # resembles a DeltaProduct sub-key. A group with no householder sections is
         # therefore not DeltaProduct at all -- leave it exactly as the converter found
@@ -1132,8 +1176,8 @@ def _merge_deltaproduct_projections(tensors):
         # shard to replicated before concatenating, then re-shard the fused result --
         # cat along a sharded axis is not the same tensor.
         parts = []
-        for name in expected:
-            value = out.pop(members[name])
+        for section in expected:
+            value = out.pop(members[section])
             if isinstance(value, torch.distributed.tensor.DTensor):
                 value = redistribute_uneven_dtensor_to_replicated(value)
             parts.append(value)
@@ -1141,8 +1185,8 @@ def _merge_deltaproduct_projections(tensors):
         if isinstance(fused, torch.distributed.tensor.DTensor):
             fused = fused.redistribute(placements=[Shard(0)])
         out[f"{param}{tail}"] = fused
-        for _name in expected:
-            merged_keys[members[_name]] = f"{param}{tail}"
+        for section in expected:
+            merged_keys[members[section]] = f"{param}{tail}"
         n_merged += 1
     return out, n_merged, merged_keys
 
@@ -1150,7 +1194,9 @@ def _merge_deltaproduct_projections(tensors):
 _LAYER_INDEX_RE = re.compile(r"^(?P<prefix>.*\.layers\.)(?P<idx>\d+)(?P<rest>\..*)$")
 
 
-def _hybrid_layer_index_map(keys, section_prefixes=()):
+def _hybrid_layer_index_map(
+    keys: Iterable[str], section_prefixes: tuple[str, ...] = ()
+) -> dict[str, dict[int, int]]:
     """Map sparse hybrid-pattern layer indices onto dense ``0..n-1``, per namespace.
 
     A hybrid model whose checkpoint was written with pattern-position numbering indexes
@@ -1222,7 +1268,9 @@ def _hybrid_layer_index_map(keys, section_prefixes=()):
     return index_map
 
 
-def _renumber_param_group_map(param_to_param_group_map, index_map):
+def _renumber_param_group_map(
+    param_to_param_group_map: dict[str, int], index_map: dict[str, dict[int, int]]
+) -> dict[str, int]:
     """Apply a layer-index remap to parameter -> optimizer-param-group ids.
 
     Returns a fresh dict rather than renaming in place: new indices are <= old ones, so
@@ -1239,7 +1287,9 @@ def _renumber_param_group_map(param_to_param_group_map, index_map):
     return remapped
 
 
-def _renumber_hybrid_layers(tensors, index_map):
+def _renumber_hybrid_layers(
+    tensors: dict[str, torch.Tensor], index_map: dict[str, dict[int, int]]
+) -> tuple[dict[str, torch.Tensor], int]:
     """Rewrite layer indices according to :func:`_hybrid_layer_index_map`."""
     if not index_map:
         return tensors, 0

@@ -39,9 +39,7 @@ from megatron.core.dist_checkpointing.core import (
     save_config,
 )
 from megatron.core.dist_checkpointing.serialization import load_common_state_dict
-from megatron.core.dist_checkpointing.strategies.common import (
-    save_common,
-)
+from megatron.core.dist_checkpointing.strategies.common import save_common
 
 
 FORMAT_TORCH_DIST = 'torch_dist'
