@@ -25,11 +25,13 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
+    get_checkpoint_version,
     load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
+    set_checkpoint_version,
 )
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -784,6 +786,29 @@ def test_load_checkpoint_override_opt_param_scheduler(
         loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
+
+
+@pytest.mark.parametrize(
+    ('first', 'second', 'should_raise'),
+    [
+        (3.1, 3.0, False),  # 3.1 student then 3.0 teacher (distillation resume)
+        (3.0, 3.1, False),
+        (3.1, 3.1, False),
+        (3.0, 2.0, True),  # major bump changes QKV layout handling
+        (3.1, None, True),
+    ],
+)
+def test_set_checkpoint_version_allows_minor_mismatch(first, second, should_raise):
+    """Loading checkpoints that differ only in minor version in one process must not fail."""
+    with mock.patch('megatron.training.checkpointing._CHECKPOINT_VERSION', None):
+        set_checkpoint_version(first)
+        assert get_checkpoint_version() == first
+        if should_raise:
+            with pytest.raises(AssertionError, match='checkpoint versions do not match'):
+                set_checkpoint_version(second)
+        else:
+            set_checkpoint_version(second)
+            assert get_checkpoint_version() == second
 
 
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):

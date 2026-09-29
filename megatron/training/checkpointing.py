@@ -176,7 +176,14 @@ def finalize_deletion_processes(blocking=False):
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
-        assert _CHECKPOINT_VERSION == value, 'checkpoint versions do not match'
+        # This global feeds only fix_query_key_value_ordering, which branches on the major
+        # version. A minor bump marks a change elsewhere in the checkpoint (e.g. 3.0 -> 3.1
+        # changed optimizer key spelling), so a process that loads both a 3.0 teacher and a
+        # 3.1 student still agrees on the weight layout and must be allowed.
+        versions_match = value is not None and int(_CHECKPOINT_VERSION) == int(value)
+        assert versions_match, (
+            f'checkpoint versions do not match: {_CHECKPOINT_VERSION} vs {value}'
+        )
     _CHECKPOINT_VERSION = value
 
 
