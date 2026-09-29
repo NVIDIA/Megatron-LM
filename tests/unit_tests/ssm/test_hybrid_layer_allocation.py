@@ -621,12 +621,15 @@ class TestGetHybridLayerCounts:
     def test_group_pattern(self):
         assert get_hybrid_layer_counts("M[M*]E") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 1,
+            'W': 0,
         }
 
     def test_mtp_with_attention(self):
