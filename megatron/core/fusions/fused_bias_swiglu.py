@@ -3,6 +3,8 @@
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -70,6 +72,38 @@ def clamped_weighted_swiglu(y, weights, clamp_value):
     """Perform token-weighted clamped SwiGLU."""
     dtype = y.dtype
     res = clamped_swiglu(y, clamp_value) * weights
+    return res.to(dtype)
+
+
+@jit_fuser
+def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: float):
+    """Soft-clamps ``y`` and returns the clamp derivative alongside it, both in fp32."""
+    t = torch.tanh(y.float() / clamp_scale)
+    return clamp_scale * t, 1 - t * t
+
+
+@jit_fuser
+def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    """SiTU-GLU: ``s_g * tanh(y1 / s_g) * sigmoid(y1) * y2``, with ``y2`` optionally clamped."""
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    c, _ = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
+    gate = c * torch.sigmoid(y_1)
+    if linear_clamp_scale is not None:
+        y_2, _ = _tanh_clamp_and_deriv(y_2, linear_clamp_scale)
+    return (gate * y_2).to(dtype)
+
+
+@jit_fuser
+def bias_situ_glu(y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    """Bias addition followed by SiTU-GLU. The clamps act on the full pre-activation."""
+    return situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
+
+
+@jit_fuser
+def weighted_situ_glu(y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    dtype = y.dtype
+    res = situ_glu(y, gate_clamp_scale, linear_clamp_scale) * weights
     return res.to(dtype)
 
 
@@ -160,12 +194,64 @@ def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+@jit_fuser
+def _situ_glu_grads(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    """Gradients of SiTU-GLU w.r.t. the two halves of ``y``, kept in fp32."""
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    c, sech2 = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
+    sig = torch.sigmoid(y_1)
+    gate = c * sig
+    if linear_clamp_scale is not None:
+        lin, lin_sech2 = _tanh_clamp_and_deriv(y_2, linear_clamp_scale)
+        dy_2 = lin_sech2 * gate * g
+    else:
+        lin = y_2
+        dy_2 = gate * g
+    dy_1 = (sech2 + c * (1 - sig)) * sig * lin * g
+    return dy_1, dy_2
+
+
+@jit_fuser
+def situ_glu_back(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    input_dtype = y.dtype
+    dy_1, dy_2 = _situ_glu_grads(g, y, gate_clamp_scale, linear_clamp_scale)
+    return torch.cat((dy_1, dy_2), -1).to(input_dtype)
+
+
+@jit_fuser
+def bias_situ_glu_back(g, y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    return situ_glu_back(g, y + bias, gate_clamp_scale, linear_clamp_scale)
+
+
+@jit_fuser
+def weighted_situ_glu_back(
+    g, y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]
+):
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+    dy_1, dy_2 = _situ_glu_grads(g * weights, y, gate_clamp_scale, linear_clamp_scale)
+    input_grad = torch.cat((dy_1, dy_2), -1)
+    # precison of w may be higher than y and g, so we need to cast g to w_dtype
+    weights_grad = situ_glu(y, gate_clamp_scale, linear_clamp_scale) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
 class BiasSwiGLUFunction(torch.autograd.Function):
     """Custom autograd function for SwiGLU activation with bias support."""
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, bias, fp8_input_store, cpu_offload_input, clamp_value):
+    def forward(
+        ctx,
+        input,
+        bias,
+        fp8_input_store,
+        cpu_offload_input,
+        clamp_value,
+        gate_clamp_scale,
+        linear_clamp_scale,
+    ):
         """Forward pass of biased SwiGLU activation.
 
         Args:
@@ -173,6 +259,12 @@ class BiasSwiGLUFunction(torch.autograd.Function):
             input (torch.Tensor): Input tensor to apply SwiGLU to.
             bias (torch.Tensor): Bias tensor to be added to input before SwiGLU.
             fp8_input_store (bool): If True, stores intermediate values in FP8 format.
+            clamp_value (Optional[float]): If set, hard-clamp both halves of the input before
+                SwiGLU. Mutually exclusive with ``gate_clamp_scale``.
+            gate_clamp_scale (Optional[float]): If set, use SiTU-GLU instead of SwiGLU, with the
+                gate's linear factor soft-clamped to this scale.
+            linear_clamp_scale (Optional[float]): If set, also soft-clamp the linear half to this
+                scale. Requires ``gate_clamp_scale``.
 
         Returns:
             torch.Tensor: Result of applying bias addition followed by SwiGLU activation.
@@ -185,6 +277,10 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         ctx.clamp_value = clamp_value
+        ctx.gate_clamp_scale = gate_clamp_scale
+        ctx.linear_clamp_scale = linear_clamp_scale
+        if gate_clamp_scale is not None:
+            return bias_situ_glu(input, bias, gate_clamp_scale, linear_clamp_scale)
         if clamp_value is not None and clamp_value > 0:
             return bias_clamped_swiglu(input, bias, clamp_value)
         return bias_swiglu(input, bias)
@@ -206,11 +302,15 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         """
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+        if ctx.gate_clamp_scale is not None:
+            tmp = bias_situ_glu_back(
+                grad_output, input, bias, ctx.gate_clamp_scale, ctx.linear_clamp_scale
+            )
+        elif ctx.clamp_value is not None and ctx.clamp_value > 0:
             tmp = bias_clamped_swiglu_back(grad_output, input, bias, ctx.clamp_value)
         else:
             tmp = bias_swiglu_back(grad_output, input, bias)
-        return tmp, tmp, None, None, None
+        return tmp, tmp, None, None, None, None, None
 
 
 class SwiGLUFunction(torch.autograd.Function):
@@ -218,13 +318,27 @@ class SwiGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, fp8_input_store, cpu_offload_input, clamp_value):
+    def forward(
+        ctx,
+        input,
+        fp8_input_store,
+        cpu_offload_input,
+        clamp_value,
+        gate_clamp_scale,
+        linear_clamp_scale,
+    ):
         """Forward pass of SwiGLU activation.
 
         Args:
             ctx: Autograd context object for saving tensors for backward pass.
             input (torch.Tensor): Input tensor to apply SwiGLU to.
             fp8_input_store (bool): If True, stores intermediate values in FP8 format.
+            clamp_value (Optional[float]): If set, hard-clamp both halves of the input before
+                SwiGLU. Mutually exclusive with ``gate_clamp_scale``.
+            gate_clamp_scale (Optional[float]): If set, use SiTU-GLU instead of SwiGLU, with the
+                gate's linear factor soft-clamped to this scale.
+            linear_clamp_scale (Optional[float]): If set, also soft-clamp the linear half to this
+                scale. Requires ``gate_clamp_scale``.
 
         Returns:
             torch.Tensor: Result of applying SwiGLU activation.
@@ -236,6 +350,10 @@ class SwiGLUFunction(torch.autograd.Function):
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         ctx.clamp_value = clamp_value
+        ctx.gate_clamp_scale = gate_clamp_scale
+        ctx.linear_clamp_scale = linear_clamp_scale
+        if gate_clamp_scale is not None:
+            return situ_glu(input, gate_clamp_scale, linear_clamp_scale)
         if clamp_value is not None and clamp_value > 0:
             return clamped_swiglu(input, clamp_value)
         return swiglu(input)
@@ -256,21 +374,29 @@ class SwiGLUFunction(torch.autograd.Function):
         """
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+        if ctx.gate_clamp_scale is not None:
+            tmp = situ_glu_back(grad_output, input, ctx.gate_clamp_scale, ctx.linear_clamp_scale)
+        elif ctx.clamp_value is not None and ctx.clamp_value > 0:
             tmp = clamped_swiglu_back(grad_output, input, ctx.clamp_value)
         else:
             tmp = swiglu_back(grad_output, input)
-        return tmp, None, None, None
+        return tmp, None, None, None, None, None
 
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weights, fp8_input_store, clamp_value):
+    def forward(
+        ctx, input, weights, fp8_input_store, clamp_value, gate_clamp_scale, linear_clamp_scale
+    ):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         ctx.clamp_value = clamp_value
+        ctx.gate_clamp_scale = gate_clamp_scale
+        ctx.linear_clamp_scale = linear_clamp_scale
+        if gate_clamp_scale is not None:
+            return weighted_situ_glu(input, weights, gate_clamp_scale, linear_clamp_scale)
         if clamp_value is not None and clamp_value > 0:
             return clamped_weighted_swiglu(input, weights, clamp_value)
         return weighted_swiglu(input, weights)
@@ -279,14 +405,26 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+        if ctx.gate_clamp_scale is not None:
+            tmp, wgrad = weighted_situ_glu_back(
+                grad_output, input, weights, ctx.gate_clamp_scale, ctx.linear_clamp_scale
+            )
+        elif ctx.clamp_value is not None and ctx.clamp_value > 0:
             tmp, wgrad = clamped_weighted_swiglu_back(grad_output, input, weights, ctx.clamp_value)
         else:
             tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None, None
+        return tmp, wgrad, None, None, None, None
 
 
-def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False, clamp_value=None):
+def bias_swiglu_impl(
+    input,
+    bias,
+    fp8_input_store=False,
+    cpu_offload_input=False,
+    clamp_value=None,
+    gate_clamp_scale: Optional[float] = None,
+    linear_clamp_scale: Optional[float] = None,
+):
     """Implementation of biased SwiGLU that handles different input shapes.
 
     This function reshapes the input if necessary, applies the SwiGLU activation
@@ -301,7 +439,12 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
         cpu_offload_input (bool, optional): Whether to mark saved activation inputs for CPU
             offloading. Defaults to False.
         clamp_value (float, optional): Maximum gate value and absolute linear value. When None,
-            preserve the legacy unclamped SwiGLU behavior.
+            preserve the legacy unclamped SwiGLU behavior. Mutually exclusive with
+            ``gate_clamp_scale``.
+        gate_clamp_scale (Optional[float]): If set, compute SiTU-GLU instead of SwiGLU: the gate
+            becomes ``s_g * tanh(x / s_g) * sigmoid(x)``, bounded by ``s_g``.
+        linear_clamp_scale (Optional[float]): If set, also soft-clamp the linear half, bounding
+            the output by ``gate_clamp_scale * linear_clamp_scale``. Requires ``gate_clamp_scale``.
 
     Returns:
         torch.Tensor: Result of biased SwiGLU activation.
@@ -311,28 +454,64 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
+    assert gate_clamp_scale is not None or linear_clamp_scale is None
+    assert gate_clamp_scale is None or clamp_value is None
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
         output = BiasSwiGLUFunction.apply(
-            input, bias, fp8_input_store, cpu_offload_input, clamp_value
+            input,
+            bias,
+            fp8_input_store,
+            cpu_offload_input,
+            clamp_value,
+            gate_clamp_scale,
+            linear_clamp_scale,
         )
     else:
-        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input, clamp_value)
+        output = SwiGLUFunction.apply(
+            input,
+            fp8_input_store,
+            cpu_offload_input,
+            clamp_value,
+            gate_clamp_scale,
+            linear_clamp_scale,
+        )
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, clamp_value=None):
+def weighted_bias_swiglu_impl(
+    input,
+    bias,
+    weights,
+    fp8_input_store=False,
+    clamp_value=None,
+    gate_clamp_scale: Optional[float] = None,
+    linear_clamp_scale: Optional[float] = None,
+):
     """
     Token-wise-weighted bias swiglu fusion.
+
+    Args:
+        clamp_value (float, optional): Maximum gate value and absolute linear value. When None,
+            preserve the legacy unclamped SwiGLU behavior. Mutually exclusive with
+            ``gate_clamp_scale``.
+        gate_clamp_scale (Optional[float]): If set, compute SiTU-GLU instead of SwiGLU: the gate
+            becomes ``s_g * tanh(x / s_g) * sigmoid(x)``, bounded by ``s_g``.
+        linear_clamp_scale (Optional[float]): If set, also soft-clamp the linear half. Requires
+            ``gate_clamp_scale``.
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
+    assert gate_clamp_scale is not None or linear_clamp_scale is None
+    assert gate_clamp_scale is None or clamp_value is None
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, clamp_value)
+        output = WeightedSwiGLUFunction.apply(
+            input, weights, fp8_input_store, clamp_value, gate_clamp_scale, linear_clamp_scale
+        )
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

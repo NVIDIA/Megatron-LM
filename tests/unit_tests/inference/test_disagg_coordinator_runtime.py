@@ -11,6 +11,26 @@ from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoo
 from megatron.core.inference.headers import Headers
 
 
+def _decode_engine_frames(frames):
+    """Validate multipart framing and return one logical message for assertions."""
+
+    assert isinstance(frames, list) and frames
+    assert all(isinstance(frame, bytes) for frame in frames)
+    decoded = [msgpack.unpackb(frame, raw=False) for frame in frames]
+    metadata = decoded[0]
+    header = Headers(metadata[0])
+    if header == Headers.SUBMIT_REQUEST:
+        assert len(metadata) == 4
+        assert len(decoded) == 4
+        return [metadata[0], metadata[1], decoded[1], metadata[2], decoded[2], decoded[3]]
+    if header == Headers.SUBMIT_REQUEST_WITH_KV:
+        assert len(metadata) == 4
+        assert len(decoded) == 3
+        return [metadata[0], metadata[1], decoded[1], metadata[2], metadata[3], decoded[2]]
+    assert len(decoded) == 1
+    return metadata
+
+
 def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     sent = []
     coordinator = SimpleNamespace(
@@ -41,8 +61,8 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
         [0.0] * len(coordinator.identity_to_rank_index),
         [0.0] * len(coordinator.identity_to_rank_index),
     )
-    coordinator._send_to_engine = lambda identity, payload, **_kwargs: (
-        sent.append((identity, msgpack.unpackb(payload, raw=False))) or True
+    coordinator._send_to_engine = lambda identity, frames, **_kwargs: (
+        sent.append((identity, _decode_engine_frames(frames))) or True
     )
     runtime = DisaggCoordinatorRuntime(coordinator)
     coordinator.disagg = runtime
@@ -318,11 +338,11 @@ def test_undelivered_decode_handoff_releases_prefill_source():
     runtime, sent = _runtime(ssm_capacity=1)
     runtime.route_submit(5, [1], {})
 
-    def reject_decode(identity, payload, *, remove_unreachable=True):
+    def reject_decode(identity, frames, *, remove_unreachable=True):
         if identity == b"decode":
             assert not remove_unreachable
             return False
-        sent.append((identity, msgpack.unpackb(payload, raw=False)))
+        sent.append((identity, _decode_engine_frames(frames)))
         return True
 
     runtime.coordinator._send_to_engine = reject_decode
@@ -356,8 +376,8 @@ def test_engine_removal_after_kv_read_preserves_source_safety():
     )
     sent.clear()
 
-    def reject_prefill_release(identity, payload, *, remove_unreachable=True):
-        message = msgpack.unpackb(payload, raw=False)
+    def reject_prefill_release(identity, frames, *, remove_unreachable=True):
+        message = _decode_engine_frames(frames)
         if identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV:
             assert remove_unreachable
             runtime.remove_engine(identity)

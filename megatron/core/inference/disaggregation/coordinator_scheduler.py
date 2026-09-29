@@ -25,7 +25,7 @@ class QueuedDecodeHandoff:
     """Decode handoff waiting for SSM state capacity."""
 
     request_id: int
-    payload: bytes
+    payload: list[bytes]
     slot_cost: int
 
 
@@ -366,7 +366,7 @@ class DisaggCoordinatorScheduler:
 
         return bool(self._decode.queues.get(identity))
 
-    def enqueue(self, identity, request_id: int, payload: bytes, slot_cost: int) -> None:
+    def enqueue(self, identity, request_id: int, payload: list[bytes], slot_cost: int) -> None:
         """Append a decode handoff to an engine's FIFO capacity queue."""
 
         self._decode.queues.setdefault(identity, deque()).append(

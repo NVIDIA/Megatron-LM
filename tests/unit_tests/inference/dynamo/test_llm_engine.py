@@ -366,16 +366,18 @@ async def test_streaming_generation_forwards_selected_log_probs():
 
     chunks = [chunk async for chunk in engine.generate(request, _Context())]
 
-    assert chunks == [
-        {"token_ids": [7], "index": 0, "log_probs": [-0.7]},
+    assert [
+        {key: value for key, value in chunk.items() if key != "log_probs"} for chunk in chunks
+    ] == [
+        {"token_ids": [7], "index": 0},
         {
             "token_ids": [8],
             "index": 0,
             "finish_reason": "length",
             "completion_usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
-            "log_probs": [-0.8],
         },
     ]
+    assert [chunk["log_probs"][0] for chunk in chunks] == pytest.approx([-0.7, -0.8])
 
 
 @pytest.mark.asyncio

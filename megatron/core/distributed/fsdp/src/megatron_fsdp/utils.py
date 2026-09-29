@@ -20,7 +20,7 @@ import os
 from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
-from typing import Callable, Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 try:
     import einops
@@ -104,6 +104,44 @@ def is_submodule(module, parent_module, strict=True):
         if m is module:
             return True
     return False
+
+
+def get_sharding_strategy(ddp_config, is_expert_param: bool = False) -> str:
+    """
+    Resolve the DP-Shard sharding strategy that applies to a class of parameters.
+
+    Expert parameters follow `expert_data_parallel_sharding_strategy` when it is set,
+    otherwise every parameter follows `data_parallel_sharding_strategy`.
+    """
+    experts_strategy = getattr(ddp_config, "expert_data_parallel_sharding_strategy", None)
+    if is_expert_param and experts_strategy is not None:
+        return experts_strategy
+    return ddp_config.data_parallel_sharding_strategy
+
+
+def get_sharding_strategies_in_use(ddp_config) -> Tuple[str, ...]:
+    """
+    Return every DP-Shard sharding strategy configured for this model.
+
+    Contains one entry unless expert and non-expert parameters are sharded differently.
+    Used by call sites that enable machinery for the model as a whole, which have to
+    consider both classes of parameters.
+    """
+    strategies = [get_sharding_strategy(ddp_config, is_expert_param=False)]
+    experts_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
+    if experts_strategy not in strategies:
+        strategies.append(experts_strategy)
+    return tuple(strategies)
+
+
+def any_sharding_strategy_in(ddp_config, strategies: Sequence[str]) -> bool:
+    """Whether any configured DP-Shard sharding strategy is one of `strategies`."""
+    return any(s in strategies for s in get_sharding_strategies_in_use(ddp_config))
+
+
+def all_sharding_strategies_in(ddp_config, strategies: Sequence[str]) -> bool:
+    """Whether every configured DP-Shard sharding strategy is one of `strategies`."""
+    return all(s in strategies for s in get_sharding_strategies_in_use(ddp_config))
 
 
 def find_megatron_fsdp(model):

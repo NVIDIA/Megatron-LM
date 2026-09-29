@@ -17,7 +17,6 @@ from megatron.core.inference.disaggregation.coordinator_scheduler import (
     DisaggCoordinatorScheduler,
 )
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
-    make_submit_request_with_kv_message,
     restore_registered_nixl_agent_metadata,
 )
 from megatron.core.inference.headers import Headers
@@ -249,7 +248,15 @@ class DisaggCoordinatorRuntime:
         prefill_params["skip_prompt_log_probs"] = True
         if "num_tokens_total" in prefill_params:
             prefill_params["num_tokens_total"] = None
-        if self._send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params):
+        frames = [
+            msgpack.packb(
+                [Headers.SUBMIT_REQUEST.value, request_id, prefill_params, None], use_bin_type=True
+            ),
+            msgpack.packb(prompt, use_bin_type=True),
+            msgpack.packb(None, use_bin_type=True),
+            msgpack.packb(None, use_bin_type=True),
+        ]
+        if self.coordinator._send_to_engine(prefill_id, frames):
             self._record_hash_assignment(prefill_id, self.requests[request_id].block_hashes)
 
     def _drain_prefill_queue(self, prefill_id) -> None:
@@ -308,17 +315,19 @@ class DisaggCoordinatorRuntime:
                 )
                 return
 
-        payload = msgpack.packb(
-            make_submit_request_with_kv_message(
-                Headers.SUBMIT_REQUEST_WITH_KV.value,
-                request_id,
-                request_state.prompt,
-                request_state.sampling_params,
-                kv_meta,
-                block_ids,
+        payload = [
+            msgpack.packb(
+                [
+                    Headers.SUBMIT_REQUEST_WITH_KV.value,
+                    request_id,
+                    request_state.sampling_params,
+                    kv_meta,
+                ],
+                use_bin_type=True,
             ),
-            use_bin_type=True,
-        )
+            msgpack.packb(request_state.prompt, use_bin_type=True),
+            msgpack.packb(block_ids, use_bin_type=True),
+        ]
         # The serialized handoff owns these values until decode receives it.
         request_state.prompt = None
         request_state.sampling_params = {}
@@ -339,7 +348,7 @@ class DisaggCoordinatorRuntime:
             return
         self._send_decode_handoff(decode_id, request_id, payload)
 
-    def _send_decode_handoff(self, decode_id, request_id: int, payload: bytes) -> bool:
+    def _send_decode_handoff(self, decode_id, request_id: int, payload: list[bytes]) -> bool:
         """Send a handoff; an unreachable engine is removed with its assigned work."""
 
         sent = self.coordinator._send_to_engine(decode_id, payload, remove_unreachable=False)
@@ -519,4 +528,4 @@ class DisaggCoordinatorRuntime:
 
     def _send(self, identity, header, *parts) -> bool:
         payload = msgpack.packb([header.value, *parts], use_bin_type=True)
-        return self.coordinator._send_to_engine(identity, payload)
+        return self.coordinator._send_to_engine(identity, [payload])
