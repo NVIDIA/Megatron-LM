@@ -15,6 +15,7 @@ import json
 import os
 import warnings
 from functools import wraps
+from weakref import WeakKeyDictionary
 
 from megatron.core.tuning import selection
 from megatron.core.tuning import table as table_mod
@@ -24,6 +25,8 @@ _installed = False
 _policy: AutotunePolicy | None = None
 _explicit_policy = False
 _tables: dict = {}
+# Keep each autotuner's live configs (and hooks) separate, even for equal names.
+_selected_configs: WeakKeyDictionary = WeakKeyDictionary()
 
 # (kernel, shape) -> chosen config. Which config a kernel runs is the *cause* of
 # reduction-order nondeterminism; diverging tensors are the effect. Recording it
@@ -169,6 +172,7 @@ def _install(policy: AutotunePolicy) -> bool:
         _dump_records()
         _policy = policy
         _tables.clear()
+        _selected_configs.clear()
         _choice_log.clear()
         _tune_records.clear()
         _enumerated.clear()
@@ -209,30 +213,40 @@ def _install(policy: AutotunePolicy) -> bool:
 
         candidates = self.configs
         nargs = getattr(self, "nargs", None)
+        # Device selection can follow framework initialization. Include the current
+        # architecture and Triton's declared tuning inputs in each cache entry.
+        arch = selection.arch_tag()
+        key = (arch, selection.tuning_key(self, args, kwargs))
+        cache = _selected_configs.setdefault(self, {})
         try:
-            # Preserve Triton's shape-dependent validity/performance pruning.
-            # It expects positional arguments in self.nargs, as in Autotuner.run.
-            self.nargs = dict(zip(self.arg_names, args))
-            valid_configs = self.prune_configs(kwargs)
-            if not valid_configs:
-                raise RuntimeError(
-                    f"No valid configs for Triton kernel {selection.kernel_name(self)!r}"
-                )
-            if policy.chaos:
-                chosen = selection.chaos_choice(self, valid_configs, args, kwargs)
-            else:
-                # Framework configuration can precede CUDA device selection.
-                # Load tables only at kernel execution, for the current device.
-                arch = selection.arch_tag()
-                if arch not in _tables:
-                    _tables[arch] = table_mod.load(arch, policy.table_path)
-                chosen = selection.deterministic_choice(
-                    self, valid_configs, args, kwargs, table=_tables[arch], on_miss=policy.on_miss
-                )
+            chosen = cache.get(key)
+            if chosen is None:
+                # Preserve Triton's pruning on the first invocation of each key.
+                # It expects positional arguments in self.nargs, as in Autotuner.run.
+                self.nargs = dict(zip(self.arg_names, args))
+                valid_configs = self.prune_configs(kwargs)
+                if not valid_configs:
+                    raise RuntimeError(
+                        f"No valid configs for Triton kernel {selection.kernel_name(self)!r}"
+                    )
+                if policy.chaos:
+                    chosen = selection.chaos_choice(self, valid_configs, args, kwargs)
+                else:
+                    if arch not in _tables:
+                        _tables[arch] = table_mod.load(arch, policy.table_path)
+                    chosen = selection.deterministic_choice(
+                        self,
+                        valid_configs,
+                        args,
+                        kwargs,
+                        table=_tables[arch],
+                        on_miss=policy.on_miss,
+                    )
             # Triton only benchmarks when more than one candidate remains, so a
             # single-entry list skips the timing loop entirely.
             self.configs = [chosen]
             result = original_run(self, *args, **kwargs)
+            cache[key] = chosen
             _record_choice(self, args, kwargs, chosen, True)
             return result
         finally:

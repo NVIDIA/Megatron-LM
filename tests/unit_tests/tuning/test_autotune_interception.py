@@ -3,6 +3,8 @@
 """Test Triton's real Autotuner, with focused CUDA and distributed coverage."""
 
 import inspect
+from unittest.mock import Mock
+from weakref import WeakKeyDictionary
 
 import pytest
 
@@ -22,6 +24,7 @@ def isolated_policy(monkeypatch):
     monkeypatch.setattr(interception, "_policy", None)
     monkeypatch.setattr(interception, "_explicit_policy", False, raising=False)
     monkeypatch.setattr(interception, "_tables", {}, raising=False)
+    monkeypatch.setattr(interception, "_selected_configs", WeakKeyDictionary(), raising=False)
     monkeypatch.setattr(interception, "_choice_log", {})
     monkeypatch.setattr(interception, "_tune_records", {})
     monkeypatch.setattr(interception, "_enumerated", set())
@@ -92,15 +95,133 @@ def test_pinning_honours_pruning_per_shape_and_preserves_hooks(isolated_policy, 
     assert tuner.nargs is None
 
 
-def test_pinning_restores_state_after_launch_failure(isolated_policy):
-    tuner, _ = make_tuner(fail=True)
+@pytest.mark.parametrize("chaos", [False, True])
+def test_repeated_pinning_caches_pruning_and_selection(isolated_policy, monkeypatch, chaos):
+    def prune(configs, named_args, **kwargs):
+        size = kwargs.get("size", named_args.get("size"))
+        return [config for config in configs if config.kwargs["BLOCK_SIZE"] == size]
+
+    tuner, hooks = make_tuner(prune=prune)
     original_configs = tuner.configs
-    interception.install(AutotunePolicy(mode="pinned"))
-    with pytest.raises(RuntimeError, match="launch failed"):
-        tuner.run(None, 128)
+    pruning = Mock(wraps=tuner.prune_configs)
+    choice_name = "chaos_choice" if chaos else "deterministic_choice"
+    choosing = Mock(wraps=getattr(selection, choice_name))
+    monkeypatch.setattr(tuner, "prune_configs", pruning)
+    monkeypatch.setattr(selection, choice_name, choosing)
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(mode="pinned", chaos=chaos))
+
+    assert tuner.run(None, 128) == 128
+    assert tuner.run(None, size=128) == 128
+    assert tuner.run(None, 32) == 32
+    assert tuner.run(None, 128) == 128
+    assert pruning.call_count == choosing.call_count == 2
+    assert hooks == [128, 128, 32, 128]
     assert tuner.configs is original_configs
     assert tuner.nargs is None
-    assert interception.choice_log() == {}
+
+
+def test_pinned_cache_distinguishes_dtype_and_architecture(isolated_policy, monkeypatch):
+    import torch
+
+    tuner, hooks = make_tuner()
+    pruning = Mock(wraps=tuner.prune_configs)
+    choosing = Mock(wraps=selection.deterministic_choice)
+    monkeypatch.setattr(tuner, "prune_configs", pruning)
+    monkeypatch.setattr(selection, "deterministic_choice", choosing)
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(mode="pinned"))
+    fp32 = torch.empty(0, dtype=torch.float32)
+    fp16 = torch.empty(0, dtype=torch.float16)
+
+    assert tuner.run(fp32, 128) == 32
+    assert tuner.run(fp32, 128) == 32
+    assert pruning.call_count == choosing.call_count == 1
+    assert tuner.run(fp16, 128) == 32
+    assert pruning.call_count == choosing.call_count == 2
+    monkeypatch.setattr(selection, "arch_tag", lambda: "other_arch")
+    assert tuner.run(fp32, 128) == 32
+    assert tuner.run(fp32, 128) == 32
+    assert pruning.call_count == choosing.call_count == 3
+    monkeypatch.setattr(selection, "arch_tag", lambda: "test_arch")
+    assert tuner.run(fp32, 128) == 32
+    assert pruning.call_count == choosing.call_count == 3
+    assert hooks == [32] * 6
+
+
+def test_pinned_cache_keeps_live_configs_per_tuner(isolated_policy, monkeypatch):
+    first, first_hooks = make_tuner(prune=lambda configs, *args, **kwargs: configs[1:])
+    second, second_hooks = make_tuner(prune=lambda configs, *args, **kwargs: configs[:1])
+    monkeypatch.setattr(first, "_bench", forbid_benchmark)
+    monkeypatch.setattr(second, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert selection.kernel_name(first) == selection.kernel_name(second)
+
+    for _ in range(2):
+        assert first.run(None, 128) == 128
+        assert second.run(None, 128) == 32
+        assert first.best_config is first.configs[1]
+        assert second.best_config is second.configs[0]
+    assert first_hooks == [128, 128]
+    assert second_hooks == [32, 32]
+
+
+def test_pinned_cache_invalidates_only_when_policy_changes(isolated_policy, monkeypatch):
+    tuner, hooks = make_tuner()
+    pruning = Mock(wraps=tuner.prune_configs)
+    choosing = Mock(side_effect=tuner.configs)
+    monkeypatch.setattr(tuner, "prune_configs", pruning)
+    monkeypatch.setattr(selection, "deterministic_choice", choosing)
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert tuner.run(None, 128) == 32
+
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert tuner.run(None, 128) == 32
+    assert pruning.call_count == choosing.call_count == 1
+    interception.install(AutotunePolicy(mode="pinned", on_miss="error"))
+    assert tuner.run(None, 128) == 128
+    assert tuner.run(None, 128) == 128
+    assert pruning.call_count == choosing.call_count == 2
+    assert hooks == [32, 32, 128, 128]
+
+
+def test_pinning_restores_state_after_launch_failure(isolated_policy, monkeypatch):
+    tuner, _ = make_tuner(fail=True)
+    original_configs = tuner.configs
+    choosing = Mock(wraps=selection.deterministic_choice)
+    monkeypatch.setattr(selection, "deterministic_choice", choosing)
+    interception.install(AutotunePolicy(mode="pinned"))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="launch failed"):
+            tuner.run(None, 128)
+        assert tuner.configs is original_configs
+        assert tuner.nargs is None
+        assert interception.choice_log() == {}
+    assert choosing.call_count == 2
+
+
+def test_cached_pinning_restores_state_after_launch_failure(isolated_policy, monkeypatch):
+    tuner, hooks = make_tuner()
+    original_configs = tuner.configs
+    choosing = Mock(wraps=selection.deterministic_choice)
+    monkeypatch.setattr(selection, "deterministic_choice", choosing)
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert tuner.run(None, 128) == 32
+    choices = interception.choice_log()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("launch failed")
+
+    monkeypatch.setattr(tuner.fn, "run", fail)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="launch failed"):
+            tuner.run(None, 128)
+        assert tuner.configs is original_configs
+        assert tuner.nargs is None
+        assert interception.choice_log() == choices
+    assert choosing.call_count == 1
+    assert hooks == [32, 32, 32]
 
 
 def test_install_can_upgrade_an_observer_to_pinning(isolated_policy, monkeypatch):

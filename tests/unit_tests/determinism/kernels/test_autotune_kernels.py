@@ -4,6 +4,7 @@
 
 import inspect
 import os
+from weakref import WeakKeyDictionary
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ def isolated_policy(monkeypatch):
     monkeypatch.setattr(interception, "_explicit_policy", False)
     for name in ("_tables", "_choice_log", "_tune_records"):
         monkeypatch.setattr(interception, name, {})
+    monkeypatch.setattr(interception, "_selected_configs", WeakKeyDictionary())
     monkeypatch.setattr(interception, "_enumerated", set())
     monkeypatch.setattr(selection, "_untuned_kernels_warned", set())
     monkeypatch.setattr(interception.atexit, "register", lambda *_: None)
@@ -38,8 +40,9 @@ def isolated_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("use_table", [False, True], ids=["min_cost", "tuned_table"])
-def test_pinned_reduction_replays(isolated_policy, monkeypatch, tmp_path, use_table):
-    """Both selection paths replay without timing and retain the live candidate list."""
+@pytest.mark.parametrize("cold_cache", [False, True], ids=["warm_cache", "cold_cache"])
+def test_pinned_reduction_replays(isolated_policy, monkeypatch, tmp_path, use_table, cold_cache):
+    """Both selection paths replay bit-exactly with cold and warm config caches."""
 
     @triton.autotune(
         configs=[triton.Config({"BLOCK_SIZE": size}) for size in (128, 256)], key=["columns"]
@@ -80,8 +83,9 @@ def test_pinned_reduction_replays(isolated_policy, monkeypatch, tmp_path, use_ta
 
         def run(values):
             output = torch.empty(values.shape[0], device=values.device, dtype=values.dtype)
-            # Exercise cold selection on every replay as well as changing shapes.
             row_sum.cache.clear()
+            if cold_cache:
+                interception._selected_configs.clear()
             row_sum[(values.shape[0],)](values, output, values.shape[1])
             assert row_sum.best_config is chosen
             assert row_sum.configs is candidates

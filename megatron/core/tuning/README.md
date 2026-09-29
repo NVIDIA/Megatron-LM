@@ -24,6 +24,14 @@ then restores both the list and argument state, including when the launch fails.
 This skips benchmarking and timing-cache lookup even on older Triton versions
 that still benchmark a singleton returned by `early_config_prune`.
 
+After a successful launch, the adapter caches the selected live config per
+autotuner, GPU architecture, and tuning key (including tensor dtypes). Repeated
+calls reuse it without pruning or selecting again; launch hooks still run on
+every call. Changing the installed policy clears this cache. As with Triton's
+normal autotuning cache, inputs that affect pruning must be represented in the
+kernel's tuning key. Configure block-size environment overrides before launching
+kernels; changing them during a run does not invalidate cached choices.
+
 The static fallback is reproducible for the same candidates and inputs. Its cost
 estimate is not a throughput model, and it cannot predict every compile-time
 resource failure. An invalid selection raises; it never retries with timing.
