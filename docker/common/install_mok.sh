@@ -4,8 +4,9 @@
 
 set -euxo pipefail
 
-MOK_REVISION="${1:?Usage: install_mok.sh <git commit> <patch>}"
-PATCH_FILE=$(realpath "${2:?Usage: install_mok.sh <git commit> <patch>}")
+MOK_REVISION="${1:?Usage: install_mok.sh <git commit> <patch> <wheel directory>}"
+PATCH_FILE=$(realpath "${2:?Usage: install_mok.sh <git commit> <patch> <wheel directory>}")
+WHEEL_DIR=$(realpath -m "${3:?Usage: install_mok.sh <git commit> <patch> <wheel directory>}")
 PYTHON="${UV_PROJECT_ENVIRONMENT:-/opt/venv}/bin/python"
 
 if [[ ! "${MOK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -30,7 +31,8 @@ export NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
 export MOK_NVCC="${NVCC}"
 # Docker builds have no GPU driver. Stubs are link inputs, never runtime libraries.
 export LIBRARY_PATH="${CUDA_HOME:-/usr/local/cuda}/lib64/stubs${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-uv pip install --python "${PYTHON}" --no-build-isolation --no-deps --no-cache "${WORK_DIR}"
+uv build --python "${PYTHON}" --wheel --no-build-isolation --no-cache --out-dir "${WHEEL_DIR}" "${WORK_DIR}"
+uv pip install --python "${PYTHON}" --no-deps --no-cache "${WHEEL_DIR}"/*.whl
 
 # Inspect the installed wheel without loading libcuda on GPU-less image builders.
 MOK_EXTENSION=$("${PYTHON}" - <<'PY'

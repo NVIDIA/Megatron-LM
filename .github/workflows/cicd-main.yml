@@ -474,7 +474,9 @@ jobs:
           uv sync --locked --only-group linting
 
       - name: Test CI cache keys
-        run: .github/scripts/test_cache_keys.sh
+        run: |
+          .github/scripts/test_cache_keys.sh
+          python3 .github/scripts/test_build_cache_donor.py
 
       - name: Test queue approval topology
         run: .github/scripts/test_approve_test_queue.sh
