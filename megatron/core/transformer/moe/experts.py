@@ -147,6 +147,7 @@ class GroupedLinearFc1Builder(Protocol):
         output_size: int,
         /,
         *,
+        num_virtual_experts: int = 0,
         config: TransformerConfig,
         init_method: Callable[[torch.Tensor], None],
         bias: bool,
@@ -184,6 +185,7 @@ class GroupedLinearFc2Builder(Protocol):
         output_size: int,
         /,
         *,
+        num_virtual_experts: int = 0,
         config: TransformerConfig,
         init_method: Callable[[torch.Tensor], None],
         bias: bool,
@@ -235,10 +237,9 @@ def _te_grouped_tensor_supports_sharded_weights() -> bool:
 class _VirtualExpertFC2WgradStore:
     """Start the FC2 virtual-expert gradient reduction when TE enqueues FC2's wgrad GEMM.
 
-    Installed as the FC2 GroupedLinear op's ``wgrad_store``. TE's delayed-wgrad protocol
-    hands the wgrad GEMM to ``put`` instead of launching it, from the basic op's backward
-    and from the fused grouped-MLP backward alike; this store runs the GEMM at once and
-    starts the reduction right behind it, so it hides under FC1's dgrad and wgrad GEMMs
+    Installed on the executing FC2 GroupedLinear module or op. TE's delayed-wgrad
+    protocol hands the wgrad GEMM to ``put`` instead of launching it; this store
+    runs the GEMM at once and starts the reduction behind FC1's dgrad and wgrad GEMMs
     instead of the dispatch-backward all-to-all. The queue stays empty, so TE's
     ``backward_dw`` has nothing to run.
     """
@@ -294,10 +295,14 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        num_virtual_experts = (
+            self.num_local_experts if self.config.moe_virtual_expert_load_balance else 0
+        )
         self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
             self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.init_method),
             bias=self.config.add_bias_linear,
@@ -321,6 +326,7 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.moe_latent_size is None
                 else self.config.moe_latent_size
             ),
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
@@ -438,11 +444,18 @@ class TEGroupedMLP(MegatronModule):
                 "Virtual-expert weights must be bound before the first expert forward."
             )
         self._virtual_experts = load_balancer
-        if not self._with_fused_impl:
-            self._fused_ops = (self._make_fused_ops(),)
-            ops = self._fused_ops[0]
-            self.linear_fc1.bind_forward_op(ops[0])
-            self.linear_fc2.bind_forward_op(ops[-1])
+        for fc_layer, linear in enumerate((self.linear_fc1, self.linear_fc2)):
+            weights = load_balancer.runtime_weights(fc_layer)
+            if len(weights) != linear.num_gemms:
+                raise ValueError("Runtime weight count must match grouped-linear GEMMs.")
+            # TE's unfused path reads weight{i} with getattr(); the fused op copies these
+            # same references below. Keep DDP and checkpoint registration in _parameters.
+            for index, weight in enumerate(weights):
+                object.__setattr__(linear, f"weight{index}", weight)
+        if not self._with_fused_impl and not getattr(
+            self.linear_fc2.weight0, "is_distributed_weight", False
+        ):
+            self.linear_fc2.wgrad_store = _VirtualExpertFC2WgradStore(load_balancer)
 
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
@@ -602,21 +615,16 @@ class TEGroupedMLP(MegatronModule):
             linear: torch.nn.Module,
             single_grouped_weight: bool,
             single_grouped_bias: bool,
-            weights: tuple[torch.nn.Parameter, ...] | None = None,
         ) -> None:
-            """Register GroupedLinear params, optionally overriding its per-expert weights."""
+            """Give a fused op the weights exposed by its source GroupedLinear."""
             if single_grouped_weight:
                 op.register_parameter("weight", linear.get_parameter("weight"))
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"weight{idx}", None)
             else:
                 op.register_parameter("weight", None)
-                if weights is None:
-                    weights = tuple(
-                        linear.get_parameter(f"weight{idx}") for idx in range(linear.num_gemms)
-                    )
-                for idx, weight in enumerate(weights):
-                    op.register_parameter(f"weight{idx}", weight)
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"weight{idx}", getattr(linear, f"weight{idx}"))
 
             if not linear.use_bias:
                 return
@@ -655,12 +663,11 @@ class TEGroupedMLP(MegatronModule):
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
         virtual_experts = self._virtual_experts
-        virtual_expert_num_gemms = virtual_experts.num_runtime_experts if virtual_experts else None
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
-            virtual_expert_num_gemms or self.linear_fc1.num_gemms,
+            self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
@@ -672,12 +679,10 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
+        # In single grouped mode, clear stale per-expert meta params so TE does not reset
+        # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         register_grouped_linear_params(
-            op,
-            self.linear_fc1,
-            fc1_single_grouped_weight,
-            fc1_single_grouped_bias,
-            weights=virtual_experts.runtime_weights(0) if virtual_experts is not None else None,
+            op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
         # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
         # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
@@ -769,7 +774,7 @@ class TEGroupedMLP(MegatronModule):
         # FC2
         fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
         op = te.pytorch.ops.GroupedLinear(
-            virtual_expert_num_gemms or self.linear_fc2.num_gemms,
+            self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
@@ -783,12 +788,10 @@ class TEGroupedMLP(MegatronModule):
             **fc2_bias_kwargs,
         )
 
+        # In single grouped mode, clear stale per-expert meta params so TE does not reset
+        # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         register_grouped_linear_params(
-            op,
-            self.linear_fc2,
-            fc2_single_grouped_weight,
-            fc2_single_grouped_bias,
-            weights=virtual_experts.runtime_weights(1) if virtual_experts is not None else None,
+            op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
         if virtual_experts is not None and not getattr(op.weight0, "is_distributed_weight", False):
             op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_experts)
@@ -820,12 +823,13 @@ class TEGroupedMLP(MegatronModule):
         def forward_pre_hook(module, *_) -> None:
             for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
                 for hook in submodule._forward_pre_hooks.values():
+                    # Assume that hook does not interact with input
                     ret = hook(submodule, None)
                     if ret is not None:
                         raise RuntimeError(
                             f"Applying a fused implementation for {self.__class__.__name__}, "
-                            f"but a {submodule.__class__.__name__} submodule pre-forward hook "
-                            "modifies the input tensor."
+                            f"but a {submodule.__class__.__name__} submodule "
+                            "has a pre-forward hook that modifies the input tensor."
                         )
             self._ensure_main_grad_for_fused_impl()
 
