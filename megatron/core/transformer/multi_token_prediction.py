@@ -39,6 +39,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
@@ -1962,49 +1963,27 @@ class MultiTokenPredictionLayer(MegatronModule):
             outer_quantization_context = nullcontext()
 
         def checkpoint_handler():
-            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            # fp4 quantization is internally implemented via TE's
-            # ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``), so
-            # quantized recompute on either fp8 or fp4 must go through
-            # ``te_checkpoint``. Matches ``transformer_block``'s policy.
-            if self.config.fp8 or self.config.fp4:
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                return te_checkpoint(
-                    custom_forward,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    padding_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
-                )
-            else:
-                # tensor_parallel.checkpoint stashes args via autograd's
-                # ``save_for_backward``, which only accepts tensors and ``None``.
-                # Pass tensor / ``None`` args positionally and capture the
-                # non-tensor objects via the ``custom_forward`` closure.
-                return tensor_parallel.checkpoint(
-                    custom_forward,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    padding_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
-                )
+            """Checkpoint ``custom_forward`` with the implementation its precision requires."""
+            # tensor_parallel.checkpoint stashes args via autograd's
+            # ``save_for_backward``, which only accepts tensors and ``None``.
+            # Pass tensor / ``None`` args positionally and capture the
+            # non-tensor objects via the ``custom_forward`` closure.
+            return precision_aware_checkpoint(
+                custom_forward,
+                self.config,
+                parallel_state.get_tensor_model_parallel_group(),
+                hidden_states,
+                decoder_input,
+                attention_mask,
+                padding_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+                distribute_saved_activations=self.config.distribute_saved_activations,
+            )
 
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
