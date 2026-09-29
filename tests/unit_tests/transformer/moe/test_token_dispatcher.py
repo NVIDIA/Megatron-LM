@@ -559,6 +559,7 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
         moe_hybridep_pad_uneven_dispatch_inputs=True,
     )
     manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
     manager.drop_and_pad = False
     manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
@@ -603,6 +604,7 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     manager.num_experts = 2
     manager.router_topk = 1
     manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
     manager.drop_and_pad = False
     manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
@@ -631,6 +633,7 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
     manager.num_experts = 4
     manager.router_topk = 2
     manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
     manager.drop_and_pad = False
     manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
@@ -651,6 +654,78 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
     assert (manager.topk_idx[1] == -1).sum() == 1 and (manager.topk_idx[2] == -1).all()
     # Full-width probs are passed through untouched for HybridEP to gather by index.
     assert torch.equal(manager.token_probs, probs)
+
+
+@pytest.mark.parametrize("flex", [False, True])
+def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex):
+    """MoELayer.preprocess hands the batch-first mask to the flex dispatcher (whose backend
+    decides whether padded rows are excluded); the other dispatchers keep their 3-arg call."""
+    calls = []
+
+    class _FlexSpy(MoEFlexTokenDispatcher):
+        def __init__(self):
+            pass
+
+        def dispatch_preprocess(self, hidden_states, routing_map, probs, padding_mask=None):
+            calls.append(padding_mask)
+            return hidden_states, probs
+
+    class _OtherSpy:
+        def dispatch_preprocess(self, hidden_states, routing_map, probs):
+            calls.append("no-mask")
+            return hidden_states, probs
+
+    layer = object.__new__(MoELayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = SimpleNamespace(cuda_graph_impl="local", moe_latent_size=None)
+    layer.shared_expert_overlap = False
+    layer.token_dispatcher = _FlexSpy() if flex else _OtherSpy()
+    hidden_states = torch.zeros(4, 8)
+    probs = torch.zeros(4, 2)
+    routing_map = torch.zeros(4, 2, dtype=torch.bool)
+    padding_mask = torch.tensor([[False, True], [False, False]])
+
+    layer.preprocess(hidden_states, probs, routing_map, padding_mask)
+
+    if flex:
+        assert len(calls) == 1 and calls[0] is padding_mask
+    else:
+        assert calls == ["no-mask"]
+
+
+def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
+    """Dropless HybridEP drops padded tokens in the dispatcher (the router keeps them routed):
+    padding rows lose their routes and weights, valid rows are untouched. The mask arrives
+    batch-first [b, s] and is transposed to the sequence-first token order."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="bool"
+    )
+    manager.group = object()
+    manager.num_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = False
+    manager.use_dense_routing_for_bool_map = False
+
+    # s=2, b=2 -> 4 tokens in sequence-first order (s0b0, s0b1, s1b0, s1b1).
+    routing_map = torch.tensor([[True, False], [False, True], [True, False], [False, True]])
+    probs = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
+    # Batch-first mask: sample 1 has its second position padded -> token s1b1.
+    padding_mask = torch.tensor([[False, False], [False, True]])
+
+    manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+
+    expected_map = routing_map.clone()
+    expected_map[3] = False
+    assert torch.equal(manager.routing_map, expected_map)
+    # Dropless setup_metadata leaves tokens_per_expert to dispatch(); count from the map.
+    assert torch.equal(manager.routing_map.sum(dim=0), torch.tensor([2, 1]))
+    assert torch.count_nonzero(manager.token_probs[3]) == 0
+    torch.testing.assert_close(manager.token_probs[:3], probs[:3])
 
 
 def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
@@ -700,6 +775,7 @@ def test_hybridep_dense_input_requires_backend_support(monkeypatch):
     manager.num_experts = 4
     manager.router_topk = 2
     manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
     manager.drop_and_pad = False
     manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
@@ -730,70 +806,43 @@ def test_flex_dense_metadata_preserves_invalid_routes():
 
 
 @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
-def test_flex_dense_metadata_expands_topk_probs_like_indices(backend):
-    """deepep/ncclep: the router pairs dense indices with the selected [num_tokens, topk] weights;
-    both are expanded per expert-TP rank in the same slot order."""
+def test_flex_dense_metadata_keeps_full_width_probs(backend):
+    """deepep/ncclep: dense indices arrive with the router's full-width probs, which are expanded
+    like a bool map; the backend manager selects the per-route weights afterwards."""
     dispatcher = object.__new__(MoEFlexTokenDispatcher)
     dispatcher.tp_size = 2
     dispatcher.ep_size = 2
     dispatcher.num_local_experts = 2
     dispatcher.config = SimpleNamespace(moe_flex_dispatcher_backend=backend)
     routing_map = torch.tensor([[0, 3], [3, 1]], dtype=torch.int64)
-    probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
+    probs = torch.tensor([[0.6, 0.0, 0.0, 0.4], [0.0, 0.3, 0.0, 0.7]])
 
     expanded_routes, expanded_probs = dispatcher._initialize_metadata(routing_map, probs)
 
     assert torch.equal(expanded_routes, torch.tensor([[0, 2, 5, 7], [5, 7, 1, 3]]))
-    torch.testing.assert_close(
-        expanded_probs, torch.tensor([[0.6, 0.6, 0.4, 0.4], [0.7, 0.7, 0.3, 0.3]])
-    )
-    # Full-width probs with dense indices are a contract violation for these backends.
-    with pytest.raises(AssertionError):
-        dispatcher._initialize_metadata(routing_map, torch.ones((2, 4)))
+    # [num_tokens, world_size, num_local_experts], one copy per expert-TP rank.
+    assert expanded_probs.shape == (2, 4, 2)
+    torch.testing.assert_close(expanded_probs[:, 0, :], torch.tensor([[0.6, 0.0], [0.0, 0.3]]))
+    torch.testing.assert_close(expanded_probs[:, 2, :], torch.tensor([[0.0, 0.4], [0.0, 0.7]]))
 
 
 @pytest.mark.parametrize("manager_cls", [_DeepepManager, _NCCLEPManager])
-@pytest.mark.parametrize("dense_probs", [False, True])
-def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls, dense_probs):
+def test_dense_required_manager_selects_weights_at_dense_indices(manager_cls):
+    """The manager, not the router, gathers the per-route weights from the full-width probs;
+    -1 routes get zero weight."""
     manager = object.__new__(manager_cls)
     manager.num_experts = 4
     manager.router_topk = 2
-    if isinstance(manager, _DeepepManager):
-        manager.capacity_factor = None
-    dense_indices = torch.tensor([[0, 2], [3, 1]], dtype=torch.int16)
-    full_probs = torch.tensor([[0.6, 0.0, 0.4, 0.0], [0.0, 0.3, 0.0, 0.7]])
-    expected_probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
-    # The flex router hands these managers the already-selected [num_tokens, topk] weights
-    # (TopKRouter.routing); setup_metadata runs inside the compiled dispatch_preprocess and must
-    # store them without any gather. Full-width probs are a contract violation, not a fallback.
-    monkeypatch.setattr(
-        torch, "topk", lambda *args, **kwargs: pytest.fail("dense routing must not call torch.topk")
-    )
-    monkeypatch.setattr(
-        torch.Tensor,
-        "gather",
-        lambda *args, **kwargs: pytest.fail("dense probs must be stored without a gather"),
-    )
-    if not dense_probs:
-        with pytest.raises(AssertionError, match="probs selected at those indices"):
-            manager.setup_metadata(dense_indices, full_probs)
-        return
+    manager.capacity_factor = None
+    manager.config = SimpleNamespace(moe_expert_capacity_factor=None)
+    routing_map = torch.tensor([[0, 3], [2, -1]], dtype=torch.int64)
+    probs = torch.tensor([[0.6, 0.1, 0.1, 0.4], [0.2, 0.2, 0.7, 0.9]])
 
-    probs = expected_probs.clone()
-    manager.setup_metadata(dense_indices, probs)
+    manager.setup_metadata(routing_map, probs)
 
     assert manager.token_indices.dtype == torch.int64
-    assert torch.equal(manager.token_indices, dense_indices.long())
-    torch.testing.assert_close(manager.token_probs, expected_probs)
-    # Stored without a copy (reshape may return a new view object of the same storage).
-    assert manager.token_probs.data_ptr() == probs.data_ptr()
-
-    # topk == num_experts: the width no longer identifies the layout; compact weights are taken
-    # in index order, never reinterpreted as full-width probabilities in expert order.
-    manager.num_experts = 2
-    manager.router_topk = 2
-    manager.setup_metadata(torch.tensor([[1, 0]]), torch.tensor([[0.8, 0.2]]))
-    torch.testing.assert_close(manager.token_probs, torch.tensor([[0.8, 0.2]]))
+    assert torch.equal(manager.token_indices, routing_map)
+    torch.testing.assert_close(manager.token_probs, torch.tensor([[0.6, 0.4], [0.7, 0.0]]))
 
 
 def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):

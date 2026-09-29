@@ -424,10 +424,6 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
-        # Batch-first shape of the padding mask seen by route() during eager execution (the
-        # cuda_graph_warmup_steps). TE CUDA graph capture uses it to reserve a padding_mask
-        # graph input, so graphed routing sees the same mask as eager routing.
-        self.padding_mask_shape_seen: Optional[tuple[int, ...]] = None
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
@@ -498,8 +494,6 @@ class MoELayer(BaseMoELayer):
         routing consumes it sequence-first to align with ``hidden_states``.
         """
         if padding_mask is not None:
-            if self.padding_mask_shape_seen is None:
-                self.padding_mask_shape_seen = tuple(padding_mask.shape)
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids=input_ids
@@ -508,12 +502,18 @@ class MoELayer(BaseMoELayer):
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
-        dispatcher.
+        dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
+        passed through untouched and the dispatcher decides whether its backend excludes padded
+        rows.
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -543,9 +543,15 @@ class MoELayer(BaseMoELayer):
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
+        if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
+            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs, padding_mask=padding_mask
+            )
+        else:
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs
+            )
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -717,7 +723,9 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    hidden_states, probs = self.preprocess(
+                        hidden_states, probs, routing_map, padding_mask
+                    )
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output

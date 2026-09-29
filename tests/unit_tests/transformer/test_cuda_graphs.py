@@ -1560,6 +1560,7 @@ class TestPartialCudaGraph:
         cuda_graph_modules,
         cuda_graph_warmup_steps,
         padding_mask=None,
+        mlp_chunks_for_training=1,
         **kwargs,
     ):
         """Test fp8_param with gpt_model."""
@@ -1581,6 +1582,9 @@ class TestPartialCudaGraph:
             ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
+        if mlp_chunks_for_training > 1:
+            # Not a training argument; the layers read it from the shared TransformerConfig.
+            gpt_model[0].config.mlp_chunks_for_training = mlp_chunks_for_training
 
         if cuda_graph_impl == "transformer_engine":
             self.cuda_graph_helper = TECudaGraphHelper(
@@ -1761,13 +1765,21 @@ class TestPartialCudaGraph:
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
     )
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "hybridep", "ncclep"])
-    def test_moe_partial_cudagraph_padding_mask(self, moe_dispatcher_type):
+    @pytest.mark.parametrize(
+        "moe_dispatcher_type,mlp_chunks",
+        [("alltoall", 1), ("alltoall", 2), ("hybridep", 1), ("ncclep", 1)],
+        ids=["alltoall", "alltoall-chunked", "hybridep", "ncclep"],
+    )
+    def test_moe_partial_cudagraph_padding_mask(self, moe_dispatcher_type, mlp_chunks):
         """Graphed routing must see the MoE padding mask exactly like eager routing.
 
         Eager warmup records the mask shape, TE capture reserves a padding_mask graph input for
         every graphed MoE router (whether or not attention is graphed too), and replay feeds the
-        real mask. The loss trajectory must match the eager run bit for bit.
+        real mask. The loss trajectory must match the eager run bit for bit. With MLP chunking the
+        layer splits the mask per chunk, so the reserved graph input must still be the whole-layer
+        mask (checked at capture); that case graphs the whole layer, which is where the chunk loop
+        runs inside the graph. Whole-layer graphs with MLP chunking are not bit-exact against
+        eager even without a mask (pre-existing), so the chunked case only checks capture/replay.
         """
         ep_size = 4
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -1792,35 +1804,50 @@ class TestPartialCudaGraph:
             extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        if mlp_chunks > 1:
+            # The chunked case graphs the whole layer, which a dropless dispatcher cannot do (its
+            # dispatch syncs token counts to the host); use drop-and-pad for both runs.
+            extra_kwargs["moe_expert_capacity_factor"] = 1.0
+            extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
         # Batch-first mask matching input_ids: pad the tail of the second sample.
         seq_per_cp = self.seq_length // self.cp_size
         padding_mask = torch.zeros((self.micro_batch_size, seq_per_cp), dtype=torch.bool).cuda()
         padding_mask[1, seq_per_cp // 2 :] = True
 
-        loss_list_ref = self._run_test_helper(
-            ep_size, "none", None, 0, padding_mask=padding_mask, **extra_kwargs
-        )
-        for cuda_graph_modules in [
-            # Attention eager: replay used to reset kwargs and drop the mask.
-            [CudaGraphModule.mlp, CudaGraphModule.moe_router],
-            # Attention graphed: the mask reached TE but was not a captured input.
-            [
-                CudaGraphModule.attn,
-                CudaGraphModule.mlp,
-                CudaGraphModule.moe_router,
-                CudaGraphModule.moe_preprocess,
-            ],
-        ]:
+        loss_list_ref = None
+        if mlp_chunks == 1:
+            loss_list_ref = self._run_test_helper(
+                ep_size, "none", None, 0, padding_mask=padding_mask, **extra_kwargs
+            )
+        if mlp_chunks > 1:
+            # Whole-layer graph: eager warmup chunks the MLP, capture must reserve the unchunked
+            # [b, s] mask (a chunk-shaped input fails at capture with a mask/token-count mismatch).
+            cuda_graph_modules_list = [None]
+        else:
+            cuda_graph_modules_list = [
+                # Attention eager: replay used to reset kwargs and drop the mask.
+                [CudaGraphModule.mlp, CudaGraphModule.moe_router],
+                # Attention graphed: the mask reached TE but was not a captured input.
+                [
+                    CudaGraphModule.attn,
+                    CudaGraphModule.mlp,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                ],
+            ]
+        for cuda_graph_modules in cuda_graph_modules_list:
             loss_list = self._run_test_helper(
                 ep_size,
                 "transformer_engine",
                 cuda_graph_modules,
                 3,
                 padding_mask=padding_mask,
+                mlp_chunks_for_training=mlp_chunks,
                 **extra_kwargs,
             )
-            assert torch.equal(loss_list, loss_list_ref), cuda_graph_modules
+            if loss_list_ref is not None:
+                assert torch.equal(loss_list, loss_list_ref), cuda_graph_modules
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()

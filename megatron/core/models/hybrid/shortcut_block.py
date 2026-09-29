@@ -204,7 +204,7 @@ class ShortcutMoEBlock(MegatronModule):
             shortcut_input, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
         )
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
-        return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map)
+        return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map, padding_mask)
 
     def _moe_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
         """Run the paired MoE layer's pre-MLP norm and shared experts.

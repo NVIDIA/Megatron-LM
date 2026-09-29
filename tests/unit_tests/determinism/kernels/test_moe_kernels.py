@@ -373,11 +373,16 @@ class TestMoEModules:
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
 
+    @pytest.mark.skipif(
+        not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
+        reason="TE dense fused router output is not available",
+    )
     @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
     @pytest.mark.parametrize("expert_bias", [False, True], ids=["no_bias", "bias"])
     def test_topk_router_dense_indices_replays(self, backend, expert_bias):
-        """Flex deepep/ncclep routers return dense [tokens, topk] indices with the selected
-        weights (router-side top-k/gather) and count expert loads from the indices."""
+        """With TE dense fused output, flex deepep/ncclep routers return dense int64
+        [tokens, topk] indices next to the full-width [tokens, num_experts] probs (the dispatcher
+        selects the weights) and count expert loads from the indices."""
         self._init()
         seeded()
         config = _moe_config(
@@ -387,7 +392,7 @@ class TestMoEModules:
             # Expert bias is only permitted with the sigmoid / sqrtsoftplus score functions.
             moe_router_score_function="sigmoid" if expert_bias else "softmax",
             moe_router_enable_expert_bias=expert_bias,
-            moe_router_fusion=False,
+            moe_router_fusion=True,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend=backend,
         )
@@ -397,7 +402,8 @@ class TestMoEModules:
         router.set_layer_number(0)
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         probs, routing_map = router(hidden)
-        assert routing_map.dtype == torch.int64 and routing_map.shape == probs.shape
+        assert routing_map.dtype == torch.int64 and routing_map.shape == (8192, 8)
+        assert probs.shape == (8192, 64)
         assert_module_replays_bit_exact(
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )

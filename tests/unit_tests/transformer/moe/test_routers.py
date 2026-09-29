@@ -272,16 +272,24 @@ class TestTop2Router:
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_DENSE_ROUTER_FUSION,
+        reason="TE dense fused router output is not available",
+    )
     @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
     @pytest.mark.parametrize("topk", [2, 4])
-    def test_router_diagnostics_accept_dense_routing_indices(self, backend, topk):
-        """Flex deepep/ncclep return dense [num_tokens, topk] indices; the diagnostics need the
-        bool [num_tokens, num_experts] map (topk == num_experts used to misread ids as flags)."""
+    def test_router_diagnostics_accept_dense_routing_indices(self, monkeypatch, backend, topk):
+        """With TE dense fused output, flex deepep/ncclep return int64 [num_tokens, topk]
+        indices next to full-width probs; the diagnostics need the bool [num_tokens, num_experts]
+        map (topk == num_experts used to misread ids as flags)."""
+        monkeypatch.setattr(
+            router_module, "fused_topk_with_score_function_supports_topk_indices", True
+        )
         self.router = self.router.cuda()
-        self.router.config.moe_router_fusion = False  # torch.topk path, no TE needed
+        self.router.config.moe_router_fusion = True
         self.router.config.moe_token_dispatcher_type = "flex"
         self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_expert_capacity_factor = None
         self.router.config.moe_router_topk = topk
         self.router.topk = topk
         self.router.tp_group = _ProcessGroup(1)
@@ -295,7 +303,7 @@ class TestTop2Router:
             probs, routing_map = self.router(hidden_states)
 
         assert routing_map.dtype == torch.int64 and routing_map.shape == (64, topk)
-        assert probs.shape == (64, topk)
+        assert probs.shape == (64, num_experts)
         assert len(observed) == 1
         diagnostics = observed[0][3]
         assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, num_experts)
@@ -440,7 +448,8 @@ class TestTop2Router:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("router_fusion", [False, True])
     def test_router_with_padding_mask(self, router_fusion):
-        """Test that HybridEP excludes padding tokens from routing."""
+        """Test that the padding mask leaves HybridEP routing unchanged: the router only feeds
+        the mask to the losses, dropless HybridEP excludes padded rows in the dispatcher."""
         if router_fusion and not HAVE_ROUTER_FUSION:
             pytest.skip("TE fused router ops not available")
         self.router = self.router.cuda()
@@ -487,9 +496,11 @@ class TestTop2Router:
                 self.router.config.num_moe_experts,
             )
 
+            # Padded rows stay routed (top-k routes with nonzero weights) like any other row.
             padding_rows = padding_mask.reshape(-1)
-            assert torch.count_nonzero(probs_with_mask[padding_rows]) == 0
-            assert not routing_map_with_mask[padding_rows].any()
+            topk = self.router.config.moe_router_topk
+            assert torch.all(routing_map_with_mask[padding_rows].sum(dim=-1) == topk)
+            assert torch.all(torch.count_nonzero(probs_with_mask[padding_rows], dim=-1) == topk)
 
             # Verify that probs for valid tokens are similar
             assert torch.equal(probs_valid_part, probs_without_mask)
@@ -499,7 +510,9 @@ class TestTop2Router:
         not torch.cuda.is_available() or not HAVE_DENSE_ROUTER_FUSION,
         reason="TE dense fused router output is not available",
     )
-    def test_hybridep_dense_routing_masks_padding(self, monkeypatch):
+    def test_hybridep_dense_routing_keeps_padding_rows_routed(self, monkeypatch):
+        """The router does not drop padded rows for any dispatcher: dropless HybridEP excludes
+        them itself in _HybridEPManager.setup_metadata. Here the mask only feeds the losses."""
         monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
         self.router = self.router.cuda()
         self.router.config.moe_router_fusion = True
@@ -514,12 +527,13 @@ class TestTop2Router:
 
         with torch.no_grad():
             probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
+            probs_no_mask, routing_map_no_mask = self.router(hidden_states)
 
-        padding_rows = padding_mask.reshape(-1)
         assert routing_map.dtype == torch.int16
         assert routing_map.shape == (16, self.router.config.moe_router_topk)
-        assert torch.all(routing_map[padding_rows] == -1)
-        assert torch.count_nonzero(probs[padding_rows]) == 0
+        assert torch.all(routing_map >= 0)
+        assert torch.equal(routing_map, routing_map_no_mask)
+        torch.testing.assert_close(probs, probs_no_mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -532,12 +546,15 @@ class TestTop2Router:
             ("flex", "deepepv2", None, None),
             ("flex", "hybridep", 1.0, None),
             ("flex", "hybridep", None, 1.0),
+            ("flex", "hybridep", None, None),
         ],
     )
-    def test_padding_mask_preserves_routes_outside_dropless_hybridep(
+    def test_padding_mask_never_changes_routes(
         self, dispatcher, backend, capacity_factor, rank_capacity_factor
     ):
-        """Only dropless HybridEP may consume a sparse route map."""
+        """The router keeps every route regardless of dispatcher; the padding mask only feeds the
+        losses and the expert-bias update. Dropless HybridEP excludes padded rows in its own
+        token dispatcher, not here."""
         self.router = self.router.cuda()
         self.router.config.moe_token_dispatcher_type = dispatcher
         self.router.config.moe_flex_dispatcher_backend = backend
@@ -956,13 +973,13 @@ class TestAuxLossFreeTop2Router:
     )
     @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
     @pytest.mark.parametrize("dense_te_indices", [False, True])
-    def test_flex_dense_backends_get_topk_probs_from_router(
+    def test_flex_dense_backends_get_full_width_probs_from_router(
         self, monkeypatch, backend, dense_te_indices
     ):
-        """For the deepep/ncclep flex backends the router returns the selected [num_tokens, topk]
-        weights next to int64 indices (so the dispatcher's compiled dispatch_preprocess has no
-        differentiable compute), both with TE's dense index output and with the bool-map
-        fallback. The weights must match the full-width routing probs at those indices."""
+        """The router knows nothing about the dispatcher: for the deepep/ncclep flex backends it
+        returns the same full-width [num_tokens, num_experts] probs as for alltoall. Only the
+        route representation differs when TE emits dense indices (int64 [num_tokens, topk]);
+        the per-route weight selection is the dispatcher's job."""
         if dense_te_indices and not HAVE_DENSE_ROUTER_FUSION:
             pytest.skip("TE dense fused router output is not available")
         monkeypatch.setattr(
@@ -983,14 +1000,17 @@ class TestAuxLossFreeTop2Router:
         self.router.config.moe_flex_dispatcher_backend = backend
         self.router.config.moe_expert_capacity_factor = None
         with torch.no_grad():
-            probs, topk_indices = self.router(hidden_states)
+            probs, routing_map = self.router(hidden_states)
 
+        torch.testing.assert_close(probs, full_probs)
         topk = self.router.config.moe_router_topk
-        assert topk_indices.dtype == torch.int64
-        assert topk_indices.shape == (8, topk)
-        assert probs.shape == (8, topk)
-        assert bool_map.gather(1, topk_indices).all()
-        torch.testing.assert_close(probs, full_probs.gather(1, topk_indices))
+        if dense_te_indices:
+            assert routing_map.dtype == torch.int64
+            assert routing_map.shape == (8, topk)
+            assert bool_map.gather(1, routing_map).all()
+        else:
+            assert routing_map.dtype == torch.bool
+            assert torch.equal(routing_map, bool_map)
 
     def test_expert_bias_ignores_2d_padding_mask(self):
         self.router = self.router.cuda()
