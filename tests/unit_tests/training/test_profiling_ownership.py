@@ -4,7 +4,7 @@
 
 from argparse import ArgumentParser
 from contextlib import nullcontext
-from dataclasses import asdict, fields
+from dataclasses import asdict, dataclass, fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -13,6 +13,7 @@ import pytest
 from megatron.training import argument_utils, arguments, checkpointing, global_vars, training
 from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.config import ProfilingConfig
+from megatron.training.config.container import ConfigContainerBase
 from megatron.training.utils import start_memory_history_recording
 
 
@@ -126,12 +127,56 @@ def test_cli_and_native_settings_match_without_aliasing(profile, pytorch):
     assert config.use_pytorch_profiler is (profile and pytorch)
 
 
-def test_profiler_backends_are_mutually_exclusive(inline_profiler):
+@pytest.fixture
+def validate_at_pretrain(monkeypatch, run_config):
+    """Exercise validation through pretrain without initializing runtime services."""
+
+    class BeforeInitialization(Exception):
+        pass
+
+    initialize = Mock(side_effect=BeforeInitialization)
+    setup = Mock()
+    monkeypatch.setattr(training, "initialize_megatron", initialize)
+    monkeypatch.setattr(training.ft_integration, "setup", setup)
+
+    def validate(config):
+        run_config.profiling = config
+        initialize.reset_mock()
+        setup.reset_mock()
+        try:
+            with pytest.raises(BeforeInitialization):
+                training.pretrain(run_config, Mock(), None, Mock())
+        except ValueError:
+            initialize.assert_not_called()
+            setup.assert_not_called()
+            raise
+
+    return validate
+
+
+def test_container_validates_all_available_subconfigs():
+    @dataclass
+    class Container(ConfigContainerBase):
+        first: object
+        second: object
+        optional: object = None
+        no_validator: object = 0
+
+    first = SimpleNamespace(validate=Mock(), __post_init__=Mock())
+    second = SimpleNamespace(validate=Mock(), __post_init__=Mock())
+    Container(first=first, second=second).validate()
+    first.validate.assert_called_once_with()
+    second.validate.assert_called_once_with()
+    first.__post_init__.assert_not_called()
+    second.__post_init__.assert_not_called()
+
+
+def test_profiler_backends_are_mutually_exclusive(validate_at_pretrain):
     config = ProfilingConfig(use_nsys_profiler=True, use_pytorch_profiler=True)
     with pytest.raises(ValueError, match="mutually exclusive"):
         config.validate()
     with pytest.raises(ValueError, match="mutually exclusive"):
-        inline_profiler(config)
+        validate_at_pretrain(config)
 
 
 @pytest.mark.parametrize("backend", ["use_nsys_profiler", "use_pytorch_profiler"])
@@ -163,7 +208,7 @@ def test_inference_factory_keeps_automatic_model_construction(monkeypatch, expli
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_active_pytorch_window_validation(native, inline_profiler):
+def test_active_pytorch_window_validation(native, validate_at_pretrain):
     if native:
         config = ProfilingConfig(
             use_pytorch_profiler=True, profile_step_start=5, profile_step_end=5
@@ -177,17 +222,17 @@ def test_active_pytorch_window_validation(native, inline_profiler):
             "--profile-step-end",
             "5",
         )
-    # Construction is valid for non-training consumers; an active selected
-    # profiler checks its requirements immediately before starting.
+    # Validate before runtime initialization, independently of rank selection.
     with pytest.raises(ValueError, match="profile_step_end > profile_step_start"):
-        inline_profiler(config)
+        validate_at_pretrain(config)
     config.profile_ranks = [1]
-    inline_profiler(config)  # Excluded ranks do not validate the window.
+    with pytest.raises(ValueError, match="profile_step_end > profile_step_start"):
+        validate_at_pretrain(config)
     config.profile_ranks = []
     config.use_pytorch_profiler = False
-    inline_profiler(config)
+    validate_at_pretrain(config)
     config.use_nsys_profiler = True
-    inline_profiler(config)
+    validate_at_pretrain(config)
 
 
 @pytest.mark.parametrize("profile", [None, False, True])

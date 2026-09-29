@@ -1615,6 +1615,8 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    cfg_container.validate()
+
     callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
@@ -4925,7 +4927,6 @@ def train(
         and (len(cfg.profiling.profile_ranks) == 0 or
              torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
-        cfg.profiling.validate()
         if cfg.profiling.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)

@@ -71,7 +71,7 @@ class ProfilingConfig:
     to categorize execution in profiler output."""
 
     def validate(self) -> None:
-        """Validate requirements when the selected profiler is about to start."""
+        """Validate profiler settings before training runtime initialization."""
         # Match torch.profiler.schedule's active-window requirement. Inactive
         # options and CUDA-profiler windows retain their existing CLI behavior.
         if self.use_nsys_profiler and self.use_pytorch_profiler:
