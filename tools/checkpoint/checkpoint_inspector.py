@@ -402,9 +402,9 @@ def convert_checkpoint(
     # after the transforms, but the source keys already carry the decoder indices, so a
     # missing --renumber-hybrid-layers can be caught here in seconds rather than after
     # loading and transforming the whole checkpoint.
-    _section_prefixes = (model_weight_prefix, optimizer_state_prefix)
+    section_prefixes = (model_weight_prefix, optimizer_state_prefix)
     if renumber_hybrid_layers is None and _hybrid_layer_index_map(
-        metadata.state_dict_metadata, _section_prefixes
+        metadata.state_dict_metadata, section_prefixes
     ):
         raise NotImplementedError(
             "This checkpoint numbers layers by hybrid-pattern position (sparse indices, "
@@ -750,7 +750,7 @@ def convert_checkpoint(
     # the checkpoint's numbering, so neither the map nor its consistency check applies.
     _layer_index_map = (
         {} if renumber_hybrid_layers is False
-        else _hybrid_layer_index_map(fsdp_dtensor_state_dict, _section_prefixes)
+        else _hybrid_layer_index_map(fsdp_dtensor_state_dict, section_prefixes)
     )
     if _layer_index_map and renumber_hybrid_layers is None:
         _example = sorted(_layer_index_map)[0]
