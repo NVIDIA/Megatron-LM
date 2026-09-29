@@ -754,7 +754,14 @@ if _TRITON_AVAILABLE:
         )
 
         grid_b = lambda META: (triton.cdiv(sb, META["BLOCK_S"]),)
-        _triton_hpb_bwd_g_hp_hr_kernel[grid_b](
+        # Autotuned BLOCK_C changes the channel reduction tree and therefore g_hr/g_hp bits.
+        # Bypass the autotuner (including any non-deterministic-mode cache) for strict replay.
+        h_grad_kernel = _triton_hpb_bwd_g_hp_hr_kernel
+        h_grad_launch_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled():
+            h_grad_kernel = h_grad_kernel.fn
+            h_grad_launch_kwargs = {"BLOCK_C": 512, "BLOCK_S": 1, "num_warps": 4}
+        h_grad_kernel[grid_b](
             go_flat,
             orig_flat,
             x_flat,
@@ -774,6 +781,7 @@ if _TRITON_AVAILABLE:
             g_hr.stride(1),
             g_hr.stride(2),
             HAS_BIAS=(bias is not None),
+            **h_grad_launch_kwargs,
         )
 
         g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
