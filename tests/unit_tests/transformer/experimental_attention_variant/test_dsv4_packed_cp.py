@@ -13,6 +13,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.experimental_attention_variant.csa_utils import packed_layout
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     HAVE_HADAMARD,
@@ -21,6 +22,74 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
 )
 
 pytestmark = pytest.mark.launch_on_gb200
+
+
+@pytest.fixture(autouse=True)
+def fresh_packed_compile_cache():
+    """Isolate independent layouts without changing the production recompile limit."""
+    # Keep compiled state shared between CP/reference or replay arms within one case.
+    # Carrying every parameterized layout into the next case can exhaust Dynamo's limit.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires compiled CUDA metadata")
+@pytest.mark.parametrize('cu_values', [(0, 128, 256), (0, 0, 128, 128, 256), (0, 96, 256)])
+@pytest.mark.parametrize('ratio', [4, 128])
+def test_compiled_packed_metadata_matches_document_positions(cu_values, ratio):
+    """Compiled metadata must preserve real document positions, including empty segments."""
+    cu = torch.tensor(cu_values, dtype=torch.int32, device='cuda')
+    capacity = 40 if ratio == 4 else 2
+    halo = 8 if ratio == 4 else ratio
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        for start in (0, 128):
+            hidden = torch.arange(start, start + 128, device='cuda').float().view(128, 1, 1)
+            boundary = (
+                torch.arange(start - 128, start, device='cuda').float().view(128, 1, 1)
+                if start
+                else hidden[:0]
+            )
+            args = (hidden, boundary, cu, start, ratio, halo, capacity, 2)
+            expected = packed_layout._compact_compressor_input(*args)
+            actual = packed_layout._compiled_compactor(*args)
+            for reference, result in zip(expected, actual):
+                assert torch.equal(reference, result)
+            # An independent integer oracle also protects the eager reference.
+            ids, positions, source_rows = [], [], []
+            for begin, end in zip(cu_values, cu_values[1:]):
+                first = (max(start - halo - begin, 0) + ratio - 1) // ratio
+                stop = (min(end, start + 128) - begin) // ratio
+                if begin < start + 128 and end > start:
+                    for group in range(first, max(first, stop)):
+                        ids.append(group)
+                        positions.append(group * ratio)
+                        assert 0 <= group * ratio < end - begin
+                        source_rows.extend(
+                            range(begin + group * ratio, begin + (group + 1) * ratio)
+                        )
+            valid_groups = len(ids)
+            ids.extend([-1] * (capacity - valid_groups))
+            positions.extend([0] * (capacity - valid_groups))
+            source_rows.extend([0] * ((capacity - valid_groups) * ratio))
+            assert actual[1].tolist() == ids
+            assert actual[2].tolist() == positions
+            assert actual[0].flatten().tolist() == source_rows
+            # The other compiled bucketize consumer must retain every window row.
+            index_args = (cu, start, 128, boundary.shape[0], 128, ratio, 0)
+            index_expected = packed_layout._build_attention_indices(*index_args)
+            index_actual = packed_layout._compiled_attention_indices(*index_args)
+            for reference, result in zip(index_expected, index_actual):
+                if reference is None:
+                    assert result is None
+                else:
+                    assert torch.equal(reference, result)
+            assert (index_actual[1] > 0).all()
+    finally:
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
 
 
 class _CP1:

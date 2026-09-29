@@ -31,7 +31,9 @@ def _compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, c
     local_comp_cu = _prefix(counts)
     comp_cu = _prefix(torch.div(cu[1:] - cu[:-1], ratio, rounding_mode="floor"))
     rows = torch.arange(capacity, dtype=torch.int32, device=cu.device)
-    seq = torch.bucketize(rows, local_comp_cu[1:], right=True).clamp_max(cu.numel() - 2)
+    # Avoid compiled bucketize mismatches observed with the sliced prefix. For
+    # nonnegative rows, subtracting the leading zero preserves empty-document handling.
+    seq = (torch.bucketize(rows, local_comp_cu, right=True) - 1).clamp_max(cu.numel() - 2)
     valid = rows < local_comp_cu[-1]
     group_ids = first[seq] + rows - local_comp_cu[seq]
     source_rows = cu[seq, None] + group_ids[:, None] * ratio + torch.arange(ratio, device=cu.device)
@@ -49,7 +51,7 @@ def _compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, c
     # A group's final source token determines its canonical owner. Halo copies
     # are used only for local pooling, never duplicated in the global KV domain.
     logical_rows = torch.arange(local_rows * cp_size // ratio, dtype=torch.int32, device=cu.device)
-    sequence = torch.bucketize(logical_rows, comp_cu[1:], right=True).clamp_max(cu.numel() - 2)
+    sequence = (torch.bucketize(logical_rows, comp_cu, right=True) - 1).clamp_max(cu.numel() - 2)
     group = logical_rows - comp_cu[sequence]
     owner = torch.div(cu[sequence] + (group + 1) * ratio - 1, local_rows, rounding_mode="floor")
     owner = owner.clamp(0, cp_size - 1)
@@ -102,7 +104,7 @@ def _build_attention_indices(
     """Lower document-relative keys to physical KV rows, masking real/padded boundaries."""
     cu = cu_seqlens
     rows = torch.arange(global_start, global_start + l_local, device=cu.device, dtype=torch.int32)
-    seq = torch.bucketize(rows, cu[1:], right=True).clamp_max(cu.numel() - 2)
+    seq = (torch.bucketize(rows, cu, right=True) - 1).clamp_max(cu.numel() - 2)
     valid = (rows >= cu[seq]) & (rows < cu[seq + 1])
     if cu_seqlens_unpadded is not None:
         real_lengths = cu_seqlens_unpadded[1:] - cu_seqlens_unpadded[:-1]
@@ -201,7 +203,7 @@ def build_seq_lens(
     if ratio <= 0:
         raise ValueError("ratio must be positive")
     row_idx = torch.arange(total_q, device=cu_seqlens_q.device, dtype=torch.int32)
-    row_batch_ids = torch.bucketize(row_idx, cu_seqlens_q[1:], right=True).clamp(
+    row_batch_ids = (torch.bucketize(row_idx, cu_seqlens_q, right=True) - 1).clamp(
         max=cu_seqlens_q.shape[0] - 2
     )
     row_valid = row_idx < cu_seqlens_q[-1]
