@@ -128,7 +128,7 @@ def test_high_priority_options_are_wired_to_each_module_grid(monkeypatch, mock_n
 
     expected = {
         (("tp",), None),
-        (("gtp_remat", "dp", "cp"), None),
+        (("cp", "gtp_remat", "dp"), None),
         (("expt_tp",), "expert"),
         (("expt_tp", "ep", "expt_gtp_remat", "pp"), "expert"),
     }

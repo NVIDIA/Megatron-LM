@@ -255,7 +255,8 @@ def _initialize_affine_weight_cpu(
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
-    the relevant chunk."""
+    the relevant chunk. A ``weight`` that is already GTP_remat-sharded is sliced down to this
+    rank's GTP rows as well, so the initialization matches a run with GTP off."""
 
     if not skip_set_tensor_parallel_attributes:
         set_tensor_model_parallel_attributes(
@@ -277,7 +278,17 @@ def _initialize_affine_weight_cpu(
     with torch.no_grad():
         # all tensors must live on the same device
         cpu_weight = torch.cat(my_weight_list, dim=partition_dim).to_dense()
+        if getattr(weight, "gtp_remat_size", 1) > 1:
+            from megatron.core.tensor_parallel.gtp_api import gtp_remat_slice_rows
+
+            cpu_weight = gtp_remat_slice_rows(cpu_weight, weight.group)
         weight.data.copy_(cpu_weight)
+        # Quantized (FP8/FP4) primary weights snapshot their values at construction, before CPU
+        # init writes the real ones. The distributed optimizer seeds its master params from that
+        # snapshot, so it must be refreshed or training starts from uninitialized memory.
+        high_precision_init_val = getattr(weight, "_high_precision_init_val", None)
+        if high_precision_init_val is not None:
+            high_precision_init_val.copy_(cpu_weight)
     if return_master_weight:
         return master_weight
     return None
@@ -525,8 +536,20 @@ def _linear_forward(
 
     input_shape = input.shape
     input_2d = input.reshape(-1, input_shape[-1])
-    output = te_general_gemm(weight, input_2d, out_dtype=output_dtype, layout="TN", bias=bias)[0]
-    return output.reshape(*input_shape[:-1], weight.size(0))
+    output = torch.empty(
+        (*input_shape[:-1], weight.size(0)), dtype=output_dtype, device=input.device
+    )
+    # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
+    # the final-shaped allocation, then return the owning tensor rather than that view.
+    te_general_gemm(
+        weight,
+        input_2d,
+        out_dtype=output_dtype,
+        layout="TN",
+        out=output.view(-1, weight.size(0)),
+        bias=bias,
+    )
+    return output
 
 
 def linear_with_frozen_weight(
@@ -612,8 +635,12 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
-def _wgrad_gemm(out, grad_output, total_input):
+def _wgrad_gemm(out, grad_output, total_input, accumulate=False):
     """Weight-gradient GEMM into ``out``, which may be wider than the inputs (bf16 -> fp32).
+
+    ``accumulate=True`` adds into ``out`` rather than overwriting it, which lets a weight that is
+    consumed several times in one backward build its total wgrad in place -- no second buffer, and
+    the first consume (``accumulate=False``) doubles as the zero-fill.
 
     Returns ``out``, filled with the weight gradient.
     """
@@ -623,8 +650,17 @@ def _wgrad_gemm(out, grad_output, total_input):
     if te_general_gemm is not None:
         # torch.matmul cannot widen via out=, so TE's GEMM does the mixed-precision output.
         te_general_gemm(
-            total_input, grad_output, out_dtype=out.dtype, layout="NT", out=out, grad=True
+            total_input,
+            grad_output,
+            out_dtype=out.dtype,
+            layout="NT",
+            out=out,
+            grad=True,
+            accumulate=accumulate,
         )
+    elif accumulate:
+        # matmul rejects an out= of a different dtype, so land in the compute dtype and add.
+        out.add_(grad_output.t().matmul(total_input))
     else:
         # matmul rejects an out= of a different dtype, so land in the compute dtype and cast.
         out.copy_(grad_output.t().matmul(total_input))
@@ -826,12 +862,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             #
             # This branch widens the epilogue to main_grad's dtype, so the RS no longer rounds
             # across ranks before the fp32 accum sees the value.
-            grad_weight = _wgrad_gemm(sharded_weight.get_wgrad_tensor(), grad_output, total_input)
+            wgrad_buf = sharded_weight.get_wgrad_tensor()
+            grad_weight = _wgrad_gemm(
+                wgrad_buf,
+                grad_output,
+                total_input,
+                accumulate=sharded_weight.record_wgrad_consume(wgrad_buf),
+            )
         else:
             if ctx.gtp_remat_size > 1 and sharded_weight.use_zero_copy_wgrad(grad_output.dtype):
                 # GTP: write the wgrad straight into the reduce-scatter send buffer.
                 grad_weight = sharded_weight.get_wgrad_tensor()
-                torch.matmul(grad_output.t(), total_input, out=grad_weight)
+                # Consume the flag here too or this path never collapses; keep plain matmul
+                # otherwise, so the kernel is unchanged for every other GTP weight.
+                if sharded_weight.record_wgrad_consume(grad_weight):
+                    _wgrad_gemm(grad_weight, grad_output, total_input, accumulate=True)
+                else:
+                    torch.matmul(grad_output.t(), total_input, out=grad_weight)
             else:
                 grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
@@ -1260,7 +1307,11 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             # Check the weight passed in is the correct shape
             expected_shape = (self.output_size_per_partition, self.input_size)
-            if weight.shape != expected_shape:
+            # Deferred to break the tensor_parallel package import cycle (gtp_api ->
+            # generalized_tensor_parallelism -> tensor_parallel/__init__ -> layers).
+            from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+            if weight.shape != expected_shape and not is_gtp_param(weight):
                 raise RuntimeError(
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"

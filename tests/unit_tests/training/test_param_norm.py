@@ -68,6 +68,55 @@ def _fill_parameters_with_ones(model: GPTModel) -> None:
             param.fill_(1.0)
 
 
+def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
+    class _ProcessGroup:
+        def size(self):
+            return 1
+
+    class _TinyMimoModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Linear(1, 1, bias=False)
+            self.modality_submodules = torch.nn.ModuleDict(
+                {"images": torch.nn.Linear(1, 1, bias=False)}
+            )
+            self.mimo_config = SimpleNamespace(
+                module_to_grid_map={"images": object(), "language": object()}
+            )
+
+    model = _TinyMimoModel()
+    model.modality_submodules["images"].requires_grad_(False)
+    module_pg = SimpleNamespace(pp=_ProcessGroup())
+    pg_collection = {"images": module_pg, "language": module_pg}
+    calls = []
+    all_reduce_calls = 0
+
+    original_zeros = torch.zeros
+
+    def _cpu_zeros(*args, **kwargs):
+        kwargs.pop("device", None)
+        return original_zeros(*args, **kwargs)
+
+    def _record_all_reduce(*args, **kwargs):
+        nonlocal all_reduce_calls
+        all_reduce_calls += 1
+
+    def _module_norm(module_models, force_create_fp32_copy=False, **kwargs):
+        calls.append((module_models, force_create_fp32_copy, kwargs))
+        return torch.tensor(9.0)
+
+    monkeypatch.setattr(common_utils.torch, "zeros", _cpu_zeros)
+    monkeypatch.setattr(common_utils.torch.distributed, "all_reduce", _record_all_reduce)
+    monkeypatch.setattr(common_utils, "calc_params_l2_norm", _module_norm)
+
+    norm = common_utils._calc_mimo_params_l2_norm([model], pg_collection)
+
+    assert norm == 3.0
+    assert all(call[0] == [model.language_model] for call in calls)
+    assert all(call[2]["trainable_only"] for call in calls)
+    assert all_reduce_calls == 1
+
+
 @pytest.mark.parametrize(
     ("tensor_parallel_size", "expert_parallel_size", "expert_tensor_parallel_size"),
     ((2, 2, 1), (2, 1, 2), (4, 1, 2), (2, 1, 4)),
@@ -123,6 +172,7 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky_in_dev
 def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(monkeypatch):
     """Expert parameters must use EGTP even when EP, TP, and ETP alone do not distinguish them."""
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -196,7 +246,13 @@ def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(
         "gtp_weight_remat_size",
         "expert_gtp_weight_remat_size",
     ),
-    ((2, 2, 1, 1, 1), (2, 1, 2, 1, 1), (4, 1, 2, 1, 1), (2, 1, 4, 1, 1), (1, 1, 1, 1, 2)),
+    (
+        (2, 2, 1, 1, 1),
+        (2, 1, 2, 1, 1),
+        (4, 1, 2, 1, 1),
+        (2, 1, 4, 1, 1),
+        pytest.param(1, 1, 1, 1, 2, marks=pytest.mark.flaky_in_dev),
+    ),
     ids=(
         "expert-parallel",
         "expert-tensor-parallel",

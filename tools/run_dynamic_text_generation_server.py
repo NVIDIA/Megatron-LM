@@ -2,8 +2,10 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
+from typing import Optional
 
 # tools/ lives at the repo root; put the repo root on sys.path so the
 # megatron.* and examples.* packages are importable regardless of cwd.
@@ -19,7 +21,10 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 import torch  # noqa: E402
 
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
-from megatron.core.inference.config import ImageProcessingConfig  # noqa: E402
+from megatron.core.inference.config import (  # noqa: E402
+    ImageProcessingConfig,
+    VideoProcessingConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
@@ -32,14 +37,20 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (
     _detect_vlm_from_checkpoint,
     _print_resolved_args,
     add_vlm_inference_args,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
     get_model as get_vlm_model,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
-from megatron.core.utils import configure_nvtx_profiling, trace_async_exceptions  # noqa: E402
+from megatron.core.utils import (  # noqa: E402
+    configure_nvtx_profiling,
+    get_pg_size,
+    trace_async_exceptions,
+)
 from megatron.inference.utils import (  # noqa: E402
     get_dynamic_inference_engine,
     get_inference_config_from_model_and_args,
@@ -47,6 +58,7 @@ from megatron.inference.utils import (  # noqa: E402
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -58,17 +70,118 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_multimodal_extra_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
-        "--host", type=str, default=None,
-        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
+        "--host",
+        type=str,
+        default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
+    )
+    parser.add_argument(
+        "--frontend-replicas",
+        type=int,
+        default=-1,
+        help="Number of HTTP frontend processes spawned per hosting rank. "
+        "-1 (default) uses max(data parallel size, 4), or a flat 4 with "
+        "--frontend-on-all-ranks, where capacity already scales with the "
+        "number of ranks hosting a frontend.",
+    )
+    parser.add_argument(
+        "--frontend-on-all-ranks",
+        action="store_true",
+        help="Run HTTP frontends on every rank instead of only rank 0, and "
+        "return every rank's URL for the caller to spread requests over. "
+        "Frontend work (chat template, detokenize, parsers, JSON) is "
+        "CPU-bound and otherwise confined to the hosting rank's CPU "
+        "allocation, which leaves the rest of the job's cores unused. "
+        "Ranks still share one DP coordinator; only the HTTP tier is "
+        "replicated.",
     )
     # NOTE: --chat-template is already declared by upstream's TrainingConfig
     # (megatron/training/config/training_config.py); we don't re-register it.
     # The chat_completions endpoint reads it from args.chat_template via
     # _load_chat_template, which accepts either a file path or an inline string.
+    parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
+    )
+    parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
+    )
+    parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        action="store_true",
+        help=(
+            "Optimize defaults for pure serving. In chat requests, prevent_retokenization "
+            "defaults to false so prompt token IDs are not returned."
+        ),
+    )
     return parser
+
+
+def parse_args_and_detect_vlm(
+    extra_args_provider, args_defaults: dict, user_passed_attrs: Optional[set] = None
+):
+    """Parse CLI args and auto-detect VLM vs language model only from the checkpoint.
+
+    `add_multimodal_extra_args` via `add_text_generation_server_args` requires
+    --language-model-type or --tokenizer-prompt-format for a text-only checkpoint, so this injects
+    placeholders before parsing when the caller hasn't already set them, then overwrites them with
+    real values once the checkpoint shape is known.
+    Precedence for VLM-relevant args is CLI > checkpoint > parser default.
+
+    Callers that inject their own argv defaults first should compute user_passed_attrs beforehand
+    and pass it in.
+
+    Returns (args, is_vlm).
+    """
+    if user_passed_attrs is None:
+        user_passed_attrs = set()
+        for tok in sys.argv[1:]:
+            if tok.startswith('--'):
+                user_passed_attrs.add(tok[2:].split('=', 1)[0].replace('-', '_'))
+
+    _defaults = []
+    if "language_model_type" not in user_passed_attrs:
+        _defaults += ["--language-model-type", "placeholder"]
+    if "tokenizer_prompt_format" not in user_passed_attrs:
+        _defaults += ["--tokenizer-prompt-format", "mistral"]
+    sys.argv[1:1] = _defaults
+
+    args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    initialize_runtime_services(args)
+    initialize_megatron()
+    args = get_args()
+
+    is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
+    # Tiling and dynamic_resolution are mutually exclusive at inference, so
+    # use --use-tiling explicitly.
+    if getattr(args, 'use_tiling', False):
+        args.dynamic_resolution = False
+    if is_vlm:
+        _print_resolved_args("resolved VLM arguments", args)
+    if torch.distributed.get_rank() == 0:
+        print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
+
+    return args, is_vlm
 
 
 def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
@@ -92,9 +205,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     # image-expanded prompt, matching vlm_server.py's pre-engine bookkeeping.
     args.num_img_embeddings_per_tile = 0
     if hasattr(args, 'patch_dim'):
-        dynamic_res = (
-            getattr(args, 'dynamic_resolution', False)
-            and not getattr(args, 'use_tiling', False)
+        dynamic_res = getattr(args, 'dynamic_resolution', False) and not getattr(
+            args, 'use_tiling', False
         )
         if dynamic_res:
             max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
@@ -107,6 +219,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             )
         else:
             from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+
             args.num_img_embeddings_per_tile = get_num_image_embeddings(
                 args.img_h,
                 args.img_w,
@@ -132,12 +245,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
         spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
-        dynamic_resolution_min_patches=getattr(
-            args, 'dynamic_resolution_min_patches', 1
-        ),
-        dynamic_resolution_max_patches=getattr(
-            args, 'dynamic_resolution_max_patches', 128
-        ),
+        dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
+        dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),
         pixel_mean=getattr(args, 'pixel_mean', None),
         pixel_std=getattr(args, 'pixel_std', None),
@@ -146,6 +255,17 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         max_num_tiles=getattr(args, 'max_num_tiles', 1),
         use_thumbnail=getattr(args, 'use_thumbnail', False),
         num_img_embeddings_per_tile=args.num_img_embeddings_per_tile,
+    )
+    inference_config.video_preprocessing_config = VideoProcessingConfig(
+        image_config=inference_config.image_preprocessing_config,
+        num_frames=int(getattr(args, "num_frames", 8)),
+        temporal_patch_size=int(
+            getattr(
+                model,
+                "temporal_patch_dim",
+                getattr(getattr(model, "vision_model", None), "temporal_patch_dim", 1),
+            )
+        ),
     )
 
     context = DynamicInferenceContext(model.config, inference_config)
@@ -161,6 +281,10 @@ async def run_text_generation_server(
     server_port: int,
     hostname: str | None = None,
     chat_template: str | None = None,
+    default_temperature: float | None = None,
+    default_top_p: float | None = None,
+    default_top_k: int | None = None,
+    eval_mode: bool = False,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -170,35 +294,95 @@ async def run_text_generation_server(
         engine (DynamicInferenceEngine): The dynamic inference engine.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
         server_port (int): The network for port the frontend text generation server.
+        hostname (str | None): Hostname or IP address for coordinator and HTTP traffic.
+        chat_template (str | None): Inline chat template or contents loaded from a file.
+        default_temperature (float | None): Sampling default when a request omits
+            `temperature`. None leaves it unset so the model's generation_config.json
+            can supply it; a value here takes precedence over that file.
+        default_top_p (float | None): Same, for `top_p`.
+        default_top_k (int | None): Same, for `top_k`.
+        eval_mode (bool): Whether to use evaluation response defaults.
     """
 
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True,
+        inference_coordinator_port=coordinator_port,
+        launch_inference_coordinator=True,
         hostname=hostname,
     )
 
+    num_replicas = getattr(args, 'frontend_replicas', -1)
+    if num_replicas < 0:
+        if getattr(args, 'frontend_on_all_ranks', False):
+            # Capacity now scales with the number of ranks, so the per-rank
+            # replica count stays flat rather than tracking DP size on top of it.
+            num_replicas = 4
+        else:
+            # Each replica is a single event loop, so frontend capacity has to scale with
+            # the number of engines it feeds. The floor of 4 preserves the previous default
+            # for small deployments.
+            num_replicas = max(get_pg_size(engine.pg_collection.dp), 4)
+    if rank == 0:
+        logging.info("Starting %d HTTP frontend replica(s) per hosting rank.", num_replicas)
+
+    if getattr(args, 'frontend_on_all_ranks', False):
+        # Only the DP coordinator rank learns the coordinator's address: the
+        # engine broadcasts it over the DP group, which is a singleton when data
+        # parallel size is 1. Every rank needs it here, since every rank's
+        # frontend opens its own client.
+        address = [coordinator_addr]
+        torch.distributed.broadcast_object_list(address, src=0)
+        coordinator_addr = address[0]
+        assert coordinator_addr is not None, "no rank published a DP coordinator address"
+
     try:
-        if rank == 0:
-            start_text_gen_server(
+        url = None
+        if getattr(args, 'frontend_on_all_ranks', False) or rank == 0:
+            url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 parsers=args.parsers,
                 rank=rank,
-                server_port=server_port,
+                server_port=0 if getattr(args, 'frontend_on_all_ranks', False) else server_port,
                 verbose=args.inference_text_gen_server_logging,
+                num_replicas=num_replicas,
                 hostname=hostname,
                 chat_template=chat_template,
+                multimodal_prompt_config=(
+                    engine.controller.inference_wrapped_model.multimodal_prompt_config
+                ),
+                default_temperature=default_temperature,
+                default_top_p=default_top_p,
+                default_top_k=default_top_k,
+                eval_mode=eval_mode,
+                # Taken from the engine so the frontend hashes on the same block
+                # boundaries the engine caches on; a mismatch would name blocks it
+                # never held and every routing decision would miss.
+                block_size_tokens=engine.context.block_size_tokens,
+                prefix_caching_coordinator_policy=(
+                    engine.context.prefix_caching_coordinator_policy
+                ),
             )
+
+        if getattr(args, 'frontend_on_all_ranks', False):
+            # Unlike callers that already collect a URL per worker, this entry
+            # point has to gather them itself before it can report the set.
+            urls = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(urls, url)
+            if rank == 0:
+                for entry in [u for u in urls if u]:
+                    logging.info("Frontend: %s", entry)
+        elif rank == 0:
+            logging.info("Frontend: %s", url)
 
         # Await the engine loop directly since the server is running in a separate process
         await engine.engine_loop_task
 
     finally:
-        # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
-        if rank == 0:
-            stop_text_gen_server()
+        # Guarantee that the separate processes are terminated when the engine loop
+        # stops or is interrupted. Every rank may now own frontend processes.
+        stop_text_gen_server()
 
 
 def _load_chat_template(value):
@@ -219,9 +403,9 @@ if __name__ == "__main__":
     with torch.inference_mode():
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
-        # Snapshot what the user actually typed BEFORE we inject defaults, so
-        # _detect_vlm_from_checkpoint can tell explicit CLI args from injected
-        # defaults / parser defaults.  Precedence: CLI > checkpoint > default.
+        # Snapshot what the user actually typed BEFORE we inject defaults below,
+        # so parse_args_and_detect_vlm's checkpoint-vs-CLI precedence isn't
+        # confounded by server-specific injected defaults. Precedence: CLI > checkpoint > default.
         user_passed_attrs = set()
         for tok in sys.argv[1:]:
             if tok.startswith('--'):
@@ -235,13 +419,10 @@ if __name__ == "__main__":
         # store_true flags have no negating counterpart, so we only inject
         # those when the user hasn't set a conflicting explicit value.
         _defaults = [
-            "--micro-batch-size", "1",
-            "--inference-dynamic-batching-buffer-size-gb", "2.0",
-            # Placeholders for add_multimodal_extra_args' required args. These
-            # are injected as defaults, so _detect_vlm_from_checkpoint will
-            # replace them with the checkpoint's real values when loading a VLM.
-            "--language-model-type", "placeholder",
-            "--tokenizer-prompt-format", "mistral",
+            "--micro-batch-size",
+            "1",
+            "--inference-dynamic-batching-buffer-size-gb",
+            "2.0",
         ]
         # store_true flags: only inject when the user hasn't expressed a
         # conflicting choice on the CLI.
@@ -255,32 +436,13 @@ if __name__ == "__main__":
         # prompt log-probs can be computed for lm-eval / MCQ likelihood scoring.
         if "return_log_probs" not in user_passed_attrs:
             _defaults.append("--return-log-probs")
-        # Avoid running prefill through CUDA graphs: under a graphed prefill,
-        # is_decode_only() returns True and calculate_log_probs short-circuits
-        # to a single logprob per request, breaking logprob-based eval.
-        if "decode_only_cuda_graphs" not in user_passed_attrs:
-            _defaults.append("--decode-only-cuda-graphs")
         sys.argv[1:1] = _defaults
 
-        parse_and_validate_args(
+        args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
+            user_passed_attrs=user_passed_attrs,
         )
-        initialize_megatron()
-
-        args = get_args()
-
-        # Auto-detect VLM and copy VLM args from the checkpoint with precedence
-        # CLI > checkpoint > parser default.  Tiling and dynamic_resolution are
-        # mutually exclusive at inference, so honor --use-tiling explicitly.
-        is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
-        if getattr(args, 'use_tiling', False):
-            args.dynamic_resolution = False
-        if is_vlm:
-            _print_resolved_args("resolved VLM arguments", args)
-
-        if torch.distributed.get_rank() == 0:
-            print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
 
         # Match training's NVTX gating (training.py only flips this when both
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
@@ -305,6 +467,10 @@ if __name__ == "__main__":
                     args.port,
                     args.host,
                     chat_template=chat_template,
+                    default_temperature=args.default_temperature,
+                    default_top_p=args.default_top_p,
+                    default_top_k=args.default_top_k,
+                    eval_mode=args.eval_mode,
                 )
             )
         except KeyboardInterrupt:
