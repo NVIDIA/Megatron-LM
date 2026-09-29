@@ -236,8 +236,12 @@ class TestFSDPHybridOverlap:
                 buffer = wrapper.module.param_and_grad_buffer
                 unit_ids = []
                 for group in wrapper.module.module.decoder.layers:
+                    # Outside forward/backward, FSDP exposes optimizer DTensors.
+                    # Their orig_param is the key retained by the bucket map.
                     group_ids = {
-                        buffer.parameter_groups[buffer.param_to_param_group[param]].fsdp_unit_id
+                        buffer.parameter_groups[
+                            buffer.param_to_param_group[getattr(param, "orig_param", param)]
+                        ].fsdp_unit_id
                         for param in group.parameters()
                     }
                     assert len(group_ids) == 1 and None not in group_ids
