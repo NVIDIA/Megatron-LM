@@ -33,6 +33,8 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    packed_seq_params_by_layout: Optional[dict] = None,
+    cp_layout_plan: object | None = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -46,6 +48,11 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        packed_seq_params_by_layout (dict, optional): Prebuilt packed metadata per CP layout,
+            forwarded to nested HybridStack group layers so they can build their own layout
+            state while being checkpointed by the enclosing stack.
+        cp_layout_plan (optional): Prebuilt packed contiguous/zigzag route, forwarded to nested
+            HybridStack group layers together with ``packed_seq_params_by_layout``.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -93,9 +100,10 @@ def checkpointed_forward(
                     layer_padding_mask = cp_layout_state.get_layer_padding_mask(
                         index, padding_mask, padding_mask_by_layout
                     )
+                is_hybrid_group = getattr(layer, "is_layer_group_stack", False)
 
                 # Get appropriate inner quantization context
-                if use_inner_quantization_context:
+                if use_inner_quantization_context and not is_hybrid_group:
                     if self.config.fp8:
                         inner_quantization_context = get_fp8_context(
                             self.config, layer.layer_number - 1
@@ -143,6 +151,24 @@ def checkpointed_forward(
                                 packed_sequence_cp_metadata
                             )
                         hidden_states, context = layer(**layer_kwargs)
+                    elif is_hybrid_group:
+                        # Nested HybridStack group: run its physical layers inside this
+                        # checkpoint segment (it must not checkpoint them again) and let it
+                        # build its own CP layout state from the prebuilt per-layout metadata.
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
+                        if input_ids is not None:
+                            layer_kwargs["input_ids"] = input_ids
+                        # The group picks each inner layer's mask from these by its layout.
+                        if padding_mask_by_layout is not None:
+                            layer_kwargs["padding_mask_by_layout"] = padding_mask_by_layout
+                        if packed_seq_params_by_layout is not None or cp_layout_plan is not None:
+                            layer_kwargs["packed_seq_params_by_layout"] = (
+                                packed_seq_params_by_layout
+                            )
+                            layer_kwargs["cp_layout_plan"] = cp_layout_plan
+                        hidden_states = layer(**layer_kwargs, _checkpointed_forward_in_parent=True)
+                        context = None
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (
                             "context",
