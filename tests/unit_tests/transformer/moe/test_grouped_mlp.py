@@ -1492,17 +1492,11 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("override_pattern", (None, "*experts*", "*linear_fc1", "*linear_fc2"))
-    def test_gpu_precision_override_keeps_experts_unfused(self, override_pattern):
-        """A per-module precision override must keep these experts off the op-fuser path.
+    def test_gpu_precision_override_is_resolved_without_disabling_ops(self, override_pattern):
+        """Resolve per-linear overrides while leaving execution precision to forward.
 
-        The fused grouped-MLP kernels are FP8/NVFP4-only and select their recipe from the
-        global autocast state, not from the module's own quantization config. So a module the
-        precision config forces to high precision has to run unfused: otherwise it is silently
-        quantized anyway, and with GTP weight sharding its backward pass is handed an
-        unquantized weight the kernel cannot consume (AttributeError on `_columnwise_data`).
-
-        The fused op covers fc1 and fc2 jointly, so an override matching either one alone must
-        still disable it -- matching only fc2 is what the original GTP crash hit.
+        Matching BF16 overrides can use TE basic operations. Different FC1/FC2 overrides
+        are rejected at execution, as covered by the fused-forward precision tests.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear
@@ -1564,10 +1558,13 @@ class TestTEGroupedMLP:
         experts = layer.experts
         assert isinstance(experts, TEGroupedMLP)
 
-        if override_pattern is None:
-            assert experts._with_fused_impl
-        else:
-            assert not experts._with_fused_impl
+        assert experts._with_fused_impl
+        for name, linear in (
+            ("linear_fc1", experts.linear_fc1),
+            ("linear_fc2", experts.linear_fc2),
+        ):
+            overridden = override_pattern in ("*experts*", f"*{name}")
+            assert linear.will_execute_quantized(True) is not overridden
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
