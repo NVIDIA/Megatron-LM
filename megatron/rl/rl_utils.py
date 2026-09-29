@@ -3026,10 +3026,10 @@ def megatron_rl_inference_mode(
         with torch.no_grad(), nvtx_range("rl/synchronize-inference-parameters", time=True):
             optimizer.prepare_model_params_for_param_sync()
             for model_chunk in model:
-                # Ordinary DDP already has complete parameters.
+                # Non-overlapped gathers already completed in optimizer.step().
                 if (
                     isinstance(model_chunk, DistributedDataParallel)
-                    and model_chunk.ddp_config.param_sync_via_bucket_group
+                    and model_chunk.ddp_config.overlap_param_gather
                 ):
                     model_chunk.start_param_sync(force_sync=True)
 
