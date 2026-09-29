@@ -946,7 +946,7 @@ def _simplified_sparse_forward_impl(
     total_positions = batch_size * sq
     for q_start in range(0, sq, query_chunk_size):
         q_end = min(q_start + query_chunk_size, sq)
-        _, topk_indices, q_index = _simplified_topk_index_tile(
+        routing_scores, topk_indices, q_index = _simplified_topk_index_tile(
             hidden_states,
             key,
             q_start,
@@ -971,40 +971,8 @@ def _simplified_sparse_forward_impl(
             query_tile, key, value, topk_indices, attention_softmax_scale, q_start
         )
         if loss_coeff > 0:
-            if linear_k_weight is None:
-                selected_scores = _simplified_selected_index_scores(
-                    q_index, key, topk_indices, indexer_score_scale, q_start
-                )
-            else:
-                if full_k_index is None:
-                    selected_score_k_index = _project_simplified_k_index_block(
-                        hidden_states,
-                        0,
-                        q_end,
-                        linear_k_weight,
-                        index_head_dim,
-                        index_rotary_dim,
-                        rotary_pos_emb,
-                        rotary_interleaved,
-                        use_indexer_rope,
-                        simplified_input_norm,
-                    )
-                else:
-                    selected_score_k_index = full_k_index
-                selected_scores = query.new_empty(topk_indices.shape, dtype=torch.float32)
-                support_chunk_size = min(
-                    _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE, topk_indices.size(-1)
-                )
-                for support_start in range(0, topk_indices.size(-1), support_chunk_size):
-                    support_end = min(support_start + support_chunk_size, topk_indices.size(-1))
-                    support_slice = slice(support_start, support_end)
-                    selected_scores[:, :, support_slice] = _simplified_selected_index_scores(
-                        q_index,
-                        selected_score_k_index,
-                        topk_indices[:, :, support_slice].contiguous(),
-                        indexer_score_scale,
-                        q_start,
-                    )
+            # FP32 for the KL below.
+            selected_scores = routing_scores.float()
             if selected_scores_cache is not None:
                 selected_scores_cache.append(selected_scores)
             indexer_loss = indexer_loss + _indexer_loss_tile(
@@ -1175,11 +1143,13 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             for chunk_idx, q_start in enumerate(range(0, sq, ctx.query_chunk_size)):
                 q_end = min(q_start + ctx.query_chunk_size, sq)
                 q_index = None
+                routing_scores = None
                 if ctx.routing_topk_cache is not None:
+                    # Only the indices were cached, so the scores still have to be rebuilt below.
                     topk_indices = ctx.routing_topk_cache[chunk_idx]
                 else:
                     with torch.no_grad():
-                        _, topk_indices, q_index = _simplified_topk_index_tile(
+                        routing_scores, topk_indices, q_index = _simplified_topk_index_tile(
                             hidden_states,
                             key,
                             q_start,
@@ -1306,6 +1276,9 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             )
                         if ctx.selected_scores_cache is not None:
                             selected_scores = ctx.selected_scores_cache[chunk_idx]
+                        elif routing_scores is not None:
+                            # Routing just scored these keys; reuse rather than score them again.
+                            selected_scores = routing_scores.float()
                         else:
                             selected_scores = query.new_empty(
                                 topk_indices.shape, dtype=torch.float32
