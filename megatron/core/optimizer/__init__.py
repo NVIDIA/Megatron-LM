@@ -787,6 +787,26 @@ def _get_megatron_emerging_optimizer(
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
+    if not use_layer_wise:
+        for chunk_idx, model_chunk in enumerate(model_chunks):
+            # Replicated optimizers consume full gradients. A singleton reduce-scatter
+            # group still supplies those, including with multiple optimizer instances.
+            bucket_groups = getattr(model_chunk, 'bucket_groups', []) + getattr(
+                model_chunk, 'expert_parallel_bucket_groups', []
+            )
+            if any(
+                group.ddp_config.use_distributed_optimizer
+                and group.intra_distributed_optimizer_instance_size > 1
+                for group in bucket_groups
+            ):
+                raise ValueError(
+                    f"Non-layer-wise optimizer='{eopt_name}' requires complete gradients, "
+                    f"but model chunk {chunk_idx} uses DDP reduce-scatter across multiple "
+                    "ranks. Disable DDP use_distributed_optimizer, or rebuild "
+                    "the model with a layer-wise parameter layout and set "
+                    "use_layer_wise_distributed_optimizer=True."
+                )
+
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
