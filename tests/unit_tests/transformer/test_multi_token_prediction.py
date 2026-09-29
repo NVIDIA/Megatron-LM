@@ -2979,6 +2979,8 @@ class TestMultiTokenPrediction:
         """An output layer that gathers by default (parallel_output=False) must give the same MTP
         loss, acceptance counts and gradients as a sharded one. Gathered MTP logits would make
         the vocab-parallel loss see a TP-times larger vocabulary: loss +ln(TP), wrong gradients."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
