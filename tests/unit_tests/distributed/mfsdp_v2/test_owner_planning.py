@@ -113,7 +113,7 @@ def test_from_group_keys_are_tensor_indices():
 
 
 def test_from_group_per_rank_data_not_uniform():
-    """Flat sharding with uniform buffer size but non-uniform per-rank tensor data.
+    """RowAtomic sharding with uniform buffer size but non-uniform per-rank tensor data.
 
     `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
     flat buffer is the same size. However, the actual tensor data per rank is not necessarily

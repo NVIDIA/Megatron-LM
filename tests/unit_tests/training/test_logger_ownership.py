@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.training import arguments, global_vars
-from megatron.training.argument_utils import logger_config_from_args
+from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.async_utils import build_otel_worker_bootstrap
 from megatron.training.config import LoggerConfig
 from megatron.training.initialize import setup_logging, write_args_to_tensorboard
@@ -42,7 +42,7 @@ def test_cli_aliases_and_native_config_match(run_config):
             '--run-workload-inspector-server',
         ]
     )
-    config = logger_config_from_args(args)
+    config = _default_config_from_args(LoggerConfig, args)
     expected = LoggerConfig(
         enable_one_logger=False,
         one_logger_project='project',
@@ -61,7 +61,7 @@ def test_cli_aliases_and_native_config_match(run_config):
 
 def test_normalization_does_not_alias_or_mutate_args():
     args = Namespace(modules_to_filter=['module'], log_interval=7, iteration=12)
-    config = logger_config_from_args(args)
+    config = _default_config_from_args(LoggerConfig, args)
     args.modules_to_filter.append('stale')
     assert config.modules_to_filter == ['module']
     config.log_interval = 11
@@ -73,11 +73,12 @@ def test_normalization_does_not_alias_or_mutate_args():
 @pytest.mark.parametrize('interval,valid', [(None, True), (20, True), (21, False)])
 def test_native_memory_interval_validation(interval, valid, run_config):
     config = LoggerConfig(log_interval=10, log_memory_interval=interval)
+    run_config.logger = config
     if valid:
-        config.validate()
+        run_config.validate()
     else:
         with pytest.raises(AssertionError):
-            config.validate()
+            run_config.validate()
 
 
 @pytest.mark.parametrize('rank,enabled', [(0, False), (1, True)])
@@ -218,7 +219,7 @@ def test_checkpoint_logging_does_not_override_current_run(monkeypatch, run_confi
         Mock(return_value=(state, 'checkpoint', False, None)),
     )
     checkpointing.load_args_from_checkpoint(args)
-    config = logger_config_from_args(args)
+    config = _default_config_from_args(LoggerConfig, args)
     assert config.log_interval == 17 and config.otel_service_name is None
 
 

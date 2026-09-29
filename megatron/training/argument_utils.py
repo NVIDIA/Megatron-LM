@@ -10,13 +10,14 @@ import types
 import typing
 import warnings
 from argparse import ArgumentParser, Namespace, _ArgumentGroup
+from copy import deepcopy
 from dataclasses import Field, fields
 from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
     CheckpointConfig,
@@ -274,7 +275,57 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _mfsdp_v2_disables_pipeline_output_dealloc(args) -> bool:
+    """Whether the pipeline-output pseudo-free must stay disabled for ``args``.
+
+    Megatron-FSDP v2 registers a full-backward hook on every FSDP module, and
+    PyTorch delivers ``grad_output`` to that hook by wrapping the module output
+    in ``BackwardHookFunction``, whose forward returns its inputs. The pipeline
+    stage output therefore becomes an autograd view of the module's own output,
+    and ``deallocate_output_tensor()`` must not pseudo-free it: the base tensor
+    owns the storage and keeps it alive, so the swap would reclaim no memory.
+    Disable the optimization for this configuration instead of aborting on the
+    view guard.
+    """
+    return bool(
+        getattr(args, 'use_megatron_fsdp', False) and getattr(args, 'megatron_fsdp_version', 1) == 2
+    )
+
+
+def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | None:
+    """Build the optional nested wide-residual config from flat training arguments."""
+
+    num_streams = getattr(args, 'wide_residual_num_streams', None)
+    control_defaults = {
+        'wide_residual_streamwise_sigmoid_init_scale': 0.01,
+        'wide_residual_learned_retention': False,
+        'wide_residual_retention_init': 0.999,
+        'wide_residual_retention_max_forget': 0.10,
+    }
+    if num_streams is None:
+        nondefault_controls = [
+            name
+            for name, default in control_defaults.items()
+            if getattr(args, name, default) != default
+        ]
+        if nondefault_controls:
+            options = ', '.join('--' + name.replace('_', '-') for name in nondefault_controls)
+            raise ValueError(f'{options} require --wide-residual.')
+        return None
+
+    return WideResidualConfig(
+        num_streams=num_streams,
+        streamwise_sigmoid_init_scale=getattr(
+            args, 'wide_residual_streamwise_sigmoid_init_scale', 0.01
+        ),
+        learned_retention=getattr(args, 'wide_residual_learned_retention', False),
+        retention_init=getattr(args, 'wide_residual_retention_init', 0.999),
+        retention_max_forget=getattr(args, 'wide_residual_retention_max_forget', 0.10),
+    )
+
+
 def core_transformer_config_from_args(args, config_class=None):
+    """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
     from megatron.core.quantization.utils import (
@@ -302,10 +353,12 @@ def core_transformer_config_from_args(args, config_class=None):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    if kw_args.get('hash_moe_vocab_size') is None:
+        kw_args['hash_moe_vocab_size'] = args.vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
@@ -379,6 +432,10 @@ def core_transformer_config_from_args(args, config_class=None):
 
     kw_args['moe_latent_size'] = args.moe_latent_size
 
+    wide_residual = _wide_residual_config_from_args(args)
+    if wide_residual is not None or 'wide_residual' not in kw_args:
+        kw_args['wide_residual'] = wide_residual
+
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
         # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
@@ -442,7 +499,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
             kwargs[f.name] = getattr(args, f.name)
 
     if return_instance:
-        return cls(**kwargs)
+        return cls(**deepcopy(kwargs))
     else:
         return kwargs
 
@@ -600,15 +657,17 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
-def logger_config_from_args(args: Namespace) -> LoggerConfig:
-    """Normalize logging inputs once at a legacy CLI/YAML boundary."""
-    from copy import deepcopy
-
-    config = LoggerConfig(**deepcopy(_default_config_from_args(
-        LoggerConfig, args, return_instance=False
-    )))
-    config.validate()
-    return config
+def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
+    """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
+    # Legacy args retain these fields temporarily during the training-loop refactor;
+    # ProfilingConfig is authoritative after construction.
+    kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    # The legacy CLI uses --profile as a master switch and selects one backend.
+    if hasattr(args, "profile"):
+        use_pytorch = kwargs.get("use_pytorch_profiler", False)
+        kwargs["use_nsys_profiler"] = args.profile and not use_pytorch
+        kwargs["use_pytorch_profiler"] = args.profile and use_pytorch
+    return ProfilingConfig(**deepcopy(kwargs))
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
@@ -630,9 +689,6 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
     ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
 
-    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
-    prof_kwargs["use_nsys_profiler"] = args.profile
-
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
@@ -648,9 +704,9 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         ddp=ddp_config,
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
-        logger=logger_config_from_args(args),
+        logger=_default_config_from_args(LoggerConfig, args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
-        profiling=ProfilingConfig(**prof_kwargs),
+        profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
@@ -687,7 +743,8 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
-        build_model_config: Leave the model unset for legacy model-provider entrypoints.
+        build_model_config: If False, retain model_cfg (including None) for legacy callers
+            that still construct the model through a model provider.
     """
     if model_cfg is None and build_model_config:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
@@ -705,10 +762,6 @@ def inference_cfg_container_from_args(
         if hasattr(args, f"ckpt_{name}"):
             ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
 
-    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
-    if hasattr(args, "profile"):
-        prof_kwargs["use_nsys_profiler"] = args.profile
-
     cfg = InferenceConfigContainer(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
@@ -716,8 +769,8 @@ def inference_cfg_container_from_args(
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-        logger=logger_config_from_args(args),
-        profiling=ProfilingConfig(**prof_kwargs),
+        logger=_default_config_from_args(LoggerConfig, args),
+        profiling=profiling_config_from_args(args),
     )
 
     return cfg
