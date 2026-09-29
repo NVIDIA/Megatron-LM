@@ -51,17 +51,19 @@ class _Replay(nn.Module):
         return output + state["memory"]
 
 
+@pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("mode", ["eager", "checkpoint", "torch", "transformer_engine"])
 def test_shared_region_replays_forward_and_all_gradients(mode):
     Utils.initialize_model_parallel(1, 1)
     seeded()
     inputs = tuple(torch.randn(64, 2, 16, device="cuda", requires_grad=True) for _ in range(2))
-    module = _Replay(mode, inputs)
+    module = None
     try:
+        module = _Replay(mode, inputs)
         with deterministic_algorithms(True):
             assert_module_replays_bit_exact(module, inputs)
     finally:
-        if module.graphs is not None:
+        if module is not None and module.graphs is not None:
             module.graphs.close()
         Utils.destroy_model_parallel()
 

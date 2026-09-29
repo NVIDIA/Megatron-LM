@@ -88,6 +88,7 @@ class _CrossRankRegion(nn.Module):
         return hidden + gathered["shared"].sum(0) * self.weight, {}
 
 
+@pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("mode", ["recompute", "torch", "transformer_engine"])
 def test_cp_collective_region_matches_eager_in_recompute_and_graphs(cp, mode):
     module = _CrossRankRegion(cp)

@@ -122,10 +122,16 @@ class _RngRegion(nn.Module):
 
 
 @pytest.mark.parametrize("tracker_kind", ["native", "native_graphsafe", "te"])
-def test_checkpoint_replays_model_parallel_rng_and_restores_tracker(monkeypatch, tracker_kind):
+def test_checkpoint_replays_model_parallel_rng_and_restores_tracker(
+    monkeypatch, tracker_kind, request
+):
     if tracker_kind == "te":
+        from transformer_engine.pytorch.distributed import get_all_rng_states, set_all_rng_states
+
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
+        previous = get_all_rng_states()
+        request.addfinalizer(lambda: set_all_rng_states(previous))
         tracker = TECudaRNGStatesTracker()
     else:
         tracker = rng.CudaRNGStatesTracker(use_cudagraphable_rng=tracker_kind == "native_graphsafe")
@@ -158,6 +164,7 @@ def test_checkpoint_replays_model_parallel_rng_and_restores_tracker(monkeypatch,
     assert not rng.is_checkpointing()
 
 
+@pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_real_graph_slots_preserve_two_outstanding_microbatches(backend, dtype):
@@ -202,6 +209,33 @@ def test_graph_rejects_changed_profile_and_unused_differentiable_output():
         hidden.sum().backward()
 
 
+def test_te_graph_rejects_legacy_rng_before_capture_and_recovers(te_rng_tracker):
+    """A bad RNG profile must not poison later TE attention or graph captures."""
+    from transformer_engine.pytorch import graph as te_graph
+    from transformer_engine.pytorch.distributed import get_all_rng_states, set_all_rng_states
+
+    region = StatefulModule(_Branches(), output_fields=_fields())
+    sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
+    original_call = StatefulModule.__call__
+    registered = get_all_rng_states()
+    assert not te_graph.is_graph_capturing()
+    try:
+        set_all_rng_states({"legacy": torch.cuda.get_rng_state()})
+        with pytest.raises(ValueError, match="graph-safe RNG states"):
+            StatefulGraphs(region, sample, {}, backend="transformer_engine")
+        assert not te_graph.is_graph_capturing()
+        assert StatefulModule.__call__ is original_call
+    finally:
+        set_all_rng_states(registered)
+
+    graphs = StatefulGraphs(region, sample, {}, backend="transformer_engine")
+    hidden, state = graphs.run(sample, {})
+    _loss(hidden, state, "used").backward()
+    assert region.module.main.grad is not None and region.module.side.grad is not None
+    del hidden, state
+    graphs.close()
+
+
 def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
     hidden = torch.randn(4, 1, 8, requires_grad=True)
     fields = (
@@ -238,6 +272,7 @@ def test_last_consumer_retires_inputs_without_dropping_another_components_state(
     assert producer.module.side.grad is not None
 
 
+@pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_graph_with_real_te_normalized_projection_and_shared_output(backend, dtype):

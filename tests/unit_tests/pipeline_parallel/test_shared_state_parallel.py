@@ -106,6 +106,7 @@ def control_group():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("vp_size", [1, 2])
 @pytest.mark.parametrize("mode", ["eager", "recompute", "torch", "transformer_engine"])
 def test_cp_pp_state_matches_unpartitioned_layers(vp_size, mode, control_group):

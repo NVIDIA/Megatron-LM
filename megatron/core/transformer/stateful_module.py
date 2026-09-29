@@ -166,7 +166,20 @@ class StatefulGraphs:
             capture = torch.cuda.make_graphed_callables
         elif backend == "transformer_engine":
             from transformer_engine.pytorch import make_graphed_callables
+            from transformer_engine.pytorch.distributed import (
+                get_all_rng_states,
+                graph_safe_rng_available,
+            )
 
+            # TE changes its global capture flag and module __call__ before
+            # saving RNG state. Reject legacy byte states before those changes.
+            if graph_safe_rng_available() and any(
+                not isinstance(value, torch.Generator) for value in get_all_rng_states().values()
+            ):
+                raise ValueError(
+                    "Transformer Engine CUDA graphs require graph-safe RNG states; "
+                    "initialize and seed the TE RNG tracker during model setup"
+                )
             capture = make_graphed_callables
         else:
             raise ValueError(f"Unsupported stateful graph backend: {backend}")

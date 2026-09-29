@@ -71,6 +71,9 @@ frozen, and preserves absent versus explicitly zero gradients.
 `StatefulGraphs(region, sample_hidden, sample_state, slots=N, backend=...)`
 captures the same tensor interface with `backend="torch"` or
 `backend="transformer_engine"`. Replay with `graphs.run(hidden, state, slot=i)`.
+For the TE backend, initialize and seed Megatron's TE RNG tracker during model
+setup. Legacy byte-tensor RNG states are rejected before capture; the adapter
+does not reset or replace the caller's RNG configuration.
 Use independent slots for outstanding forwards; a slot cannot be reused until
 its backward completes. Input geometry, strides, dtypes, gradient profile,
 parameter storage, and training mode must match capture. Optimizer updates to
