@@ -205,6 +205,24 @@ class TestBridgeCommunicatorSplitMetadata:
         bridge.dim_mapping = {'b': 0}
         return bridge
 
+    def test_send_dtype_validation_accepts_bridge_dtype(self):
+        bridge = self._bridge()
+        bridge.comm_dtype = torch.bfloat16
+
+        bridge._validate_send_dtype(torch.empty(1, dtype=torch.bfloat16), "send_forward")
+
+    def test_send_dtype_validation_rejects_mismatch(self):
+        bridge = self._bridge()
+        bridge.comm_dtype = torch.bfloat16
+        bridge.current_rank = 3
+        bridge.src_module_name = "vision"
+        bridge.dest_module_name = "language"
+
+        with pytest.raises(
+            TypeError, match="sending torch.float32.*receive dtype is torch.bfloat16"
+        ):
+            bridge._validate_send_dtype(torch.empty(1, dtype=torch.float32), "send_forward")
+
     def test_split_tensor_aggregates_per_sample_metadata_by_peer(self):
         tensor = torch.arange(6).reshape(6, 1)
         tensor._mimo_bridge_split_sizes = [0, 3, 1, 2]

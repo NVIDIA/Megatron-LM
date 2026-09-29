@@ -119,7 +119,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
                     p.grad.zero_()
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
     FP8GlobalStateManager.reset()
 
     # ---- Phase 2: GTP_remat=4 (world = TP1 * GTP4 * CP1 * DP1) ----
@@ -169,7 +169,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     if rank == 0:
         _assert_loss_trajectories_match(baseline_losses, gtp_losses, STEPS)

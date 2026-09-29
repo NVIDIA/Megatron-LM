@@ -68,6 +68,8 @@ are known open gaps.
 | Fused cross-entropy loss (`--cross-entropy-loss-fusion`) | rejected by `--deterministic-mode` (`megatron/training/determinism.py`) | The fused kernel is non-deterministic. Whether a deterministic variant is feasible remains an open question. Until then, the framework uses the native vocab-parallel path. |
 | TP communication overlap (`--tp-comm-overlap`) | rejected by `--deterministic-mode` | Overlapped collective ordering is not reproducible. |
 | Packed sequence (`thd`) in gated-delta-net | assertion in `megatron/core/ssm/gated_delta_net.py` | No deterministic packed-sequence SSM path exists yet. |
+| Pre-GDR fusion (`--gdn-pre-gated-delta-rule-fusion`) | rejected by `GatedDeltaNet._setup_variant_attrs` | Uses atomic parameter-gradient reductions and timing-based Triton autotuning. |
+| Post-GDR fusion (`--gdn-gated-output-norm-fusion`) | rejected on every fused forward by `validate_gated_norm` | The supported configuration requires `deterministic_mode=False`; preserve the unfused path for deterministic mode. |
 | Cross-allocation floating-point collectives (TP all-reduce, DP grad reduce-scatter) | open gap | `NCCL_ALGO=Ring` pins the algorithm but not the physical ring an allocation receives. The environment variable alone does not guarantee bit-exactness across *different* allocations for these reductions. Runs repeated within one allocation, or on allocations with identical topology, remain bit-exact. |
 
 ## Performance Notes

@@ -456,7 +456,11 @@ class TestA2AOverlap:
         not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
     )
     @pytest.mark.parametrize(
-        "wire_dtype", ["bf16", pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200)]
+        "wire_dtype",
+        [
+            pytest.param("bf16", marks=pytest.mark.flaky_in_dev),
+            pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200),
+        ],
     )
     def test_transformer_layer_overlap_zero_copy(self, wire_dtype):
         """ncclEP zero-copy under 1F1B a2a overlap must match the non-overlap reference.

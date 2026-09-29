@@ -46,7 +46,7 @@ class GlobalLayout:
         size is a multiple of ``chunk_size``; DBuffer derives rank-local slices
         later through DTensor placements.
 
-        The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
+        The computed layout is compatible with RowAtomic, TensorAtomic, and BlockAtomic,
         even though the latter two are not implemented.
 
         ``chunk_size`` is the least common multiple of each tensor's row size
@@ -243,7 +243,7 @@ class GlobalLayout:
             axis_size = mesh.size(axis)
             if numel % axis_size != 0:
                 raise ValueError(
-                    f"Local range size {numel} is not divisible by Flat axis size {axis_size}."
+                    f"Local range size {numel} is not divisible by RowAtomic axis size {axis_size}."
                 )
             shard_size = numel // axis_size
             offset += mesh.get_local_rank(axis) * shard_size

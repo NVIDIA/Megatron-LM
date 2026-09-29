@@ -1,22 +1,22 @@
 ---
 name: pr-review
-description: Prompt asset for the Claude Code Review GitHub Action. It is read as a file by .github/workflows/claude_review.yml and is not an interactive skill — do not load it to answer questions or to review code outside that workflow.
+description: Review rubric for the `/review` pull-request command. The formal reviewer reads it as a file and it is not an interactive skill — do not load it to answer questions or to review code outside that command.
 license: Apache-2.0
 disable-model-invocation: true
 user_invocable: false
 ---
 
-# Claude PR Review
+# PR Review
 
-This is the review prompt behind `.github/workflows/claude_review.yml`. The
-workflow supplies `REPO`, `PR NUMBER`, `REVIEW DEPTH` and — for strict reviews —
-`BASE REF`, then tells the reviewer to read this file.
+This is the review rubric behind the `/review` pull-request command. The
+reviewer receives the requested `REVIEW DEPTH` (`mode=light|strict`), then reads
+this file.
 
 It lives in `skills/` so the rubric can be diffed, reviewed and evolved like
 code instead of being buried in YAML, but it is deliberately inert: the
 frontmatter carries `disable-model-invocation: true`, so Claude Code drops it
 from the advertised skill list and refuses to auto-invoke it. Reading it by
-path, which is exactly what the workflow does, still works. Do not add a
+path, which is exactly what the reviewer does, still works. Do not add a
 `when_to_use:` field — that is the trigger text that would make it activate on
 its own.
 
@@ -27,8 +27,8 @@ rubric, so loading the other adds nothing but noise:
 
 | `REVIEW DEPTH` | Comment trigger | Read |
 | -------------- | --------------- | ---- |
-| `light` | `/claude review` | `skills/pr-review/references/light.md` |
-| `strict` | `/claude strict-review` | `skills/pr-review/references/strict.md` |
+| `light` | `/review` | `skills/pr-review/references/light.md` |
+| `strict` | `/review mode=strict` | `skills/pr-review/references/strict.md` |
 
 ## Mandatory workflow — never skip or reorder
 
