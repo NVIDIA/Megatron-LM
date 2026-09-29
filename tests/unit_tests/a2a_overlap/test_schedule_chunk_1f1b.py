@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
+from megatron.core.transformer.moe import fused_a2a
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     apply_flex_backend_kwargs,
@@ -239,16 +240,43 @@ class TestA2AOverlap:
     produces the same results as the reference implementation.
     """
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=4,
-        )
-        set_streams()
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+    @pytest.fixture(autouse=True)
+    def model_parallel(self):
+        """Own all process groups created by one parametrized case, including TP resets."""
+        Utils.initialize_distributed()
+        # destroy_model_parallel clears MCore's NCCL group references, but c10d still
+        # owns the groups. Repeated initialization otherwise accumulates communicators
+        # until even the small cross-entropy all-reduce runs out of device memory.
+        # Snapshot after distributed initialization to preserve the default group and
+        # any groups owned by other tests. Use c10d's registry to include groups from
+        # the padding-mask test's second initialize_model_parallel call as well.
+        pg_map = torch.distributed.distributed_c10d._world.pg_map
+        existing_groups = set(pg_map)
+        try:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                expert_model_parallel_size=4,
+            )
+            set_streams()
+            yield
+        finally:
+            # The test helpers have returned, so their last model/plan locals no longer
+            # keep cyclic graphs alive. Finalize NCCL EP before destroying the borrowed
+            # EP communicator. Cached flex buffers must not outlive their groups.
+            torch.cuda.synchronize()
+            gc.collect()
+            fused_a2a.reset_hybrid_ep_buffer()
+            fused_a2a._buffer = None
+            Utils.destroy_model_parallel()
+            # Gloo groups already destroyed by MCore are no longer in this registry.
+            # Reverse creation order consistently on every rank, preserving WORLD.
+            for group in reversed(list(pg_map)):
+                if group not in existing_groups:
+                    torch.distributed.destroy_process_group(group)
+            gc.collect()
+            torch.cuda.empty_cache()
+            assert set(pg_map) <= existing_groups, "test leaked distributed process groups"
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
