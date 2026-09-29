@@ -94,6 +94,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
     """
 
+    sft_cross_document_attention: bool = False
+    """When True, :class:`SFTDataset` emits packed samples without ``cu_seqlens`` and with
+    continuous position ids, so the conversations packed into a sample share plain causal
+    attention (as documents do in pretraining) instead of being isolated by THD packing."""
+
     varlen_mock_dataset_config_json: Optional[str] = None
     """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
     used by the ``--use-varlen-dataset`` path; kept separate so the varlen path

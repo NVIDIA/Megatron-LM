@@ -17,10 +17,38 @@ except ModuleNotFoundError:
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
+# For base models without a chat template. System messages render to nothing, so they only mark
+# conversation boundaries for packing. The answer follows a newline, not a space, so tokenizing
+# each turn separately gives the same tokens as tokenizing the whole conversation.
+plain_qa_template = """{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Question: ' + message['content'].strip() + '\nAnswer:\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + eos_token }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
+# Multi-turn version. Every assistant turn ends with EOS; a non-empty system message becomes a
+# (loss-masked) "System:" line, while an empty one only marks a conversation start.
+plain_chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}{% if message['content'].strip() %}{{ 'System: ' + message['content'].strip() + '\n' }}{% endif %}{% elif message['role'] == 'user' %}{{ 'User: ' + message['content'].strip() + '\nAssistant:\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + eos_token }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 # fmt: on
 
 
 IGNORE_INDEX = -100
+
+
+PLAIN_TEMPLATES = {"plain-qa": plain_qa_template, "plain-chat": plain_chat_template}
+
+
+def _plain_pad_token_id(tokenizer, prompt_format):
+    """Pad token for the plain-* formats, which must not be EOS.
+
+    Padded positions are loss-masked by token id, which would also mask the EOS that ends each
+    answer. Base tokenizers often have no pad token, so fall back to the FIM pad token that
+    StarCoder-style vocabularies reserve.
+    """
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.convert_tokens_to_ids("<|fim_pad|>")
+    assert pad_token_id is not None and pad_token_id != tokenizer.unk_token_id, (
+        f"{prompt_format} needs a pad token distinct from EOS; the tokenizer has neither a pad "
+        "token nor <|fim_pad|>."
+    )
+    assert pad_token_id != tokenizer.eos_token_id, f"{prompt_format} pad token must not be EOS"
+    return pad_token_id
 
 
 @dataclass
@@ -89,6 +117,14 @@ class SFTTokenizer:
                 assistant_prefix_len=0,
                 pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
                 custom_chat_template=identity_template,
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format in PLAIN_TEMPLATES:
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=_plain_pad_token_id(tokenizer, prompt_format),
+                custom_chat_template=PLAIN_TEMPLATES[prompt_format],
                 has_bos=False,
                 has_system_role=True,
             )

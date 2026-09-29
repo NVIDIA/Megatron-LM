@@ -76,7 +76,8 @@ class SFTDataset(MegatronDataset):
         return SFTLowLevelDataset(dataset_path)
 
     def __len__(self) -> int:
-        return self.num_samples
+        # --full-validation builds splits with num_samples=None, meaning one pass over the data.
+        return self.num_samples if self.num_samples is not None else len(self.indices)
 
     def _split_conversations(self, merged_conversations):
         split_conversations = []
@@ -198,6 +199,16 @@ class SFTDataset(MegatronDataset):
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
         # attention_mask = None
 
+        if self.config.sft_cross_document_attention:
+            # Plain causal attention over the whole pack, so positions run on across
+            # conversations like documents in pretraining.
+            return {
+                'tokens': input_ids,
+                'labels': labels,
+                'loss_mask': loss_mask,
+                'position_ids': torch.arange(pack_length, dtype=torch.int64),
+            }
+
         assert len(cu_seqlens) >= 2
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
         # Calculating max_seqlen here, rather than incrementally above, because of possible
@@ -222,6 +233,51 @@ class SFTDataset(MegatronDataset):
             'position_ids': position_ids,
             'cu_seqlens': padded_cu_seqlens,
             'max_seqlen': max_seqlen,
+        }
+
+
+class PretrainValidAsSFTDataset(torch.utils.data.Dataset):
+    """Presents a pretraining GPTDataset in the packed-sample format SFTDataset returns.
+
+    Lets an SFT run evaluate pretraining-format validation data (e.g. to measure forgetting):
+    each sequence becomes a pack holding one document spanning the whole sequence, so attention
+    is plain causal over the sequence and the loss matches pretraining evaluation.
+
+    Args:
+        dataset (MegatronDataset): The pretraining (GPTDataset) validation split
+        max_samples (Optional[int]): Use only the first max_samples sequences
+        packed (bool): Emit THD packing fields (cu_seqlens, max_seqlen), matching an SFT run
+            that isolates packed conversations; False matches --sft-cross-document-attention
+    """
+
+    def __init__(
+        self, dataset: MegatronDataset, max_samples: Optional[int] = None, packed: bool = True
+    ) -> None:
+        self.dataset = dataset
+        self.index_split = dataset.index_split
+        self.num_samples = len(dataset) if max_samples is None else min(len(dataset), max_samples)
+        self.packed = packed
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.dataset[idx]
+        if not self.packed:
+            return {
+                key: sample[key] for key in ('tokens', 'labels', 'loss_mask', 'position_ids')
+            }
+        seq_length = sample['tokens'].numel()
+        # Padded to seq_length + 1 entries like SFTDataset, so default_collate can stack them.
+        cu_seqlens = torch.full((seq_length + 1,), seq_length, dtype=torch.int32)
+        cu_seqlens[0] = 0
+        return {
+            'tokens': sample['tokens'],
+            'labels': sample['labels'],
+            'loss_mask': sample['loss_mask'],
+            'position_ids': sample['position_ids'],
+            'cu_seqlens': cu_seqlens,
+            'max_seqlen': torch.tensor(seq_length, dtype=torch.int32),
         }
 
 

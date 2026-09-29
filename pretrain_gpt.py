@@ -7,6 +7,7 @@ import time
 
 _PROGRAM_START_TIME = time.time()
 
+import dataclasses
 import json
 
 from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
@@ -60,7 +61,11 @@ from megatron.training import (
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import (
+    MockSFTDataset,
+    PretrainValidAsSFTDataset,
+    SFTDataset,
+)
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
@@ -116,7 +121,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
-    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
+    has_cu_seqlens = (
+        is_sft and not args.sft_cross_document_attention
+    ) or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -453,6 +460,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
+        "sft_cross_document_attention": args.sft_cross_document_attention,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
         "varlen_sbhd_validation": args.varlen_sbhd_validation,
     }
@@ -526,9 +534,44 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
+    if args.sft and args.sft_pretrain_valid_data_path:
+        valid_ds = _as_list(valid_ds) + _build_sft_pretrain_valid_datasets(
+            config, is_dataset_built
+        )
+
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
+
+
+def _as_list(datasets):
+    return datasets if isinstance(datasets, list) else [datasets]
+
+
+def _build_sft_pretrain_valid_datasets(sft_config, is_dataset_built):
+    """Build the --sft-pretrain-valid-data-path sets as SFT-format validation datasets."""
+    args = get_args()
+    print_rank_0("> building pretraining-format validation sets for SFT ...")
+    # Same sequence length, seed and masking as the SFT run, with only a validation blend
+    # (blend and split cleared, since they exclude blend_per_split).
+    config = dataclasses.replace(
+        sft_config,
+        blend=None,
+        blend_per_split=[None, (args.sft_pretrain_valid_data_path, None), None],
+        split=None,
+    )
+    # num_samples=None builds one pass over each set, as --full-validation expects.
+    _, pretrain_valid_ds, _ = BlendedMegatronDatasetBuilder(
+        GPTDataset, [0, None, 0], is_dataset_built, config
+    ).build()
+    return [
+        None
+        if ds is None
+        else PretrainValidAsSFTDataset(
+            ds, args.sft_pretrain_valid_samples, packed=not args.sft_cross_document_attention
+        )
+        for ds in _as_list(pretrain_valid_ds)
+    ]
 
 
 def get_embedding_ranks(pp_ranks: List[int]):

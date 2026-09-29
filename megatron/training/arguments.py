@@ -1695,6 +1695,16 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    if args.sft_cross_document_attention:
+        assert args.sft, "--sft-cross-document-attention requires --sft."
+    if args.sft_pretrain_valid_data_path:
+        assert args.sft, "--sft-pretrain-valid-data-path requires --sft."
+        assert args.multiple_validation_sets and args.full_validation, (
+            "--sft-pretrain-valid-data-path adds validation sets, so it requires "
+            "--multiple-validation-sets and --full-validation."
+        )
+        assert not args.mock_data, "--sft-pretrain-valid-data-path does not support --mock-data."
+
     # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
     # because they are mutually-exclusive top-level dataset selectors that both
     # drive the packed-sequence (THD) path. These stay in validate_args: the
@@ -3939,6 +3949,23 @@ def _add_sft_args(parser):
                        'defaults to a lognormal distribution with min_seq_len=seq_length//2, '
                        'max_seq_len=seq_length, mean_seq_len=seq_length*3//4, '
                        'lognormal_sigma=1.1.')
+    group.add_argument('--sft-cross-document-attention', action='store_true',
+                       help='Let the conversations packed into one SFT sample attend to each '
+                       'other with plain causal attention and continuous positions, as '
+                       'documents do in pretraining, instead of isolating them with THD '
+                       'packing. Loss masking is unchanged. Use when no attention backend '
+                       'supports THD (e.g. no flash-attn and cuDNN without THD support).')
+    group.add_argument('--sft-pretrain-valid-data-path', nargs='*', default=None,
+                       help='Pretraining-format (bin/idx) dataset prefixes evaluated as extra '
+                       'validation sets during --sft, e.g. to track forgetting of the '
+                       'pretraining distribution. Each prefix is its own validation set, '
+                       'evaluated after the SFT validation set(s) from --valid-data-path; '
+                       '--validation-set-names covers both, SFT sets first. Requires '
+                       '--multiple-validation-sets and --full-validation.')
+    group.add_argument('--sft-pretrain-valid-samples', type=int, default=None,
+                       help='Evaluate only the first N sequences of each '
+                       '--sft-pretrain-valid-data-path set (a fixed, seed-determined subset). '
+                       'Default: the whole set.')
     return parser
 
 
