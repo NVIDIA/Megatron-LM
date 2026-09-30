@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Compatibility tests for MTP and MIMO with streamwise wide residuals."""
+"""HybridStack compatibility tests for streamwise wide residuals."""
 
 from unittest.mock import patch
 
@@ -29,6 +29,7 @@ def _wide_config(
     hidden_size: int,
     mtp_num_layers: int | None = None,
     with_moe: bool = False,
+    moe_num_hash_layers: int = 0,
     fp32_residual_connection: bool = False,
 ):
     moe_config = {}
@@ -40,6 +41,8 @@ def _wide_config(
             "moe_router_topk": 2,
             "moe_grouped_gemm": True,
             "add_bias_linear": False,
+            "moe_num_hash_layers": moe_num_hash_layers,
+            "hash_moe_vocab_size": 128 if moe_num_hash_layers else None,
         }
     return TransformerConfig(
         num_layers=num_layers,
@@ -54,6 +57,7 @@ def _wide_config(
         bf16=fp32_residual_connection,
         params_dtype=torch.bfloat16 if fp32_residual_connection else torch.float32,
         fp32_residual_connection=fp32_residual_connection,
+        is_hybrid_model=moe_num_hash_layers > 0,
         recompute_granularity="selective",
         recompute_modules=["residual_stream"],
         residual_stream_recompute_num_layers=1,
@@ -209,3 +213,54 @@ class TestWideResidualMTPAndMIMO:
         assert model.language_model.decoder.residual_stream_readout.exit_map.logit.grad is not None
         assert returned_loss_mask is loss_mask
         assert loss.shape == input_ids.shape
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_wide_hybrid_hash_moe_uses_global_layer_threshold_and_token_ids():
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _wide_config(num_layers=3, hidden_size=256, with_moe=True, moe_num_hash_layers=1)
+        model = _move_model_to_configured_dtype(
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=wide_residual_hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=4,
+                hybrid_layer_pattern="MEE",
+                position_embedding_type="none",
+            ),
+            config,
+        )
+        hash_layer, learned_layer = model.decoder.layers[1:]
+        hash_router = hash_layer.mlp.router
+        learned_router = learned_layer.mlp.router
+        assert isinstance(hash_layer, WideResidualTransformerLayer)
+        assert hash_layer.layer_number == 2
+        assert hash_router.hash_moe_layer_threshold == 2
+        assert hash_router.is_hash_layer
+        assert hash_router.tid2eid is not None
+        assert learned_layer.layer_number == 3
+        assert learned_router.hash_moe_layer_threshold == 2
+        assert not learned_router.is_hash_layer
+        assert learned_router.tid2eid is None
+
+        input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
+        position_ids = torch.arange(4, device="cuda").unsqueeze(0).expand(2, -1)
+        with patch.object(hash_router, "_hash_routing", wraps=hash_router._hash_routing) as route:
+            loss = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                labels=input_ids.roll(-1, dims=1),
+            )
+            route.assert_called()
+            assert torch.equal(route.call_args.args[1], input_ids)
+            loss.mean().backward()
+
+        assert hash_router.weight.grad is not None
+        assert learned_router.weight.grad is not None
+        assert model.decoder.residual_stream_readout.exit_map.logit.grad is not None
+    finally:
+        Utils.destroy_model_parallel()
