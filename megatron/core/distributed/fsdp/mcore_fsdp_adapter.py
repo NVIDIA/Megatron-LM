@@ -655,9 +655,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
-        dense_grad_divisor, expert_grad_divisor = _get_grad_divisors(
-            config, dp_mesh, expert_dp_mesh
-        )
+        dense_grad_scale, expert_grad_scale = _get_grad_scales(config, dp_mesh, expert_dp_mesh)
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -690,7 +688,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            grad_divisor=expert_grad_divisor,
+                            grad_scale=expert_grad_scale,
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
@@ -705,7 +703,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        grad_divisor=dense_grad_divisor,
+                        grad_scale=dense_grad_scale,
                         **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
@@ -714,7 +712,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 module,
                 mesh=dp_mesh,
                 placements=dense_placements,
-                grad_divisor=dense_grad_divisor,
+                grad_scale=dense_grad_scale,
                 **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
@@ -972,10 +970,10 @@ _DATA_PARALLEL_PLACEMENTS = {
 }
 
 
-def _get_grad_divisors(
+def _get_grad_scales(
     config: TransformerConfig, dp_mesh: DeviceMesh, expert_dp_mesh: DeviceMesh | None
 ) -> tuple[float, float]:
-    """Return the additional dense and expert gradient divisors for MFSDP v2."""
+    """Return the dense and expert gradient multipliers applied after MFSDP v2 averaging."""
     if config.calculate_per_token_loss:
         # With per-token normalization, backward uses each rank's sum of valid-token
         # losses, sᵢ, where nᵢ is the valid-token count.
@@ -983,21 +981,21 @@ def _get_grad_divisors(
         # (0, 1) and (2, 3); expert A has replicas on ranks 0 and 2. EP backward routes
         # gradients from both source ranks' losses back to each expert replica:
         #     g₀ = ∂(s₀ + s₁)/∂θ_A,  g₂ = ∂(s₂ + s₃)/∂θ_A.
-        # We need their sum, so cancel EDP averaging with grad_divisor = 1 / EDP:
-        #     ((g₀ + g₂) / EDP) / (1 / EDP) = g₀ + g₂
-        #                                  = ∂(s₀ + s₁ + s₂ + s₃)/∂θ_A.
+        # We need their sum, so cancel EDP averaging with grad_scale = EDP:
+        #     ((g₀ + g₂) / EDP) * EDP = g₀ + g₂
+        #                            = ∂(s₀ + s₁ + s₂ + s₃)/∂θ_A.
         # For dense parameters θ_dense, let gᵢ = ∂sᵢ/∂θ_dense. Here dp_mesh.size() = 4.
-        # MFSDP averages over all four ranks, then divides by grad_divisor = 1 / 4:
-        #     ((g₀ + g₁ + g₂ + g₃) / 4) / (1 / 4) = g₀ + g₁ + g₂ + g₃
-        #                                         = ∂(s₀ + s₁ + s₂ + s₃)/∂θ_dense.
+        # MFSDP averages over all four ranks, then multiplies by grad_scale = 4:
+        #     ((g₀ + g₁ + g₂ + g₃) / 4) * 4 = g₀ + g₁ + g₂ + g₃
+        #                                  = ∂(s₀ + s₁ + s₂ + s₃)/∂θ_dense.
         # After accumulation, finalize_model_grads() divides gradients by N, the valid-token
         # count across all ranks and microbatches. For this single-microbatch example,
         # N = n₀ + n₁ + n₂ + n₃, so the final expert gradient is:
         #     (g₀ + g₂) / N = ∂[(s₀ + s₁ + s₂ + s₃) / N]/∂θ_A.
-        dense_grad_divisor = 1.0 / dp_mesh.size()
-        expert_grad_divisor = 1.0
+        dense_grad_scale = float(dp_mesh.size())
+        expert_grad_scale = 1.0
         if expert_dp_mesh is not None:
-            expert_grad_divisor = 1.0 / expert_dp_mesh.size()
+            expert_grad_scale = float(expert_dp_mesh.size())
     else:
         # Without per-token normalization, backward uses each microbatch's mean
         # valid-token loss, so dense gradients need the mesh's rank average.
@@ -1008,18 +1006,18 @@ def _get_grad_divisors(
         # source rank i. Its mean loss is sᵢ / nᵢ. EP backward routes gradients back
         # to the experts, so each replica includes BOTH source ranks' mean losses:
         #     g₀ = ∂(s₀/n₀ + s₁/n₁)/∂θ_A,  g₂ = ∂(s₂/n₂ + s₃/n₃)/∂θ_A.
-        # EDP averaging followed by grad_divisor = EP gives:
-        #     ((g₀ + g₂) / EDP) / EP = (g₀ + g₂) / 4
-        #                            = ∂[(s₀/n₀ + s₁/n₁ + s₂/n₂ + s₃/n₃) / 4]/∂θ_A.
+        # EDP averaging followed by grad_scale = 1 / EP gives:
+        #     ((g₀ + g₂) / EDP) * (1 / EP) = (g₀ + g₂) / 4
+        #                                  = ∂[(s₀/n₀ + s₁/n₁ + s₂/n₂ + s₃/n₃) / 4]/∂θ_A.
         # The same calculation applies to the experts on ranks 1 and 3.
         # There are EP * EDP source ranks, but EDP averaging divides by only EDP.
-        # Divide by EP as well to obtain the mean gradient over all source ranks.
+        # Multiply by 1 / EP as well to obtain the mean gradient over all source ranks.
         # When all nᵢ are equal, this equals:
         #     ∂[(s₀ + s₁ + s₂ + s₃) / (n₀ + n₁ + n₂ + n₃)]/∂θ_A,
         # matching the per-token branch above.
-        dense_grad_divisor = 1.0
-        expert_grad_divisor = config.expert_model_parallel_size
-    return dense_grad_divisor, expert_grad_divisor
+        dense_grad_scale = 1.0
+        expert_grad_scale = 1.0 / config.expert_model_parallel_size
+    return dense_grad_scale, expert_grad_scale
 
 
 def _build_expert_mesh_and_placements(

@@ -196,7 +196,7 @@ class FsdpModule:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: float = 1.0,
+        grad_scale: float = 1.0,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
@@ -209,8 +209,8 @@ class FsdpModule:
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
-        if grad_divisor <= 0:
-            raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
+        if grad_scale <= 0:
+            raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             first_parameter = next(iter(group_parameters.values()))
@@ -228,7 +228,7 @@ class FsdpModule:
                         main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
-                    grad_divisor=grad_divisor,
+                    grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                 )
             )
