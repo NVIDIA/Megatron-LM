@@ -124,6 +124,7 @@ def initialize_quantized_gpt_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     with torch.no_grad():
         for p in model.parameters():
