@@ -247,6 +247,31 @@ class TestGetModelBucketSizingPgCollection:
 
 
 class TestPackedSampleAccounting:
+    @pytest.mark.parametrize("cp,weight_shards,samples", [(1, 4, 8), (4, 2, 2), (2, 4, 4)])
+    def test_static_cp_sample_count_and_scheduler(self, monkeypatch, cp, weight_shards, samples):
+        """Folded CP counts each sequence once for progress and sample-based LR schedules."""
+        import megatron.training.training as training
+
+        args = SimpleNamespace(
+            gtp_remat_fold_cp=True,
+            world_size=8,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp,
+            gtp_weight_remat_size=weight_shards,
+            micro_batch_size=2,
+            train_iters=None,
+            train_samples=10_000,
+        )
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)
+        monkeypatch.setattr(training, "is_pp_last_stage", lambda group: True)
+        monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
+
+        count = training._get_samples_seen_in_iteration([{}] * 3, args, SimpleNamespace(pp=None))
+
+        assert count == 3 * 2 * samples
+        assert _get_optimizer_param_scheduler_increment(args, count) == 3 * 2 * samples
+
     def test_pop_samples_seen_sums_and_removes_metadata(self):
         losses = [
             {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
