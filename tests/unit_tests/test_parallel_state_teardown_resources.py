@@ -117,6 +117,78 @@ def test_resource_owners_register_teardown():
     assert OptimizerCudaGraphWrapper.reset_cuda_graph in graphs
 
 
+def test_release_failure_keeps_groups(recorded_teardown, monkeypatch):
+    events = recorded_teardown
+    stage = ps.TeardownStage
+
+    def finalize_nccl_ep():
+        events.append("ep_finalize")
+        raise RuntimeError("injected EP finalization failure")
+
+    ps.register_model_parallel_teardown(stage.RELEASE_CUDA_GRAPHS, _recorder(events, "graphs"))
+    ps.register_model_parallel_teardown(
+        stage.RELEASE_COMMUNICATION, _recorder(events, "a2a_buffers")
+    )
+    ps.register_model_parallel_teardown(stage.RELEASE_COMMUNICATION, finalize_nccl_ep)
+    group = object()
+    monkeypatch.setattr(ps, "_MODEL_PARALLEL_GROUP", group)
+    groups = ps._global_process_group_list
+
+    with pytest.raises(RuntimeError, match="injected EP finalization failure"):
+        ps.destroy_model_parallel()
+    # The other releases still ran; the groups and module state were kept.
+    assert events == ["ep_finalize", "a2a_buffers", "graphs"]
+    assert ps._global_process_group_list is groups
+    assert ps._MODEL_PARALLEL_GROUP is group
+
+
+def test_inprocess_restart_raises_teardown_failure(monkeypatch):
+    inprocess = pytest.importorskip("nvidia_resiliency_ext.inprocess")
+    from megatron.training import inprocess_restart
+
+    wrapper_kwargs = {}
+
+    def wrapper(**kwargs):
+        wrapper_kwargs.update(kwargs)
+        return lambda train: train
+
+    monkeypatch.setattr(inprocess, "Wrapper", wrapper)
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    args = SimpleNamespace(
+        inprocess_active_world_size=1,
+        inprocess_granularity="rank",
+        inprocess_empty_cuda_cache=True,
+        async_strategy=None,
+        inprocess_heartbeat_interval=30,
+        inprocess_heartbeat_timeout=60,
+        inprocess_barrier_timeout=120,
+        inprocess_completion_timeout=120,
+        inprocess_monitor_process_interval=1.0,
+        inprocess_monitor_thread_interval=1.0,
+        inprocess_last_call_wait=1.0,
+        inprocess_soft_timeout=60,
+        inprocess_hard_timeout=90,
+        inprocess_termination_grace_time=1.0,
+    )
+    inprocess_restart.inprocess_restart(lambda: None, args)
+    finalize = wrapper_kwargs["finalize"]
+    torch.cuda.init()
+    state = SimpleNamespace(rank=0)
+
+    calls = []
+    monkeypatch.setattr(inprocess_restart, "destroy_state", lambda: calls.append("destroy"))
+    assert finalize(state) is state
+    assert calls == ["destroy"]
+
+    def destroy_state():
+        raise RuntimeError("injected teardown failure")
+
+    # ThreadedFinalize alone would drop this error on its thread.
+    monkeypatch.setattr(inprocess_restart, "destroy_state", destroy_state)
+    with pytest.raises(RuntimeError, match="injected teardown failure"):
+        finalize(state)
+
+
 def test_abort_failure_does_not_enter_graceful_destroy(monkeypatch):
     groups = [Mock(), Mock()]
     groups[1]._get_backend.return_value.abort.side_effect = RuntimeError("injected abort failure")
