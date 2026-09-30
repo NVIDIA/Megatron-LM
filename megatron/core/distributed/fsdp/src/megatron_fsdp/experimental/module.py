@@ -82,6 +82,7 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
+        self._deferred_post_backward_hooks: dict[FsdpModule, Callable[[FsdpModule], None]] = {}
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -137,8 +138,21 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this context's gradient reductions."""
+        hooks, self._deferred_post_backward_hooks = self._deferred_post_backward_hooks, {}
+        for module, hook in hooks.items():
+            hook(module)
         self.current_stream().wait_stream(self.reduce_scatter_stream)
         self._post_backward_hook_registered = False
+
+    def defer_post_backward(
+        self, module: "FsdpModule", hook: Callable[["FsdpModule"], None]
+    ) -> None:
+        """Finish a reused module after autograd, once all its uses have contributed."""
+        if self._post_backward_hook_registered:
+            self._deferred_post_backward_hooks[module] = hook
+        else:
+            # Delayed TE gradients can become ready after autograd has finished.
+            hook(module)
 
     def register_post_backward_hook(self) -> None:
         """Register one context-level final callback for the current backward.
@@ -207,6 +221,8 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
+        self._forward_invocations = 0
+        self._ready_parameters: set[nn.Parameter] = set()
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
@@ -328,9 +344,19 @@ class FsdpModule:
         # before that when module inputs do not require grad.
         module_ref = ref(self)
 
-        def grad_hook(_: nn.Parameter) -> None:
+        def grad_hook(parameter: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
+                return
+            if module._forward_invocations > 1:
+                # Reentrant checkpointing can accumulate a parameter more than
+                # once. Count distinct parameters, then wait for all uses of them.
+                module._ready_parameters.add(parameter)
+                if (
+                    len(module._ready_parameters)
+                    == module._trainable_parameter_countdown.initial_value
+                ):
+                    module.context.defer_post_backward(module, post_backward_hook)
                 return
             if module._trainable_parameter_countdown.decrement():
                 post_backward_hook(module)
@@ -389,6 +415,8 @@ class FsdpModule:
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
         is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        if not is_recomputing:
+            self._forward_invocations += 1
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -398,6 +426,10 @@ class FsdpModule:
 
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
+            if is_recomputing:
+                # Reentrant checkpointing enters forward in the outer backward,
+                # before starting a nested backward for the recomputed graph.
+                context.register_post_backward_hook()
 
         self.unshard(prefetch="forward" if not is_recomputing else "none")
 
@@ -498,6 +530,10 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+        # Every invocation installs a pre-hook, but leaf gradients can accumulate
+        # only after several of those invocations have finished backward.
+        if self.phase is FsdpModule.Phase.BACKWARD:
+            return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
@@ -520,6 +556,8 @@ class FsdpModule:
         self.reshard()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
+        self._forward_invocations = 0
+        self._ready_parameters.clear()
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
