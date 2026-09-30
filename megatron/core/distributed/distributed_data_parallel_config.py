@@ -119,7 +119,8 @@ class DistributedDataParallelConfig:
       None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
-    """If true, perform gradient reduce and division fusion."""
+    """If true, perform gradient reduce and division fusion. Ignored by MFSDP v1,
+    which scales gradients explicitly to keep coalesced reduction operators consistent."""
 
     suggested_communication_unit_size: int = None
     """Specifies the number of elements to communicate at once during
