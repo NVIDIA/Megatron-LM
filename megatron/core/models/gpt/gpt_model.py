@@ -144,6 +144,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "mtp_hybrid_override_pattern is not supported by GPTModel. "
                 "For GPT models, define MTP layers through mtp_block_spec."
             )
+        if (
+            self.config.enable_mhc_connections
+            and self.config.pipeline_model_parallel_size > 1
+            and self.config.mtp_num_layers
+        ):
+            raise NotImplementedError(
+                "GPTModel does not support mHC with pipeline parallelism and MTP. "
+                "The decoder contracts the residual before the multi-stream MTP block."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

@@ -157,7 +157,9 @@ def _initialize_parameters(model):
             param.copy_(values)
 
 
-def _make_config(pp_size, vp_size, *, tp_size, cp_size, recompute, variable, standalone, mtp):
+def _make_config(
+    pp_size, vp_size, *, tp_size, cp_size, recompute, variable, standalone, mtp, overlap=False
+):
     bf16 = cp_size > 1
     config = TransformerConfig(
         num_layers=4,
@@ -186,7 +188,8 @@ def _make_config(pp_size, vp_size, *, tp_size, cp_size, recompute, variable, sta
         attention_backend=AttnBackend.fused if bf16 else AttnBackend.unfused,
         gradient_accumulation_fusion=False,
         deallocate_pipeline_outputs=True,
-        batch_p2p_comm=True,
+        batch_p2p_comm=not overlap,
+        overlap_p2p_comm=overlap,
         variable_seq_lengths=variable,
         mtp_num_layers=1 if mtp else None,
         mtp_loss_scaling_factor=0.1,
@@ -237,6 +240,32 @@ def _make_models(config, kind, empty):
         _initialize_parameters(model)
         models.append(model)
     return models
+
+
+@pytest.mark.internal
+def test_mhc_gpt_pipeline_rejects_mtp():
+    """Reject GPT's early contraction before constructing its multi-stream MTP block."""
+    if Utils.world_size % 2 != 0:
+        pytest.skip("Requires a world size divisible by 2")
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    try:
+        config = _make_config(
+            2,
+            None,
+            tp_size=1,
+            cp_size=1,
+            recompute=False,
+            variable=False,
+            standalone=False,
+            mtp=True,
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="GPTModel does not support mHC with pipeline parallelism and MTP",
+        ):
+            _make_models(config, "gpt", False)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _batches(variable, cp_group):
@@ -347,19 +376,21 @@ def fresh_mhc_compile_cache():
 @pytest.mark.usefixtures("fresh_mhc_compile_cache")
 @pytest.mark.parametrize("recompute", [False, True], ids=["eager", "recompute_mhc"])
 @pytest.mark.parametrize(
-    "kind,vp_size,tp_size,cp_size,variable,standalone,empty,mtp",
+    "kind,vp_size,tp_size,cp_size,variable,standalone,empty,mtp,overlap",
     [
-        ("gpt", None, 1, 1, False, False, False, False),
-        ("gpt", 2, 1, 1, False, False, False, False),
-        ("gpt", 2, 1, 1, False, True, False, False),
-        ("hybrid", 2, 1, 1, False, False, True, False),
-        ("hybrid", None, 2, 1, False, False, False, True),
-        ("gpt", None, 1, 2, True, False, False, False),
-        ("gpt", 2, 1, 2, True, False, False, False),
+        ("gpt", None, 1, 1, False, False, False, False, False),
+        ("gpt", 2, 1, 1, False, False, False, False, False),
+        ("gpt", 2, 1, 1, False, False, False, False, True),
+        ("gpt", 2, 1, 1, False, True, False, False, False),
+        ("hybrid", 2, 1, 1, False, False, True, False, False),
+        ("hybrid", None, 2, 1, False, False, False, True, False),
+        ("gpt", None, 1, 2, True, False, False, False, False),
+        ("gpt", 2, 1, 2, True, False, False, False, False),
     ],
     ids=[
         "pp2",
         "vpp2",
+        "vpp2_overlap",
         "embedding_loss",
         "empty_hybrid",
         "tp_sp_mtp",
@@ -368,7 +399,7 @@ def fresh_mhc_compile_cache():
     ],
 )
 def test_mhc_schedule_matches_pp1(
-    kind, vp_size, tp_size, cp_size, variable, standalone, empty, mtp, recompute
+    kind, vp_size, tp_size, cp_size, variable, standalone, empty, mtp, overlap, recompute
 ):
     if Utils.world_size % (2 * tp_size * cp_size) != 0:
         pytest.skip("Requires a world size divisible by 2 * TP * CP")
@@ -390,7 +421,7 @@ def test_mhc_schedule_matches_pp1(
                 context_parallel_size=cp_size,
             )
             model_parallel_cuda_manual_seed(123)
-            config = _make_config(pp_size, vp, **kwargs)
+            config = _make_config(pp_size, vp, overlap=overlap and pp_size > 1, **kwargs)
             models = _make_models(config, kind, empty)
             snapshots.append(_run_schedule(config, models))
             del models

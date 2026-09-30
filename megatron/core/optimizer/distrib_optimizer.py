@@ -340,6 +340,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Main parameter groups put native FP32 shards before FP16/BF16
             # master shards. Checkpoint lookups must use that same ordering,
             # even when gradient buffers encountered the low-precision dtype first.
+            # Keep this partition in sync with both orig_group["params"] branches
+            # in _build_model_and_main_param_groups.
             main_param_order = [
                 param for param in group_range["params"] if param.dtype == torch.float32
             ] + [param for param in group_range["params"] if param.dtype != torch.float32]
@@ -501,6 +503,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
+            # _build_optimizer_group_ranges assigns checkpoint indices in this order.
             if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,

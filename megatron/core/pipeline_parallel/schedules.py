@@ -2116,9 +2116,10 @@ def forward_backward_pipelining_with_interleaving(
 def _get_pipeline_hidden_size(config) -> int:
     """Return the residual width carried across every logical pipeline boundary.
 
-    mHC expands at pre_process and contracts at post_process. All communicating
-    stages therefore carry every residual stream, including the last physical
-    rank sending to the next virtual chunk on the first physical rank.
+    Supported mHC layouts expand at pre_process and contract at post_process.
+    GPTModel rejects mHC with PP and MTP, where the decoder can contract earlier.
+    All communicating stages therefore carry every residual stream, including
+    the last physical rank sending to the next virtual chunk on the first rank.
     """
     hidden_size = config.hidden_size
     if config.pipeline_model_parallel_size > 1 and getattr(config, "enable_mhc_connections", False):
