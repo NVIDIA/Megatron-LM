@@ -3331,6 +3331,7 @@ class TestIndexerTensorParallel:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
         )
 
     def _create_indexer(self, config, pg_collection):
