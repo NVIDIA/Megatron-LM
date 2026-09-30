@@ -3467,9 +3467,8 @@ def _add_distributed_args(parser):
                             'DP-Outer is prefetched one FSDP unit beyond the existing '
                             'DP-Inner prefetch frontier. '
                             'Only effective with --outer-dp-sharding-strategy=optim.')
-    group.add_argument('--gradient-reduce-div-fusion', action=argparse.BooleanOptionalAction, default=True,
-                       help='Fuse the division in gradient reduce. Enabled by default. '
-                            'MFSDP v1 requires a single gradient communication dtype per coalesced bucket group.')
+    group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
+                       help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
                        help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
                         "Double-buffering the communication memory improves memory management efficiency by "
