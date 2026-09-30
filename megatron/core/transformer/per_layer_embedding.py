@@ -310,7 +310,7 @@ class NGramEmbedding(MegatronModule):
         )
 
         tp_group = get_tensor_model_parallel_group_if_none(None)
-        if os.environ.get("QWEN48_PLE_CPU_OFFLOAD") == "1":
+        if os.environ.get("QWEN38_PLE_CPU_OFFLOAD") == "1":
             self.ngram_embedding = PinnedVocabParallelEmbedding(
                 self.padded_vocab_size, self.head_dim, config, tp_group
             )
