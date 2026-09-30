@@ -118,7 +118,7 @@ class DistributedDataParallelConfig:
       parallelism is enabled, so the two classes have very different traffic-per-byte.
       None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
-    gradient_reduce_div_fusion: bool = False
+    gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion. MFSDP v1 requires a single
     gradient communication dtype per coalesced bucket group when this is enabled."""
 
