@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+from megatron.core.gtp_parallel_layout import resolve_tensor_parallel_sequence_shards
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
@@ -17,8 +19,28 @@ def get_grid_dim_size(grid: HyperCommGrid, dim: str) -> int:
 
 
 def get_data_lane_rank(pg_collection: ProcessGroupCollection) -> int:
-    """Return the DP x GTP data-lane rank, excluding model-parallel dimensions."""
+    """Return the independent sample rank, excluding every context partition."""
+    sample_group = getattr(pg_collection, "dp_gtp_remat", None)
+    if sample_group is not None:
+        return sample_group.rank()
+    # Compatibility for collections with independent CP/GTP axes only.
     gtp_group = getattr(pg_collection, "gtp_remat", None)
     gtp_size = gtp_group.size() if gtp_group is not None else 1
     gtp_rank = gtp_group.rank() if gtp_group is not None else 0
     return pg_collection.dp.rank() * gtp_size + gtp_rank
+
+
+def get_language_sample_parallel_size(args) -> int:
+    """Count language data lanes before or after stock argument validation."""
+    _, weight_size = resolve_tensor_parallel_weight_shards(
+        getattr(args, "mimo_llm_tp", 1),
+        getattr(args, "tensor_parallel_num_weight_shards", None),
+        getattr(args, "gtp_weight_remat_size", 1),
+    )
+    _, num_sequence_shards = resolve_tensor_parallel_sequence_shards(
+        getattr(args, "mimo_llm_tp", 1),
+        getattr(args, "tensor_parallel_num_sequence_shards", None),
+        weight_size,
+        getattr(args, "sequence_parallel", False),
+    )
+    return args.mimo_llm_dp * (weight_size // num_sequence_shards)

@@ -13,6 +13,7 @@ from examples.mimo.training.args import (
     build_module_grid_specs,
     validate_hetero_grid_args,
 )
+from examples.mimo.utils.hetero import get_language_sample_parallel_size
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
 WORLD_SIZE_8 = 8
@@ -106,6 +107,52 @@ def test_canonical_layout_validates_and_maps_specs():
     assert language_grid_spec.dp == 2
     # expt_tp defaults to 1 when --mimo-llm-expt-tp is unset.
     assert language_grid_spec.expt_tp == 1
+
+
+@pytest.mark.parametrize("llm_only", [False, True])
+def test_sequence_sharding_counts_only_independent_language_samples(llm_only):
+    args = _layout_8gpu_20l(
+        mimo_llm_dp=1,
+        mimo_llm_cp=1,
+        mimo_llm_ep=1,
+        tensor_parallel_num_weight_shards=8,
+        tensor_parallel_num_sequence_shards=4,
+        sequence_parallel=True,
+        mimo_llm_only=llm_only,
+        mimo_llm_offset=0 if llm_only else 4,
+    )
+    world_size = 8 if llm_only else 12
+    specs = build_module_grid_specs(args, world_size, encoder_module_name="images")
+    language = specs[-1]
+    assert language.num_ranks == 8
+    assert language.dp == 1
+    assert language.gtp_remat == 4
+    assert language.gtp_num_sequence_shards == 2
+    assert get_language_sample_parallel_size(args) == 2
+    if not llm_only:
+        assert specs[0].num_ranks == 4
+        assert specs[0].gtp_num_sequence_shards == 1
+
+
+@pytest.mark.parametrize("tp,weight_shards", [(1, 1), (1, 64), (2, 64)])
+def test_sequence_sharding_preserves_requested_weight_shards(tp, weight_shards):
+    args = _layout_8gpu_20l(
+        micro_batch_size=2,
+        mimo_llm_tp=tp,
+        mimo_llm_cp=128 // weight_shards,
+        mimo_llm_dp=1,
+        tensor_parallel_num_weight_shards=weight_shards,
+        tensor_parallel_num_sequence_shards=weight_shards,
+        sequence_parallel=tp > 1,
+    )
+    encoder, language = build_module_grid_specs(args, 132, "vision")
+    assert encoder.num_ranks == 4
+    assert language.num_ranks == 128
+    assert language.cp == 128 // weight_shards
+    assert language.gtp_remat == weight_shards // tp
+    assert language.gtp_num_sequence_shards == weight_shards // tp
+    assert language.dp == 1
+    assert get_language_sample_parallel_size(args) == 1
 
 
 def test_gtp_layout_validates_and_maps_weight_shard_axes():

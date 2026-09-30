@@ -507,10 +507,21 @@ class TestBridgeCommunicator:
                 512,
             ), f"Expected gradient shape {(4, 128, 512)}, got {received_gradient.shape}"
 
-    def test_cp_gradient_reconstruction(self):
+    @pytest.mark.parametrize("fold_cp", [False, True])
+    def test_cp_gradient_reconstruction(self, fold_cp):
         """Complementary destination-CP gradients are summed before fan-in splitting."""
         src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
-        dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        if fold_cp:
+            from examples.mimo.training.topology import ModuleGridSpec, _build_grid
+
+            dest_grid = _build_grid(
+                ModuleGridSpec(
+                    "language", 4, cp=4, gtp_remat=2, rank_offset=4, gtp_remat_fold_cp=True
+                )
+            )
+            _active_grids.append(dest_grid)
+        else:
+            dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
         bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32, tensor_ndim=2)
 
         rows_per_chunk = 2
@@ -522,8 +533,10 @@ class TestBridgeCommunicator:
         source_values_match = True
 
         if bridge.is_current_rank_in_grid(dest_grid):
-            cp_rank = dist.get_rank(group=dest_grid.get_pg("cp"))
-            owned_chunks = (0, 3) if cp_rank == 0 else (1, 2)
+            cp_rank = dist.get_rank(
+                group=dest_grid.get_pg(bridge._context_parallel_dims(dest_grid))
+            )
+            owned_chunks = (cp_rank,) if fold_cp else ((0, 3) if cp_rank == 0 else (1, 2))
             local_gradient = torch.zeros(payload_shape, device="cuda", dtype=torch.float32)
             for chunk_idx in owned_chunks:
                 chunk_start = chunk_idx * rows_per_chunk

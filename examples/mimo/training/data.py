@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from examples.mimo.training.topology import HeteroTopology
-from examples.mimo.utils.hetero import get_data_lane_rank
+from examples.mimo.utils.hetero import get_data_lane_rank, get_language_sample_parallel_size
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -291,13 +291,13 @@ def build_train_valid_test_data_loaders(
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
     encoder_name = _encoder_name(topology)
-    llm_data_parallel_size = args.mimo_llm_dp * args.gtp_weight_remat_size
+    llm_data_parallel_size = get_language_sample_parallel_size(args)
     if (
         encoder_name is not None
         and (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp
     ):
         raise ValueError(
-            "micro_batch_size * mimo_llm_dp * GTP must be divisible by mimo_encoder_dp"
+            "micro_batch_size * language sample lanes must be divisible by mimo_encoder_dp"
         )
 
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
