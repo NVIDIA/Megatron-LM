@@ -711,6 +711,7 @@ class TestTritonSinkhorn:
         configs = [triton.Config({}, num_warps=warps) for warps in (1, 8)]
         was_deterministic = torch.are_deterministic_algorithms_enabled()
         was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        was_fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
         launches = []
         results = []
 
@@ -721,6 +722,7 @@ class TestTritonSinkhorn:
             return out.detach(), inp.grad
 
         try:
+            torch.utils.deterministic.fill_uninitialized_memory = True
             with monkeypatch.context() as patch:
                 for index, tuner in enumerate(tuners):
                     for name in ("best_config", "configs_timings", "bench_time", "nargs"):
@@ -754,17 +756,24 @@ class TestTritonSinkhorn:
                     results.append(run())
         finally:
             torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+            torch.utils.deterministic.fill_uninitialized_memory = was_fill_uninitialized
 
         # A fixed policy is required even if this shape/compiler happens to make
         # multiple warp counts numerically identical. No performance claim is made.
         assert launches == [(0, 4), (1, 4), (0, 4), (1, 4)]
-        for first, second, reference in zip(
-            results[0], results[1], (reference_output, reference_input.grad)
+        for name, first, second, reference in zip(
+            ("output", "input gradient"),
+            results[0],
+            results[1],
+            (reference_output, reference_input.grad),
         ):
+            assert torch.isfinite(first).all() and torch.isfinite(second).all(), name
             assert torch.equal(
                 first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
             )
-            torch.testing.assert_close(first.cpu().double(), reference, atol=2e-6, rtol=2e-5)
+            torch.testing.assert_close(
+                first.cpu().double(), reference, atol=2e-6, rtol=2e-5, msg=name
+            )
 
     @_require_triton
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10), (8, 4, 4, 20)])
