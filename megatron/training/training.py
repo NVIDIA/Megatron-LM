@@ -155,7 +155,7 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import FaultInjectorConfig
-from megatron.training.config.container import PretrainConfigContainer, finalize_optimizer_config
+from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
@@ -1654,7 +1654,6 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
-    cfg_container.finalize()
     cfg_container.validate()
 
     callback_manager = normalize_callbacks(callbacks)
@@ -2901,8 +2900,6 @@ def setup_model_and_optimizer(
     """Setup model and optimizer."""
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
-    cfg = cfg_container if cfg_container is not None else get_run_config()
-    cfg.finalize()
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -2923,13 +2920,15 @@ def setup_model_and_optimizer(
 
             start_memory_history_recording(cfg_container.profiling)
 
-            builder_cls = cfg.model.get_builder_cls()
-            builder = builder_cls(cfg.model)
+            cfg = cfg_container
+            model_config = cfg.model
+            builder_cls = model_config.get_builder_cls()
+            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
             _add_model_freeze_pre_wrap_hook(
-                cfg.model,
+                model_config,
                 freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
             )
@@ -3016,7 +3015,6 @@ def setup_model_and_optimizer(
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
-        finalize_optimizer_config(config, cfg.logger)
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -3307,7 +3305,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
     """
-    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
@@ -3483,7 +3480,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
-    timers('optimizer', log_level=1).start(barrier=cfg.logger.barrier_with_L1_time)
+    timers('optimizer', log_level=1).start(barrier=config.barrier_with_L1_time)
     _opt_cm = (
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
@@ -3498,7 +3495,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
-    if args.qk_clip or cfg.logger.log_max_attention_logit:
+    if args.qk_clip or config.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
@@ -3526,7 +3523,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if cfg.logger.log_num_zeros_in_grad:
+    if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -3848,7 +3845,8 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
-        if cfg.logger.log_max_attention_logit:
+        model_config = get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
+        if model_config is not None and model_config.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)

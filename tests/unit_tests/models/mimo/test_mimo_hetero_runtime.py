@@ -32,11 +32,6 @@ from tests.unit_tests.test_utilities import Utils
 ENCODER = "images"
 
 
-@pytest.fixture(autouse=True)
-def runtime_config(run_config):
-    return run_config
-
-
 def _args(**overrides):
     ddp_defaults = vars(DistributedDataParallelConfig())
     base = dict(

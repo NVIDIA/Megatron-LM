@@ -686,7 +686,7 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         ), "use_te_activation_func must be forwarded from config"
 
 
-def test_gpt_builder_forwards_rope_scaling_factor(run_config):
+def test_gpt_builder_forwards_rope_scaling_factor():
     """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
 
     Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305

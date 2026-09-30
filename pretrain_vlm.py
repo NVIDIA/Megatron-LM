@@ -39,8 +39,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.arguments import parse_and_validate_args
-from megatron.training.argument_utils import get_transformer_config
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from pretrain_gpt import loss_func
 
@@ -119,7 +118,10 @@ def model_provider(
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
-    language_transformer_config = get_transformer_config(args, config)
+    if config is None:
+        language_transformer_config = core_transformer_config_from_args(get_args())
+    else:
+        language_transformer_config = config
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
     else:

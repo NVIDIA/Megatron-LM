@@ -315,23 +315,11 @@ class LoggerConfig:
     log_l2_norm_grad_to_tensorboard: bool = False
     """Enable gradients logging to tensorboard."""
 
-    log_num_zeros_in_grad: bool = False
-    """If set, calculate and log the number of zeros in gradient."""
-
-    log_max_attention_logit: bool = False
-    """Enable max attention logit logging to tensorboard."""
-
     log_runtime_to_tensorboard: bool = False
     """Enable runtime metrics logging to tensorboard."""
 
     runtime_time_unit: str = "hours"
     """Time unit to use for time logging. """
-
-    barrier_with_L1_time: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}})
-    """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
-    make sure calling barrier with their timers will not result in hangs. This can happen if for
-    example the user adds a level 1 timer that is not called by all ranks.
-    """
 
     log_world_size_to_tensorboard: bool = False
     """Enable world size logging to tensorboard."""
@@ -421,11 +409,6 @@ class LoggerConfig:
         """Check logging requirements shared by CLI and native configurations."""
         if self.log_memory_interval is not None:
             assert self.log_memory_interval % self.log_interval == 0
-        if self.log_max_attention_logit:
-            from megatron.core.utils import is_te_min_version
-
-            assert is_te_min_version("2.9.0"), \
-                '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
 
 @dataclass(kw_only=True)

@@ -18,10 +18,11 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 from megatron.inference.text_generation import generate_and_post_process
-from megatron.training.argument_utils import get_transformer_config
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 from megatron.training.argument_utils import inference_cfg_container_from_args
@@ -40,7 +41,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = get_transformer_config(args)
+    config = core_transformer_config_from_args(args)
 
     if args.spec is None:
         if args.transformer_impl == 'local':
