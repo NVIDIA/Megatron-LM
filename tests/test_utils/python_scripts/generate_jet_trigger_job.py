@@ -132,6 +132,7 @@ def main(
             platform=platform,
             tag=tag,
             cadence=cadence_arg,
+            time_limit=time_limit,
         )
         if test_case.type != "build"
     ]
@@ -210,7 +211,7 @@ def main(
                 f"--model {test_case['spec']['model']}",
                 f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
-                f"--time-limit {time_limit}",
+                f"--time-limit {test_case['spec'].get('time_limit', time_limit)}",
                 f"--scope {scope}",
                 f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",

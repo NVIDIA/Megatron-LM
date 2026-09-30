@@ -51,8 +51,24 @@ def test_is_decode_only_uses_current_execution_snapshot(
     context._using_cuda_graph_this_step = using_cuda_graph
     context.num_prefill_requests = num_prefill_requests
     context.padded_batch_dimensions = mock.Mock(prefill_req_count=padded_prefill_requests)
+    # Must be explicitly falsy: a bare Mock attribute is truthy, which would short-circuit
+    # `is_decode_only` to False and make every case below pass for the wrong reason.
+    context.mtp_metadata = mock.Mock(is_varlen_forward=False)
 
     assert context.is_decode_only() is expected
+
+
+@pytest.mark.parametrize("using_cuda_graph", [False, True])
+def test_is_decode_only_is_false_during_the_mtp_commit_pass(using_cuda_graph):
+    """The commit pass is a varlen forward, so it overrides a decode-only request count."""
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context._using_cuda_graph_this_step = using_cuda_graph
+    # Request counts that would otherwise classify this step as decode-only.
+    context.num_prefill_requests = 0
+    context.padded_batch_dimensions = mock.Mock(prefill_req_count=0)
+    context.mtp_metadata = mock.Mock(is_varlen_forward=True)
+
+    assert context.is_decode_only() is False
 
 
 class TestDynamicContext:
@@ -3395,7 +3411,9 @@ class TestDynamicContext:
         prefix_skip = 2 * bs - 1
         eff_chunk = chunk_length - prefix_skip
 
-        _, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, chunk_length)
+        _m = ctx._compute_prefix_match(req2, chunk_length)
+        prefix_skip = _m.prefix_skip_tokens
+        eff_chunk = _m.effective_prefill_chunk_length
         expected_active = tokens_before_chunk_2 + eff_chunk
         assert ctx.active_token_count == expected_active
 

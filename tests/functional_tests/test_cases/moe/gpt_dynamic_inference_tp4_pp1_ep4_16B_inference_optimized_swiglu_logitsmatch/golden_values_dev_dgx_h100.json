@@ -34,10 +34,10 @@
    1394,
    1636
   ],
-  "latency": 4.658271074295044,
-  "ttft": 0.15854811668395996,
+  "latency": 4.945865869522095,
+  "ttft": 0.3214988708496094,
   "cuda_graph_request_count_map": null,
-  "step_count": 30,
+  "step_count": 31,
   "top_n_logprobs": null,
   "prompt_top_n_logprobs": null,
   "prompt_logprobs": [
@@ -282,17 +282,17 @@
   ]
  },
  "throughput": [
-  2.3304007637648834,
-  6.32366590848818,
-  6.396973111935408,
-  6.371799291627996,
-  6.431814924368525,
-  6.440822539177039,
-  6.433822662809243,
-  6.438126830194765
+  2.2780557481054875,
+  6.078742561543894,
+  6.057249714044113,
+  6.044022483363691,
+  6.050279166824139,
+  6.0318890366258495,
+  6.04237916105567,
+  6.063671745414795
  ],
- "mem-max-allocated-bytes": 30659137536,
+ "mem-max-allocated-bytes": 31196024320,
  "lifetime_prefill_token_count": 88,
- "async_sched_step_count": 0,
- "async_sched_compaction_step_count": 0
+ "async_sched_step_count": 30,
+ "async_sched_compaction_step_count": 1
 }

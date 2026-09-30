@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint.metadata import Metadata, TensorProperties, TensorStorageMetadata
 
 try:
     from torch.distributed import DeviceMesh
@@ -350,6 +351,23 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    def test_load_tensors_metadata_ignores_tensor_strides(self, tmp_path):
+        """`strides` (pytorch/pytorch#194251) is a TensorProperties field torch.empty rejects."""
+        properties = TensorProperties(dtype=torch.bfloat16)
+        properties.strides = (4, 1)
+        metadata = Metadata(
+            state_dict_metadata={
+                'keyA': TensorStorageMetadata(
+                    properties=properties, size=torch.Size([3, 4]), chunks=[]
+                )
+            }
+        )
+
+        sharded_metadata = TorchDistLoadShardedStrategy().load_tensors_metadata(tmp_path, metadata)
+
+        assert sharded_metadata['keyA'].dtype == torch.bfloat16
+        assert sharded_metadata['keyA'].global_shape == (3, 4)
+
     def test_can_mix_sharded_tensors_and_factories(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
 
@@ -562,7 +580,10 @@ class TestSerialization:
             save_strategy = TorchDistSaveShardedStrategy(
                 "torch_dist", 1, separation_hint=prefix_name
             )
-            save(state_dict, ckpt_dir, save_strategy)
+            # separation_hint is only supported by the nvrx async writer, so this must
+            # go through the async save path (executed synchronously here).
+            async_request = save(state_dict, ckpt_dir, save_strategy, async_sharded_save=True)
+            async_request.execute_sync()
 
             files = os.listdir(ckpt_dir)
             prefix_files = [f for f in files if f.startswith(prefix_name)]

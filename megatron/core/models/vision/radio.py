@@ -367,14 +367,19 @@ class RADIOViTModel(VisionModule):
             )
 
         if self.separate_video_embedder and self.temporal_patch_dim > 1:
-            embedded_chunks = []
-            for chunk, is_img in zip(x, is_image):
-                if is_img:
-                    emb, _ = self.embedder(chunk)
-                else:
-                    emb, _ = self.video_embedder(chunk)
-                embedded_chunks.append(emb)
-            x = torch.cat(embedded_chunks, dim=1)
+            # Compute image and video embeddings per temporal patch.
+            # x: list of [1, num_patches_for_chunk, 3TP^2 or 3P^2] where
+            # the hidden dimension is the flat concat of patch features
+            # and image -> embedder and video -> video_embedder.
+            local_chunks = [
+                (self.embedder if is_img else self.video_embedder)(
+                    chunk, runtime_gather_output=False
+                )[0]
+                for chunk, is_img in zip(x, is_image)
+            ]
+            # One all-gather for every chunk: back-to-back inference-optimized
+            # gathers on the shared symmetric buffer race across TP ranks.
+            x = self.embedder.gather_tensor_parallel_output(torch.cat(local_chunks, dim=1))
         else:
             x, _ = self.embedder(x)
 
