@@ -120,34 +120,6 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
 
-    def __init__(self, model, *args, **kwargs):
-        """Initialize the hybrid chunk plan after validating cuda graph support."""
-        assert model.config.cuda_graph_impl == "none", (
-            "EP A2A overlap with grouped HybridStack patterns (e.g. '[*E]') does not "
-            "support cuda graphs yet. Set cuda_graph_impl='none' or use an ungrouped pattern."
-        )
-        if getattr(model.config, "moe_num_hash_layers", 0):
-            raise ValueError("HybridStack EP overlap does not support hash-routed MoE layers.")
-        if any(
-            getattr(model.config, option, False)
-            for option in ("enable_mhc_connections", "wide_residual", "moe_shortcut_connection")
-        ):
-            raise ValueError(
-                "HybridStack EP overlap does not support mHC, wide residuals, or MoE shortcuts."
-            )
-        # The schedule plan calls the layer callables directly and bypasses
-        # ``HybridStack.forward``, which is where per-layer context-parallel layout
-        # conversion happens; mixed linear/attention CP layouts are therefore unsupported.
-        # A group's outer layout is the boundary layout even when its inner
-        # layers need conversion, so inspect the nested stacks as well.
-        for module in model.modules():
-            cp_layout_manager = getattr(module, "_cp_layout_manager", None)
-            assert cp_layout_manager is None or not cp_layout_manager.requires_conversion, (
-                "EP A2A overlap with HybridStack does not support mixed context-parallel layouts "
-                "(linear_cp_layout != attention_cp_layout with context_parallel_size > 1)."
-            )
-        super().__init__(model, *args, **kwargs)
-
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
         extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)
         extra_args["layer_type"] = (

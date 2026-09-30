@@ -1,23 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from megatron.core.context_parallel.layout import ContextParallelLayoutManager
-from megatron.core.models.common.model_chunk_schedule_plan import (
-    TransformerLayerSchedulePlan,
-    TransformerModelChunkSchedulePlan,
-)
+from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.model_chunk_schedule_plan import (
-    HybridStackModelChunkSchedulePlan,
-    HybridStackSchedulePlan,
-)
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.model_chunk_schedule_plan import HybridStackSchedulePlan
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -27,9 +21,27 @@ from tests.unit_tests.a2a_overlap.utils import DummyState
 from tests.unit_tests.test_utilities import Utils
 
 
+def _hybrid_stack_stub(cp_layout_manager=None):
+    stack = HybridStack.__new__(HybridStack)
+    torch.nn.Module.__init__(stack)
+    stack._cp_layout_manager = cp_layout_manager
+    return stack
+
+
+def _overlap_model_stub(**config_overrides):
+    config = dict(
+        cuda_graph_impl="none", enable_mhc_connections=False, moe_shortcut_connection=False
+    )
+    config.update(config_overrides)
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(**config)
+    model.decoder = _hybrid_stack_stub()
+    return model
+
+
 @pytest.mark.parametrize("location", ["decoder", "group", "mtp"])
 @pytest.mark.parametrize("needs_conversion", [True, False])
-def test_hybrid_schedule_checks_nested_cp_layouts(location, needs_conversion):
+def test_hybrid_ep_overlap_checks_nested_cp_layouts(location, needs_conversion):
     """An outer group's boundary layout can hide an inner attention conversion."""
     config = AttentionLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
     config.attention_cp_layout = "zigzag" if needs_conversion else "contiguous"
@@ -48,43 +60,38 @@ def test_hybrid_schedule_checks_nested_cp_layouts(location, needs_conversion):
             tp_cp_group=None,
         )
 
-    model = torch.nn.Module()
-    model.config = SimpleNamespace(cuda_graph_impl="none")
-    model.decoder = torch.nn.Module()
+    model = _overlap_model_stub()
     model.decoder._cp_layout_manager = layout_manager([(config,)])
     assert not model.decoder._cp_layout_manager.requires_conversion
     if location == "group":
-        model.decoder.group = torch.nn.Module()
+        model.decoder.group = _hybrid_stack_stub()
         target = model.decoder.group
     elif location == "mtp":
-        model.mtp = torch.nn.Module()
+        model.mtp = _hybrid_stack_stub()
         target = model.mtp
     else:
         target = model.decoder
     target._cp_layout_manager = layout_manager([config])
 
-    with patch.object(TransformerModelChunkSchedulePlan, "__init__", return_value=None) as build:
-        if needs_conversion:
-            with pytest.raises(AssertionError, match="mixed context-parallel layouts"):
-                HybridStackModelChunkSchedulePlan(model)
-            build.assert_not_called()
-        else:
-            HybridStackModelChunkSchedulePlan(model)
-            build.assert_called_once()
+    if needs_conversion:
+        with pytest.raises(ValueError, match="mixed context-parallel layouts"):
+            HybridModel._validate_ep_overlap_support(model)
+    else:
+        HybridModel._validate_ep_overlap_support(model)
 
 
 @pytest.mark.parametrize(
-    "option",
-    ["moe_num_hash_layers", "enable_mhc_connections", "wide_residual", "moe_shortcut_connection"],
+    "config_overrides, message",
+    [
+        (dict(cuda_graph_impl="full_iteration"), "does not support CUDA graphs"),
+        (dict(enable_mhc_connections=True), "does not support enable_mhc_connections"),
+        (dict(moe_shortcut_connection=True), "moe_shortcut_connection"),
+    ],
 )
-def test_hybrid_schedule_rejects_unsupported_layer_execution(option):
-    """Direct overlap callables must not bypass token routing or residual wrappers."""
-    model = torch.nn.Module()
-    model.config = SimpleNamespace(cuda_graph_impl="none", **{option: 1})
-    with patch.object(TransformerModelChunkSchedulePlan, "__init__", return_value=None) as build:
-        with pytest.raises(ValueError, match="HybridStack EP overlap does not support"):
-            HybridStackModelChunkSchedulePlan(model)
-        build.assert_not_called()
+def test_hybrid_ep_overlap_rejects_unsupported_features(config_overrides, message):
+    """Direct overlap callables must not bypass CUDA graphs or residual wrappers."""
+    with pytest.raises(ValueError, match=message):
+        HybridModel._validate_ep_overlap_support(_overlap_model_stub(**config_overrides))
 
 
 @pytest.mark.parametrize("pattern", ["[*E]", "[+E]"])
