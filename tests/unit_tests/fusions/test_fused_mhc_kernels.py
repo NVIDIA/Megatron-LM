@@ -569,7 +569,7 @@ class TestTritonHPostBDA:
                     for name in ("best_config", "configs_timings", "bench_time", "nargs"):
                         patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
                     patch.setattr(tuner, "cache", {})
-                    patch.setattr(tuner, "cache_results", False)
+                    patch.setattr(tuner, "cache_results", False, raising=False)
                 patch.setattr(elementwise_tuner, "configs", [configs[0]])
                 patch.setattr(reduction_tuner, "configs", configs)
 
@@ -693,6 +693,79 @@ class TestTritonHPostBDABwdE2EDebug:
 
 
 class TestTritonSinkhorn:
+    @_require_triton
+    @pytest.mark.parametrize("hc", [4, 8])
+    def test_deterministic_ignores_prior_autotuning(self, monkeypatch, hc):
+        """Strict replay fixes both warp counts even when ordinary execution tuned first."""
+        import triton
+
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        generator = torch.Generator().manual_seed(193)
+        data = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        grad_out = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        reference_input = data.cpu().double().requires_grad_()
+        reference_output = _ref_sinkhorn(reference_input, 5)
+        reference_output.backward(grad_out.cpu().double())
+        tuners = (kernels._triton_sinkhorn_fwd_kernel, kernels._triton_sinkhorn_bwd_kernel)
+        configs = [triton.Config({}, num_warps=warps) for warps in (1, 8)]
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        launches = []
+        results = []
+
+        def run():
+            inp = data.clone().requires_grad_()
+            out = kernels.triton_fused_sinkhorn(inp, 5)
+            out.backward(grad_out)
+            return out.detach(), inp.grad
+
+        try:
+            with monkeypatch.context() as patch:
+                for index, tuner in enumerate(tuners):
+                    for name in ("best_config", "configs_timings", "bench_time", "nargs"):
+                        patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
+                    patch.setattr(tuner, "cache_results", False, raising=False)
+                    patch.setattr(tuner, "configs", configs)
+                    original_run = tuner.fn.run
+
+                    def record_launch(*args, original=original_run, index=index, **kwargs):
+                        if torch.are_deterministic_algorithms_enabled():
+                            launches.append((index, kwargs.get("num_warps")))
+                        return original(*args, **kwargs)
+
+                    patch.setattr(tuner.fn, "run", record_launch)
+                for warps in (1, 8):
+                    for tuner in tuners:
+                        patch.setattr(tuner, "cache", {})
+                        patch.setattr(
+                            tuner,
+                            "_bench",
+                            lambda *args, config, selected=warps, **kwargs: [
+                                0.0 if config.num_warps == selected else 1.0
+                            ],
+                        )
+                    torch.use_deterministic_algorithms(False)
+                    run()
+                    for tuner in tuners:
+                        assert tuner.cache
+                        assert all(config.num_warps == warps for config in tuner.cache.values())
+                    torch.use_deterministic_algorithms(True)
+                    results.append(run())
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+
+        # A fixed policy is required even if this shape/compiler happens to make
+        # multiple warp counts numerically identical. No performance claim is made.
+        assert launches == [(0, 4), (1, 4), (0, 4), (1, 4)]
+        for first, second, reference in zip(
+            results[0], results[1], (reference_output, reference_input.grad)
+        ):
+            assert torch.equal(
+                first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+            )
+            torch.testing.assert_close(first.cpu().double(), reference, atol=2e-6, rtol=2e-5)
+
     @_require_triton
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10), (8, 4, 4, 20)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
