@@ -14,7 +14,13 @@ pytestmark = [pytest.mark.internal]
 
 
 async def _generate(
-    text, *, finish_reason="length", template_kwargs=None, parsers=None, tools=None
+    text,
+    *,
+    finish_reason="length",
+    template_kwargs=None,
+    parsers=None,
+    tools=None,
+    generated_tokens=None,
 ):
     budget = 2 if finish_reason == "stop" else 1
     client = _ReplyingClient(
@@ -22,7 +28,7 @@ async def _generate(
             _reply(
                 "forced",
                 [10, 11],
-                [12],
+                [12] if generated_tokens is None else generated_tokens,
                 finish_reason=finish_reason,
                 sampling_params={"num_tokens_to_generate": budget},
             )
@@ -78,7 +84,8 @@ async def test_ordinary_empty_content_is_preserved():
 
 
 @pytest.mark.asyncio
-async def test_reasoning_followed_by_valid_tool_call_is_preserved():
+@pytest.mark.parametrize("reasoning", ["thinking", ""])
+async def test_reasoning_followed_by_valid_tool_call_is_preserved(reasoning):
     tools = [
         {
             "type": "function",
@@ -92,8 +99,58 @@ async def test_reasoning_followed_by_valid_tool_call_is_preserved():
             },
         }
     ]
-    text = "thinking</think><tool_call>\n<function=finish>\n<parameter=message>done</parameter>\n</function>\n</tool_call>"
+    text = (
+        reasoning
+        + "</think><tool_call>\n<function=finish>\n<parameter=message>done</parameter>\n</function>\n</tool_call>"
+    )
     choice = await _generate(text, finish_reason="stop", tools=tools)
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "finish"
     assert choice["message"]["content"] == ""
     assert choice["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("text", ["", "</think>", "<think></think>"])
+async def test_empty_reasoning_content_is_null(text, finish_reason):
+    choice = await _generate(text, finish_reason=finish_reason)
+    assert choice["message"]["content"] is None
+    assert choice["message"]["reasoning_content"] == ""
+    assert not choice["message"].get("tool_calls")
+    assert choice["finish_reason"] == finish_reason
+
+
+@pytest.mark.asyncio
+async def test_immediate_eos_with_empty_decoding_is_reasoning_only():
+    choice = await _generate("", finish_reason="stop", generated_tokens=[2])
+    assert choice["message"]["content"] is None
+    assert choice["message"]["reasoning_content"] == ""
+    assert choice["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("text", ["", "</think>", "<think></think>"])
+@pytest.mark.parametrize("kwargs", [{"enable_thinking": False}, {"force_nonempty_content": True}])
+async def test_empty_reasoning_explicit_fallback_is_ordinary_content(text, finish_reason, kwargs):
+    choice = await _generate(text, finish_reason=finish_reason, template_kwargs=kwargs)
+    assert choice["message"]["content"] == ""
+    assert "reasoning_content" not in choice["message"]
+    assert choice["finish_reason"] == finish_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("text", ["", "</think>", "<think></think>"])
+async def test_no_parser_does_not_reinterpret_empty_reasoning(text, finish_reason):
+    choice = await _generate(text, finish_reason=finish_reason, parsers=[])
+    assert choice["message"]["content"] == text
+    assert "reasoning_content" not in choice["message"]
+    assert choice["finish_reason"] == finish_reason
+
+
+@pytest.mark.asyncio
+async def test_empty_reasoning_with_final_answer_preserves_answer():
+    choice = await _generate("<think></think>answer")
+    assert choice["message"]["content"] == "answer"
+    assert choice["message"]["reasoning_content"] == ""
