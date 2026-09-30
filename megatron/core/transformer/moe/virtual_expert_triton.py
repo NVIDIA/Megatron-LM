@@ -48,6 +48,7 @@ _BARRIER_TIMEOUT_NS = tl.constexpr(100_000_000_000)
 # Fixed planner grid, leaving compute resources for the overlapping attention/shared MLP.
 PLANNER_PROGRAMS = 32
 _PLANNER_PROGRAMS = tl.constexpr(PLANNER_PROGRAMS)
+_ROUTE_TILE = tl.constexpr(512)
 # One 128-byte line per flag word of the planner's scratch arena.
 _FLAG_STRIDE = tl.constexpr(32)
 
@@ -100,6 +101,7 @@ def _plan_virtual_expert_routes_kernel(
     ROUTER_TOPK: tl.constexpr,
     EP_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
+    ALIGNMENT: tl.constexpr = 1,
 ):
     """Plan histogram, placement, and stable route remapping in one 32-block launch.
 
@@ -108,11 +110,13 @@ def _plan_virtual_expert_routes_kernel(
     histogram cannot overwrite rows still consumed by the prior plan. Contiguous route tiles avoid
     padding top-k to a power of two. Remapping sorts each tile by (expert, original position), scans
     equal-expert runs to recover stable ordinals, and scatters runtime IDs back to their original
-    positions. Planner quotas, tie breaks, router scores, and per-expert route order are unchanged.
+    positions. Alignment 1 retains the original quotas. Aligned placement balances rounded
+    expert blocks, assigning remainder blocks to lower ranks. Tie breaks, router scores, and
+    per-expert real-route order are unchanged.
     """
     PLACEMENT_PROGRAMS: tl.constexpr = min(EP_SIZE, _PLANNER_PROGRAMS)
     RANKS_PER_PROGRAM: tl.constexpr = tl.cdiv(EP_SIZE, _PLANNER_PROGRAMS)
-    ROUTE_TILE: tl.constexpr = 512
+    ROUTE_TILE: tl.constexpr = _ROUTE_TILE
     GATHER_RUNNING: tl.constexpr = NUM_EXPERTS <= 512
     NUM_EXPERTS_PER_GPU: tl.constexpr = NUM_EXPERTS // EP_SIZE
     BLOCK_EP_SIZE: tl.constexpr = 1 << (EP_SIZE - 1).bit_length()
@@ -202,6 +206,10 @@ def _plan_virtual_expert_routes_kernel(
         owned_prefix = tl.sum(tl.where(ranks[:, None] < source_rank, source_counts, 0), axis=0).to(
             tl.int32
         )
+        # Round each global logical expert exactly once. Placement operates in blocks;
+        # ordinals remain real routes, with conceptual padding only at each expert's end.
+        owned_totals = tl.cdiv(owned_totals, ALIGNMENT)
+
         source_total = tl.sum(
             tl.load(
                 counts_sym_mem + owned_ranks[:, None] * NUM_EXPERTS + experts[None, :],
@@ -216,8 +224,9 @@ def _plan_virtual_expert_routes_kernel(
         )
         tl.store(
             balance + owned_ranks,
-            tl.sum(tl.reshape(owned_totals, (RANKS_PER_PROGRAM, BLOCK_NUM_EXPERTS_PER_GPU)), axis=1)
-            - NUM_ROUTES,
+            tl.sum(
+                tl.reshape(owned_totals, (RANKS_PER_PROGRAM, BLOCK_NUM_EXPERTS_PER_GPU)), axis=1
+            ),
             mask=valid_owned_ranks,
         )
         _grid_sync(placement_sync, _GRID_SYNC_TAG, PLACEMENT_PROGRAMS)
@@ -236,8 +245,14 @@ def _plan_virtual_expert_routes_kernel(
                 # receiver gets exactly one sender's experts and therefore fits its available
                 # virtual-expert slots. Moving only min(excess, deficit) could draw from several
                 # senders and overflow those slots.
-                balances = tl.load(balance + ranks, mask=valid_ranks, other=0)
-                # quotas[d] is the number of routes this rank must transfer to destination d.
+                loads = tl.load(balance + ranks, mask=valid_ranks, other=0)
+                if ALIGNMENT == 1:
+                    targets = NUM_ROUTES
+                else:
+                    total_blocks = tl.sum(loads, 0)
+                    targets = total_blocks // EP_SIZE + (ranks < total_blocks % EP_SIZE)
+                balances = tl.where(valid_ranks, loads - targets, 0)
+                # quotas[d] counts placement units sent to d: rows at A=1, blocks otherwise.
                 quotas = tl.zeros((BLOCK_EP_SIZE,), dtype=tl.int32)
                 quota_step = 0
                 while (quota_step < EP_SIZE) & (tl.max(balances, 0) > 0):
@@ -272,6 +287,7 @@ def _plan_virtual_expert_routes_kernel(
                         local_experts == local_expert, remaining - moved, remaining
                     )
                     quotas = tl.where(ranks == destination, quotas - moved, quotas)
+                allocations *= ALIGNMENT
                 tl.store(
                     allocation + native_experts[:, None] * EP_SIZE + ranks[None, :],
                     allocations,
@@ -374,8 +390,8 @@ def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
         ("_pad0", (_FLAG_STRIDE.value - 1,)),
         ("grid_sync", (1,)),
         ("_pad1", (_FLAG_STRIDE.value - 1,)),
-        ("balance", (ep_size,)),  # native load minus rank capacity
-        ("allocation", (num_experts, ep_size)),  # routes of each expert per destination
+        ("balance", (ep_size,)),  # native block count per rank
+        ("allocation", (num_experts, ep_size)),  # padded rows of each expert per destination
         ("destination_boundaries", (num_experts, block_ep)),  # segment ends, local ordinals
         ("virtual_expert_slots", (num_experts, ep_size)),  # slot holding an expert on a rank
         ("program_histogram", (PLANNER_PROGRAMS, num_experts)),
@@ -404,6 +420,7 @@ class VirtualExpertPlannerWorkspace:
             raise ValueError(
                 f"Virtual-expert planner supports at most {MAX_VIRTUAL_EXPERT_EP_SIZE} EP ranks."
             )
+        self.planner_kernels = {}
         self.rank = dist.get_rank(group=group)
         # The window needs the group's communicator (created by a first collective).
         dist.all_reduce(torch.zeros(1, device=device), group=group)
@@ -436,7 +453,7 @@ class VirtualExpertPlannerWorkspace:
 
 
 def launch_virtual_expert_planner(
-    top_indices: torch.Tensor, workspace
+    top_indices: torch.Tensor, workspace, alignment: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Plan one layer's routes in a fused 32-block cooperative launch.
 
@@ -450,7 +467,17 @@ def launch_virtual_expert_planner(
     empty = functools.partial(torch.empty, device=top_indices.device)
     virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
     experts_to_copy = empty((ep_size, num_experts // ep_size), dtype=torch.int32)
-    _plan_virtual_expert_routes_kernel[(PLANNER_PROGRAMS,)](
+    # Keep Triton's compiled launchers per workspace, including precision and input-pointer
+    # alignment. Re-entering the JIT dispatcher for every layer adds measurable eager overhead.
+    # Contiguous slices can still have unaligned base pointers, so shape/dtype alone is unsafe.
+    kernel_key = (
+        num_tokens,
+        router_topk,
+        alignment,
+        top_indices.dtype,
+        top_indices.data_ptr() % 16,
+    )
+    arguments = (
         top_indices,
         virtual_experts,
         experts_to_copy,
@@ -459,10 +486,18 @@ def launch_virtual_expert_planner(
         workspace.rank,
         int(workspace.histogram_handle.buffer_ptrs_dev),
         int(workspace.histogram_handle.signal_pad_ptrs_dev),
+    )
+    kernel = workspace.planner_kernels.get(kernel_key)
+    if kernel is not None:
+        kernel[(PLANNER_PROGRAMS, 1, 1)](*arguments)
+        return virtual_experts, experts_to_copy
+    workspace.planner_kernels[kernel_key] = _plan_virtual_expert_routes_kernel[(PLANNER_PROGRAMS,)](
+        *arguments,
         NUM_TOKENS=num_tokens,
         ROUTER_TOPK=router_topk,
         EP_SIZE=ep_size,
         NUM_EXPERTS=num_experts,
+        ALIGNMENT=alignment,
         launch_cooperative_grid=True,
         num_warps=4,
     )

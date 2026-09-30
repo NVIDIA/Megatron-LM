@@ -604,6 +604,11 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             ]
             assert len(experts) == 3
             for name, layer in experts:
+                # Tiny MXFP8 inputs round every nonempty expert to one block. Concentrate
+                # choices on one owner so this test still exercises real replica transfers.
+                layer.router.qb_beta.copy_(
+                    torch.tensor([-100, -100, 100, 100], device='cuda', dtype=torch.float32)
+                )
                 assert is_mxfp8tensor(layer.experts.linear_fc1.weight0) == (
                     egtp_size > 1 or 'mtp' not in name
                 )
@@ -620,7 +625,19 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                     manager = layer.token_dispatcher._comm_manager
                     dispatch = manager.plan_dispatch
 
-                    def record(*args, manager=manager, dispatch=dispatch):
+                    expected_alignment = moe_utils.get_align_size_for_quantization(layer.config)
+                    assert layer.experts._with_fused_impl == (egtp_size > 1 or 'mtp' not in name)
+
+                    def record(
+                        *args,
+                        manager=manager,
+                        dispatch=dispatch,
+                        expected_alignment=expected_alignment,
+                    ):
+                        assert manager._alignment == expected_alignment
+                        assert manager.rank_capacity == manager._compute_rank_capacity(
+                            args[0].shape[0]
+                        )
                         dispatch(*args)
                         plans.append(manager._plan)
 
@@ -645,6 +662,23 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                         loss_mask=torch.ones_like(tokens, dtype=torch.float32),
                     )
                 loss.sum().backward()
+                if virtual:
+                    managers = [layer.token_dispatcher._comm_manager for _, layer in experts]
+                    assert len({id(manager.planner) for manager in managers}) == 1
+                    for (_, layer), manager in zip(experts, managers):
+                        assert manager.pad_multiple == manager._alignment
+                        assert (manager.tokens_per_expert % manager._alignment == 0).all()
+                        assert manager.tokens_per_expert.sum() <= manager.rank_capacity
+                        assert (
+                            layer.experts._fused_ops is not None
+                        ) == layer.experts._with_fused_impl
+                        if layer.experts._with_fused_impl:
+                            (sequence,) = layer.experts._fused_ops
+                            assert any(
+                                type(op).__name__ == 'GroupedMLP_CuTeGEMMUnary'
+                                for group in sequence._module_groups
+                                for op, _ in group._forward_ops
+                            ), 'MXFP8 must execute the fused CuTeDSL MLP'
                 gtp.wait_for_gtp_grad_reduction_on_current_stream()
                 model.finish_grad_sync()
                 torch.cuda.synchronize()
@@ -836,15 +870,24 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             weights = {
                 name: p.detach().float().cpu().clone() for name, p in layer.named_parameters()
             }
+            # Use multiple alignment blocks to retain native and virtual work for the hot expert.
+            num_tokens = 512
             for use in range(2):
                 rng = torch.Generator(device='cuda').manual_seed(8765 + 10 * use + pg.ep.rank())
-                x = torch.randn(32, 1, 128, device='cuda', dtype=torch.bfloat16, generator=rng)
+                x = torch.randn(
+                    num_tokens, 1, 128, device='cuda', dtype=torch.bfloat16, generator=rng
+                )
                 x[..., 0] = 1 if use == 0 else -1
                 x[..., 1] = 0
-                x[-8:, :, 1] = 1 if use == 0 else -1
+                x[-num_tokens // 4 :, :, 1] = 1 if use == 0 else -1
                 x.requires_grad_()
                 y, bias = layer(x)
                 assert bias is None
+                if virtual:
+                    assert manager._alignment == moe_utils.get_align_size_for_quantization(config)
+                    assert manager.pad_multiple == manager._alignment
+                    assert manager.tokens_per_expert.sum() <= manager.rank_capacity
+                    assert (manager.tokens_per_expert % manager._alignment == 0).all()
                 if virtual and not use_op_fuser:
                     for fc_layer, linear in enumerate(
                         (layer.experts.linear_fc1, layer.experts.linear_fc2)
@@ -886,10 +929,12 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             for use, (x, y, (probs, indices)) in enumerate(zip(inputs, outputs, routes)):
                 expected_routes = (
                     torch.tensor([0, 1] if use == 0 else [2, 3], device='cuda')
-                    .expand(32, -1)
+                    .expand(num_tokens, -1)
                     .clone()
                 )
-                expected_routes[-8:] = torch.tensor([0, 2] if use == 0 else [1, 3], device='cuda')
+                expected_routes[-num_tokens // 4 :] = torch.tensor(
+                    [0, 2] if use == 0 else [1, 3], device='cuda'
+                )
                 torch.testing.assert_close(indices.sort(dim=-1).values.long(), expected_routes)
                 values[f'use {use}: routes'] = indices.cpu()
                 values[f'use {use}: probabilities'] = probs.detach().cpu()
@@ -1031,25 +1076,31 @@ def _report(errors, group):
     assert not combined, "\n".join(combined)
 
 
-def _reference_plan(routes, num_experts):
+def _reference_plan(routes, num_experts, alignment=1):
     """CPU greedy placement and stable route assignment, using only semantic input routes."""
     ep_size, num_tokens, topk = routes.shape
-    local_experts, capacity = num_experts // ep_size, num_tokens * topk
+    local_experts = num_experts // ep_size
     counts = torch.stack([torch.bincount(row.flatten(), minlength=num_experts) for row in routes])
     totals = counts.sum(0).tolist()
-    loads = counts.sum(0).reshape(ep_size, local_experts).sum(1).tolist()
+    blocks = [(count + alignment - 1) // alignment for count in totals]
+    total_blocks = sum(blocks)
+    targets = [total_blocks // ep_size + (rank < total_blocks % ep_size) for rank in range(ep_size)]
+    loads = [
+        sum(blocks[r * local_experts : (r + 1) * local_experts]) - targets[r]
+        for r in range(ep_size)
+    ]
     quotas = [[0] * ep_size for _ in range(ep_size)]
-    while max(loads) > capacity:
+    while max(loads) > 0:
         sender = max(range(ep_size), key=lambda r: (loads[r], -r))
         receiver = min(range(ep_size), key=lambda r: (loads[r], r))
         # A receiver takes its entire deficit from one sender, even beyond that sender's
         # excess. This bounds the number of virtual slots by the sender's native experts.
-        moved = capacity - loads[receiver]
+        moved = -loads[receiver]
         quotas[sender][receiver] += moved
         loads[sender] -= moved
-        loads[receiver] = capacity
+        loads[receiver] = 0
     allocation = [[0] * ep_size for _ in range(num_experts)]
-    for expert, count in enumerate(totals):
+    for expert, count in enumerate(blocks):
         allocation[expert][expert // local_experts] = count
     for sender, pending in enumerate(quotas):
         experts = range(sender * local_experts, (sender + 1) * local_experts)
@@ -1061,6 +1112,7 @@ def _reference_plan(routes, num_experts):
             allocation[expert][sender] -= moved
             allocation[expert][destination] += moved
             pending[destination] -= moved
+    allocation = [[count * alignment for count in row] for row in allocation]
     copies = []
     for destination in range(ep_size):
         remote = sorted(
@@ -1080,7 +1132,10 @@ def _reference_plan(routes, num_experts):
     mapped = torch.empty(routes.numel(), dtype=torch.int16)
     cursor = 0
     for expert, destinations in enumerate(allocation):
+        remaining = totals[expert]
         for destination, count in enumerate(destinations):
+            count = min(count, remaining)
+            remaining -= count
             if count:
                 local = (
                     expert % local_experts
@@ -1100,6 +1155,14 @@ def _reference_plan(routes, num_experts):
 
 def _routes_for_skew(ep_size, num_experts, num_tokens, topk, skew):
     """Generate distinct top-k choices with exact balance, ties or controlled load skew."""
+    if skew == "boundary":
+        assert topk == 1
+        counts = (31, 32, 33, 127, 128, 129, 255, 256, 257)
+        flat = torch.cat([torch.full((count,), i % num_experts) for i, count in enumerate(counts)])
+        size = ep_size * num_tokens
+        return flat.repeat((size + flat.numel() - 1) // flat.numel())[:size].reshape(
+            ep_size, num_tokens, 1
+        )
     if skew == "ties":
         return torch.arange(9).repeat_interleave(4).reshape(4, 9, 1)
     rows = torch.arange(num_tokens)[:, None] + torch.arange(topk)
@@ -1165,7 +1228,7 @@ def test_virtual_expert_planner_reference_tie_breaks():
     assert mapped.flatten().tolist() == expected
 
 
-def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
+def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews, alignments=(1,)):
     Utils.initialize_distributed()
     world_size = dist.get_world_size()
     groups = (
@@ -1185,12 +1248,13 @@ def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
     workspace = VirtualExpertPlannerWorkspace(num_experts=num_experts, device=device, group=group)
     errors = []
     try:
-        for iteration, skew in enumerate(skews.split()):
+        cases = [(skew, alignment) for alignment in alignments for skew in skews.split()]
+        for iteration, (skew, alignment) in enumerate(cases):
             routes = _routes_for_skew(ep_size, num_experts, num_tokens, topk, skew)
-            counts, allocation, copies, mapped = _reference_plan(routes, num_experts)
+            counts, allocation, copies, mapped = _reference_plan(routes, num_experts, alignment)
             dtype = torch.int32 if iteration % 2 else torch.int64
             own = routes[rank].to(device=device, dtype=dtype)
-            if iteration % 3:
+            if iteration % 3 and num_tokens > 1:
                 # A nonzero offset and poisoned gaps catch a wrapper that forgets contiguous().
                 storage = torch.full(
                     (num_tokens, 2 * topk + 1), num_experts + 7, device=device, dtype=dtype
@@ -1198,7 +1262,14 @@ def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
                 storage[:, 1::2] = own
                 own = storage[:, 1::2]
                 assert not own.is_contiguous()
-            plan = plan_virtual_expert_routes(own, workspace)
+            elif num_tokens:
+                # A contiguous view need not have a 16-byte-aligned base. Launcher reuse must
+                # not borrow the compiler's stronger pointer alignment from another input.
+                storage = torch.empty(own.numel() + 1, device=device, dtype=dtype)
+                storage[1:].copy_(own.flatten())
+                own = storage[1:].view_as(own)
+                assert own.is_contiguous() and own.data_ptr() % 16 != 0
+            plan = plan_virtual_expert_routes(own, workspace, alignment)
             actual = plan.virtual_experts.cpu()
             actual_copies = plan.experts_to_copy.cpu()
             for label, value, expected in (
@@ -1222,9 +1293,9 @@ def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
                     destination[remote], local[remote] - local_experts
                 ].long()
                 torch.testing.assert_close(semantic, routes[rank], rtol=0, atol=0)
-                if skew in ("balanced", "local", "remote"):
+                if alignment == 1 and skew in ("balanced", "local", "remote"):
                     assert (actual_copies == -1).all()
-                if skew in ("local", "remote"):
+                if alignment == 1 and skew in ("local", "remote"):
                     assert (
                         (destination == rank) if skew == "local" else (destination != rank)
                     ).all()
@@ -1236,18 +1307,36 @@ def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
                 errors.append(f"{skew} semantic routes: {exc}")
                 observed = torch.zeros(num_experts * ep_size, device=device, dtype=torch.int32)
             dist.all_reduce(observed, group=group)
+            real_counts = observed.cpu().reshape(num_experts, ep_size)
+            padded_counts = ((real_counts + alignment - 1) // alignment) * alignment
+            _check_equal(padded_counts, allocation, f"{skew} route counts", errors)
             _check_equal(
-                observed.cpu().reshape(num_experts, ep_size),
-                allocation,
-                f"{skew} route counts",
-                errors,
-            )
-            _check_equal(
-                observed.reshape(num_experts, ep_size).sum(0).cpu(),
-                torch.full((ep_size,), num_tokens * topk, dtype=torch.int64),
+                padded_counts.sum(0),
+                torch.tensor(
+                    [
+                        (
+                            int(allocation.sum()) // alignment // ep_size
+                            + (r < int(allocation.sum()) // alignment % ep_size)
+                        )
+                        * alignment
+                        for r in range(ep_size)
+                    ]
+                ),
                 f"{skew} balanced load",
                 errors,
             )
+            assert int(real_counts.sum()) == routes.numel()
+            capacity_owner = object.__new__(VirtualExpertLoadBalancer)
+            capacity_owner.ep_size = ep_size
+            capacity_owner.num_owned_experts = local_experts
+            capacity_owner.router_topk = topk
+            capacity_owner._alignment = alignment
+            assert int(padded_counts.sum(0).max()) <= capacity_owner._compute_rank_capacity(
+                num_tokens
+            )
+            # Every nonempty replica on a receiver belongs to a single owner.
+            for row in copies:
+                assert len(set((row[row >= 0] // local_experts).tolist())) <= 1
             # The real dispatcher provides this cross-rank ordering between planner launches.
             dist.barrier(group=group, device_ids=[device.index])
         _report(errors, dist.group.WORLD)
@@ -1264,14 +1353,18 @@ def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
     "ep_size,num_experts,num_tokens,topk,skews",
     [
         (4, 8, 17, 3, "balanced concentrated balanced"),
+        (4, 8, 1, 1, "hot_expert random"),
+        (4, 8, 0, 1, "balanced"),
+        (4, 8, 257, 1, "hot_expert random balanced boundary"),
         (4, 12, 9, 1, "ties local remote"),
         (4, 512, 33, 10, "random concentrated balanced"),
     ],
-    ids=["changing-plan-and-strided-input", "ties-and-empty-experts", "nt4-experts-and-topk"],
 )
 def test_virtual_expert_planner_matches_reference(ep_size, num_experts, num_tokens, topk, skews):
-    """Preserve expert identity and exactly balance routes, including reused workspace."""
-    _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews)
+    """Aligned remapping preserves identity and balances loads, including reused workspace."""
+    _check_planner_reference(
+        ep_size, num_experts, num_tokens, topk, skews, alignments=(1, 32, 128, 256, 1, 256)
+    )
 
 
 def _virtual_expert_hybridep_config(**overrides):
@@ -1419,9 +1512,7 @@ def test_virtual_expert_recompute_offload_scopes(
                 parameter.grad_added_to_main_grad = False
             with torch.no_grad():
                 layer.router.weight.zero_()
-                layer.router.weight[:, 0].copy_(
-                    torch.tensor([1, 0.5, -0.5, -1], device="cuda")
-                )
+                layer.router.weight[:, 0].copy_(torch.tensor([1, 0.5, -0.5, -1], device="cuda"))
                 layer.router.weight[2, 1] = 2
             if enabled and offload_scope:
                 offload.init_chunk_handler(
@@ -1437,7 +1528,9 @@ def test_virtual_expert_recompute_offload_scopes(
                 generator = torch.Generator(device="cuda").manual_seed(
                     8765 + 10 * use + pg.ep.rank()
                 )
-                x = torch.randn(32, 1, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
+                x = torch.randn(
+                    32, 1, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+                )
                 x[..., 0] = 1 if use == 0 else -1
                 x.requires_grad_()
                 if enabled and recompute == "full":
