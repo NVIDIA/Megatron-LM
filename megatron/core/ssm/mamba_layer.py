@@ -236,7 +236,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-    ):
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, tuple[Tensor, ...]]:
         """Run normalization, input projection, and the selective SSM/SSD.
 
         Args:
@@ -248,7 +248,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
-            Tuple containing the core SSM result and residual.
+            Core SSM result and residual, followed by connection state for a connected layer.
+            Pass the entire tuple to the layer's ``forward_post_core_attn`` method.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -271,38 +272,14 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         self,
         ssm_output: Tensor,
         residual: Tensor,
-        *positional_args,
         inference_context: Optional[BaseInferenceContext] = None,
         padding_mask: Optional[Tensor] = None,
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-    ):
-        """Apply Mamba's output projection and residual-stream or ordinary BDA update."""
-
-        connection_state = None
-        if positional_args and isinstance(positional_args[0], tuple):
-            connection_state = positional_args[0]
-            positional_args = positional_args[1:]
-        if len(positional_args) > 2:
-            raise TypeError("Mamba post-core attention received too many positional arguments.")
-        if positional_args:
-            if inference_context is not None:
-                raise TypeError("Mamba post-core attention received inference_context twice.")
-            inference_context = positional_args[0]
-        if len(positional_args) == 2:
-            if padding_mask is not None:
-                raise TypeError("Mamba post-core attention received padding_mask twice.")
-            padding_mask = positional_args[1]
+    ) -> Tensor:
+        """Apply Mamba's output projection and ordinary bias-dropout-add update."""
 
         del inference_context, padding_mask
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
-        recompute_context = (
-            residual_stream_recompute_context
-            if self._get_residual_connection() is not None
-            else None
-        )
-        return self._apply_mixer_bda(
-            mixer_out_with_bias, residual, connection_state, recompute_context=recompute_context
-        )
+        return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
     def _get_residual_connection(self):
         """Return an optional architecture-owned connection around the Mamba mixer."""

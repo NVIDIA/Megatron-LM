@@ -1,8 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
+from torch import Tensor
+
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+from megatron.core.transformer.residual_connection import ResidualConnectionState
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
@@ -72,3 +76,21 @@ class WideResidualMambaLayer(MambaLayer):
         """Return the connection surrounding the Mamba mixer."""
 
         return self.residual_connection
+
+    def forward_post_core_attn(
+        self,
+        ssm_output: Tensor,
+        residual: Tensor,
+        connection_state: ResidualConnectionState,
+        *,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ) -> Tensor:
+        """Project the mixer output and write it to the saved wide-residual stream."""
+
+        mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
+        return self._apply_mixer_bda(
+            mixer_out_with_bias,
+            residual,
+            connection_state,
+            recompute_context=residual_stream_recompute_context,
+        )
