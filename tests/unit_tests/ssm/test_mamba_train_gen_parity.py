@@ -11,7 +11,10 @@ import pytest
 import torch
 
 try:
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    from mamba_ssm.ops.triton.ssd_combined import (
+        mamba_chunk_scan_combined,
+        mamba_split_conv1d_scan_combined,
+    )
 
     from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
@@ -176,23 +179,85 @@ class TestConvParity:
         )
 
 
-class TestGatePlacement:
-    """The two places the gate can enter, and what choosing wrongly costs."""
+@pytest.mark.skipif(not HAVE_CAUSAL_CONV1D, reason="causal-conv1d required")
+class TestFusedTrainingParity:
+    """The memory-efficient training kernel against generation's varlen conv + varlen scan.
 
-    def test_gate_inside_and_outside_the_scan_differ(self, inputs):
-        """If these were equal, the mixer's batch-invariant branch would be unnecessary."""
-        x, z, dt, B, C = (inputs[k] for k in ("x", "z", "dt", "B", "C"))
+    ``MambaMixer._ssm_training`` calls ``mamba_split_conv1d_scan_combined`` with no
+    ``rmsnorm_weight``: the gate goes through the scan and the norm afterwards is ungated. That
+    is generation's arrangement in batch-invariant mode, so the fused kernel should equal the
+    conv followed by the scan, which is what ``ssm_prefill`` runs.
+    """
+
+    @requires_pinned_autotune
+    def test_fused_training_kernel_matches_varlen_prefill(self, inputs):
+        from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+
+        device, dtype = inputs["device"], inputs["dtype"]
+        x, z, B, C = (inputs[k] for k in ("x", "z", "B", "C"))
         A, D, dt_bias = inputs["A"], inputs["D"], inputs["dt_bias"]
-        common = dict(D=D, dt_bias=dt_bias, dt_softplus=True, return_final_states=True)
+        dt = inputs["dt"].to(dtype)  # the mixer's dt is a bf16 slice of the projection
+        d_inner = NHEADS * HEADDIM
+        conv_dim = d_inner + 2 * NGROUPS * DSTATE
+        generator = torch.Generator(device=device).manual_seed(1)
+        conv_weight = torch.randn(conv_dim, D_CONV, device=device, dtype=dtype, generator=generator)
+        conv_bias = torch.randn(conv_dim, device=device, dtype=dtype, generator=generator)
 
-        y_inside, _ = mamba_chunk_scan_combined(x, dt, A, B, C, CHUNK_SIZE, z=z, **common)
-        y_outside, _ = mamba_chunk_scan_combined(x, dt, A, B, C, CHUNK_SIZE, z=None, **common)
-        # The mixer applies RMSNormGated rather than a bare multiply, so this is a lower
-        # bound on the divergence.
-        y_outside = y_outside * torch.nn.functional.silu(z)
+        xBC = torch.cat([x.flatten(2), B.flatten(2), C.flatten(2)], dim=-1)  # [1, L, conv_dim]
+        zxbcdt = torch.cat([z.flatten(2), xBC, dt], dim=-1)
 
-        _report("gate inside the scan vs gate applied after it", y_inside, y_outside)
-        assert not torch.equal(y_inside, y_outside), (
-            "gating inside and outside the scan produced identical bits, so the "
-            "batch_invariant_mode branch in _static_prefill is unnecessary"
+        # Training: one fused kernel, exactly as _ssm_training calls it.
+        y_train = mamba_split_conv1d_scan_combined(
+            zxbcdt,
+            conv_weight,
+            conv_bias,
+            dt_bias,
+            A,
+            D=D,
+            chunk_size=CHUNK_SIZE,
+            activation="silu",
+            headdim=HEADDIM,
+            ngroups=NGROUPS,
+            norm_before_gate=True,
         )
+
+        # Generation: varlen conv, then varlen scan with the gate inside, as ssm_prefill does.
+        cu_seqlens = torch.tensor([0, SEQLEN], dtype=torch.int32, device=device)
+        conv_out = causal_conv1d_varlen_fn(
+            x=xBC.squeeze(0).contiguous(),
+            weight=conv_weight,
+            bias=conv_bias,
+            cu_seqlens=cu_seqlens,
+            activation="silu",
+        )
+        x_c, B_c, C_c = torch.split(conv_out, [d_inner, NGROUPS * DSTATE, NGROUPS * DSTATE], dim=-1)
+        num_chunks = SEQLEN // CHUNK_SIZE
+        y_prefill = torch.zeros(SEQLEN, NHEADS, HEADDIM, device=device, dtype=dtype)
+        mamba_chunk_scan_combined_varlen(
+            x=x_c.reshape(SEQLEN, NHEADS, HEADDIM).contiguous(),
+            dt=dt.squeeze(0),
+            A=A,
+            B=B_c.reshape(SEQLEN, NGROUPS, DSTATE).contiguous(),
+            C=C_c.reshape(SEQLEN, NGROUPS, DSTATE).contiguous(),
+            chunk_size=CHUNK_SIZE,
+            cu_chunk_seqlens=torch.arange(
+                0, SEQLEN + 1, CHUNK_SIZE, dtype=torch.int32, device=device
+            ),
+            last_chunk_indices=torch.tensor([num_chunks - 1], dtype=torch.int64, device=device),
+            seq_idx=torch.zeros(num_chunks, dtype=torch.int32, device=device),
+            out=y_prefill,
+            D=D,
+            z=z.squeeze(0),
+            dt_bias=dt_bias,
+            dt_softplus=True,
+        )
+
+        a, b = y_train.squeeze(0).reshape(SEQLEN, -1), y_prefill.reshape(SEQLEN, -1)
+        same = _report("fused training kernel vs varlen conv + varlen scan", a, b)
+        if not same:
+            bad = (a != b).nonzero()
+            print(
+                f"[mamba-parity] {bad.shape[0]} elements differ; "
+                f"first (token, channel): {bad[:6].tolist()}"
+            )
+        assert same, "the fused training kernel does not match generation's varlen conv + scan"
