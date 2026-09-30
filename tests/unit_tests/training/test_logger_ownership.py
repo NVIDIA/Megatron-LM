@@ -260,6 +260,8 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     args.hidden_size = 32
     args.num_attention_heads = 4
     args.params_dtype = torch.float32
+    args.main_grads_dtype = args.main_params_dtype = torch.float32
+    args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
     transformer = core_transformer_config_from_args(args)
     optimizer, _ = get_megatron_optimizer_config(args)
     assert transformer.log_max_attention_logit is enabled
