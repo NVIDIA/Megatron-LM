@@ -800,9 +800,6 @@ class TestNVFP4IndexMaps:
                 'megatron.core.distributed.param_and_grad_buffer.modify_nvfp4_rowwise_storage'
             ),
             mock.patch('torch.cuda.current_device', return_value='cpu'),
-            mock.patch(
-                'megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage'
-            ),
         ):
             buffer = _ParamAndGradBuffer(
                 ddp_config=ddp_config,

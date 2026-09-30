@@ -200,8 +200,8 @@ class ShortcutMoEBlock(MegatronModule):
             )
         else:
             shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
-        shortcut_input, padding_mask, _ = self.moe_layer._maybe_unflatten_for_moe(
-            shortcut_input, padding_mask, packed_seq_params
+        shortcut_input, padding_mask, _, _ = self.moe_layer._maybe_unflatten_for_moe(
+            shortcut_input, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
         )
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
         return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map)
@@ -215,8 +215,8 @@ class ShortcutMoEBlock(MegatronModule):
         pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
             hidden_states
         )
-        pre_mlp_output, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
-            pre_mlp_output, padding_mask, packed_seq_params
+        pre_mlp_output, _, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
+            pre_mlp_output, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
         )
         shared_expert_output = self.moe_layer.mlp.shared_experts_compute(pre_mlp_output)
         return shared_expert_output, moe_unflatten_mbs, residual, mlp_state
