@@ -63,9 +63,11 @@ def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_type):
     ]
 
 
-def test_hybrid_schedule_preserves_plain_layer_quantization_context():
+@pytest.mark.parametrize("layer_cls", [TransformerLayer, MultiTokenPredictionLayer])
+def test_hybrid_schedule_preserves_plain_layer_quantization_context(layer_cls):
     expected_context = nullcontext()
-    layer = SimpleNamespace(get_inner_quantization_context=Mock(return_value=expected_context))
+    layer = Mock(spec=layer_cls)
+    layer.get_inner_quantization_context.return_value = expected_context
     plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
     plan.layer = layer
     plan.layer_type = None

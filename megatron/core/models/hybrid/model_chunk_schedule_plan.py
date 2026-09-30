@@ -19,6 +19,14 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
+from megatron.core.models.hybrid.fine_grained_callables import (
+    HybridStackNode,
+    build_hybrid_stack_callables,
+)
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.pipeline_parallel.utils import NoopScheduleNode
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
@@ -39,14 +47,6 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         if self.layer_type is None:
             return super()._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
-
-        # Hybrid grouped path. Imports are local because hybrid pulls in TE / SSM
-        # extensions that we don't want to load when only the GPT path is used.
-        from megatron.core.models.hybrid.fine_grained_callables import (
-            HybridStackNode,
-            build_hybrid_stack_callables,
-        )
-        from megatron.core.pipeline_parallel.utils import NoopScheduleNode
 
         fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
             build_hybrid_stack_callables(self.layer, layer_type=self.layer_type)
@@ -98,12 +98,16 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         self.mtp_post_process = NoopScheduleNode()
 
     def get_low_precision_context(self):
-        """Let hybrid callables manage each physical layer's quantization context."""
-        # HybridStack and MambaLayer do not expose the TransformerLayer context
-        # hook. Their callables enter the appropriate context for each inner layer.
-        if self.layer_type is not None or not hasattr(self.layer, "get_inner_quantization_context"):
-            return nullcontext()
-        return super().get_low_precision_context()
+        """Return the layer-level quantization context for GPT-path layers.
+
+        Hybrid callables enter the quantization context of each physical layer
+        themselves, so hybrid layer plans use a null context here.
+        """
+        if self.layer_type is None and isinstance(
+            self.layer, (TransformerLayer, MultiTokenPredictionLayer)
+        ):
+            return super().get_low_precision_context()
+        return nullcontext()
 
 
 class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
@@ -111,8 +115,8 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     Threads HybridStack's ``layer_type_list[layer_idx]`` symbol into each
     layer plan's ``extra_args`` so the per-layer plan can dispatch grouped
-    layers correctly. Ordinary GPT/MTP layers (no ``layer_type_list``)
-    default to ``layer_type=None`` and follow the GPT path. The pre/post
+    layers correctly. Layers of other modules (e.g. MTP layers) get
+    ``layer_type=None`` and follow the GPT path. The pre/post
     process nodes inherit from the GPT base class — they already dispatch
     on ``model._preprocess`` / ``model._postprocess`` which a HybridModel
     implements.
@@ -123,6 +127,6 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
         extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)
         extra_args["layer_type"] = (
-            module.layer_type_list[layer_idx] if hasattr(module, "layer_type_list") else None
+            module.layer_type_list[layer_idx] if isinstance(module, HybridStack) else None
         )
         return extra_args
