@@ -967,9 +967,10 @@ class TestMcoreAdapterHybrid:
     def test_hybrid_matches_single_instance_accumulating(
         self, outer_size, outer_strategy, inner_strategy, microbatches
     ):
-        """Compare losses against one optimizer instance with ZeRO-3 across all DP ranks.
+        """Compare losses against ZeRO-3 sharded across all DP ranks.
 
-        The reference has outer_size=1, so its inner DP group spans all ranks.
+        With eight ranks, the reference uses a 1D mesh of size 8. A hybrid run
+        with outer_size=2 uses a 2D mesh of shape (2 outer, 4 inner).
         Both runs use the same global batches, including no_sync accumulation.
         """
         config = self._config()
