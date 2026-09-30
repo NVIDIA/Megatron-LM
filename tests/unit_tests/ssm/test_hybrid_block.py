@@ -433,6 +433,8 @@ def test_mamba_state_shapes_are_selected_by_layer_config_type():
             SimpleNamespace(mamba_state_shapes_per_request=lambda: mamba_shapes),
         ],
     )
+    # No shortcut pairs, so the physical layers are the registered layers.
+    block.physical_layers = lambda: tuple(block.layers)
 
     assert HybridStack.mamba_state_shapes_per_request(block) == mamba_shapes
 

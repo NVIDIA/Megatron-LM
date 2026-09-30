@@ -1994,6 +1994,7 @@ def _load_non_persistent_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
@@ -2014,6 +2015,7 @@ def _load_non_persistent_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif args.non_persistent_ckpt_type == 'local':
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -2035,6 +2037,15 @@ def _load_non_persistent_base_checkpoint(
         )
 
 
+def _gtp_pad_for_alignment_from_args(args):
+    """GTP dim-0 alignment implied by the precision recipe recorded in ``args``."""
+    return resolve_gtp_pad_for_alignment(
+        fp4=getattr(args, 'fp4', None) is not None,
+        fp8_recipe=getattr(args, 'fp8_recipe', None),
+        fp8=getattr(args, 'fp8', None) is not None,
+    )
+
+
 def _load_global_dist_base_checkpoint(
     load_dir,
     args,
@@ -2045,6 +2056,7 @@ def _load_global_dist_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
@@ -2095,11 +2107,9 @@ def _load_global_dist_base_checkpoint(
 
     # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
     # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
-    gtp_pad_for_alignment = resolve_gtp_pad_for_alignment(
-        fp4=getattr(args, 'fp4', None) is not None,
-        fp8_recipe=getattr(args, 'fp8_recipe', None),
-        fp8=getattr(args, 'fp8', None) is not None,
-    )
+    # load_checkpoint passes the saving run's recipe when the checkpoint records it.
+    if gtp_pad_for_alignment is None:
+        gtp_pad_for_alignment = _gtp_pad_for_alignment_from_args(args)
     grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
@@ -2142,6 +2152,7 @@ def _load_base_checkpoint(
     dp_cp_group=None,
     expt_dp_group=None,
     gpt_compat_layer_maps=None,
+    gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from the given directory
 
@@ -2182,6 +2193,7 @@ def _load_base_checkpoint(
                 checkpointing_context,
                 dp_cp_group=dp_cp_group,
                 expt_dp_group=expt_dp_group,
+                gtp_pad_for_alignment=gtp_pad_for_alignment,
             )
         else:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
@@ -2234,6 +2246,7 @@ def _load_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif ckpt_format == 'torch':
         ckpt_type = CheckpointType.LEGACY
@@ -2717,6 +2730,14 @@ def load_checkpoint(
     ):
         ckpt_args = state_dict.get('args') or types.SimpleNamespace()
 
+    # GTP padding was sized by the precision recipe of the run that saved the checkpoint, which
+    # can differ from this run's (e.g. an MXFP8-trained checkpoint loaded for BF16 inference).
+    gtp_pad_for_alignment = (
+        _gtp_pad_for_alignment_from_args(ckpt_args)
+        if any(hasattr(ckpt_args, name) for name in ('fp4', 'fp8', 'fp8_recipe'))
+        else None
+    )
+
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
     gpt_compat_layer_maps, gpt_compat_load_optim = (
@@ -3034,6 +3055,7 @@ def load_checkpoint(
         dp_cp_group=dp_cp_group,
         expt_dp_group=expt_dp_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
+        gtp_pad_for_alignment=gtp_pad_for_alignment,
         **load_kwargs,
     )
 

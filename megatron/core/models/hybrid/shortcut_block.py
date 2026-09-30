@@ -195,7 +195,7 @@ class ShortcutMoEBlock(MegatronModule):
 
     def _moe_router_preprocess(self, shortcut_hidden, padding_mask=None, packed_seq_params=None):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
-        if self.recompute_shortcut_pre_mlp_layernorm:
+        if self.recompute_shortcut_pre_mlp_layernorm and not InferenceMode.is_active():
             self.shortcut_pre_mlp_layernorm_checkpoint = CheckpointWithoutOutput()
             shortcut_input = self.shortcut_pre_mlp_layernorm_checkpoint.checkpoint(
                 apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
@@ -236,7 +236,9 @@ class ShortcutMoEBlock(MegatronModule):
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
         post_norm_input = output
         post_norm_manager = self.off_interface(
-            self.offload_shortcut_post_norm, post_norm_input, "shortcut_post_norm"
+            self.offload_shortcut_post_norm and not InferenceMode.is_active(),
+            post_norm_input,
+            "shortcut_post_norm",
         )
         with post_norm_manager as post_norm_input:
             output = self.shortcut_post_norm(post_norm_input)
@@ -343,14 +345,6 @@ class ShortcutMoEBlock(MegatronModule):
         layer runs its ordinary forward and all communication stays on the current stream. Routing
         still reads the pair input, before the paired layer transforms the residual stream.
         """
-        if (
-            self.config.mlp_chunks_for_prefill > 1
-            and inference_context is not None
-            and not inference_context.is_decode_only()
-        ):
-            raise RuntimeError(
-                "Shortcut-MoE inference does not support mlp_chunks_for_prefill greater than 1."
-            )
         attn_config = self.compute_layer.config
         moe_config = self.moe_layer.config
 
@@ -409,7 +403,9 @@ class ShortcutMoEBlock(MegatronModule):
     ):
         """Run the eager schedule with each physical layer's quantization context."""
 
-        self.moe_layer.mlp.select_token_dispatcher()
+        select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
+        if select_token_dispatcher is not None:
+            select_token_dispatcher()
         if InferenceMode.is_active():
             if cp_layout_state is not None:
                 raise RuntimeError("Shortcut-MoE inference does not support context parallelism.")
@@ -423,6 +419,10 @@ class ShortcutMoEBlock(MegatronModule):
                 padding_mask=padding_mask,
                 quant_context_factory=quant_context_factory,
             )
+        assert inference_context is None, (
+            "Shortcut-MoE received an inference context outside inference mode; the training "
+            "schedule does not update KV-cache or recurrent inference state."
+        )
 
         attn_config = self.compute_layer.config
         moe_config = self.moe_layer.config

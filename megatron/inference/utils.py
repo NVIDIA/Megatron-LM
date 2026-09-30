@@ -7,8 +7,9 @@ from typing import Literal, Optional
 
 import torch
 
-from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -31,7 +32,13 @@ from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.checkpointing import load_checkpoint
+from megatron.training.checkpointing import (
+    get_checkpoint_name,
+    get_checkpoint_tracker_filename,
+    get_loaded_iteration,
+    load_checkpoint,
+    read_metadata,
+)
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
 try:
@@ -79,30 +86,61 @@ def get_model_builder(
     raise ValueError(f"Invalid model provider {provider}")
 
 
-def _allow_gtp_padding_shape_mismatch(sharded_state_dict) -> None:
-    """Permit DCP to crop trusted GTP padding while retaining key validation."""
+def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
+    """Map model sharded keys onto a checkpoint that nests the model under a prefix.
 
-    def mark_weight(value):
-        if isinstance(value, ShardedTensor) and value.key.endswith('.weight'):
-            value.allow_shape_mismatch = True
-        return value
-
-    dict_list_map_inplace(mark_weight, sharded_state_dict)
-
-
-def _get_checkpoint_model_modifier(args: Namespace):
-    """Compose the model sharded state dict adjustments requested by args, if any."""
+    Records the resulting keys in ``requested_keys`` so unloaded checkpoint tensors can be
+    reported after the load.
+    """
     prefix = getattr(args, 'checkpoint_model_prefix', '')
-    if not prefix and not args.inference_allow_gtp_padding:
+    if not prefix:
         return None
 
     def modifier(sharded_state_dict):
-        if prefix:
-            apply_prefix_mapping(sharded_state_dict, {'': prefix})
-        if args.inference_allow_gtp_padding:
-            _allow_gtp_padding_shape_mismatch(sharded_state_dict)
+        apply_prefix_mapping(sharded_state_dict, {'': prefix})
+        requested_keys.update(
+            value.key
+            for value in nested_values(sharded_state_dict)
+            if isinstance(value, (ShardedTensor, ShardedTensorFactory))
+        )
 
     return modifier
+
+
+def _warn_on_unloaded_checkpoint_tensors(args: Namespace, requested_keys: set) -> None:
+    """Warn about checkpoint tensors under the model prefix that no rank loaded.
+
+    Loading one model out of a larger checkpoint cannot use strict key checking (the other
+    submodules' tensors are always unused), so a module this build omits, e.g. because of a
+    config default that differs from the one the checkpoint was trained with, would otherwise
+    be dropped silently.
+    """
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, sorted(requested_keys))
+    if args.ckpt_step is not None:
+        release = False
+    else:
+        _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+    if torch.distributed.get_rank() != 0:
+        return
+
+    requested = set().union(*gathered)
+    checkpoint_dir = get_checkpoint_name(
+        args.load, get_loaded_iteration(), release, return_base_dir=True
+    )
+    unloaded = sorted(
+        key
+        for key in dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+        if key.startswith(args.checkpoint_model_prefix)
+        # Factories (e.g. fused in_proj) expand into sub-keys of the requested key.
+        and key not in requested
+        and not any(key.startswith(f"{requested_key}.") for requested_key in requested)
+    )
+    if unloaded:
+        logger.warning(
+            f"{len(unloaded)} checkpoint tensors under '{args.checkpoint_model_prefix}' were not "
+            f"loaded; check that the model config matches the checkpoint: {unloaded[:20]}"
+        )
 
 
 def get_model_for_inference() -> MegatronModule:
@@ -125,14 +163,17 @@ def get_model_for_inference() -> MegatronModule:
 
     # Load checkpoint.
     assert args.load is not None
+    requested_keys = set()
     args.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
-        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args),
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
     )
+    if requested_keys:
+        _warn_on_unloaded_checkpoint_tensors(args, requested_keys)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -289,15 +330,6 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--inference-ckpt-non-strict",
         action="store_true",
         help="Load checkpoint with `strict=False`.",
-    )
-    group.add_argument(
-        "--inference-allow-gtp-padding",
-        action="store_true",
-        default=False,
-        help=(
-            "Allow model weights saved with GTP alignment padding to load into a non-GTP "
-            "inference topology. Use only for trusted GTP checkpoints."
-        ),
     )
     group.add_argument(
         "--termination-id",

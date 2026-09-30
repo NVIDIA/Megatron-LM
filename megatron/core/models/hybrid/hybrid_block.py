@@ -463,9 +463,7 @@ class HybridStack(MegatronModule):
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
-        for layer_config, layer in zip(
-            self.layer_config_list, self.physical_layers(), strict=True
-        ):
+        for layer_config, layer in zip(self.layer_config_list, self.physical_layers(), strict=True):
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:
