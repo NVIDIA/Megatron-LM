@@ -43,6 +43,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudaGraphRunner,
     create_cudagraphs,
     delete_cuda_graphs,
+    release_all_cuda_graphs,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -97,12 +98,9 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert assigned[:pool_size] == assigned[pool_size:]
 
 
-@pytest.mark.internal
-@pytest.mark.launch_on_gb200
-def test_delete_cuda_graphs_releases_runner_without_capture_records(monkeypatch):
-    class Graph:
-        pass
-
+@pytest.fixture
+def isolated_cuda_graph_record(monkeypatch):
+    """Give each test its own runner registry and global capture state."""
     monkeypatch.setattr(_CudagraphGlobalRecord, "all_runners", weakref.WeakSet())
     monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", True)
     monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [])
@@ -113,28 +111,67 @@ def test_delete_cuda_graphs_releases_runner_without_capture_records(monkeypatch)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
+
+class _Graph:
+    pass
+
+
+def _runner_with_created_graphs():
+    """Return a runner in the state 'create_cudagraphs' leaves it in, plus graph weakrefs."""
     runner = _CudaGraphRunner(
         MegatronModule(config=None), object(), [], {}, func=None, need_backward=True
     )
     runner.cudagraph_created = True
     runner.fwd_graph_recorded = True
     runner.bwd_graph_recorded = True
-    runner.fwd_graph = Graph()
-    runner.bwd_graph = Graph()
+    runner.fwd_graph = _Graph()
+    runner.bwd_graph = _Graph()
     runner._gtp_fwd_params_to_ensure_ready = (object(),)
-    graph_refs = (weakref.ref(runner.fwd_graph), weakref.ref(runner.bwd_graph))
+    return runner, (weakref.ref(runner.fwd_graph), weakref.ref(runner.bwd_graph))
 
-    # Capture clears the records, but the model still owns this runner.
-    delete_cuda_graphs()
 
+def _assert_runner_released(runner, graph_refs):
     assert all(graph_ref() is None for graph_ref in graph_refs)
     assert not runner.cudagraph_created
     assert not runner.fwd_graph_recorded
     assert not runner.bwd_graph_recorded
     assert runner.mempool is None
     assert runner._gtp_fwd_params_to_ensure_ready == ()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+def test_release_all_cuda_graphs_releases_runner_without_capture_records(
+    isolated_cuda_graph_record,
+):
+    runner, graph_refs = _runner_with_created_graphs()
+
+    # Capture clears the records, but the model still owns this runner.
+    release_all_cuda_graphs()
+
+    _assert_runner_released(runner, graph_refs)
     assert not _CudagraphGlobalRecord.cudagraph_created
     assert CudaGraphManager.global_mempool is None
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+def test_delete_cuda_graphs_keeps_created_training_graphs(isolated_cuda_graph_record):
+    # An inference engine's suspend calls delete_cuda_graphs(). Graphs that
+    # create_cudagraphs() captured for training are not in the record and must survive.
+    training_runner, training_graph_refs = _runner_with_created_graphs()
+    inference_runner, inference_graph_refs = _runner_with_created_graphs()
+    _CudagraphGlobalRecord.cudagraph_inference_record.append((inference_runner, "fwd", (), {}))
+
+    delete_cuda_graphs()
+
+    _assert_runner_released(inference_runner, inference_graph_refs)
+    assert all(graph_ref() is not None for graph_ref in training_graph_refs)
+    assert training_runner.cudagraph_created
+    assert training_runner.fwd_graph_recorded and training_runner.bwd_graph_recorded
+
+    release_all_cuda_graphs()
+    _assert_runner_released(training_runner, training_graph_refs)
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:

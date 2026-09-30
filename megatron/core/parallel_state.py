@@ -2721,10 +2721,7 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     # (pytorch#115388). Only touch the module if something already imported it.
     cuda_graphs_module = sys.modules.get("megatron.core.transformer.cuda_graphs")
     if cuda_graphs_module is not None:
-        # A failed capture can leave a live runner before any record/flag was set.
-        record = cuda_graphs_module._CudagraphGlobalRecord
-        if record.all_runners or cuda_graphs_module.CudaGraphManager.global_mempool is not None:
-            cuda_graphs_module.delete_cuda_graphs()
+        cuda_graphs_module.release_all_cuda_graphs()
 
     full_cuda_graph_module = sys.modules.get("megatron.core.full_cuda_graph")
     if full_cuda_graph_module is not None:
