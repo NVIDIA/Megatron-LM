@@ -194,7 +194,83 @@ def _native_single_grouped_weight_view(
     from megatron.core.fp8_utils import is_grouped_mxfp8tensor
 
     if not is_grouped_mxfp8tensor(weight):
-        raise RuntimeError("MOK MXFP8 requires native TE grouped MXFP8 parameters")
+        # fp8_param=False: weight is BF16. Quantize on-the-fly to MXFP8 so
+        # MOK's MXFP8 kernel runs without permanently storing FP8 parameters.
+        # The result is cached across microbatches by backend._routed_weight_view_cache
+        # and re-quantized once per optimizer step (cache is invalidated by the
+        # first-microbatch TE path in moe_layer.megakernel_forward).
+        try:
+            import transformer_engine.pytorch.cpp_extensions as _tex
+            from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "MOK on-the-fly MXFP8 quantization requires Transformer Engine "
+                "with MXFP8Quantizer (TE >= 2.10.0). Either use fp8_param=True "
+                "or upgrade Transformer Engine."
+            ) from exc
+
+        if weight.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"MOK on-the-fly MXFP8: expected BF16 weight, got {weight.dtype}"
+            )
+        storage = getattr(weight, "rowwise_data", None)
+        if storage is not None:
+            weight_data = _storage_view(
+                storage, shape,
+                dtype=torch.bfloat16,
+                name="single-grouped BF16 quantization input",
+            )
+        else:
+            weight_data = weight.contiguous()
+
+        quantizer = MXFP8Quantizer(
+            fp8_dtype=_tex.DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=True,
+        )
+        mxfp8 = quantizer.quantize_impl(weight_data)
+
+        # Data tensors: uint8 (E, R, C) → float8_e4m3fn view (E, R, C)
+        row_data = mxfp8._rowwise_data.view(torch.float8_e4m3fn).view(shape)
+        col_data = mxfp8._columnwise_data.view(torch.float8_e4m3fn).view(shape)
+
+        # Scale tensors: quantizer produces 2D (E*R, C//32) / (E*R//32, C);
+        # reshape to 3D expert-major for _swizzle_mxfp8_scale.
+        expected_row_scale_numel = num_experts * rows * (columns // 32)
+        if mxfp8._rowwise_scale_inv.numel() != expected_row_scale_numel:
+            raise RuntimeError(
+                f"MOK on-the-fly MXFP8: rowwise scale numel "
+                f"{mxfp8._rowwise_scale_inv.numel()} != {expected_row_scale_numel}. "
+                "E*R must be a multiple of 128 (TE scale padding not supported)."
+            )
+        row_scale = mxfp8._rowwise_scale_inv.view(num_experts, rows, columns // 32)
+
+        expected_col_scale_numel = num_experts * (rows // 32) * columns
+        if mxfp8._columnwise_scale_inv.numel() != expected_col_scale_numel:
+            raise RuntimeError(
+                f"MOK on-the-fly MXFP8: columnwise scale numel "
+                f"{mxfp8._columnwise_scale_inv.numel()} != {expected_col_scale_numel}. "
+                "E*R must be a multiple of 128*32 (TE scale padding not supported)."
+            )
+        col_scale = mxfp8._columnwise_scale_inv.view(num_experts, rows // 32, columns)
+
+        return (
+            row_data,
+            _swizzle_mxfp8_scale(
+                row_scale,
+                rows=rows,
+                columns=columns,
+                out=None if cached_view is None else cached_view[1],
+            ),
+            col_data,
+            _swizzle_mxfp8_scale(
+                col_scale.transpose(-2, -1),  # (E, R//32, C) → (E, C, R//32) for MOK dgrad
+                rows=columns,
+                columns=rows,
+                out=None if cached_view is None else cached_view[3],
+            ),
+            True,
+        )
 
     row_data = _storage_view(
         weight.rowwise_data,

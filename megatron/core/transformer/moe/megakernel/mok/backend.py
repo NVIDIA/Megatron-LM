@@ -71,6 +71,7 @@ class MoKMegakernel(MegakernelBackend):
         self.num_local_experts = num_local_experts
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_ffn_hidden_size
+        self.tp_size = config.tensor_model_parallel_size
         shared_intermediate_size = config.moe_shared_expert_intermediate_size
         if shared_intermediate_size != self.intermediate_size:
             raise ValueError(
@@ -81,14 +82,17 @@ class MoKMegakernel(MegakernelBackend):
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = bool(
-            config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
+            config.fp8 is not None and config.fp8_recipe in ("mxfp8", "custom")
         )
-        if self.use_mxfp8_weights:
+        if self.use_mxfp8_weights and config.fp8_param:
+            # fp8_param=True: weights are stored as MXFP8Tensor. TE refreshes
+            # columnwise data after TP all-gather via post_all_gather_processing;
+            # verify TE is new enough to support that hook.
             from megatron.core import fp8_utils
 
             if fp8_utils.te_post_all_gather_processing is None:
                 raise RuntimeError(
-                    "MOK MXFP8 requires Transformer Engine with "
+                    "MOK MXFP8 with fp8_param=True requires Transformer Engine with "
                     "post_all_gather_processing support (normally TE >= 2.10.0). Older TE "
                     "versions rely on a later TE expert forward to refresh columnwise weights, "
                     "but MOK bypasses that forward path."
@@ -211,6 +215,18 @@ class MoKMegakernel(MegakernelBackend):
         from megatron.core.fp8_utils import is_float8tensor
 
         i, h = self.intermediate_size, self.hidden_size
+        tp_size = self.tp_size
+        i_per_tp = i // tp_size
+        if tp_size > 1:
+            raise NotImplementedError(
+                f"MOK does not yet support tensor_model_parallel_size > 1 for shared experts "
+                f"(got TP={tp_size}). MOK's shared expert GEMM requires full "
+                f"[{2 * i}, {h}] / [{h}, {i}] weights but only sees TP-partitioned "
+                f"[{2 * i_per_tp}, {h}] / [{h}, {i_per_tp}] shards, and the backward "
+                "accumulates gradients directly into per-rank main_grad buffers without a "
+                "TP all-reduce. Use tensor_model_parallel_size=1, or implement weight "
+                "all-gather + post-backward TP grad reduction."
+            )
         if not isinstance(fc1_ref, nn.Parameter) or not isinstance(fc2_ref, nn.Parameter):
             raise RuntimeError("MOK shared FC1 and FC2 must be MCore-owned Parameters")
         if tuple(fc1_ref.shape) != (2 * i, h) or tuple(fc2_ref.shape) != (h, i):

@@ -1211,16 +1211,23 @@ class ColumnParallelLinear(torch.nn.Module):
         )
 
         if config.gradient_accumulation_fusion and not _grad_accum_fusion_available:
-            raise RuntimeError(
-                "ColumnParallelLinear was called with gradient_accumulation_fusion set "
-                "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
-                "module is not found. To use gradient_accumulation_fusion you must "
-                "install APEX with --cpp_ext and --cuda_ext. For example: "
-                'pip install --global-option="--cpp_ext" --global-option="--cuda_ext ." '
-                "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
-                "gradient accumulation fusion."
-            )
-        self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
+            if getattr(config, 'moe_megakernel_backend', None) == 'mok':
+                # MOK handles MoE weight gradient accumulation via its megakernel;
+                # non-MoE linear layers (e.g. output projection) do not require APEX
+                # grad-accum fusion for correctness, so disable it silently here.
+                self.gradient_accumulation_fusion = False
+            else:
+                raise RuntimeError(
+                    "ColumnParallelLinear was called with gradient_accumulation_fusion set "
+                    "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
+                    "module is not found. To use gradient_accumulation_fusion you must "
+                    "install APEX with --cpp_ext and --cuda_ext. For example: "
+                    'pip install --global-option="--cpp_ext" --global-option="--cuda_ext ." '
+                    "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+                    "gradient accumulation fusion."
+                )
+        else:
+            self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
 
         if self.allreduce_dgrad and self.sequence_parallel:
             raise RuntimeError(

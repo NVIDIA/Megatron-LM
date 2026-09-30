@@ -773,6 +773,11 @@ class TransformerConfig(ModelParallelConfig):
     For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
     """
 
+    log_moe_overload_factor: bool = False
+    """When True, log MoE overload metrics (avg/max vs balanced token count per step) to
+    TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch; use for
+    debugging."""
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -1890,12 +1895,13 @@ class TransformerConfig(ModelParallelConfig):
             # (BF16/FP16), MXFP8 primary weights, and NVFP4 primary weights.
             # Other quantized primary-weight paths need grouped partial-cast support
             # before they are safe to enable.
-            if (self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8) or (
+            if (self.fp8 and self.fp8_recipe not in (Fp8Recipe.mxfp8, Fp8Recipe.custom)) or (
                 self.fp4 and self.fp4_recipe != Fp4Recipe.nvfp4
             ):
                 raise ValueError(
                     "moe_single_grouped_weight is currently supported with high-precision "
-                    "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
+                    "primary weights, fp8_recipe='mxfp8', fp8_recipe='custom' (with MOK), "
+                    "or fp4_recipe='nvfp4'."
                 )
             if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "mok":
                 raise ValueError(
@@ -2033,13 +2039,18 @@ class TransformerConfig(ModelParallelConfig):
                 and self.fp4 is None
                 and not self.fp4_param
             )
-            mok_mxfp8 = (
-                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            mok_mxfp8 = self.fp8 is not None and (
+                # fp8_param=True: weights stored as MXFP8Tensor (TE manages FP8 storage).
+                (self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param)
+                # fp8_recipe=custom, fp8_param=False: weights are BF16; MOK quantizes
+                # on-the-fly once per optimizer step and caches the result.
+                or self.fp8_recipe == Fp8Recipe.custom
             )
             if not (mok_bf16 or mok_mxfp8):
                 raise ValueError(
                     "MOK routed experts require either bf16=True with no FP8/FP4 mode, "
-                    "or MXFP8 with fp8_param=True; FP32, FP16, and FP4 are not supported"
+                    "or MXFP8 with fp8_param=True, or fp8_recipe='custom' (on-the-fly "
+                    "BF16→MXFP8 quantization); FP32, FP16, and FP4 are not supported"
                 )
             if self.overlap_moe_expert_parallel_comm:
                 raise ValueError(
@@ -2053,8 +2064,15 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
                     "the megakernel never runs the native dispatch path"
                 )
-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
-                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError(
+                    "MOK requires expert_tensor_parallel_size=1: the megakernel takes full "
+                    "expert weight tensors and cannot process TP-sharded weights"
+                )
+            if self.tensor_model_parallel_size != 1 and not self.sequence_parallel:
+                raise ValueError(
+                    "MOK with tensor_model_parallel_size>1 requires sequence_parallel=True"
+                )
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
             if self.moe_shared_expert_intermediate_size is None:
@@ -2302,9 +2320,11 @@ class TransformerConfig(ModelParallelConfig):
                     "on a None chunk. Disable one of them."
                 )
 
-        if self.enable_mhc_connections and not (
+        use_mhc_recompute = (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
-        ):
+        )
+
+        if self.enable_mhc_connections and not use_mhc_recompute:
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "

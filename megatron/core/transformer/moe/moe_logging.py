@@ -22,7 +22,7 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -388,3 +388,51 @@ class MoEMetricsTracker:
     def _format(scalars: Dict[str, Union[float, torch.Tensor]]) -> str:
         """Format aggregated metrics as a console log string."""
         return "".join(f" {k}: {v:.2f} |" for k, v in scalars.items())
+
+
+# ---------------------------------------------------------------------------
+# MoE Overload Factor Tracker
+# ---------------------------------------------------------------------------
+_MOE_OVERLOAD_FACTOR_TRACKER: Optional['MoEOverloadFactorTracker'] = None
+
+
+def get_moe_overload_factor_tracker() -> 'MoEOverloadFactorTracker':
+    """Return the global MoE overload factor tracker, creating it lazily if needed."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    if _MOE_OVERLOAD_FACTOR_TRACKER is None:
+        _MOE_OVERLOAD_FACTOR_TRACKER = MoEOverloadFactorTracker()
+    return _MOE_OVERLOAD_FACTOR_TRACKER
+
+
+def set_moe_overload_factor_tracker(tracker: 'MoEOverloadFactorTracker') -> None:
+    """Set the global MoE overload factor tracker."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    _MOE_OVERLOAD_FACTOR_TRACKER = tracker
+
+
+def destroy_moe_overload_factor_tracker() -> None:
+    """Reset the global MoE overload factor tracker to None."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    _MOE_OVERLOAD_FACTOR_TRACKER = None
+
+
+class MoEOverloadFactorTracker:
+    """Stub tracker for MoE overload-factor metrics (backport placeholder)."""
+
+    def set_process_groups(
+        self,
+        tp_ep_group: torch.distributed.ProcessGroup,
+        expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> None:
+        """Store process groups for distributed reductions."""
+        self.tp_ep_group = tp_ep_group
+        self.expt_dp_group = expt_dp_group
+
+    def report(
+        self,
+        iteration: int,
+        writer: Optional[object] = None,
+        wandb_writer: Optional[object] = None,
+    ) -> str:
+        """Report overload factor metrics (stub — returns empty string)."""
+        return ""

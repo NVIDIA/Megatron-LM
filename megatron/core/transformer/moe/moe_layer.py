@@ -716,10 +716,20 @@ class MoELayer(BaseMoELayer):
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
-                probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, packed_seq_params
+                sp_and_tp = (
+                    self.config.sequence_parallel and self.attn_tp_group.size() > 1
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                if sp_and_tp:
+                    hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                        hidden_states, group=self.attn_tp_group
+                    )
+                probs, routing_map = self.route(hidden_states, padding_mask)
+                output = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                if sp_and_tp:
+                    output = tensor_parallel.scatter_to_sequence_parallel_region(
+                        output, group=self.attn_tp_group
+                    )
+                return output
 
             if self.moe_layer_recompute and self.training:
                 if self.config.fp8 or self.config.fp4:
