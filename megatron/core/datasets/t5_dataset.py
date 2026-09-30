@@ -248,7 +248,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         tokens = tokens[:target_sequence_length]
 
         # Masking
-        (tokens, _, _, _, masked_spans) = self._create_masked_lm_predictions(
+        tokens, _, _, _, masked_spans = self._create_masked_lm_predictions(
             tokens, target_sequence_length, numpy_random_state
         )
 
