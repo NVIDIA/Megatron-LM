@@ -94,6 +94,7 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
+    from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.enums import AttnMaskType
@@ -147,6 +148,7 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp']),
         ).cuda()
         build_group = module.pg_collection.cp
         core = module.core_attention
@@ -164,9 +166,9 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
             sum(lengths), 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
         )
         cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
-        rotary = RotaryEmbedding(kv_channels=config.kv_channels, rotary_percent=1.0)(
-            max(lengths), packed_seq=True
-        )
+        rotary = RotaryEmbedding(
+            kv_channels=config.kv_channels, rotary_percent=1.0, cp_group=build_group
+        )(max(lengths), packed_seq=True)
         references = {}
         with _runtime_cp_groups() as groups:
             # None exercises the legacy build-time path before and after runtime overrides.
