@@ -7,6 +7,7 @@ import logging
 
 import torch
 
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
     get_all_rng_states,
@@ -272,3 +273,8 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
         if had_graph:
             gc.collect()
+
+
+register_model_parallel_teardown(
+    TeardownStage.RELEASE_CUDA_GRAPHS, FullCudaGraphWrapper.reset_cuda_graph
+)

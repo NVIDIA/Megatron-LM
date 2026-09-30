@@ -22,6 +22,7 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -839,6 +840,9 @@ def release_all_cuda_graphs():
     for runner in runners:
         _reset_cuda_graph_runner(runner)
     delete_cuda_graphs()
+
+
+register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, release_all_cuda_graphs)
 
 
 class _GraphStatus(Enum):

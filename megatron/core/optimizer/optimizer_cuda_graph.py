@@ -7,6 +7,7 @@ import logging
 import torch
 
 from megatron.core.full_cuda_graph import get_graph_pool, get_shared_capture_stream
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 
 logger = logging.getLogger(__name__)
 
@@ -69,3 +70,8 @@ class OptimizerCudaGraphWrapper:
         cls.cuda_graph = None
         cls.result = None
         cls.curr_iteration = 0
+
+
+register_model_parallel_teardown(
+    TeardownStage.RELEASE_CUDA_GRAPHS, OptimizerCudaGraphWrapper.reset_cuda_graph
+)

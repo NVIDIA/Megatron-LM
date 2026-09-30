@@ -2,9 +2,9 @@
 
 """Model and data parallel groups."""
 
+import enum
 import logging
 import os
-import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -163,6 +163,41 @@ _GLOBAL_MEMORY_BUFFER = None
 # Member groups recorded by create_group, in creation order, for timeout updates
 # and teardown. The first entry, None, represents the default process group.
 _global_process_group_list = None
+
+
+class TeardownStage(enum.IntEnum):
+    """Stages of destroy_model_parallel(), in execution order."""
+
+    VALIDATE = 0
+    """Raise if teardown must not start. Runs before anything is aborted or released."""
+
+    RELEASE_COMMUNICATION = 1
+    """Release contexts and buffers that use model-parallel communicators."""
+
+    RELEASE_CUDA_GRAPHS = 2
+    """Release captured CUDA graphs, which keep the communicators they captured alive."""
+
+    RESET_STATE = 3
+    """Reset library state that refers to the ending lifetime's process groups."""
+
+
+# Teardown callbacks by stage. See register_model_parallel_teardown().
+_MODEL_PARALLEL_TEARDOWN_CALLBACKS = {stage: [] for stage in TeardownStage}
+
+
+def register_model_parallel_teardown(stage: TeardownStage, callback: Callable[[], None]) -> None:
+    """Run ``callback`` at ``stage`` of every destroy_model_parallel() call.
+
+    Modules that cache resources bound to model-parallel process groups register a
+    callback when they are imported, so this module does not depend on them. Callbacks
+    run whether or not their resource exists, so they must be cheap and idempotent.
+    Within a stage, callbacks run in reverse registration order: a module registers
+    after the modules it imports, so it releases its resources before theirs.
+    Registering the same callback again has no effect.
+    """
+    callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS[stage]
+    if callback not in callbacks:
+        callbacks.append(callback)
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -2644,17 +2679,16 @@ def _abort_created_process_groups():
 
 def _clear_dtensor_sharding_cache():
     """Invalidate this thread's sharding specs, which can name a previous lifetime's groups."""
-    dtensor_module = sys.modules.get("torch.distributed.tensor")
-    if dtensor_module is not None:
-        sharding_propagator = dtensor_module.DTensor._op_dispatcher.sharding_propagator
-        cache = sharding_propagator.propagate_op_sharding
-        clear_python_cache = getattr(cache, "cache_clear", None)
-        if clear_python_cache is None:  # Older LocalLRUCache only exposes the wrapped LRU.
-            clear_python_cache = cache.cache.cache_clear
-        clear_python_cache()
-        clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
-        if clear_native_cache is not None:
-            clear_native_cache()
+    from torch.distributed.tensor import DTensor
+
+    cache = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding
+    clear_python_cache = getattr(cache, "cache_clear", None)
+    if clear_python_cache is None:  # Older LocalLRUCache only exposes the wrapped LRU.
+        clear_python_cache = cache.cache.cache_clear
+    clear_python_cache()
+    clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
+    if clear_native_cache is not None:
+        clear_native_cache()
 
 
 def destroy_model_parallel(*, abort: bool = False) -> None:
@@ -2665,6 +2699,11 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     (including TE graphed callables) before invoking this function. The default
     process group is preserved.
 
+    Teardown runs the registered TeardownStage.VALIDATE callbacks, aborts the owned
+    NCCL backends if requested, runs the remaining stages' callbacks in stage order
+    while the groups still exist, clears this module's state, and destroys the created
+    groups last. See register_model_parallel_teardown().
+
     Args:
         abort: Abort the owned NCCL backends before releasing cached resources. Failure
             handlers with outstanding collectives must use this mode, or abort their
@@ -2672,68 +2711,26 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
             by external libraries such as DeepEP; those require caller-managed recovery.
 
     Raises:
-        RuntimeError: A TE autocast context is still active, or its depth cannot be read.
+        RuntimeError: A validation callback refused teardown, for example because a TE
+            autocast context is still active.
         Exception: A resource or process group could not be released. Group destruction
             attempts all registered groups before reporting the first failure.
     """
-    fp8_state_manager = None
-    if "transformer_engine.pytorch" in sys.modules:
-        try:
-            from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-        except ImportError:  # TE < 2.9
-            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-
-        fp8_state_manager = FP8GlobalStateManager
-        state = getattr(fp8_state_manager, "quantization_state", fp8_state_manager)
-        for name in ("autocast_depth", "AUTOCAST_DEPTH", "FP8_AUTOCAST_DEPTH"):
-            if hasattr(state, name):
-                autocast_depth = getattr(state, name)
-                break
-        else:
-            raise RuntimeError("Cannot determine Transformer Engine autocast depth.")
-        # nvrx resets TE before unwinding the interrupted main thread's autocast.
-        # Its finally block can then decrement the reset depth to a negative value.
-        if autocast_depth > 0:
-            raise RuntimeError(
-                "Exit Transformer Engine autocast before destroying model parallelism."
-            )
+    callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS
+    for validate in reversed(callbacks[TeardownStage.VALIDATE]):
+        validate()
 
     if abort:
         _abort_created_process_groups()
 
     # Release cached resources while their process groups still exist.
-    fused_a2a_module = sys.modules.get("megatron.core.transformer.moe.fused_a2a")
-    if fused_a2a_module is not None:
-        token_dispatcher_module = sys.modules.get("megatron.core.transformer.moe.token_dispatcher")
-        try:
-            if token_dispatcher_module is not None:
-                token_dispatcher_module.nccl_ep_release_context()
-            else:
-                fused_a2a_module.nccl_ep_finalize()
-        except Exception:
-            logger.warning(
-                "Failed to finalize NCCL EP during model-parallel teardown.", exc_info=True
-            )
-        fused_a2a_module.reset_fused_a2a_buffers()
-
-    # Captured CUDA graphs keep references to the communicators whose collectives they
-    # captured; ncclCommFinalize/Destroy cannot complete while such a graph is alive
-    # (pytorch#115388). Only touch the module if something already imported it.
-    cuda_graphs_module = sys.modules.get("megatron.core.transformer.cuda_graphs")
-    if cuda_graphs_module is not None:
-        cuda_graphs_module.release_all_cuda_graphs()
-
-    full_cuda_graph_module = sys.modules.get("megatron.core.full_cuda_graph")
-    if full_cuda_graph_module is not None:
-        full_cuda_graph_module.FullCudaGraphWrapper.reset_cuda_graph()
-    optimizer_cuda_graph_module = sys.modules.get("megatron.core.optimizer.optimizer_cuda_graph")
-    if optimizer_cuda_graph_module is not None:
-        optimizer_cuda_graph_module.OptimizerCudaGraphWrapper.reset_cuda_graph()
-
-    # TE retains FP8 reduction groups and per-model tensor caches. The full reset is
-    # safe here because active autocast contexts were rejected before any cleanup.
-    if fp8_state_manager is not None:
-        fp8_state_manager.reset()
+    for stage in (
+        TeardownStage.RELEASE_COMMUNICATION,
+        TeardownStage.RELEASE_CUDA_GRAPHS,
+        TeardownStage.RESET_STATE,
+    ):
+        for release in reversed(callbacks[stage]):
+            release()
 
     # DTensor's sharding cache compares meshes by layout, not process-group identity.
     # A later initialization with the same layout would reuse specs naming dead groups.
