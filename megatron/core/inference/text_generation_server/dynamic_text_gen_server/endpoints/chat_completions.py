@@ -48,6 +48,7 @@ from .common import (
     attach_stage_metadata,
     collect_stage_metadata,
     generation_config_sampling_defaults,
+    generation_finish_reason,
     log_sampling_defaults_once,
     resolve_sampling_default,
     validate_offload_params,
@@ -1523,10 +1524,7 @@ try:
             # - "tool_calls" for auto or required tool choice when tools are called
             # - "stop" for named tool choice (even when tools are called)
             # - "length" when max tokens is reached
-            if (
-                len(result["generated_tokens"])
-                >= result["sampling_params"]["num_tokens_to_generate"]
-            ):
+            if generation_finish_reason(result) == "length":
                 finish_reason = "length"
             elif normalized_tool_calls and not is_named_tool_choice:
                 finish_reason = "tool_calls"

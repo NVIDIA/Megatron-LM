@@ -12,6 +12,8 @@ from collections.abc import Iterable
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 
+from .endpoints.common import generation_finish_reason
+
 logger = logging.getLogger(__name__)
 
 # JSON cannot represent non-finite floats: `orjson.dumps` encodes them as null and the
@@ -115,9 +117,7 @@ def _prompt_logprobs(tokenizer, token_ids, log_probs, top_log_probs):
 
 
 def _finish_reason(result):
-    requested = (result.get("sampling_params") or {}).get("num_tokens_to_generate")
-    generated = len(result.get("generated_tokens") or [])
-    return "length" if requested is not None and generated >= requested else "stop"
+    return generation_finish_reason(result)
 
 
 def _safe_content_prefix(content, markers):
