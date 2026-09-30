@@ -336,9 +336,24 @@ def test_async_forward_routes_one_controller_iteration(
     assert engine.schedule_waiting_requests.call_count == expected_schedule_calls
     nvtx_range_push.assert_called_once_with(expected_nvtx_range)
     nvtx_range_pop.assert_called_once_with(expected_nvtx_range)
+    finalize_requests = (
+        engine.controller.async_generate_output_tokens_dynamic_batch.await_args.kwargs[
+            "finalize_requests"
+        ]
+    )
+    assert finalize_requests.func == engine._finalize_finished_requests
+    assert finalize_requests.args == (
+        {},
+        {key: value for key, value in context_state.items() if key != "kv_stats"},
+        False,
+    )
+    if output is not None:
+        assert finalize_requests.args[0] is output["completed_requests"]
     if mode == AsyncScheduleMode.LEGACY:
         engine._should_run_async_sched_overlap.assert_not_called()
-        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with()
+        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
+            finalize_requests=finalize_requests
+        )
     else:
         engine._should_run_async_sched_overlap.assert_called_once_with()
         engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
@@ -346,6 +361,7 @@ def test_async_forward_routes_one_controller_iteration(
             schedule_waiting_requests=(
                 None if run_async_overlap else engine.schedule_waiting_requests
             ),
+            finalize_requests=finalize_requests,
         )
     engine.context.is_decode_only.assert_not_called()
 

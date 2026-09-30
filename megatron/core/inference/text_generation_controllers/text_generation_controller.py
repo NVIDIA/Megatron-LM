@@ -243,6 +243,7 @@ class _AsyncScheduleRequestResult:
     finished_handoff_ssm_slots: Dict[int, int] = field(default_factory=dict)
     finished_handoff_decode_tokens: Dict[int, List[int]] = field(default_factory=dict)
     finished_routing_block_ids: Dict[int, List[int]] = field(default_factory=dict)
+    log_probs_result: Optional[Tuple[Optional[List], Optional[Dict]]] = None
 
 
 @dataclass
@@ -1825,8 +1826,15 @@ class TextGenerationController(MTPControllerMixin):
                 finished_routing_block_ids[request_id] = valid_blocks
         return finished_routing_block_ids
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(
+        self, *, finalize_requests=None, log_probs=None, top_n_logprobs=None
+    ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
+
+        Args:
+            finalize_requests: Engine callback assembling finished results before release.
+            log_probs: Selected-token scores in the consumed request order.
+            top_n_logprobs: Top-n scores in the consumed request order.
 
         Returns:
             Dict [str, Tensor]: A dictionary containing:
@@ -1890,6 +1898,24 @@ class TextGenerationController(MTPControllerMixin):
                 finished_idxs, sampled_tokens_cpu, sampled_mtp_tokens_cpu
             )
         )
+
+        if finalize_requests is not None and finished_request_ids.numel():
+            finalize_requests(
+                request_ids=active_request_ids,
+                finished_request_ids=finished_request_ids,
+                sample=sampled_tokens_cpu,
+                accepted_tokens=(
+                    self._accepted_tokens_per_request
+                    if self.num_speculative_tokens > 0 and context.num_decode_requests > 0
+                    else None
+                ),
+                log_probs=log_probs,
+                top_n_logprobs=top_n_logprobs,
+                finished_routing_block_ids=finished_routing_block_ids,
+                finished_handoff_block_ids=finished_handoff_block_ids,
+                finished_handoff_ssm_slots=finished_handoff_ssm_slots,
+                finished_handoff_decode_tokens=finished_handoff_decode_tokens,
+            )
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
@@ -2749,8 +2775,59 @@ class TextGenerationController(MTPControllerMixin):
 
         return True, bookkeeping_done_event
 
+    def _finalize_async_sched_log_probs(
+        self, request_result, sample_result, log_probs_transfer
+    ) -> None:
+        """Materialize scores once, either for early completion or normal step output.
+
+        Args:
+            request_result: Request result owning the materialized scores.
+            sample_result: Sample and accepted-token counts.
+            log_probs_transfer: Pending score transfer, or None when scores were not requested.
+        """
+        if request_result.log_probs_result is None:
+            if log_probs_transfer is not None:
+                self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+            request_result.log_probs_result = self._materialize_async_sched_log_probs(
+                log_probs_transfer,
+                sample_result.accepted_counts_cpu_view if self.num_speculative_tokens > 0 else None,
+            )
+
+    def _finalize_async_sched_requests(
+        self, request_result, sample_result, log_probs_transfer, finalize_requests
+    ) -> None:
+        """Assemble completed requests before lifecycle cleanup can reuse their storage.
+
+        Args:
+            request_result: Consumed request IDs, tokens, and completion metadata.
+            sample_result: Sample and accepted-token counts.
+            log_probs_transfer: Pending score transfer, or None.
+            finalize_requests: Engine callback, or None for standalone controller use.
+        """
+        if finalize_requests is None or not request_result.finished_request_ids.numel():
+            return
+        self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
+        log_probs, top_n_logprobs = request_result.log_probs_result
+        finalize_requests(
+            request_ids=request_result.active_request_ids,
+            finished_request_ids=request_result.finished_request_ids,
+            sample=request_result.sampled_tokens_cpu,
+            accepted_tokens=request_result.accepted_tokens_cpu,
+            log_probs=log_probs,
+            top_n_logprobs=top_n_logprobs,
+            finished_routing_block_ids=request_result.finished_routing_block_ids,
+            finished_handoff_block_ids=request_result.finished_handoff_block_ids,
+            finished_handoff_ssm_slots=request_result.finished_handoff_ssm_slots,
+            finished_handoff_decode_tokens=request_result.finished_handoff_decode_tokens,
+        )
+
     def _run_async_sched_resolve(
-        self, sample_result: _AsyncScheduleSampleResult, resolved_sequence_lengths: Tensor
+        self,
+        sample_result: _AsyncScheduleSampleResult,
+        resolved_sequence_lengths: Tensor,
+        *,
+        finalize_requests=None,
+        log_probs_transfer=None,
     ) -> _AsyncScheduleRequestResult:
         """Resolve request state and compact speculative forward logits.
 
@@ -2758,6 +2835,8 @@ class TextGenerationController(MTPControllerMixin):
             sample_result (_AsyncScheduleSampleResult): Sampling outputs in reusable CPU views.
             resolved_sequence_lengths (Tensor): Sequence lengths after accepting
                 current output and before preparing unverified successor tokens.
+            finalize_requests: Engine callback assembling finished results before release.
+            log_probs_transfer: Pending selected and top-n score transfer.
 
         Returns:
             _AsyncScheduleRequestResult: Sampled tokens, resolved request row
@@ -2790,6 +2869,20 @@ class TextGenerationController(MTPControllerMixin):
             )
         )
 
+        result = _AsyncScheduleRequestResult(
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            accepted_tokens_cpu=accepted_tokens_cpu,
+            active_request_ids=active_request_ids,
+            finished_request_ids=finished_request_ids,
+            finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
+            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
+            finished_routing_block_ids=finished_routing_block_ids,
+        )
+        self._finalize_async_sched_requests(
+            result, sample_result, log_probs_transfer, finalize_requests
+        )
+
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
         resolved_finished_request_ids, survivor_idxs = context.resolve_requests(active_request_mask)
@@ -2801,20 +2894,16 @@ class TextGenerationController(MTPControllerMixin):
         self._compact_async_sched_forward(survivor_idxs)
 
         # Return the resolution result.
-        return _AsyncScheduleRequestResult(
-            sampled_tokens_cpu=sampled_tokens_cpu,
-            accepted_tokens_cpu=accepted_tokens_cpu,
-            active_request_ids=active_request_ids,
-            finished_request_ids=finished_request_ids,
-            survivor_idxs=survivor_idxs,
-            finished_handoff_block_ids=finished_handoff_block_ids,
-            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
-            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
-            finished_routing_block_ids=finished_routing_block_ids,
-        )
+        result.survivor_idxs = survivor_idxs
+        return result
 
     def _run_async_sched_update_requests(
-        self, sample_result: _AsyncScheduleSampleResult, resolved_sequence_lengths: Tensor
+        self,
+        sample_result: _AsyncScheduleSampleResult,
+        resolved_sequence_lengths: Tensor,
+        *,
+        finalize_requests=None,
+        log_probs_transfer=None,
     ) -> _AsyncScheduleRequestResult:
         """Run complete request lifecycle bookkeeping for a no-overlap step.
 
@@ -2822,6 +2911,8 @@ class TextGenerationController(MTPControllerMixin):
             sample_result (_AsyncScheduleSampleResult): Sampling outputs in reusable CPU views.
             resolved_sequence_lengths (Tensor): Sequence lengths after accepting
                 the current output.
+            finalize_requests: Engine callback assembling finished results before release.
+            log_probs_transfer: Pending selected and top-n score transfer.
 
         Returns:
             _AsyncScheduleRequestResult: Stable sampled output and lifecycle results.
@@ -2852,6 +2943,20 @@ class TextGenerationController(MTPControllerMixin):
             )
         )
 
+        result = _AsyncScheduleRequestResult(
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            accepted_tokens_cpu=accepted_tokens_cpu,
+            active_request_ids=active_request_ids,
+            finished_request_ids=finished_request_ids,
+            finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
+            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
+            finished_routing_block_ids=finished_routing_block_ids,
+        )
+        self._finalize_async_sched_requests(
+            result, sample_result, log_probs_transfer, finalize_requests
+        )
+
         mutable_sampled_tokens_cpu = sampled_tokens_cpu.clone()
         mutable_sampled_mtp_tokens_cpu = (
             sample_result.sampled_mtp_tokens_cpu_view.clone()
@@ -2866,18 +2971,9 @@ class TextGenerationController(MTPControllerMixin):
         range_pop()
         update_result = update_result or {}
 
-        return _AsyncScheduleRequestResult(
-            sampled_tokens_cpu=sampled_tokens_cpu,
-            accepted_tokens_cpu=accepted_tokens_cpu,
-            active_request_ids=active_request_ids,
-            finished_request_ids=finished_request_ids,
-            newly_paused_request_ids=update_result.get("newly_paused_request_ids"),
-            evict_request_ids=update_result.get("evict_request_ids"),
-            finished_handoff_block_ids=finished_handoff_block_ids,
-            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
-            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
-            finished_routing_block_ids=finished_routing_block_ids,
-        )
+        result.newly_paused_request_ids = update_result.get("newly_paused_request_ids")
+        result.evict_request_ids = update_result.get("evict_request_ids")
+        return result
 
     def _build_async_sched_step_result(
         self,
@@ -2931,7 +3027,7 @@ class TextGenerationController(MTPControllerMixin):
         )
 
     async def _run_async_sched_step_no_overlap(
-        self, *, schedule_waiting_requests: Optional[Callable[[], None]]
+        self, *, schedule_waiting_requests: Optional[Callable[[], None]], finalize_requests=None
     ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> update -> admit -> forward``.
 
@@ -2941,6 +3037,7 @@ class TextGenerationController(MTPControllerMixin):
         Args:
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
                 that admits eligible non-chunked prefill requests.
+            finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
             DynamicBatchControllerStepResult: Primer-only state or sampled output.
@@ -2978,7 +3075,10 @@ class TextGenerationController(MTPControllerMixin):
 
                 self._async_sched_forward.clear()
                 request_result = self._run_async_sched_update_requests(
-                    sample_result, resolved_sequence_lengths
+                    sample_result,
+                    resolved_sequence_lengths,
+                    finalize_requests=finalize_requests,
+                    log_probs_transfer=log_probs_transfer,
                 )
 
             # -------------------------------------------------------------------------
@@ -3013,12 +3113,8 @@ class TextGenerationController(MTPControllerMixin):
                 return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
-        if log_probs_transfer is not None:
-            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
-        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
-            log_probs_transfer,
-            sample_result.accepted_counts_cpu_view if self.num_speculative_tokens > 0 else None,
-        )
+        self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
+        log_probs, top_n_logprobs = request_result.log_probs_result
         result = self._build_async_sched_step_result(
             request_result,
             cuda_graph_request_count,
@@ -3030,8 +3126,13 @@ class TextGenerationController(MTPControllerMixin):
         await asyncio.sleep(0)
         return result
 
-    async def _run_async_sched_step_overlap(self) -> DynamicBatchControllerStepResult:
+    async def _run_async_sched_step_overlap(
+        self, *, finalize_requests=None
+    ) -> DynamicBatchControllerStepResult:
         """Run ``prepare -> sample -> forward -> resolve`` with one token per request.
+
+        Args:
+            finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
             DynamicBatchControllerStepResult: Completed sampled-step result.
@@ -3090,16 +3191,20 @@ class TextGenerationController(MTPControllerMixin):
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
             # Resolve N while forward N+1 continues.
-            resolve_result = self._run_async_sched_resolve(sample_result, resolved_sequence_lengths)
+            resolve_result = self._run_async_sched_resolve(
+                sample_result,
+                resolved_sequence_lengths,
+                finalize_requests=finalize_requests,
+                log_probs_transfer=log_probs_transfer,
+            )
 
             # Commit CPU input IDs in the resolved survivor order.
             context.commit_sampled_tokens(
                 resolve_result.sampled_tokens_cpu[resolve_result.survivor_idxs]
             )
 
-        if log_probs_transfer is not None:
-            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
-        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(log_probs_transfer)
+        self._finalize_async_sched_log_probs(resolve_result, sample_result, log_probs_transfer)
+        log_probs, top_n_logprobs = resolve_result.log_probs_result
         result = self._build_async_sched_step_result(
             resolve_result,
             cuda_graph_request_count,
@@ -3113,8 +3218,13 @@ class TextGenerationController(MTPControllerMixin):
         await asyncio.sleep(0)
         return result
 
-    async def _run_async_sched_step_overlap_mtp(self) -> DynamicBatchControllerStepResult:
+    async def _run_async_sched_step_overlap_mtp(
+        self, *, finalize_requests=None
+    ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> prepare -> forward -> resolve`` with MTP.
+
+        Args:
+            finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
             DynamicBatchControllerStepResult: Completed sampled-step result.
@@ -3173,7 +3283,12 @@ class TextGenerationController(MTPControllerMixin):
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            resolve_result = self._run_async_sched_resolve(sample_result, resolved_sequence_lengths)
+            resolve_result = self._run_async_sched_resolve(
+                sample_result,
+                resolved_sequence_lengths,
+                finalize_requests=finalize_requests,
+                log_probs_transfer=log_probs_transfer,
+            )
 
             # Commit CPU input IDs in the resolved survivor order.
             survivor_idxs = resolve_result.survivor_idxs
@@ -3186,11 +3301,8 @@ class TextGenerationController(MTPControllerMixin):
                 resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
             )
 
-        if log_probs_transfer is not None:
-            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
-        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
-            log_probs_transfer, sample_result.accepted_counts_cpu_view
-        )
+        self._finalize_async_sched_log_probs(resolve_result, sample_result, log_probs_transfer)
+        log_probs, top_n_logprobs = resolve_result.log_probs_result
         result = self._build_async_sched_step_result(
             resolve_result,
             cuda_graph_request_count,
@@ -3207,12 +3319,13 @@ class TextGenerationController(MTPControllerMixin):
     # -------------------------------------------------------------------------
 
     async def _run_legacy_step(
-        self, skip_bookkeeping: Optional[bool] = False
+        self, skip_bookkeeping: Optional[bool] = False, *, finalize_requests=None
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+            finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
             DynamicBatchControllerStepResult: Legacy sampled-step output and its
@@ -3346,7 +3459,11 @@ class TextGenerationController(MTPControllerMixin):
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                    finalize_requests=finalize_requests,
+                    log_probs=log_probs,
+                    top_n_logprobs=top_n_logprobs,
+                )
 
             ret = {
                 "accepted_tokens": (
@@ -3373,6 +3490,7 @@ class TextGenerationController(MTPControllerMixin):
         *,
         run_async_overlap: bool = True,
         schedule_waiting_requests: Optional[Callable[[], None]] = None,
+        finalize_requests: Optional[Callable[..., None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
@@ -3382,6 +3500,7 @@ class TextGenerationController(MTPControllerMixin):
             run_async_overlap (bool): Whether to run the overlap ordering.
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
                 used by the no-overlap path to admit eligible prefill requests.
+            finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.
@@ -3390,7 +3509,9 @@ class TextGenerationController(MTPControllerMixin):
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY:
-            return await self._run_legacy_step(skip_bookkeeping)
+            return await self._run_legacy_step(
+                skip_bookkeeping, finalize_requests=finalize_requests
+            )
         if mode != AsyncScheduleMode.ASYNC:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
@@ -3410,11 +3531,12 @@ class TextGenerationController(MTPControllerMixin):
 
         if not run_async_overlap or not self._async_sched_forward.is_valid:
             return await self._run_async_sched_step_no_overlap(
-                schedule_waiting_requests=schedule_waiting_requests
+                schedule_waiting_requests=schedule_waiting_requests,
+                finalize_requests=finalize_requests,
             )
         if self.num_speculative_tokens > 0:
-            return await self._run_async_sched_step_overlap_mtp()
-        return await self._run_async_sched_step_overlap()
+            return await self._run_async_sched_step_overlap_mtp(finalize_requests=finalize_requests)
+        return await self._run_async_sched_step_overlap(finalize_requests=finalize_requests)
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
