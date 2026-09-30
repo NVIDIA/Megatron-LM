@@ -334,9 +334,8 @@ class TestDSv4HybridCSADelayedWgradFlush:
 
         # dgrads flow normally; only the TE-linear wgrads are deferred.
         assert hidden.grad is not None, "no dgrad on hidden_states"
-        # linear_o_group_proj is a raw nn.Parameter (einsum), not a TE linear: it
-        # receives its gradient through plain autograd, proving backward ran.
-        assert attn.linear_o_group_proj.grad is not None, "no grad on linear_o_group_proj"
+        # BatchedLinear and the einsum fallback both compute this wgrad eagerly.
+        assert attn._linear_o_group_proj_weight.grad is not None, "no grad on linear_o_group_proj"
 
         _assert_all_grads_none(csa_nested_linears + attention_level_linears, "pre-flush")
 
