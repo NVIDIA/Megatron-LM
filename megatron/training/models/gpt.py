@@ -2,7 +2,9 @@
 
 import inspect
 import logging
-from typing import Any, Callable, ClassVar, Literal, override
+from typing import Any, Callable, ClassVar, Literal
+
+from typing_extensions import override
 
 import torch
 
