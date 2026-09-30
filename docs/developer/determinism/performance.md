@@ -274,7 +274,7 @@ not establish hardware latency, correctness, replay coverage or usable budgets.
 ## Time actual captured collectives
 
 `benchmark_collectives.py` measures the six direct TP/SP mappings supported by
-the [recipe capture adapter](recipe-coverage.md), using its actual rank-local
+the recipe capture adapter, using its actual rank-local
 input and upstream-gradient bytes. This optional adapter needs the capture and
 replay producer (#7260/#7317) and the early startup API (#7419). It runs on the
 capture's original single-node allocation; a capture from a different physical
