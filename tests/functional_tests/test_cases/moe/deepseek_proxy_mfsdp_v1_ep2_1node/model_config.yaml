@@ -36,8 +36,6 @@ MODEL_ARGS:
   --fp8-format: "e4m3"
   --fp8-recipe: "tensorwise"
   --fp8-param-gather: true
-  --megatron-fsdp-main-grads-dtype: fp32
-  --megatron-fsdp-grad-comm-dtype: fp32
 
   # Training args
   --use-mcore-models: true
