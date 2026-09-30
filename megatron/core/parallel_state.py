@@ -2586,11 +2586,12 @@ def destroy_model_parallel():
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
-    # Idempotent and a no-op when NCCL EP was never bootstrapped.
+    # Also drop shared zero-copy buffers so the next bootstrap cannot reuse the old context's
+    # buffers. Idempotent and a no-op when NCCL EP was never bootstrapped.
     try:
-        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
 
-        nccl_ep_finalize()
+        nccl_ep_release_context()
     except Exception:  # finalize must never block teardown
         pass
 
