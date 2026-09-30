@@ -108,6 +108,15 @@ def test_deallocate_output_tensor():
     assert out.nelement() == 6
 
 
+def test_deallocate_output_tensor_rejects_view():
+    """The view guard is back: pseudo-freeing a view reclaims nothing."""
+    base = torch.arange(6.0, requires_grad=True)
+    out = base.view(2, 3)
+    assert out._base is base
+    with pytest.raises(AssertionError, match="counter-productive"):
+        schedule.deallocate_output_tensor(out, deallocate_pipeline_outputs=True)
+
+
 @contextmanager
 def _no_sync():
     yield

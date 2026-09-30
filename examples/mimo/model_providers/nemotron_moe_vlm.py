@@ -364,6 +364,14 @@ def build_nemotron_communicator(
     """Wire the RADIO-encoder -> language cross-grid pipeline communicator."""
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
     language_config = language_model_spec(args, None, language_grid).params["config"]
+    if RADIO_ENCODER_MODULE_NAME not in topology.grids:
+        # LLM-only topology has no encoder or cross-module bridge metadata.
+        return MultiModulePipelineCommunicator(
+            topology.grids,
+            {MIMO_LANGUAGE_MODULE_KEY: []},
+            language_config,
+            dim_mapping={"s": 0, "h": 2, "b": 1},
+        )
     bridge_recv_shape_fns = None
     if getattr(args, "mimo_bridge_skip_shape_exchange", False):
         bridge_hidden_size = int(args.hidden_size)
