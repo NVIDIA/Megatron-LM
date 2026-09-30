@@ -667,6 +667,8 @@ class TestPackedSeqCudagraphs:
         assert actual_cu_seqlens_metadata.is_cudagraph_input
         assert padded_cu_seqlens_metadata.is_cudagraph_input
         eager_out.sum().backward()
+        # Release default-stream autograd nodes before capture on the runner's stream.
+        eager_out = eager_out.detach()
 
         # This is the primary function under test.
         create_cudagraphs()
@@ -1948,6 +1950,7 @@ class TestRepeatedParameterCapture:
         ddp_model.finish_grad_sync()
         record_wgrad = module.weight.main_grad.detach().clone()
         torch.testing.assert_close(record_wgrad, reference_wgrad)
+        del record_output
 
         create_cudagraphs()
 

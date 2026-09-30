@@ -680,10 +680,6 @@ class _CudagraphGlobalRecord:
             GTP_CONFIG.check_param_states = False
             initialize_graph_wgrad_rings()
 
-        _set_capture_start()
-        if has_te_modules:
-            te_set_capture_start()
-
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
         def format_mem_bytes(mem_bytes):
@@ -693,25 +689,36 @@ class _CudagraphGlobalRecord:
                     return f"{sign}{n / 1024**p:.1f} {s}"
             return f"{sign}{n} bytes"
 
-        for g_idx, g in progress_bar:
-            if torch.distributed.get_rank() == 0:
-                mem_stats = torch.cuda.memory_stats()
-                progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
-                    format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
-                    format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
-                )
-                if HAVE_TQDM:
-                    progress_bar.set_description(progress_str)
-                elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
-                    logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+        _set_capture_start()
+        try:
+            if has_te_modules:
+                te_set_capture_start()
 
-            runner, graph_type = g[0:2]
-            if graph_type == 'fwd':
-                args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
-            else:
-                assert fwd_buffer_reuse_ref_count == 0
-                runner.create_bwd_graph()
+            for g_idx, g in progress_bar:
+                if torch.distributed.get_rank() == 0:
+                    mem_stats = torch.cuda.memory_stats()
+                    progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
+                        format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
+                        format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
+                    )
+                    if HAVE_TQDM:
+                        progress_bar.set_description(progress_str)
+                    elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
+                        logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+
+                runner, graph_type = g[0:2]
+                if graph_type == 'fwd':
+                    args, kwargs, out = g[2:]
+                    runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+                else:
+                    assert fwd_buffer_reuse_ref_count == 0
+                    runner.create_bwd_graph()
+        finally:
+            # Failed capture must not suppress subsequent DDP gradient accumulation.
+            _set_capture_end()
+            if has_te_modules:
+                te_set_capture_end()
+            torch.cuda.set_stream(torch.cuda.default_stream())
 
         # Memory usage.
         time_end = time.time()
@@ -749,13 +756,6 @@ class _CudagraphGlobalRecord:
         # Reset global record.
         cls.cudagraph_created = True
         cls.cudagraph_record = []
-
-        # Finished capturing.
-        _set_capture_end()
-        if has_te_modules:
-            te_set_capture_end()
-
-        torch.cuda.set_stream(torch.cuda.default_stream())
 
         # Return capture time and memory usage.
         return capture_stats
