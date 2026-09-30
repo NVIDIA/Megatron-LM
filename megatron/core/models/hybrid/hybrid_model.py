@@ -535,6 +535,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        # MTP rolls its token-side fields together in the caller's CP-local sequence
+        # layout, so it must receive the caller's padding mask, not the sequence-parallel
+        # shard the decoder gets below (MoE layers align a full-length mask themselves).
+        mtp_padding_mask = padding_mask
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -702,7 +707,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     position_ids=position_ids if roll_position_ids else None,
                     labels=labels if self.post_process else None,
                     loss_mask=loss_mask if self.post_process else None,
-                    padding_mask=padding_mask,
+                    padding_mask=mtp_padding_mask,
                 )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
@@ -718,7 +723,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_roll_context=sequence_roll_context,
                 embedding=self.embedding,
-                padding_mask=padding_mask,
+                padding_mask=mtp_padding_mask,
             )
 
         if not self.post_process:
