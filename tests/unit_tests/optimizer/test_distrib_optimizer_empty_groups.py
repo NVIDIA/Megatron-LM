@@ -35,6 +35,9 @@ def _optimizer(empty_group: bool = False, reverse: bool = False):
 
 def _wrapper(optimizer):
     """Provide local shard sizes without constructing a distributed model."""
+    # Populate the fields used by the production save/load methods: config,
+    # ddp_config, grad_scaler, model_param_group_index_map and gbuf_ranges.
+    # optimizer_state_keys remains the real DistributedOptimizer property.
     wrapper = distrib_optimizer.DistributedOptimizer.__new__(distrib_optimizer.DistributedOptimizer)
     wrapper.optimizer = optimizer
     wrapper.config = OptimizerConfig(optimizer="adam", lr=0.01)
