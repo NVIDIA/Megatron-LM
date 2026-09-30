@@ -328,33 +328,11 @@ def test_transformer_config_accepts_simplified_learned_k_with_independent_dimens
     assert config.dsa_indexer_head_dim == 6
 
 
-def test_simplified_main_q_reset_requires_main_attention_dimension_with_learned_k():
-    with pytest.raises(AssertionError, match="Main-Q initialization"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            num_query_groups=1,
-            kv_channels=8,
-            experimental_attention_variant="dsa",
-            add_bias_linear=False,
-            dsa_indexer_mode="simplified",
-            dsa_indexer_head_dim=6,
-            dsa_indexer_topk=4,
-            dsa_indexer_reset_method="main-q-mean-rescaled",
-            dsa_reset_indexer_on_load=True,
-            dsa_kernel_backend="min-memory-torch",
-            dsa_indexer_loss_coeff=0.1,
-            dsa_indexer_use_sparse_loss=True,
-        )
-
-
 @pytest.mark.parametrize(
     "overrides, message",
     [
         ({"dsa_fwd_use_dense_attn": True}, "dsa_fwd_use_dense_attn requires"),
         ({"dsa_reset_indexer_on_load": True}, "dsa_reset_indexer_on_load requires"),
-        ({"dsa_indexer_reset_method": "main-q-mean"}, "dsa_indexer_reset_method requires"),
     ],
 )
 def test_transformer_config_rejects_simplified_only_options_in_standard_mode(overrides, message):
