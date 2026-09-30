@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import gc
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -232,6 +233,40 @@ def capture_overlap_grads(layers, extra_kwargs, use_mtp_input_mask=False):
     return captures
 
 
+@contextmanager
+def model_parallel_context(tp_size=1):
+    """Own a fixed parallel topology and its backend buffers for a test scope."""
+    Utils.initialize_distributed()
+    torch.cuda.synchronize()
+    fused_a2a.reset_hybrid_ep_buffer()
+    fused_a2a._buffer = None
+    # MCore clears NCCL references without unregistering groups from c10d. Own only
+    # the groups created here so WORLD and groups from other test scopes survive.
+    pg_map = torch.distributed.distributed_c10d._world.pg_map
+    existing_groups = set(pg_map)
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=4,
+            expert_tensor_parallel_size=1,
+        )
+        set_streams()
+        yield
+    finally:
+        torch.cuda.synchronize()
+        gc.collect()
+        fused_a2a.reset_hybrid_ep_buffer()
+        fused_a2a._buffer = None
+        Utils.destroy_model_parallel()
+        for group in reversed(list(pg_map)):
+            if group not in existing_groups:
+                torch.distributed.destroy_process_group(group)
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert set(pg_map) <= existing_groups, "test scope leaked distributed process groups"
+
+
 class TestA2AOverlap:
     """
     Test class for all-to-all overlap optimization in transformer models.
@@ -240,43 +275,20 @@ class TestA2AOverlap:
     produces the same results as the reference implementation.
     """
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(scope="class", autouse=True)
     def model_parallel(self):
-        """Own all process groups created by one parametrized case, including TP resets."""
-        Utils.initialize_distributed()
-        # destroy_model_parallel clears MCore's NCCL group references, but c10d still
-        # owns the groups. Repeated initialization otherwise accumulates communicators
-        # until even the small cross-entropy all-reduce runs out of device memory.
-        # Snapshot after distributed initialization to preserve the default group and
-        # any groups owned by other tests. Use c10d's registry to include groups from
-        # the padding-mask test's second initialize_model_parallel call as well.
-        pg_map = torch.distributed.distributed_c10d._world.pg_map
-        existing_groups = set(pg_map)
-        try:
-            Utils.initialize_model_parallel(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=1,
-                expert_model_parallel_size=4,
-            )
-            set_streams()
+        # All parity cases use the same TP=1/EP=4 topology. Keep its collective backend
+        # alive across cases instead of repeatedly rebuilding HybridEP/NCCL runtimes.
+        with model_parallel_context():
             yield
-        finally:
-            # The test helpers have returned, so their last model/plan locals no longer
-            # keep cyclic graphs alive. Finalize NCCL EP before destroying the borrowed
-            # EP communicator. Cached flex buffers must not outlive their groups.
-            torch.cuda.synchronize()
-            gc.collect()
-            fused_a2a.reset_hybrid_ep_buffer()
-            fused_a2a._buffer = None
-            Utils.destroy_model_parallel()
-            # Gloo groups already destroyed by MCore are no longer in this registry.
-            # Reverse creation order consistently on every rank, preserving WORLD.
-            for group in reversed(list(pg_map)):
-                if group not in existing_groups:
-                    torch.distributed.destroy_process_group(group)
-            gc.collect()
-            torch.cuda.empty_cache()
-            assert set(pg_map) <= existing_groups, "test leaked distributed process groups"
+
+    @pytest.fixture(autouse=True)
+    def release_models(self):
+        yield
+        # Helpers have returned, so their last model/plan locals no longer pin cycles.
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
@@ -300,32 +312,6 @@ class TestA2AOverlap:
             extra_kwargs["mtp_num_layers"] = mtp_layers
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
-
-    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("layers", [[2, 1], [1, 1]])
-    @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-    def test_1f1b_schedule_model_chunk_with_padding_mask(
-        self, dispatcher_type, flex_backend, layers, tp_size
-    ):
-        """
-        Verifies all-to-all overlap optimization with padding_mask produces
-        the same results as the reference implementation with various TP/EP/CP combinations.
-        """
-        # Re-initialize model parallel with the specified configuration
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=4,
-            expert_tensor_parallel_size=1,
-        )
-        set_streams()
-
-        # create TransformerConfig
-        extra_kwargs = {"tensor_model_parallel_size": tp_size, "sequence_parallel": tp_size > 1}
-        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
-        run_two_chunk_parity(layers, extra_kwargs, use_padding_mask=True)
 
     def _run_full_recompute_parity(
         self,
@@ -495,3 +481,38 @@ class TestA2AOverlap:
             assert "embedding.word_embeddings.weight" in eager[i], "embedding grad not captured"
             comp_res = compare_captures(eager[i], recomputed[i], True, False)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] chunk {i}: {comp_res[1]}"
+
+
+class TestA2AOverlapPaddingMask:
+    """Padding-mask parity owns its topology because this matrix varies TP size."""
+
+    @pytest.fixture(scope="class", params=[1, 2, 4, 8])
+    def tp_size(self, request):
+        return request.param
+
+    @pytest.fixture(scope="class", autouse=True)
+    def model_parallel(self, tp_size):
+        with model_parallel_context(tp_size):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def release_models(self):
+        yield
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    @pytest.mark.parametrize("layers", [[2, 1], [1, 1]])
+    def test_1f1b_schedule_model_chunk_with_padding_mask(
+        self, dispatcher_type, flex_backend, layers, tp_size
+    ):
+        """
+        Verifies all-to-all overlap optimization with padding_mask produces
+        the same results as the reference implementation with various TP/EP/CP combinations.
+        """
+        # create TransformerConfig
+        extra_kwargs = {"tensor_model_parallel_size": tp_size, "sequence_parallel": tp_size > 1}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+        run_two_chunk_parity(layers, extra_kwargs, use_padding_mask=True)

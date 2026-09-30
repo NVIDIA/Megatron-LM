@@ -501,7 +501,7 @@ class TestMcoreAdapterCudaGraph:
         StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
         _destroy_model_parallel()
 
-    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self):
+    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self, monkeypatch):
         """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
         eager_config = TransformerConfig(
             num_layers=2,
@@ -613,12 +613,24 @@ class TestMcoreAdapterCudaGraph:
         cuda_graph_forward_backward = FullCudaGraphWrapper(
             forward_backward, cuda_graph_warmup_steps=1
         )
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        # Count actual replays, independent of whether PyTorch launches through the CUDA
+        # runtime or driver API and whether Kineto records that API in a CPU-only trace.
+        replayed_graphs = []
+        original_replay = torch.cuda.CUDAGraph.replay
+
+        def record_replay(graph):
+            replayed_graphs.append(graph)
+            return original_replay(graph)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda.CUDAGraph, "replay", record_replay)
             graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
 
-        graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
-        assert graph_launches == 2 * (len(steps) - 1)
-        assert FullCudaGraphWrapper.cuda_graph["training"] is not None
+        training_graph = FullCudaGraphWrapper.cuda_graph["training"]
+        optimizer_graph = OptimizerCudaGraphWrapper.cuda_graph
+        assert training_graph is not None and optimizer_graph is not None
+        assert training_graph is not optimizer_graph
+        assert replayed_graphs == [training_graph, optimizer_graph] * (len(steps) - 1)
         # Verify that both runs use the requested BF16 moment state rather than silently
         # allocating FP32 state, so the comparison isolates CUDA-graph execution.
         for optimizer in (eager_optimizer, graph_optimizer):
