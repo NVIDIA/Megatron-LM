@@ -294,8 +294,6 @@ exclude = '''
 
 [tool.pytest.ini_options]
 addopts = "--durations=15 -s -rA"
-# Dump thread stacks after 10 minutes in a test or fixture teardown, without aborting.
-faulthandler_timeout = 600
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [

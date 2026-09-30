@@ -15,7 +15,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -161,8 +160,6 @@ class TestGPTModelBatchInvariant:
         self.vocab_size = 96
 
     def teardown_method(self, method):
-        # Engine construction enables inference mode for the process.
-        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
     def test_forward_batch_invariant(self):

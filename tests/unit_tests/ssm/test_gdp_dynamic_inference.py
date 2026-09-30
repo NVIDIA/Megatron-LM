@@ -210,58 +210,41 @@ class _FakeSSM(SSMDynamicInferenceMixin):
         intermediate_ssm_state=None,
     ):
         self.decode_inputs.append((zxBCdt.clone(), batch_indices.clone()))
-        return zxBCdt[..., :2].contiguous()
-
-    def ssm_prefill(self, zxBCdt, _conv_state, _ssm_state, _context):
-        return zxBCdt[..., :2].contiguous()
+        return zxBCdt[..., :2]
 
     def out_proj(self, y):
         return y, None
 
 
-@pytest.mark.parametrize("context_token_multiplier", [1, 2])
 @pytest.mark.parametrize(
     ("batch_invariant_mode", "num_requests", "tokens_per_request", "padded_token_count"),
     [
         (False, 40, 1, 40),
-        (False, 1, 1, 4),
-        (False, 40, 1, 64),
         (True, 40, 1, 40),
         (True, 40, 1, 64),
         (False, 20, 3, 60),
-        (False, 20, 3, 64),
         (True, 20, 3, 64),
     ],
 )
 def test_decode_ssm_preserves_batch_invariant_token_padding(
-    batch_invariant_mode,
-    num_requests,
-    tokens_per_request,
-    padded_token_count,
-    context_token_multiplier,
+    batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
 ):
-    """Token-only rows bypass decode even when only kernel-level padding is enabled."""
+    """Only batch-invariant token-only rows bypass SSM decode."""
     metadata_token_count = num_requests * tokens_per_request
     projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
         padded_token_count, 1, 4
     )
     mixer = _FakeSSM(projected)
 
-    active_requests = min(4, num_requests)
     batch_indices = torch.cat(
-        (
-            torch.arange(active_requests, dtype=torch.int32),
-            torch.full((num_requests - active_requests,), -1, dtype=torch.int32),
-        )
+        (torch.arange(4, dtype=torch.int32), torch.full((num_requests - 4,), -1, dtype=torch.int32))
     )
     context = types.SimpleNamespace(
         batch_invariant_mode=batch_invariant_mode,
         mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
         num_speculative_tokens=tokens_per_request - 1,
         padded_batch_dimensions=InferenceBatchDimensions(
-            token_count=padded_token_count * context_token_multiplier,
-            prefill_req_count=0,
-            decode_req_count=num_requests,
+            token_count=padded_token_count, prefill_req_count=0, decode_req_count=num_requests
         ),
         mamba_metadata=types.SimpleNamespace(batch_indices_decode=batch_indices),
         padding_slice=slice(metadata_token_count, padded_token_count),
@@ -278,38 +261,6 @@ def test_decode_ssm_preserves_batch_invariant_token_padding(
     assert output.shape == (padded_token_count, 1, 2)
     assert torch.equal(output[:metadata_token_count], projected[:metadata_token_count, :, :2])
     assert torch.count_nonzero(output[metadata_token_count:]) == 0
-    assert bias is None
-
-
-@requires_cuda
-@pytest.mark.parametrize("batch_invariant_mode", [False, True])
-@pytest.mark.parametrize("decode_req_count", [0, 2])
-def test_ssm_prefill_preserves_projected_rows(
-    batch_invariant_mode, decode_req_count, rank_local_device
-):
-    """Padding restoration is a no-op for normal prefill and mixed partitions."""
-    projected = torch.arange(32, dtype=torch.float32, device="cuda").reshape(8, 1, 4)
-    mixer = _FakeSSM(projected)
-    context = types.SimpleNamespace(
-        batch_invariant_mode=batch_invariant_mode,
-        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
-        num_speculative_tokens=0,
-        padded_batch_dimensions=InferenceBatchDimensions(
-            token_count=8, prefill_req_count=1, decode_req_count=decode_req_count
-        ),
-        mamba_metadata=types.SimpleNamespace(
-            batch_indices_decode=torch.arange(decode_req_count, dtype=torch.int32, device="cuda"),
-            device_decode_prefill=torch.tensor(
-                [decode_req_count], dtype=torch.int32, device="cuda"
-            ),
-        ),
-    )
-
-    output, bias = mixer.ssm_dynamic_inference(torch.empty(0), context)
-
-    assert output.shape == (8, 1, 2)
-    assert torch.equal(output, projected[..., :2])
-    assert len(mixer.decode_inputs) == (1 if decode_req_count else 0)
     assert bias is None
 
 

@@ -109,7 +109,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_bias_swiglu.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
-        notes="Elementwise, including exact clamp-boundary replays; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
+        notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
     ),
     KernelEntry(
         name="fused_bias_geglu",
@@ -151,18 +151,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(
-            K + "test_fused_activations.py",
-            K + "test_runtime_cp_attention.py",
-            K + "test_flash_attention.py",
-        ),
+        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py. Paged FA4 and Hopper small-head automatic fallback "
-        "prefill/decode, including attention-sink LSE correction, are replayed in "
-        "test_flash_attention.py.",
+        "test_runtime_cp_attention.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",

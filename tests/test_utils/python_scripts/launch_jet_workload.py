@@ -138,12 +138,6 @@ def launch_and_wait_for_completion(
     if partition is not None:
         cluster_config["partition"] = partition
 
-    checkout_variables = {}
-    if cluster == "dgxh100_coreweave":
-        # The runner's chmod prepass fails on missing checkout paths. Retain removal
-        # and checkout, but skip the permission prepass on these SSH runners.
-        checkout_variables["FF_SET_PERMISSIONS_BEFORE_CLEANUP"] = "false"
-
     n_submission_attempts = 0
     while n_submission_attempts < 3:
         try:
@@ -173,7 +167,6 @@ def launch_and_wait_for_completion(
                             "environments": {
                                 cluster: {
                                     "variables": {
-                                        **checkout_variables,
                                         "PYTHONUNBUFFERED": "1",
                                         "RUN_NAME": run_name or "",
                                         "ENABLE_LIGHTWEIGHT_MODE": str(

@@ -145,11 +145,6 @@ MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
-# Keep stdout on rank 0, but expose every rank's stderr even if artifact upload fails.
-TORCHRUN_TEE="0:3"
-for ((local_rank = 1; local_rank < GPUS_PER_NODE; local_rank++)); do
-    TORCHRUN_TEE+=",${local_rank}:2"
-done
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
@@ -157,7 +152,7 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
     --node_rank $NODE_RANK
     --log-dir $LOG_DIR
-    --tee "$TORCHRUN_TEE"
+    --tee "0:3"
     --redirects "3"
 )
 
