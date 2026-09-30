@@ -104,6 +104,10 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
+    # FlashAttention 4.0.0b24 needs a newer CuTe DSL and compatible QuACK APIs.
+    # CUTLASS 4.8 also preserves the existing protobuf 7 dependency.
+    "nvidia-cutlass-dsl>=4.8.0",
+    "quack-kernels>=0.6.5",
     "nvidia-cudnn-frontend[cutedsl]==1.28.0",
     "wget",
     "onnxscript",
