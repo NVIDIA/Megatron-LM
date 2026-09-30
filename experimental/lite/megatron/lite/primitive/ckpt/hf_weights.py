@@ -23,9 +23,10 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
+
+from megatron.lite.primitive.quantization.qat import canonical_state_key
 
 try:
     from torch.distributed.tensor import DTensor
@@ -504,6 +505,10 @@ def split_qkv(
     """
     if world <= 1:
         return tensor
+    if num_kv_heads < world:
+        # KV heads are replicated (gathered and selected in the attention module), so the column-parallel
+        # weight is a plain contiguous 1/world slice of the canonical [Q | K | V].
+        return split_dim(tensor, rank, world, dim=0)
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
     q = tensor[:q_size]
@@ -1679,7 +1684,10 @@ def _gather_dense(
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
-            tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
+            shards = [torch.empty_like(tensor) for _ in range(ps.tp_size)]
+            dist.all_gather(shards, tensor.contiguous(), group=ps.tp_group)
+            # Same hook the pp=1 bucketed path honours (fused qkv / gate_up shards are not a plain cat).
+            tensor = _merge_dense_shards(name, tensor, shards, spec)
     return _maybe_cpu(tensor, cpu=cpu)
 
 

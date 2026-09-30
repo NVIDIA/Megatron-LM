@@ -11,10 +11,13 @@ from megatron.lite.primitive.modules.attention.magi import (
     MagiDotProductAttention,
 )
 from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
+from megatron.lite.primitive.modules.attention.msa import MSAIndexer, MSAttention
 
 __all__ = [
     "DSAIndexShareState",
     "DynamicSparseAttention",
+    "MSAIndexer",
+    "MSAttention",
     "MagiAttentionConfig",
     "MagiDotProductAttention",
     "MultiLatentAttention",
