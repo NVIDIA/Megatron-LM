@@ -48,13 +48,22 @@ EOF
 # pins its Python, PyTorch, CUDA, compiler, and CPU architecture; BuildKit also keys
 # this stage on the source revision, GPU target, helper, and patch.
 FROM base AS mok-wheel
-RUN uv venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
 ARG MOK_COMMIT=a2ad2d0ce2366c1817d15498cdbaf8ead5966117
 # Include both GPU architectures supported by the pinned MoK source by default.
 ARG MOK_ARCH=ALL
 RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mok.sh \
     --mount=type=bind,source=docker/patches/mok.patch,target=/opt/mok.patch \
-    MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok.patch /opt/mok-wheels
+    bash -ex <<"EOF"
+    # The mount in main requires this directory even when MoK is skipped.
+    mkdir -p /opt/mok-wheels
+    # The ARM64 image serves GB200/GB300; the AMD64 image serves H100.
+    if [ "${TARGETARCH}" = "arm64" ]; then
+        uv venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
+        MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok.patch /opt/mok-wheels
+    else
+        echo "[MoK] skipping build for TARGETARCH=${TARGETARCH}"
+    fi
+EOF
 
 FROM base AS main
 ARG REINSTALL_NCCL=False
@@ -156,7 +165,13 @@ EOF
 
 # Reuse the wheel without copying a second archive into the final image.
 RUN --mount=type=bind,from=mok-wheel,source=/opt/mok-wheels,target=/opt/mok-wheels \
-    uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --no-deps --no-cache /opt/mok-wheels/*.whl
+    bash -ex <<"EOF"
+    if [ "${TARGETARCH}" = "arm64" ]; then
+        uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --no-deps --no-cache /opt/mok-wheels/*.whl
+    else
+        echo "[MoK] skipping install for TARGETARCH=${TARGETARCH}"
+    fi
+EOF
 
 ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
 # nccl_m2n compiles all of its sources in one nvcc call, and nvcc --threads parallelizes across
