@@ -326,68 +326,6 @@ class ShortcutMoEBlock(MegatronModule):
         )
         return hidden_states
 
-    def _forward_inference_serial(
-        self,
-        hidden_states,
-        *,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-        quant_context_factory,
-    ):
-        """Run Shortcut-MoE serially for inference.
-
-        The training schedule runs the paired layer through its two-stage path, which never
-        updates inference state, and overlaps dispatch/combine on a side stream. Here the paired
-        layer runs its ordinary forward and all communication stays on the current stream. Routing
-        still reads the pair input, before the paired layer transforms the residual stream.
-        """
-        attn_config = self.compute_layer.config
-        moe_config = self.moe_layer.config
-
-        with quant_context_factory(moe_config, self.moe_layer_idx):
-            route_input, route_probs = self._moe_router_preprocess(
-                shortcut_hidden=hidden_states,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
-
-        with quant_context_factory(attn_config, self.attn_layer_idx):
-            attn_layer_output = self._forward_compute_atomic(
-                hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-            )
-
-        with quant_context_factory(moe_config, self.moe_layer_idx):
-            dispatched_input, dispatched_probs = self._launch_dispatch(route_input, route_probs)
-            output, _ = self.moe_layer.mlp.routed_experts_compute(
-                dispatched_input, dispatched_probs
-            )
-            combined_output = self._launch_combine(output)
-            shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
-                self._moe_shared_experts(
-                    hidden_states=attn_layer_output,
-                    padding_mask=padding_mask,
-                    packed_seq_params=packed_seq_params,
-                )
-            )
-            return self._postprocess(
-                residual=mlp_residual,
-                combined_output=combined_output,
-                shared_expert_output=shared_expert_output,
-                packed_seq_params=packed_seq_params,
-                moe_unflatten_mbs=moe_unflatten_mbs,
-                mlp_state=mlp_state,
-            )
-
     def forward(
         self,
         hidden_states,
@@ -401,28 +339,26 @@ class ShortcutMoEBlock(MegatronModule):
         cp_layout_state=None,
         packed_sequence_cp_metadata=None,
     ):
-        """Run the eager schedule with each physical layer's quantization context."""
+        """Run the eager schedule with each physical layer's quantization context.
+
+        In inference the paired layer runs its ordinary forward instead of the two-stage split,
+        which never updates KV-cache or recurrent state, and communication stays on the current
+        stream.
+        """
 
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
             select_token_dispatcher()
-        if InferenceMode.is_active():
+        inference = InferenceMode.is_active()
+        if inference:
             if cp_layout_state is not None:
                 raise RuntimeError("Shortcut-MoE inference does not support context parallelism.")
-            return self._forward_inference_serial(
-                hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                quant_context_factory=quant_context_factory,
+        else:
+            assert inference_context is None, (
+                "Shortcut-MoE received an inference context outside inference mode; the two-stage "
+                "schedule does not update KV-cache or recurrent inference state."
             )
-        assert inference_context is None, (
-            "Shortcut-MoE received an inference context outside inference mode; the training "
-            "schedule does not update KV-cache or recurrent inference state."
-        )
+        overlap = self.overlap_mode and not inference
 
         attn_config = self.compute_layer.config
         moe_config = self.moe_layer.config
@@ -445,25 +381,36 @@ class ShortcutMoEBlock(MegatronModule):
                 padding_mask=padding_mask,
                 packed_seq_params=moe_packed_seq_params,
             )
-            if self.overlap_mode:
+            if overlap:
                 self.route_ready_event.record(torch.cuda.current_stream())
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-            )
+            if inference:
+                attn_layer_output = self._forward_compute_atomic(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+            else:
+                paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                )
 
         # Launch the dispatch, experts, and combine
         with quant_context_factory(moe_config, self.moe_layer_idx):
             dispatched_input, dispatched_probs = self._launch_dispatch(
-                route_input, route_probs, async_op=self.overlap_mode
+                route_input, route_probs, async_op=overlap
             )
-            if self.overlap_mode:
+            if overlap:
                 dispatched_input, dispatched_probs = self._wait_dispatch(
                     dispatched_input, dispatched_probs
                 )
@@ -471,7 +418,7 @@ class ShortcutMoEBlock(MegatronModule):
             output, _ = self.moe_layer.mlp.routed_experts_compute(
                 dispatched_input, dispatched_probs
             )
-            combined_output = self._launch_combine(output, async_op=self.overlap_mode)
+            combined_output = self._launch_combine(output, async_op=overlap)
             if self.shortcut_pre_mlp_layernorm_checkpoint is not None:
                 self.shortcut_pre_mlp_layernorm_checkpoint.discard_output_and_register_recompute(
                     combined_output
@@ -479,10 +426,11 @@ class ShortcutMoEBlock(MegatronModule):
                 self.shortcut_pre_mlp_layernorm_checkpoint = None
 
         # launch the output layer of the attention layer
-        with quant_context_factory(attn_config, self.attn_layer_idx):
-            attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
-            if isinstance(attn_layer_output, tuple):
-                attn_layer_output = attn_layer_output[0]
+        if not inference:
+            with quant_context_factory(attn_config, self.attn_layer_idx):
+                attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
+                if isinstance(attn_layer_output, tuple):
+                    attn_layer_output = attn_layer_output[0]
 
         if cp_layout_state is not None:
             attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(
@@ -498,7 +446,7 @@ class ShortcutMoEBlock(MegatronModule):
                     packed_seq_params=moe_packed_seq_params,
                 )
             )
-            if self.overlap_mode:
+            if overlap:
                 combined_output = self._wait_combine(combined_output)
 
             # Ensure the combine autograd node is scheduled first before shared_experts
