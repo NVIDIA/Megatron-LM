@@ -38,8 +38,30 @@ def validate_csa2_config(config) -> None:
         raise NotImplementedError("CSA2 does not yet support shortcut MoE")
     if config.pipeline_model_parallel_size != 1 or config.virtual_pipeline_model_parallel_size:
         raise NotImplementedError("CSA2 currently requires PP=1 and no VPP")
-    if config.recompute_granularity is not None or config.cuda_graph_impl != "none":
+    if config.cuda_graph_impl != "none":
         raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
+    _CSA2_ATTN_RECOMPUTE_MODULES = {
+        "core_attn",
+        "gdn_norm_out",
+        "gdp_qkv",
+        "gdp_in_proj",
+        "shortcut_pre_mlp_layernorm",
+    }
+    if config.recompute_granularity is not None:
+        if config.recompute_granularity == "full":
+            raise NotImplementedError(
+                "CSA2 cross-layer state requires eager attention; full recompute "
+                "re-runs attention layers and re-publishes cross-layer KV"
+            )
+        if config.recompute_granularity == "selective":
+            _attn_in_recompute = set(config.recompute_modules or []) & _CSA2_ATTN_RECOMPUTE_MODULES
+            if _attn_in_recompute:
+                raise NotImplementedError(
+                    f"CSA2 cross-layer state requires eager attention; cannot "
+                    f"recompute attention modules {sorted(_attn_in_recompute)}"
+                )
+        else:
+            raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
     if (
         config.overlap_moe_expert_parallel_comm
         or config.delay_wgrad_compute

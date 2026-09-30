@@ -42,6 +42,23 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import get_pg_size
 
 
+def _chunked_csa2_indexer_scores(
+    q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
+) -> torch.Tensor:
+    """Compute no-grad indexer scores without materializing all key scores at once."""
+    q = q.float()
+    indexer_k = indexer_k.float()
+    head_weights = weights.permute(1, 0, 2).unsqueeze(-1)
+    scores = torch.empty(
+        (q.shape[1], q.shape[0], indexer_k.shape[0]), device=q.device, dtype=torch.float32
+    )
+    for start in range(0, indexer_k.shape[0], key_chunk_size):
+        end = min(start + key_chunk_size, indexer_k.shape[0])
+        chunk = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
+        scores[..., start:end] = (chunk * head_weights).sum(dim=2)
+    return scores
+
+
 @dataclass
 class CSA2State:
     """Shared attention tensors for one full-sequence stack forward.
@@ -297,8 +314,11 @@ class CSA2Indexer(MegatronModule):
         q = _apply_rope(q, rotary_seq_len=q.shape[0], **rope_kwargs)
         weights, _ = self.linear_weights_proj(x)
         weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
-        scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
-        scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+        if torch.is_grad_enabled():
+            scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
+            scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+        else:
+            scores = _chunked_csa2_indexer_scores(q, indexer_k, weights)
         visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
         causal = torch.arange(indexer_k.shape[0], device=x.device)[None, :] < visible[:, None]
         scores = scores.masked_fill(~causal, -torch.inf)
