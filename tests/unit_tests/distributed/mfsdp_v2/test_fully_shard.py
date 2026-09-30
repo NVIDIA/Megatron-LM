@@ -11,7 +11,7 @@ import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import profile
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -550,7 +550,7 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     train_one_step()
     torch.cuda.synchronize(device)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with profile() as prof:
         train_one_step()
         torch.cuda.synchronize(device)
 
@@ -614,7 +614,7 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
     train_one_step()
     torch.cuda.synchronize(device)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with profile() as prof:
         train_one_step()
         torch.cuda.synchronize(device)
 

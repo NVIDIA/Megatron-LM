@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Shard
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -100,11 +100,11 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
 
         return losses
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_without_symm_mem:
+    with profile() as prof_without_symm_mem:
         losses_without_symm_mem = train(use_symmetric_memory=False)
         torch.cuda.synchronize()
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_with_symm_mem:
+    with profile() as prof_with_symm_mem:
         losses_with_symm_mem = train(use_symmetric_memory=True)
         torch.cuda.synchronize()
 
@@ -212,7 +212,7 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     x = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
     target = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with profile() as prof:
         for _ in range(num_training_steps):
             optimizer.zero_grad()
             torch.nn.functional.mse_loss(model(x), target).backward()
