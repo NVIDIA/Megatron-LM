@@ -1,15 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the Triton varlen causal conv1d kernel.
+"""Unit tests for the varlen causal conv1d ops.
 
-Tests correctness of `causal_conv1d_varlen_fn` against a reference implementation
-that loops over requests calling `causal_conv1d_fn` with `initial_states`.
+`causal_conv1d_varlen_fn` (the Triton kernel) is checked against a reference that
+loops over requests calling `causal_conv1d_fn` with `initial_states`.
+
+`causal_conv1d_varlen_carry_states` (the conv-state update) is checked against a
+reference that concatenates the previous state with the slice. Under chunked
+prefill a request's conv state has to survive being handed a slice at a time:
+deriving it from the slice alone is fine while every slice is at least `d_conv`
+tokens long, and wrong the moment one is not -- which chunked prefill makes
+reachable, since a prompt's final chunk can be as short as two tokens.
 """
 
 import pytest
 import torch
 
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+    causal_conv1d_varlen_carry_states,
+    causal_conv1d_varlen_fn,
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -171,3 +181,91 @@ class TestCausalConv1dVarlen:
         assert not torch.allclose(
             out_nonzero[: d_conv - 1], out_none[: d_conv - 1], atol=1e-5
         ), "Non-zero initial states should produce different outputs for early tokens"
+
+
+def _carry_reference(x, cu_seqlens, previous_states):
+    """Right-align `[previous_tokens..., slice_tokens...]` into a d_conv window."""
+    num_requests, conv_dim, d_conv = previous_states.shape
+    out = torch.empty_like(previous_states)
+    for i in range(num_requests):
+        start, end = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+        # The previous state already holds the d_conv tokens before the slice.
+        history = torch.cat([previous_states[i], x[start:end].transpose(0, 1)], dim=1)
+        out[i] = history[:, -d_conv:]
+    return out
+
+
+def _run_carry(lengths, d_conv=4, conv_dim=3, seed=0):
+    torch.manual_seed(seed)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32, device="cuda"
+    )
+    x = torch.randn(int(cu_seqlens[-1]), conv_dim, device="cuda")
+    previous_states = torch.randn(len(lengths), conv_dim, d_conv, device="cuda")
+    got = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous_states)
+    return got, _carry_reference(x, cu_seqlens, previous_states)
+
+
+class TestCausalConv1dVarlenCarryStates:
+    """Conv-state update that carries prior history across a chunked-prefill slice."""
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("length", [0, 1, 2, 3, 4, 5, 9])
+    def test_matches_reference_for_every_slice_length(self, length):
+        """Slices shorter, equal to, and longer than d_conv all round-trip."""
+        got, expected = _run_carry([length])
+        torch.testing.assert_close(got, expected)
+
+    @pytest.mark.internal
+    def test_long_slice_ignores_previous_state(self):
+        """A slice of at least d_conv tokens fully determines the new state.
+
+        Pins the equivalence with deriving the state from the slice alone:
+        nothing of the incoming state may leak through.
+        """
+        torch.manual_seed(1)
+        cu_seqlens = torch.tensor([0, 7], dtype=torch.int32, device="cuda")
+        x = torch.randn(7, 3, device="cuda")
+        first = causal_conv1d_varlen_carry_states(
+            x, cu_seqlens, torch.randn(1, 3, 4, device="cuda")
+        )
+        second = causal_conv1d_varlen_carry_states(
+            x, cu_seqlens, torch.randn(1, 3, 4, device="cuda")
+        )
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(first[0], x[-4:].transpose(0, 1))
+
+    @pytest.mark.internal
+    def test_short_slice_carries_history(self):
+        """A 2-token slice keeps the two taps that predate it.
+
+        Deriving the state from the slice alone would zero-fill those two columns,
+        which is exactly what corrupts the first decode step after a short final
+        prefill chunk.
+        """
+        torch.manual_seed(2)
+        cu_seqlens = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+        x = torch.randn(2, 3, device="cuda")
+        previous = torch.randn(1, 3, 4, device="cuda")
+        got = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous)
+
+        torch.testing.assert_close(got[0, :, :2], previous[0, :, 2:])
+        torch.testing.assert_close(got[0, :, 2:], x.transpose(0, 1))
+        assert not torch.allclose(got[0, :, :2], torch.zeros_like(got[0, :, :2]))
+
+    @pytest.mark.internal
+    def test_mixed_batch_including_padding_requests(self):
+        """Zero-length padding requests keep their state; real ones update."""
+        lengths = [0, 2, 5, 0, 130]
+        got, expected = _run_carry(lengths)
+        torch.testing.assert_close(got, expected)
+
+    @pytest.mark.internal
+    def test_zero_length_request_is_a_no_op(self):
+        torch.manual_seed(3)
+        cu_seqlens = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+        previous = torch.randn(1, 3, 4, device="cuda")
+        got = causal_conv1d_varlen_carry_states(
+            torch.randn(0, 3, device="cuda"), cu_seqlens, previous
+        )
+        torch.testing.assert_close(got, previous)

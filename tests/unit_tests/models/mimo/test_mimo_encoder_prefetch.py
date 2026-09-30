@@ -31,7 +31,7 @@ def _args(**overrides):
         "mimo_encoder_prefetch_depth": 2,
         "freeze_vit": True,
         "freeze_projection": False,
-        "encoder_tp": 1,
+        "mimo_encoder_tp": 1,
         "rerun_mode": "disabled",
     }
     values.update(overrides)
@@ -43,10 +43,10 @@ def _args(**overrides):
     [
         ("freeze_vit", False, "freeze-vit"),
         ("freeze_projection", True, "trainable projection"),
-        ("encoder_tp", 2, "TP=1"),
-        ("encoder_cp", 2, "CP=1"),
-        ("encoder_pp", 2, "PP=1"),
-        ("encoder_ep", 2, "EP=1"),
+        ("mimo_encoder_tp", 2, "TP=1"),
+        ("mimo_encoder_cp", 2, "CP=1"),
+        ("mimo_encoder_pp", 2, "PP=1"),
+        ("mimo_encoder_ep", 2, "EP=1"),
         ("mimo_encoder_prefetch_depth", 0, "positive"),
         ("rerun_mode", "validate_results", "rerun"),
     ],

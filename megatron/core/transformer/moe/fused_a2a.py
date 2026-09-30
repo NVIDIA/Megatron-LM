@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import inspect
 from typing import Optional
 
 from megatron.core.utils import internal_api
@@ -692,6 +693,11 @@ if HAVE_TE_EP:
         the per-call recv buffers it recycles."""
         return te_ep.symm_mem_alloc(shape, dtype, ep_group)
 
+    # Whether this TE build supports quantized EP dispatch/combine payloads.
+    _TE_EP_BUFFER_HAS_QUANT_RECIPE = (
+        "dispatch_fwd_quant_recipe" in inspect.signature(te_ep.EpBuffer).parameters
+    )
+
     def new_nccl_ep_buffer(
         top_k,
         max_tokens_per_rank,
@@ -699,13 +705,31 @@ if HAVE_TE_EP:
         hidden_dim,
         num_local_experts,
         alignment=0,
+        dispatch_fwd_quant_recipe=None,
+        combine_bwd_quant_recipe=None,
     ):
         """Build a fresh TE EpBuffer for one dispatch/combine pair.
 
         The buffer owns handle_mem (the routing table dispatch writes and combine reads); a new one
         is built per dispatch and dropped after combine. Payload symm buffers are not owned here —
         they are caller-supplied to dispatch/combine or allocated on the fly by TE.
+
+        dispatch_fwd_quant_recipe / combine_bwd_quant_recipe (TE Recipe, optional): quantize the
+        dispatch forward payload / combine backward gradient over the wire,
+        the corresponding output is returned as a per-expert GroupedTensor.
         """
+        quant_kwargs = {}
+        if dispatch_fwd_quant_recipe is not None or combine_bwd_quant_recipe is not None:
+            if not _TE_EP_BUFFER_HAS_QUANT_RECIPE:
+                raise RuntimeError(
+                    "Quantized NCCL EP dispatch/combine payloads require a TransformerEngine "
+                    "build with EpBuffer quant-recipe support "
+                    "(dispatch_fwd_quant_recipe / combine_bwd_quant_recipe)."
+                )
+            quant_kwargs = dict(
+                dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
+                combine_bwd_quant_recipe=combine_bwd_quant_recipe,
+            )
         return te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -713,6 +737,7 @@ if HAVE_TE_EP:
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
+            **quant_kwargs,
         )
 
     def nccl_ep_dispatch(

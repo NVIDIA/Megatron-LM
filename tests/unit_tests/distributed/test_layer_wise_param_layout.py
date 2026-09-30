@@ -13,7 +13,13 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    _all_gather_param_group_metadata,
+    is_managed_by_layer_wise_optimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
@@ -35,6 +41,60 @@ def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw
     cfg.grad_reduce_in_fp32 = grad_reduce_in_fp32
     return cfg
+
+
+class TestLayerwiseParameterRouting:
+
+    @pytest.mark.parametrize(
+        ("shape", "attrs"),
+        [
+            pytest.param((16, 8), {}, id="matrix"),
+            pytest.param((16, 8), {"use_muon": False}, id="explicit-exclusion"),
+            pytest.param((16, 8), {"use_muon": True}, id="explicit-opt-in"),
+            pytest.param(
+                (16, 8), {"is_embedding_or_output_parameter": True}, id="embedding-or-output"
+            ),
+            pytest.param((16,), {}, id="vector"),
+            pytest.param((16,), {"use_muon": False}, id="excluded-vector"),
+            pytest.param((4, 4, 4), {}, id="non-matrix"),
+        ],
+    )
+    def test_layer_wise_ownership_matches_muon_routing(self, shape, attrs):
+        param = _make_param(shape, **attrs)
+
+        assert is_managed_by_layer_wise_optimizer(param) == (not _is_muon_excluded(param))
+
+    def test_tags_excluded_matrix_separately_from_muon_matrix(self):
+        model = torch.nn.Module()
+        model.muon_weight = _make_param((16, 8))
+        model.scalar_weight = _make_param((16, 8), use_muon=False)
+
+        tag_params_for_buffer_routing([model])
+
+        assert model.muon_weight.is_managed_by_layer_wise_optimizer
+        assert not model.scalar_weight.is_managed_by_layer_wise_optimizer
+
+
+@pytest.mark.parametrize(
+    ("is_expert", "group_name", "group_size"), [(False, "dp_cp", 4), (True, "expt_dp", 2)]
+)
+def test_checkpoint_metadata_uses_owning_module_group(is_expert, group_name, group_size):
+    dp_cp = mock.Mock()
+    expt_dp = mock.Mock()
+    pg_collection = mock.Mock(dp_cp=dp_cp, expt_dp=expt_dp)
+    param_group = {"is_expert_parallel": is_expert, "params": True}
+    expected_group = getattr(pg_collection, group_name)
+
+    with (
+        mock.patch(
+            "megatron.core.optimizer.layer_wise_optimizer.get_pg_size", return_value=group_size
+        ),
+        mock.patch("torch.distributed.all_gather_object") as all_gather,
+    ):
+        gathered = _all_gather_param_group_metadata(param_group, pg_collection)
+
+    assert len(gathered) == group_size
+    all_gather.assert_called_once_with(gathered, param_group, group=expected_group)
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
@@ -111,9 +112,11 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
 
 
 def copy_gtp_attributes(destination, source):
-    """Copy the GTP dedup tags (is_gtp_weight_remat, allreduce) onto a param view/copy, so the
-    optimizer's master shards stay classifiable by param_is_not_gtp_duplicate."""
-    for attr in ("is_gtp_weight_remat", "allreduce"):
+    """Copy GTP metadata onto a param view/copy (e.g. an optimizer's master or shard param):
+    dedup tags for ``param_is_not_gtp_duplicate``, the checkpoint replica group, and
+    ``pad_length``/``group`` for ``gtp_local_pad_zero_count``. The latter two must both be
+    present or padding exclusion silently returns 0."""
+    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length", "group"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 
@@ -131,6 +134,60 @@ def param_is_not_gtp_duplicate(param):
     if is_expert:
         return get_expert_gtp_weight_remat_rank() == 0
     return get_gtp_weight_remat_rank() == 0
+
+
+def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):
+    """Count structural GTP alignment-padding elements in
+    ``gtp_shard.view(-1)[range_start:range_end]`` (see ``_gtp_slice_one_param``).
+
+    Padding is a contiguous suffix of the *unsharded* padded buffer (``shard_dim0 *
+    group.size()`` rows), sliced evenly across the GTP group. It usually lands entirely in the
+    last rank's shard, but when ``pad_length`` exceeds one shard's own row count (small ``dim0``
+    relative to ``pad_for_alignment * gtp_remat_size``) it spills backward from the tail into
+    lower-numbered ranks' shards too. Computed via each rank's row offset in the unsharded
+    buffer -- not special-cased to the last rank -- so both cases come out correct.
+
+    Args:
+        gtp_shard: This rank's local GTP shard (carries ``pad_length``/``group``).
+        range_start: Start offset, in ``gtp_shard.view(-1)`` flat-index units, of the
+            fragment being queried.
+        range_end: End offset (exclusive) of that fragment. Pass ``0, gtp_shard.numel()``
+            for the whole shard (e.g. ``LayerWiseDistributedOptimizer``, which never
+            byte-slices); ``DistributedOptimizer`` passes the DP-optimizer-state
+            fragment's own ``[param_range.start, param_range.end)`` instead, since a
+            fragment only covers part of the shard.
+    """
+    # No padding on this weight at all -> nothing to exclude.
+    pad_length = getattr(gtp_shard, "pad_length", 0)
+    if not pad_length:
+        return 0
+    # Not a GTP shard (or GTP off) -> no group to compute a row offset against.
+    group = getattr(gtp_shard, "group", None)
+    if group is None:
+        return 0
+
+    # Reconstruct the *unsharded* padded buffer this shard came from, and where in it
+    # the real (non-padding) data ends. Padding is always a contiguous suffix of this
+    # buffer (see _gtp_slice_one_param), so everything from unsharded_real_dim0 onward
+    # is padding.
+    shard_dim0 = gtp_shard.shape[0]
+    unsharded_padded_dim0 = shard_dim0 * group.size()
+    unsharded_real_dim0 = unsharded_padded_dim0 - pad_length
+
+    # Locate this rank's shard within that unsharded buffer, and convert the row-based
+    # padding boundary into flat-index units (one row = elems_per_row elements) so it's
+    # comparable against range_start/range_end.
+    elems_per_row = gtp_shard.numel() // shard_dim0
+    shard_row_start = group.rank() * shard_dim0
+    pad_start_in_shard = max(0, unsharded_real_dim0 - shard_row_start) * elems_per_row
+
+    # Overlap of the queried [range_start, range_end) fragment with [pad_start_in_shard, end).
+    # A whole-shard query only needs "does this shard have padding", but DistributedOptimizer's
+    # DP-wide bucket split doesn't respect shard boundaries, so a fragment can start/end
+    # anywhere -- entirely before the padding, straddling it, or entirely inside it.
+    # max(0, ...) at the end handles a fragment that ends before padding starts.
+    overlap_start = max(range_start, pad_start_in_shard)
+    return max(0, range_end - overlap_start)
 
 
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
@@ -199,7 +256,8 @@ def _initialize_affine_weight_cpu(
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
-    the relevant chunk."""
+    the relevant chunk. A ``weight`` that is already GTP_remat-sharded is sliced down to this
+    rank's GTP rows as well, so the initialization matches a run with GTP off."""
 
     if not skip_set_tensor_parallel_attributes:
         set_tensor_model_parallel_attributes(
@@ -221,7 +279,17 @@ def _initialize_affine_weight_cpu(
     with torch.no_grad():
         # all tensors must live on the same device
         cpu_weight = torch.cat(my_weight_list, dim=partition_dim).to_dense()
+        if getattr(weight, "gtp_remat_size", 1) > 1:
+            from megatron.core.tensor_parallel.gtp_api import gtp_remat_slice_rows
+
+            cpu_weight = gtp_remat_slice_rows(cpu_weight, weight.group)
         weight.data.copy_(cpu_weight)
+        # Quantized (FP8/FP4) primary weights snapshot their values at construction, before CPU
+        # init writes the real ones. The distributed optimizer seeds its master params from that
+        # snapshot, so it must be refreshed or training starts from uninitialized memory.
+        high_precision_init_val = getattr(weight, "_high_precision_init_val", None)
+        if high_precision_init_val is not None:
+            high_precision_init_val.copy_(cpu_weight)
     if return_master_weight:
         return master_weight
     return None
@@ -319,7 +387,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(
+                self,
+                ["weight"],
+                gtp_remat_group,
+                replica_group=getattr(pg_collection, "dp_cp", None),
+            )
             self.gtp_remat_size = gtp_remat_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
             # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
@@ -360,7 +433,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
-            if self.use_inference_optimized_reduce_scatter and not self.training:
+            if self.use_inference_optimized_reduce_scatter and InferenceMode.is_active():
                 # Deferred to avoid circular import: inference_layers → TE → layers.
                 from .inference_layers import inference_reduce_scatter_to_sequence_parallel_region
 
@@ -464,8 +537,20 @@ def _linear_forward(
 
     input_shape = input.shape
     input_2d = input.reshape(-1, input_shape[-1])
-    output = te_general_gemm(weight, input_2d, out_dtype=output_dtype, layout="TN", bias=bias)[0]
-    return output.reshape(*input_shape[:-1], weight.size(0))
+    output = torch.empty(
+        (*input_shape[:-1], weight.size(0)), dtype=output_dtype, device=input.device
+    )
+    # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
+    # the final-shaped allocation, then return the owning tensor rather than that view.
+    te_general_gemm(
+        weight,
+        input_2d,
+        out_dtype=output_dtype,
+        layout="TN",
+        out=output.view(-1, weight.size(0)),
+        bias=bias,
+    )
+    return output
 
 
 def linear_with_frozen_weight(
@@ -549,6 +634,38 @@ def linear_with_frozen_weight(
     args = [input, weight, bias, allreduce_dgrad, tp_group, output_dtype]
 
     return LinearWithFrozenWeight.apply(*args)
+
+
+def _wgrad_gemm(out, grad_output, total_input, accumulate=False):
+    """Weight-gradient GEMM into ``out``, which may be wider than the inputs (bf16 -> fp32).
+
+    ``accumulate=True`` adds into ``out`` rather than overwriting it, which lets a weight that is
+    consumed several times in one backward build its total wgrad in place -- no second buffer, and
+    the first consume (``accumulate=False``) doubles as the zero-fill.
+
+    Returns ``out``, filled with the weight gradient.
+    """
+    # Import here to avoid circular import
+    from megatron.core.extensions.transformer_engine import te_general_gemm
+
+    if te_general_gemm is not None:
+        # torch.matmul cannot widen via out=, so TE's GEMM does the mixed-precision output.
+        te_general_gemm(
+            total_input,
+            grad_output,
+            out_dtype=out.dtype,
+            layout="NT",
+            out=out,
+            grad=True,
+            accumulate=accumulate,
+        )
+    elif accumulate:
+        # matmul rejects an out= of a different dtype, so land in the compute dtype and add.
+        out.add_(grad_output.t().matmul(total_input))
+    else:
+        # matmul rejects an out= of a different dtype, so land in the compute dtype and cast.
+        out.copy_(grad_output.t().matmul(total_input))
+    return out
 
 
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
@@ -689,23 +806,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
-                    # Import here to avoid circular import
-                    from megatron.core.extensions.transformer_engine import te_general_gemm
-
-                    if te_general_gemm is not None:
-                        # Use TE general_gemm to support mixed-precision output
-                        # (e.g. bf16 input -> fp32 main_grad) which torch.matmul
-                        # does not support via the out= parameter.
-                        te_general_gemm(
-                            total_input,
-                            grad_output,
-                            out_dtype=weight.main_grad.dtype,
-                            layout="NT",
-                            out=weight.main_grad,
-                            grad=True,
-                        )
-                    else:
-                        torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
+                    _wgrad_gemm(weight.main_grad, grad_output, total_input)
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
@@ -752,8 +853,35 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
+        elif ctx.gtp_remat_size > 1 and sharded_weight.main_grad.dtype != total_input.dtype:
+            # Fusion is off for GTP (main_grad is SHARDED, the GEMM output is not), so the wgrad
+            # takes three hops, and get_wgrad_tensor() types it from main_grad:
+            #
+            #                                          epilogue     RS       accum
+            #   --accumulate-allreduce-grads-in-fp32     fp32  --->  fp32 --->  fp32   <- here
+            #   --grad-reduce-in-bf16                    bf16  --->  bf16 --->  bf16   <- else
+            #
+            # This branch widens the epilogue to main_grad's dtype, so the RS no longer rounds
+            # across ranks before the fp32 accum sees the value.
+            wgrad_buf = sharded_weight.get_wgrad_tensor()
+            grad_weight = _wgrad_gemm(
+                wgrad_buf,
+                grad_output,
+                total_input,
+                accumulate=sharded_weight.record_wgrad_consume(wgrad_buf),
+            )
         else:
-            grad_weight = grad_output.t().matmul(total_input)
+            if ctx.gtp_remat_size > 1 and sharded_weight.use_zero_copy_wgrad(grad_output.dtype):
+                # GTP: write the wgrad straight into the reduce-scatter send buffer.
+                grad_weight = sharded_weight.get_wgrad_tensor()
+                # Consume the flag here too or this path never collapses; keep plain matmul
+                # otherwise, so the kernel is unchanged for every other GTP weight.
+                if sharded_weight.record_wgrad_consume(grad_weight):
+                    _wgrad_gemm(grad_weight, grad_output, total_input, accumulate=True)
+                else:
+                    torch.matmul(grad_output.t(), total_input, out=grad_weight)
+            else:
+                grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         # GTP: reduce-scatter wgrad
@@ -1070,7 +1198,15 @@ class ColumnParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(
+                self,
+                ["weight"],
+                gtp_remat_group,
+                # Expert weights replicate over EXPERT dp; dense over dp_cp.
+                replica_group=getattr(
+                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                ),
+            )
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:
@@ -1146,6 +1282,7 @@ class ColumnParallelLinear(torch.nn.Module):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        inference_tp_ag_barrier: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1156,6 +1293,12 @@ class ColumnParallelLinear(torch.nn.Module):
                 weight tensor to use, compulsory when skip_weight_param_allocation is True.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `gather_output` arg in the constructor will be used.
+            inference_tp_ag_barrier (bool): Synchronizes consecutive AG launched via
+                ``multimem_all_gather`` for ``megatron.core.inference`` to prevent
+                AG multicast from overwriting the symmetric buffers before TP ranks
+                can copy-out the previous AG output. For more information, refer to
+                ``barrier_before`` in ``multimem_all_gather``
+                (``megatron.core.inference.communication.torch_symm_triton.collectives``).
 
         Returns:
             - output
@@ -1172,7 +1315,11 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             # Check the weight passed in is the correct shape
             expected_shape = (self.output_size_per_partition, self.input_size)
-            if weight.shape != expected_shape:
+            # Deferred to break the tensor_parallel package import cycle (gtp_api ->
+            # generalized_tensor_parallelism -> tensor_parallel/__init__ -> layers).
+            from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+            if weight.shape != expected_shape and not is_gtp_param(weight):
                 raise RuntimeError(
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"
@@ -1235,22 +1382,36 @@ class ColumnParallelLinear(torch.nn.Module):
             gather_output = runtime_gather_output
 
         if gather_output:
-            # All-gather across the partitions.
-            if self.use_inference_optimized_all_gather and not self.training:
-                # Deferred to avoid circular import: inference_layers → TE → layers.
-                from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
-
-                output = inference_all_gather_from_tensor_model_parallel_region(
-                    output_parallel, self.tp_group, self.config
-                )
-            else:
-                output = gather_from_tensor_model_parallel_region(
-                    output_parallel, group=self.tp_group
-                )
+            output = self.gather_tensor_parallel_output(
+                output_parallel, barrier_before=inference_tp_ag_barrier
+            )
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def gather_tensor_parallel_output(
+        self, output_parallel: torch.Tensor, barrier_before: bool = False
+    ) -> torch.Tensor:
+        """All-gather a partitioned output along the last dimension.
+
+        Args:
+            output_parallel: This rank's partition of the output, [..., output_size_per_partition].
+            barrier_before: Barrier before the inference-optimized all-gather overwrites the
+                shared symmetric buffer. Set it when this gather directly follows another
+                all-gather on that buffer. Ignored by the default NCCL all-gather.
+
+        Returns:
+            The gathered output, [..., output_size].
+        """
+        if self.use_inference_optimized_all_gather and InferenceMode.is_active():
+            # Deferred to avoid circular import: inference_layers → TE → layers.
+            from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
+
+            return inference_all_gather_from_tensor_model_parallel_region(
+                output_parallel, self.tp_group, self.config, barrier_before=barrier_before
+            )
+        return gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
 
     def backward_dw(self) -> None:
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled.
@@ -1434,7 +1595,15 @@ class RowParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(
+                self,
+                ["weight"],
+                gtp_remat_group,
+                # Expert weights replicate over EXPERT dp; dense over dp_cp.
+                replica_group=getattr(
+                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                ),
+            )
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:

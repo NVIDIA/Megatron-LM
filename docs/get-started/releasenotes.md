@@ -7,7 +7,9 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Release Notes
+# Release Notes and Roadmaps
+
+## Release Notes
 
 We publish release notes for every [major release](https://github.com/NVIDIA/Megatron-LM/releases).
 
@@ -17,6 +19,8 @@ Stay up-to-date with the development roadmaps and planned features:
 
 - **Q3 2026**
   - [General Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/5676)
+  - [MoE-focused Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/6757)
+  - [Megatron FSDP v2 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/6812)
 - **Q2 2026**
   - [General Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4815)
   - [MoE-focused Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4815)

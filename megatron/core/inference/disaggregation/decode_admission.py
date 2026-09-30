@@ -9,11 +9,16 @@ import math
 import torch
 
 
-def additional_decode_blocks(prompt_length: int, input_token_count: int, block_size: int) -> int:
-    """Return blocks needed beyond those containing the imported prompt."""
+def additional_decode_blocks(
+    prompt_length: int, input_token_count: int, block_size: int, mtp_kv_cache: bool = False
+) -> int:
+    """Return blocks for verification and drafting beyond the imported prompt."""
 
     prompt_blocks = math.ceil(prompt_length / block_size)
-    blocks_after_input = math.ceil((prompt_length + input_token_count) / block_size)
+    draft_lookahead = max(0, input_token_count - 2) if mtp_kv_cache else 0
+    blocks_after_input = math.ceil(
+        (prompt_length + input_token_count + draft_lookahead) / block_size
+    )
     return blocks_after_input - prompt_blocks
 
 
@@ -35,12 +40,14 @@ def admit_prefilled_decode(
     prompt_block_ids: list[int],
     continuation_block_ids: list[int],
     input_tokens: list[int],
+    ssm_state_idx: int | None = None,
 ) -> None:
-    """Admit imported KV state directly as an active decode request.
+    """Admit imported KV/SSM state directly as an active decode request.
 
     The imported prompt blocks already carry one allocator reference. This
-    function transfers that ownership to the live request and schedules the
-    sampled first token (plus any MTP proposals) as the next decode query.
+    function transfers that ownership to the live request, binds the exact
+    post-prompt recurrent state, and schedules the sampled first token (plus
+    any MTP proposals) as the next decode query.
     """
 
     input_token_count = len(input_tokens)
@@ -55,7 +62,10 @@ def admit_prefilled_decode(
             f"got {len(prompt_block_ids)}"
         )
     expected_decode_blocks = additional_decode_blocks(
-        prompt_length, input_token_count, context.block_size_tokens
+        prompt_length,
+        input_token_count,
+        context.block_size_tokens,
+        mtp_kv_cache=getattr(context, "enable_mtp_kv_cache", False),
     )
     if len(continuation_block_ids) != expected_decode_blocks:
         raise ValueError(
@@ -70,6 +80,10 @@ def admit_prefilled_decode(
         )
     if request.get_metadata_types() != context.request_metadata_types:
         raise ValueError("Imported request metadata does not match the decode context")
+
+    if context.is_hybrid_model:
+        if ssm_state_idx is None:
+            raise ValueError("A hybrid decode request requires an exact imported SSM state")
 
     current_id = context.total_request_count
     all_block_ids = prompt_block_ids + continuation_block_ids
@@ -96,7 +110,9 @@ def admit_prefilled_decode(
     )
     context.request_in_prefill_status_tensor[current_id] = 0
     context.request_kv_block_counts[current_id] = len(all_block_ids)
-    context.request_last_kv_block_id[current_id] = all_block_ids[-1]
+    context.mtp_metadata.reset_request_rows(current_id)
+    last_main_block = (prompt_length + input_token_count - 1) // context.block_size_tokens
+    context.request_last_kv_block_id[current_id] = all_block_ids[last_main_block]
     context.request_last_kv_block_offset[current_id] = (
         prompt_length - 1 + input_token_count
     ) % context.block_size_tokens
@@ -128,6 +144,10 @@ def admit_prefilled_decode(
     context.token_to_block_idx[token_start:token_end] = block_ids_tensor[
         token_positions // context.block_size_tokens
     ]
+
+    if context.is_hybrid_model:
+        assert ssm_state_idx is not None
+        context.mamba_metadata.request_to_mamba_state_idx[current_id] = ssm_state_idx
 
     context.active_token_count = token_end
     context.total_request_count += 1

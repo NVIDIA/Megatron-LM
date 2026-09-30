@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -22,8 +23,44 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
+class TwoStageAttentionLayer:
+    """Interface for attention-like modules that expose core and post-core stages."""
+
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this module instance supports two-stage execution."""
+        return True
+
+    def forward_pre_attn_and_core_attn(
+        self, *args: Any, packed_sequence_cp_metadata: Any = None, **kwargs: Any
+    ) -> Any:
+        """Run the pre-attention and core-attention stage."""
+        raise NotImplementedError
+
+    def forward_post_core_attn(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the post-core-attention stage."""
+        raise NotImplementedError
+
+
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
+
+
+def is_first_microbatch_tracked(config) -> bool:
+    """True if ``is_first_microbatch`` is still being kept up to date.
+
+    A training step runs N microbatches. The flag marks microbatch 1 -- the one that
+    re-quantizes the weights and starts a fresh main_grad, while 2..N reuse and accumulate::
+
+        layer is built      ->  flag = True
+        every forward       ->  flag = False   (microbatch 1 is over)
+        start of each step  ->  flag = True    (only quantized configs)
+    """
+    return (
+        config.fp8 is not None
+        or config.fp4 is not None
+        or getattr(config, 'use_kitchen', False)
+        or getattr(config, 'quant_recipe', None) is not None
+    )
 
 
 class MegatronModule(torch.nn.Module):
@@ -40,6 +77,14 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    def refresh_cache(self) -> None:
+        """Refresh state derived from parameters after an in-place weight refit.
+
+        Refit bypasses the normal checkpoint-load and train/eval lifecycles. Modules
+        that cache values derived from parameters can override this method; the refit
+        receiver calls it after all parameter and buffer transfers have completed.
+        """
 
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
@@ -108,12 +153,7 @@ class MegatronModule(torch.nn.Module):
         If kitchen is being used, kitchen controls quantization level.
         A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
-        if (
-            self.config.fp8 is not None
-            or self.config.fp4 is not None
-            or getattr(self.config, 'use_kitchen', False)
-            or getattr(self.config, 'quant_recipe', None) is not None
-        ):
+        if is_first_microbatch_tracked(self.config):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():

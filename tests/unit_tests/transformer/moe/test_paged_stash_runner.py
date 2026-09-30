@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -204,3 +205,46 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
         decoder_moe_config.moe_paged_stash,
         mtp_moe_config.moe_paged_stash,
     ) == (True, True, True, False)
+
+
+def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):
+    class _DistributedOptimizer:
+
+        def __init__(self, *, reuse_grad_buffer, overlap_param_gather):
+            self.ddp_config = SimpleNamespace(
+                reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buffer,
+                overlap_param_gather=overlap_param_gather,
+            )
+            self.shard_fp32_from_float16_groups = []
+            self._copy_main_params_to_param_buffer = Mock()
+
+    overlapped = _DistributedOptimizer(reuse_grad_buffer=True, overlap_param_gather=True)
+    nonoverlapped = _DistributedOptimizer(reuse_grad_buffer=True, overlap_param_gather=False)
+    dedicated_buffer = _DistributedOptimizer(reuse_grad_buffer=False, overlap_param_gather=True)
+    optimizer = SimpleNamespace(
+        zero_grad=Mock(), chained_optimizers=[overlapped, nonoverlapped, dedicated_buffer]
+    )
+    model_chunk = SimpleNamespace(zero_grad_buffer=Mock())
+    stash_manager = SimpleNamespace(overflow=None, host_spill=None, release_stash_buffers=Mock())
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.moe_layers = []
+    runner._required_recv_capacity = None
+    runner.stash_manager = stash_manager
+    runner.copy_main_params = True
+    runner.model = [model_chunk]
+    runner.optimizer = optimizer
+    runner.forward_backward_func = object()
+    runner._set_moe_paged_stash_all = Mock()
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.paged_stash.DistributedOptimizer", _DistributedOptimizer
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.paged_stash.nccl_ep_release_context", lambda: None
+    )
+
+    runner.prepare_for_rerun()
+
+    overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
+    nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
+    dedicated_buffer._copy_main_params_to_param_buffer.assert_not_called()

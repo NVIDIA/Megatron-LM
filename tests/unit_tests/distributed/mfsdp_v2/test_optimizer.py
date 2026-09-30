@@ -6,10 +6,10 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 from transformer_engine.pytorch.optimizers import FusedAdam
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -32,8 +32,8 @@ class TinyModel(nn.Module):
         return self.fc2(self.relu(self.fc1(x)))
 
 
-def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+def _default_placements() -> Placements:
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def test_adam_without_adapter_raises_precision_error(distributed_setup):
@@ -44,8 +44,8 @@ def test_adam_without_adapter_raises_precision_error(distributed_setup):
     torch.manual_seed(2026)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
@@ -74,13 +74,13 @@ def test_fused_adam_adapter_accepts_mismatched_grads(distributed_setup):
         fully_shard(
             model.fc1,
             mesh=mesh,
-            placements=_flat_placements(),
+            placements=_default_placements(),
             mixed_precision_policy=mixed_precision_policy,
         )
         fully_shard(
             model.fc2,
             mesh=mesh,
-            placements=_flat_placements(),
+            placements=_default_placements(),
             mixed_precision_policy=mixed_precision_policy,
         )
     optimizer = FusedAdam(model.parameters(), lr=0.01)

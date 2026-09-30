@@ -71,7 +71,13 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
-    """Strip language-only MoE/Mamba/hybrid settings inherited from the base config."""
+    """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
+    config.activation_func_tanh_clamp_scale = None
+    config.activation_func_tanh_clamp_scale_linear = None
+    # FP32 residual accumulation is a language-model policy. Preserve the pretrained
+    # modality math and restore the communication dtype promoted by TransformerConfig.
+    config.fp32_residual_connection = False
+    config.pipeline_dtype = config.params_dtype
     config.num_moe_experts = None
     config.moe_ffn_hidden_size = None
     config.moe_shared_expert_intermediate_size = None
@@ -79,8 +85,30 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.moe_router_fusion = False
     config.moe_permute_fusion = False
     config.moe_shared_expert_overlap = False
+    config.moe_shortcut_connection = False
+    config.moe_shortcut_parallel = False
+    config.moe_shortcut_post_norm = False
     config.is_hybrid_model = False
     config.use_fused_weighted_squared_relu = False
+    if config.recompute_modules is not None:
+        config.recompute_modules = [
+            module
+            for module in config.recompute_modules
+            if module != "shortcut_pre_mlp_layernorm"
+        ]
+    if getattr(config, "offload_modules", None) is not None:
+        config.offload_modules = [
+            module for module in config.offload_modules if module != "shortcut_post_norm"
+        ]
+
+
+def _disable_gtp(config: TransformerConfig) -> None:
+    """Keep this module replicated across any LLM GTP axes."""
+    config.tensor_parallel_num_weight_shards = config.tensor_model_parallel_size
+    config.gtp_weight_remat_size = 1
+    expert_tp = config.expert_tensor_parallel_size or config.tensor_model_parallel_size
+    config.expert_tensor_parallel_num_weight_shards = expert_tp
+    config.expert_gtp_weight_remat_size = 1
 
 
 def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) -> TransformerConfig:
@@ -114,6 +142,8 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.bf16 = bf16
     config.tensor_model_parallel_size = tp_size
     config.pipeline_model_parallel_size = pp_size
+    config.context_parallel_size = 1
+    _disable_gtp(config)
     config.sequence_parallel = False
     return config
 

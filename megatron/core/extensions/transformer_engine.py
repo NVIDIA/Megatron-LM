@@ -24,7 +24,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
@@ -36,6 +36,7 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -49,6 +50,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -104,7 +106,7 @@ def _set_expert_parameter_attributes(
     Args:
         module: Transformer Engine module whose direct parameters should be marked.
         parallel_mode: Tensor-parallel mode used by the module (``"column"``, ``"row"``, or None).
-        use_expert_pgs: Whether to use EP/ETP/EGTP/EDP process groups instead of TP/GTP/CP/DP.
+        use_expert_pgs: Whether to use EP/ETP/EGTP/EDP process groups instead of TP/CP/GTP/DP.
     """
     for name, param in module.named_parameters(recurse=False):
         param.allreduce = not use_expert_pgs
@@ -164,9 +166,16 @@ class TEQuantizationRecipe:
     If an amax reduction is applicable, such as in per-tensor quantization recipe,
     whether to reduce only along TP groups.
     """
+    inherit_model_init_context: bool = False
+    """
+    Whether parameter storage should always inherit the enclosing model-init context.
+    Inference-optimized modules with matching global and per-module MXFP8 policies
+    also inherit automatically when no storage or inheritance option is specified.
+    """
     fp8_param: bool = False
     """
-    If cast the initialized parameters to fp8 precision and all-gather weights in FP8.
+    Whether to cast initialized parameters to FP8. Defaults to BF16 storage unless
+    ``inherit_model_init_context`` is enabled explicitly or resolved for inference.
     """
     fp4_param: bool = False
     """
@@ -174,10 +183,18 @@ class TEQuantizationRecipe:
     """
 
     @classmethod
-    def parse_from_config(cls, quant_config: Dict[Any, Any]) -> "TEQuantizationRecipe":
+    def parse_from_config(
+        cls, quant_config: Dict[Any, Any], *, auto_inherit_model_init_context: bool = False
+    ) -> "TEQuantizationRecipe":
         """
         Parse config from quantization dictionary.
         """
+        if quant_config.get("inherit_model_init_context", False) and any(
+            field in quant_config for field in ("fp8_param", "fp4_param")
+        ):
+            raise ValueError(
+                "inherit_model_init_context cannot be combined with fp8_param or fp4_param."
+            )
         kwargs = {}
         class_keys = cls.get_config_keys()
         for field in class_keys:
@@ -186,7 +203,20 @@ class TEQuantizationRecipe:
         for field in quant_config:
             if field not in class_keys:
                 raise ValueError(f"Field '{field}' not valid for this configuration.")
+        # Resolve inference defaults while omission is still distinguishable from
+        # explicit false. Only modify the constructor kwargs, not the shared recipe.
+        if (
+            auto_inherit_model_init_context
+            and quant_config.get("fp8_quantization_recipe") == Fp8Recipe.mxfp8
+            and not any(
+                field in quant_config
+                for field in ("fp8_param", "fp4_param", "inherit_model_init_context")
+            )
+        ):
+            kwargs["inherit_model_init_context"] = True
         instance = TEQuantizationRecipe(**kwargs)
+        if not isinstance(instance.fp8_param, bool):
+            raise ValueError("fp8_param must be a bool (true or false).")
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
         if (
@@ -221,9 +251,20 @@ class TEQuantizationParams:
     """
 
     @staticmethod
-    def parse_from_config(quant_config: QuantizationConfig) -> "TEQuantizationParams":
+    def parse_from_config(
+        quant_config: QuantizationConfig, *, model_config: TransformerConfig | None = None
+    ) -> "TEQuantizationParams":
         """Parses quantization config for a layer or throw an error."""
         config = quant_config.config
+        # Training retains its existing BF16 storage default. The optimized
+        # inference backend needs MXFP8 storage to select its MXFP8 kernels.
+        auto_inherit_model_init_context = (
+            model_config is not None
+            and model_config.transformer_impl == "inference_optimized"
+            and bool(model_config.fp8)
+            and model_config.fp8_recipe == Fp8Recipe.mxfp8
+            and model_config.fp8_param
+        )
         try:
             config_type = TransformerEngineConfigType(config[_TE_CONFIG_TYPE_KEY])
         except KeyError:
@@ -238,13 +279,17 @@ class TEQuantizationParams:
                 raise ValueError(
                     "TransformerEngine config dictionary must have 'training_recipe' key"
                 )
-            training_recipe = TEQuantizationRecipe.parse_from_config(config['training_recipe'])
+            training_recipe = TEQuantizationRecipe.parse_from_config(
+                config['training_recipe'],
+                auto_inherit_model_init_context=auto_inherit_model_init_context,
+            )
             if 'evaluation_recipe' not in config.keys():
                 evaluation_recipe = None
                 assert len(config.keys()) == 2
             else:
                 evaluation_recipe = TEQuantizationRecipe.parse_from_config(
-                    config['evaluation_recipe']
+                    config['evaluation_recipe'],
+                    auto_inherit_model_init_context=auto_inherit_model_init_context,
                 )
                 assert len(config.keys()) == 3
             return TEQuantizationParams(
@@ -255,11 +300,16 @@ class TEQuantizationParams:
 
 
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    if qrecipe.inherit_model_init_context:
+        # Preserve both the enclosing recipe and whether storage is enabled. In
+        # particular, this lets the global first/last-layer BF16 policy remain in
+        # control while a per-module recipe changes execution precision.
+        return nullcontext()
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
         enabled = False
         quant_recipe = None
     elif qrecipe.fp8_quantization_recipe is not None:
-        enabled = qrecipe.fp8_param
+        enabled = bool(qrecipe.fp8_param)
         if qrecipe.fp8_format == "e4m3":
             fp8_format = te.common.recipe.Format.E4M3
         elif qrecipe.fp8_format == "hybrid":
@@ -304,9 +354,11 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
     if qparams is None:
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_model_init_for_quant_recipe(qparams.evaluation_recipe)
+        qrecipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_model_init_for_quant_recipe(qparams.training_recipe)
+        qrecipe = qparams.training_recipe
+
+    return _get_fp8_model_init_for_quant_recipe(qrecipe)
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
@@ -400,6 +452,21 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _resolve_is_first_microbatch(module) -> Optional[bool]:
+    """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
+
+    A ``True`` tells TE the gradient is fresh, so backward writes over ``main_grad`` instead of
+    adding into it. Pass the flag on only when it can be trusted.
+    """
+    if (
+        module.disable_parameter_transpose_cache
+        or not is_first_microbatch_tracked(module.config)
+        or getattr(module, 'is_repeated_layer', False)
+    ):
+        return None
+    return module.is_first_microbatch
+
+
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
@@ -454,10 +521,12 @@ def _gtp_pre_init(
     return shard_out, gtp_ctx
 
 
-def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, replica_group=None):
     """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
 
     ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
+    ``replica_group`` is the caller's gtp_remat-excluded DP x CP group, stamped on each weight for
+    distributed checkpointing (see ``gtp_replica_rank``).
     """
     from megatron.core.tensor_parallel.gtp_api import attach_gtp_to_presharded_module
 
@@ -466,7 +535,9 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
     module.out_features = logical_out_features
-    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+    attach_gtp_to_presharded_module(
+        module, gtp_remat_group, pad_length, is_grouped=is_grouped, replica_group=replica_group
+    )
 
 
 @contextmanager
@@ -480,11 +551,13 @@ def _init_gtp_remat_context(
     is_grouped=False,
     rng_via_kwarg=True,
     out_split_size=1,
+    replica_group=None,
 ):
     """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
     GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
 
     ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
+    ``replica_group`` = the caller's gtp_remat-excluded DP x CP group (checkpoint writer election).
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         yield output_size
@@ -499,7 +572,7 @@ def _init_gtp_remat_context(
         out_split_size=out_split_size,
     )
     yield out_features
-    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -599,16 +672,22 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.SwiGLU
                 elif config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GEGLU
-                elif config.activation_func == F.silu:
+                elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReGLU
             else:
                 if config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GELU
-                elif config.activation_func == F.silu:
+                elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReLU
+                elif config.activation_func == F.silu:
+                    if not is_te_min_version("2.8.0"):
+                        raise NotImplementedError(
+                            "SiLU activation requires Transformer Engine 2.8+"
+                        )
+                    layer_type = te.pytorch.ops.SiLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SiLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
@@ -640,12 +719,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
           to use the original module hierarchy as the source of truth.
         - The fused implementation is an unregistered execution view over
           registered source modules and parameters.
-        - Forward hooks on source modules are best-effort emulated on the fused
-          implementation. Hooks that modify tensors are unsupported because TE
-          fused ops do not expose intermediate tensors.
-        - Hooks, config, and source module replacement after first forward are
-          not reflected in the cached fused implementation. Call
-          ``_reset_fused_impl`` before the next forward after such changes.
+        - Hooks on the wrapper itself are handled by its normal
+          ``Module.__call__``.
+        - Forward hooks on descendant source modules are best-effort emulated
+          on the unregistered execution views. Hooks that modify tensors are
+          unsupported because TE fused ops do not expose intermediate tensors.
+        - The descendant module set is captured when the fused implementation
+          is built. Pre-forward hooks on those descendants are resolved
+          dynamically because DDP may change them after construction;
+          post-forward hooks are captured at build time. Descendant backward
+          hooks are unsupported and validated at build time.
+        - Call ``_reset_fused_impl`` before the next forward after replacing
+          source modules, changing descendant module membership or descendant
+          post-forward hooks, or changing config that affects TE ops.
         """
 
         _fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]]
@@ -676,59 +762,64 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             """Discard the cached unregistered fused implementation.
 
             This is intended for tests and for internal use after replacing
-            source modules, changing config that affects TE ops, or changing
-            hooks after the first forward.
+            source modules, changing descendant module membership, changing
+            config that affects TE ops, or changing descendant post-forward
+            hooks. Pre-forward-hook mutations on existing descendants are
+            observed dynamically and do not require a reset. Descendant
+            backward hooks remain unsupported; reset after adding one to rerun
+            validation.
             """
             self._fused_impl = None
 
-        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-            """Attempt to emulate submodule callback hooks.
+        def _register_forward_pre_hooks_on_fused_impl(
+            self, fused_impl: torch.nn.Module, source_submodules: Sequence[torch.nn.Module]
+        ) -> None:
+            """Forward current source-submodule pre-hooks at an execution boundary."""
 
-            This is not always possible because Transformer Engine's
-            op fuser does not expose intermediate tensors. Depending
-            on what kernel fusions the op fuser chooses, the
-            intermediate tensors may not even exist. Hooks that modify
-            tensors will result in incorrect behavior.
-            """
-
-            # Get submodule hooks
-            forward_pre_hooks = []
-            forward_post_hooks = []
-            backward_pre_hooks = []
-            backward_post_hooks = []
-            for submodule in self.modules():
-                for hook_id, hook in submodule._forward_pre_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
-                    forward_pre_hooks.append((submodule, hook, with_kwargs))
-                for hook_id, hook in submodule._forward_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
-                    forward_post_hooks.append((submodule, hook, with_kwargs))
-                for hook in submodule._backward_pre_hooks.values():
-                    backward_pre_hooks.append((submodule, hook))
-                for hook in submodule._backward_hooks.values():
-                    backward_post_hooks.append((submodule, hook))
+            source_submodules = tuple(source_submodules)
+            if not source_submodules:
+                return
+            source_submodule_ids = [id(submodule) for submodule in source_submodules]
+            if len(source_submodule_ids) != len(set(source_submodule_ids)):
+                raise ValueError("Pre-forward hook sources must not contain duplicates")
+            descendant_ids = {
+                id(submodule) for submodule in self.modules() if submodule is not self
+            }
+            if any(submodule_id not in descendant_ids for submodule_id in source_submodule_ids):
+                raise ValueError("Pre-forward hook sources must be descendants of the wrapper")
 
             module_name = self.__class__.__name__
+            distributed_data_parallel = None
+            warned_non_ddp_hooks = set()
 
-            # Pre-forward hooks
-            # Note: DDP pre-forward hooks are safe since they do not
-            # interact with input tensor.
-            if forward_pre_hooks:
-                from megatron.core.distributed import distributed_data_parallel
+            def forward_pre_hook(module, *_) -> None:
+                # DDP may disable its parameter-gather hooks for the first iteration and
+                # re-enable them after this fused implementation has been cached. Read the
+                # current hook registries on every invocation instead of capturing a stale
+                # construction-time snapshot.
+                nonlocal distributed_data_parallel
+                for submodule in source_submodules:
+                    hooks_with_kwargs = submodule._forward_pre_hooks_with_kwargs
+                    for hook_id, hook in list(submodule._forward_pre_hooks.items()):
+                        if distributed_data_parallel is None:
+                            from megatron.core.distributed import (
+                                distributed_data_parallel as ddp_module,
+                            )
 
-                if any(
-                    inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook, _ in forward_pre_hooks
-                ):
-                    warnings.warn(
-                        f"{module_name} module has a submodule with a pre-forward hook. "
-                        f"{module_name} module does not expose intermediate tensors, "
-                        "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
-                    )
-
-                def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook, with_kwargs in forward_pre_hooks:
+                            distributed_data_parallel = ddp_module
+                        hook_key = (id(submodule), hook_id)
+                        if (
+                            inspect.getmodule(hook) != distributed_data_parallel
+                            and hook_key not in warned_non_ddp_hooks
+                        ):
+                            warnings.warn(
+                                f"{module_name} module has a submodule with a pre-forward hook. "
+                                f"{module_name} module does not expose intermediate tensors, "
+                                "so the hook may have incorrect behavior if it attempts to "
+                                "access the input tensor."
+                            )
+                            warned_non_ddp_hooks.add(hook_key)
+                        with_kwargs = hook_id in hooks_with_kwargs
                         if with_kwargs:
                             ret = hook(submodule, (), {})
                         else:
@@ -739,9 +830,64 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                                 "but submodule has pre-forward hook that modifies input tensor."
                             )
 
-                fused_impl.register_forward_pre_hook(forward_pre_hook)
+            # Install the pre-hook forwarder even when source hook registries are currently
+            # empty. DDP changes their contents throughout the training lifecycle.
+            fused_impl.register_forward_pre_hook(forward_pre_hook)
+
+        def _register_hooks_on_fused_impl(
+            self,
+            fused_impl: torch.nn.Module,
+            *,
+            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+        ) -> None:
+            """Attempt to emulate submodule callback hooks.
+
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
+
+            ``pre_forward_submodules`` selects the descendants whose current
+            pre-hooks run at this execution boundary. By default, all skipped
+            descendants are selected. Backward validation and post-hook
+            forwarding always cover all skipped descendants.
+            """
+
+            module_name = self.__class__.__name__
+
+            # Hooks on the wrapper itself are executed by its normal Module.__call__.
+            # Cache only the descendants whose calls the fused implementation skips.
+            skipped_submodules = tuple(
+                submodule for submodule in self.modules() if submodule is not self
+            )
+            for submodule in skipped_submodules:
+                if submodule._backward_pre_hooks:
+                    raise RuntimeError(
+                        f"{module_name} module does not support submodules with pre-backward hooks"
+                    )
+                if submodule._backward_hooks:
+                    raise RuntimeError(
+                        f"{module_name} module does not support submodules with post-backward hooks"
+                    )
+
+            if not skipped_submodules:
+                return
+
+            if pre_forward_submodules is None:
+                pre_forward_submodules = skipped_submodules
+            else:
+                pre_forward_submodules = tuple(pre_forward_submodules)
+
+            # DDP pre-forward hooks are safe since they do not interact with input tensors.
+            self._register_forward_pre_hooks_on_fused_impl(fused_impl, pre_forward_submodules)
 
             # Post-forward hooks
+            forward_post_hooks = []
+            for submodule in skipped_submodules:
+                hooks_with_kwargs = submodule._forward_hooks_with_kwargs
+                for hook_id, hook in submodule._forward_hooks.items():
+                    forward_post_hooks.append((submodule, hook, hook_id in hooks_with_kwargs))
             if forward_post_hooks:
                 warnings.warn(
                     f"{module_name} module has a submodule with a post-forward hook. "
@@ -763,16 +909,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                             )
 
                 fused_impl.register_forward_hook(forward_post_hook)
-
-            # Backward hooks
-            if backward_pre_hooks:
-                raise RuntimeError(
-                    f"{module_name} module does not support submodules with pre-backward hooks"
-                )
-            if backward_post_hooks:
-                raise RuntimeError(
-                    f"{module_name} module does not support submodules with post-backward hooks"
-                )
 
     def _te_ops_has_nested_attr(module: torch.nn.Module, attr_name: str) -> bool:
         """Return whether an adapter input exposes a possibly-nested attribute."""
@@ -1071,6 +1207,7 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        instance.returns_residual = use_fused_residual
         return cast(LayerNormInterface, instance)
 
 
@@ -1106,6 +1243,7 @@ class TELinear(te.pytorch.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
         gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -1250,6 +1388,7 @@ class TELinear(te.pytorch.Linear):
             extra_kwargs,
             is_expert=is_expert,
             out_split_size=tp_size if te_parallel_mode == "column" else 1,
+            replica_group=gtp_replica_group,
         )
 
         with init_quant_context, init_gtp_remat_context as output_size:
@@ -1292,7 +1431,9 @@ class TELinear(te.pytorch.Linear):
         if quantization_config is None:
             self.te_quant_params = None
         else:
-            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+            self.te_quant_params = TEQuantizationParams.parse_from_config(
+                quantization_config, model_config=self.config
+            )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1302,9 +1443,7 @@ class TELinear(te.pytorch.Linear):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
@@ -1479,6 +1618,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             extra_kwargs,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
+            replica_group=getattr(pg_collection, "dp_cp", None),
         )
 
         with init_quant_context, init_gtp_remat_context as gtp_output_size:
@@ -1540,7 +1680,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         if quantization_config is None:
             self.te_quant_params = None
         else:
-            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+            self.te_quant_params = TEQuantizationParams.parse_from_config(
+                quantization_config, model_config=self.config
+            )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1550,9 +1692,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def forward(self, x):
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
@@ -1670,6 +1810,7 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
+            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
 
         # Set proper partition_stride
@@ -1776,6 +1917,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         output_dtype: Optional[torch.dtype] = None,
     ):
         from megatron.core.fp8_utils import is_mxfp8_output_proj_active
@@ -1815,6 +1957,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            pg_collection=pg_collection,
             stride=stride,
         )
 
@@ -1934,6 +2077,7 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
+            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2000,6 +2144,13 @@ class TERowParallelLinear(TELinear):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
         if self.config.delay_wgrad_compute:
             super().backward_dw()
+
+
+# Some patched TE builds expose a `softcap` kwarg on DotProductAttention without bumping the TE
+# version number, so we probe the signature once instead of gating on is_te_min_version().
+_te_dpa_supports_softcap = (
+    "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
+)
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -2152,6 +2303,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             extra_kwargs["softmax_type"] = self.config.softmax_type
 
+        if self.config.attn_logit_softcapping is not None:
+            assert _te_dpa_supports_softcap, (
+                f"Transformer-Engine v{get_te_version()} does not expose a `softcap` argument on "
+                "DotProductAttention, so `attn_logit_softcapping` cannot be used. Install a TE "
+                "build with softcap support or unset `attn_logit_softcapping`."
+            )
+            extra_kwargs["softcap"] = self.config.attn_logit_softcapping
+
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
@@ -2205,6 +2364,46 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+    @contextmanager
+    def _temporary_runtime_context_parallel_group(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ):
+        """Bind TE to one microbatch's CP group and restore it on every exit path."""
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            yield
+            return
+
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None
+        original_cp_group = self.cp_group
+        original_cp_global_ranks = self.cp_global_ranks
+
+        try:
+            if runtime_cp_group.size() == 1:
+                # Dynamic CP metadata retains the singleton group, while TE
+                # must see CP disabled for this microbatch.
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                if TEDotProductAttention.cp_stream is None:
+                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                super().set_context_parallel_group(
+                    runtime_cp_group,
+                    torch.distributed.get_process_group_ranks(runtime_cp_group),
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+            yield
+        finally:
+            if original_cp_group is None or original_cp_group.size() == 1:
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                super().set_context_parallel_group(
+                    original_cp_group,
+                    original_cp_global_ranks,
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+
     def forward(
         self,
         query: Tensor,
@@ -2215,25 +2414,36 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        with self._temporary_runtime_context_parallel_group(packed_seq_params):
+            return self._forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
+
+    def _forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Run TE attention after the runtime CP binding has been installed."""
         if packed_seq_params is not None:
-            # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -2282,6 +2492,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
+            if bf16_backward is not None:
+                _fa_kwargs["bf16_backward"] = bf16_backward
 
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
@@ -2312,6 +2524,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
+            if bf16_backward is not None:
+                _fa_kwargs["bf16_backward"] = bf16_backward
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
@@ -2479,6 +2693,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=True,
                 is_grouped=True,
                 out_split_size=tp_size if parallel_mode == "column" else 1,
+                replica_group=getattr(pg_collection, "expt_dp", None),
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:
@@ -2671,7 +2886,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if quantization_config is None:
                 self.te_quant_params = None
             else:
-                self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+                self.te_quant_params = TEQuantizationParams.parse_from_config(
+                    quantization_config, model_config=self.config
+                )
 
         def will_execute_quantized(self, is_context_quantized: bool) -> bool:
             """Returns whether the module is configured to execute quantized."""
@@ -2681,9 +2898,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-            )
+            _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
@@ -3091,9 +3306,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             input_size: int | None = None,
             ffn_hidden_size: int | None = None,
             name: str | None = None,
+            hash_moe_layer_threshold: int | None = None,
         ) -> MLP:
             """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
             del is_mtp_layer
+            if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
+                raise ValueError("Dense MLP does not support hash MoE routing.")
             assert hasattr(
                 pg_collection, 'tp'
             ), 'TP process group is required for TEFusedMLP in TransformerLayer'
@@ -3137,6 +3355,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     f"activation_func={self.config.activation_func}, "
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
+
+        def _reset_fused_impl(self) -> None:
+            """Discard both cached execution views."""
+            super()._reset_fused_impl()
+            self._norm_seq = None
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
@@ -3234,8 +3457,41 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
             fused_impl.append(op)
 
-            self._register_hooks_on_fused_impl(fused_impl)
             return fused_impl
+
+        def _register_hooks_on_fused_impl(
+            self,
+            fused_impl: torch.nn.Module,
+            *,
+            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+        ) -> None:
+            """Register hook forwarding for the grouped and normalization boundaries."""
+
+            if get_tensor_model_parallel_world_size() > 1:
+                super()._register_hooks_on_fused_impl(
+                    fused_impl, pre_forward_submodules=pre_forward_submodules
+                )
+                return
+            if pre_forward_submodules is not None:
+                raise ValueError("Grouped MLP pre-forward hook phases are selected internally")
+
+            if self._norm_seq is None:
+                raise RuntimeError("Grouped MLP normalization sequence has not been built")
+
+            # DDP's parameter-gather hook on FC1 must run before the separate norm
+            # sequence reads FC1's aliased normalization parameters. Keep FC1's
+            # subtree out of the main fused boundary so every source hook runs once.
+            fc1_submodules = tuple(self.linear_fc1.modules())
+            fc1_submodule_ids = {id(submodule) for submodule in fc1_submodules}
+            remaining_submodules = tuple(
+                submodule
+                for submodule in self.modules()
+                if submodule is not self and id(submodule) not in fc1_submodule_ids
+            )
+            super()._register_hooks_on_fused_impl(
+                fused_impl, pre_forward_submodules=remaining_submodules
+            )
+            self._register_forward_pre_hooks_on_fused_impl(self._norm_seq[0], fc1_submodules)
 
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
@@ -3266,7 +3522,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             if self._fused_impl is None:
                 with te.pytorch.quantized_model_init(enabled=True, recipe=recipe):
-                    self._fused_impl = (self._make_fused_impl(),)
+                    fused_impl = self._make_fused_impl()
+                    self._register_hooks_on_fused_impl(fused_impl)
+                    self._fused_impl = (fused_impl,)
 
             # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
             # tensor used by RMSNorm backward (running it inside causes up to 10^6
@@ -3374,9 +3632,20 @@ def te_checkpoint(
 
     from transformer_engine.pytorch.distributed import checkpoint
 
+    initial_forward = True
+
+    def forward_func_without_recomputed_observations(*forward_args, **forward_kwargs):
+        nonlocal initial_forward
+        if initial_forward:
+            initial_forward = False
+            return forward_func(*forward_args, **forward_kwargs)
+
+        with suspend_tensor_observations():
+            return forward_func(*forward_args, **forward_kwargs)
+
     if is_te_min_version("1.5.0"):
         return checkpoint(
-            forward_func,
+            forward_func_without_recomputed_observations,
             *args,
             distribute_saved_activations=distribute_saved_activations,
             get_rng_state_tracker=get_rng_state_tracker,
@@ -3385,7 +3654,11 @@ def te_checkpoint(
         )
     else:
         return checkpoint(
-            forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args
+            forward_func_without_recomputed_observations,
+            distribute_saved_activations,
+            get_rng_state_tracker,
+            tp_group,
+            *args,
         )
 
 
@@ -3559,6 +3832,9 @@ try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
     _TE_SUPPORTS_CG_CAPTURABLE = is_te_min_version("2.7.0")
+    _TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT = (
+        "overwrite_input" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -3566,18 +3842,45 @@ try:
         labels: torch.Tensor,
         tp_group: torch.distributed.ProcessGroup,
         is_cg_capturable: bool = False,
+        overwrite_input: bool = True,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel"""
+        parallel_cross_entropy_kwargs = {
+            "label_smoothing": 0.0,
+            "reduce_loss": False,
+            "dist_process_group": tp_group,
+        }
+        if _TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT:
+            # TransformerEngine will reuse the input buffer for dgrad if overwrite_input=True.
+            # Supported after https://github.com/NVIDIA/TransformerEngine/pull/3273.
+            parallel_cross_entropy_kwargs["overwrite_input"] = overwrite_input
         if _TE_SUPPORTS_CG_CAPTURABLE:
+            # Use the CUDA graph-capturable version of the loss function.
+            parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
-            return parallel_cross_entropy(
-                logits, labels, 0.0, False, tp_group, -100, is_cg_capturable
-            )
-        else:
-            return parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
+            parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
+
+
+def te_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    cuda_graph_capturable: bool = False,
+    overwrite_input: bool = True,
+) -> torch.Tensor:
+    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    if te_parallel_cross_entropy is None:
+        raise RuntimeError("Trying to use a TE block when it's not present.")
+    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    return te_parallel_cross_entropy(
+        logits, labels, tp_group, cuda_graph_capturable, overwrite_input=overwrite_input
+    )
+
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
@@ -3597,6 +3900,7 @@ try:
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
+        accumulate: bool = False,
     ) -> List[torch.Tensor]:
         """
         Wrapper for TE's general_gemm function.
@@ -3604,13 +3908,17 @@ try:
         The output dtype can be specified by `out_dtype`.
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
+
+        ``accumulate=True`` makes the epilogue add into ``out`` instead of overwriting it, so a
+        caller that drives the same output buffer through several GEMMs gets the sum without a
+        separate accumulator. ``out`` must then already hold the running value.
         """
         kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
             gelu_in=None,
-            accumulate=False,
+            accumulate=accumulate,
             layout=layout,
             out=out,
             bias=bias,

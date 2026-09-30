@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -290,12 +291,57 @@ class TestPixelShuffleNonSquare:
     def test_non_square_h_w_required_for_dynamic_res(self):
         from megatron.core.models.multimodal.llava_model import pixel_shuffle
 
-        # 12 patches arranged as 3×4 (non-square). With h, w supplied the
-        # function must accept this and produce the shuffled output.
+        # Pixel shuffle must group spatial 2x2 neighborhoods rather than four
+        # consecutive entries in the flattened non-square grid.
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        out = pixel_shuffle(x, h=4, w=6)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_non_square_image_golden_values(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle_dynamic_res
+
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        imgs_sizes = torch.tensor([[4, 6]], dtype=torch.int32)
+
+        out = pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim=1)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_non_square_h_w_must_be_even(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
         x = torch.randn(1, 12, 4)
-        out = pixel_shuffle(x, h=3, w=4)
-        # scale=0.5 ⇒ each spatial dim halves ⇒ output area = (3*4)/(2*2) = 3.
-        assert out.shape == (1, 3, 16)
+        with pytest.raises(AssertionError, match="must both be divisible"):
+            pixel_shuffle(x, h=3, w=4)
 
     @pytest.mark.internal
     def test_h_w_mismatch_raises(self):
@@ -305,6 +351,69 @@ class TestPixelShuffleNonSquare:
         # Mismatch: h*w != patches.
         with pytest.raises(AssertionError):
             pixel_shuffle(x, h=2, w=2)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_video_chunks_use_real_non_square_grids(self):
+        from megatron.core.models.multimodal.llava_model import (
+            _pixel_shuffle_dynamic_resolution_chunks,
+        )
+
+        # The temporal encoder returns one 2D chunk per tubelet. The shared
+        # helper must also continue accepting packed 3D image chunks.
+        video_chunks = [torch.randn(1008, 8) for _ in range(8)]
+        shuffled_video = _pixel_shuffle_dynamic_resolution_chunks(
+            video_chunks, [(448, 576)] * 8, patch_dim=16
+        )
+        assert all(chunk.shape == (252, 32) for chunk in shuffled_video)
+
+        packed_image_chunks = [torch.randn(1, 1008, 8)]
+        shuffled_images = _pixel_shuffle_dynamic_resolution_chunks(
+            packed_image_chunks, [(448, 576)], patch_dim=16
+        )
+        assert shuffled_images[0].shape == (1, 252, 32)
+
+    @pytest.mark.internal
+    def test_temporal_token_counts_group_one_placeholder_per_media(self):
+        from megatron.core.models.multimodal.llava_model import (
+            _align_temporal_token_counts_to_placeholders,
+            _group_temporal_token_counts_tensor,
+        )
+
+        tubelet_counts = torch.tensor([252, 252, 128], dtype=torch.int32, device="cuda")
+        media_tubelet_counts = [2, 1]
+        grouped_counts = _group_temporal_token_counts_tensor(tubelet_counts, media_tubelet_counts)
+        assert torch.equal(
+            grouped_counts, torch.tensor([504, 128], dtype=torch.int32, device="cuda")
+        )
+
+        compact_input_ids = torch.tensor([[-200, 1, -200]], device="cuda")
+        aligned_counts = _align_temporal_token_counts_to_placeholders(
+            tubelet_counts, media_tubelet_counts, compact_input_ids, -200
+        )
+        assert torch.equal(aligned_counts, grouped_counts)
+
+        expanded_input_ids = torch.tensor([[-200, -200, 1, -200]], device="cuda")
+        aligned_counts = _align_temporal_token_counts_to_placeholders(
+            tubelet_counts, media_tubelet_counts, expanded_input_ids, -200
+        )
+        assert torch.equal(aligned_counts, tubelet_counts)
+
+        invalid_input_ids = torch.tensor([[-200]], device="cuda")
+        with pytest.raises(ValueError, match="must align"):
+            _align_temporal_token_counts_to_placeholders(
+                tubelet_counts, media_tubelet_counts, invalid_input_ids, -200
+            )
+
+        # temporal_patch_dim=1 makes every frame one tubelet. A per-video
+        # placeholder therefore receives the sum of all frame embeddings.
+        device_counts = torch.tensor([64, 64, 32], dtype=torch.int32, device="cuda")
+        grouped_counts = _group_temporal_token_counts_tensor(device_counts, [2, 1])
+        assert torch.equal(
+            grouped_counts, torch.tensor([128, 32], dtype=torch.int32, device="cuda")
+        )
+
+        with pytest.raises(ValueError, match="must partition"):
+            _group_temporal_token_counts_tensor(tubelet_counts, [1, 1])
 
 
 class TestRADIODynamicResAndTemporal:
@@ -360,6 +469,77 @@ class TestRADIODynamicResAndTemporal:
         # Image embedder is 2D (P*P*3); video embedder is 3D (T*P*P*3).
         assert model.embedder.input_size == 3 * 14 * 14
         assert model.video_embedder.input_size == 3 * 2 * 14 * 14
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize(
+        "num_frames", [[1, 4, 1, 3], [4], [1, 1]], ids=["mixed", "video_only", "image_only"]
+    )
+    def test_separate_video_embedder_forward_gathers_once(self, num_frames, tp_size):
+        """Chunks are embedded without a gather and gathered together once, which
+        must match gathering every chunk's embedding separately."""
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires at least {tp_size} GPUs")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tp_size, 1)
+        model_parallel_cuda_manual_seed(123)
+        patch_dim = 14
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=patch_dim,
+            add_class_token=False,
+            dynamic_resolution=True,
+            temporal_patch_dim=2,
+            separate_video_embedder=True,
+        ).cuda()
+        model.eval()
+
+        # Give images and videos different grids so a misplaced chunk changes shapes.
+        frame_sizes = []
+        for nf in num_frames:
+            size = (28, 56) if nf == 1 else (56, 42)
+            frame_sizes.extend([size] * nf)
+        imgs_sizes = torch.tensor(frame_sizes, dtype=torch.int32)
+        total_patches = sum((h // patch_dim) * (w // patch_dim) for h, w in frame_sizes)
+        # Every TP rank must see the same input.
+        generator = torch.Generator().manual_seed(0)
+        x = torch.randn(1, total_patches, 3 * patch_dim * patch_dim, generator=generator).cuda()
+
+        with (
+            torch.no_grad(),
+            mock.patch.object(model, "apply_pos_enc", wraps=model.apply_pos_enc) as pos_enc_spy,
+            mock.patch.object(
+                type(model.embedder),
+                "gather_tensor_parallel_output",
+                autospec=True,
+                side_effect=type(model.embedder).gather_tensor_parallel_output,
+            ) as gather_spy,
+        ):
+            out, out_sizes, out_num_frames = model(x, imgs_sizes=imgs_sizes, num_frames=num_frames)
+
+        assert gather_spy.call_count == 1
+
+        with torch.no_grad():
+            grouped, _sizes, _nf, _packed, is_image = model._apply_temporal_grouping(
+                x, imgs_sizes, num_frames, None, skip_image_duplication=True
+            )
+            expected = torch.cat(
+                [
+                    (model.embedder if img else model.video_embedder)(chunk)[0]
+                    for chunk, img in zip(grouped, is_image)
+                ],
+                dim=1,
+            )
+        embedded = torch.cat([call.args[0] for call in pos_enc_spy.call_args_list], dim=1)
+        torch.testing.assert_close(embedded, expected, rtol=0, atol=0)
+
+        expected_num_frames = [1 if nf == 1 else -(-nf // 2) for nf in num_frames]
+        assert out_num_frames == expected_num_frames
+        assert out_sizes.shape[0] == len(is_image)
+        assert out.shape == (1, expected.shape[1], self.transformer_config.hidden_size)
 
     @pytest.mark.internal
     def test_constructor_with_temporal_ckpt_compat_registers_pre_hook(self):

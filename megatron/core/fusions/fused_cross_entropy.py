@@ -33,7 +33,7 @@ def calculate_predicted_logits(
     """
     Calculates the predicted logits for the tokens.
     """
-    (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
+    target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
         VocabParallelCrossEntropy.calculate_predicted_logits(
             vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
         )
@@ -67,11 +67,12 @@ def calculate_gradients(
     grad_output: torch.Tensor,
     target_mask: torch.Tensor,
     masked_target_1d: torch.Tensor,
+    logits_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
     Calculate the logits gradients scaled based on the CE loss
     """
-    (grad_2d, arange_1d, softmax_update, grad_input) = (
+    grad_2d, arange_1d, softmax_update, grad_input = (
         VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
     )
 
@@ -79,7 +80,10 @@ def calculate_gradients(
         grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
     )
 
-    grad_input = grad_input.to(torch.bfloat16)
+    # Emit the gradient in the dtype of the forward logits. If it differed, the autograd
+    # engine would insert its own cast (a non-vectorized, un-fusable copy over the full
+    # [s, b, v] tensor) before handing the gradient to the output layer's backward.
+    grad_input = grad_input.to(logits_dtype)
 
     return grad_input
 
@@ -90,6 +94,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """
         Forward implementation for the cross entropy loss.
         """
+        # Record the incoming dtype: calculate_logits_max upcasts to fp32 (a no-op for fp32
+        # logits), and backward must return a gradient of the original dtype.
+        ctx.logits_dtype = vocab_parallel_logits.dtype
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
 
@@ -100,7 +107,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             partition_vocab_size, tp_group.rank(), tp_group.size()
         )
 
-        (target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits) = (
+        target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits = (
             calculate_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
             )
@@ -128,7 +135,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # Retreive tensors from the forward path.
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
 
-        grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)
+        grad_input = calculate_gradients(
+            softmax, grad_output, target_mask, masked_target_1d, ctx.logits_dtype
+        )
 
         return grad_input, None, None
 

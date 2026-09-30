@@ -516,8 +516,8 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
-    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
-    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+    async_strategy: Literal["nvrx"] = "nvrx"
+    """Which async save strategy to use. Deprecated and will be removed."""
 
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
@@ -611,7 +611,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
@@ -648,15 +651,11 @@ class CheckpointConfig:
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
-        assert self.async_strategy in ["nvrx", "mcore"], \
-            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
-
-        if not self.async_save:
-            self.async_strategy = "mcore"
+        assert self.async_strategy in ["nvrx"], \
+            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
         if (
             self.async_save
-            and self.async_strategy == "nvrx"
             and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
         ):
             assert has_nvrx_checkpointing_async_support(), (
@@ -751,3 +750,6 @@ class TokenizerConfig:
 
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
+
+    use_gigatoken: Optional[bool] = False
+    """Whether to use faster implementation of tokenizers (gigatoken)"""

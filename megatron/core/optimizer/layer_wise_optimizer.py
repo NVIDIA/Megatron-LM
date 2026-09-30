@@ -39,13 +39,13 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
 
     Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
-    via Newton-Schulz, and False for embeddings, biases, LayerNorm weights, and
-    any other non-matrix parameter (which are handled by Adam through a separate
-    :class:`DistributedOptimizer`).
+    via Newton-Schulz, and False for parameters routed to Muon's scalar fallback:
+    explicit ``use_muon=False`` exclusions, embeddings, and non-matrix parameters.
 
-    Mirrors the routing rule applied by ``_get_param_groups`` /
-    ``default_param_overrides`` for Muon.
+    This DDP-buffer ownership rule must match Muon's parameter-group routing.
     """
+    if not getattr(param, 'use_muon', True):
+        return False
     if not param.dim() == 2:
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):
@@ -85,6 +85,19 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+
+
+def _all_gather_param_group_metadata(param_group, pg_collection):
+    """Gather optimizer-group metadata within the group that owns the parameters."""
+    process_group = (
+        pg_collection.expt_dp
+        if param_group.get('is_expert_parallel', False)
+        else pg_collection.dp_cp
+    )
+    assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
+    all_rank_groups = [None for _ in range(get_pg_size(process_group))]
+    torch.distributed.all_gather_object(all_rank_groups, param_group, group=process_group)
+    return all_rank_groups
 
 
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
@@ -269,8 +282,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             m, n = param.data.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m = m * getattr(param, 'gtp_remat_size', 1)
-            big, small = max(m, n), min(m, n)
-            return big * small * small
+            small = min(m, n)
+            return m * n * small
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
@@ -444,6 +457,44 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         )
 
     @staticmethod
+    def _assign_ns_homes(params: list, specs: list, gtp_remat_size: int, tp_size: int) -> dict:
+        """Assign each sharded param an NS home ``(g_home, t_home)`` in the domain.
+
+        Longest Processing Time (LPT) bin-packing over ``gtp_remat_size * tp_size`` bins:
+        params sorted by ``ParamShardSpec.ns_cost`` descending, each placed in the bin
+        with the least accumulated cost. REPLICATED params are omitted: they are whole on
+        every rank of the domain, so every rank orthogonalizes its own copy instead of
+        electing a home, and giving them a bin would charge one rank for work all of
+        them do.
+
+        Args:
+            params: The domain's parameters.
+            specs: ``ParamShardSpec`` per param (same order).
+            gtp_remat_size: Size of the gtp_remat axis.
+            tp_size: Size of the tp axis.
+
+        Returns:
+            Dict mapping ``id(param)`` -> ``(g_home, t_home)``.
+        """
+        from megatron.core.optimizer.layer_sharded_muon import ParamSharding
+
+        num_bins = gtp_remat_size * tp_size
+        candidates = [
+            (spec.ns_cost, p)
+            for p, spec in zip(params, specs)
+            if spec.sharding is not ParamSharding.REPLICATED
+        ]
+        candidates.sort(key=lambda c: -c[0])  # stable: equal costs keep param order
+        bin_cost = [0] * num_bins
+        assignment = {}
+        for cost, p in candidates:
+            min_bin = min(range(num_bins), key=lambda b: bin_cost[b])
+            # Bin b -> (g_home, t_home) = (b // tp_size, b % tp_size).
+            assignment[id(p)] = (min_bin // tp_size, min_bin % tp_size)
+            bin_cost[min_bin] += cost
+        return assignment
+
+    @staticmethod
     def compute_full_param_layout(
         params: List[torch.nn.Parameter],
         bucket_size: Optional[int],
@@ -518,6 +569,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+        self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+
+        # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
+        # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
+        self.ddp_config = None
+        if model_chunks:
+            self.ddp_config = model_chunks[0].ddp_config
+            if any(model_chunk.ddp_config != self.ddp_config for model_chunk in model_chunks[1:]):
+                raise ValueError("LayerWise optimizer model chunks must share one DDP config")
 
         # The data-parallel groups this optimizer shards parameters over. Cached here so the
         # sharding, all-gather and broadcast paths read one attribute instead of reaching back
@@ -557,15 +617,33 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # path.
         self.use_buffer_param_sync = full_param_layouts is not None
 
-        # Set up overlap param gather using DDP bucket infrastructure.
-        self.overlap_param_gather = config.overlap_param_gather
-        if self.overlap_param_gather and not self.use_buffer_param_sync:
-            # Legacy path: set up per-bucket param lists for variable-size all-gather.
-            # When use_buffer_param_sync is True, the standard distributed optimizer
-            # all-gather path is used and this setup is not needed.
+        # Fall back to OptimizerConfig only for direct construction without model chunks.
+        self.overlap_param_gather = (
+            self.ddp_config.overlap_param_gather
+            if self.ddp_config is not None
+            else config.overlap_param_gather
+        )
+        # Selects who executes LayerWise parameter synchronization. True means DDP bucket groups
+        # launch it: a full layout uses the fixed-size parameter buffer, while the variable-size
+        # path without a full layout uses grad_data. False means the optimizer calls
+        # allgather_params() synchronously after its step, using temporary flatten/receive buffers.
+        self.layerwise_param_sync_via_bucket_group = (
+            self.ddp_config.param_sync_via_bucket_group
+            if self.ddp_config is not None
+            else self.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
+        )
+
+        needs_variable_size_bucket_metadata = (
+            not self.use_buffer_param_sync and self.layerwise_param_sync_via_bucket_group
+        )
+        if needs_variable_size_bucket_metadata:
+            # With use_layer_wise_param_layout=False, set up per-bucket param lists for
+            # variable-size all-gather.
+            # Overlap uses this from forward pre-hooks; synchronous MXFP8 reuse uses the same
+            # path during optimizer step so both modes stage FP32 masters into BF16 grad_data.
             assert (
                 model_chunks is not None
-            ), "model_chunks must be provided if overlap_param_gather is True"
+            ), "model_chunks must be provided for bucket-based LayerWise parameter sync"
             self.set_bucket_layerwise_params_list(model_chunks)
 
         if init_state_fn_list:
@@ -591,7 +669,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         for optimizer in optimizers:
-            # Child optimizers perform TP duplicate filtering when collecting gradients.
+            # Child optimizers perform duplicate filtering and gradient-stat reductions.
+            optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
 
@@ -604,12 +683,108 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # ``for model_chunk in self.model_chunks`` actually iterates.
         self.model_chunks = model_chunks if model_chunks is not None else []
 
+        # Wire up layer sharding NS home assignment for LayerShardedMuon. After
+        # shard_params, group["params"] contains only this DP rank's assigned params;
+        # dense and expert params are sharded over *different* domains, so the domain is
+        # resolved per param group inside the helper.
+        self._wire_layer_sharding_ns_homes(optimizers, pg_collection)
+
         # TODO(kunlun, deyuf): potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in
         # contiguous gbuf. So instead of shard param by layer randomly, we can shard by
         # buf range but keep some "extras" to keep boundary weight not sharded.
         # This way each rank do some duplicated work but allgather_v is no longer needed
         # All current distopt optimization can also be potentially applied
+
+    def _wire_layer_sharding_ns_homes(self, optimizers, pg_collection) -> None:
+        """Wire up NS home assignments for any LayerShardedMuon inner optimizers.
+
+        Each param group is matched to the domain it is sharded over, dense params over
+        ``(gtp_remat, tp)`` and expert params over ``(expt_gtp_remat, expt_tp)``; every
+        param's sharding is read once (``ParamShardSpec.from_param``), the domain's params
+        are pooled so LPT balances all of them at once, and the ``(g_home, t_home)``
+        assignments are pushed onto the ``LayerShardedMuon``.
+
+        Params of a single-rank domain get no home; ``LayerShardedMuon.step`` runs plain
+        local Newton-Schulz on them. Nothing here creates process groups or issues a
+        collective: this code runs with rank-local inventory, which differs across
+        pipeline and multimodal stages.
+        """
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
+
+        dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
+        expert_axes = (
+            getattr(pg_collection, 'expt_gtp_remat', None),
+            getattr(pg_collection, 'expt_tp', None),
+        )
+
+        for opt in optimizers:
+            # Unwrap Float16OptimizerWithFloat16Params / FP32Optimizer if present.
+            inner = getattr(opt, 'optimizer', opt)
+            if not isinstance(inner, LayerShardedMuon):
+                continue
+
+            # Domain per param group (group['is_expert_parallel'] is the param-group-level
+            # expert marker), pooling the params of groups that share a domain.
+            group_axes: Dict[int, Tuple] = {}
+            domains: Dict[Tuple, List] = {}
+            for group_index, group in enumerate(inner.param_groups):
+                axes = expert_axes if group.get('is_expert_parallel', False) else dense_axes
+                group_axes[group_index] = axes
+                domains.setdefault(axes, []).extend(group['params'])
+
+            assignment: Dict[int, Tuple[int, int]] = {}
+            for (gtp_remat_group, tp_group), domain_params in domains.items():
+                gtp_remat_size = get_pg_size(gtp_remat_group)
+                tp_size = get_pg_size(tp_group)
+                if not domain_params or gtp_remat_size * tp_size <= 1:
+                    continue
+                # Classifying here (not only in step()) surfaces a misconfiguration at
+                # optimizer construction instead of after data loading and the first
+                # forward/backward.
+                specs = [
+                    ParamShardSpec.from_param(p, gtp_remat_size, tp_size) for p in domain_params
+                ]
+                self._check_gtp_group_matches(domain_params, specs, gtp_remat_group)
+                homes = self._assign_ns_homes(domain_params, specs, gtp_remat_size, tp_size)
+                assignment.update(homes)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f'LayerShardedMuon: assigned {len(homes)} params across '
+                    f'{tp_size} x {gtp_remat_size} (TP x GTP_remat) NS homes.',
+                )
+
+            if not assignment:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    'LayerShardedMuon: no NS homes to assign (single-rank domains or '
+                    'replicated params only); step() runs local Newton-Schulz.',
+                )
+            inner.set_group_process_groups(group_axes)
+            inner.set_param_ns_homes(assignment)
+
+    @staticmethod
+    def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:
+        """The GTP layer records the group it sharded a weight over on the param
+        (``p.group``); the gtp_remat axis picked for the domain must have the same ranks,
+        or the stage-1 exchange would concatenate shards from the wrong ranks."""
+        expected = None
+        for p, spec in zip(params, specs):
+            recorded = getattr(p, 'group', None)
+            if not spec.gtp_sharded or recorded is None:
+                continue
+            if expected is None:
+                expected = torch.distributed.get_process_group_ranks(gtp_remat_group)
+            recorded_ranks = torch.distributed.get_process_group_ranks(recorded)
+            if recorded_ranks != expected:
+                raise ValueError(
+                    f"LayerShardedMuon wiring: param of shape {tuple(p.shape)} was GTP-sharded "
+                    f"over ranks {recorded_ranks} but its param group resolves to the "
+                    f"gtp_remat axis with ranks {expected}; check the group's "
+                    "is_expert_parallel marker against the module's process groups."
+                )
 
     def shard_params(self, optimizers, full_param_layouts=None):
         """Shard params across ranks according to the computed param layout.
@@ -886,21 +1061,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
-        """Whether any global rank owns params for a registered grad-norm group.
+        """Whether any rank in this optimizer's module owns a registered grad-norm group.
 
-        Overrides ChainedOptimizer to use a single global all-reduce (group=None),
-        matching the scope of get_grad_norm and _get_grad_norm_for_group which also
-        reduce globally. All LayerWise grad-stats reductions are global (identical to
-        DistributedOptimizer's pattern), so the existence check must be too — using
-        a per-sub-optimizer group here would create a collective mismatch.
+        The existence check uses the same module-local group as the corresponding
+        gradient-norm reductions so heterogeneous modules cannot mismatch collectives.
         """
         _validate_grad_norm_group(grad_norm_group)
         if getattr(self, '_has_grad_norm_group_cache', None) is None:
@@ -916,17 +1090,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     _validate_grad_norm_group(param_grad_norm_group)
                     local = local or param_grad_norm_group == grad_norm_group
             flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
-            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=None)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.grad_stats_parallel_group
+            )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
     @torch.no_grad()
     def _get_grad_norm_for_group(self, grad_norm_group: str):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     @torch.no_grad()
@@ -936,7 +1114,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params += optimizer.get_parameters()
         return count_zeros_fp32(
             params,
-            grad_stats_parallel_group=None,
+            grad_stats_parallel_group=self.grad_stats_parallel_group,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=self.tp_group,
             expert_tp_group=self.expert_tp_group,
@@ -975,14 +1153,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
-            if self.use_buffer_param_sync:
-                # Model params are views into the DDP param buffer
-                # (ddp_config.use_distributed_optimizer=True). The optimizer step
-                # already copied updated fp32 main params → bf16 model params (=
-                # buffer views), so the buffer is up-to-date. Trigger the standard
-                # buffer all-gather, but only for LayerWise-managed bucket groups
-                # so a sibling DistributedOptimizer's own ``start_param_sync`` call
-                # is not duplicated for the same buckets.
+            if self.layerwise_param_sync_via_bucket_group:
+                # Full layouts use the standard DDP buffer all-gather. With
+                # use_layer_wise_param_layout=False, the variable-size path uses grad_data.
+                # Both cases sync only the LayerWise-owned bucket groups.
                 self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()
@@ -1000,7 +1174,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             wrapped_state_dict = state_dict
         for sd in wrapped_state_dict.values():
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
-                logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    '[layerwise] converting fp32_from_fp16_params from dict to list',
+                )
                 sd['fp32_from_fp16_params'] = [
                     v for k, v in sorted(sd['fp32_from_fp16_params'].items())
                 ]
@@ -1061,8 +1239,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather_object(all_rank_groups, group)
+                all_rank_groups = _all_gather_param_group_metadata(group, self.pg_collection)
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params
