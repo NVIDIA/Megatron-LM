@@ -23,6 +23,7 @@ Public API:
 from __future__ import annotations
 
 import inspect
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -172,14 +173,21 @@ def _ensure_dsa_namespace():
 
 # Query-head counts supported by cuDNN's deterministic sparse-attention backward.
 _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
-# Retained per-(device, size) scratch buffers for that kernel; grow-only and never freed so a
-# pointer captured into an earlier CUDA graph stays valid.
+# Retain only the largest scratch buffer per device. Warm up all graph shapes (including the
+# largest workspace) before capture, and do not grow the workspace after capturing a graph.
 _DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict = {}
+# Shape metadata contains no tensor references; bound it for variable-length workloads too.
+_DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES: OrderedDict = OrderedDict()
+_DETERMINISTIC_SPARSE_BWD_WORKSPACE_CACHE_SIZE = 128
 
 
 def _deterministic_requested(flag: bool = False) -> bool:
-    """Deterministic execution was asked for, via the config flag or torch's global switch."""
-    return bool(flag) or torch.are_deterministic_algorithms_enabled()
+    """Select the opt-in MCore path only for the explicit ``deterministic_mode`` flag.
+
+    PyTorch's global switch alone does not opt into replacement external kernels or their
+    stricter hardware/feature requirements.
+    """
+    return bool(flag)
 
 
 def _get_deterministic_sparse_attention_workspace(
@@ -192,33 +200,63 @@ def _get_deterministic_sparse_attention_workspace(
     topk_length: Optional[Tensor],
     softmax_scale: float,
 ) -> Tensor:
-    """Scratch buffer for cuDNN's deterministic sparse-attention backward (sized by cuDNN)."""
-    backward_api = _DSA.SparseAttentionBackward(
-        sample_q=q_flat,
-        sample_kv=kv_flat,
-        sample_out=out_flat,
-        sample_dout=out_flat,
-        sample_lse=lse,
-        sample_attn_sink=attn_sink,
-        sample_topk_idxs=topk_idxs,
-        sample_topk_length=topk_length,
-        softmax_scale=softmax_scale,
-        deterministic=True,
-    )
-    if not backward_api.check_support():
-        raise RuntimeError(
-            "deterministic mode: cuDNN rejected the deterministic DSA sparse-attention backward "
-            "for this problem shape."
-        )
-    required_bytes = int(backward_api.scratch_workspace_bytes())
+    """Reuse a grow-only per-device buffer and cache cuDNN's shape-dependent size queries.
+
+    Calls on a device must be serialized. Before CUDA graph capture, eagerly run the complete
+    backward for every capture shape and the maximum workspace to warm cuDNN's kernels too.
+    Cache misses and buffer growth during capture are rejected before querying/allocating.
+    """
     device = q_flat.device
-    if device.index is None:
+    if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    key = (device, required_bytes)
-    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(key)
-    if workspace is None:
+    samples = (q_flat, kv_flat, out_flat, lse, attn_sink, topk_idxs, topk_length)
+    key = (
+        _DSA.SparseAttentionBackward,
+        device,
+        softmax_scale,
+        tuple(
+            (tuple(t.shape), tuple(t.stride()), t.dtype, t.device) if t is not None else None
+            for t in samples
+        ),
+    )
+    capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+    sizes = _DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES
+    if key not in sizes:
+        if capturing:
+            raise RuntimeError(
+                "Warm up deterministic sparse-attention shapes before CUDA graph capture."
+            )
+        backward_api = _DSA.SparseAttentionBackward(
+            sample_q=q_flat,
+            sample_kv=kv_flat,
+            sample_out=out_flat,
+            sample_dout=out_flat,
+            sample_lse=lse,
+            sample_attn_sink=attn_sink,
+            sample_topk_idxs=topk_idxs,
+            sample_topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            deterministic=True,
+        )
+        if not backward_api.check_support():
+            raise RuntimeError(
+                "deterministic mode: cuDNN rejected the deterministic DSA "
+                "sparse-attention backward "
+                "for this problem shape."
+            )
+        sizes[key] = int(backward_api.scratch_workspace_bytes())
+        if len(sizes) > _DETERMINISTIC_SPARSE_BWD_WORKSPACE_CACHE_SIZE:
+            sizes.popitem(last=False)
+    sizes.move_to_end(key)
+    required_bytes = sizes[key]
+    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(device)
+    if workspace is None or workspace.numel() < required_bytes:
+        if capturing:
+            raise RuntimeError(
+                "Warm up the maximum deterministic sparse-attention workspace before capture."
+            )
         workspace = torch.empty(required_bytes, dtype=torch.uint8, device=device)
-        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[key] = workspace
+        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[device] = workspace
     return workspace
 
 

@@ -1688,6 +1688,7 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_rs_state,
                 self.window_size,
                 kv_reconstruction_parts,
+                # Final forward argument; backward returns no gradient for this flag.
                 self.config.deterministic_mode,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
