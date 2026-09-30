@@ -491,14 +491,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite.",
     ),
     KernelEntry(
-        name="mfsdp_v1_grad_buffer_reductions",
-        sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py",),
-        tests=(K + "test_mfsdp_v1_gradient_reduction.py",),
-        kind="external-lib",
-        notes="Explicit gradient scaling and coalesced NCCL reduce-scatter; mixed FP32/BF16 "
-        "buckets in both orders and two scale factors are checked against exact results and replayed.",
-    ),
-    KernelEntry(
         name="nccl_allocator",
         sources=("megatron/core/nccl_allocator.py",),
         kind="cuda-ext",
