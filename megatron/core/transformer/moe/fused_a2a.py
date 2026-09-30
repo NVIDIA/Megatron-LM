@@ -6,6 +6,7 @@
 import inspect
 from typing import Callable, Optional
 
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.utils import internal_api
 
 try:
@@ -731,6 +732,12 @@ def nccl_ep_finalize():
     """
     if HAVE_TE_EP:
         te_ep.ep_finalize()
+
+
+# Teardown runs these in reverse order: finalize NCCL EP, then drop the DeepEP and
+# HybridEP buffers.
+register_model_parallel_teardown(TeardownStage.RELEASE_COMMUNICATION, reset_fused_a2a_buffers)
+register_model_parallel_teardown(TeardownStage.RELEASE_COMMUNICATION, nccl_ep_finalize)
 
 
 if HAVE_TE_EP:

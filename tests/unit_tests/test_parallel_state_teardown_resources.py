@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +7,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state as ps
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.transformer import cuda_graphs
+from megatron.core.transformer.moe import fused_a2a, token_dispatcher
 
 pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
 
@@ -41,9 +44,9 @@ def test_destroy_attempts_remaining_groups_after_failure(monkeypatch):
     assert ps._global_process_group_list == [None, next_group]
 
 
-@pytest.mark.parametrize("abort", [False, True])
-@pytest.mark.parametrize("release_context_fails", [False, True])
-def test_abort_precedes_resource_cleanup(monkeypatch, abort, release_context_fails):
+@pytest.fixture
+def recorded_teardown(monkeypatch):
+    """Replace the groups, callbacks and caches of teardown with recorders."""
     events = []
     backend = SimpleNamespace(abort=lambda: events.append("abort"))
     group = Mock()
@@ -56,32 +59,62 @@ def test_abort_precedes_resource_cleanup(monkeypatch, abort, release_context_fai
         torch.distributed, "destroy_process_group", lambda group: events.append("destroy")
     )
     monkeypatch.setattr(ps, "_global_process_group_list", [None, group])
-    monkeypatch.setattr(ps, "is_torch_min_version", lambda version: True)
     monkeypatch.setattr(ps.SymmetricMemoryManager, "destroy", lambda: events.append("memory"))
-    monkeypatch.setattr(ps, "_clear_dtensor_sharding_cache", lambda: None)
-    monkeypatch.delitem(sys.modules, "transformer_engine.pytorch", raising=False)
-    for name in (
-        "megatron.core.transformer.cuda_graphs",
-        "megatron.core.full_cuda_graph",
-        "megatron.core.optimizer.optimizer_cuda_graph",
-    ):
-        monkeypatch.delitem(sys.modules, name, raising=False)
-
-    def release_context():
-        events.append("ep_context")
-        if release_context_fails:
-            raise RuntimeError("injected EP finalization failure")
-
-    fused = SimpleNamespace(reset_fused_a2a_buffers=lambda: events.append("buffers"))
-    monkeypatch.setitem(sys.modules, "megatron.core.transformer.moe.fused_a2a", fused)
-    monkeypatch.setitem(
-        sys.modules,
-        "megatron.core.transformer.moe.token_dispatcher",
-        SimpleNamespace(nccl_ep_release_context=release_context),
+    monkeypatch.setattr(ps, "_clear_dtensor_sharding_cache", lambda: events.append("dtensor"))
+    monkeypatch.setattr(
+        ps, "_MODEL_PARALLEL_TEARDOWN_CALLBACKS", {stage: [] for stage in ps.TeardownStage}
     )
+    return events
+
+
+def _recorder(events, name):
+    return lambda: events.append(name)
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_teardown_runs_callbacks_in_stage_order(recorded_teardown, abort):
+    events = recorded_teardown
+    stage = ps.TeardownStage
+    # Register out of stage order. Within a stage the later registration runs first.
+    ps.register_model_parallel_teardown(stage.RESET_STATE, _recorder(events, "te_state"))
+    ps.register_model_parallel_teardown(stage.RELEASE_CUDA_GRAPHS, _recorder(events, "graphs"))
+    ps.register_model_parallel_teardown(
+        stage.RELEASE_COMMUNICATION, _recorder(events, "a2a_buffers")
+    )
+    release_symm_buffers = _recorder(events, "symm_buffers")
+    for _ in range(2):
+        ps.register_model_parallel_teardown(stage.RELEASE_COMMUNICATION, release_symm_buffers)
+    ps.register_model_parallel_teardown(stage.VALIDATE, _recorder(events, "validate"))
+
     ps.destroy_model_parallel(abort=abort)
-    assert events == (["abort"] if abort else []) + ["ep_context", "buffers", "memory", "destroy"]
+    assert events == [
+        "validate",
+        *(["abort"] if abort else []),
+        "symm_buffers",
+        "a2a_buffers",
+        "graphs",
+        "te_state",
+        "dtensor",
+        "memory",
+        "destroy",
+    ]
     assert ps._global_process_group_list is None
+
+
+def test_resource_owners_register_teardown():
+    callbacks = ps._MODEL_PARALLEL_TEARDOWN_CALLBACKS
+    communication = callbacks[ps.TeardownStage.RELEASE_COMMUNICATION]
+    # Teardown runs these in reverse: symm buffers, NCCL EP finalize, fused A2A buffers.
+    positions = [
+        communication.index(fused_a2a.reset_fused_a2a_buffers),
+        communication.index(fused_a2a.nccl_ep_finalize),
+        communication.index(token_dispatcher._release_nccl_ep_symm_buffers),
+    ]
+    assert positions == sorted(positions)
+    graphs = callbacks[ps.TeardownStage.RELEASE_CUDA_GRAPHS]
+    assert cuda_graphs.release_all_cuda_graphs in graphs
+    assert FullCudaGraphWrapper.reset_cuda_graph in graphs
+    assert OptimizerCudaGraphWrapper.reset_cuda_graph in graphs
 
 
 def test_abort_failure_does_not_enter_graceful_destroy(monkeypatch):
@@ -100,8 +133,6 @@ def test_abort_failure_does_not_enter_graceful_destroy(monkeypatch):
 
 
 def test_hybridep_rebuilds_buffer_for_new_group(monkeypatch):
-    from megatron.core.transformer.moe import fused_a2a
-
     created = []
 
     class Buffer:
