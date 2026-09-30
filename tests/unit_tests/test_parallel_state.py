@@ -1,7 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from math import log2
-
 import pytest
 import torch
 
@@ -595,9 +593,9 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     "world_size, tp_size, cp_size, dp_size",
     [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
 )
-def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
+def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     """
-    Test that hybrid DPxCP groups are created correctly.
+    Test that every valid dynamic DPxCP group, including CP1, is created.
     """
     Utils.destroy_model_parallel()
 
@@ -608,36 +606,25 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
     )
 
-    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
-    group_sizes = [2**i for i in range(int(log2(dp_cp_size)))][1:]
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
+    group_sizes = ps.get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
     for group_size in group_sizes:
-        group = ps.get_hybrid_data_context_parallel_groups(group_size=group_size)
+        group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
 
     Utils.destroy_model_parallel()
 
 
-def test_hybrid_dp_cp_groups_include_non_power_of_two_domain_sizes(monkeypatch):
-    """Dynamic CP groups must include every usable power of two below an odd domain size."""
+def test_valid_dynamic_cp_group_sizes():
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(8) == [1, 2, 4, 8]
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(6) == [1, 2, 6]
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(3) == [1, 3]
 
-    class FakeGroup:
-        def __init__(self, ranks):
-            self.ranks = ranks
-
-    monkeypatch.setattr(ps, "create_group", lambda ranks, **kwargs: FakeGroup(ranks))
-
-    groups = ps.create_hybrid_dp_cp_groups(rank=0, ranks=list(range(6)), pg_options=None)
-
-    assert sorted(groups) == [2, 4]
-    assert groups[2].ranks == [0, 1]
-    assert groups[4].ranks == [0, 1, 2, 3]
-
-    tail_groups = ps.create_hybrid_dp_cp_groups(rank=4, ranks=list(range(6)), pg_options=None)
-    assert sorted(tail_groups) == [2]
-    assert tail_groups[2].ranks == [4, 5]
+    with pytest.raises(ValueError, match="must be positive"):
+        ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
 def test_separate_all_gather_group():

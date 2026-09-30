@@ -34,6 +34,9 @@ class TestLLaVAModel:
         self.language_hidden_size = 64
         self.language_num_attention_heads = 4
 
+        self.model = self._build_model()
+
+    def _build_model(self, allow_llm_only_checkpoint=False):
         language_config = TransformerConfig(
             num_layers=3,
             hidden_size=self.language_hidden_size,
@@ -60,7 +63,7 @@ class TestLLaVAModel:
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
-        self.model = LLaVAModel(
+        model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=ModuleSpec(
                 module=TransformerLayer, submodules=language_layer_submodules
@@ -72,10 +75,12 @@ class TestLLaVAModel:
             drop_vision_class_token=False,
             vision_projection_config=vision_projection_config,
             vision_projection_layer_spec=vision_projection_spec,
+            allow_llm_only_checkpoint=allow_llm_only_checkpoint,
             img_h=336,
             img_w=336,
             patch_dim=14,
         )
+        return model
 
     @pytest.mark.internal
     def teardown_method(self, method):
@@ -286,7 +291,8 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[4], expected_loss_mask)
 
     @pytest.mark.internal
-    def test_preprocess_data_with_media_token_counts(self):
+    @pytest.mark.parametrize("media_token_counts_dtype", [torch.int32, torch.int64])
+    def test_preprocess_data_with_media_token_counts(self, media_token_counts_dtype):
         self.model.cuda()
 
         hidden_size = 8
@@ -301,7 +307,7 @@ class TestLLaVAModel:
             [[image_token_index, 1, 2], [3, image_token_index, 4]], dtype=torch.long, device="cuda"
         )
         num_image_tiles = torch.ones(2, dtype=torch.int, device="cuda")
-        media_token_counts = torch.tensor([2, 3], dtype=torch.int, device="cuda")
+        media_token_counts = torch.tensor([2, 3], dtype=media_token_counts_dtype, device="cuda")
 
         embeddings, _, _, _, _ = self.model._preprocess_data(
             image_embeddings,
@@ -605,6 +611,33 @@ class TestLLaVAModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+    @pytest.mark.internal
+    def test_llm_only_checkpoint_sharded_key_mapping_is_load_only(self):
+        model = self._build_model(allow_llm_only_checkpoint=True)
+
+        save_state_dict = model.sharded_state_dict()
+        assert (
+            save_state_dict['language_model.embedding.word_embeddings.weight'].key
+            == 'language_model.embedding.word_embeddings.weight'
+        )
+
+        load_state_dict = model.sharded_state_dict(metadata={'load_from_llm_only_checkpoint': True})
+        assert (
+            load_state_dict['language_model.embedding.word_embeddings.weight'].key
+            == 'embedding.word_embeddings.weight'
+        )
+        assert 'vision_model.class_token' not in load_state_dict
+
+    @pytest.mark.internal
+    def test_llm_only_checkpoint_allows_missing_vision_modules(self):
+        model = self._build_model(allow_llm_only_checkpoint=True)
+        language_state_dict = {
+            f'language_model.{name}': tensor
+            for name, tensor in model.language_model.state_dict().items()
+        }
+
+        model.load_state_dict(language_state_dict, strict=True)
 
     @pytest.mark.internal
     def test_freeze(self):
