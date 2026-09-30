@@ -49,7 +49,8 @@ class ProcessGroupCollection:
 
         # Data Parallelism Groups
         dp: Data parallel process group
-        dp_cp: Data and context parallel group
+        dp_gtp_remat: Independent sequences, excluding all context partitions
+        dp_cp: Copies of the same dense weight shard, excluding its GTP group
         dp_cp_gtp_remat: Full data-distribution group, dp_cp x gtp_remat;
             identical to dp_cp when GTP_remat_size=1
         expt_dp: Expert data parallel group
@@ -122,7 +123,15 @@ class ProcessGroupCollection:
     # _DATA_PARALLEL_GROUP
     dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _DATA_PARALLEL_GROUP_WITH_CP
+    # _DATA_PARALLEL_GROUP_WITH_GTP_REMAT: independent sample owners. When sequences
+    # are partitioned within GTP_remat groups, only the remaining GTP_remat batch
+    # shards x DP distribute samples; all context partitions are excluded.
+    # Dataloaders shard samples and index their per-rank state by this group.
+    dp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
+
+    # _DATA_PARALLEL_GROUP_WITH_CP: dense weight replicas. When sequences are
+    # partitioned within GTP_remat groups, this includes only the CP extent
+    # outside the weight-sharding group.
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT — the full data-distribution group, DP x CP x
@@ -258,6 +267,9 @@ class ProcessGroupCollection:
                 parallel_state.get_position_embedding_group, check_initialized=False
             ),
             'dp': partial(parallel_state.get_data_parallel_group, with_gtp_remat=False),
+            'dp_gtp_remat': partial(
+                parallel_state.get_data_parallel_group, with_context_parallel=False
+            ),
             'dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,

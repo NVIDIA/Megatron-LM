@@ -455,15 +455,26 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
-    # GTP_remat counts toward total_model_size (an independent weight-shard axis), so the
-    # args.data_parallel_size below is the replicate degree (matches
-    # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
+    # Resolve the actual weight degree before deriving the rank layout. Independent
+    # sample count is computed separately below, including when CP overlaps GTP.
     from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+    from megatron.core.tensor_parallel.gtp_parallel_layout import (
+        resolve_tensor_parallel_sequence_shards,
+    )
+
     (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
         resolve_tensor_parallel_weight_shards(
             args.tensor_model_parallel_size,
             args.tensor_parallel_num_weight_shards,
             getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards = (
+        resolve_tensor_parallel_sequence_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_sequence_shards,
+            args.gtp_weight_remat_size,
+            args.sequence_parallel,
         )
     )
     total_model_size = (
@@ -472,6 +483,15 @@ def validate_args(args, defaults={}):
         * args.context_parallel_size
         * args.gtp_weight_remat_size
     )
+    # Normalize CLI CP once: downstream args/config consumers expect the full runtime group size.
+    args.context_parallel_size *= args.gtp_remat_num_sequence_shards
+    if args.gtp_remat_num_sequence_shards > 1:
+        if args.ckpt_format != "torch_dist":
+            raise ValueError("GTP sequence sharding requires --ckpt-format torch_dist")
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
+        if args.use_tp_pp_dp_mapping:
+            raise ValueError("GTP sequence sharding does not support --use-tp-pp-dp-mapping")
 
     # Total model size.
     assert (
@@ -486,13 +506,12 @@ def validate_args(args, defaults={}):
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
-    total_model_size = (
+    args.data_parallel_size = args.world_size // total_model_size
+    args.batch_parallel_size = args.world_size // (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
-        * args.gtp_weight_remat_size
     )
-    args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
         # ----------------------------------------------------------------
@@ -595,7 +614,7 @@ def validate_args(args, defaults={}):
 
     print_rank_0(
         'using world size: {}, data-parallel size: {}, '
-        'context-parallel size: {}, '
+        'resolved context-parallel group size: {}, '
         'hierarchical context-parallel sizes: {}, '
         'tensor-model-parallel size: {}, '
         'pipeline-model-parallel size: {}'.format(
@@ -744,7 +763,7 @@ def validate_args(args, defaults={}):
     if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
         raise ValueError('Cannot specify both --step-batch-size-schedule and --global-batch-size')
     if args.global_batch_size is None:
-        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        args.global_batch_size = args.micro_batch_size * args.batch_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
@@ -753,17 +772,13 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
-    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
-    # divides eval_global_batch_size by the same product to get its microbatch count, and without
-    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
+    # Evaluation microbatches depend on independent sequences, not weight shards.
     assert (
-        args.eval_global_batch_size
-        % (args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size)
-        == 0
+        args.eval_global_batch_size % (args.eval_micro_batch_size * args.batch_parallel_size) == 0
     ), (
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
-        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) "
+        f"* batch_parallel_size ({args.batch_parallel_size})"
     )
 
     if args.perform_rl_step:
@@ -1476,8 +1491,9 @@ def validate_args(args, defaults={}):
 
     if args.seq_length is not None and args.context_parallel_size > 1:
         assert args.seq_length % (args.context_parallel_size * 2) == 0, (
-            'seq-length should be a multiple of 2 * context-parallel-size '
-            'if context-parallel-size > 1.'
+            f"seq-length ({args.seq_length}) must be a multiple of 2 * the resolved "
+            f"context-parallel group size ({args.context_parallel_size}), "
+            "including GTP sequence shards."
         )
 
     if getattr(args, 'dataloader_inter_document_masking', False):
@@ -1707,21 +1723,7 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
-    # Derive the internal gtp_weight_remat_size from the user-facing
-    # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
-    # from argument generation), so it is set here as a fresh attribute on args before it is
-    # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
-    # Mirrors ModelParallelConfig.__post_init__.
-    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
-        resolve_tensor_parallel_weight_shards(
-            args.tensor_model_parallel_size,
-            args.tensor_parallel_num_weight_shards,
-            getattr(args, "gtp_weight_remat_size", 1),
-        )
-    )
-    # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
+    # Derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
     # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
     (args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size) = (
@@ -3552,38 +3554,51 @@ def _add_regularization_args(parser):
         default=5,
         help='Number of Newton-Schulz steps for Muon optimizer',
     )
-    group.add_argument('--muon-tp-mode', type=str, default='duplicated',
-                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
-                                'layer_sharded'],
-                       help='How to perform NS calculation for tensor model parallel weights. '
-                       'blockwise orthogonalizes each shard on its own, so the update rule '
-                       'depends on the parallelism config; duplicated and distributed both '
-                       'orthogonalize the whole matrix and give TP-invariant results; auto '
-                       'select between duplicated and distributed mode per-weight for '
-                       'dense weights; layer_sharded assigns each 2D weight one NS home '
-                       'rank in the (gtp_remat x tp) domain and routes the shards there '
-                       'with all_to_all (same math as duplicated, no redundant NS); '
-                       'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
-                       'OptimizerConfig.muon_tp_mode.')
-    group.add_argument('--muon-ns-batch-size', type=int, default=1,
-                       help='Max number of same-shape matrices fused into one batched '
-                       'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
-                       'The default of 1 keeps the bit-exact per-matrix path; raise '
-                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
-                       'the cost of bitwise parity (baddbmm vs addmm rounding).')
-    group.add_argument('--muon-use-syrk', action='store_true',
-                       help='Use the Triton SYRK kernel for the symmetric-output '
-                       'Newton-Schulz GEMMs in Muon (~1/3 off '
-                       'NS FLOPs for near-square matrices). Takes effect only with '
-                       '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
-                       'layer_sharded, unmet Triton/SM/emerging-optimizers '
-                       'requirements are rejected at startup.')
-    group.add_argument('--muon-no-concurrent-groups', action='store_false',
-                       dest='muon_concurrent_groups',
-                       help='Serialize param groups on one CUDA stream under '
-                       '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
-                       'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
-                       'when the concurrent transient buffers push peak memory too high.')
+    group.add_argument(
+        '--muon-tp-mode',
+        type=str,
+        default='duplicated',
+        choices=['blockwise', 'duplicated', 'distributed', 'auto', 'layer_sharded'],
+        help='How to perform NS calculation for tensor model parallel weights. '
+        'blockwise orthogonalizes each shard on its own, so the update rule '
+        'depends on the parallelism config; duplicated and distributed both '
+        'orthogonalize the whole matrix and give TP-invariant results; auto '
+        'select between duplicated and distributed mode per-weight for '
+        'dense weights; layer_sharded assigns each 2D weight one NS home '
+        'rank in the (gtp_remat x tp) domain and routes the shards there '
+        'with all_to_all (same math as duplicated, no redundant NS); '
+        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
+        'OptimizerConfig.muon_tp_mode.',
+    )
+    group.add_argument(
+        '--muon-ns-batch-size',
+        type=int,
+        default=1,
+        help='Max number of same-shape matrices fused into one batched '
+        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
+        'The default of 1 keeps the bit-exact per-matrix path; raise '
+        '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+        'the cost of bitwise parity (baddbmm vs addmm rounding).',
+    )
+    group.add_argument(
+        '--muon-use-syrk',
+        action='store_true',
+        help='Use the Triton SYRK kernel for the symmetric-output '
+        'Newton-Schulz GEMMs in Muon (~1/3 off '
+        'NS FLOPs for near-square matrices). Takes effect only with '
+        '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
+        'layer_sharded, unmet Triton/SM/emerging-optimizers '
+        'requirements are rejected at startup.',
+    )
+    group.add_argument(
+        '--muon-no-concurrent-groups',
+        action='store_false',
+        dest='muon_concurrent_groups',
+        help='Serialize param groups on one CUDA stream under '
+        '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
+        'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
+        'when the concurrent transient buffers push peak memory too high.',
+    )
     group.add_argument(
         '--muon-extra-scale-factor',
         type=float,
