@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import functools
 import logging
 import random
 from contextlib import nullcontext
@@ -40,6 +41,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -126,6 +128,19 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
     """
     for submodule in module.modules():
         _materialize_meta_module(submodule, device)
+
+
+def _is_mcore_fsdp_unit(module: nn.Module, unit_types: Tuple[Type[nn.Module], ...]) -> bool:
+    """FSDP unit filter for MCore models: instances of ``unit_types``, minus outer HybridStacks.
+
+    A grouped hybrid pattern such as ``[M*E][M*E]`` builds an outer HybridStack whose
+    layers are one HybridStack per bracket group. The groups are the FSDP units, but the
+    outer stack has the same class and is visited first, so a class match alone would
+    make the whole decoder a single unit. Only group stacks set ``is_layer_group_stack``.
+    """
+    if isinstance(module, HybridStack) and not module.is_layer_group_stack:
+        return False
+    return isinstance(module, unit_types)
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -255,8 +270,6 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
             ddp_config, ["optim_grads_params"]
         ):
-            from megatron.core.models.hybrid.hybrid_block import HybridStack
-
             supported_fsdp_unit_modules = [
                 TransformerLayer,
                 MoETransformerLayer,
@@ -272,17 +285,11 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 f"got {self.fsdp_unit_modules}."
             )
 
-        # HybridStack-specific filter: when bracketed hybrid patterns are used,
-        # the model has a nested layout -- an outer HybridStack root
-        # (``is_layer_group_stack=False``) whose ``layers`` are inner
-        # bracket-group HybridStacks (``is_layer_group_stack=True``).
-        # ``named_modules()`` walks root-first, so with ``[HybridStack]`` the
-        # outer matches first, the inner ones get skipped as its submodules,
-        # and the whole decoder becomes a single FSDP unit. We exclude the
-        # outer so each bracket group is its own unit. Modules without the
-        # attribute (TransformerLayer, etc.) keep the default ``True``.
-        def _fsdp_unit_filter(m):
-            return getattr(m, "is_layer_group_stack", True)
+        fsdp_unit_filter = (
+            functools.partial(_is_mcore_fsdp_unit, unit_types=tuple(self.fsdp_unit_modules))
+            if self.fsdp_unit_modules
+            else None
+        )
 
         super().__init__(
             config=config,
@@ -290,8 +297,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 ddp_config=ddp_config,
                 mixed_precision_policy=self.mp_policy,
                 module=module,
-                fsdp_unit_modules=self.fsdp_unit_modules,
-                fsdp_unit_filter=_fsdp_unit_filter,
+                fsdp_unit_filter=fsdp_unit_filter,
                 disable_bucketing=disable_bucketing,
                 device=self.device,
                 dist_index=self.megatron_fsdp_dist_index,
