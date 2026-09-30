@@ -2038,7 +2038,7 @@ def _load_non_persistent_base_checkpoint(
 
 
 def _gtp_pad_for_alignment_from_args(args):
-    """GTP dim-0 alignment implied by the precision recipe recorded in ``args``."""
+    """GTP dim-0 alignment implied by the precision recipe recorded in args."""
     return resolve_gtp_pad_for_alignment(
         fp4=getattr(args, 'fp4', None) is not None,
         fp8_recipe=getattr(args, 'fp8_recipe', None),
@@ -2107,7 +2107,6 @@ def _load_global_dist_base_checkpoint(
 
     # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
     # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
-    # load_checkpoint passes the saving run's recipe when the checkpoint records it.
     if gtp_pad_for_alignment is None:
         gtp_pad_for_alignment = _gtp_pad_for_alignment_from_args(args)
     grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)

@@ -89,7 +89,7 @@ def get_model_builder(
 def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
     """Map model sharded keys onto a checkpoint that nests the model under a prefix.
 
-    Records the resulting keys in ``requested_keys`` so unloaded checkpoint tensors can be
+    Records the resulting keys in `requested_keys` so unloaded checkpoint tensors can be
     reported after the load.
     """
     prefix = getattr(args, 'checkpoint_model_prefix', '')
