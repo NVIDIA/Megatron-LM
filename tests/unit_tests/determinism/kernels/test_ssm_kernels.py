@@ -313,7 +313,9 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
     )
 
 
-def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
+@pytest.mark.parametrize("M", [2, 3])
+@pytest.mark.parametrize("compact_output", [False, True])
+def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays(M, compact_output):
     """Speculative decode: ``S`` draft tokens of ``M`` Householder steps each.
 
     Exercises the slot-indexed state cache and ``intermediate_states``, which the
@@ -324,7 +326,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
-    B, S, M, H, K, V = 64, 4, 2, 8, 128, 128
+    B, S, H, K, V = 64, 4, 8, 128, 128
     T = S * M
     slots = B + 8
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
@@ -351,6 +353,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
             state_indices=state_indices,
             intermediate_states=intermediate,
             steps_per_token=M,
+            compact_output=compact_output,
         )
         return o, final_state, intermediate
 
@@ -360,17 +363,18 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
         replays=4,
         backward=False,
         contention=True,
-        what="fused_recurrent_gated_delta_rule_update (speculative decode)",
+        what=f"fused_recurrent_gated_delta_rule_update (speculative decode, compact={compact_output})",
     )
 
 
 @pytest.mark.parametrize("S", [1, 4])
-def test_gdp_decode_prepare_replays(S):
-    """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
+@pytest.mark.parametrize("M", [1, 2, 3])
+def test_gdp_decode_prepare_replays(S, M):
+    """Replay all copy-index paths in plain and speculative decode."""
     from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
 
     seeded()
-    n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
+    n, H, G, P, N = 256, 16, 4, 128, 128
     x = torch.randn(n, S, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
     # `ba` reaches the kernel as a slice of the input projection, so only its last
     # dimension is contiguous and the token stride comes from the view, not the width.
@@ -382,7 +386,7 @@ def test_gdp_decode_prepare_replays(S):
         (x, ba, A_log, dt_bias),
         replays=4,
         backward=False,
-        what=f"gdp_decode_prepare (S={S})",
+        what=f"gdp_decode_prepare (S={S}, M={M})",
     )
 
 

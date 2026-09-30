@@ -1113,7 +1113,14 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
 
-        opA = A.transpose(0, 1).contiguous() if transa else A.contiguous()  # [K, O] or [I, O]
+        opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
+        # Triton's persistent GEMM consumes the operand strides directly. A
+        # contiguous copy here materializes large TE projection weights on
+        # every forward, including each CUDA-graph replay. DeepGEMM still
+        # requires contiguous operands, and non-transposed layouts retain
+        # their existing behavior.
+        if not (transa and _BATCH_INVARIANT_BACKEND == "triton"):
+            opA = opA.contiguous()
         opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
 
         # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
