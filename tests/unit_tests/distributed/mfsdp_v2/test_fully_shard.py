@@ -256,6 +256,41 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
+def test_repeated_module_backward_matches_baseline(distributed_setup):
+    """Two calls to one sharded layer share a single parameter-gradient accumulation."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    width = 2 * world_size
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(width, width, bias=False).to(device)
+    model = nn.Linear(width, width, bias=False).to(device)
+    model.load_state_dict(baseline.state_dict())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    torch.manual_seed(5678 + rank)
+    x = torch.randn(2, width, device=device, requires_grad=True)
+    baseline_x = x.detach().clone().requires_grad_()
+    h1 = model(x)
+    h2 = model(h1)
+    loss = h1.square().mean() + h2.square().mean()
+    baseline_h1 = baseline(baseline_x)
+    baseline_h2 = baseline(baseline_h1)
+    baseline_loss = baseline_h1.square().mean() + baseline_h2.square().mean()
+    loss.backward()
+    baseline_loss.backward()
+
+    torch.testing.assert_close(loss, baseline_loss)
+    torch.testing.assert_close(x.grad, baseline_x.grad)
+    dist.all_reduce(baseline.weight.grad)
+    baseline.weight.grad.div_(world_size)
+    torch.testing.assert_close(
+        model.weight.grad.to_local(), baseline.weight.grad.chunk(world_size, dim=0)[rank]
+    )
+
+
 def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
     """TE's callback, not AccumulateGrad, completes MFSDP backward."""
     world_size = distributed_setup.world_size
