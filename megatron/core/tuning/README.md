@@ -7,7 +7,9 @@ determinism inside the kernel or across the whole training job.
 
 ## Configure through Python or training arguments
 
-The policy is a first-class model configuration. Library callers use:
+`AutotunePolicy` is an immutable configuration object. It holds user-supplied
+settings such as selection mode, module scope, table paths, and verification
+cadence. Library callers pass these settings through `TransformerConfig`:
 
 ```python
 from megatron.core.transformer import TransformerConfig
@@ -26,6 +28,18 @@ config = TransformerConfig(
     ),
 )
 ```
+
+`TransformerConfig.triton_autotune` exposes kernel-selection settings alongside
+`deterministic_mode` to library callers, including applications that do not use
+Megatron's training initializer. Constructing the config applies these settings
+before the model executes its kernels.
+
+Installation reads the settings and resolves an omitted mode into a separate
+policy value. It does not modify the supplied `AutotunePolicy` or store results
+in `TransformerConfig`. The runtime adapter in `interception.py` separately
+owns loaded tables, selected-config caches, recorded winners, and diagnostics.
+For example, `table_path` specifies where to read a table; the table's entries
+are loaded into runtime state when a pinned kernel first executes.
 
 Standalone kernel callers can instead call `install(AutotunePolicy(...))` before
 launching kernels. An explicit `install(policy)` takes precedence over framework
@@ -58,8 +72,9 @@ normal configuration serialization.
 
 ## Selection and scope
 
-For each pinned invocation, the adapter first applies the kernel's pruning rules
-and selects from the remaining live candidates:
+On the first pinned invocation for an autotuner, architecture, and tuning key,
+the adapter applies the kernel's pruning rules and selects from the remaining
+live candidates:
 
 1. A matching architecture-table entry.
 2. A matching `block_sizes` configuration override.
@@ -85,8 +100,9 @@ By default the adapter covers `mamba_ssm`, `transformer_engine`, and
 `megatron.core.ssm.ops`, including submodules. This also covers in-tree SSM
 kernels imported before model configuration. Override `modules` to include
 another package; this replaces the default list. In-tree SSM kernels also use
-`autotune_configs()` at decoration time. That helper uses the explicit deterministic-mode setter or
-PyTorch's deterministic flag and, if already installed, the policy's block sizes.
+`autotune_configs()` at decoration time. That helper uses the explicit
+deterministic-mode setter or PyTorch's deterministic flag and, if already
+installed, the policy's block sizes.
 An import-time singleton cannot later recover its discarded candidates.
 
 ## Modes and precedence
@@ -164,11 +180,10 @@ use it only as a diagnostic in pinned mode.
 | `enumerate_autotuners` | `--triton-autotune-enumerate` |
 | `chaos` | `--triton-autotune-chaos` |
 
-The earlier tuning environment variables (`MCORE_AUTOTUNE_*`, `DET_AUTOTUNE_*`,
-`MCORE_DET_TUNE_RECORD`, and `TRITON_AUTOTUNE_BLOCK_*`) are no longer read. The
-policy also does not read `MAMBA_DETERMINISTIC`; external libraries may still
-have their own environment controls. Distributed launcher rank metadata remains
-used for per-rank recordings and diagnostics.
+Configure this policy through Python, training arguments, or YAML. External
+libraries may have their own environment controls. The adapter reads the
+distributed launcher's `RANK` metadata to name per-rank recordings and drive
+the chaos diagnostic.
 
 ## Upstream path
 

@@ -1306,11 +1306,23 @@ class TransformerConfig(ModelParallelConfig):
     # miscellaneous
     ####################
     triton_autotune: Optional[AutotunePolicy] = None
-    """Optional process-wide Triton configuration-selection policy.
+    """Configuration inputs for selecting Triton kernel launch parameters.
 
-    None follows ``deterministic_mode``: deterministic runs pin configurations,
-    otherwise Triton autotunes normally. An explicit policy can also record or
-    select configurations for modules outside the default scope.
+    ``AutotunePolicy`` is an immutable settings object containing the selection
+    mode, module scope, table paths, and diagnostic options. Autotuning results
+    and runtime caches are stored separately; installation never writes them
+    into this field.
+
+    This field lets library callers configure kernel selection alongside
+    ``deterministic_mode`` without going through Megatron's training initializer.
+    Construction applies the settings before model kernels run. They apply to
+    the whole process, so models in one process share the effective policy.
+    With no explicit policy, deterministic mode enables pinning and ordinary
+    execution keeps Triton's autotuning; later default configs preserve a
+    policy already configured in the process.
+
+    See the configuration, precedence, and recording examples in
+    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tuning/README.md.
     """
 
     clone_scatter_output_in_embedding: bool = True
@@ -1698,14 +1710,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
 
-        # Apply the Triton autotune policy here rather than from any one layer.
-        # Kernel autotuning is not a property of the model: Mamba's SSD kernels
-        # and Transformer Engine's MoE permutation kernels both select a config
-        # by wall-clock timing, so wiring this into a single module type leaves
-        # every other model unprotected. The patch replaces a method on Triton's
-        # Autotuner class, so it only has to be installed before the first kernel
-        # call, not before the decorators are evaluated; every model goes through
-        # a config, and install() is idempotent.
+        # Library users may construct models without the training initializer.
+        # Apply their kernel-selection settings before the first kernel call.
+        # Installation is process-wide and idempotent; runtime tables, choices,
+        # and caches stay in the tuning adapter, outside this configuration.
         from megatron.core.tuning import install_from_config
 
         install_from_config(self.triton_autotune, deterministic=self.deterministic_mode)

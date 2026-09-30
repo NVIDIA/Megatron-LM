@@ -4,6 +4,7 @@
 
 import inspect
 import json
+from dataclasses import asdict
 from unittest.mock import Mock
 from weakref import WeakKeyDictionary
 
@@ -93,13 +94,27 @@ def test_model_config_pins_in_tree_tuner_created_before_install(isolated_policy,
     assert len(original_configs) == 2
     monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
 
-    TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1, deterministic_mode=True)
+    policy = AutotunePolicy()
+    supplied_settings = asdict(policy)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=1,
+        deterministic_mode=True,
+        triton_autotune=policy,
+    )
 
     assert tuner.run(None, 128) == 32
     assert tuner.run(None, 128) == 32
     assert hooks == [32, 32]
     assert tuner.configs is original_configs
     assert tuner.nargs is None
+    # Installation and cached launches keep results outside the model's settings.
+    assert config.triton_autotune is policy
+    assert asdict(config.triton_autotune) == supplied_settings
+    assert policy.mode is None
+    assert interception.active_policy().mode == "pinned"
+    assert interception.choice_log()
 
 
 def test_pinning_honours_pruning_per_shape_and_preserves_hooks(isolated_policy, monkeypatch):

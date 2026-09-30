@@ -41,7 +41,11 @@ def set_deterministic_mode(value):
 
 @dataclass(frozen=True)
 class AutotunePolicy:
-    """How to choose Triton kernel configs.
+    """Immutable configuration inputs for choosing Triton kernel launch parameters.
+
+    This object contains settings only. Installation resolves defaults into a
+    separate policy value; loaded tables, selected configs, and recorded winners
+    belong to the runtime adapter in :mod:`megatron.core.tuning.interception`.
 
     Attributes:
         mode: ``None`` derives the mode from recording and determinism settings.
