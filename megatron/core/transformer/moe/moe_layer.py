@@ -470,7 +470,7 @@ class MoELayer(BaseMoELayer):
         # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
         self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
-    def select_token_dispatcher(self) -> None
+    def select_token_dispatcher(self) -> None:
         """Select the inference token dispatcher if active, otherwise use training dispatcher."""
         if not hasattr(self, "_inference_token_dispatcher"):
             return
