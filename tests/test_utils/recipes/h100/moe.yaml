@@ -243,6 +243,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb2_per_token_loss]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [deepseek_proxy_mfsdp_v2_ep2_hsdp_mb2]
     products:
       - environment: [dev]
