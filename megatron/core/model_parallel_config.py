@@ -6,6 +6,8 @@ from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
+from megatron.core.gtp_parallel_layout import resolve_tensor_parallel_sequence_shards
+
 
 def resolve_tensor_parallel_weight_shards(
     tensor_model_parallel_size: int,
@@ -73,6 +75,31 @@ class ModelParallelConfig:
        INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
        ``__post_init__`` from ``tensor_parallel_num_weight_shards`` (= that value divided by
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
+    """
+
+    tensor_parallel_num_sequence_shards: Optional[int] = None
+    """Number of sequence partitions within a TP x GTP_remat weight-sharding group.
+
+    Defaults to TP when sequence parallelism (SP) is enabled, otherwise 1.
+    By default, GTP_remat ranks process independent microbatches; no sequence
+    partitioning occurs along the GTP_remat axis.
+
+    Increasing this value partitions sequences across GTP_remat ranks, reducing
+    the number of independent batch partitions within each weight-sharding group:
+
+        sp_size = tensor_model_parallel_size if sequence_parallel else 1
+        gtp_remat_num_sequence_shards = tensor_parallel_num_sequence_shards // sp_size
+        gtp_remat_num_batch_shards = gtp_weight_remat_size // gtp_remat_num_sequence_shards
+
+    Both divisions must be exact. Sequence partitioning within GTP_remat requires SP when TP > 1.
+
+    Configured CP adds further sequence partitions across weight replicas.
+    In this config, context_parallel_size must already contain the resolved
+    runtime CP size, excluding TP/SP:
+
+        context_parallel_size = configured_cp_size * gtp_remat_num_sequence_shards
+
+    TP must be the innermost axis and PP the outermost axis in the global rank ordering.
     """
 
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
@@ -500,6 +527,16 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    @property
+    def gtp_remat_num_sequence_shards(self) -> int:
+        """Sequence-shard count within GTP_remat, excluding sequence parallelism across TP."""
+        return resolve_tensor_parallel_sequence_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_sequence_shards,
+            self.gtp_weight_remat_size,
+            self.sequence_parallel,
+        )[1]
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -570,6 +607,9 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+
+        if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
+            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
 
         if self.sequence_packing_scheduler is not None:
             supported_schedulers = ['dp_balanced']

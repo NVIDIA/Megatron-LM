@@ -326,6 +326,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "tensor_parallel_num_weight_shards": 2,
+    "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
     "timers": None,
     "tp_comm_atomic_ag": False,
