@@ -19,6 +19,15 @@
 
 Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-backward: after each pass it checks **stash overflow** (only with `--moe-paged-stash`) and **token over-budget**. If either hits any rank, the step **reruns once** without capacity padding and without paged stashing.
 
+## NCCL EP context lifetime
+
+For the NCCL EP backend, zero-copy symmetric buffers belong to the process-wide
+communication context. Rerun transitions and model-parallel teardown release both
+the context and its cached buffers before destroying the borrowed communicator.
+Eager dispatch and combine do not use cached zero-copy buffers; only quantized
+zero-copy dispatch supplies a shared receive-probability buffer. This prevents a
+later BF16 or dropless rerun from inheriting the previous static receive capacity.
+
 ## Prerequisites
 
 HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.

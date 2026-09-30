@@ -1,7 +1,8 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -57,6 +58,53 @@ def test_pad_routing_map_does_not_modify_input():
     assert torch.equal(routing_map, original)
     assert routing_map._version == original_version
     assert torch.equal(padded.sum(dim=0), torch.tensor([2, 2]))
+
+
+def test_nccl_ep_eager_dispatch_ignores_cached_zero_copy_buffers(monkeypatch):
+    # A quantized static-shape model may have populated process-wide buffers before
+    # a BF16/eager model runs. Those buffers have the old receive capacity.
+    for name in ("_zc_fwd_token_buf", "_zc_bwd_token_buf", "_zc_recv_topk_weights_buf"):
+        monkeypatch.setattr(_NCCLEPManager, name, object())
+    hidden_states = torch.randn(2, 8)
+    probs = torch.ones(2)
+    dispatch = Mock(return_value=(hidden_states, torch.tensor([1, 1]), probs))
+    combine = Mock(return_value=hidden_states)
+    monkeypatch.setattr(token_dispatcher, "nccl_ep_dispatch", dispatch)
+    monkeypatch.setattr(token_dispatcher, "nccl_ep_combine", combine)
+    monkeypatch.setattr(token_dispatcher, "new_nccl_ep_buffer", Mock())
+    monkeypatch.setattr(_NCCLEPManager, "_ensure_bootstrap", lambda self: None)
+    manager = _NCCLEPManager(
+        group=None,
+        num_local_experts=2,
+        router_topk=2,
+        num_experts=4,
+        config=TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+    )
+    manager.setup_metadata(torch.ones(2, 4, dtype=torch.bool), torch.ones(2, 4))
+
+    assert manager.dispatch(hidden_states) is hidden_states
+    assert dispatch.call_args.kwargs["recv_tokens"] is None
+    assert dispatch.call_args.kwargs["recv_topk_weights"] is None
+    assert manager.dispatched_probs is probs
+    assert manager.combine(hidden_states) is hidden_states
+    assert combine.call_args.kwargs["grad_out"] is None
+
+
+def test_destroy_model_parallel_releases_nccl_ep_zero_copy_buffers(monkeypatch):
+    parallel_state.destroy_model_parallel()
+    buffer_names = ("_zc_fwd_token_buf", "_zc_bwd_token_buf", "_zc_recv_topk_weights_buf")
+    for name in buffer_names:
+        monkeypatch.setattr(_NCCLEPManager, name, object())
+
+    def finalize():
+        # Symmetric tensors must be dropped before the context/communicator is freed.
+        assert all(getattr(_NCCLEPManager, name) is None for name in buffer_names)
+
+    finalize_mock = Mock(side_effect=finalize)
+    monkeypatch.setattr(token_dispatcher, "nccl_ep_finalize", finalize_mock)
+    parallel_state.destroy_model_parallel()
+    assert all(getattr(_NCCLEPManager, name) is None for name in buffer_names)
+    finalize_mock.assert_called_once_with()
 
 
 def token_permutation(token_dispatcher, hidden_states, probs, indices):

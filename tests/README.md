@@ -3,16 +3,26 @@
 ## A2A Overlap Test Isolation
 
 The two-chunk schedule tests in `unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`
-use a per-case fixture to own their distributed process groups. MCore's
-`destroy_model_parallel()` clears NCCL group references without unregistering those
-groups from PyTorch, so repeated parameterized cases must explicitly destroy the
-groups they create. The fixture preserves the default group and pre-existing groups,
-includes groups created by in-test TP reinitialization, and finalizes NCCL EP before
-destroying its borrowed communicator. Cached flex buffers are also released before
-their groups. The fixture collects model/plan cycles after the
-test helpers return and checks that no new registered groups remain. This keeps
+reuse one parallel topology per class (and per TP size for padding-mask tests).
+This bounds communicator and HybridEP initialization across the parameter matrix.
+MCore's `destroy_model_parallel()` clears NCCL group references without unregistering those
+groups from PyTorch, so each topology scope explicitly destroys the groups it
+creates. The fixture preserves the default group and pre-existing groups,
+and finalizes NCCL EP before destroying its borrowed communicator. Cached flex buffers
+are also released before their groups. A per-case fixture collects model/plan cycles
+after the test helpers return and releases the NCCL EP context and zero-copy buffers.
+NCCL EP caches the dispatch alignment process-wide, so BF16 and FP8 cases must not
+reuse that context even when their parallel topology matches. Topology teardown
+checks that no new registered groups remain. This keeps
 communication memory bounded across the full dispatcher, precision, MTP, and
 recompute matrix.
+
+## CUDA Graph Test Isolation
+
+Reference outputs retained across capture must be detached after eager backward so
+their autograd nodes do not retain warmup-stream state. Capture errors restore the
+process-wide warmup/capture flags before propagating the error; otherwise later DDP
+backwards can incorrectly suppress gradient accumulation.
 
 ## Updating Functional Test Golden Values
 

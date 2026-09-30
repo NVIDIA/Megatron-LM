@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -73,6 +74,31 @@ from tests.unit_tests.test_utilities import (
 )
 
 fp8_available, _ = check_fp8_support()
+
+
+def test_failed_capture_restores_process_state(monkeypatch):
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_CAPTURING", False)
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_WARMUP", False)
+    monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+    monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", True)
+    te_capture_end = Mock()
+    unfreeze = Mock()
+    monkeypatch.setattr(cuda_graphs_module, "te_set_capture_end", te_capture_end, raising=False)
+    monkeypatch.setattr(cuda_graphs_module.gc, "unfreeze", unfreeze)
+
+    def fail_capture(cls):
+        cuda_graphs_module._set_capture_start()
+        cuda_graphs_module._set_warmup_start()
+        raise RuntimeError("injected capture failure")
+
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_create_cudagraphs", classmethod(fail_capture))
+    with pytest.raises(RuntimeError, match="injected capture failure"):
+        create_cudagraphs()
+
+    assert not cuda_graphs_module.is_graph_capturing()
+    assert not cuda_graphs_module.is_graph_warmup()
+    te_capture_end.assert_called_once_with()
+    unfreeze.assert_called_once_with()
 
 
 def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
@@ -667,6 +693,9 @@ class TestPackedSeqCudagraphs:
         assert actual_cu_seqlens_metadata.is_cudagraph_input
         assert padded_cu_seqlens_metadata.is_cudagraph_input
         eager_out.sum().backward()
+        # Keep only reference values. Retaining the eager autograd graph also retains
+        # AccumulateGrad nodes tied to the default stream, invalidating later capture.
+        eager_out = eager_out.detach().clone()
 
         # This is the primary function under test.
         create_cudagraphs()
