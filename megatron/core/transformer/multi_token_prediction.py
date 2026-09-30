@@ -1971,7 +1971,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             return precision_aware_checkpoint(
                 custom_forward,
                 self.config,
-                parallel_state.get_tensor_model_parallel_group(),
+                self.tp_group,
                 hidden_states,
                 decoder_input,
                 attention_mask,
