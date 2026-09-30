@@ -17,6 +17,7 @@ import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -1053,7 +1054,7 @@ class TestMcoreAdapterHybrid:
 
         for name, submodule in model.named_modules():
             if isinstance(submodule, FsdpModule):
-                inner = Shard(0) if "experts" in name else Replicate()
+                inner = RowAtomic() if "experts" in name else Replicate()
                 for group in submodule.parameter_groups:
                     assert group.model_weight.placements == (Replicate(), inner), name
 
