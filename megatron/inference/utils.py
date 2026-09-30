@@ -7,6 +7,12 @@ from typing import Literal, Optional
 
 import torch
 
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedObject,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -76,6 +82,45 @@ def get_model_builder(
     raise ValueError(f"Invalid model provider {provider}")
 
 
+def _allow_gtp_padding_shape_mismatch(sharded_state_dict) -> None:
+    """Permit DCP to crop trusted GTP padding while retaining key validation."""
+
+    def mark_weight(value):
+        if isinstance(value, ShardedTensor) and value.key.endswith('.weight'):
+            value.allow_shape_mismatch = True
+        return value
+
+    dict_list_map_inplace(mark_weight, sharded_state_dict)
+
+
+def _remap_checkpoint_keys(sharded_state_dict, prefix: str, renames: dict[str, str]) -> None:
+    """Map model sharded keys to a checkpoint's naming: substring renames, then a prefix."""
+
+    def remap(value):
+        if isinstance(value, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
+            for old, new in renames.items():
+                value.key = value.key.replace(old, new)
+            value.key = prefix + value.key
+        return value
+
+    dict_list_map_inplace(remap, sharded_state_dict)
+
+
+def _get_checkpoint_model_modifier(args: Namespace):
+    """Compose the model sharded state dict adjustments requested by args, if any."""
+    prefix = getattr(args, 'checkpoint_model_prefix', '')
+    renames = getattr(args, 'checkpoint_model_key_renames', {})
+    if not prefix and not renames and not args.inference_allow_gtp_padding:
+        return None
+
+    def modifier(sharded_state_dict):
+        _remap_checkpoint_keys(sharded_state_dict, prefix, renames)
+        if args.inference_allow_gtp_padding:
+            _allow_gtp_padding_shape_mismatch(sharded_state_dict)
+
+    return modifier
+
+
 def get_model_for_inference() -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
 
@@ -102,6 +147,7 @@ def get_model_for_inference() -> MegatronModule:
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args),
     )
 
     # No virtual PP.
@@ -259,6 +305,15 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--inference-ckpt-non-strict",
         action="store_true",
         help="Load checkpoint with `strict=False`.",
+    )
+    group.add_argument(
+        "--inference-allow-gtp-padding",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow model weights saved with GTP alignment padding to load into a non-GTP "
+            "inference topology. Use only for trusted GTP checkpoints."
+        ),
     )
     group.add_argument(
         "--termination-id",

@@ -623,6 +623,19 @@ def hybrid_config_from_args(
         assert (
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
+        if args.spec is not None:
+            # Checkpoints record their training spec (restored by --use-checkpoint-args). Use its
+            # inference sibling, e.g. gated_delta_product_stack_spec ->
+            # wide_residual_gated_delta_product_inference_stack_spec, so the layer types match.
+            base_path, name = args.spec
+            name = name.removeprefix("wide_residual_").replace("_inference_", "_")
+            name = name.replace("_stack_spec", "_inference_stack_spec")
+            if transformer_cfg.wide_residual is not None:
+                name = "wide_residual_" + name
+            try:
+                kwargs["hybrid_stack_spec"] = import_module((base_path, name))
+            except ImportError:
+                warnings.warn(f"No {name} for --spec {args.spec}; using default inference spec.")
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):

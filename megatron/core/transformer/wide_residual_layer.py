@@ -269,6 +269,7 @@ class WideResidualTransformerLayer(TransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ) -> None:
         super().__init__(
@@ -281,6 +282,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             is_mtp_layer=is_mtp_layer,
             add_layer_offset=add_layer_offset,
             pp_layer_offset=pp_layer_offset,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
             name=name,
         )
 

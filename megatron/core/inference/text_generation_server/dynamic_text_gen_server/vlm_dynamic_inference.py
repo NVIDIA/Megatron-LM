@@ -119,6 +119,10 @@ def _print_resolved_args(title, args):
     print_rank_0("------------ end of VLM argument provenance -------------")
 
 
+_MIMO_MODEL_PROVIDERS = ('nemotron-moe-vlm', 'nemotron-moe-mistral-vit')
+_MIMO_LANGUAGE_MODEL_PREFIX = 'language_model.module.module.'
+
+
 def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     """Peek at the checkpoint's saved training args to detect VLM vs GPT.
 
@@ -138,6 +142,16 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
         return False
 
     _, checkpoint_args = result
+    # MIMO VLM checkpoints nest the language model under ``language_model.module.module.``.
+    # Run text inference on that language model alone as a HybridModel, loading only its keys.
+    if getattr(checkpoint_args, 'model_provider', None) in _MIMO_MODEL_PROVIDERS:
+        if 'model_provider' not in user_passed_attrs:
+            args.model_provider = 'hybrid'
+        args.checkpoint_model_prefix = _MIMO_LANGUAGE_MODEL_PREFIX
+        # These checkpoints come from a fork whose ShortcutMoEBlock names its first sublayer
+        # ``compute_layer``; Megatron-LM names it ``attn_layer``.
+        args.checkpoint_model_key_renames = {'.attn_layer.': '.compute_layer.'}
+        return False
     if not hasattr(checkpoint_args, 'language_model_type'):
         return False
     if checkpoint_args.language_model_type is None:

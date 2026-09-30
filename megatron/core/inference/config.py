@@ -121,7 +121,13 @@ class MambaInferenceStateConfig:
             # gated off for GDP (batch-invariant chunk lengths, prefix-cache
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
-            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
+            # Shortcut-MoE groups attention/MoE pairs into one logical layer; index physical layers.
+            layers = (
+                decoder.physical_layers()
+                if callable(getattr(decoder, "physical_layers", None))
+                else decoder.layers
+            )
+            chunking = ssm_chunking(decoder.layer_type_list, layers)
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
