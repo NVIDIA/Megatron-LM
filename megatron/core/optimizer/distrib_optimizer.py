@@ -1103,7 +1103,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if len(steps) != 0:
                 assert len(steps) == 1, f"steps: {steps}"
                 step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
-                for v in self.optimizer.state.values():
+                for v in state_dict_state.values():
                     v["step"] = step.detach().clone()
 
         # Optimizer.
@@ -1274,6 +1274,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if not isinstance(v, torch.Tensor):
                     continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
+                    # HDO's scalar step is restored from param_groups.
+                    if k == "step":
+                        continue
                     if k == "param":
                         k = "master_param"
                     self.optimizer.state[sharded_model_param][k] = v
@@ -1296,6 +1299,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # run under no_grad.
             with torch.no_grad():
                 for key in dst_tensors:
+                    # HDO's scalar step is restored from param_groups.
+                    if isinstance(self.optimizer, HybridDeviceOptimizer) and key == "step":
+                        continue
                     if not isinstance(tensors[key], torch.Tensor):
                         continue
                     dst_tensors[key].copy_(tensors[key])
