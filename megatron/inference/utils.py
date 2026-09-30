@@ -61,31 +61,35 @@ def get_model_builder(
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
     """
-    from megatron.training.argument_utils import core_transformer_config_from_args
+    from megatron.training.argument_utils import get_transformer_config
     from megatron.training.global_vars import get_run_config
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
 
     cfg = get_run_config()
     if provider is None:
         provider = args.model_provider
-    transformer_config = None
-    if args.yaml_cfg is None or provider in ("hybrid", "mamba"):
-        transformer_config = core_transformer_config_from_args(
-            args, inference_sampling_seed=cfg.rng.seed,
-            inference_rng_tracker=cfg.rng.inference_rng_tracker,
-        )
     if provider == "gpt":
-        config = gpt_config_from_args(args, config=transformer_config)
-        return GPTModelBuilder(config)
-    if provider in ("hybrid", "mamba"):
+        config_cls, factory, builder_cls = GPTModelConfig, gpt_config_from_args, GPTModelBuilder
+    elif provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
                 '"mamba" model provider is deprecated. Use "hybrid" instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
-        config = hybrid_config_from_args(args, config=transformer_config)
-        return HybridModelBuilder(config)
-    raise ValueError(f"Invalid model provider {provider}")
+        config_cls, factory, builder_cls = HybridModelConfig, hybrid_config_from_args, HybridModelBuilder
+    else:
+        raise ValueError(f"Invalid model provider {provider}")
+
+    if isinstance(cfg.model, config_cls):
+        config = cfg.model
+    else:
+        transformer = get_transformer_config(
+            args, use_yaml=provider == "gpt", reuse_model_config=False
+        )
+        config = factory(args, config=transformer)
+    cfg.finalize_model_config(config)
+    return builder_cls(config)
 
 
 def get_model_for_inference() -> MegatronModule:

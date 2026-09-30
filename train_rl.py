@@ -20,10 +20,10 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.training.global_vars import get_run_config
+from megatron.training.argument_utils import get_transformer_config
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
@@ -47,11 +47,7 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
             recompute_granularity_from_args = args.recompute_granularity
             args.recompute_granularity = None
 
-        cfg = get_run_config()
-        config = core_transformer_config_from_args(
-            args, inference_sampling_seed=cfg.rng.seed,
-            inference_rng_tracker=cfg.rng.inference_rng_tracker,
-        )
+        config = get_transformer_config(args)
 
         if recompute_granularity_from_args is not None:
             config.recompute_granularity = recompute_granularity_from_args

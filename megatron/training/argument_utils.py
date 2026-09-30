@@ -661,6 +661,40 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def get_transformer_config(
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    *,
+    use_yaml: bool = False,
+    reuse_model_config: bool = True,
+) -> TransformerConfig:
+    """Resolve native or legacy model inputs using the current run configuration.
+
+    Explicit/native/YAML sampling seeds are independent of the training seed.
+    Only legacy CLI construction derives the sampling seed from ``cfg.rng.seed``.
+    Separate models, such as refit destinations or explicit provider overrides,
+    can request fresh model inputs without mutating the current model config.
+    """
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
+    if config is None and reuse_model_config:
+        config = getattr(cfg.model, "transformer", None)
+    if config is None:
+        if use_yaml and args.yaml_cfg is not None:
+            from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+            config = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            config = core_transformer_config_from_args(
+                args,
+                inference_sampling_seed=cfg.rng.seed,
+                inference_rng_tracker=cfg.rng.inference_rng_tracker,
+            )
+    cfg.finalize_model_config(config)
+    return config
+
+
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -717,6 +751,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
     )
 
+    cfg.finalize()
     return cfg
 
 
@@ -777,4 +812,5 @@ def inference_cfg_container_from_args(
         profiling=profiling_config_from_args(args),
     )
 
+    cfg.finalize()
     return cfg

@@ -9,7 +9,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
 import torch
-from megatron.training.global_vars import get_run_config
+from megatron.training.argument_utils import get_transformer_config
 from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
@@ -19,7 +19,6 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 from megatron.inference.text_generation import generate_and_post_process
-from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
@@ -42,11 +41,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
 
     print_rank_0('building GPT model ...')
 
-    cfg = get_run_config()
-    config = core_transformer_config_from_args(
-        args, inference_sampling_seed=cfg.rng.seed,
-        inference_rng_tracker=cfg.rng.inference_rng_tracker,
-    )
+    config = get_transformer_config(args)
 
     if args.spec is None:
         if args.transformer_impl == 'local':

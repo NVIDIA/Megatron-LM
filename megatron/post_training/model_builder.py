@@ -27,6 +27,7 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.training.argument_utils import get_transformer_config
 from megatron.training.global_vars import get_run_config
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -298,11 +299,7 @@ def modelopt_gpt_hybrid_builder(
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    cfg = get_run_config()
-    config = core_transformer_config_from_args(
-        args, inference_sampling_seed=cfg.rng.seed,
-        inference_rng_tracker=cfg.rng.inference_rng_tracker,
-    )
+    config = get_transformer_config(args, config)
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:

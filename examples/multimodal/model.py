@@ -23,9 +23,8 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
-from megatron.training.global_vars import get_run_config
+from megatron.training.argument_utils import get_transformer_config
 from megatron.training import get_args, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
 
 
 def model_provider(
@@ -109,11 +108,7 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    cfg = get_run_config()
-    base_config = config or core_transformer_config_from_args(
-        get_args(), inference_sampling_seed=cfg.rng.seed,
-        inference_rng_tracker=cfg.rng.inference_rng_tracker,
-    )
+    base_config = get_transformer_config(args, config)
 
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type

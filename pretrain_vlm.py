@@ -29,6 +29,7 @@ from megatron.core.models.vision.vit_layer_specs import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import get_submodules, import_module
+from megatron.training.argument_utils import get_transformer_config
 from megatron.training import (
     get_args,
     get_timers,
@@ -39,7 +40,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
     initialize_runtime_services,
@@ -122,16 +123,7 @@ def model_provider(
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
-    if config is None:
-        from megatron.training.global_vars import get_run_config
-
-        cfg = get_run_config()
-        language_transformer_config = core_transformer_config_from_args(
-            get_args(), inference_sampling_seed=cfg.rng.seed,
-            inference_rng_tracker=cfg.rng.inference_rng_tracker,
-        )
-    else:
-        language_transformer_config = config
+    language_transformer_config = get_transformer_config(args, config)
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
     else:

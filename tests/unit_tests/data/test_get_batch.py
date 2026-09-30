@@ -1016,7 +1016,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface(run_config
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
+        patch.object(pretrain_hybrid, "get_transformer_config", return_value=config),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
             pretrain_hybrid,

@@ -194,7 +194,9 @@ def test_checkpoint_policy_retains_current_run_precedence(
 
 
 @pytest.mark.parametrize("model_kind", ["gpt", "hybrid"])
-def test_native_builder_preserves_explicit_inference_policy(monkeypatch, model_kind, run_config):
+def test_native_builder_derives_tracker_and_preserves_sampling_seed(
+    monkeypatch, model_kind, run_config
+):
     from megatron.core.transformer import TransformerConfig
     from megatron.training import training
     from megatron.training.models import gpt, hybrid
@@ -219,12 +221,170 @@ def test_native_builder_preserves_explicit_inference_policy(monkeypatch, model_k
 
     def construct(model_config):
         assert model_config.transformer.inference_sampling_seed == 777
-        assert model_config.transformer.inference_rng_tracker is False
+        assert model_config.transformer.inference_rng_tracker is True
         raise ObservedModel
 
     monkeypatch.setattr(config_cls, "get_builder_cls", lambda self: construct)
     with pytest.raises(ObservedModel):
         training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+
+
+@pytest.mark.parametrize("source", ["args", "yaml", "native", "provided", "separate"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shared_transformer_resolution(monkeypatch, source, enabled, run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training import argument_utils, yaml_arguments
+    from megatron.training.models import GPTModelConfig
+
+    args = _args_without_rng()
+    args.yaml_cfg = "model.yaml" if source == "yaml" else None
+    before = vars(args).copy()
+    run_config.rng = RNGConfig(seed=987, inference_rng_tracker=enabled)
+    transformer = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        inference_sampling_seed=777,
+        inference_rng_tracker=not enabled,
+    )
+    native = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
+    if source in ("native", "provided", "separate"):
+        run_config.model = GPTModelConfig(
+            transformer=transformer if source == "native" else native, vocab_size=128, seq_length=16
+        )
+
+    def from_args(legacy_args, **overrides):
+        assert legacy_args is args
+        assert overrides == {"inference_sampling_seed": 987, "inference_rng_tracker": enabled}
+        transformer.inference_sampling_seed = overrides["inference_sampling_seed"]
+        return transformer
+
+    cli_factory = Mock(side_effect=from_args)
+    yaml_factory = Mock(return_value=transformer)
+    monkeypatch.setattr(argument_utils, "core_transformer_config_from_args", cli_factory)
+    monkeypatch.setattr(yaml_arguments, "core_transformer_config_from_yaml", yaml_factory)
+    result = argument_utils.get_transformer_config(
+        args,
+        transformer if source == "provided" else None,
+        use_yaml=True,
+        reuse_model_config=source != "separate",
+    )
+    assert result is transformer
+    assert result.inference_rng_tracker is enabled
+    assert result.inference_sampling_seed == (987 if source in ("args", "separate") else 777)
+    assert cli_factory.call_count == (source in ("args", "separate"))
+    assert yaml_factory.call_count == (source == "yaml")
+    assert native.inference_rng_tracker is False
+    assert vars(args) == before
+
+
+@pytest.mark.parametrize("provider", ["gpt", "hybrid", "mamba"])
+@pytest.mark.parametrize("source", ["native", "legacy", "other_provider"])
+def test_inference_builder_respects_native_model_and_provider_override(
+    monkeypatch, provider, source, run_config
+):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.inference import utils
+    from megatron.training import argument_utils
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    requested_cls = GPTModelConfig if provider == "gpt" else HybridModelConfig
+    other_cls = HybridModelConfig if provider == "gpt" else GPTModelConfig
+
+    def model(cls, seed):
+        return cls(
+            transformer=TransformerConfig(
+                num_layers=2, hidden_size=32, num_attention_heads=4, inference_sampling_seed=seed
+            ),
+            vocab_size=128,
+            seq_length=16,
+        )
+
+    native = model(requested_cls if source == "native" else other_cls, 777)
+    run_config.model = None if source == "legacy" else native
+    run_config.rng = RNGConfig(seed=987, inference_rng_tracker=True)
+    built = model(requested_cls, 987)
+    resolver = Mock(return_value=built.transformer)
+    factory = Mock(return_value=built)
+    monkeypatch.setattr(argument_utils, "get_transformer_config", resolver)
+    monkeypatch.setattr(utils, "gpt_config_from_args", factory)
+    monkeypatch.setattr(utils, "hybrid_config_from_args", factory)
+    monkeypatch.setattr(utils, "GPTModelBuilder", lambda config: config)
+    monkeypatch.setattr(utils, "HybridModelBuilder", lambda config: config)
+    args = Namespace(model_provider="gpt")
+    result = utils.get_model_builder(args, provider)
+    assert result is (native if source == "native" else built)
+    assert result.transformer.inference_rng_tracker is True
+    assert result.transformer.inference_sampling_seed == (777 if source == "native" else 987)
+    if source == "native":
+        factory.assert_not_called()
+        resolver.assert_not_called()
+    else:
+        resolver.assert_called_once_with(args, use_yaml=provider == "gpt", reuse_model_config=False)
+        factory.assert_called_once_with(args, config=built.transformer)
+        assert native.transformer.inference_rng_tracker is False
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "hybrid", "legacy"])
+def test_inference_finalization_is_idempotent_without_training_configs(model_type):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+    )
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    model = None
+    if model_type != "legacy":
+        cls = GPTModelConfig if model_type == "gpt" else HybridModelConfig
+        model = cls(
+            transformer=TransformerConfig(
+                num_layers=2, hidden_size=32, num_attention_heads=4, inference_sampling_seed=777
+            ),
+            vocab_size=128,
+            seq_length=16,
+        )
+    cfg = InferenceConfigContainer(
+        model=model,
+        checkpoint=CheckpointConfig(),
+        inference=InferenceSetupConfig(),
+        rng=RNGConfig(seed=987, inference_rng_tracker=True),
+    )
+    cfg.finalize()
+    cfg.finalize()
+    assert not hasattr(cfg, "optimizer")
+    if model is not None:
+        assert model.transformer.inference_rng_tracker is True
+        assert model.transformer.inference_sampling_seed == 777
+        cfg.rng.inference_rng_tracker = False
+        cfg.finalize()
+        assert model.transformer.inference_rng_tracker is False
+
+
+def test_mimo_finalization_updates_specs_not_metadata(run_config):
+    from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+    from megatron.core.transformer import TransformerConfig
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    active = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    ignored = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    spec = ModuleSpec(
+        module=Mock,
+        params={"config": active, "metadata": SimpleNamespace(config=ignored)},
+        metainfo={"config": ignored},
+    )
+    spec.submodules = {"shared": [spec, spec]}
+    model = MimoModelConfig(
+        language_model_spec=spec, module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: ignored}
+    )
+    run_config.rng.inference_rng_tracker = True
+    run_config.finalize_model_config(model)
+    assert active.inference_rng_tracker is True
+    assert ignored.inference_rng_tracker is False
+    run_config.finalize_model_config(SimpleNamespace(config=ignored))
+    assert ignored.inference_rng_tracker is False
 
 
 def test_tensorboard_records_owned_rng_values(monkeypatch, run_config):
