@@ -964,7 +964,7 @@ class TestMcoreAdapterHybrid:
             (2, "optim", "optim_grads_params"),
         ],
     )
-    def test_hybrid_matches_single_instance_accumulating(
+    def test_hybrid_matches_zero3_reference(
         self, outer_size, outer_strategy, inner_strategy, microbatches
     ):
         """Compare losses against ZeRO-3 sharded across all DP ranks.
