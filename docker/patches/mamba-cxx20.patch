@@ -1,0 +1,33 @@
+Backport of https://github.com/state-spaces/mamba/commit/653923ce8fb0d47cdd9bcfd5904a0f1d58f91274
+Build the existing pinned Mamba sources with the standard required by PyTorch's ATen headers.
+
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -210,10 +210,10 @@ def append_nvcc_threads(nvcc_extra_args):
+     if HIP_BUILD:
+ 
+         extra_compile_args = {
+-            "cxx": ["-O3", "-std=c++17"],
++            "cxx": ["-O3", "-std=c++20"],
+             "nvcc": [
+                 "-O3",
+-                "-std=c++17",
++                "-std=c++20",
+                 f"--offload-arch={os.getenv('HIP_ARCHITECTURES', 'native')}",
+                 "-U__CUDA_NO_HALF_OPERATORS__",
+                 "-U__CUDA_NO_HALF_CONVERSIONS__",
+@@ -223,11 +223,11 @@ def append_nvcc_threads(nvcc_extra_args):
+         }
+     else:
+         extra_compile_args = {
+-            "cxx": ["-O3", "-std=c++17"],
++            "cxx": ["-O3", "-std=c++20"],
+             "nvcc": append_nvcc_threads(
+                 [
+                     "-O3",
+-                    "-std=c++17",
++                    "-std=c++20",
+                     "-U__CUDA_NO_HALF_OPERATORS__",
+                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+                     "-U__CUDA_NO_BFLOAT16_OPERATORS__",

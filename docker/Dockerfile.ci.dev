@@ -67,6 +67,7 @@ RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_n
 EOF
 
 COPY pyproject.toml uv.lock /workspace/
+COPY docker/patches/mamba-cxx20.patch /workspace/mamba-cxx20.patch
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
@@ -110,6 +111,7 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
+        --no-install-package mamba-ssm \
         --no-install-package transformer-engine-cu12 \
         --no-install-package nvidia-cublas-cu12 \
         --no-install-package nvidia-cuda-cupti-cu12 \
@@ -123,6 +125,24 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
+
+    # Backport state-spaces/mamba#1000 without changing the pinned runtime sources.
+    # PyTorch's ATen headers now require C++20 for both host and CUDA compilation.
+    MAMBA_REV=$(sed -n 's/^mamba-ssm = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
+    test -n "${MAMBA_REV}"
+    MAMBA_BUILD_DIR=$(mktemp -d)
+    trap 'rm -rf "${MAMBA_BUILD_DIR}"' EXIT
+    git -C "${MAMBA_BUILD_DIR}" init
+    git -C "${MAMBA_BUILD_DIR}" fetch --depth 1 https://github.com/state-spaces/mamba.git "${MAMBA_REV}"
+    git -C "${MAMBA_BUILD_DIR}" checkout --detach "${MAMBA_REV}"
+    git -C "${MAMBA_BUILD_DIR}" apply /workspace/mamba-cxx20.patch
+    MAMBA_FORCE_BUILD=TRUE uv pip install --no-deps --no-build-isolation -v "${MAMBA_BUILD_DIR}"
+    # Keep the source revision and applied patch after deleting the build checkout.
+    mkdir -p /opt/mamba-build-info
+    git -C "${MAMBA_BUILD_DIR}" rev-parse HEAD > /opt/mamba-build-info/revision
+    cp /workspace/mamba-cxx20.patch /opt/mamba-build-info/
+    rm -rf "${MAMBA_BUILD_DIR}"
+    trap - EXIT
 
     # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
     # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
