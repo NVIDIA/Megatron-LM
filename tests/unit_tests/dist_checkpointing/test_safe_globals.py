@@ -35,7 +35,9 @@ class TestSafeGlobals:
         torch.load(ckpt_path)
 
     @pytest.mark.skipif(not is_torch_min_version("2.6a0"), reason="PyTorch 2.6 is required")
-    @pytest.mark.parametrize("optimizer_cls", [torch.optim.Adam, torch.optim.AdamW, torch.optim.SGD])
+    @pytest.mark.parametrize(
+        "optimizer_cls", [torch.optim.Adam, torch.optim.AdamW, torch.optim.SGD]
+    )
     def test_legacy_optimizer(self, tmp_path, optimizer_cls):
         optimizer = optimizer_cls([torch.nn.Parameter(torch.ones(1))])
         torch.save({"optimizer": optimizer}, tmp_path / COMMON_STATE_FNAME)
