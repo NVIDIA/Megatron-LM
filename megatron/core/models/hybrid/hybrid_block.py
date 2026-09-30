@@ -477,6 +477,8 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+        else:
+            self.final_norm = None
 
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.mhc_num_residual_streams
@@ -556,10 +558,10 @@ class HybridStack(MegatronModule):
         """Alias for ``final_norm`` matching the attribute name on TransformerBlock.
 
         Lets generic decoder consumers (e.g. ``GPTModel.PostProcessNode``) discover the
-        final norm via the same attribute name they use for non-hybrid decoders, while
-        keeping ``final_norm`` as the registered submodule for local state-dict compatibility.
+        final norm via the same attribute name they use for non-hybrid decoders.
+        ``final_norm`` remains the registered submodule name.
         """
-        return getattr(self, "final_norm", None)
+        return self.final_norm
 
     @staticmethod
     def _get_layer_cp_layout(layer_config: LayerConfigItem, boundary_layout: CPLayout) -> CPLayout:
@@ -668,9 +670,6 @@ class HybridStack(MegatronModule):
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        rotary_pos_cos_sin: Optional[Tensor] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -679,7 +678,6 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
-        _checkpointed_forward_in_parent: bool = False,
     ):
         """
         Forward function of the HybridStack class.
@@ -697,14 +695,8 @@ class HybridStack(MegatronModule):
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
-            rotary_pos_cos / rotary_pos_sin / rotary_pos_cos_sin (Tensor, optional):
-                precomputed rotary embeddings forwarded to transformer layers (flash-decode /
-                fused-rope inference paths). Defaults to None.
             sequence_len_offset (Tensor, optional): precomputed per-sample sequence offsets
                 for static-batching inference. Computed here when None.
-            _checkpointed_forward_in_parent (bool): set by ``checkpointed_forward`` when the
-                enclosing stack already checkpoints this nested group stack, so the group
-                must not checkpoint its layers a second time.
         Returns:
             Tensor: the output tensor.
         """
@@ -822,10 +814,12 @@ class HybridStack(MegatronModule):
         )
 
         with outer_fp8_context:
+            # A bracketed group stack runs inside its enclosing stack's checkpointed
+            # segment, so only the outer stack applies full recomputation.
             if (
                 self.config.recompute_granularity == 'full'
                 and self.training
-                and not _checkpointed_forward_in_parent
+                and not self.is_layer_group_stack
             ):
                 hidden_states = checkpointed_forward(
                     self,
@@ -908,9 +902,6 @@ class HybridStack(MegatronModule):
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     rotary_pos_emb=rotary_pos_emb,
-                                    rotary_pos_cos=rotary_pos_cos,
-                                    rotary_pos_sin=rotary_pos_sin,
-                                    rotary_pos_cos_sin=rotary_pos_cos_sin,
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=padding_mask,
@@ -928,12 +919,6 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=padding_mask,
                                 )
-                                if rotary_pos_cos is not None:
-                                    layer_kwargs["rotary_pos_cos"] = rotary_pos_cos
-                                if rotary_pos_sin is not None:
-                                    layer_kwargs["rotary_pos_sin"] = rotary_pos_sin
-                                if rotary_pos_cos_sin is not None:
-                                    layer_kwargs["rotary_pos_cos_sin"] = rotary_pos_cos_sin
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                                 if residual_stream_recompute_context is not None:

@@ -725,7 +725,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
-        is_spec_decode=None,
         output_processor=None,
         output_processor_context=None,
         compute_mtp_loss=True,
@@ -758,13 +757,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Speculative decoding: when active, MTP must run *after* verification so
         # it conditions on verified tokens rather than stale speculative ones.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context is not None
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
+        is_spec_decode = (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.is_dynamic_batching()
+            and inference_context.num_speculative_tokens > 0
+        )
 
         # Whether the MTP auxiliary objective is computed in this call.
         # ``self.mtp_process`` guards against models built without an MTP block.
