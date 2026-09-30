@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -75,6 +76,52 @@ class TestMcoreAdapterDense:
 
     def teardown_method(self):
         _destroy_model_parallel()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+    )
+    def test_mxfp8_parameters(self, distributed_setup):
+        """The MCore adapter preserves MXFP8 parameters when FP8 gather is enabled."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+        )
+
+        block = TransformerBlock(
+            config=config, spec=get_gpt_layer_with_transformer_engine_spec()
+        ).to(device="cuda", dtype=config.params_dtype)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                fp8_param_gather=True,
+            ),
+            module=block,
+            pg_collection=self.pg_collection,
+        )
+        # FSDP installs DTensor shards; check the parameters used for compute.
+        parameters = []
+        for module in model.module.modules():
+            if not isinstance(module, FsdpModule):
+                continue
+            for group in module.parameter_groups:
+                for parameter in group.fsdp_parameters:
+                    parameters.append(parameter.unsharded)
+        assert any(isinstance(p, MXFP8Tensor) for p in parameters)
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
         """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""

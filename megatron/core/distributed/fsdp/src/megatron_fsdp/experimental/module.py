@@ -31,7 +31,7 @@ from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
-from .placement import BlockAtomic, Flat
+from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
 
@@ -631,7 +631,7 @@ def _specialize_placements(
     """Specialize public placements for one homogeneous parameter group.
 
     Map Torch's user-facing ``Shard(0)`` to ``BlockAtomic`` for MXFP8 groups
-    and ``Flat`` for ordinary floating-point groups.
+    and ``RowAtomic`` for ordinary floating-point groups.
     """
     if group_dtype not in (torch.uint8, torch.float32, torch.bfloat16, torch.float16):
         raise NotImplementedError(f"Unsupported group dtype: {group_dtype}.")
@@ -640,7 +640,7 @@ def _specialize_placements(
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else Flat()
+    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else RowAtomic()
     return tuple(
         placement_type if type(placement) is Shard else placement for placement in placements
     )
