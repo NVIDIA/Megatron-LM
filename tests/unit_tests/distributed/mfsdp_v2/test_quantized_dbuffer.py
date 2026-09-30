@@ -142,24 +142,32 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
                 assert chunks[rank].eq(0).all()
 
 
+@pytest.mark.parametrize("mesh_ndim", [1, 2])
 @pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
-    """All-gather preserves rank order in every plane, with or without an output buffer."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shapes = [(128, 64), (32, 128)]
-    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, mesh_ndim):
+    """Gather every plane, including into aliased output storage on a hybrid mesh."""
+    world_size = distributed_setup.world_size
+    if world_size < 2 or world_size % mesh_ndim:
+        pytest.skip("Requires at least two ranks and an even world size for a hybrid mesh.")
+    mesh_shape = (world_size,) if mesh_ndim == 1 else (2, world_size // 2)
+    mesh = init_device_mesh(distributed_setup.device.type, mesh_shape)
+    out = QuantizedDBuffer.empty(
+        mesh, [Replicate()] * mesh_ndim, [(128, 64), (32, 128)], distributed_setup.device
+    )
+    for plane in out.planes:
+        plane.local_buffer.zero_()
+    source = out.view([BlockAtomic(32)] * mesh_ndim)
     for index, plane in enumerate(source.planes):
-        plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
+        values = (
+            torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
+        )
+        plane.local_buffer.copy_(values % 251)
+    result = source.allgather(0 if mesh_ndim == 1 else (1, 0), out=out if use_out else None)
     if use_out:
-        destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
-        result = source.allgather(0, out=destination)
-        assert result is destination
-    else:
-        result = source.allgather(0)
+        assert result is out
     for index, plane in enumerate(result.planes):
-        assert plane.placements == (Replicate(),)
-        chunks = plane.local_buffer.view(mesh.size(), -1)
-        for rank in range(mesh.size()):
-            assert chunks[rank].eq(index * mesh.size() + rank).all()
+        assert plane.placements == (Replicate(),) * mesh_ndim
+        expected = (
+            (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
+        ).to(plane.dtype)
+        torch.testing.assert_close(plane.local_buffer, expected, rtol=0, atol=0)
