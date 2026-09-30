@@ -655,16 +655,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
-        dense_grad_divisor = 1.0
-        # Expert parameters use expert-DP rather than the full dense-DP group.
-        # With averaged losses, account for contributions dispatched from every EP rank.
-        expert_grad_divisor: float = config.expert_model_parallel_size
-        if config.calculate_per_token_loss:
-            # Per-token loss supplies token sums, then finalize_model_grads() divides by
-            # the global token count. Cancel MFSDP's mesh averaging in that case.
-            dense_grad_divisor = 1.0 / dp_mesh.size()
-            if expert_dp_mesh is not None:
-                expert_grad_divisor = 1.0 / expert_dp_mesh.size()
+        dense_grad_divisor, expert_grad_divisor = _get_grad_divisors(
+            config, dp_mesh, expert_dp_mesh
+        )
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -977,6 +970,31 @@ _DATA_PARALLEL_PLACEMENTS = {
     "optim_grads": _AxisPlacements(Replicate(), Shard(0), Shard(0)),  # ZeRO-2
     "optim_grads_params": _AxisPlacements(Shard(0), Shard(0), Shard(0)),  # ZeRO-3
 }
+
+
+def _get_grad_divisors(
+    config: TransformerConfig, dp_mesh: DeviceMesh, expert_dp_mesh: DeviceMesh | None
+) -> tuple[float, float]:
+    """Return the additional dense and expert gradient divisors for MFSDP v2."""
+    # Without per-token normalization, backward uses each microbatch's mean
+    # valid-token loss, so dense gradients need the mesh's rank average.
+    # Each expert replica already sums contributions from tokens dispatched by
+    # every EP rank. With D expert-DP replicas and E EP ranks, mesh averaging
+    # divides by D; divide by E as well to average over all D * E source ranks.
+    dense_grad_divisor = 1.0
+    expert_grad_divisor: float = config.expert_model_parallel_size
+    if config.calculate_per_token_loss:
+        # Backward uses the sum of unmasked token losses. The desired gradient is
+        # sum(grads) / total_valid_tokens across all ranks and microbatches.
+        # MFSDP averages over each mesh, then divides by grad_divisor. Set it to
+        # 1 / mesh_size to recover the sum: (sum(grads) / mesh_size) / (1 / mesh_size).
+        # Experts already include the EP sum, so only expert-DP averaging needs undoing.
+        # After accumulation, finalize_model_grads() divides by the global valid-token
+        # count before clipping and the optimizer update.
+        dense_grad_divisor = 1.0 / dp_mesh.size()
+        if expert_dp_mesh is not None:
+            expert_grad_divisor = 1.0 / expert_dp_mesh.size()
+    return dense_grad_divisor, expert_grad_divisor
 
 
 def _build_expert_mesh_and_placements(
