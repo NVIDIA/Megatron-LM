@@ -125,7 +125,6 @@ def test_abort_failure_does_not_enter_graceful_destroy(monkeypatch):
     )
     monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "nccl")
     monkeypatch.setattr(ps, "_global_process_group_list", [None, *groups])
-    monkeypatch.setattr(ps, "is_torch_min_version", lambda version: True)
     with pytest.raises(RuntimeError, match="injected abort failure"):
         ps._abort_created_process_groups()
     for group in groups:
