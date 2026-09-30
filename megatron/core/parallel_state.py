@@ -2786,8 +2786,6 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
     _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
-    _HYBRID_DP_CP_GROUPS.clear()
-
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
 

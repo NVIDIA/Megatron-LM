@@ -132,7 +132,7 @@ def test_destroy_clears_partial_and_context_groups(distributed_without_model_par
     ps.initialize_model_parallel(
         context_parallel_size=2,
         hierarchical_context_parallel_sizes=[2],
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
         num_distributed_optimizer_instances=2,
     )
     partial_dp = ps.get_data_parallel_group(
@@ -142,7 +142,7 @@ def test_destroy_clears_partial_and_context_groups(distributed_without_model_par
         with_context_parallel=True, partial_data_parallel=True
     )
     assert ps.get_hierarchical_context_parallel_groups()
-    assert ps._HYBRID_DP_CP_GROUPS
+    assert ps._DYNAMIC_DP_CP_GROUPS
     for group, device in ((partial_dp, "cuda"), (partial_gloo, "cpu")):
         value = torch.ones(1, device=device)
         torch.distributed.all_reduce(value, group=group)
@@ -157,12 +157,12 @@ def test_destroy_clears_partial_and_context_groups(distributed_without_model_par
         ps.get_data_parallel_group_gloo(with_context_parallel=True, partial_data_parallel=True)
     with pytest.raises(AssertionError):
         ps.get_hierarchical_context_parallel_groups()
-    assert not ps._HYBRID_DP_CP_GROUPS
+    assert not ps._DYNAMIC_DP_CP_GROUPS
     assert set(torch.distributed.distributed_c10d._world.pg_map) == baseline
 
-    # A lifetime without hybrid CP must not inherit the earlier size-to-group map.
+    # A lifetime without dynamic CP must not inherit the earlier size-to-group map.
     ps.initialize_model_parallel()
-    assert not ps._HYBRID_DP_CP_GROUPS
+    assert not ps._DYNAMIC_DP_CP_GROUPS
     ps.destroy_model_parallel()
     _assert_world_usable()
 
