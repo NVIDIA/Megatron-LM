@@ -885,8 +885,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         grads = []
         for parameter in self.parameters():
             if parameter.grad is not None:
-                if any(placement.is_partial() for placement in parameter.grad.placements):
-                    raise RuntimeError("MFSDP v2 gradient scaling requires finalized gradients.")
+                assert not any(
+                    placement.is_partial() for placement in parameter.grad.placements
+                ), "MFSDP v2 gradient scaling requires finalized gradients."
                 grads.append(parameter.grad.to_local())
         if grads:
             torch._foreach_mul_(grads, scaling_factor)
