@@ -361,21 +361,12 @@ class MoELayer(BaseMoELayer):
             from megatron.core.transformer.moe.moe_ep_chunk_overlap import MoEEPChunkOverlapRuntime
             from megatron.core.transformer.moe.moe_ep_chunk_overlap.transport import MoEEPTransportType
 
-            selective_recompute = (
-                set(self.config.recompute_modules or [])
-                if self.config.recompute_granularity == 'selective'
-                else set()
-            )
-            assert self.config.recompute_granularity != 'full', (
-                "moe_ep_chunk_overlap forbids recompute_granularity='full'"
-            )
-            assert 'moe' not in selective_recompute, (
-                "moe_ep_chunk_overlap forbids 'moe' in recompute_modules"
-            )
-
-            if self.config.moe_paged_stash:
-                raise RuntimeError("moe_ep_chunk_overlap does not support moe_paged_stash.")
-
+            # The recompute and moe_paged_stash refusals moved to
+            # TransformerConfig.__post_init__. The two below stay here because neither is
+            # decidable there: expert_gtp_weight_remat_size is itself derived in
+            # ModelParallelConfig.__post_init__ and num_local_experts comes from the live
+            # process group, and the transport mapping would make transformer_config import
+            # this package.
             if self.config.expert_gtp_weight_remat_size != 1:
                 # TE's num_groups == 1 dense shortcuts read past sum(split_sizes): wrong or NaN
                 # expert wgrads, with the forward and dgrad bit-identical.
@@ -402,7 +393,7 @@ class MoELayer(BaseMoELayer):
                 hidden_size=self.config.moe_latent_size or self.config.hidden_size,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 num_chunks=self.config.moe_ep_chunk_overlap_num_chunks,
-                num_comm_SMs=self.config.moe_ep_chunk_overlap_num_comm_sms,
+                num_comm_SMs=self.config.moe_flex_dispatcher_num_sms,
                 experts=self.experts,
                 tp_ep_group=pg_collection.tp_ep,
                 num_local_experts=self.num_local_experts,
@@ -698,6 +689,16 @@ class MoELayer(BaseMoELayer):
             self._latent_shared_expert_output = None
         return output
 
+    @internal_api
+    def dispatch_compute_combine(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """Run the trunk dispatcher's whole routed-expert region: dispatch -> expert compute ->
+        combine. Extracted so the EP-chunk-overlap branch and this one are one call each and read
+        as alternatives, rather than one of them being spelled out inline beside the other."""
+        dispatched_input, probs = self.dispatch(hidden_states, probs)
+        output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        return self.combine(output), mlp_bias
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
@@ -779,12 +780,7 @@ class MoELayer(BaseMoELayer):
                 if self._ep_chunk_overlap_active():
                     output, mlp_bias = self.moe_ep_chunk_overlap.forward(hidden_states, probs)
                 else:
-                    dispatched_input, probs = self.dispatch(hidden_states, probs)
-                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                    assert (
-                        mlp_bias is None
-                    ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                    output = self.combine(output)
+                    output, mlp_bias = self.dispatch_compute_combine(hidden_states, probs)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

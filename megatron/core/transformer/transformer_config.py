@@ -1030,14 +1030,9 @@ class TransformerConfig(ModelParallelConfig):
     )
     """[Experimental] Enable the token-chunked EP overlap path. When set,
     the whole routed-expert region (dispatch -> FC1/activation/FC2 -> combine) is replaced by a
-    chunked two-stream schedule that overlaps the EP A2A with the expert GEMMs. Training only. 
-    Its communication-SM budget is moe_ep_chunk_overlap_num_comm_sms."""
-
-    moe_ep_chunk_overlap_num_comm_sms: int = field(
-        default=32,
-        metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap-num-comm-sms"]}},
-    )
-    """SMs the EP chunk overlap path reserves for communication."""
+    chunked two-stream schedule that overlaps the EP A2A with the expert GEMMs. Training only.
+    Its communication-SM budget is moe_flex_dispatcher_num_sms, shared with the flex
+    dispatcher rather than tuned separately."""
 
     moe_ep_chunk_overlap_num_chunks: int = field(
         default=4, metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap-num-chunks"]}}
@@ -2262,6 +2257,28 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # moe_ep_chunk_overlap refusals that are decidable from the config alone. Deliberately
+        # AFTER the moe_layer_recompute normalization above, which appends 'moe' to
+        # recompute_modules, so that route into the refused state is covered too. RAISE rather
+        # than assert: each of these guards the chunked wgrad FIFO, whose misordering is silent,
+        # and PYTHONOPTIMIZE=1 strips asserts.
+        if self.moe_ep_chunk_overlap:
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_ep_chunk_overlap forbids recompute_granularity='full': re-running the "
+                    "chunked forward inside the backward reorders the wgrad FIFO silently."
+                )
+            if self.recompute_granularity == 'selective' and 'moe' in (
+                self.recompute_modules or []
+            ):
+                raise ValueError(
+                    "moe_ep_chunk_overlap forbids 'moe' in recompute_modules: it wraps the whole "
+                    "chunked forward in a checkpoint, which reorders the wgrad FIFO silently. "
+                    "'moe_act' recomputes inside TE's own backward and is supported."
+                )
+            if self.moe_paged_stash:
+                raise ValueError("moe_ep_chunk_overlap does not support moe_paged_stash.")
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:

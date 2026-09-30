@@ -53,7 +53,12 @@ class _MoEEPChunkOverlapConfig:
     router_topk: int
     num_token_chunks: int
     world_size: int
-    num_comm_SMs: int
+    num_comm_SMs: int | None
+    #: Experts owned by THIS rank. Supplied by the caller, never re-derived here: world_size is
+    #: the DISPATCH group (expert-tensor-parallel x expert-parallel), so num_experts // world_size
+    #: is too small by the expert-tensor-parallel factor and would silently under-fetch the
+    #: expert weights and under-size receive capacity.
+    num_local_experts: int
 
     def __post_init__(self) -> None:
         if self.num_token_chunks < 1:
@@ -75,10 +80,6 @@ class _MoEEPChunkOverlapConfig:
     @property
     def largest_token_chunk_size(self) -> int:
         return -(-self.num_local_tokens // self.num_token_chunks)
-
-    @property
-    def num_local_experts(self) -> int:
-        return self.num_experts // self.world_size
 
     @property
     def max_num_expanded_tokens_per_chunk(self) -> int:
@@ -394,7 +395,7 @@ class MoEEPChunkOverlapRuntime:
         hidden_size: int,
         ffn_hidden_size: int,
         num_chunks: int,
-        num_comm_SMs: int,
+        num_comm_SMs: int | None,
         experts: torch.nn.Module,
         tp_ep_group: torch.distributed.ProcessGroup,
         num_local_experts: int,
@@ -412,7 +413,7 @@ class MoEEPChunkOverlapRuntime:
         self._hidden_size: int = hidden_size
         self._ffn_hidden_size: int = ffn_hidden_size
         self._num_chunks: int = num_chunks
-        self._num_comm_SMs: int = num_comm_SMs
+        self._num_comm_SMs: int | None = num_comm_SMs
         self._transport_type: MoEEPTransportType = transport_type
 
         self.config: _MoEEPChunkOverlapConfig | None = None
@@ -456,6 +457,7 @@ class MoEEPChunkOverlapRuntime:
             num_token_chunks=self._num_chunks,
             world_size=world_size,
             num_comm_SMs=self._num_comm_SMs,
+            num_local_experts=self._num_local_experts,
         )
         self.config = overlap_config
         self.device = torch.device(flat_hidden.device)
@@ -594,23 +596,27 @@ class MoEEPChunkOverlapRuntime:
         """Reduce-scatter each EGTP expert group's accumulated wgrad ONCE, then drop the shadows."""
         num_local_experts = self.config.num_local_experts
         params = self.expert_params
+        # Hoisted out of the loop below: one expert_gtp_weight_remat_size governs BOTH expert
+        # linears, so either one's leader decides for both and the test cannot differ per group.
+        leader = params[0]
+        if not is_gtp_param(leader):
+            return
+
         for op, weights in (
             (self._fc2_op, params[num_local_experts:]),
             (self._fc1_op, params[:num_local_experts]),
         ):
             if op is None:
                 continue
-            leader = weights[0]
-            if not is_gtp_param(leader):
-                continue
+            group_leader = weights[0]
 
             wgrads = []
             for index in range(num_local_experts):
                 shadow = op.__dict__.get(f"weight{index}")
                 wgrads.append(getattr(shadow, "main_grad", None))
 
-            # ONE reduce-scatter per group
-            leader.finalize_group_grads(wgrads)
+            # ONE reduce-scatter per group, through THAT group's own leader
+            group_leader.finalize_group_grads(wgrads)
 
             # Restore the non-EGTP post-backward state: an empty slot.
             for index in range(num_local_experts):
