@@ -2654,11 +2654,7 @@ def _abort_created_process_groups():
         return
 
     def abort_group(group):
-        backend = group._get_backend(torch.device("cuda"))
-        if hasattr(backend, "abort"):
-            backend.abort()
-        else:  # torch < 2.6
-            backend._shutdown()
+        group._get_backend(torch.device("cuda")).abort()
 
     # Like nvrx, start all aborts together: outstanding work on different
     # communicators can depend on one another (pytorch#119797).
@@ -2682,13 +2678,14 @@ def _clear_dtensor_sharding_cache():
     from torch.distributed.tensor import DTensor
 
     cache = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding
-    clear_python_cache = getattr(cache, "cache_clear", None)
-    if clear_python_cache is None:  # Older LocalLRUCache only exposes the wrapped LRU.
-        clear_python_cache = cache.cache.cache_clear
-    clear_python_cache()
-    clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
-    if clear_native_cache is not None:
-        clear_native_cache()
+    if is_torch_min_version("2.10.0"):
+        cache.cache_clear()
+        # The C++ dispatch fast path keeps its own sharding cache in front of the LRU.
+        torch._C._clear_DTensor_sharding_propagator_cache()
+    else:
+        # LocalLRUCache exposes cache_clear() from torch 2.10; before that, clear the LRU
+        # it wraps.
+        cache.cache.cache_clear()
 
 
 def destroy_model_parallel(*, abort: bool = False) -> None:

@@ -88,9 +88,11 @@ def test_repeated_lifetimes_release_process_groups(
         _assert_world_usable()
 
 
-@pytest.mark.parametrize("direct_cache_clear", [False, True], ids=["torch_2_6_to_2_9", "current"])
+@pytest.mark.parametrize(
+    "torch_2_10_or_later", [False, True], ids=["torch_2_6_to_2_9", "torch_2_10_or_later"]
+)
 def test_destroy_invalidates_dtensor_sharding_cache(
-    distributed_without_model_parallel, monkeypatch, direct_cache_clear
+    distributed_without_model_parallel, monkeypatch, torch_2_10_or_later
 ):
     current_group = [object()]
 
@@ -98,8 +100,9 @@ def test_destroy_invalidates_dtensor_sharding_cache(
     def cached_sharding(mesh_layout):
         return current_group[0]
 
+    # LocalLRUCache wraps an LRU and exposes cache_clear() from torch 2.10.
     propagate = SimpleNamespace(cache=cached_sharding)
-    if direct_cache_clear:
+    if torch_2_10_or_later:
         propagate.cache_clear = cached_sharding.cache_clear
     dtensor = SimpleNamespace(
         _op_dispatcher=SimpleNamespace(
@@ -107,6 +110,7 @@ def test_destroy_invalidates_dtensor_sharding_cache(
         )
     )
     monkeypatch.setitem(sys.modules, "torch.distributed.tensor", SimpleNamespace(DTensor=dtensor))
+    monkeypatch.setattr(ps, "is_torch_min_version", lambda version: torch_2_10_or_later)
     native_cache = {"same_mesh": current_group[0]}
     monkeypatch.setattr(
         torch._C, "_clear_DTensor_sharding_propagator_cache", native_cache.clear, raising=False
@@ -118,7 +122,8 @@ def test_destroy_invalidates_dtensor_sharding_cache(
 
     assert cached_sharding("same_mesh") is current_group[0]
     assert cached_sharding("same_mesh") is not previous_group
-    assert not native_cache
+    # The native cache exists, and is cleared, only from torch 2.10.
+    assert bool(native_cache) != torch_2_10_or_later
 
 
 @pytest.mark.skipif(Utils.world_size < 4, reason="Requires partial DP and hierarchical CP")
@@ -203,6 +208,7 @@ def test_initialize_clears_thread_local_dtensor_caches(
         )
     )
     monkeypatch.setitem(sys.modules, "torch.distributed.tensor", SimpleNamespace(DTensor=dtensor))
+    monkeypatch.setattr(ps, "is_torch_min_version", lambda version: True)
     monkeypatch.setattr(
         torch._C,
         "_clear_DTensor_sharding_propagator_cache",
