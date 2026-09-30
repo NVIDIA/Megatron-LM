@@ -70,22 +70,16 @@ class HybridStackNode(TransformerLayerNode):
 
     Subclassed from ``TransformerLayerNode`` so the runtime backbone (forward /
     backward / backward_dw plumbing, detach bookkeeping, output-grad release)
-    is shared. The hybrid path keeps a separate node class so its free-input
-    policy can diverge from the GPT defaults — for example, the
+    is shared. The subclass is where the hybrid free-input policy lives: the
     ``pre_dispatch_computation`` slot here covers the whole pre-dispatch loop
-    (mamba + attention + …) rather than a single attention block, and
-    group-level decisions about whether the input is needed in backward may
-    differ from ``should_free_input`` in ``gpt/fine_grained_callables.py``.
-    Keep this override thin until a hybrid counter-example forces it to
-    diverge; the explicit subclass exists so the divergence can be made
-    surgically without touching the GPT class.
+    (mamba + attention + …) rather than a single attention block.
     """
 
     @staticmethod
     def _resolve_free_input(name, is_moe, config, num_local_experts):
         """Hybrid free-input policy.
 
-        Currently mirrors the GPT default: dense layers always retain their
+        Same as the GPT default: dense layers always retain their
         input for backward; MoE-only "moe_dispatch", "mlp", and "moe_combine"
         slots can free, subject to the dispatcher / cuda-graph constraints
         encoded in ``should_free_input``. Hybrid groups have a
@@ -93,8 +87,7 @@ class HybridStackNode(TransformerLayerNode):
         loop over Mamba/attention/GDN sub-layers, not a single attention
         block), but its policy resolves to ``False`` in
         ``should_free_input``, which is correct: pre-layer outputs are needed
-        for backward through the loop. Override here when a hybrid-specific
-        rule is needed.
+        for backward through the loop.
         """
         return should_free_input(name, is_moe, config, num_local_experts)
 
@@ -225,16 +218,12 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
     output = layer.mlp.combine(output)
     output = layer.mlp.postprocess(output, shared_expert_output)
-    # Inline bda instead of calling ``layer._forward_post_mlp`` so we can skip
-    # the redundant ``discard_output_and_register_recompute(mlp_output_with_bias[0])``
-    # that ``_forward_post_mlp`` would otherwise issue. The pre_mlp_layernorm recompute
-    # is already registered on ``expert_output`` inside ``_run_moe_experts``; the second
-    # hook on the combine-slot ``mlp_output_with_bias[0]`` is not only unnecessary but
-    # harmful in the bracketed-hybrid case (``[*E]``): it fires during combine_bwd's
-    # autograd backward and triggers the LN recompute ahead of attention's backward
-    # in the same pre_dispatch slot, corrupting attention gradients (grad_norm explodes
-    # from iter 2). GPT's ``submodule_combine_forward`` likewise inlines bda and does
-    # not call ``_forward_post_mlp`` for the same reason.
+    # Inline bda instead of calling ``layer._forward_post_mlp``, which would register
+    # a second pre_mlp_layernorm recompute hook on the combine output. The hook is
+    # already registered on ``expert_output`` in ``_run_moe_experts``. A second one
+    # would run the layernorm recompute before attention's backward in the same
+    # pre-dispatch slot of a bracketed group (``[*E]``), which corrupts the attention
+    # gradients. GPT's ``submodule_combine_forward`` inlines bda for the same reason.
     mlp_output_with_bias = (output, None)
     with layer.bias_dropout_add_exec_handler():
         output = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
@@ -260,7 +249,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
     """Create fine-grained callables for one logical HybridStack layer.
 
     A logical layer may be a bracketed nested ``HybridStack`` (for example ``[M*E]``)
-    or a single legacy hybrid layer symbol. The split is:
+    or a single ungrouped hybrid layer symbol. The split is:
     pre-dispatch compute -> dispatch -> MLP/experts -> combine.
     """
     pre_layers, terminal_type, terminal_layer, is_moe, num_local_experts = (
@@ -301,12 +290,11 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                     # a view from a fused/JIT kernel). Downstream cuBLAS matmuls — including
                     # the terminal MLP/MoE's pre_mlp_layernorm and the next attention's QKV
                     # projection in a multi-pre-layer group — pick algorithms based on input
-                    # strides; a view's non-canonical strides can lead to different algo
-                    # selection across processes and produce ~1e-5 bit drift on the forward
-                    # output. TransformerLayer's full forward() inserts this exact call at the
-                    # MLP exit (transformer_layer.py:895) for the same reason; the
-                    # _forward_attention shortcut here doesn't get that cleanup, so we add it
-                    # explicitly. Same idea as the make_viewless_tensor in _maybe_apply_final_norm.
+                    # strides, so a view can make the forward output differ slightly between
+                    # processes. TransformerLayer makes its MLP output viewless for the same
+                    # reason (``TransformerLayer._apply_mlp_bda_step``); the _forward_attention
+                    # shortcut here does not, so do it explicitly. Same idea as the
+                    # make_viewless_tensor in _maybe_apply_final_norm.
                     hidden_states = make_viewless_tensor(
                         inp=hidden_states,
                         requires_grad=hidden_states.requires_grad,
