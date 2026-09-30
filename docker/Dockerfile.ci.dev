@@ -233,6 +233,21 @@ RUN bash -ex <<"EOF"
     rm -rf DeepEP
 EOF
 
+# NGC 26.09 bundles FA4 beta24, which calls a helper removed by newer Quack.
+# Backport Dao-AILab/flash-attention#2787 onto the bundled package.
+COPY docker/patches/flash-attn-quack.patch /opt/flash-attn-build-info/quack.patch
+RUN bash -ex <<"EOF"
+    if [ "$IMAGE_TYPE" = "lts" ]; then
+        exit 0
+    fi
+    FA4_SITE_PACKAGES=$(python -c 'from importlib.metadata import distribution; d = distribution("flash-attn-4"); assert d.version == "4.0.0b24", f"Re-evaluate the FA4 Quack backport for version {d.version}"; print(d.locate_file(""))')
+    patch --batch --forward --fuzz=0 -p1 -d "${FA4_SITE_PACKAGES}" < /opt/flash-attn-build-info/quack.patch
+    python -c 'import cutlass.cute as cute; from flash_attn.cute import utils; assert callable(cute.arch.sub_packed_f32x2)'
+    printf 'flash-attn-4==4.0.0b24\nbackport=145b1010051dbfd4bdc41a0ae55d495b08d7a458\n' > /opt/flash-attn-build-info/revision
+    sha256sum "${FA4_SITE_PACKAGES}/flash_attn/cute/utils.py" \
+        "${FA4_SITE_PACKAGES}/flash_attn/cute/flash_bwd_sm100.py" > /opt/flash-attn-build-info/patched-files.sha256
+EOF
+
 # Install the local project after expensive dependency builds so README-only
 # changes do not invalidate those layers.
 COPY README.md /workspace/
