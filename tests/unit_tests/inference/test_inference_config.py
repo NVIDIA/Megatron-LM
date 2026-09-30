@@ -147,9 +147,11 @@ class TestInferenceConfig:
                     "expansion_mode": "temporal_patch",
                     "include_frame_timestamps_for_nemotron_vl": True,
                 },
+                "content_part_order": "media_first",
             }
         )
 
+        assert config.content_part_order == "media_first"
         assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
         assert config.get_spec("video") == MediaPromptSpec(
             model_token="<video>",
@@ -162,7 +164,8 @@ class TestInferenceConfig:
 
     def test_multimodal_prompt_config_partial_override_preserves_wrapper_defaults(self):
         defaults = MultimodalPromptConfig(
-            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>")
+            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
+            content_part_order="media_first",
         )
 
         config = MultimodalPromptConfig.from_dict(
@@ -182,6 +185,11 @@ class TestInferenceConfig:
             expansion_mode="temporal_patch",
             include_frame_timestamps_for_nemotron_vl=True,
         )
+        assert config.content_part_order == "media_first"
+
+    def test_multimodal_prompt_config_rejects_invalid_content_part_order(self):
+        with pytest.raises(ValueError, match="content_part_order"):
+            MultimodalPromptConfig(content_part_order="interleave")
 
     def test_media_prompt_timestamps_require_temporal_expansion(self):
         with pytest.raises(ValueError, match="requires"):

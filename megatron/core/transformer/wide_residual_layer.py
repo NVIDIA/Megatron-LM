@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
@@ -22,6 +23,7 @@ from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_writeback,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 _MIN_CONTROLLER_NUMEL = 128
 
@@ -192,6 +194,21 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             (),
         )
 
+    def _read_with_output_dtype(
+        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
+    ) -> tuple[Tensor, ResidualConnectionWriteState]:
+        """Fuse an optional branch-output conversion into the streamwise read."""
+
+        return (
+            streamwise_sigmoid_read(
+                hidden_states,
+                self.read_map(return_logits=True),
+                self.num_streams,
+                output_dtype=output_dtype,
+            ),
+            (),
+        )
+
     def _write(
         self,
         branch_output: ResidualBranchOutput,
@@ -206,7 +223,18 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         else:
             branch_update, bias = branch_output, None
 
-        branch_update = branch_update.to(dtype=residual_stream.dtype)
+        dropout_is_active = training and dropout_probability > 0.0
+        defer_update_cast = (
+            residual_stream.dtype == torch.float32
+            and branch_update.dtype in (torch.bfloat16, torch.float16)
+            and bias is None
+            and not dropout_is_active
+        )
+        # Bias addition and active dropout currently run in residual precision. Only defer the
+        # update cast when neither operation can observe its placement; the mixed-dtype Triton
+        # write then performs the BF16/FP16 -> FP32 conversion while loading the update.
+        if not defer_update_cast:
+            branch_update = branch_update.to(dtype=residual_stream.dtype)
         if bias is not None:
             branch_update = branch_update + bias.to(
                 device=branch_update.device, dtype=branch_update.dtype
@@ -223,6 +251,118 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             retention_logits=retention_logits,
             retention_max_forget=(self.retention.max_forget if self.retention is not None else 0.0),
         )
+
+
+class WideResidualTransformerLayer(TransformerLayer):
+    """Transformer layer carrying a wide stream around ordinary-width branches."""
+
+    supports_wide_residual_connections: bool = True
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            hidden_dropout=hidden_dropout,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            is_mtp_layer=is_mtp_layer,
+            add_layer_offset=add_layer_offset,
+            pp_layer_offset=pp_layer_offset,
+            name=name,
+        )
+
+        if config.wide_residual is None:
+            raise ValueError("WideResidualTransformerLayer requires wide_residual config.")
+        if not isinstance(self.cross_attention, IdentityOp):
+            raise NotImplementedError(
+                "WideResidualTransformerLayer does not support cross-attention branches."
+            )
+
+        self.residual_connection_self_attn = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=self.config,
+                layer_number=self.layer_number,
+                branch_name="self_attention",
+                pg_collection=self.pg_collection,
+                name=(name + ".residual_connection_self_attn") if name is not None else None,
+            )
+            if not isinstance(self.self_attention, IdentityOp)
+            else None
+        )
+        self.residual_connection_mlp = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=self.config,
+                layer_number=self.layer_number,
+                branch_name="mlp",
+                pg_collection=self.pg_collection,
+                name=(name + ".residual_connection_mlp") if name is not None else None,
+            )
+            if not isinstance(self.mlp, IdentityOp)
+            else None
+        )
+
+        residual_connections = [
+            connection
+            for connection in (self.residual_connection_self_attn, self.residual_connection_mlp)
+            if connection is not None
+        ]
+        if (
+            self.residual_connection_self_attn is not None
+            and self._input_layernorm_returns_residual
+        ):
+            raise ValueError(
+                "A self-attention residual connection cannot be combined with a layer norm "
+                "that returns its own residual."
+            )
+        if self.residual_connection_mlp is not None and self._pre_mlp_layernorm_returns_residual:
+            raise ValueError(
+                "An MLP residual connection cannot be combined with a layer norm that returns "
+                "its own residual."
+            )
+        if residual_connections and self.config.inference_fuse_tp_communication:
+            raise NotImplementedError(
+                "Wide-residual connections do not support fused tensor-parallel inference."
+            )
+
+        self.residual_stream_hidden_size = (
+            config.wide_residual.num_streams * self.config.hidden_size
+        )
+        for connection in residual_connections:
+            if connection.residual_stream_hidden_size != self.residual_stream_hidden_size:
+                raise ValueError(
+                    "All wide-residual connections must carry num_streams * hidden_size "
+                    f"features, expected {self.residual_stream_hidden_size}, got "
+                    f"{connection.residual_stream_hidden_size}."
+                )
+            if connection.branch_hidden_size != self.config.hidden_size:
+                raise ValueError(
+                    "Wide-residual connections around TransformerLayer branches must produce "
+                    f"hidden_size={self.config.hidden_size}, got "
+                    f"{connection.branch_hidden_size}."
+                )
+
+    def _get_self_attention_residual_connection(self) -> ResidualConnection | None:
+        """Return the connection surrounding the self-attention branch."""
+
+        return self.residual_connection_self_attn
+
+    def _get_mlp_residual_connection(self) -> ResidualConnection | None:
+        """Return the connection surrounding the MLP or MoE branch."""
+
+        return self.residual_connection_mlp
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):
