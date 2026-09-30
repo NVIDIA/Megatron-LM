@@ -2,6 +2,8 @@
 
 import pytest
 import torch
+from packaging.version import Version
+from torch.torch_version import TorchVersion
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
@@ -9,10 +11,50 @@ from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
+    cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("version_type", [str, TorchVersion])
+@pytest.mark.parametrize(
+    "torch_version,git_version,needs_registration",
+    [
+        ("2.13.0", "Unknown", True),
+        ("2.14.0a0+4fdf77b940.nv26.08", "Unknown", False),
+        ("2.14.0a0+4fdf77b940.nv26.08", "4fdf77b940" + "0" * 30, False),
+        ("2.14.0a0+4fdf77b940.nv26.08", "b2c75dd062" + "0" * 30, True),
+        ("2.14.0a0+b2c75dd062.nv26.09", "Unknown", True),
+        ("2.14.0a0+4fdf77b940.custom", "Unknown", True),
+        ("2.14.0a0+4fdf77b940.NV26.08", "Unknown", True),
+        ("2.14.0.dev20261001", "Unknown", True),
+        ("2.14.0", "Unknown", True),
+        ("2.15.0a0", "Unknown", True),
+    ],
+)
+def test_cudagraph_generator_registration_policy(
+    monkeypatch, version_type, torch_version, git_version, needs_registration
+):
+    monkeypatch.setattr(torch, "__version__", version_type(torch_version))
+    monkeypatch.setattr(torch.version, "git_version", git_version)
+    monkeypatch.setattr("megatron.core.utils._torch_version", Version(torch_version))
+    assert cudagraph_needs_generator_registration() is needs_registration
+
+
+def test_cudagraph_custom_generator_replay():
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    reference_generator = torch.Generator(device="cuda").manual_seed(1234)
+    expected = [torch.rand(32, device="cuda", generator=reference_generator) for _ in range(2)]
+    graph = torch.cuda.CUDAGraph()
+    if cudagraph_needs_generator_registration():
+        graph.register_generator_state(generator)
+    with torch.cuda.graph(graph):
+        output = torch.rand(32, device="cuda", generator=generator)
+    for reference in expected:
+        graph.replay()
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
 def test_cuda_rng_states_tracker():

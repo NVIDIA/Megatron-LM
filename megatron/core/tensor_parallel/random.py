@@ -451,13 +451,15 @@ def get_all_rng_states():
 def cudagraph_needs_generator_registration() -> bool:
     """Whether generators must be registered with a `torch.cuda.CUDAGraph` before capture.
 
-    PyTorch >= 2.14 (pytorch/pytorch#176753) lazily registers every generator whose Philox
-    state is consumed during capture, and `CUDAGraph.register_generator_state()` became a
-    deprecated no-op that prints a warning on *every* call. Skip the explicit registration
-    there: it does nothing, and with one call per layer, per graph and per generator it floods
-    stderr (tens of thousands of lines per rank for dynamic inference with CUDA graphs).
+    NGC 26.08's exact PyTorch build implements lazy registration from pytorch/pytorch#176753;
+    explicit registration is a deprecated no-op that floods stderr. Other 2.14 prereleases,
+    including NGC 26.09, require registration again, so a minimum version is insufficient.
+    Skip only the verified no-op build and conservatively register on every other build.
     """
-    return not is_torch_min_version("2.14.0a0")
+    if str(torch.__version__) != "2.14.0a0+4fdf77b940.nv26.08":
+        return True
+    git_version = getattr(torch.version, "git_version", None)
+    return git_version not in (None, "Unknown") and not git_version.startswith("4fdf77b940")
 
 
 def model_parallel_cuda_manual_seed(
