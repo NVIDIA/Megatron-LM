@@ -8,11 +8,8 @@ from typing import Literal, Optional
 import torch
 
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-from megatron.core.dist_checkpointing.mapping import (
-    ShardedObject,
-    ShardedTensor,
-    ShardedTensorFactory,
-)
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -93,28 +90,15 @@ def _allow_gtp_padding_shape_mismatch(sharded_state_dict) -> None:
     dict_list_map_inplace(mark_weight, sharded_state_dict)
 
 
-def _remap_checkpoint_keys(sharded_state_dict, prefix: str, renames: dict[str, str]) -> None:
-    """Map model sharded keys to a checkpoint's naming: substring renames, then a prefix."""
-
-    def remap(value):
-        if isinstance(value, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
-            for old, new in renames.items():
-                value.key = value.key.replace(old, new)
-            value.key = prefix + value.key
-        return value
-
-    dict_list_map_inplace(remap, sharded_state_dict)
-
-
 def _get_checkpoint_model_modifier(args: Namespace):
     """Compose the model sharded state dict adjustments requested by args, if any."""
     prefix = getattr(args, 'checkpoint_model_prefix', '')
-    renames = getattr(args, 'checkpoint_model_key_renames', {})
-    if not prefix and not renames and not args.inference_allow_gtp_padding:
+    if not prefix and not args.inference_allow_gtp_padding:
         return None
 
     def modifier(sharded_state_dict):
-        _remap_checkpoint_keys(sharded_state_dict, prefix, renames)
+        if prefix:
+            apply_prefix_mapping(sharded_state_dict, {'': prefix})
         if args.inference_allow_gtp_padding:
             _allow_gtp_padding_shape_mismatch(sharded_state_dict)
 

@@ -148,8 +148,6 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
         if 'model_provider' not in user_passed_attrs:
             args.model_provider = 'hybrid'
         args.checkpoint_model_prefix = _MIMO_LANGUAGE_MODEL_PREFIX
-        # Map ShortcutMoEBlock's sublayer compute_layer to the current model's attn_layer.
-        args.checkpoint_model_key_renames = {'.attn_layer.': '.compute_layer.'}
         return False
     if not hasattr(checkpoint_args, 'language_model_type'):
         return False

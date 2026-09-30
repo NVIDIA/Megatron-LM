@@ -453,7 +453,7 @@ class HybridStack(MegatronModule):
         physical_layers = []
         for layer in self.layers:
             if isinstance(layer, ShortcutMoEBlock):
-                physical_layers.extend((layer.attn_layer, layer.moe_layer))
+                physical_layers.extend((layer.compute_layer, layer.moe_layer))
             else:
                 physical_layers.append(layer)
         return tuple(physical_layers)

@@ -97,7 +97,7 @@ def group_layers_into_shortcut_blocks(
             physical_index += 1
             continue
 
-        attn_layer = layers[physical_index]
+        compute_layer = layers[physical_index]
         paired_type = layer_type_list[physical_index]
         if paired_type not in SUPPORTED_SHORTCUT_PREDECESSORS:
             raise ValueError(
@@ -105,8 +105,8 @@ def group_layers_into_shortcut_blocks(
             )
 
         supports_two_stage = (
-            isinstance(attn_layer, TwoStageAttentionLayer)
-            and attn_layer.supports_two_stage_attention()
+            isinstance(compute_layer, TwoStageAttentionLayer)
+            and compute_layer.supports_two_stage_attention()
         )
         if not supports_two_stage:
             raise ValueError(
@@ -115,7 +115,7 @@ def group_layers_into_shortcut_blocks(
         moe_layer = layers[physical_index + 1]
         grouped_layers.append(
             ShortcutMoEBlock(
-                attn_layer,
+                compute_layer,
                 moe_layer,
                 overlap_a2a=config.moe_shortcut_parallel,
                 attn_local_idx=physical_index,
@@ -141,25 +141,25 @@ class ShortcutMoEBlock(MegatronModule):
 
     def __init__(
         self,
-        attn_layer,
+        compute_layer,
         moe_layer,
         overlap_a2a: bool,
         attn_local_idx: int | None = None,
         moe_local_idx: int | None = None,
     ):
-        super().__init__(attn_layer.config)
+        super().__init__(compute_layer.config)
 
         self.overlap_mode = overlap_a2a
-        self.layer_number = attn_layer.layer_number
-        self.attn_layer_idx = attn_layer.layer_number - 1
+        self.layer_number = compute_layer.layer_number
+        self.attn_layer_idx = compute_layer.layer_number - 1
         self.attn_local_idx = attn_local_idx
         self.moe_layer_idx = moe_layer.layer_number - 1
         self.moe_local_idx = moe_local_idx
 
-        self.is_first_layer = getattr(attn_layer, "is_first_layer", False)
+        self.is_first_layer = getattr(compute_layer, "is_first_layer", False)
         self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
         self.tp_group = moe_layer.mlp.tp_group
-        self.attn_layer = attn_layer
+        self.compute_layer = compute_layer
         self.moe_layer = moe_layer
         self.recompute_shortcut_pre_mlp_layernorm = (
             self.config.recompute_granularity == "selective"
@@ -291,7 +291,7 @@ class ShortcutMoEBlock(MegatronModule):
         combined_output.record_stream(torch.cuda.current_stream())
         return combined_output
 
-    def _forward_attn_layer_atomic(
+    def _forward_compute_atomic(
         self,
         hidden_states,
         *,
@@ -306,14 +306,14 @@ class ShortcutMoEBlock(MegatronModule):
 
         Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
         """
-        if isinstance(self.attn_layer, MambaLayer):
-            return self.attn_layer(
+        if isinstance(self.compute_layer, MambaLayer):
+            return self.compute_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
             )
-        hidden_states, _ = self.attn_layer(
+        hidden_states, _ = self.compute_layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -351,7 +351,7 @@ class ShortcutMoEBlock(MegatronModule):
             raise RuntimeError(
                 "Shortcut-MoE inference does not support mlp_chunks_for_prefill greater than 1."
             )
-        attn_config = self.attn_layer.config
+        attn_config = self.compute_layer.config
         moe_config = self.moe_layer.config
 
         with quant_context_factory(moe_config, self.moe_layer_idx):
@@ -362,7 +362,7 @@ class ShortcutMoEBlock(MegatronModule):
             )
 
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            attn_layer_output = self._forward_attn_layer_atomic(
+            attn_layer_output = self._forward_compute_atomic(
                 hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -424,7 +424,7 @@ class ShortcutMoEBlock(MegatronModule):
                 quant_context_factory=quant_context_factory,
             )
 
-        attn_config = self.attn_layer.config
+        attn_config = self.compute_layer.config
         moe_config = self.moe_layer.config
         if cp_layout_state is not None:
             assert self.attn_local_idx is not None and self.moe_local_idx is not None
@@ -450,7 +450,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            paired_state = self.attn_layer.forward_pre_attn_and_core_attn(
+            paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -480,7 +480,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the output layer of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            attn_layer_output = self.attn_layer.forward_post_core_attn(*paired_state)
+            attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
             if isinstance(attn_layer_output, tuple):
                 attn_layer_output = attn_layer_output[0]
 

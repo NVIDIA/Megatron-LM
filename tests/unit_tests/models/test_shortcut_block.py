@@ -127,7 +127,7 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert grouped[2] is trailing_layer
     shortcut = grouped[1]
     assert isinstance(shortcut, ShortcutMoEBlock)
-    assert shortcut.attn_layer is compute
+    assert shortcut.compute_layer is compute
     assert shortcut.moe_layer is paired_moe
     assert shortcut.attn_layer_idx == compute.layer_number - 1
     assert shortcut.moe_layer_idx == paired_moe.layer_number - 1
