@@ -42,8 +42,16 @@ class ConfigContainerBase:
     """
     Configuration container base class for Megatron configurations.
 
-    Provides YAML/Dict serialization and deserialization.
+    Provides sub-config validation and YAML/Dict serialization and deserialization.
     """
+
+    def validate(self) -> None:
+        """Run each sub-config's explicit validation before runtime initialization."""
+        for config_field in dataclass_fields(self):
+            config = getattr(self, config_field.name)
+            validate = getattr(config, "validate", None)
+            if callable(validate):
+                validate()
     
     @classmethod
     def from_dict(

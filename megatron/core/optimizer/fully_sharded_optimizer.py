@@ -13,6 +13,7 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
+from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -87,8 +88,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        # Multiple model chunks are allowed: VPP shares a single FsdpContext across
+        # chunks, and FullyShardedOptimizer optimizes every chunk's parameters
+        # together (self.model_chunks is iterated in zero_grad / get_parameters).
+        if not model_chunks:
+            raise ValueError("MFSDP v2 requires at least one model chunk.")
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:
@@ -219,6 +223,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
+
+        if not is_te_min_version("2.18.0"):
+            # Older TE FusedAdam requires empty local shards to be omitted from optimizer
+            # parameter groups (see the matching workaround in get_megatron_optimizer()).
+            # Those parameters are not cleared by optimizer.zero_grad().
+            for model_chunk in self.model_chunks:
+                model_chunk.zero_grad(set_to_none=set_to_none)
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""

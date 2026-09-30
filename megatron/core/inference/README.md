@@ -24,6 +24,12 @@ For the full documentation, including supported features, basic and advanced
 usage, direct compared to coordinator modes, the OpenAI-compatible server, known
 limitations, and the roadmap, refer to the [Megatron Core Inference user guide](../../../docs/mcore-inference-user-guide.md).
 
+`DynamicInferenceEngine.step_modern()` and `generate()` return flat,
+token-complete `DynamicInferenceRequest` objects whose `generated_text` is
+initially `None`. Low-level callers must call `request.finalize_text(tokenizer)`
+at the boundary where decoded text is needed. The high-level APIs and
+coordinator perform this finalization when requested.
+
 ## Additional Resources
 
 - Examples: [`examples/inference/`](../../../examples/inference/)

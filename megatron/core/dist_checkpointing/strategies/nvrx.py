@@ -3,6 +3,8 @@
 """Helpers for interacting with the experimental nvidia-resiliency-ext API."""
 
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import Any, Callable, Dict
 
 try:
@@ -41,9 +43,8 @@ def has_nvrx_async_support() -> bool:
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    assert (
-        is_nvrx_min_version()
-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
+    if not is_nvrx_min_version():
+        return False
 
     return all(symbol is not None for symbol in required_symbols) and hasattr(
         filesystem_async, "_results_queue"
@@ -82,6 +83,14 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
     except (ImportError, ModuleNotFoundError):
         HAVE_NVRX = False
 
-    nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
+    if not HAVE_NVRX:
+        return False
 
-    return PkgVersion(nvrx_version) >= PkgVersion(version)
+    nvrx_version = getattr(nvrx, "__version__", None)
+    if nvrx_version is None:
+        try:
+            nvrx_version = package_version("nvidia-resiliency-ext")
+        except PackageNotFoundError:
+            return False
+
+    return PkgVersion(str(nvrx_version)) >= PkgVersion(version)
