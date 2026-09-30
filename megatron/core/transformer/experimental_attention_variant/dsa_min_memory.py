@@ -605,6 +605,53 @@ def _apply_indexer_input_norm_tile(
 _apply_simplified_input_norm_tile = _apply_indexer_input_norm_tile
 
 
+_INDEXER_K_BUILD_CHUNK = 8192
+
+
+def _build_full_indexer_k(
+    hidden_states: torch.Tensor,
+    linear_k_weight: torch.Tensor,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    simplified_input_norm=None,
+) -> torch.Tensor:
+    """Project the indexer K for the whole sequence, in bounded chunks.
+
+    The result is small -- [sequence, batch, 1, index_head_dim] -- but building it in one call
+    is not. _apply_indexer_input_norm_tile casts its input to FP32 and forms the normalized
+    product there, so a full-sequence call materialises several temporaries the size of
+    hidden_states in FP32: at sequence 131072 and hidden size 4096 that is gigabytes, against
+    tens of megabytes of result. Chunking bounds those temporaries without changing the output,
+    since the projection and its norm are both pointwise and the rotary positions are absolute.
+    """
+    rows = hidden_states.size(0)
+    chunk = min(_INDEXER_K_BUILD_CHUNK, rows)
+    full_k_index = None
+    for start in range(0, rows, chunk):
+        end = min(start + chunk, rows)
+        block = _project_simplified_k_index_block(
+            hidden_states,
+            start,
+            end,
+            linear_k_weight,
+            index_head_dim,
+            index_rotary_dim,
+            rotary_pos_emb,
+            rotary_interleaved,
+            use_indexer_rope,
+            simplified_input_norm,
+        )
+        if full_k_index is None:
+            full_k_index = block.new_empty((rows, *block.shape[1:]))
+        # Copy into the result and drop the block, rather than collecting the blocks and
+        # concatenating: a cat would hold every block and the joined tensor at the same time.
+        full_k_index[start:end] = block
+    return full_k_index
+
+
 def _project_simplified_q_index_tile(
     hidden_states: torch.Tensor,
     q_start: int,
@@ -1033,10 +1080,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 # for keys whose values do not depend on the tile. cache_indexer_k decides only
                 # whether this survives into the backward pass, below; the forward projects once
                 # either way.
-                full_k_index = _project_simplified_k_index_block(
+                full_k_index = _build_full_indexer_k(
                     hidden_states,
-                    0,
-                    hidden_states.size(0),
                     linear_k_weight,
                     index_head_dim,
                     index_rotary_dim,
@@ -1112,10 +1157,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             # tile. This is the recompute the empty cached_k asked for, done once rather than
             # once per tile, and it is released when this backward returns.
             with torch.no_grad():
-                full_k_index = _project_simplified_k_index_block(
+                full_k_index = _build_full_indexer_k(
                     hidden_states,
-                    0,
-                    hidden_states.size(0),
                     linear_k_weight,
                     ctx.index_head_dim,
                     ctx.index_rotary_dim,
@@ -1895,10 +1938,8 @@ def dsa_min_memory_gqa_forward_only(
         with torch.no_grad(), _triton_dispatch_enabled(use_triton):
             # Project once, as the training forward does. Nothing is retained on this path --
             # there is no backward to feed -- so cache_indexer_k has nothing left to decide.
-            full_k_index = _project_simplified_k_index_block(
+            full_k_index = _build_full_indexer_k(
                 hidden_states,
-                0,
-                hidden_states.size(0),
                 linear_k_weight,
                 indexer.index_head_dim,
                 indexer.index_rotary_dim,
