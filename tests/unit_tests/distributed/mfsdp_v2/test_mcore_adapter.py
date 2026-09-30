@@ -934,7 +934,7 @@ class TestMcoreAdapterHybrid:
             module=_build_block(config),
             pg_collection=pg_collection,
         )
-        expected_outer = Shard(0) if outer_strategy == "optim" else Replicate()
+        expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
         for parameter in model.parameters():
             assert parameter.data.placements == (expected_outer, Shard(0))
         output = model(
@@ -967,9 +967,13 @@ class TestMcoreAdapterHybrid:
     def test_hybrid_matches_single_instance_accumulating(
         self, outer_size, outer_strategy, inner_strategy, microbatches
     ):
-        """Inner/outer sharding preserves updates, including no_sync accumulation."""
+        """Compare losses against one optimizer instance with ZeRO-3 across all DP ranks.
+
+        The reference has outer_size=1, so its inner DP group spans all ranks.
+        Both runs use the same global batches, including no_sync accumulation.
+        """
         config = self._config()
-        Utils.initialize_model_parallel(1, 1)
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
         model, optimizer = self._build_model_and_optimizer(config, 1, "no_shard")
         reference = self._train(model, optimizer, microbatches=microbatches)
         del model, optimizer
@@ -989,13 +993,14 @@ class TestMcoreAdapterHybrid:
     def test_moe_with_independent_hybrid_placements(
         self, dense_outer_strategy, expert_outer_strategy, ep_size
     ):
-        """Dense and expert parameters use different placements on the same hybrid mesh."""
+        """Check dense/expert placements and finite losses across accumulated optimizer steps."""
+        outer_size = 2
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size % (2 * ep_size):
-            pytest.skip("MoE + hybrid needs a world size divisible by EP * instances.")
+        if world_size % (outer_size * ep_size):
+            pytest.skip("MoE + hybrid needs a world size divisible by EP * 2 (outer DP size).")
 
         Utils.initialize_model_parallel(
-            1, 1, expert_model_parallel_size=ep_size, num_distributed_optimizer_instances=2
+            1, 1, expert_model_parallel_size=ep_size, num_distributed_optimizer_instances=outer_size
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         torch.manual_seed(123)
@@ -1027,7 +1032,7 @@ class TestMcoreAdapterHybrid:
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads",
                 expert_data_parallel_sharding_strategy="optim_grads_params",
-                num_distributed_optimizer_instances=2,
+                num_distributed_optimizer_instances=outer_size,
                 outer_dp_sharding_strategy=dense_outer_strategy,
                 expert_outer_dp_sharding_strategy=expert_outer_strategy,
             ),
