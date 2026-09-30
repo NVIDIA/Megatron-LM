@@ -499,6 +499,9 @@ class FsdpModule:
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
         # A reused module can enter backward again before its shared gradients are ready.
+        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
+        # This likely requires addressing static prefetch order for repeated invocations first:
+        # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is FsdpModule.Phase.BACKWARD:
             return
         self.phase = FsdpModule.Phase.BACKWARD
