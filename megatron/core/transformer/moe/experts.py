@@ -385,7 +385,6 @@ class TEGroupedMLP(MegatronModule):
             and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        self._virtual_experts = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -440,21 +439,19 @@ class TEGroupedMLP(MegatronModule):
     def bind_virtual_experts(self, load_balancer) -> None:
         """Bind native and virtual runtime weights after main gradients are initialized."""
         if self._fused_ops is not None:
-            raise RuntimeError(
-                "Virtual-expert weights must be bound before the first expert forward."
-            )
-        self._virtual_experts = load_balancer
+            raise RuntimeError("Virtual-expert weights must be bound before fused ops are created.")
+
         for fc_layer, linear in enumerate((self.linear_fc1, self.linear_fc2)):
-            weights = load_balancer.runtime_weights(fc_layer)
-            if len(weights) != linear.num_gemms:
+            runtime_weights = load_balancer.runtime_weights(fc_layer)
+            if len(runtime_weights) != linear.num_gemms:
                 raise ValueError("Runtime weight count must match grouped-linear GEMMs.")
             # TE's unfused path reads weight{i} with getattr(); the fused op copies these
-            # same references below. Keep DDP and checkpoint registration in _parameters.
-            for index, weight in enumerate(weights):
+            # same references below. Avoid registering virtual expertsas parameters so DDP
+            # and checkpointing dont pick them up.
+            for index, weight in enumerate(runtime_weights):
                 object.__setattr__(linear, f"weight{index}", weight)
-        if not self._with_fused_impl and not getattr(
-            self.linear_fc2.weight0, "is_distributed_weight", False
-        ):
+        # For non GTP, trigger the virtual expert reduce scatter on TE's 'wgrad_store'
+        if not getattr(self.linear_fc2.weight0, "is_distributed_weight", False):
             self.linear_fc2.wgrad_store = _VirtualExpertFC2WgradStore(load_balancer)
 
     @staticmethod
@@ -662,7 +659,6 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
-        virtual_experts = self._virtual_experts
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
@@ -793,8 +789,7 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
-        if virtual_experts is not None and not getattr(op.weight0, "is_distributed_weight", False):
-            op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_experts)
+        op.wgrad_store = self.linear_fc2.wgrad_store
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
         # view at the op boundary.

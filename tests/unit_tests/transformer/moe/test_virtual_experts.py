@@ -892,7 +892,7 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
                     for fc_layer, linear in enumerate(
                         (layer.experts.linear_fc1, layer.experts.linear_fc2)
                     ):
-                        runtime_weights = layer.experts._virtual_experts.runtime_weights(fc_layer)
+                        runtime_weights = manager.runtime_weights(fc_layer)
                         assert not hasattr(linear, "_runtime_weights")
                         assert all(
                             getattr(linear, f"weight{index}") is weight
