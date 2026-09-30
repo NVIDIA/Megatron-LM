@@ -594,7 +594,7 @@ def gpt_config_from_args(
 
 
 def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> ModuleSpec | None:
-    """Return the inference_optimized counterpart of a HybridStack training ``--spec``.
+    """Return the inference_optimized counterpart of a HybridStack training --spec.
 
     Checkpoints record their training spec, which --use-checkpoint-args restores; its inference
     sibling keeps the layer types, e.g. gated_delta_product_stack_spec ->
