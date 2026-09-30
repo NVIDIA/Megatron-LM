@@ -298,15 +298,13 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             return hidden_states
 
     def backward_dw(self):
-        """Compute weight gradients for the layer's linear projections.
+        """Compute the delayed weight gradients of the mixer's linear projections.
 
-        Delegates to the mixer; lets the hybrid EP-overlap schedule plan
-        register a Mamba pre-layer's wgrad alongside attention/GDN pre-layers
-        so the schedule node iterates a uniform set of callables. No-op when
-        the linears in the spec do not support delayed wgrad.
+        Lets the hybrid EP-overlap schedule plan register a Mamba pre-layer's wgrad
+        alongside attention/GDN pre-layers, so the schedule node iterates a uniform set
+        of callables.
         """
-        if hasattr(self.mixer, "backward_dw"):
-            self.mixer.backward_dw()
+        self.mixer.backward_dw()
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
