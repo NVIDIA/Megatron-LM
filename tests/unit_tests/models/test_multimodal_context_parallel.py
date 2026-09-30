@@ -388,6 +388,7 @@ class TestDynamicResCPDistributed:
                 global_t,
                 global_imgs_sizes,
                 global_packed_seq_params,
+                cp_group=parallel_state.get_context_parallel_group(),
                 patch_dim=patch_dim,
                 balance_by_tokens=True,
                 profile_partition=True,
@@ -400,7 +401,8 @@ class TestDynamicResCPDistributed:
         assert local_t.shape[1] == expected_num_tokens
 
         gathered = gather_from_context_parallel_ranks_dynamic_res(
-            local_t.permute(1, 0, 2).contiguous()
+            local_t.permute(1, 0, 2).contiguous(),
+            cp_group=parallel_state.get_context_parallel_group(),
         )
         torch.testing.assert_close(gathered, global_t.permute(1, 0, 2).contiguous(), rtol=0, atol=0)
 
@@ -530,6 +532,7 @@ class TestDynamicResCPDistributed:
                 global_t,
                 global_imgs_sizes,
                 global_packed_seq_params,
+                cp_group=parallel_state.get_context_parallel_group(),
                 patch_dim=patch_dim,
                 balance_by_tokens=True,
             )
@@ -565,6 +568,7 @@ class TestDynamicResCPDistributed:
                 global_t,
                 global_imgs_sizes,
                 global_packed_seq_params,
+                cp_group=parallel_state.get_context_parallel_group(),
                 patch_dim=patch_dim,
                 dummy_image_size=2 * patch_dim,
             )
