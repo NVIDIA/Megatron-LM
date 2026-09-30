@@ -17,6 +17,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -467,10 +468,45 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
+        if self.config.overlap_moe_expert_parallel_comm:
+            self._validate_ep_overlap_support()
+
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def _validate_ep_overlap_support(self) -> None:
+        """Reject features that the EP-overlap schedule plan cannot run.
+
+        Hash-routed MoE layers and wide residuals are rejected by TransformerConfig.
+        """
+        if self.config.cuda_graph_impl != "none":
+            raise ValueError(
+                "overlap_moe_expert_parallel_comm with HybridModel does not support CUDA graphs "
+                "yet. Set cuda_graph_impl='none'."
+            )
+        if self.config.enable_mhc_connections or self.config.moe_shortcut_connection:
+            raise ValueError(
+                "overlap_moe_expert_parallel_comm with HybridModel does not support "
+                "enable_mhc_connections or moe_shortcut_connection."
+            )
+        # The schedule plan calls the layer callables directly and bypasses
+        # ``HybridStack.forward``, which is where per-layer context-parallel layout
+        # conversion happens. A bracketed group presents the boundary layout to its
+        # enclosing stack even when its own layers need conversion, so check every
+        # stack, including the nested ones.
+        for module in self.modules():
+            if (
+                isinstance(module, HybridStack)
+                and module._cp_layout_manager is not None
+                and module._cp_layout_manager.requires_conversion
+            ):
+                raise ValueError(
+                    "overlap_moe_expert_parallel_comm with HybridModel does not support mixed "
+                    "context-parallel layouts (linear_cp_layout != attention_cp_layout with "
+                    "context_parallel_size > 1)."
+                )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
