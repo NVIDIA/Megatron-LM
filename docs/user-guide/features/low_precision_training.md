@@ -48,7 +48,7 @@ throughput, memory, and stability.
 Only the NVFP4 minimum (`Transformer Engine >= 2.7.0.dev0`) is enforced by
 Megatron at startup (see [`arguments.py`](../../../megatron/training/arguments.py)).
 For the other recipes, refer to the
-[Transformer Engine release notes](https://docs.nvidia.com/deeplearning/transformer-engine/release-notes/index.html)
+[Transformer Engine release notes](https://github.com/NVIDIA/TransformerEngine/releases)
 for the exact version that introduced each recipe on your target hardware.
 
 `--fp8-format` and `--fp4-format` are mutually exclusive; you can only enable
@@ -353,5 +353,5 @@ distributed optimizer, Torch FSDP2, Megatron-FSDP, or inference mode.
   recipe choice.
 - [Fine-Grained Activation Offloading](fine_grained_activation_offloading.md)
   — Interaction with `--keep-fp8-transpose-cache`.
-- [Transformer Engine documentation](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/index.html)
+- [Transformer Engine documentation](https://docs.nvidia.com/deeplearning/transformer-engine/)
   — Authoritative reference for the underlying recipes.
