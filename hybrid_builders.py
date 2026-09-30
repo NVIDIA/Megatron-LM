@@ -1,5 +1,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
+from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
@@ -74,6 +75,13 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
             hybrid_stack_spec = hybrid_stack_spec(config)
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
+
+    engram_config = EngramConfig.from_args(args, config)
+    if engram_config is not None:
+        engram_config.validate_vocabulary(args.padded_vocab_size)
+        hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+            hybrid_stack_spec, engram_config, args.hybrid_layer_pattern, config
+        )
 
     model = HybridModel(
         config=config,

@@ -328,6 +328,9 @@ class TransformerLayerSubmodules:
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
+    # Optional token-conditioned injection on the residual before attention/mHC.
+    engram: Union[ModuleSpec, type] = IdentityOp
+
 
 class BaseTransformerLayer(ABC):
     """A common parent class for `TransformerLayer` like implementations.
@@ -395,6 +398,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+
+        self.engram = None
+        if submodules.engram is not IdentityOp and not is_mtp_layer:
+            if not isinstance(submodules.engram, ModuleSpec):
+                raise TypeError("The Engram composition point requires a ModuleSpec.")
+            engram_config = submodules.engram.params["engram_config"]
+            if self.layer_number in engram_config.layer_ids:
+                self.engram = build_module(
+                    submodules.engram,
+                    config=self.config,
+                    layer_number=self.layer_number,
+                    pg_collection=pg_collection,
+                )
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -763,6 +779,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         *,
         inference_params: Optional[Any] = None,
         cross_layer_state: CrossLayerState | None = None,
+        skip_engram: bool = False,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -792,6 +809,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if not skip_engram:
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -908,6 +928,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
+    def _maybe_apply_engram(
+        self, hidden_states: Tensor, input_ids: Tensor | None, packed_seq_params=None
+    ) -> Tensor:
+        """Inject token-conditioned memory on the real residual streams."""
+        if self.engram is None:
+            return hidden_states
+        return self.engram.add_to_residual(hidden_states, input_ids, packed_seq_params)
+
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """
@@ -927,6 +955,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "wrapped TransformerLayer through this path automatically for hybrid "
                 "stacks."
             )
+        if called_from_hybrid_mhc_wrapper and self.engram is not None:
+            kwargs["skip_engram"] = True
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -2448,9 +2478,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         inference_params: Optional[Any] = None,
         cross_layer_state: CrossLayerState | None = None,
         mhc_state: SinglePassMHCState | None = None,
+        skip_engram: bool = False,
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if not skip_engram:
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (

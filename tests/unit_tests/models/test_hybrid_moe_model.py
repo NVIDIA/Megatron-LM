@@ -112,6 +112,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_kernel_backend": "none",
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
+    "engram_enabled": False,
     "enable_autocast": False,
     "enable_cuda_graph": False,
     "enable_hyper_connections": False,

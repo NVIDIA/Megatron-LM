@@ -233,6 +233,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
 
+    engram_enabled: bool = False
+    """Selected layers carry n-gram memory; allows EP row sharding without MoE."""
+
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
@@ -2301,8 +2304,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError("num_moe_experts must be non None to use expert-parallel.")
+        if (
+            self.expert_model_parallel_size > 1
+            and self.num_moe_experts is None
+            and not self.engram_enabled
+        ):
+            raise ValueError("Expert parallelism requires num_moe_experts or engram_enabled.")
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             if self.expert_tensor_parallel_size > 1:

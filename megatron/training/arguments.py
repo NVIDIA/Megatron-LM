@@ -18,6 +18,7 @@ from megatron.core.activations import situlu, squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
+from megatron.core.models.engram.variants import DEEPSEEK_VARIANT_NAME, ENGRAM_VARIANTS
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
@@ -78,6 +79,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_engram_args(parser)
     parser = _add_mla_args(parser)
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
@@ -160,6 +162,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    args.engram_enabled = getattr(args, "engram_vocab_sizes", None) is not None
 
     # Args to enable MSC (opt-in: disabled by default)
     if args.disable_msc_deprecated:
@@ -1735,12 +1738,13 @@ def validate_args(args, defaults={}):
 
     # Expert parallelism check
     if args.expert_model_parallel_size > 1:
-        assert (
-            args.num_experts is not None
-        ), "num_experts must be non None to use expert model parallelism"
-        assert (
-            args.num_experts % args.expert_model_parallel_size == 0
-        ), "Number of experts should be a multiple of expert model parallel_size."
+        assert args.num_experts is not None or getattr(
+            args, "engram_enabled", False
+        ), "Expert parallelism requires MoE experts or Engram tables."
+        if args.num_experts is not None:
+            assert (
+                args.num_experts % args.expert_model_parallel_size == 0
+            ), "Number of experts should be a multiple of expert model parallel_size."
 
     # MoE router check
     if (
@@ -4954,6 +4958,68 @@ def _add_moe_args(parser):
         help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
         'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.',
     )
+    return parser
+
+
+def _add_engram_args(parser):
+    group = parser.add_argument_group(title="engram")
+    group.add_argument(
+        '--engram-vocab-sizes',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Per-head row budget for each n-gram order; enables native Engram in HybridModel.',
+    )
+    group.add_argument(
+        '--engram-layer-ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Selected 1-based global Hybrid layer IDs (attention and MLP count separately).',
+    )
+    group.add_argument(
+        '--engram-hash-layer-ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Hash seed identities, independent of placement; V4.1 requires zero-based block IDs.',
+    )
+    group.add_argument(
+        '--engram-variant',
+        choices=sorted(ENGRAM_VARIANTS),
+        default=DEEPSEEK_VARIANT_NAME,
+        help='Memory definition: original DeepSeek Engram, Qwen PLE, or DeepSeek-V4.1.',
+    )
+    group.add_argument('--engram-max-ngram-order', type=int, default=None)
+    group.add_argument('--engram-num-hash-heads', type=int, default=8)
+    group.add_argument(
+        '--engram-memory-dim',
+        type=int,
+        default=None,
+        help='Total embedding width per n-gram order; V4.1 defaults to 2048.',
+    )
+    group.add_argument(
+        '--engram-kernel-size',
+        type=int,
+        default=None,
+        help='Causal convolution kernel size; V4.1 has no convolution and uses 0.',
+    )
+    group.add_argument('--engram-hash-seed', type=int, default=0)
+    group.add_argument('--engram-pad-token-id', type=int, default=None)
+    group.add_argument(
+        '--engram-tokenizer-map',
+        type=str,
+        default=None,
+        help='Offline compressed-token/hash artifact for DeepSeek variants.',
+    )
+    group.add_argument(
+        '--engram-compressed-vocab-size',
+        type=int,
+        default=None,
+        help='Expected compressed vocabulary; official V4.1 uses 99092.',
+    )
+    group.add_argument('--engram-eos-token-id', type=int, default=None)
+    group.add_argument('--engram-unigram-vocab-size', type=int, default=None)
     return parser
 
 
