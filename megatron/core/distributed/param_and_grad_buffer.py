@@ -1217,18 +1217,7 @@ class _ParamAndGradBuffer:
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
-            if self.nccl_grad_pool_is_separate and self.ddp_config.use_distributed_optimizer:
-                self.param_nccl_mem_pool = nccl_allocator.create_nccl_mem_pool(
-                    symmetric=not self.ddp_config.disable_symmetric_registration
-                )
-                param_alloc_context = functools.partial(
-                    nccl_allocator.nccl_mem,
-                    self.param_nccl_mem_pool,
-                    group=self.data_parallel_group,
-                    symmetric=not self.ddp_config.disable_symmetric_registration,
-                )
-            else:
-                param_alloc_context = grad_alloc_context
+            param_alloc_context = grad_alloc_context
             # Since nccl communicator group is created lazily, we need to perform a warmup call to
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
             torch.distributed.barrier()
@@ -1287,14 +1276,22 @@ class _ParamAndGradBuffer:
                 # before creating the persistent parameter pool if registration does not succeed.
                 with torch.cuda.use_mem_pool(self.nccl_mem_pool):
                     allocate_grad_buffer()
-                nccl_allocator.register_mem_pool(
-                    self.nccl_mem_pool,
-                    self.data_parallel_group,
-                    symmetric=not self.ddp_config.disable_symmetric_registration,
-                )
+                self._register_nccl_mem_pool(self.nccl_mem_pool)
                 if self.ddp_config.use_distributed_optimizer:
-                    with param_alloc_context():
-                        allocate_param_buffer()
+                    try:
+                        # Create the persistent parameter pool only after the replaceable gradient
+                        # pool has registered successfully, so either failure can be rolled back.
+                        self.param_nccl_mem_pool = nccl_allocator.create_nccl_mem_pool(
+                            symmetric=not self.ddp_config.disable_symmetric_registration
+                        )
+                        with torch.cuda.use_mem_pool(self.param_nccl_mem_pool):
+                            allocate_param_buffer()
+                        self._register_nccl_mem_pool(self.param_nccl_mem_pool)
+                    except RuntimeError:
+                        # The gradient pool was registered first. Roll it back before its storage
+                        # can be released while PyTorch still associates the pool with this group.
+                        self._deregister_nccl_mem_pool_after_error(self.nccl_mem_pool)
+                        raise
             else:
                 with grad_alloc_context():
                     if self.ddp_config.use_distributed_optimizer:
@@ -1728,6 +1725,27 @@ class _ParamAndGradBuffer:
                 pools.append(pool)
         return pools
 
+    def _deregister_nccl_mem_pool_after_error(self, pool: "torch.cuda.MemPool") -> None:
+        """Best-effort rollback without replacing the error that triggered cleanup."""
+        try:
+            nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)
+        except RuntimeError:
+            pass
+
+    def _register_nccl_mem_pool(self, pool: "torch.cuda.MemPool") -> None:
+        """Register a pool and roll back partial ProcessGroupNCCL bookkeeping on failure."""
+        try:
+            nccl_allocator.register_mem_pool(
+                pool,
+                self.data_parallel_group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+            )
+        except RuntimeError:
+            # ProcessGroupNCCL records the pool before registering its existing segments. If a
+            # segment fails, removing that record must precede releasing the pool allocation.
+            self._deregister_nccl_mem_pool_after_error(pool)
+            raise
+
     def deregister_nccl_mem_pools(self) -> None:
         """Deregister every live NCCL memory pool owned by this buffer."""
         for pool in self.get_nccl_mem_pools():
@@ -1763,14 +1781,13 @@ class _ParamAndGradBuffer:
             # storage unregistered. Allocate in the pool first, then register explicitly.
             with torch.cuda.use_mem_pool(pool):
                 self.reload_from_cpu(move_params=False, move_grads=True)
-            nccl_allocator.register_mem_pool(
-                pool,
-                self.data_parallel_group,
-                symmetric=not self.ddp_config.disable_symmetric_registration,
-            )
+            self._register_nccl_mem_pool(pool)
         except RuntimeError:
             # Leave the buffer offloaded so a caller can retry or shut down cleanly.
-            self.offload_to_cpu(move_params=False, move_grads=True)
+            try:
+                self.offload_to_cpu(move_params=False, move_grads=True)
+            except RuntimeError:
+                pass
             raise
         self.nccl_mem_pool = pool
 

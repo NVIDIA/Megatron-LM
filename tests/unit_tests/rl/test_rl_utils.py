@@ -1324,25 +1324,33 @@ class TestRLUtils:
         torch.testing.assert_close(aligned, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "initialize_model_parallel,nccl_ub,grad_buffer_offload,initial_registration_fails",
+        "initialize_model_parallel,nccl_ub,grad_buffer_offload,registration_failure",
         [
             *[
-                pytest.param((tp, pp), False, True, False, id=f"ordinary-tp{tp}-pp{pp}")
+                pytest.param((tp, pp), False, True, None, id=f"ordinary-tp{tp}-pp{pp}")
                 for tp, pp in itertools.product([1, 2], [1, 2])
                 if tp * pp <= Utils.world_size
             ],
-            pytest.param((1, 1), True, True, False, id="nccl-ub-offload-layout"),
-            pytest.param((1, 1), True, True, True, id="nccl-ub-initial-registration-failure"),
-            pytest.param((1, 1), True, False, False, id="nccl-ub-shared-pool-rejected"),
+            pytest.param((1, 1), True, True, None, id="nccl-ub-offload-layout"),
+            pytest.param(
+                (1, 1), True, True, "gradient", id="nccl-ub-gradient-registration-failure"
+            ),
+            pytest.param(
+                (1, 1),
+                True,
+                True,
+                "gradient-cleanup",
+                id="nccl-ub-gradient-registration-cleanup-failure",
+            ),
+            pytest.param(
+                (1, 1), True, True, "parameter", id="nccl-ub-parameter-registration-failure"
+            ),
+            pytest.param((1, 1), True, False, None, id="nccl-ub-shared-pool-rejected"),
         ],
         indirect=["initialize_model_parallel"],
     )
     def test_grad_buffer_offload(
-        self,
-        initialize_model_parallel,
-        nccl_ub,
-        grad_buffer_offload,
-        initial_registration_fails,
+        self, initialize_model_parallel, nccl_ub, grad_buffer_offload, registration_failure
     ):
         """Test that grad buffer offload/restore correctly frees and restores GPU memory."""
         world_size, dp, tp, pp = initialize_model_parallel
@@ -1370,24 +1378,52 @@ class TestRLUtils:
             grad_buffer_offload=grad_buffer_offload,
         )
 
-        registration_context = (
-            patch(
-                "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
-                side_effect=RuntimeError("initial registration failed"),
+        if registration_failure is not None:
+            registration_error = RuntimeError(
+                f"initial {registration_failure.split('-')[0]} registration failed"
             )
-            if initial_registration_fails
-            else nullcontext()
-        )
-        with registration_context:
-            if initial_registration_fails:
-                with pytest.raises(RuntimeError, match="initial registration failed"):
+            register_side_effect = (
+                [None, registration_error]
+                if registration_failure == "parameter"
+                else registration_error
+            )
+            deregister_side_effect = (
+                RuntimeError("registration cleanup failed")
+                if registration_failure == "gradient-cleanup"
+                else None
+            )
+            with (
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                    side_effect=register_side_effect,
+                ) as register_mock,
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool",
+                    side_effect=deregister_side_effect,
+                ) as deregister_mock,
+            ):
+                with pytest.raises(RuntimeError, match=str(registration_error)):
                     DistributedDataParallel(
                         transformer_config, ddp_config=ddp_config, module=gpt_model
                     )
-                return
-            ddp_model = DistributedDataParallel(
-                transformer_config, ddp_config=ddp_config, module=gpt_model
-            )
+            if registration_failure == "parameter":
+                assert register_mock.call_count == 2
+                failed_param_pool = register_mock.call_args_list[1].args[0]
+                registered_grad_pool = register_mock.call_args_list[0].args[0]
+                assert deregister_mock.call_args_list == [
+                    call(failed_param_pool, register_mock.call_args_list[1].args[1]),
+                    call(registered_grad_pool, register_mock.call_args_list[0].args[1]),
+                ]
+            else:
+                assert register_mock.call_count == 1
+                deregister_mock.assert_called_once_with(
+                    register_mock.call_args.args[0], register_mock.call_args.args[1]
+                )
+            return
+
+        ddp_model = DistributedDataParallel(
+            transformer_config, ddp_config=ddp_config, module=gpt_model
+        )
 
         all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
 
@@ -1420,11 +1456,34 @@ class TestRLUtils:
             assert all(buf.nccl_mem_pool is None for buf in all_buffers)
             assert [buf.param_nccl_mem_pool.id for buf in all_buffers] == initial_param_pool_ids
 
-            with patch(
-                "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
-                side_effect=RuntimeError("registration failed"),
+            with (
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                    side_effect=RuntimeError("registration failed"),
+                ) as register_mock,
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool"
+                ) as deregister_mock,
             ):
                 with pytest.raises(RuntimeError, match="registration failed"):
+                    ddp_model.restore_grad_buffers()
+            deregister_mock.assert_called_once_with(
+                register_mock.call_args.args[0], register_mock.call_args.args[1]
+            )
+            assert all(buf.grad_data.storage().size() == 0 for buf in all_buffers)
+            assert all(buf.nccl_mem_pool is None for buf in all_buffers)
+
+            with (
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                    side_effect=RuntimeError("original registration failed"),
+                ),
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool",
+                    side_effect=RuntimeError("registration cleanup failed"),
+                ),
+            ):
+                with pytest.raises(RuntimeError, match="original registration failed"):
                     ddp_model.restore_grad_buffers()
             assert all(buf.grad_data.storage().size() == 0 for buf in all_buffers)
             assert all(buf.nccl_mem_pool is None for buf in all_buffers)
