@@ -67,9 +67,7 @@ def _canonicalize_packed_sequence_metadata(batch: Dict[str, Any]) -> Dict[str, A
     if cu_seqlens_padded is not None:
         cu_seqlens_padded = cu_seqlens_padded.to(dtype=torch.int32)
         batch["cu_seqlens_padded"] = (
-            cu_seqlens_padded.unsqueeze(0)
-            if cu_seqlens_padded.dim() == 1
-            else cu_seqlens_padded
+            cu_seqlens_padded.unsqueeze(0) if cu_seqlens_padded.dim() == 1 else cu_seqlens_padded
         )
 
     batch["max_seqlen"] = packing_kwargs["max_seqlen_q"].to(dtype=torch.int32).reshape(1)

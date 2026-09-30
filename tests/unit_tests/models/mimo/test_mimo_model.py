@@ -593,7 +593,7 @@ class TestMimoModel:
             captured['decoder_input'] = kwargs.get('decoder_input')
             captured['loss_mask'] = kwargs.get('loss_mask')
             captured['mtp_input_mask'] = kwargs.get('mtp_input_mask')
-            captured['cp_batch'] = kwargs.get('cp_batch')
+            captured["cp_batch"] = kwargs.get("cp_batch")
             return torch.zeros(
                 self.batch_size, sharded_seq_len, self.vocab_size, device=self.device
             )
@@ -615,18 +615,18 @@ class TestMimoModel:
 
         mock_adapter.partition.assert_called_once()
         partition_kwargs = mock_adapter.partition.call_args.kwargs
-        assert partition_kwargs['embeddings'].shape == (
+        assert partition_kwargs["embeddings"].shape == (
             self.seq_len,
             self.batch_size,
             self.hidden_size,
         )
-        assert partition_kwargs['input_ids'] is input_ids
-        assert partition_kwargs['position_ids'] is position_ids
-        assert partition_kwargs['loss_mask'] is loss_mask
-        assert partition_kwargs['cu_seqlens'] is None
-        assert partition_kwargs['cu_seqlens_padded'] is None
-        assert partition_kwargs['max_seqlen'] is None
-        torch.testing.assert_close(partition_kwargs['mtp_input_mask'], text_mask)
+        assert partition_kwargs["input_ids"] is input_ids
+        assert partition_kwargs["position_ids"] is position_ids
+        assert partition_kwargs["loss_mask"] is loss_mask
+        assert partition_kwargs["cu_seqlens"] is None
+        assert partition_kwargs["cu_seqlens_padded"] is None
+        assert partition_kwargs["max_seqlen"] is None
+        torch.testing.assert_close(partition_kwargs["mtp_input_mask"], text_mask)
         # The adapter's LM-layout output and dual-layout CP batch flow straight into the LM.
         assert captured['decoder_input'].shape == (
             sharded_seq_len,
@@ -638,7 +638,7 @@ class TestMimoModel:
         assert captured['position_ids'] is sharded_position_ids
         assert captured['mtp_input_mask'].dtype == torch.bool
         assert torch.equal(captured['mtp_input_mask'], text_mask[:, :sharded_seq_len])
-        assert captured['cp_batch'] is cp_batch
+        assert captured["cp_batch"] is cp_batch
         # forward() returns the adapter's possibly sharded loss mask.
         assert out_loss_mask is sharded_loss_mask
 

@@ -208,7 +208,7 @@ class TestPartitionAdapter:
         with (
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
             patch(
-                'megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank',
+                "megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank",
                 return_value=cp_batch,
             ),
         ):
@@ -233,12 +233,12 @@ class TestPartitionAdapter:
         labels = torch.randint(0, 100, (2, 7))
         loss_mask = torch.ones(2, 7)
         cp_batch = ContextParallelBatch.from_single_layout(
-            "zigzag", {'labels': labels[:, :4], 'loss_mask': loss_mask[:, :4]}, None
+            "zigzag", {"labels": labels[:, :4], "loss_mask": loss_mask[:, :4]}, None
         )
         with (
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
             patch(
-                'megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank',
+                "megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank",
                 return_value=cp_batch,
             ),
         ):

@@ -24,7 +24,7 @@ class TestEmbeddingAlignment:
         language_model_spec = ModuleSpec(
             module=MagicMock,
             params={
-                'config': TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+                "config": TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
             },
         )
         self.mimo_config = MimoModelConfig(
