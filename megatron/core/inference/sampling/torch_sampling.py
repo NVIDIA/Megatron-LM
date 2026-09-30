@@ -7,10 +7,15 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.sampling.base import Sampling
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 
 
 class TorchSampling(Sampling):
-    """Sampling via bucketed `torch.multinomial`.
+    """Sampling via a bucketed Gumbel-max (exponential-race) draw.
 
     Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
     """
@@ -29,7 +34,7 @@ class TorchSampling(Sampling):
     def _modify_logits_for_top_p_filtering(logits: Tensor, top_p: float) -> None:
         """In-place: set logits outside the top-p (nucleus) set to -inf."""
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        cumulative_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
 
         filter_ = cumulative_probs > top_p
         # Clone needed: filter_[:, 1:] and filter_[:, :-1] are overlapping views;
@@ -54,18 +59,18 @@ class TorchSampling(Sampling):
         Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
         """
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
+        top_p_active = not is_no_op_top_p(top_p)
+        assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
         # Clone needed: .div_() and the filters below modify in-place.
         last_token_logits = last_token_logits.clone()
         if temperature != 1.0:
-            last_token_logits.div_(temperature)
-        if top_k >= 1:
+            last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
+        if not is_no_op_top_k(top_k):
             assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
             if vocab_size:
                 assert top_k < vocab_size, "top-k is larger than vocab size."
             TorchSampling._modify_logits_for_top_k_filtering(last_token_logits, top_k)
-        elif top_p > 0.0:
+        elif top_p_active:
             TorchSampling._modify_logits_for_top_p_filtering(last_token_logits, top_p)
         return last_token_logits
 
@@ -87,7 +92,7 @@ class TorchSampling(Sampling):
             last_token_logits: Logits of shape `[batch_size, vocab_size]`.
             temperature: Temperature scaling factor.
             top_k: Top-k filtering value (0 = disabled).
-            top_p: Top-p (nucleus) filtering value (0.0 = disabled).
+            top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled).
             generator: RNG used by `torch.multinomial`.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
@@ -97,16 +102,27 @@ class TorchSampling(Sampling):
         """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
+        assert not (
+            top_k > 0 and not is_no_op_top_p(top_p)
+        ), "Cannot have top-p and top-k both active"
         if top_k == 1:
             return torch.argmax(last_token_logits, dim=-1)
 
         filtered = TorchSampling.filter_logits(
             last_token_logits, temperature, top_k, top_p, vocab_size=vocab_size
         )
-        probabilities = filtered.softmax(dim=-1)
-        sampled = torch.multinomial(probabilities, num_samples=1, generator=generator).view(-1)
+        probabilities = filtered.softmax(dim=-1, dtype=torch.float32)
+        # Gumbel-max in exponential form: draw q ~ Exp(1) per vocabulary entry and
+        # take argmax(p / q). Distributionally identical to `torch.multinomial`,
+        # but it never forms a cumulative sum, so the low-probability tail is not
+        # eroded by the rounding an inverse-CDF walk accumulates across a 100k+
+        # vocabulary. Matches vLLM's sampler:
+        # https://github.com/vllm-project/vllm/blob/7702ee87dba0d8eed7f201e77a0a6613aac738a8/vllm/v1/sample/ops/topk_topp_sampler.py#L464
+        # which keeps the two engines' sampling paths aligned; vLLM also uses it to
+        # avoid the CPU-GPU sync that `torch.multinomial` incurs.
+        q = torch.empty_like(probabilities)
+        q.exponential_(generator=generator)
+        sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
         if vocab_size:
             sampled = torch.clamp(sampled, min=0, max=(vocab_size - 1))
@@ -128,7 +144,7 @@ class TorchSampling(Sampling):
                 each logits row to its request index.
 
         Returns:
-            Tensor: Per-row log probabilities for the processed distribution.
+            Tensor: Per-row float32 log probabilities for the processed distribution.
         """
         active_request_count = context.total_request_count - context.paused_request_count
         metadata = context.active_request_metadata
@@ -149,13 +165,17 @@ class TorchSampling(Sampling):
         for row, key in enumerate(zip(temps, top_ks, top_ps)):
             buckets[key].append(row)
 
-        log_probs = torch.empty_like(logits)
+        # fp32: `torch.log_softmax(..., dtype=torch.float32)` below is computed in
+        # fp32 precisely to avoid the tail erosion bf16/fp16 causes on wide vocabularies;
+        # allocating this buffer in `logits.dtype` would silently downcast the result
+        # back on assignment and defeat that precision fix.
+        log_probs = torch.empty_like(logits, dtype=torch.float32)
         for (t, k, p), rows in buckets.items():
             idx = torch.tensor(rows, device=logits.device, dtype=torch.long)
             filtered = TorchSampling.filter_logits(
                 logits[idx], float(t), int(k), float(p), vocab_size=self._vocab_size
             )
-            log_probs[idx] = torch.log_softmax(filtered, dim=-1)
+            log_probs[idx] = torch.log_softmax(filtered, dim=-1, dtype=torch.float32)
         return log_probs
 
     def sample_kernel(

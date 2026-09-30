@@ -49,6 +49,8 @@ SAFE_GLOBALS = [
     RerunMode,
     RerunState,
     BytesIO,
+    # Allow frozenset values in legacy checkpoint metadata when loading with weights_only=True.
+    frozenset,
     Signals,
     torch.optim.Adam,
     torch.optim.AdamW,

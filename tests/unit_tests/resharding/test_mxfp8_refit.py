@@ -3,8 +3,10 @@
 import pytest
 import torch
 
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
+from megatron.core.resharding.transforms import MXFP8ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
 
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
@@ -157,6 +159,26 @@ class TestMXFP8ReshardTransform:
             assert buf.backend == "triton"
             assert buf.scale.dtype == torch.float8_e8m0fnu
 
+    def test_full_prepare_recv_skips_staging_zero_fill(self, monkeypatch):
+        """A complete receive need not initialize storage that the transport overwrites."""
+        buf = MXFP8Tensor.from_bf16(
+            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), backend="triton"
+        )
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={"weight": buf},
+            buffer_key_prefix="decoder.",
+        )
+
+        def fail_zeros(*args, **kwargs):
+            raise AssertionError("full receive unexpectedly zero-initialized staging storage")
+
+        monkeypatch.setattr(torch, "zeros", fail_zeros)
+        recv_buffers = transform.prepare_recv("decoder.weight", (slice(None), slice(None)))
+
+        assert recv_buffers[0].shape == buf.shape
+        assert recv_buffers[0].dtype == torch.bfloat16
+
     def test_sender_side_conversion_supports_explicit_triton_backend(self):
         """A sender without persistent buffers can select the Triton wire format."""
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
@@ -204,7 +226,8 @@ class TestMXFP8ReshardTransform:
                 persistent_buffers={"first": triton_buffer, "second": flashinfer_buffer},
             )
 
-    def test_concatenated_moe_buffers_remain_refittable(self):
+    @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm"])
+    def test_concatenated_moe_buffers_remain_refittable(self, grouped_gemm_backend):
         """Lazy MoE stacking must not replace persistent storage with inference tensors."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
@@ -216,7 +239,7 @@ class TestMXFP8ReshardTransform:
         num_experts, M, K = 2, 64, 128
         grouped_mlp = Namespace()
         grouped_mlp.num_local_experts = num_experts
-        grouped_mlp.inference_grouped_gemm_backend = "torch"
+        grouped_mlp.inference_grouped_gemm_backend = grouped_gemm_backend
         buffers = {}
         for linear_name in ("linear_fc1", "linear_fc2"):
             linear = Namespace()
@@ -414,6 +437,33 @@ class TestQuantizeParamsToMXFP8:
         assert "0.weight" in buffers and "1.weight" in buffers
         assert isinstance(buffers["0.weight"], MXFP8Tensor)
 
+    def test_mixed_precision_conversion_preserves_bf16_parameter(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
+
+        model = torch.nn.Module()
+        model.attention = torch.nn.Linear(128, 64, bias=False)
+        model.mlp = torch.nn.Module()
+        model.mlp.experts = torch.nn.Module()
+        model.mlp.experts.num_local_experts = 1
+        model.mlp.experts.linear_fc1 = torch.nn.Linear(128, 64, bias=False)
+        model.mlp.experts.linear_fc2 = torch.nn.Linear(64, 128, bias=False)
+        model.to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model.mlp.experts)
+        original_attention = model.attention.weight
+        attention_value = original_attention.detach().clone()
+
+        buffers = quantize_params_to_mxfp8(model, backend="triton")
+
+        assert model.attention.weight is original_attention
+        assert torch.equal(model.attention.weight, attention_value)
+        assert model.attention.weight.dtype == torch.bfloat16
+        assert "attention.weight" not in buffers
+        assert isinstance(model.mlp.experts.linear_fc1.weight, MXFP8Tensor)
+        assert isinstance(model.mlp.experts.linear_fc2.weight, MXFP8Tensor)
+        assert "mlp.experts.linear_fc1.weight" in buffers
+        assert "mlp.experts.linear_fc2.weight" in buffers
+
 
 # ===========================================================================
 # End-to-end MXFP8 refit integration (single-GPU)
@@ -580,3 +630,125 @@ class TestMXFP8RefitIntegration:
             expected = MXFP8Tensor.from_bf16(source_weight)
             assert torch.equal(actual.data, expected.data)
             assert torch.equal(actual.scale, expected.scale)
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+class TestTEGroupedParameterRefit:
+    """Refit grouped BF16 and MXFP8 experts independent of TE's parameter format."""
+
+    @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
+    @pytest.mark.parametrize(
+        "source_single_grouped,destination_single_grouped",
+        [(False, False), (False, True), (True, False), (True, True)],
+    )
+    def test_refit_preserves_destination_storage(
+        self, monkeypatch, quantized, source_single_grouped, destination_single_grouped
+    ):
+        import inspect
+
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        if "single_grouped_weight" not in inspect.signature(te.GroupedLinear).parameters:
+            pytest.skip("Transformer Engine lacks single grouped parameters")
+
+        class LoopbackCopyService(CopyService):
+            requires_process_group_barrier = False
+            supports_multiple_runs_per_plan = True
+
+            def __init__(self):
+                self.sends = {}
+                self.recvs = []
+
+            def submit_send(self, src_tensor, dest_rank, task_id=None):
+                del dest_rank
+                self.sends[task_id] = src_tensor.clone()
+
+            def submit_recv(self, dest_tensor, src_rank, task_id=None):
+                del src_rank
+                self.recvs.append((dest_tensor, task_id))
+
+            def run(self):
+                for dest_tensor, task_id in self.recvs:
+                    dest_tensor.copy_(self.sends[task_id])
+                self.sends.clear()
+                self.recvs.clear()
+
+        def make_grouped_linear(single_grouped_weight, seed):
+            torch.manual_seed(seed)
+            with te.fp8_model_init(enabled=quantized, recipe=MXFP8BlockScaling()):
+                return te.GroupedLinear(
+                    2,
+                    128,
+                    64,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    device="cuda",
+                    single_grouped_weight=single_grouped_weight,
+                )
+
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        source = make_grouped_linear(source_single_grouped, seed=123)
+        destination = make_grouped_linear(destination_single_grouped, seed=456)
+        torch.cuda.synchronize()
+
+        if destination_single_grouped:
+            destination.weight.allreduce = False
+            destination.weight.tensor_model_parallel = True
+            destination.weight.partition_dim = 1
+
+        source_tensors = dict(named_refit_tensors(source))
+        destination_tensors = dict(named_refit_tensors(destination))
+        assert source_tensors.keys() == destination_tensors.keys() == {"weight0", "weight1"}
+        if destination_single_grouped:
+            for tensor in destination_tensors.values():
+                assert tensor.allreduce is False
+                assert tensor.tensor_model_parallel is True
+                assert tensor.partition_dim == 1
+
+        if quantized:
+            expected = {
+                name: tensor.dequantize().clone() for name, tensor in source_tensors.items()
+            }
+            pointers_before = {
+                name: (tensor._rowwise_data.data_ptr(), tensor._rowwise_scale_inv.data_ptr())
+                for name, tensor in destination_tensors.items()
+            }
+        else:
+            expected = {name: tensor.clone() for name, tensor in source_tensors.items()}
+            pointers_before = {
+                name: tensor.data_ptr() for name, tensor in destination_tensors.items()
+            }
+
+        full_slice = (slice(None), slice(None))
+        send_ops = [
+            TransferOp(name, 0, True, full_slice, full_slice, task_id=task_id)
+            for task_id, name in enumerate(source_tensors)
+        ]
+        recv_ops = [
+            TransferOp(name, 0, False, full_slice, full_slice, task_id=task_id)
+            for task_id, name in enumerate(source_tensors)
+        ]
+        execute_reshard_plan(
+            ReshardPlan(send_ops=send_ops, recv_ops=recv_ops),
+            source,
+            destination,
+            LoopbackCopyService(),
+        )
+
+        actual = dict(named_refit_tensors(destination))
+        if quantized:
+            pointers_after = {
+                name: (tensor._rowwise_data.data_ptr(), tensor._rowwise_scale_inv.data_ptr())
+                for name, tensor in actual.items()
+            }
+            assert pointers_after == pointers_before
+            for name, tensor in actual.items():
+                torch.testing.assert_close(tensor.dequantize(), expected[name], atol=0, rtol=0)
+        else:
+            assert {name: tensor.data_ptr() for name, tensor in actual.items()} == pointers_before
+            for name, tensor in actual.items():
+                assert torch.equal(tensor, expected[name])
