@@ -1878,7 +1878,16 @@ class DSAIndexer(MegatronModule):
             k, _ = self.linear_wk(x)
             if self.config.dsa_indexer_k_norm_fp32:
                 k_dtype = k.dtype
-                k = self.k_norm(k.float()).to(dtype=k_dtype)
+                # TE LayerNorm casts its input to the parameter dtype, so passing
+                # k.float() to the BF16 module does not guarantee FP32 math.
+                with torch.autocast(device_type=k.device.type, enabled=False):
+                    k = torch.nn.functional.layer_norm(
+                        k.float(),
+                        (self.index_head_dim,),
+                        self.k_norm.weight.float(),
+                        self.k_norm.bias.float(),
+                        self.k_norm.eps,
+                    ).to(dtype=k_dtype)
             else:
                 k = self.k_norm(k)
             # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]

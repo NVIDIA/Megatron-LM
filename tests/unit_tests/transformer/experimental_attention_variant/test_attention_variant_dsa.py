@@ -2445,6 +2445,7 @@ class TestDSAIndexer:
             patch.object(self.indexer, "index_kpool", 4),
             patch.object(self.indexer, "index_kpool_compress_gate", gate),
             patch.object(self.config, "dsa_indexer_rotate_activation", False),
+            patch.object(self.config, "dsa_indexer_weights_proj_output_dtype", "fp32"),
         ):
             q, k, weights = self.indexer.forward_before_topk(x, qr)
             gate_score = self.indexer._kpool_gate_score
@@ -3331,6 +3332,7 @@ class TestIndexerTensorParallel:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
         )
 
     def _create_indexer(self, config, pg_collection):
