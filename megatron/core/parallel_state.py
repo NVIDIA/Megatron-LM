@@ -2709,8 +2709,10 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
 
     Raises:
         RuntimeError: A validation callback refused teardown, for example because a TE
-            autocast context is still active.
-        Exception: A resource or process group could not be released. Group destruction
+            autocast context is still active. Nothing has been released.
+        Exception: A resource or process group could not be released. If a callback
+            fails, the remaining callbacks still run, and the first failure is raised
+            before any group is destroyed or module state is cleared. Group destruction
             attempts all registered groups before reporting the first failure.
     """
     callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS
@@ -2720,14 +2722,26 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     if abort:
         _abort_created_process_groups()
 
-    # Release cached resources while their process groups still exist.
+    # Release cached resources while their process groups still exist. Run every
+    # callback even if one fails: some releases rendezvous with peer ranks, which run
+    # all of them.
+    first_error = None
     for stage in (
         TeardownStage.RELEASE_COMMUNICATION,
         TeardownStage.RELEASE_CUDA_GRAPHS,
         TeardownStage.RESET_STATE,
     ):
         for release in reversed(callbacks[stage]):
-            release()
+            try:
+                release()
+            except Exception as error:
+                logger.warning("Failed to release a model-parallel resource.", exc_info=True)
+                if first_error is None:
+                    first_error = error
+    # A resource that failed to release may still use its communicator, so destroying
+    # the group could wait forever. Keep the groups and this module's state.
+    if first_error is not None:
+        raise first_error
 
     # DTensor's sharding cache compares meshes by layout, not process-group identity.
     # A later initialization with the same layout would reuse specs naming dead groups.
