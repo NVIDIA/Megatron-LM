@@ -203,7 +203,6 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
         grad = torch.randn_like(whole)
         count = whole.shape[0] // cp_size
         rows = slice(pg.cp.rank() * count, (pg.cp.rank() + 1) * count)
-        documents = (physical_cu, real_cu)
         actual = _run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp)
         expected = _run_attention(reference, whole, grad, packed)
         failures = []
@@ -218,21 +217,33 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
         if cp_size == 2:
             state = model.state_dict()
 
-            def run_control(config, *, sbhd=False):
+            def run_control(config, *, packed_params=packed, documents=None):
                 attention = _build_attention(config, 1, ref_pg).cuda()
                 attention.load_state_dict(state)
-                return _run_attention(
-                    attention, whole, grad, packed, documents=documents if sbhd else None
-                )
+                return _run_attention(attention, whole, grad, packed_params, documents=documents)
 
+            # The SBHD indexer requires S_q <= S_k * ratio. Use complete ratio-4
+            # groups for this comparison, while retaining partial groups in the
+            # original THD/CP case above. Both fixtures have 2016 real tokens.
+            sbhd_real_cu = [0, 128, 128, 1140, 2016] if ratio == 4 else real_cu
+            thd_reference = expected
+            if ratio == 4:
+                sbhd_real = real.new_tensor(sbhd_real_cu)
+                sbhd_packed = replace(packed, cu_seqlens_q=sbhd_real, cu_seqlens_kv=sbhd_real)
+                thd_reference = run_control(ref_cfg, packed_params=sbhd_packed)
+            documents = (physical_cu, sbhd_real_cu)
             # Sum each document's auxiliary loss using the packed global real-token count.
             sbhd_cfg = replace(
-                ref_cfg, calculate_per_token_loss=True, dsa_indexer_loss_coeff=coeff / real_cu[-1]
+                ref_cfg,
+                calculate_per_token_loss=True,
+                dsa_indexer_loss_coeff=coeff / sbhd_real_cu[-1],
             )
-            native_sbhd = run_control(replace(sbhd_cfg, dsa_kernel_backend="none"), sbhd=True)
-            fused_sbhd = run_control(sbhd_cfg, sbhd=True)
+            native_sbhd = run_control(
+                replace(sbhd_cfg, dsa_kernel_backend="none"), documents=documents
+            )
+            fused_sbhd = run_control(sbhd_cfg, documents=documents)
             _compare_results(fused_sbhd, native_sbhd, f"{label}:sbhd_fused_vs_native", failures)
-            _compare_results(expected, fused_sbhd, f"{label}:thd_cp1_vs_fused_sbhd", failures)
+            _compare_results(thd_reference, fused_sbhd, f"{label}:thd_cp1_vs_fused_sbhd", failures)
             if recompute:
                 eager = run_control(
                     replace(ref_cfg, recompute_granularity=None, recompute_modules=[])
