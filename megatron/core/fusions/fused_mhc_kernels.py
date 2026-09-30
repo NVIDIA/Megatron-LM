@@ -309,7 +309,13 @@ if _TRITON_AVAILABLE:
         out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         M_init = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         inp = input_logits.contiguous().view(N_batch, hc, hc)
-        _triton_sinkhorn_fwd_kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations)
+        kernel = _triton_sinkhorn_fwd_kernel
+        launch_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled():
+            # Fix the reduction layout, ignoring any earlier timing-selected cache entry.
+            kernel = kernel.fn
+            launch_kwargs = {"num_warps": 4}
+        kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations, **launch_kwargs)
         return out.view(original_shape), M_init.view(original_shape)
 
     def _triton_sinkhorn_bwd(
@@ -325,8 +331,24 @@ if _TRITON_AVAILABLE:
         ws_M = torch.empty(N_batch * 2 * num_iterations * hc * hc, dtype=torch.float32, device=dev)
         ws_rs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         ws_cs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
-        _triton_sinkhorn_bwd_kernel[(N_batch,)](
-            go, mi, grad_input, ws_M, ws_rs, ws_cs, N_batch, eps, hc, num_iterations
+        kernel = _triton_sinkhorn_bwd_kernel
+        launch_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled():
+            # The backward row/column reductions need the same fixed launch policy.
+            kernel = kernel.fn
+            launch_kwargs = {"num_warps": 4}
+        kernel[(N_batch,)](
+            go,
+            mi,
+            grad_input,
+            ws_M,
+            ws_rs,
+            ws_cs,
+            N_batch,
+            eps,
+            hc,
+            num_iterations,
+            **launch_kwargs,
         )
         return grad_input.view(original_shape)
 
