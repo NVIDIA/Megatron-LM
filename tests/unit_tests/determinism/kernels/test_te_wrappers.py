@@ -155,6 +155,7 @@ class TestTEWrappers:
                     bias=False,
                     skip_bias_add=False,
                     is_expert=True,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .train()
