@@ -562,6 +562,8 @@ class InferenceRequest:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
+    # Set by the engine at termination, preserved across serialization/merging.
+    finish_reason: Optional[str] = None
     tpot: List[float] = field(default_factory=list)
 
     def __post_init__(self):
@@ -1305,6 +1307,7 @@ class DynamicInferenceRequestRecord:
             ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
+            finish_reason=self.requests[-1].finish_reason,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
