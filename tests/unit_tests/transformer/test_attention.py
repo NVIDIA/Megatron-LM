@@ -949,7 +949,10 @@ class TestFlashDecodeAndPrefillSoftcap:
             out = torch.zeros(2, 4, 8)  # FA4 decode reshapes the varlen output itself
 
         kernel = mock.Mock(return_value=(out, torch.zeros(4, 2)) if returns_tuple else out)
-        with mock.patch(f"megatron.core.transformer.attention.{kernel_name}", kernel):
+        with (
+            mock.patch(f"megatron.core.transformer.attention.{kernel_name}", kernel),
+            mock.patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
             Attention.flash_decode_and_prefill(
                 attn,
                 q=q,

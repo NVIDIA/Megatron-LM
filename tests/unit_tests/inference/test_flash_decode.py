@@ -70,6 +70,7 @@ def test_decode_attention_preserves_batch_invariant_token_padding(
 
     monkeypatch.setattr(attention_module, "HAVE_FA4", True)
     monkeypatch.setattr(attention_module, "flash_attn4_varlen_func", fake_fa4_varlen, raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
 
     metadata_token_count = num_requests * tokens_per_request
     num_heads = 2
@@ -98,3 +99,100 @@ def test_decode_attention_preserves_batch_invariant_token_padding(
     assert output.shape == q.shape
     assert torch.equal(output[:metadata_token_count], q[:metadata_token_count])
     assert torch.count_nonzero(output[metadata_token_count:]) == 0
+
+
+@pytest.mark.parametrize("is_decode_only", [False, True])
+@pytest.mark.parametrize("batch_invariant_mode", [False, True])
+@pytest.mark.parametrize("device_capability", [(9, 0), (10, 0), (11, 0)])
+def test_fa4_split_kv_respects_device_support(
+    monkeypatch, is_decode_only, batch_invariant_mode, device_capability
+):
+    """Hopper cannot use SplitKV; supported devices retain automatic splitting."""
+    attention = object.__new__(SelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.config = SimpleNamespace(
+        window_size=None, window_attn_skip_freq=None, attn_logit_softcapping=None
+    )
+    attention.layer_number = 1
+    attention.batch_invariant_mode = batch_invariant_mode
+    attention.flash_attention_version = 4
+    attention.train(False)
+
+    q = torch.ones(2, 1, 4, 8)
+    split_counts = []
+
+    def get_device_capability(device):
+        assert device == q.device
+        return device_capability
+
+    def fake_fa4_varlen(query, _k, _v, *, num_splits, **_kwargs):
+        if device_capability == (9, 0):
+            assert num_splits == 1, "SplitKV not supported on SM 9.0"
+        split_counts.append(num_splits)
+        return query.clone(), None
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_device_capability)
+    monkeypatch.setattr(attention_module, "HAVE_FA4", True)
+    monkeypatch.setattr(attention_module, "flash_attn4_varlen_func", fake_fa4_varlen)
+
+    output = attention.flash_decode_and_prefill(
+        q=q,
+        k=torch.empty(0),
+        v=torch.empty(0),
+        max_seqlen_q=1,
+        max_seqlen_k=1024,
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        cu_seqlens_k=None,
+        seqlens_k=torch.tensor([1024, 1024], dtype=torch.int32),
+        block_table=torch.zeros((2, 16), dtype=torch.int32),
+        is_decode_only=is_decode_only,
+    )
+
+    assert split_counts == [1 if batch_invariant_mode or device_capability == (9, 0) else 0]
+    assert torch.equal(output, q)
+
+
+@pytest.mark.parametrize("is_decode_only", [False, True])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_fa4_requests_lse_for_sink_correction(monkeypatch, is_decode_only, has_sink):
+    """FA4 omits LSE during inference unless the caller explicitly requests it."""
+    attention = object.__new__(SelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.config = SimpleNamespace(
+        window_size=None, window_attn_skip_freq=None, attn_logit_softcapping=None
+    )
+    attention.layer_number = 1
+    attention.batch_invariant_mode = False
+    attention.flash_attention_version = 4
+    attention.train(False)
+
+    q = torch.ones(2, 1, 4, 8)
+    offset = torch.arange(4, dtype=torch.float32) if has_sink else None
+    requested_lse = []
+
+    def fake_fa4_varlen(query, _k, _v, *, return_lse=False, **_kwargs):
+        requested_lse.append(return_lse)
+        lse = torch.zeros(4, 2) if return_lse else None
+        return query.clone(), lse
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    monkeypatch.setattr(attention_module, "HAVE_FA4", True)
+    monkeypatch.setattr(attention_module, "flash_attn4_varlen_func", fake_fa4_varlen)
+
+    output = attention.flash_decode_and_prefill(
+        q=q,
+        k=torch.empty(0),
+        v=torch.empty(0),
+        max_seqlen_q=1,
+        max_seqlen_k=2,
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        cu_seqlens_k=None,
+        seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        is_decode_only=is_decode_only,
+        softmax_offset=offset,
+    )
+
+    assert requested_lse == [has_sink]
+    expected = q * torch.sigmoid(-offset).view(1, 1, 4, 1) if has_sink else q
+    torch.testing.assert_close(output, expected)

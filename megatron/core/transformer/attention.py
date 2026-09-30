@@ -1093,6 +1093,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         need_lse = softmax_offset is not None
 
         use_fa4, use_fa3 = self._resolve_flash_version()
+        fa4_num_splits = 1 if self.batch_invariant_mode else 0
+        if use_fa4 and torch.cuda.get_device_capability(q.device)[0] == 9:
+            # FA4's automatic heuristic can select SplitKV, which Hopper does not support.
+            fa4_num_splits = 1
 
         # Flash attn kernel.
         if not is_decode_only:
@@ -1116,7 +1120,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    num_splits=fa4_num_splits,
+                    return_lse=need_lse,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1259,7 +1264,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=0 if not self.batch_invariant_mode else 1,
+                        num_splits=fa4_num_splits,
+                        return_lse=need_lse,
                         **softcap_kwargs,
                     )
                     if need_lse:
