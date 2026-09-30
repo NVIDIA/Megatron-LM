@@ -367,9 +367,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_reset_indexer_on_load: bool = False
     """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
 
-    dsa_indexer_reset_method: Literal['random', 'main-q-mean', 'main-q-mean-rescaled'] = 'random'
-    """How to initialize DSA indexer parameters when resetting after checkpoint load."""
-
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
@@ -3783,9 +3780,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 simplified_indexer or not self.dsa_reset_indexer_on_load
             ), "dsa_reset_indexer_on_load requires dsa_indexer_mode='simplified'."
-            assert (
-                simplified_indexer or self.dsa_indexer_reset_method == 'random'
-            ), "dsa_indexer_reset_method requires dsa_indexer_mode='simplified'."
             if simplified_indexer:
                 assert (
                     self.num_query_groups == 1
@@ -3805,16 +3799,6 @@ class TransformerConfig(ModelParallelConfig):
                 # apply. dsa_indexer_rotate_activation defaults True for the standard indexer,
                 # so resolve it here rather than making every simplified config turn it off.
                 self.dsa_indexer_rotate_activation = False
-                main_q_reset = self.dsa_indexer_reset_method in (
-                    'main-q-mean',
-                    'main-q-mean-rescaled',
-                )
-                assert not (
-                    main_q_reset and self.dsa_indexer_head_dim != self.kv_channels
-                ), "Main-Q initialization requires dsa_indexer_head_dim == kv_channels."
-                assert not (
-                    main_q_reset and self.qk_layernorm
-                ), "Main-Q initialization is not defined when qk_layernorm is enabled."
             else:
                 assert (
                     self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0
@@ -3822,12 +3806,6 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0
                 ), "dsa_indexer_head_dim must be set to a positive integer when using DSA."
-                assert (
-                    self.dsa_indexer_reset_method == 'random'
-                ), "Main-Q reset methods are only supported by simplified DSA."
-            assert (
-                self.dsa_reset_indexer_on_load or self.dsa_indexer_reset_method == 'random'
-            ), "A non-random dsa_indexer_reset_method requires dsa_reset_indexer_on_load."
             assert (
                 self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
             ), "dsa_indexer_topk must be set to a positive integer when using DSA."
