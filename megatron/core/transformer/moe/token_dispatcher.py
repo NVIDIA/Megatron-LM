@@ -1325,9 +1325,7 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
         # HybridEP's metadata from the planner's runtime ids and the router's probabilities.
         super().setup_metadata(runtime_experts, self.token_probs)
 
-        # The planner gives every rank exactly its own route count, and HybridEP pads each of
-        # the 2L runtime expert segments on top; the base budget (routes x capacity factor)
-        # would make HybridEP drop the padded routes.
+        # Capacity bounds balanced blocks, including each logical expert's final partial block.
         self.num_permuted_tokens = self.rank_capacity
         return super().dispatch(
             hidden_states,

@@ -85,16 +85,24 @@ class VirtualExpertPlan:
     ready: torch.cuda.Event | None = None
 
 
-def plan_virtual_expert_routes(top_indices: torch.Tensor, workspace) -> VirtualExpertPlan:
+def plan_virtual_expert_routes(
+    top_indices: torch.Tensor, workspace, alignment: int = 1
+) -> VirtualExpertPlan:
     """Plan deterministic virtual-expert placement for one EP group and map this rank's routes.
 
     ``top_indices`` are the router's ``[num_tokens, topk]`` expert ids; every rank must route the
     same number of tokens. The histograms are the only cross-rank input and the planner kernel
     exchanges them itself, so every rank computes the same placement.
+    ``alignment`` rounds global expert counts once and balances blocks; only real routes are
+    remapped. It is a per-call specialization, never a property of the shared workspace.
     """
     if top_indices.dim() != 2 or top_indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("Virtual-expert planner takes int32/int64 [num_tokens, topk] expert ids.")
-    return VirtualExpertPlan(*launch_virtual_expert_planner(top_indices.contiguous(), workspace))
+    if not isinstance(alignment, int) or alignment < 1:
+        raise ValueError("Virtual-expert alignment must be a positive integer.")
+    return VirtualExpertPlan(
+        *launch_virtual_expert_planner(top_indices.contiguous(), workspace, alignment)
+    )
 
 
 # ---- Virtual-expert slots: arenas and runtime parameters shared by every layer ---------------
@@ -621,8 +629,8 @@ class VirtualExpertLoadBalancer:
         self.config = config
         self.router_topk = router_topk
         self.num_owned_experts = num_local_experts
-        # HybridEP pads every runtime expert's segment to the quantization block.
-        self._alignment = get_align_size_for_quantization(config)
+        # Match HybridEP's config-based alignment; the planner represents no padding as 1.
+        self._alignment = max(1, get_align_size_for_quantization(config))
         # The layer's token count and this rank's transport capacity for it, sized at the first
         # forward.
         self.num_tokens: int | None = None
@@ -796,14 +804,13 @@ class VirtualExpertLoadBalancer:
             done.record(stream)
 
     def _compute_rank_capacity(self, num_tokens: int) -> int:
-        """A static, dropless route capacity for one transport rank: every rank receives
-        exactly its own route count, plus HybridEP's per-runtime-expert segment padding.
-        """
+        """Dropless capacity from the worst-case number of globally rounded expert blocks."""
         num_routes = num_tokens * self.router_topk
         alignment = self._alignment
-        padding = self.num_runtime_experts * max(alignment - 1, 0)
-        capacity = num_routes + padding
-        return capacity + (-capacity % alignment if alignment > 1 else 0)
+        total_routes = self.ep_size * num_routes
+        nonempty = min(self.ep_size * self.num_owned_experts, total_routes)
+        max_blocks = (total_routes + nonempty * (alignment - 1)) // alignment
+        return alignment * ((max_blocks + self.ep_size - 1) // self.ep_size)
 
     # ---- forward: dispatcher hooks -----------------------------------------------------------
 
@@ -825,7 +832,7 @@ class VirtualExpertLoadBalancer:
         """Overlap planning with independent shared-expert or paired-attention compute."""
         with self._on_side_stream(self.planner_stream, self.planner_done):
             top_indices.record_stream(self.planner_stream)
-            self._plan = plan_virtual_expert_routes(top_indices, self.planner)
+            self._plan = plan_virtual_expert_routes(top_indices, self.planner, self._alignment)
         self._plan.ready = self.planner_done
         self._start_weight_push(WeightDirection.FORWARD)
 
