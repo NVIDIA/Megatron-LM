@@ -48,6 +48,7 @@ SEQ = 16
 BATCH = 1
 LR = 1.0  # scale-sensitive SGD step
 dtype = torch.bfloat16
+NUM_WIDE_STREAMS = 3
 
 
 def _make_config(calculate_per_token_loss=False):
@@ -76,6 +77,50 @@ def _make_stack(config, pg_collection):
     return torch.nn.ModuleList(
         [
             spec.module(config, spec.submodules, layer_number=i + 1, pg_collection=pg_collection)
+            for i in range(NUM_LAYERS)
+        ]
+    )
+
+
+def _make_wide_config(gtp_remat_size=1, calculate_per_token_loss=False):
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.transformer.wide_residual_config import WideResidualConfig
+
+    return TransformerConfig(
+        num_attention_heads=NUM_HEADS,
+        num_layers=NUM_LAYERS,
+        hidden_size=HIDDEN,
+        ffn_hidden_size=FFN_HIDDEN,
+        add_bias_linear=False,
+        params_dtype=dtype,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bias_dropout_fusion=False,
+        tensor_model_parallel_size=1,
+        tensor_parallel_num_weight_shards=gtp_remat_size,
+        pipeline_model_parallel_size=1,
+        fp32_residual_connection=True,
+        calculate_per_token_loss=calculate_per_token_loss,
+        wide_residual=WideResidualConfig(
+            num_streams=NUM_WIDE_STREAMS,
+            streamwise_sigmoid_init_scale=0.01,
+            learned_retention=True,
+            retention_init=0.999,
+            retention_max_forget=0.10,
+        ),
+    )
+
+
+def _make_wide_stack(config, pg_collection):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    return torch.nn.ModuleList(
+        [
+            WideResidualTransformerLayer(
+                config, spec.submodules, layer_number=i + 1, pg_collection=pg_collection
+            )
             for i in range(NUM_LAYERS)
         ]
     )
@@ -123,6 +168,52 @@ def _run_one_backward(ddp_model, rank, calculate_per_token_loss=False):
         calculate_per_token_loss=calculate_per_token_loss,
     )
     return float(loss.item())
+
+
+def _build_wide_ddp(stack):
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+
+    module = torch.nn.Sequential()
+    for i, layer in enumerate(stack):
+        module.add_module(str(i), layer)
+    return DistributedDataParallel(
+        stack[0].config,
+        DistributedDataParallelConfig(use_distributed_optimizer=False, overlap_grad_reduce=False),
+        module,
+    )
+
+
+def _run_wide_backward(ddp_model, rank, calculate_per_token_loss=False):
+    """Run one wide layer and complete both DP and replicated-GTP grad reductions."""
+
+    ddp_model.zero_grad_buffer()
+    torch.manual_seed(1000 + rank)
+    x = torch.randn(
+        SEQ,
+        BATCH,
+        NUM_WIDE_STREAMS * HIDDEN,
+        dtype=torch.float32,
+        device='cuda',
+        requires_grad=True,
+    )
+    out = x
+    for layer in ddp_model.module.children():
+        out, _ = layer(out, attention_mask=None)
+    out.float().square().mean().backward()
+    ddp_model.finish_grad_sync()
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed.finalize_model_grads import (
+        _allreduce_replicated_grads_over_gtp_remat_group,
+    )
+
+    _allreduce_replicated_grads_over_gtp_remat_group(
+        [ddp_model],
+        ps.get_gtp_weight_remat_group(check_initialized=False),
+        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+        calculate_per_token_loss=calculate_per_token_loss,
+    )
+    return out.detach().float().cpu(), x.grad.detach().float().cpu()
 
 
 def _full_main_grads(stack):
@@ -251,6 +342,98 @@ def _worker(rank, world_size, port, calculate_per_token_loss=False):
             f"GTP_remat2xDP2 reduced gradient does not match the no-GTP_remat DP4 baseline "
             f"(max rel err {max_err:.3e} on {worst}) -> gtp_remat-axis grad reduce/scaling error."
         )
+
+
+def _worker_wide_residual(rank, world_size, port, calculate_per_token_loss=False):
+    """Compare one wide layer under DP4 and GTP2 x DP2 with identical weights and data."""
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import reset_gtp_state
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    del world_size, port
+
+    # Phase A: trusted no-GTP baseline. Every rank owns the complete weights.
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+    base_stack = _make_wide_stack(
+        _make_wide_config(gtp_remat_size=1, calculate_per_token_loss=calculate_per_token_loss), pgc
+    ).cuda()
+    for param in base_stack.parameters():
+        dist.broadcast(param.data, src=0)
+    saved = {name: param.data.clone() for name, param in base_stack.named_parameters()}
+
+    base_output, base_input_grad = _run_wide_backward(
+        _build_wide_ddp(base_stack), rank, calculate_per_token_loss
+    )
+    base_grads = _full_main_grads(base_stack)
+
+    ps.destroy_model_parallel()
+    reset_gtp_state()
+
+    # Phase B: GTP shards the branch GEMMs while wide-residual controllers stay replicated.
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+    gtp_stack = _make_wide_stack(
+        _make_wide_config(gtp_remat_size=2, calculate_per_token_loss=calculate_per_token_loss), pgc
+    ).cuda()
+
+    gtp_group = ps.get_gtp_weight_remat_group()
+    assert gtp_group.size() == 2
+    gtp_rank = gtp_group.rank()
+    sharded_names = []
+    controller_names = []
+    for name, param in gtp_stack.named_parameters():
+        full = saved[name]
+        if isinstance(param, GTPShardedParam):
+            shard_size = param.shape[0]
+            param.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
+            sharded_names.append(name)
+        else:
+            param.data.copy_(full)
+        if 'residual_connection_' in name:
+            controller_names.append(name.removeprefix('0.'))
+            assert not isinstance(param, GTPShardedParam), f"controller was GTP-sharded: {name}"
+
+    assert sharded_names, "no branch parameter was GTP-sharded"
+    assert controller_names, "no wide-residual controller parameter was found"
+
+    gtp_output, gtp_input_grad = _run_wide_backward(
+        _build_wide_ddp(gtp_stack), rank, calculate_per_token_loss
+    )
+    gtp_grads = _full_main_grads(gtp_stack)
+
+    ps.destroy_model_parallel()
+    reset_gtp_state()
+
+    torch.testing.assert_close(gtp_output, base_output, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(gtp_input_grad, base_input_grad, atol=2e-6, rtol=2e-2)
+
+    if rank == 0:
+        worst_rel, worst_name = _max_rel_grad_diff(base_grads, gtp_grads)
+        print(
+            f"[wide residual] max relative grad error GTP2xDP2-vs-DP4 = "
+            f"{worst_rel:.3e} ({worst_name})",
+            flush=True,
+        )
+        assert worst_rel < 2e-2, (
+            f"wide-residual GTP2xDP2 gradients differ from DP4 by {worst_rel:.3e} "
+            f"on {worst_name}"
+        )
+        for name in controller_names:
+            active_grad = base_grads[name][:NUM_WIDE_STREAMS]
+            assert torch.count_nonzero(active_grad) > 0, f"controller gradient is zero: {name}"
+            torch.testing.assert_close(
+                gtp_grads[name], base_grads[name], atol=2e-6, rtol=2e-2, msg=name
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1037,6 +1220,20 @@ class TestGTPGradCorrectness:
         update_gtp_config(calculate_per_token_loss=per_token_loss)
         try:
             _run_distributed(_worker, 4, per_token_loss)
+        finally:
+            update_gtp_config(calculate_per_token_loss=False)
+
+    @pytest.mark.parametrize("per_token_loss", [False, True])
+    def test_wide_residual_gtp2_dp2_matches_dp4_baseline(self, per_token_loss):
+        """Wide outputs and grads must match when branch weights are GTP-sharded."""
+
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
+
+        update_gtp_config(calculate_per_token_loss=per_token_loss)
+        try:
+            _run_distributed(_worker_wide_residual, 4, per_token_loss)
         finally:
             update_gtp_config(calculate_per_token_loss=False)
 

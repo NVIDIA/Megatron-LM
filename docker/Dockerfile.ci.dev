@@ -96,7 +96,7 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     uv sync --only-group build
     # Limit per-package compiler concurrency on ARM.
     if [ "$(uname -m)" = "aarch64" ]; then
-        export MAX_JOBS=8
+        export MAX_JOBS=32
     fi
     # Split the same compiler budget across TE sources and their per-source target threads.
     if [ -n "${NVTE_BUILD_THREADS_PER_JOB:-}" ]; then

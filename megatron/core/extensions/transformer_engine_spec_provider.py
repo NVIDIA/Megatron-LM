@@ -160,8 +160,6 @@ class TESpecProvider(BackendSpecProvider):
 
         Which one depends on the config rather than on this being the TE provider, so the
         same settings give the same kernel whichever backend supplies the rest of the model.
-        ``megatron/training/arguments.py`` rejects ``cross_entropy_fusion_impl='te'``, but a
-        config built directly can still ask for it.
         """
         return select_cross_entropy(
             self._cross_entropy_loss_fusion, self._cross_entropy_fusion_impl, self._cuda_graph_impl
