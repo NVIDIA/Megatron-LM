@@ -655,9 +655,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
-        # Per-token loss supplies token sums, then finalize_model_grads() divides by
-        # the global token count. Cancel MFSDP's mesh averaging in that case.
-        dense_grad_divisor = 1.0 / dp_mesh.size() if config.calculate_per_token_loss else 1.0
+        dense_grad_divisor = 1.0
+        # Expert parameters use expert-DP rather than the full dense-DP group.
+        # With averaged losses, account for contributions dispatched from every EP rank.
+        expert_grad_divisor: float = config.expert_model_parallel_size
+        if config.calculate_per_token_loss:
+            # Per-token loss supplies token sums, then finalize_model_grads() divides by
+            # the global token count. Cancel MFSDP's mesh averaging in that case.
+            dense_grad_divisor = 1.0 / dp_mesh.size()
+            if expert_dp_mesh is not None:
+                expert_grad_divisor = 1.0 / expert_dp_mesh.size()
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -682,10 +689,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         with construction_context:
             if expert_dp_mesh is not None:
-                # Expert parameters use expert-DP rather than the full dense-DP group.
-                # With averaged losses, the EP divisor accounts for contributions
-                # dispatched from every EP rank. Per-token losses instead cancel
-                # mesh averaging and use the global token count after accumulation.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
@@ -694,11 +697,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            grad_divisor=(
-                                1.0 / expert_dp_mesh.size()
-                                if config.calculate_per_token_loss
-                                else config.expert_model_parallel_size
-                            ),
+                            grad_divisor=expert_grad_divisor,
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
