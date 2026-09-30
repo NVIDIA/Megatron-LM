@@ -449,7 +449,12 @@ class HybridStack(MegatronModule):
         self.input_tensor = input_tensor
 
     def physical_layers(self) -> tuple[nn.Module, ...]:
-        """Return physical layers in execution order, expanding logical shortcut pairs."""
+        """Return one layer per layer_type_list entry, in execution order.
+
+        self.layers holds what runs: Shortcut-MoE registers each paired layer and the MoE
+        after it as a single ShortcutMoEBlock. This unpacks those pairs, so the result lines up
+        index-for-index with layer_type_list and layer_config_list.
+        """
         physical_layers = []
         for layer in self.layers:
             if isinstance(layer, ShortcutMoEBlock):
