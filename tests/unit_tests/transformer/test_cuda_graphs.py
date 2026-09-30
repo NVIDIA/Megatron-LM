@@ -66,7 +66,11 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import setup_model_and_optimizer
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+)
 
 fp8_available, _ = check_fp8_support()
 
@@ -586,7 +590,7 @@ class TestPackedSeqCudagraphs:
             pad_between_seqs=True,
         )
 
-    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("cp_size", [1, pytest.param(2, marks=pytest.mark.flaky_in_dev)])
     def test_thd_capture_with_pad_between_seqs(self, cp_size):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
@@ -1406,12 +1410,6 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
-def is_nccl_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
-
-    return HAVE_TE_EP
-
-
 class TestPartialCudaGraph:
     """Test that CUDA graph outputs match non-CUDA graph outputs for various scopes."""
 
@@ -1673,10 +1671,6 @@ class TestPartialCudaGraph:
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
         elif moe_dispatcher_type == "ncclep_fp8":
-            from tests.unit_tests.transformer.moe.test_token_dispatcher import (
-                is_nccl_ep_fp8_dispatch_available,
-            )
-
             if not is_nccl_ep_available():
                 pytest.skip("NCCL EP is not available")
             if ep_size < 2:

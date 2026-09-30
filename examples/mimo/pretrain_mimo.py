@@ -4,6 +4,13 @@
 
 from __future__ import annotations
 
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
+
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
+
 import argparse
 from functools import partial
 

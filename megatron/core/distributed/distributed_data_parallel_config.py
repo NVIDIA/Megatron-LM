@@ -108,9 +108,15 @@ class DistributedDataParallelConfig:
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
 
-    expert_data_parallel_sharding_strategy: str | None = None
-    """Optional expert-parameter sharding strategy for MFSDP v2. When unset, experts use
-      ``data_parallel_sharding_strategy``."""
+    expert_data_parallel_sharding_strategy: Optional[str] = None
+    """Sharding strategy applied to expert (MoE) parameters on DP-Shard. Valid values are
+      'no_shard', 'optim', 'optim_grads', 'optim_grads_params'. When set,
+      `data_parallel_sharding_strategy` only applies to non-expert parameters, which allows
+      trading DP-Shard communication against memory separately for the two parameter classes
+      (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
+      already sharded over a narrower DP group than non-expert parameters when expert
+      parallelism is enabled, so the two classes have very different traffic-per-byte.
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -174,6 +180,13 @@ class DistributedDataParallelConfig:
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
     Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
+    """
+
+    expert_outer_dp_sharding_strategy: Optional[str] = None
+    """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
+    Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
+    ``'optim_grads_params'``. None is replaced with
+    ``outer_dp_sharding_strategy`` during initialization.
     """
 
     disable_symmetric_registration: bool = False
@@ -296,7 +309,17 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
-        for name in ("data_parallel_sharding_strategy", "outer_dp_sharding_strategy"):
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
+        if self.expert_outer_dp_sharding_strategy is None:
+            self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
+
+        for name in (
+            "data_parallel_sharding_strategy",
+            "expert_data_parallel_sharding_strategy",
+            "outer_dp_sharding_strategy",
+            "expert_outer_dp_sharding_strategy",
+        ):
             value = getattr(self, name)
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(

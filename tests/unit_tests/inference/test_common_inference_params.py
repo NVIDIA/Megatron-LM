@@ -1,9 +1,27 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import pytest
+
 from megatron.core.inference.sampling_params import SamplingParams
 
 
 class TestSamplingParams:
+
+    @pytest.mark.parametrize(
+        'given,expected',
+        [
+            ({'top_p': 1.0}, {'top_p': 0.0}),
+            ({'top_p': 1.5}, {'top_p': 0.0}),
+            ({'top_p': 0.95}, {'top_p': 0.95}),
+            ({'top_k': -1}, {'top_k': 0}),
+        ],
+    )
+    def test_no_op_filters_normalize_to_disabled_sentinels(self, given, expected):
+        # `deserialize` funnels through `add_attributes`, bypassing __post_init__,
+        # so both construction paths must normalize.
+        for params in (SamplingParams(**given), SamplingParams.deserialize(given)):
+            for name, value in expected.items():
+                assert getattr(params, name) == value
 
     def test_sampling_params(self):
         sampling_params = SamplingParams()
