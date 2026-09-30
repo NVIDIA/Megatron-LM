@@ -995,7 +995,7 @@ def _get_grad_divisors(
         # N = n₀ + n₁ + n₂ + n₃, so the final expert gradient is:
         #     (g₀ + g₂) / N = ∂[(s₀ + s₁ + s₂ + s₃) / N]/∂θ_A.
         dense_grad_divisor = 1.0 / dp_mesh.size()
-        expert_grad_divisor: float = config.expert_model_parallel_size
+        expert_grad_divisor = 1.0
         if expert_dp_mesh is not None:
             expert_grad_divisor = 1.0 / expert_dp_mesh.size()
     else:
