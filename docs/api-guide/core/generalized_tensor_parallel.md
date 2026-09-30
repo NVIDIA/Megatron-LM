@@ -24,6 +24,9 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
 
 **Scope of this document**: a high-level summary of GTP_remat — design intent, public CLI surface, and Megatron-LM ↔ TransformerEngine integration touchpoints.
 
+The opt-in `--gtp-remat-fold-cp` layout keeps total weight shards fixed
+as CP changes; the independent-axis formulas below describe the default layout.
+
 **Source**: core sharding and collective implementation in `megatron/core/tensor_parallel/generalized_tensor_parallelism.py`, CUDA-graph lifecycle support in `megatron/core/tensor_parallel/gtp_cuda_graphs.py`, and the public surface re-exported from `megatron/core/tensor_parallel/gtp_api.py`. Low-precision tensor primitives (FP8 / MXFP8 / NVFP4) stay in TransformerEngine and are imported by the implementation module.
 
 **Outline:**

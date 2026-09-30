@@ -197,7 +197,7 @@ class TestEvalBatchSizeDivisibilityWithGTP:
         # 4 % (1 * 1) == 0 satisfies the two-factor check, but evaluate() divides by
         # eval_micro_batch_size * data_parallel_size * gtp_weight_remat_size, which floors to
         # 4 // 8 == 0 microbatches: evaluation would silently do nothing.
-        with pytest.raises(AssertionError, match="gtp_weight_remat_size"):
+        with pytest.raises(AssertionError, match="sample_parallel_size"):
             validate_args(args)
 
     def test_gtp_remat_divisible_config_passes(self, monkeypatch):
@@ -206,11 +206,26 @@ class TestEvalBatchSizeDivisibilityWithGTP:
         validate_args(args)
         assert args.gtp_weight_remat_size == 8
         assert args.data_parallel_size == 1
+        assert args.sample_parallel_size == 8
         # The division evaluate() performs; it must leave at least one microbatch.
         num_microbatches = args.eval_global_batch_size // (
             args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
         )
         assert num_microbatches == 1
+
+    @pytest.mark.parametrize("cp,weight_shards,samples", [(4, 2, 2), (2, 4, 4)])
+    def test_folded_cp_uses_independent_sample_count(self, monkeypatch, cp, weight_shards, samples):
+        """CP inside or outside the weight group does not multiply the eval batch size."""
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        args = self._build_args(
+            monkeypatch, num_weight_shards=weight_shards, eval_global_batch_size=samples
+        )
+        args.context_parallel_size = cp
+        args.gtp_remat_fold_cp = True
+        args.ckpt_format = "torch_dist"
+        validate_args(args)
+        assert args.sample_parallel_size == samples
+        assert args.eval_global_batch_size // (args.eval_micro_batch_size * samples) == 1
 
 
 class TestGetTrainValidTestNumSamples:

@@ -14,6 +14,36 @@ from tests.unit_tests.test_utilities import Utils
 class TestProcessGroupsConfig:
     """Simple tests for process group dataclasses."""
 
+    def test_dp_cp_replicas_for_ddp_and_optimizer(self, mocker):
+        """Folded CP uses the supplied replicas without expanding them by CP size."""
+        replicas = mocker.Mock(spec=dist.ProcessGroup)
+        replicas.size.return_value = 2
+        other = mocker.Mock(spec=dist.ProcessGroup)
+        other.size.return_value = 1
+        pg = ProcessGroupCollection(
+            dp=other,
+            dp_cp=replicas,
+            expt_dp=other,
+            tp=other,
+            pp=other,
+            ep=other,
+            mp=other,
+            tp_ep_pp=other,
+            intra_dist_opt=other,
+        )
+        config = mocker.Mock(context_parallel_size=128)
+        ddp_config = mocker.Mock(
+            num_distributed_optimizer_instances=1, use_distributed_optimizer=True
+        )
+        chunk = mocker.Mock(ddp_config=ddp_config)
+        ddp_groups = ProcessGroupCollection.setup_process_groups_for_ddp(pg, config, ddp_config)
+        optimizer_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg, [chunk], use_gloo_process_groups=False
+        )
+        for groups in (ddp_groups, optimizer_groups):
+            assert groups["dp_cp_group"] is replicas
+            assert groups["intra_dp_cp_group"] is replicas
+
     def test_transformer_process_groups(self, mocker):
         """Test basic functionality of TransformerProcessGroups."""
         mock_pg1 = mocker.Mock(spec=dist.ProcessGroup)

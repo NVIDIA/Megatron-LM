@@ -473,6 +473,9 @@ class TestNcclEpPagedStashing:
         pass
 
     def teardown_method(self, method):
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+
+        nccl_ep_release_context()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -536,6 +536,7 @@ def create_ckpt_load_args(create_args):
     args.vocab_file = None
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
+    args.context_parallel_size = 1
     args.ckpt_assume_constant_structure = False
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
