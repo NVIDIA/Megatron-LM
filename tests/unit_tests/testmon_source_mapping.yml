@@ -5,12 +5,11 @@
 # the listed test buckets run in full regardless of Testmon's deselection.
 #
 # This supplements tracing only for mapped paths; it does not repair tracing.
-# Older baselines produced before these mappings existed may require
-# regeneration after this file is first introduced.
+# CI supplies changed paths, including deletions and both sides of renames.
 #
 # Fields:
-#   source_dirs  - repository-relative directories to fingerprint recursively;
-#                  a change in ANY listed directory triggers ALL targets
+#   source_dirs  - repository-relative directories to match against changed paths;
+#                  a change under ANY listed directory triggers ALL targets
 #   test_buckets - per-platform lists of unit-test bucket strings; each string
 #                  must match a recipe test_case value exactly; platform names
 #                  are discovered from tests/test_utils/recipes/*/unit-tests.yaml

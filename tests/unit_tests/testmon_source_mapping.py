@@ -3,27 +3,26 @@
 """Source-directory-to-test-bucket mapping for selective unit testing.
 
 Some execution paths (e.g. CUDA autograd callbacks) are not recorded by
-Testmon's tracing.  This module checks which files changed in a PR and,
+Testmon's tracing.  This module reads the changed paths supplied by CI and,
 when any changed file falls under a mapped source directory, returns the
 test buckets that must run in full — regardless of Testmon's deselection.
 
 Usage from CI::
 
     python tests/unit_tests/testmon_source_mapping.py \\
-        --root . --platform dgx_h100 --base-ref origin/main
+        --root . --platform dgx_h100 --changed-files-json changed-files.json
 
 Or with an explicit file list on stdin::
 
-    git diff --name-only origin/main...HEAD | \\
-        python tests/unit_tests/testmon_source_mapping.py \\
-            --root . --platform dgx_h100 --changed-files-stdin
+    python tests/unit_tests/testmon_source_mapping.py \\
+        --root . --platform dgx_h100 --changed-files-stdin < changed-files.txt
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -189,16 +188,17 @@ def forced_full_buckets(root: Path, changed_files: list[str], platform: str) -> 
     return sorted(buckets)
 
 
-def _changed_files(root: Path, base_ref: str) -> list[str]:
-    """Get repo-relative paths of files changed between *base_ref* and HEAD."""
-    result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=ACDMRT", f"{base_ref}..HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+def load_changed_files(path: Path) -> list[str]:
+    """Read a JSON array of paths without changing filename characters."""
+    try:
+        changed_files = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid changed-files JSON in {path}: {error}") from error
+    if not isinstance(changed_files, list) or any(
+        not isinstance(changed, str) or not changed for changed in changed_files
+    ):
+        raise ValueError(f"changed files must be a JSON array of non-empty strings: {path}")
+    return changed_files
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,7 +207,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--platform", required=True)
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--base-ref", help="Git ref to diff against (e.g. origin/main)")
+    group.add_argument(
+        "--changed-files-json", type=Path, help="JSON file containing changed paths from CI"
+    )
     group.add_argument(
         "--changed-files-stdin",
         action="store_true",
@@ -215,12 +217,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.base_ref:
-        files = _changed_files(args.root, args.base_ref)
-    else:
-        files = [line.strip() for line in sys.stdin if line.strip()]
-
-    buckets = forced_full_buckets(args.root, files, args.platform)
+    try:
+        if args.changed_files_json:
+            files = load_changed_files(args.changed_files_json)
+        else:
+            files = [line.strip() for line in sys.stdin if line.strip()]
+        buckets = forced_full_buckets(args.root, files, args.platform)
+    except (OSError, ValueError) as error:
+        print(f"Testmon source mapping: {error}", file=sys.stderr)
+        return 1
     for bucket in buckets:
         print(bucket)
     return 0

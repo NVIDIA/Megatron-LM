@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--identity", type=Path, required=True)
         if command == "validate":
             child.add_argument("--matched-key", required=True)
-            child.add_argument("--base-ref", default="")
+            child.add_argument("--changed-files", type=Path)
         else:
             child.add_argument("--source-sha", required=True)
             child.add_argument("--generation", required=True)
@@ -292,15 +292,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"Baseline image: {manifest.get('image_id', 'unknown')}; "
                 f"current image: {identity['image_id']}"
             )
-            if args.base_ref:
+            if args.changed_files is not None:
                 spec = importlib.util.spec_from_file_location(
                     "testmon_source_mapping", Path(__file__).with_name("testmon_source_mapping.py")
                 )
+                if spec is None or spec.loader is None:
+                    raise ValueError("unable to load Testmon source mapping")
                 sm = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(sm)
                 bucket = identity["compatibility"]["bucket"]
                 platform = identity["compatibility"]["platform"]
-                files = sm._changed_files(Path("."), args.base_ref)
+                files = sm.load_changed_files(args.changed_files)
                 if bucket in sm.forced_full_buckets(Path("."), files, platform):
                     raise ValueError(f"source mapping forces full run for bucket {bucket}")
     except (OSError, ValueError, sqlite3.Error) as error:

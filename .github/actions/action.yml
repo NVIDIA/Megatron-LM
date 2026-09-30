@@ -74,6 +74,10 @@ inputs:
     description: "Baseline source branch. Selective unit tests currently support main only."
     required: false
     default: ""
+  unit_testmon_changed_files:
+    description: "JSON array of changed paths, including deletions and both sides of renames. Missing or invalid data runs the full bucket."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -185,7 +189,7 @@ runs:
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
-        TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
+        CHANGED_FILES_JSON: ${{ inputs.unit_testmon_changed_files }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -197,17 +201,17 @@ runs:
             EFFECTIVE_MODE=baseline
             ;;
           enforce)
-            git fetch --depth=1 origin "$TARGET_BRANCH" 2>/dev/null || true
+            printf '%s' "$CHANGED_FILES_JSON" > "$RUNNER_TEMP/unit-testmon-changed-files.json"
             if [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
-                --matched-key "$MATCHED_KEY" --base-ref "origin/$TARGET_BRANCH" \
+                --matched-key "$MATCHED_KEY" --changed-files "$RUNNER_TEMP/unit-testmon-changed-files.json" \
                 | tee -a "$GITHUB_STEP_SUMMARY"; then
               EFFECTIVE_MODE=enforce
             else
               EFFECTIVE_MODE=full
-              FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
-              echo "::notice::Testmon baseline unavailable or invalid; running the full unit-test bucket."
+              FALLBACK_REASON="baseline validation or source mapping requires the full bucket without recording or saving"
+              echo "::notice::Testmon baseline validation or source mapping requires the full unit-test bucket."
             fi
             ;;
           *)

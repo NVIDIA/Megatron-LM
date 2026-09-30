@@ -340,6 +340,11 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "error",
         "invalid",
         "identity-error",
+        "mapped-source",
+        "unrelated-source",
+        "missing-changed-files",
+        "invalid-changed-files",
+        "invalid-changed-file-type",
     ],
 )
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
@@ -360,6 +365,32 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     helper = tmp_path / "tests/unit_tests/testmon_cache.py"
     helper.parent.mkdir(parents=True)
     shutil.copy2(HELPER, helper)
+    shutil.copy2(
+        ROOT / "tests/unit_tests/testmon_source_mapping.py",
+        helper.with_name("testmon_source_mapping.py"),
+    )
+    helper.with_name("testmon_source_mapping.yml").write_text(
+        yaml.safe_dump(
+            {
+                "mappings": [
+                    {
+                        "source_dirs": ["megatron/core/mapped"],
+                        "test_buckets": {"dgx_h100": [BUCKET]},
+                    }
+                ]
+            }
+        )
+    )
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("spec:\n  platforms: dgx_h100\n")
+    changed_files_json = {
+        "mapped-source": json.dumps(["megatron/core/mapped/deleted.py"]),
+        "unrelated-source": json.dumps(['megatron/core/unrelated/a b\"$(touch injected).py']),
+        "missing-changed-files": "",
+        "invalid-changed-files": "not JSON",
+        "invalid-changed-file-type": '["megatron/core/unrelated.py", 1]',
+    }.get(restore, "[]")
     if restore == "miss":
         shutil.rmtree(directory)
     elif restore == "invalid":
@@ -378,7 +409,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
             "MATCHED_KEY": "" if restore == "miss" else identity["cache_prefix"] + "123-1",
             "CACHE_HIT": "false",
-            "TARGET_BRANCH": "main",
+            "CHANGED_FILES_JSON": changed_files_json,
             "RUNNER_TEMP": str(runtime_dir),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
@@ -388,7 +419,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    valid = restore in {"valid", "different-image", "missing-image"}
+    valid = restore in {"valid", "different-image", "missing-image", "unrelated-source"}
     assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
@@ -397,6 +428,8 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         assert "b" * 40 in summary.read_text()
     else:
         assert "without recording or saving" in summary.read_text()
+    assert not (tmp_path / "injected").exists()
+    assert (runtime_dir / "unit-testmon-changed-files.json").read_text() == changed_files_json
 
 
 @pytest.mark.parametrize(
