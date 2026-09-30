@@ -980,11 +980,17 @@ class DynamicSparseAttention(nn.Module):
         q_indexer: torch.Tensor | None,
         k_indexer: torch.Tensor | None,
         weights_indexer: torch.Tensor | None,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         *,
         index_share_state: DSAIndexShareState | None,
         index_share_cache_key: Hashable | None,
     ) -> torch.Tensor:
+        """Select or reuse CP top-k indices and run the sparse attention.
+
+        ``mask`` is the explicit local-Q/global-K causal mask. IndexShare shared
+        layers (``skip_topk``) reuse the source layer's indices and never read
+        it, so their callers pass ``None``.
+        """
         batch = query.shape[1]
         topk_indices: torch.Tensor | None = None
         if self.skip_topk:
@@ -1001,6 +1007,7 @@ class DynamicSparseAttention(nn.Module):
         else:
             assert q_indexer is not None and k_indexer is not None
             assert weights_indexer is not None
+            assert mask is not None
             _scores, topk_indices = _index_scores_and_topk(
                 q_indexer,
                 k_indexer,
@@ -1084,10 +1091,14 @@ class DynamicSparseAttention(nn.Module):
         )
         if kv.is_cuda and not self.skip_topk:
             kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
-        mask = _build_cp_causal_mask(
-            query_pos,
-            torch.arange(kv.shape[0], device=x.device),
-        )
+        # Shared layers reuse the source layer's indices; skip the dense
+        # [local query, global key] mask they would never read.
+        mask = None
+        if not self.skip_topk:
+            mask = _build_cp_causal_mask(
+                query_pos,
+                torch.arange(kv.shape[0], device=x.device),
+            )
         out = self._run_cp_sparse_segment(
             query,
             kv,
@@ -1143,12 +1154,16 @@ class DynamicSparseAttention(nn.Module):
         )
         if kv.is_cuda and not self.skip_topk:
             kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
-        key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
-        mask = _build_cp_causal_mask(
-            query_pos,
-            key_pos,
-            cu_seqlens=cu_seqlens,
-        )
+        # Shared layers reuse the source layer's indices; skip the dense
+        # [local query, global key] mask they would never read.
+        mask = None
+        if not self.skip_topk:
+            key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
+            mask = _build_cp_causal_mask(
+                query_pos,
+                key_pos,
+                cu_seqlens=cu_seqlens,
+            )
         out = self._run_cp_sparse_segment(
             query,
             kv,

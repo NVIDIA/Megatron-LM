@@ -152,6 +152,7 @@ def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
     fake = SimpleNamespace(
         cp_size=2,
         cp_rank=0,
+        skip_topk=False,
         _project_cp_inputs=project_inputs,
         _gather_projected_cp=gather_projected,
         _run_cp_sparse_segment=run_sparse,
@@ -203,6 +204,7 @@ def test_packed_cp_native_explicitly_selects_contiguous_projected_gather():
     fake = SimpleNamespace(
         cp_size=2,
         cp_rank=0,
+        skip_topk=False,
         _packed_cu_seqlens=lambda params, device: params.cu_seqlens_q.to(device),
         _project_cp_inputs=project_inputs,
         _gather_projected_cp=gather_projected,
@@ -225,6 +227,109 @@ def test_packed_cp_native_explicitly_selects_contiguous_projected_gather():
 
     assert result is sentinel
     assert gather_modes == [True, True]
+
+
+def _fake_cp_attention(skip_topk, seen_masks, **extra):
+    def project_inputs(x, cos, sin, position_ids):
+        del x, cos, sin, position_ids
+        return (
+            torch.randn(4, 1, 2, 8),
+            torch.randn(4, 1, 8),
+            torch.randn(2, 2, 4),
+            torch.randn(4, 1, 2, 4),
+            torch.randn(4, 1, 4),
+            torch.randn(4, 1, 2),
+        )
+
+    def gather_projected(tensor, reorder, *, contiguous=False):
+        del contiguous
+        return torch.cat([tensor, tensor], dim=0).index_select(0, reorder)
+
+    def run_sparse(query, kv, q_idx, k_idx, weights, mask, **kwargs):
+        del query, kv, q_idx, k_idx, weights, kwargs
+        seen_masks.append(mask)
+        return torch.randn(4, 1, 8)
+
+    return SimpleNamespace(
+        cp_size=2,
+        cp_rank=0,
+        skip_topk=skip_topk,
+        _project_cp_inputs=project_inputs,
+        _gather_projected_cp=gather_projected,
+        _run_cp_sparse_segment=run_sparse,
+        _project_cp_output=lambda out, weight: out,
+        **extra,
+    )
+
+
+@pytest.mark.parametrize("skip_topk", [False, True])
+def test_dense_cp_native_builds_causal_mask_only_for_topk_layers(monkeypatch, skip_topk):
+    from megatron.lite.primitive.modules.attention import dsa as dsa_module
+
+    mask = torch.zeros(4, 8)
+    build_mask = Mock(return_value=mask)
+    monkeypatch.setattr(dsa_module, "_build_cp_causal_mask", build_mask)
+    seen_masks = []
+    fake = _fake_cp_attention(skip_topk, seen_masks)
+
+    dsa_module.DynamicSparseAttention._forward_dense_cp_native(
+        fake,
+        torch.randn(1, 4, 64),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        index_share_state=None,
+    )
+
+    if skip_topk:
+        build_mask.assert_not_called()
+        assert seen_masks == [None]
+    else:
+        build_mask.assert_called_once()
+        query_pos, key_pos = build_mask.call_args.args
+        assert query_pos.tolist() == [0, 1, 2, 3]
+        assert key_pos.tolist() == list(range(8))
+        assert seen_masks[0] is mask
+
+
+@pytest.mark.parametrize("skip_topk", [False, True])
+def test_packed_cp_native_builds_causal_mask_only_for_topk_layers(monkeypatch, skip_topk):
+    from megatron.lite.primitive.modules.attention import dsa as dsa_module
+
+    mask = torch.zeros(4, 8)
+    build_mask = Mock(return_value=mask)
+    monkeypatch.setattr(dsa_module, "_build_cp_causal_mask", build_mask)
+    seen_masks = []
+    fake = _fake_cp_attention(
+        skip_topk,
+        seen_masks,
+        _packed_cu_seqlens=lambda params, device: params.cu_seqlens_q.to(device),
+    )
+    params = SimpleNamespace(
+        cp_layout="contiguous",
+        cu_seqlens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+    )
+
+    dsa_module.DynamicSparseAttention._forward_packed_cp_native(
+        fake,
+        torch.randn(1, 4, 64),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        params,
+        index_share_state=None,
+    )
+
+    if skip_topk:
+        build_mask.assert_not_called()
+        assert seen_masks == [None]
+    else:
+        build_mask.assert_called_once()
+        query_pos, key_pos = build_mask.call_args.args
+        assert query_pos.tolist() == [0, 1, 2, 3]
+        assert key_pos.tolist() == list(range(8))
+        assert build_mask.call_args.kwargs["cu_seqlens"].tolist() == [0, 3, 8]
+        assert seen_masks[0] is mask
 
 
 def test_cp_indexer_topk_respects_explicit_global_position_mask():
