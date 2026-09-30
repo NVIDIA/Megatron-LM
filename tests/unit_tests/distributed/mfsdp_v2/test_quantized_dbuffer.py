@@ -186,7 +186,7 @@ def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup):
             torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
         )
         plane.local_buffer.copy_(values % 251)
-    result = source.allgather((1, 0), out=out)
+    result = source.allgather((0, 1), out=out)
     assert result is out
     for index, plane in enumerate(result.planes):
         assert plane.placements == (Replicate(), Replicate())
