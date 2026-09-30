@@ -740,6 +740,44 @@ def test_load_checkpoint(
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_state", "expected_version"),
+    [(None, 0), ({}, 0), ({"checkpoint_version": None}, 0), ({"checkpoint_version": 3.1}, 3.1)],
+)
+def test_load_fsdp_dtensor_checkpoint_version_template(
+    create_ckpt_load_args, tmp_path, checkpoint_state, expected_version
+):
+    """Missing checkpoints can start fresh; present versions reach optimizer load templates."""
+    args = create_ckpt_load_args
+    args.load = tmp_path
+    args.ckpt_format = "fsdp_dtensor"
+    args.use_distributed_optimizer = True
+    args.no_load_rng = True
+    model = [torch.nn.Linear(1, 1)]
+    optimizer = MockState({})
+    scheduler = MockState({})
+    checkpoint_type = CheckpointType.FSDP_DTENSOR if checkpoint_state is not None else None
+
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=args),
+        mock.patch(
+            "megatron.training.checkpointing._load_base_checkpoint",
+            side_effect=[(checkpoint_state, "", False, checkpoint_type), (None, "", False, None)],
+        ) as load_base,
+        mock.patch(
+            "megatron.training.checkpointing.generate_state_dict", return_value={}
+        ) as generate,
+    ):
+        result = load_checkpoint(model, optimizer, scheduler, dp_cp_group=mock.sentinel.dp_cp)
+
+    assert result == (0, 0)
+    assert [call.kwargs["rank0"] for call in load_base.call_args_list] == [True, False]
+    metadata = generate.call_args.kwargs["optim_sd_kwargs"]["metadata"]
+    assert metadata["checkpoint_version"] == expected_version
+    assert metadata["distrib_optim_sharding_type"] == "fsdp_dtensor"
+    assert generate.call_args.kwargs["optimizer"] is optimizer
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
     init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format

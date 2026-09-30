@@ -2970,9 +2970,9 @@ def load_checkpoint(
         )
         # Same as the torch_dist branch: optimizer load templates select checkpoint-era keys by
         # version. fsdp_dtensor state has no dtype-keyed FQNs today; keep both paths identical.
-        optim_sd_kwargs['metadata']['checkpoint_version'] = (
-            state_dict.get('checkpoint_version') or 0
-        )
+        optim_sd_kwargs['metadata']['checkpoint_version'] = (state_dict or {}).get(
+            'checkpoint_version'
+        ) or 0
 
         # Megatron-FSDP materializes optimizer slots with a dummy zero-gradient
         # step while building a loading state dict. A normal full resume
