@@ -265,6 +265,10 @@ if _TRITON_AVAILABLE:
             tl.store(ws_cs_ptr + (v_ws_base + t) * HC + offs_c, col_sum)
             M = M / (col_sum[None, :] + eps)
 
+        # The reverse pass can read scratch written by another warp after layout
+        # conversion. Publish all matrix and normalization stores before those reads.
+        tl.debug_barrier()
+
         # M is the final forward output. It is the right value for the first VJP
         # through the last column-normalization step.
         grad = tl.load(grad_out_ptr + mat_ptrs).to(tl.float32)
