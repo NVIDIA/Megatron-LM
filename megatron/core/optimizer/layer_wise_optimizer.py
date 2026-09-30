@@ -790,11 +790,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
+        # globals to fall back on there (see param_is_not_gtp_duplicate).
+        self.gtp_group = getattr(self.pg_collection, 'gtp_remat', None)
+        self.expert_gtp_group = getattr(self.pg_collection, 'expt_gtp_remat', None)
         for optimizer in optimizers:
             # Child optimizers perform duplicate filtering and gradient-stat reductions.
             optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
+            optimizer.gtp_group = self.gtp_group
+            optimizer.expert_gtp_group = self.expert_gtp_group
 
         super().__init__(optimizers)
 
@@ -1372,6 +1378,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=self.grad_stats_parallel_group,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.tp_group,
+            expert_tp_group=self.expert_tp_group,
+            gtp_group=self.gtp_group,
+            expert_gtp_group=self.expert_gtp_group,
         )
 
     def _managed_optimizer_state_offload_child_indices(self) -> tuple[int, ...]:
