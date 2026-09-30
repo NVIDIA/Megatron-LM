@@ -20,6 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     StageDispatchBwdGrad,
     get_comm_stream,
 )
+from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
 
@@ -138,8 +139,7 @@ def get_hybrid_stack_moe_metadata(layer, layer_type: Optional[LayerPatternItem] 
 
 
 def _maybe_apply_final_norm(node: ScheduleNode, hidden_states: Tensor):
-    final_norm = getattr(node.chunk_state.model.decoder, "final_norm", None)
-    final_norm = final_norm or getattr(node.chunk_state.model.decoder, "final_layernorm", None)
+    final_norm = node.chunk_state.model.decoder.final_norm
     if not node.is_mtp and final_norm is not None and node.is_last_layer:
         hidden_states = final_norm(hidden_states)
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
@@ -177,6 +177,7 @@ def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
     local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
     node.layer_state.residual = node.detach(residual)
+    node.layer_state.shared_expert_output = None
     if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
         node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
@@ -215,7 +216,7 @@ def _run_moe_experts(layer, node: ScheduleNode, dispatched_tokens: Tensor):
 
 def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     residual = node.layer_state.residual
-    shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
+    shared_expert_output = node.layer_state.shared_expert_output
     output = layer.mlp.combine(output)
     output = layer.mlp.postprocess(output, shared_expert_output)
     # Inline bda instead of calling ``layer._forward_post_mlp``, which would register
@@ -229,7 +230,7 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
         output = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
             mlp_output_with_bias, residual, layer.hidden_dropout
         )
-    mlp_norm_manager = getattr(node.layer_state, "mlp_norm_manager", None)
+    mlp_norm_manager = node.layer_state.mlp_norm_manager
     if mlp_norm_manager is not None:
         output = mlp_norm_manager.group_offload(output, forced_released_tensors=[residual])
         node.layer_state.mlp_norm_manager = None
@@ -263,7 +264,6 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                     hidden_states = item_layer(
                         hidden_states=hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
-                        inference_context=getattr(node.chunk_state, "inference_context", None),
                         packed_seq_params=node.chunk_state.packed_seq_params,
                     )
                 elif item_type in (
@@ -380,6 +380,13 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             # in turn calls backward_dw on the in_proj / out_proj linears. The
             # schedule node iterates this list and calls .backward_dw() on each;
             # registering the layer directly is sufficient.
+            if item_layer.config.delay_wgrad_compute and not isinstance(
+                item_layer.mixer, MambaMixer
+            ):
+                raise ValueError(
+                    "delay_wgrad_compute with overlap_moe_expert_parallel_comm does not support "
+                    f"Mamba layers with a {type(item_layer.mixer).__name__} mixer."
+                )
             pre_bwd_dw.append(item_layer)
     if is_moe:
         # Each slot owns the hooks for exactly the parameters whose delayed wgrad
