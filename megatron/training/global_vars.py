@@ -13,6 +13,7 @@ import torch
 from megatron.core import Timers
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
+from megatron.core.gtp_parallel_layout import get_sample_parallel_size
 from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
@@ -178,8 +179,8 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
         rank=args.rank,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
-        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
-        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
+        # Independent sequences, including when CP and weight sharding share ranks.
+        data_parallel_size=get_sample_parallel_size(args),
         decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,

@@ -49,6 +49,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [2.5 Tuning knobs](#25-tuning-knobs)
     - [2.6 FP32-accumulation wgrad reduce-scatter (optional)](#26-fp32-accumulation-wgrad-reduce-scatter-optional)
     - [2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional)
+    - [2.8 Sequence sharding within GTP](#28-sequence-sharding-within-gtp)
   - [3. Implementation details](#3-implementation-details)
     - [3.1 GTP\_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
       - [What the flags do under the hood](#what-the-flags-do-under-the-hood)
@@ -228,7 +229,7 @@ See [§3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp) f
 
 ## 2. Usage
 
-GTP_remat is enabled through two CLI flags on Megatron's training launcher; everything else (process-group construction, parameter slicing, prefetch chain wiring, optimizer routing) is automatic once the flags are set.
+Weight-shard flags control dense and expert GTP independently. The sequence-shard flag controls how dense GTP ranks share each sample.
 
 ### 2.1 Knob summary
 
@@ -236,8 +237,9 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 
 | Flag / knob | Kind | When to set | Default | Details |
 |---|---|---|---|---|
-| `--tensor-parallel-num-weight-shards` | **Required** | Always, to activate dense GTP | — | Total TP×GTP_remat shards per dense weight; GTP_remat degree = value ÷ TP. Must be ≥ TP and divisible by it. [§2.2](#22-required-flags) |
-| `--expert-tensor-parallel-num-weight-shards` | **Required** | MoE models (to shard routed-expert weights) | — | Total ETP×EGTP_remat shards per expert weight; EGTP_remat degree = value ÷ ETP. Independent of dense axis. [§2.2](#22-required-flags) |
+| `--tensor-parallel-num-weight-shards` | **Required** | Always, to activate dense GTP | TP | Total TP×GTP_remat shards per dense weight; GTP_remat degree = value ÷ TP. Must be ≥ TP and divisible by it. [§2.2](#22-required-flags) |
+| `--expert-tensor-parallel-num-weight-shards` | **Required** | MoE models (to shard routed-expert weights) | ETP | Total ETP×EGTP_remat shards per expert weight; EGTP_remat degree = value ÷ ETP. Independent of dense axis. [§2.2](#22-required-flags) |
+| `--tensor-parallel-num-sequence-shards` | **Optional** | Split sequences within dense GTP groups | TP with SP, otherwise 1 | Includes TP/SP; remaining GTP ranks process different samples. [§2.8](#28-sequence-sharding-within-gtp) |
 | `--gtp-remat-reduce-scatter-with-fp32-accumulation` | **Optional** | BF16 wgrads **and** GTP_remat axis ≥ 4 | off | Replaces the ring RS with an all-to-all + local FP32 sum to eliminate per-hop rounding error. Auto-bypassed at axis size ≤ 2. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
 | `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
@@ -432,6 +434,28 @@ it** — a different collective over a different process group, so enable either
   end-to-end at 256 GPUs; the VMM allocator recovers it). Window registration accepts this
   memory and runs the same symmetric kernels.
 
+### 2.8 Sequence sharding within GTP
+
+`--tensor-parallel-num-sequence-shards S` splits sequences within the dense weight
+group. Enabling GTP sequence sharding with TP > 1 requires `--sequence-parallel`;
+`S` includes TP and must be a multiple of TP and divide the weight-shard count.
+Leaving it unset preserves existing TP/SP behavior. `--context-parallel-size`
+adds sequence partitions across weight replicas.
+
+For example, on 128 GPUs with PP=1:
+
+```bash
+--tensor-model-parallel-size 1 \
+--tensor-parallel-num-weight-shards 64 \
+--tensor-parallel-num-sequence-shards 64 \
+--context-parallel-size 2
+```
+
+This gives DP=1, 64-rank weight groups, and 128 sequence partitions per sample.
+Use TP-fastest, PP-last rank ordering and place each weight group within an NVLink
+domain. GTP sequence sharding requires Megatron DDP and `--ckpt-format torch_dist`;
+dynamic/hybrid CP, FSDP, and sequence-packing schedulers are unsupported.
+
 ---
 
 ## 3. Implementation details
@@ -458,9 +482,19 @@ it** — a different collective over a different process group, so enable either
 
 The `--*-num-weight-shards` flags flow through five stages, from process groups to the prefetch chain:
 
-1. **Process groups.** `initialize_model_parallel(...)` treats GTP_remat/EGTP_remat as **first-class orthogonal axes** (`world = TP·CP·GTP_remat·DP`; experts `= ETP·EP·EGTP_remat·PP·expert_dp`), building `_GTP_WEIGHT_REMAT_GROUP` and `_EXPERT_GTP_WEIGHT_REMAT_GROUP` (sizes = `num-weight-shards / TP` and `/ ETP`). CP is placed more locally (smaller stride) than GTP_remat on the dense/decoder axis, since CP's collectives are on the model's critical path (`_inject_gtp_remat_axis(..., after="cp")`). **DP and gtp_remat stay orthogonal:** `get_data_parallel_group()` is the replicate axis (DDP + optimizer shard over it); `with_gtp_remat=True` gives the combined DP × gtp_remat axis for data distribution.
+1. **Process groups.** With GTP sequence sharding, `GTPParallelLayout` gives the same ranks two views:
 
-   > **Batch-size arithmetic.** `args.data_parallel_size` is the **replicate degree only** — gtp_remat is *divided out* of it (folded into `total_model_size` at `arguments.py:446`). But data is distributed over the **full DP × gtp_remat axis**, so each gtp_remat peer consumes a *distinct* microbatch and the global sample count is `micro_batch_size × data_parallel_size × gtp_weight_remat_size × num_microbatches`. The training loop therefore **re-applies `gtp_weight_remat_size`** to close the gap: *multiplied back in* for the LR-scheduler `increment` and the logged `batch_size`, *divided back out* to recover `eval_num_microbatches`. Without this it would read as a double-count — it is not.
+   - **Weights:** TP × GTP_remat shards each weight; configured CP × DP replicates those shards.
+   - **Tokens:** configured CP × `gtp_num_sequence_shards` splits sequences; the remaining GTP ranks × DP process different samples.
+
+   `gtp_num_sequence_shards` excludes TP/SP. Validation multiplies CLI CP by this
+   count to obtain runtime `context_parallel_size`; direct Python callers supply
+   that combined size. Bootstrap constructs the groups from these views; without
+   GTP sequence sharding, it uses the existing independent-axis layout. The expert
+   grid remains ETP × EP × EGTP_remat × PP × expert-DP.
+
+   Batch accounting uses `sample_parallel_size = DP × GTP_remat / gtp_num_sequence_shards`.
+   Global batch size is `micro_batch_size × sample_parallel_size × num_microbatches`.
 
 2. **Per-class sharding.** `extensions/transformer_engine.py` decides *per linear class* whether to shard, so **no `gtp_remat_group` is threaded through the module APIs** (attention, Mamba, MLP, embedding, MTP). Dense wrappers resolve the group via `utils.get_gtp_weight_remat_group(...)`; `TEGroupedLinear` uses `pg_collection.expt_gtp_remat`. Group `None`/size-1 → left full; otherwise `_gtp_pre_init` pre-shards `out_features` and `_gtp_attach_post_init` makes the shard a **`GTPShardedParam`** (the `DistributedWeight` implementer; native FP8/NVFP4 by reclass, BF16 by re-register). Base `te.Linear` (MoE latent projections) receives a group only when `--gtp-remat-opt-in-modules moe_latent_proj` is set; otherwise it stays full → see [Class hierarchy](#class-hierarchy-which-linears-shard).
 
@@ -539,7 +573,9 @@ Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_as
 
 ![DDP + (E)GTP_remat interaction with the distributed optimizer](../../images/generalized_tensor_parallel/0611_ddp_egtp_orthogonal_bucketing.png)
 
-**(E)GTP_remat is *super loosely coupled* to DDP and the distributed optimizer — they stay almost completely GTP_remat-agnostic.** GTP_remat is just another sub-axis of the rank grid (`world = TP×CP×GTP_remat×DP`); a GTP_remat-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP_remat/EGTP_remat-specific buffers, optimizers, or bucket groups, and just **one** GTP_remat-specific gradient-scaling factor (the expert-buffer correction below). The entire DDP/DistOpt stack touches GTP_remat in only **four** narrow places:
+GTP weights use the existing DDP buffers and optimizer paths. DDP reduces over
+weight replicas, while GTP completes reductions across weight shards. This also
+applies when those ranks process sequence partitions. The integration has four parts:
 
 1. **finalize all-reduce** (`_allreduce_replicated_grads_over_gtp_remat_group`) — completes the gtp_remat axis for *replicated* (non-GTP_remat) params (SUM under `calculate_per_token_loss`, AVG otherwise; see §3.2 table); a no-op when GTP_remat is inactive.
 2. **`is_gtp_weight_remat` / `allreduce` tags** propagated onto the optimizer's master shards — consumed only by the grad-norm dedup filter.
@@ -886,12 +922,23 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v -m "not flaky_in_dev"
 ```
 
+Run the sequence-sharding tests on both 4 and 8 GPUs to cover all layouts:
+
+```bash
+for ranks in 4 8; do
+    uv run python -m torch.distributed.run --nproc-per-node "$ranks" -m pytest -q \
+        tests/unit_tests/test_gtp_parallel_layout.py \
+        tests/unit_tests/generalized_tensor_parallel/test_gtp_cp_overlap.py
+done
+```
+
 | Test file | What it guards |
 |-----------|----------------|
 | `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, DDP bucket alignment, the `num_zeros` padding correction (§3.7), and TE's recompute-phase flag (dtype-agnostic, relied on by the readiness gate in §3.2). |
 | `test_attention_gtp.py` | GTP_remat on attention linears, loss parity vs no-GTP_remat. |
 | `test_mamba_gtp.py` | GTP_remat on Mamba projection weights. |
 | `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |
+| `test_gtp_cp_overlap.py` | Sequence sharding with CP, TP/SP, gradient and Adam-update parity, and checkpoint loading after a CP change. |
 | `test_moe_egtp.py` | EGTP_remat on MoE routed-expert weights. |
 | `test_gtp_loss_correctness.py` | End-to-end: GTP_remat per-step loss trajectory matches a no-GTP_remat baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.6): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
