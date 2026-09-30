@@ -162,6 +162,8 @@ def main():
     # Finish saver process.
     print("Waiting for saver to complete...")
     saver_proc.join()
+    if saver_proc.exitcode != 0:
+        raise RuntimeError(f"Checkpoint saver failed with exit code {saver_proc.exitcode}.")
 
 
 if __name__ == '__main__':
