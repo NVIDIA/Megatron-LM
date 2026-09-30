@@ -27,7 +27,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     reset_model,
 )
 from tests.unit_tests.test_utilities import (
-    Utils,
     is_nccl_ep_fp8_dispatch_available,
     is_nccl_ep_zero_copy_available,
     is_op_fuser_available,
@@ -253,15 +252,13 @@ class TestA2AOverlap:
     produces the same results as the reference implementation.
     """
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(
+    @pytest.fixture(autouse=True)
+    def model_parallel(self, shared_model_parallel):
+        shared_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=4,
         )
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_transformer_layer_overlap_dense(self):
