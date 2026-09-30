@@ -5,7 +5,7 @@ concise and actionable — the value of this depth is that an author gets it bac
 in minutes, so a long list of maybes defeats the point.
 
 Prerequisite: the mandatory workflow in `../SKILL.md` (diff → domain skills →
-this file → review).
+this file → applicable style guidance → review).
 
 ## Focus ONLY on
 
@@ -17,6 +17,8 @@ this file → review).
   - If the PR fixes a bug that was not caught by an existing unit test, suggest
     adding a regression test to prevent recurrence
 - Outdated or inaccurate documentation affected by the changes
+- Clear violations of [style-guide.md](../../../style-guide.md) in changed
+  Python code that configured linters/formatters do not enforce
 - New direct global process group access in `megatron/core` production code
   - Flag added calls to `parallel_state.get_*_group()` or directly imported
     `get_*_group()` helpers unless they are in `parallel_state.py`,
@@ -25,17 +27,25 @@ this file → review).
     migration fallback
   - Prefer passing a `ProcessGroupCollection` or explicit
     `torch.distributed.ProcessGroup` from the caller
+- GPU kernel changes without a determinism test
+  - If the PR adds or changes a GPU kernel (Triton kernel,
+    `jit_fuser`/`torch.compile` function, CUDA extension, Transformer Engine
+    or external-library dispatch, or a scatter/index accumulation), check that
+    a bit-exact determinism test under
+    `tests/unit_tests/determinism/kernels/` is added or updated and that the
+    kernel is registered in `tests/unit_tests/determinism/kernels/manifest.py`
+    (see `docs/developer/determinism/testing.md`)
 
 ## Do NOT comment on
 
-- Style preferences or formatting
+- Subjective style preferences or issues already covered by configured linters/formatters
 - Minor naming suggestions
-- Architectural opinions or refactoring ideas
+- Architectural opinions or refactoring ideas unrelated to style-guide.md
 - Performance unless there is a clear, measurable issue
 
 These are the strict-review categories. Raising them here turns a fast sanity
 check into a design debate the author did not ask for; if they want that, they
-will run `/claude strict-review`.
+will run `/review mode=strict`.
 
 ## Completion
 

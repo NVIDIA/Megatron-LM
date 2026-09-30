@@ -40,7 +40,7 @@ class NestedModel(nn.Module):
         return x
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -82,7 +82,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     static_input = torch.eye(dim, device=device)
     static_target = torch.zeros_like(static_input)
 
-    placements = _flat_placements()
+    placements = _default_placements()
     with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements)

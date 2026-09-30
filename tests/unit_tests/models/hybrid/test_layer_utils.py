@@ -9,6 +9,9 @@ from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
@@ -17,10 +20,19 @@ _EXPECTED_LAYER_CONFIG_TYPES = [
     (layer_utils.Symbols.GDN, GDNLayerConfig),
     (layer_utils.Symbols.ATTENTION, AttentionLayerConfig),
     (layer_utils.Symbols.DS_ATTENTION, DSALayerConfig),
+    (layer_utils.Symbols.CSA, CSALayerConfig),
+    (layer_utils.Symbols.HCA, CSALayerConfig),
     (layer_utils.Symbols.MLA, MLALayerConfig),
+    (layer_utils.Symbols.WINDOW, CSALayerConfig),
     (layer_utils.Symbols.MLP, MLPLayerConfig),
     (layer_utils.Symbols.MOE, MoELayerConfig),
 ]
+
+_DSV4_COMPRESS_RATIOS = {
+    layer_utils.Symbols.CSA: 4,
+    layer_utils.Symbols.HCA: 128,
+    layer_utils.Symbols.WINDOW: 0,
+}
 
 
 def _make_transformer_config(tp_comm_overlap: bool = False) -> TransformerConfig:
@@ -50,20 +62,27 @@ class TestSymbols:
     def test_name_sorted_valid_layer_symbols(self):
         assert layer_utils.Symbols.name_sorted_valid_layer_symbols() == [
             layer_utils.Symbols.ATTENTION,
+            layer_utils.Symbols.CSA,
             layer_utils.Symbols.DS_ATTENTION,
             layer_utils.Symbols.GDN,
+            layer_utils.Symbols.HCA,
             layer_utils.Symbols.MAMBA,
             layer_utils.Symbols.MLA,
             layer_utils.Symbols.MLP,
             layer_utils.Symbols.MOE,
+            layer_utils.Symbols.WINDOW,
         ]
 
     def test_attention_layer_configs(self):
         assert layer_utils.Symbols.ATTENTION_LAYER_CONFIGS == {
             AttentionLayerConfig,
             DSALayerConfig,
+            CSALayerConfig,
             MLALayerConfig,
         }
+
+    def test_dsv4_symbols_map_to_fixed_compress_ratios(self):
+        assert layer_utils.Symbols.DSV4_COMPRESS_RATIO_MAP == _DSV4_COMPRESS_RATIOS
 
 
 @pytest.mark.internal
@@ -78,12 +97,15 @@ class TestCreateLayerConfig:
 
         assert type(layer_config) is config_type
         assert layer_config is not config
-        assert layer_config.__dict__.keys() == config.__dict__.keys()
+        expected_extra_keys = {"compress_ratio"} if config_type is CSALayerConfig else set()
+        assert set(layer_config.__dict__) == set(config.__dict__) | expected_extra_keys
         assert layer_config.num_layers == config.num_layers
         assert layer_config.hidden_size == config.hidden_size
         assert layer_config.num_attention_heads == config.num_attention_heads
         assert layer_config.test_mutable_value == config.test_mutable_value
         assert layer_config.test_mutable_value is not config.test_mutable_value
+        if layer_symbol in _DSV4_COMPRESS_RATIOS:
+            assert layer_config.compress_ratio == _DSV4_COMPRESS_RATIOS[layer_symbol]
 
     def test_rejects_unknown_symbol(self):
         with pytest.raises(ValueError, match="Unexpected hybrid layer symbol: X"):
@@ -95,9 +117,20 @@ class TestGetLayerSymbolFromConfig:
 
     @pytest.mark.parametrize(("expected_symbol", "config_type"), _EXPECTED_LAYER_CONFIG_TYPES)
     def test_returns_symbol_for_each_config_type(self, expected_symbol, config_type):
-        layer_config = config_type.from_config(_make_transformer_config())
+        layer_config = layer_utils.create_layer_config(_make_transformer_config(), expected_symbol)
 
+        assert type(layer_config) is config_type
         assert layer_utils.get_layer_symbol_from_config(layer_config) == expected_symbol
+
+    def test_rejects_unknown_dsv4_compress_ratio(self):
+        layer_config = CSALayerConfig.from_config(_make_transformer_config())
+        layer_config.compress_ratio = 16
+
+        with pytest.raises(
+            ValueError,
+            match=r"Unexpected CSALayerConfig compress_ratio: 16\. Expected one of \[0, 4, 128\]\.",
+        ):
+            layer_utils.get_layer_symbol_from_config(layer_config)
 
     def test_rejects_config_subclasses(self):
         class CustomMambaLayerConfig(MambaLayerConfig):
@@ -127,8 +160,16 @@ class TestValidateTpCommOverlap:
         [
             (layer_utils.Symbols.MLA, False, "MLA"),
             (layer_utils.Symbols.DS_ATTENTION, False, "DSA"),
+            (layer_utils.Symbols.CSA, False, "DSv4 attention"),
+            (layer_utils.Symbols.HCA, False, "DSv4 attention"),
+            (layer_utils.Symbols.WINDOW, False, "DSv4 attention"),
             ("", True, "MTP"),
             (layer_utils.Symbols.DS_ATTENTION + layer_utils.Symbols.MLA, True, "MLA/DSA/MTP"),
+            (
+                layer_utils.Symbols.DS_ATTENTION + layer_utils.Symbols.CSA,
+                True,
+                "DSA/DSv4 attention/MTP",
+            ),
         ],
     )
     def test_rejects_overlap_for_unsupported_features(self, segment, has_mtp, unsupported_features):

@@ -45,7 +45,17 @@ environment values.
   per-range leaderboard, and fails when the deterministic step time exceeds the
   documented threshold.
 - **End-to-end verification**: Compares full-precision training metrics across
-  two independent runs (refer to the glossary's "Verification" note). Extending
+  two independent runs (refer to the glossary's "Verification" note). The
+  functional tests do the same against checked-in golden values: every
+  pretraining case that does not opt out (`NON_DETERMINSTIC_RESULTS: 1` or
+  `NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1` in its `model_config.yaml`, which makes
+  `run_ci_test.sh` compare approximately) is compared bit-exactly by
+  `DeterministicTest` in `tests/functional_tests/python_test_utils/common.py`.
+  Newly written golden values keep the full `float32` precision of the
+  TensorBoard scalars and record it as `"value_precision": "full"`; files
+  written before this convention carry no marker and are compared at five
+  decimals until they are regenerated (refer to the glossary's "Verification"
+  note). Extending
   checked-in coverage to production-scale architectures is a roadmap item.
 
 ## Performance

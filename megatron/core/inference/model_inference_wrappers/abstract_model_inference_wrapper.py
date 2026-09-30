@@ -54,12 +54,25 @@ class AbstractModelInferenceWrapper(abc.ABC):
         ), 'interleaving schedule is not supported for inference'
         self.model = model
         self.config = get_model_config(self.model)
+        if getattr(self.config, "moe_shortcut_connection", False):
+            raise NotImplementedError(
+                "Inference is not supported with moe_shortcut_connection. The shortcut block "
+                "regroups each attention/MoE pair into one logical layer, so the decoder's "
+                "layers no longer line up with the physical layer types that recurrent state "
+                "discovery indexes them with, and its paired attention layer runs a "
+                "training-only two-stage path that never updates the KV cache."
+            )
         self.pipeline_communication_dtype = (
             torch.float if self.config.fp32_residual_connection else self.config.params_dtype
         )
         self.sequence_parallel = self.config.sequence_parallel
 
         self.inference_context = inference_context
+        configured_prompt_contract = getattr(
+            self.inference_context.config, "multimodal_prompt_config", None
+        )
+        if configured_prompt_contract is not None:
+            self.multimodal_prompt_config = configured_prompt_contract
 
         # Get the inference pg_collection from the config if it exists; otherwise the training
         # pg_collection might be used during RL

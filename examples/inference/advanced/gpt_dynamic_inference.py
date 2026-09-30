@@ -11,9 +11,10 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -50,6 +51,7 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.global_vars import initialize_runtime_services
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -142,9 +144,9 @@ def run_inference(
 
         # Update requests.
         active_request_ids = result["active_request_ids"]
-        finished_request_records = result["finished_request_records"]
+        finished_requests = result["finished_requests"]
         step_time = result["step_time"]
-        if len(active_request_ids) > 0 or len(finished_request_records) > 0:
+        if len(active_request_ids) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -152,9 +154,8 @@ def run_inference(
 
             # Append output tokens.
             output_start = get_curr_time(do_broadcast=False)
-            for finished_request_record in finished_request_records:
-
-                finished_request = finished_request_record.merge()
+            for finished_request in finished_requests:
+                finished_request.finalize_text(engine.controller.tokenizer)
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -293,6 +294,7 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     # Start Nsight profiler.
