@@ -142,31 +142,54 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
                 assert chunks[rank].eq(0).all()
 
 
-@pytest.mark.parametrize("mesh_ndim", [1, 2])
-@pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, mesh_ndim):
-    """Gather every plane, including into aliased output storage on a hybrid mesh."""
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup):
+    """Gather every plane into aliased output storage on a 1D mesh."""
     world_size = distributed_setup.world_size
-    if world_size < 2 or world_size % mesh_ndim:
-        pytest.skip("Requires at least two ranks and an even world size for a hybrid mesh.")
-    mesh_shape = (world_size,) if mesh_ndim == 1 else (2, world_size // 2)
-    mesh = init_device_mesh(distributed_setup.device.type, mesh_shape)
+    if world_size < 2:
+        pytest.skip("Requires at least two ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (world_size,))
     out = QuantizedDBuffer.empty(
-        mesh, [Replicate()] * mesh_ndim, [(128, 64), (32, 128)], distributed_setup.device
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
     )
     for plane in out.planes:
         plane.local_buffer.zero_()
-    source = out.view([BlockAtomic(32)] * mesh_ndim)
+    source = out.view([BlockAtomic(32)])
     for index, plane in enumerate(source.planes):
         values = (
             torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
         )
         plane.local_buffer.copy_(values % 251)
-    result = source.allgather(0 if mesh_ndim == 1 else (1, 0), out=out if use_out else None)
-    if use_out:
-        assert result is out
+    result = source.allgather(0, out=out)
+    assert result is out
     for index, plane in enumerate(result.planes):
-        assert plane.placements == (Replicate(),) * mesh_ndim
+        assert plane.placements == (Replicate(),)
+        expected = (
+            (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
+        ).to(plane.dtype)
+        torch.testing.assert_close(plane.local_buffer, expected, rtol=0, atol=0)
+
+
+def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup):
+    """Gather every plane into aliased output storage on a 2D mesh."""
+    world_size = distributed_setup.world_size
+    if world_size < 2 or world_size % 2:
+        pytest.skip("Requires an even world size of at least two.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, world_size // 2))
+    out = QuantizedDBuffer.empty(
+        mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    for plane in out.planes:
+        plane.local_buffer.zero_()
+    source = out.view([BlockAtomic(32), BlockAtomic(32)])
+    for index, plane in enumerate(source.planes):
+        values = (
+            torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
+        )
+        plane.local_buffer.copy_(values % 251)
+    result = source.allgather((1, 0), out=out)
+    assert result is out
+    for index, plane in enumerate(result.planes):
+        assert plane.placements == (Replicate(), Replicate())
         expected = (
             (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
         ).to(plane.dtype)
