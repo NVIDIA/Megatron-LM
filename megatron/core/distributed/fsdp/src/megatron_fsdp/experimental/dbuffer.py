@@ -465,6 +465,18 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer
         placements = list(self.placements)
+        # DBuffer requires sharded axes to form a suffix (see _validate_placements).
+        # GlobalLayout.get_local_range() partitions the global buffer from the last
+        # mesh axis to the first. For a (2, 2) (outer, inner) mesh with both axes
+        # sharded, this assigns:
+        #             inner 0   inner 1
+        #   outer 0    [0, 1]    [4, 5]
+        #   outer 1    [2, 3]    [6, 7]
+        # Gather in the opposite order, outer before inner, so each intermediate
+        # remains a contiguous global range: [0, 1, 2, 3] and [4, 5, 6, 7].
+        # The inner gather then concatenates them in order. Inner first would give
+        # [0, 1, 4, 5] and [2, 3, 6, 7], requiring rearrangement afterward.
+
         # A single all-gather over a flattened mesh may be faster. For now, reuse
         # existing axis groups for simplicity until we have a clear owner for
         # the combined process group's lifetime and cleanup. Revisit this as a
