@@ -79,8 +79,13 @@ def resolve_checkpoint_subdir(load_dir):
     latest_iter = os.path.join(load_dir, 'latest_checkpointed_iteration.txt')
     if os.path.exists(latest_iter):
         with open(latest_iter, 'r') as f:
-            iteration = int(f.read().strip())
-        iter_dir = os.path.join(load_dir, f'iter_{iteration:07d}')
+            marker = f.read().strip()
+        if marker == "release":
+            iteration = None
+            iter_dir = os.path.join(load_dir, "release")
+        else:
+            iteration = int(marker)
+            iter_dir = os.path.join(load_dir, f'iter_{iteration:07d}')
         if os.path.isdir(iter_dir):
             return iter_dir, iteration
 
