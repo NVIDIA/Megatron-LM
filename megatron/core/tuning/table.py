@@ -8,7 +8,7 @@ an architecture is a file drop, not a source edit and a rebuild:
 
     torchrun ... pretrain_gpt.py ... --triton-autotune-record-path /tmp/rec
     python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
-    torchrun ... --triton-autotune-mode pinned --triton-autotune-table-path ./tables
+    torchrun ... --triton-autotune-mode pinned --triton-autotune-table-path ~/.mcore/tuning
 
 Each file records one architecture plus the provenance needed to notice when it
 has gone stale::
@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import collections
 import json
-import warnings
+import logging
 from pathlib import Path
 
 from megatron.core.tuning.selection import config_data
+
+logger = logging.getLogger(__name__)
 
 _PACKAGED = Path(__file__).parent / "tables"
 
@@ -90,7 +92,13 @@ class TunedTable:
 
 
 def _search_dirs(extra) -> list:
-    dirs = [Path(p).expanduser() for p in (extra or ())]
+    dirs = []
+    for entry in extra or ():
+        directory = Path(entry).expanduser()
+        if not directory.is_dir():
+            logger.warning("Tuned-table directory %s does not exist; skipping it", directory)
+            continue
+        dirs.append(directory)
     dirs.append(_PACKAGED)
     return dirs
 
@@ -111,18 +119,80 @@ def load(arch: str, table_path=()) -> TunedTable:
             with path.open(encoding="utf-8") as handle:
                 data = json.load(handle)
         except (OSError, ValueError) as exc:
-            warnings.warn(f"Ignoring unreadable tuned table {path}: {exc}")
+            logger.warning("Ignoring unreadable tuned table %s: %s", path, exc)
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("kernels"), dict):
+            logger.warning("Ignoring %s: not a tuned table (no 'kernels' mapping)", path)
+            continue
+        if data.get("arch", arch) != arch:
+            logger.warning(
+                "Ignoring %s: it holds a table for %s, not %s", path, data.get("arch"), arch
+            )
             continue
         recorded = data.get("triton", "")
         current = _triton_version()
         if recorded and current and recorded != current:
-            warnings.warn(
-                f"Tuned table {path} was recorded against triton {recorded} but this "
-                f"process has {current}; entries that no longer match a live config "
-                "will fall back to the deterministic default."
+            logger.warning(
+                "Tuned table %s was recorded against triton %s but this process has %s; "
+                "entries that no longer match a live config will fall back to the "
+                "deterministic default.",
+                path,
+                recorded,
+                current,
             )
-        return TunedTable(arch, data.get("kernels", {}), data)
+        return TunedTable(arch, data["kernels"], data)
     return TunedTable(arch, {})
+
+
+def _read_recording(path) -> dict:
+    """Load one per-rank recording, rejecting files of any other shape by name."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except ValueError as exc:
+        raise ValueError(f"{path}: not valid JSON ({exc}); the capture may be truncated") from exc
+    if isinstance(data, dict) and "kernels" in data and isinstance(data.get("arch"), str):
+        raise ValueError(f"{path}: this is a tuned table, not a per-rank recording")
+    if not isinstance(data, dict) or not all(
+        isinstance(kernels, dict)
+        and all(
+            isinstance(entries, dict) and all(isinstance(c, dict) for c in entries.values())
+            for entries in kernels.values()
+        )
+        for kernels in data.values()
+    ):
+        raise ValueError(f"{path}: expected {{arch: {{kernel: {{shape key: config}}}}}}")
+    return data
+
+
+def count_votes(paths) -> dict:
+    """Count, per (arch, kernel, key), how many ranks recorded each config.
+
+    Raises ``OSError`` for unreadable files and ``ValueError`` naming the file for
+    anything that is not a per-rank recording.
+    """
+    votes: dict = collections.defaultdict(collections.Counter)
+    for path in sorted(paths):
+        for arch, kernels in _read_recording(path).items():
+            for kernel, entries in kernels.items():
+                for key, config in entries.items():
+                    votes[(arch, kernel, key)][json.dumps(config, sort_keys=True)] += 1
+    return votes
+
+
+def merge_votes(votes: dict) -> dict:
+    """Majority winner per (arch, kernel, key); ties break on the serialized config."""
+    merged: dict = {}
+    for arch, kernel, key in sorted(votes):
+        counter = votes[(arch, kernel, key)]
+        winner = min(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        merged.setdefault(arch, {}).setdefault(kernel, {})[key] = json.loads(winner)
+    return merged
+
+
+def disagreements(votes: dict) -> dict:
+    """The (arch, kernel, key) entries for which ranks recorded more than one config."""
+    return {k: dict(v) for k, v in votes.items() if len(v) > 1}
 
 
 def merge_records(paths) -> dict:
@@ -133,24 +203,7 @@ def merge_records(paths) -> dict:
     last file win. Ties break on the serialized config, so a given set of
     recordings always produces the same table.
     """
-    votes: dict = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
-    )
-    for path in sorted(paths):
-        with open(path, encoding="utf-8") as handle:
-            for arch, kernels in json.load(handle).items():
-                for kernel, entries in kernels.items():
-                    for key, config in entries.items():
-                        votes[arch][kernel][key][json.dumps(config, sort_keys=True)] += 1
-
-    merged: dict = {}
-    for arch in sorted(votes):
-        for kernel in sorted(votes[arch]):
-            for key in sorted(votes[arch][kernel]):
-                counter = votes[arch][kernel][key]
-                winner = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-                merged.setdefault(arch, {}).setdefault(kernel, {})[key] = json.loads(winner)
-    return merged
+    return merge_votes(count_votes(paths))
 
 
 def disagreement_report(paths) -> dict:
@@ -159,14 +212,7 @@ def disagreement_report(paths) -> dict:
     Anything above one is timing variance the table is about to remove, and is
     worth seeing before trusting a recording.
     """
-    votes: dict = collections.defaultdict(collections.Counter)
-    for path in sorted(paths):
-        with open(path, encoding="utf-8") as handle:
-            for arch, kernels in json.load(handle).items():
-                for kernel, entries in kernels.items():
-                    for key, config in entries.items():
-                        votes[(arch, kernel, key)][json.dumps(config, sort_keys=True)] += 1
-    return {k: dict(v) for k, v in votes.items() if len(v) > 1}
+    return disagreements(count_votes(paths))
 
 
 def write(arch: str, kernels: dict, path, source: str = "") -> None:

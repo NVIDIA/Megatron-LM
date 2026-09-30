@@ -12,28 +12,44 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
-import warnings
 from functools import wraps
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakSet
 
+from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.tuning import selection
 from megatron.core.tuning import table as table_mod
-from megatron.core.tuning.policy import AutotunePolicy, use_deterministic_mode
+from megatron.core.tuning.policy import AutotunePolicy, coerce_policy
+
+logger = logging.getLogger(__name__)
 
 _installed = False
 _policy: AutotunePolicy | None = None
-_explicit_policy = False
+# Unresolved inputs. install() supplies an explicit policy, which wins over the
+# policies framework configuration supplies through install_from_config().
+_explicit_policy: AutotunePolicy | None = None
 _configured_policy: AutotunePolicy | None = None
+# Once any component requests determinism, later components that leave the mode
+# to be derived keep pinning; only an explicitly configured mode overrides it.
+_deterministic_requested = False
 _tables: dict = {}
 # Keep each autotuner's live configs (and hooks) separate, even for equal names.
 _selected_configs: WeakKeyDictionary = WeakKeyDictionary()
+# Per-autotuner scope, computed once per policy: (module, name, qualified, in_scope, invariant).
+_scopes: WeakKeyDictionary = WeakKeyDictionary()
+# Autotuners whose single candidate has already been logged.
+_logged_singletons: WeakSet = WeakSet()
 
-# (kernel, shape) -> chosen config. Which config a kernel runs is the *cause* of
-# reduction-order nondeterminism; diverging tensors are the effect. Recording it
-# costs one dict insert and no host sync, so it can stay on in production.
+# (arch, kernel, shape) -> chosen config. Which config a kernel runs is the *cause*
+# of reduction-order nondeterminism; diverging tensors are the effect. A choice is
+# logged once, when it is made, so steady-state launches pay nothing for it.
 _choice_log: dict = {}
+# Choices logged since the last agreement check, and those already agreed on.
+_unverified: dict = {}
+_verified: dict = {}
 _tune_records: dict = {}
+_record_rank: int | None = None
 _enumerated: set = set()
 
 
@@ -42,44 +58,78 @@ def active_policy() -> AutotunePolicy | None:
     return _policy
 
 
-def _enumerate(module: str, name: str, count: int, pinned: bool) -> None:
-    key = (module, name)
-    if key in _enumerated:
+def _scope(autotuner, policy: AutotunePolicy):
+    scope = _scopes.get(autotuner)
+    if scope is None:
+        module = selection.kernel_module(autotuner)
+        name = selection.kernel_name(autotuner)
+        qualified = f"{module}.{name}"
+        in_scope = any(
+            module == prefix or module.startswith(prefix + ".") for prefix in policy.modules
+        )
+        scope = (module, name, qualified, in_scope, qualified in policy.config_invariant)
+        _scopes[autotuner] = scope
+    return scope
+
+
+def _enumerate(qualified: str, count: int, state: str) -> None:
+    if qualified in _enumerated:
         return
-    _enumerated.add(key)
-    warnings.warn(
-        f"[autotune] {'PINNED  ' if pinned else 'UNPINNED'} {module}.{name} ({count} configs)",
-        stacklevel=2,
-    )
+    _enumerated.add(qualified)
+    logger.warning("[autotune] %-8s %s (%d configs)", state, qualified, count)
 
 
-def _record_choice(autotuner, args, kwargs, config, pinned: bool) -> None:
-    key = (
-        f"{selection.arch_tag()}|{selection.kernel_module(autotuner)}."
-        f"{selection.kernel_name(autotuner)}"
-        f"|{selection.tuning_key(autotuner, args, kwargs)}"
-    )
-    _choice_log[key] = f"{selection.config_signature(config)};{'pinned' if pinned else 'timed'}"
+def _record_choice(arch: str, qualified: str, key: str, config, pinned: bool) -> None:
+    entry = f"{arch}|{qualified}|{key}"
+    value = f"{selection.config_signature(config)};{'pinned' if pinned else 'timed'}"
+    if _choice_log.get(entry) != value:
+        _choice_log[entry] = value
+        _unverified[entry] = value
 
 
-def _record_winner(autotuner, args, kwargs) -> None:
-    config = getattr(autotuner, "best_config", None)
+def _record_winner(arch: str, qualified: str, key: str, config) -> None:
+    global _record_rank
     if config is None:
         return
-    kernels = _tune_records.setdefault(selection.arch_tag(), {}).setdefault(
-        selection.kernel_name(autotuner), {}
+    if _record_rank is None:
+        # Resolve the rank while the process group is alive; the capture is written
+        # at exit, possibly after the group has been destroyed.
+        _record_rank = safe_get_rank()
+    _tune_records.setdefault(arch, {}).setdefault(qualified, {})[key] = selection.config_data(
+        config
     )
-    kernels[selection.tuning_key(autotuner, args, kwargs)] = selection.config_data(config)
+
+
+def _record_file(record_path: str, rank: int) -> str:
+    return f"{record_path}.rank{rank}.json"
+
+
+def _check_record_path(record_path: str) -> None:
+    directory = os.path.dirname(os.path.abspath(record_path))
+    os.makedirs(directory, exist_ok=True)
+    if not os.access(directory, os.W_OK):
+        raise PermissionError(
+            f"Cannot write Triton autotune recordings under {directory!r} "
+            f"(record_path={record_path!r})"
+        )
 
 
 def _dump_records() -> None:
     if not _tune_records or _policy is None or not _policy.record_path:
         return
-    rank = os.environ.get("RANK", "0")
-    path = f"{_policy.record_path}.rank{rank}.json"
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(_tune_records, handle, indent=1, sort_keys=True)
+    rank = _record_rank if _record_rank is not None else safe_get_rank()
+    path = _record_file(_policy.record_path, rank)
+    temporary = f"{path}.tmp.{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(_tune_records, handle, indent=1, sort_keys=True)
+        # Readers never see a partially written capture.
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.error("Could not write Triton autotune recording %s: %s", path, exc)
+        return
+    logger.info("Wrote Triton autotune recording %s", path)
 
 
 def choice_digest() -> str:
@@ -102,9 +152,12 @@ def verify_choices(group=None) -> bool:
     moment of choice would deadlock: ranks reach a given kernel at different
     times, so they would not agree on whether to take part in the collective.
 
-    Pipeline stages and expert ranks can execute different kernels or shapes.
-    An absent key is not a conflicting choice. Agreement only covers observed
-    choices; it does not establish numerical determinism or equal coverage.
+    Each check exchanges only the choices made since the previous check and
+    compares them with those already agreed on, so once every kernel and shape
+    has been seen a check moves an empty payload. Pipeline stages and expert
+    ranks can execute different kernels or shapes; an absent key is not a
+    conflicting choice. Agreement only covers observed choices; it does not
+    establish numerical determinism or equal coverage.
     """
     import torch
 
@@ -113,18 +166,23 @@ def verify_choices(group=None) -> bool:
     # all_gather_object requires one slot per member of ``group``, which is not the
     # global world size once a caller verifies agreement within a DP or TP subgroup.
     world_size = torch.distributed.get_world_size(group=group)
-    digests: list = [None] * world_size
-    torch.distributed.all_gather_object(digests, choice_digest(), group=group)
-    if len(set(digests)) == 1:
-        return True
+    pending = dict(_unverified)
+    _unverified.clear()
+    gathered: list = [None] * world_size
+    torch.distributed.all_gather_object(gathered, pending, group=group)
 
-    maps: list = [None] * world_size
-    torch.distributed.all_gather_object(maps, dict(_choice_log), group=group)
+    observed: dict = {}
+    for entries in gathered:
+        for key, value in (entries or {}).items():
+            observed.setdefault(key, set()).add(value)
     offenders: dict = {}
-    for key in {k for m in maps if m for k in m}:
-        seen = {m[key] for m in maps if m and key in m}
-        if len(seen) > 1:
-            offenders[key] = sorted(str(v) for v in seen)
+    for key, values in observed.items():
+        if key in _verified:
+            values = values | {_verified[key]}
+        if len(values) > 1:
+            offenders[key] = sorted(str(v) for v in values)
+        else:
+            _verified[key] = next(iter(values))
     if not offenders:
         return True
     lines = [f"  {k}\n    " + "\n    ".join(v) for k, v in sorted(offenders.items())[:10]]
@@ -135,7 +193,9 @@ def verify_choices(group=None) -> bool:
     )
     if _policy is not None and _policy.verify_strict:
         raise RuntimeError(message)
-    warnings.warn(message)
+    # Every rank reaches the same verdict, so one copy of the report is enough.
+    first_rank = 0 if group is None else torch.distributed.get_process_group_ranks(group)[0]
+    log_single_rank(logger, logging.WARNING, message, rank=first_rank)
     return False
 
 
@@ -154,30 +214,85 @@ def maybe_verify_choices(iteration: int, group=None) -> bool | None:
 
 
 def install(policy: AutotunePolicy | None = None) -> bool:
-    """Apply a process-wide policy, replacing any previously selected policy.
+    """Apply a process-wide policy that takes precedence over framework configuration.
 
-    Install once during initialization, before kernels execute. An explicit
-    policy takes precedence over subsequent framework ``install_from_config``
-    calls. Repeated calls reuse the same adapter rather than nesting patches.
+    Install once during initialization, before kernels execute. The policy wins
+    over policies supplied through ``install_from_config``; ``install(None)``
+    withdraws it. An omitted ``mode`` is still derived from recording and
+    determinism settings, including deterministic requests made by later
+    framework configuration. Repeated calls reuse the same adapter rather than
+    nesting patches.
     """
-    global _explicit_policy, _configured_policy
+    global _explicit_policy, _deterministic_requested
 
-    _explicit_policy = policy is not None
-    _configured_policy = None
-    return _install((policy or AutotunePolicy()).resolve())
+    policy = coerce_policy(policy)
+    installed, _deterministic_requested = _apply(
+        policy, _configured_policy, _deterministic_requested
+    )
+    _explicit_policy = policy
+    return installed
+
+
+def install_from_config(
+    policy: AutotunePolicy | None = None, *, deterministic: bool = False
+) -> bool:
+    """Apply framework configuration, subordinate to an explicit :func:`install`.
+
+    A ``None`` policy keeps the policy configured earlier. ``deterministic`` is
+    sticky: a later component's default ``False`` does not undo another
+    component's request, and an explicitly configured mode still takes precedence.
+    """
+    global _configured_policy, _deterministic_requested
+
+    # Validate before touching process-wide state, so a rejected value leaves it as it was.
+    policy = coerce_policy(policy)
+    configured = _configured_policy if policy is None else policy
+    installed, _deterministic_requested = _apply(
+        _explicit_policy, configured, _deterministic_requested or deterministic
+    )
+    _configured_policy = configured
+    return installed
+
+
+def _apply(explicit, configured, deterministic: bool) -> tuple[bool, bool]:
+    """Install the effective policy; return (installed, deterministic still requested).
+
+    Callers commit their inputs only after this returns, so a policy that fails to
+    install leaves the previous inputs in place.
+    """
+    source = explicit or configured or AutotunePolicy()
+    resolved = source.resolve(deterministic=deterministic)
+    installed = _install(resolved)
+    return installed, deterministic or (source.mode is None and resolved.mode == "pinned")
+
+
+def _reset_runtime_state() -> None:
+    global _record_rank
+
+    _tables.clear()
+    _selected_configs.clear()
+    _scopes.clear()
+    _logged_singletons.clear()
+    _choice_log.clear()
+    _unverified.clear()
+    _verified.clear()
+    _tune_records.clear()
+    _record_rank = None
+    _enumerated.clear()
+    selection.reset_warnings()
 
 
 def _install(policy: AutotunePolicy) -> bool:
     global _installed, _policy
 
     if policy != _policy:
+        if policy.mode == "record":
+            # Fail now rather than when the recording is written at exit.
+            _check_record_path(policy.record_path)
         _dump_records()
         _policy = policy
-        _tables.clear()
-        _selected_configs.clear()
-        _choice_log.clear()
-        _tune_records.clear()
-        _enumerated.clear()
+        _reset_runtime_state()
+        selection.warn_if_mamba_env_ignored(policy)
 
     if _installed:
         return True
@@ -196,21 +311,42 @@ def _install(policy: AutotunePolicy) -> bool:
         if not policy.intercepts:
             return original_run(self, *args, **kwargs)
         count = len(getattr(self, "configs", ()))
-        module = selection.kernel_module(self)
-        in_scope = any(
-            module == prefix or module.startswith(prefix + ".") for prefix in policy.modules
-        )
-        pinned = in_scope and policy.mode == "pinned"
+        _, _, qualified, in_scope, invariant = _scope(self, policy)
+        pinned = in_scope and not invariant and policy.mode == "pinned"
 
         if policy.enumerate_autotuners and count > 1:
-            _enumerate(module, selection.kernel_name(self), count, pinned)
+            if pinned:
+                state = "PINNED"
+            elif in_scope and invariant and policy.mode == "pinned":
+                state = "TIMED"
+            else:
+                state = "UNPINNED"
+            _enumerate(qualified, count, state)
 
         if count <= 1 or not pinned:
+            observed = in_scope and not invariant
+            tuned_before = len(getattr(self, "cache", ()))
             result = original_run(self, *args, **kwargs)
-            if in_scope and policy.mode == "record":
-                _record_winner(self, args, kwargs)
-            if count > 1 or in_scope:
-                _record_choice(self, args, kwargs, getattr(self, "best_config", None), pinned)
+            if not observed:
+                return result
+            if count > 1:
+                # Triton caches its winner per key, so a choice is new exactly when
+                # the cache grew; cached launches skip the bookkeeping.
+                if len(getattr(self, "cache", ())) == tuned_before:
+                    return result
+                arch = selection.arch_tag()
+                key = selection.tuning_key(self, args, kwargs)
+                config = getattr(self, "best_config", None)
+                if policy.mode == "record":
+                    _record_winner(arch, qualified, key, config)
+                _record_choice(arch, qualified, key, config, pinned=False)
+            elif self not in _logged_singletons:
+                # A single candidate is the same for every shape; nothing was
+                # timed, so there is nothing to record as a winner either.
+                _logged_singletons.add(self)
+                _record_choice(
+                    selection.arch_tag(), qualified, "*", getattr(self, "best_config", None), pinned
+                )
             return result
 
         candidates = self.configs
@@ -218,19 +354,20 @@ def _install(policy: AutotunePolicy) -> bool:
         # Device selection can follow framework initialization. Include the current
         # architecture and Triton's declared tuning inputs in each cache entry.
         arch = selection.arch_tag()
-        key = (arch, selection.tuning_key(self, args, kwargs))
-        cache = _selected_configs.setdefault(self, {})
+        key = selection.tuning_key(self, args, kwargs)
+        cache = _selected_configs.get(self)
+        if cache is None:
+            cache = _selected_configs[self] = {}
         try:
-            chosen = cache.get(key)
-            if chosen is None:
+            chosen = cache.get((arch, key))
+            new_choice = chosen is None
+            if new_choice:
                 # Preserve Triton's pruning on the first invocation of each key.
                 # It expects positional arguments in self.nargs, as in Autotuner.run.
                 self.nargs = dict(zip(self.arg_names, args))
                 valid_configs = self.prune_configs(kwargs)
                 if not valid_configs:
-                    raise RuntimeError(
-                        f"No valid configs for Triton kernel {selection.kernel_name(self)!r}"
-                    )
+                    raise RuntimeError(f"No valid configs for Triton kernel {qualified!r}")
                 if policy.chaos:
                     chosen = selection.chaos_choice(self, valid_configs, args, kwargs)
                 else:
@@ -249,8 +386,9 @@ def _install(policy: AutotunePolicy) -> bool:
             # single-entry list skips the timing loop entirely.
             self.configs = [chosen]
             result = original_run(self, *args, **kwargs)
-            cache[key] = chosen
-            _record_choice(self, args, kwargs, chosen, True)
+            if new_choice:
+                cache[(arch, key)] = chosen
+                _record_choice(arch, qualified, key, chosen, pinned=True)
             return result
         finally:
             # The choice is per shape: a later call must see every candidate again.
@@ -263,22 +401,6 @@ def _install(policy: AutotunePolicy) -> bool:
     return True
 
 
-def install_from_config(
-    policy: AutotunePolicy | None = None, *, deterministic: bool = False
-) -> bool:
-    """Resolve framework defaults unless a caller supplied an explicit policy."""
-    global _configured_policy
-
-    if _explicit_policy:
-        return _installed
-    if policy is not None:
-        _configured_policy = policy
-    # A later component's default False must not undo another model's request.
-    # An explicit configured mode still takes precedence in resolve().
-    deterministic = deterministic or (_policy is not None and _policy.mode == "pinned")
-    return _install((_configured_policy or AutotunePolicy()).resolve(deterministic=deterministic))
-
-
 __all__ = [
     "active_policy",
     "choice_digest",
@@ -286,6 +408,5 @@ __all__ = [
     "install",
     "install_from_config",
     "maybe_verify_choices",
-    "use_deterministic_mode",
     "verify_choices",
 ]

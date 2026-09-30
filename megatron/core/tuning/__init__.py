@@ -26,7 +26,7 @@ Recording a table for a new architecture::
 
     torchrun ... pretrain_gpt.py ... --triton-autotune-record-path /tmp/rec
     python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
-    torchrun ... --triton-autotune-mode pinned --triton-autotune-table-path ./tables
+    torchrun ... --triton-autotune-mode pinned --triton-autotune-table-path ~/.mcore/tuning
 
 Seeing what a run actually did::
 
@@ -45,6 +45,7 @@ from megatron.core.tuning.interception import (
 )
 from megatron.core.tuning.policy import (
     AutotunePolicy,
+    coerce_policy,
     set_deterministic_mode,
     use_deterministic_mode,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "autotune_configs",
     "choice_digest",
     "choice_log",
+    "coerce_policy",
     "install",
     "install_from_config",
     "maybe_verify_choices",

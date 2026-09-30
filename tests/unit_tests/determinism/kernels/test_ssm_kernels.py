@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
-from megatron.core.tuning import autotune_configs
+from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
@@ -42,6 +42,37 @@ pytestmark = pytest.mark.skipif(
 def ssm_deterministic(monkeypatch):
     """Pin the SSM autotuner / workspace path like ``--deterministic-mode`` does."""
     monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+
+
+def _autotuner(kernel):
+    """The ``Autotuner`` under ``kernel``; ``@triton.heuristics`` wraps it in another object."""
+    from triton.runtime.autotuner import Autotuner
+
+    while not isinstance(kernel, Autotuner):
+        kernel = kernel.fn
+    return kernel
+
+
+def _forbid_benchmarks(monkeypatch, *tuners, cache_results=False):
+    """Fail if any tuner times a config, including through Triton's autotune disk cache."""
+
+    def forbid_benchmark(*args, **kwargs):
+        raise AssertionError("deterministic SSM execution benchmarked a config")
+
+    for tuner in tuners:
+        # Training imports these kernels before determinism is enabled, so they keep every
+        # candidate and only the runtime adapter stands between them and timed selection.
+        assert len(tuner.configs) > 1, "expected the full candidate list at import"
+        monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+        # Triton < 3.4 has no autotune disk cache.
+        monkeypatch.setattr(tuner, "cache_results", cache_results, raising=False)
+
+
+def _assert_pinned(*tuners):
+    for tuner in tuners:
+        name = tuner.base_fn.__name__
+        choices = [value for key, value in choice_log().items() if f".{name}|" in key]
+        assert choices and all(value.endswith(";pinned") for value in choices), choices
 
 
 # --- Mamba2 --------------------------------------------------------------------------------
@@ -201,31 +232,27 @@ def test_causal_conv1d_update_spec_decode_replays():
     )
 
 
-@pytest.mark.parametrize("cache_autotuning", ["0", "1"])
+@pytest.mark.parametrize("cache_autotuning", [False, True], ids=["no_cache", "autotune_cache"])
 def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
     from megatron.core.ssm.ops.common import causal_conv1d_varlen
 
-    monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", cache_autotuning)
+    monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", "1" if cache_autotuning else "0")
     assert ssm_determinism.autotune_configs is autotune_configs
     assert ssm_determinism.use_deterministic_mode()
-    configs = autotune_configs(
+    # Kernels decorated under deterministic mode are reduced to one config at import,
+    # whatever the autotune cache setting.
+    decorated = autotune_configs(
         [
             triton.Config({"BLOCK_T": 8, "BLOCK_C": 256}, num_warps=4, num_stages=2),
             triton.Config({"BLOCK_T": 128, "BLOCK_C": 128}, num_warps=4),
         ]
     )
-    # Recreate the decorator under each cache setting: a previously imported singleton
-    # would hide a regression that restores timed autotuning when caching is enabled.
-    assert len(configs) == 1
-    kernel = triton.autotune(configs=configs, key=["conv_dim"])(
-        causal_conv1d_varlen._causal_conv1d_varlen_kernel.fn
-    )
+    assert len(decorated) == 1
 
-    def forbid_benchmark(*args, **kwargs):
-        pytest.fail("deterministic SSM execution benchmarked a config")
-
-    monkeypatch.setattr(kernel, "_bench", forbid_benchmark)
-    monkeypatch.setattr(causal_conv1d_varlen, "_causal_conv1d_varlen_kernel", kernel)
+    # Replay the real module-level autotuner, which keeps every candidate because it was
+    # imported before determinism was enabled, as in training.
+    tuner = _autotuner(causal_conv1d_varlen._causal_conv1d_varlen_kernel)
+    _forbid_benchmarks(monkeypatch, tuner, cache_results=cache_autotuning)
 
     seeded()
     dim, width = 2048, 4
@@ -244,31 +271,14 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
         backward=False,
         what="causal_conv1d_varlen_fn",
     )
+    _assert_pinned(tuner)
 
 
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="GDP varlen chunk scan replays differ on GB300 / Triton 3.7 even with the autotune "
-    "pinned to one config and the ordered workspace (measured 2026-09-04: ~0.15% of output "
-    "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
-    "model owners; not gated until root-caused.",
-)
-def test_chunk_gated_delta_product_varlen_replays(monkeypatch):
-    from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
+def _gdp_case():
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
-
-    def forbid_benchmark(*args, **kwargs):
-        pytest.fail("deterministic GDP execution benchmarked a config")
-
-    # Runtime pinning also covers early imports and restores the full candidate list.
-    for kernel in (
-        chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64,
-        chunk_o.chunk_fwd_kernel_o,
-    ):
-        monkeypatch.setattr(kernel, "_bench", forbid_benchmark)
 
     seeded()
     T, H, K, V, M = 4096, 16, 128, 128, 2
@@ -295,12 +305,36 @@ def test_chunk_gated_delta_product_varlen_replays(monkeypatch):
             use_qk_l2norm_in_kernel=True,
         )
 
+    return fn, (q, k, v, g, beta, initial_state)
+
+
+def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
+    """Runtime pinning covers the GDP autotuners, which training imports before determinism."""
+    from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
+
+    tuners = (
+        _autotuner(chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64),
+        _autotuner(chunk_o.chunk_fwd_kernel_o),
+    )
+    _forbid_benchmarks(monkeypatch, *tuners)
+    fn, args = _gdp_case()
+    fn(*args)
+    torch.cuda.synchronize()
+    _assert_pinned(*tuners)
+
+
+@pytest.mark.xfail(
+    strict=False,
+    raises=AssertionError,
+    reason="GDP varlen chunk scan replays differ on GB300 / Triton 3.7 even with the autotune "
+    "pinned to one config and the ordered workspace (measured 2026-09-04: ~0.15% of output "
+    "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
+    "model owners; not gated until root-caused.",
+)
+def test_chunk_gated_delta_product_varlen_replays():
+    fn, args = _gdp_case()
     assert_replays_bit_exact(
-        fn,
-        (q, k, v, g, beta, initial_state),
-        replays=4,
-        backward=False,
-        what="chunk_gated_delta_product_varlen",
+        fn, args, replays=4, backward=False, what="chunk_gated_delta_product_varlen"
     )
 
 

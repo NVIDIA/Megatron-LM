@@ -181,3 +181,23 @@ def test_yaml_loader_preserves_nested_block_overrides(tmp_path):
         table_path=('/tmp/tuned',),
         block_sizes={'BLOCK_C': 512},
     )
+
+
+def test_yaml_policy_nulls_fall_back_and_mistyped_values_raise():
+    nulls = SimpleNamespace(
+        triton_autotune={'mode': 'pinned', 'table_path': None, 'verify_every': None}
+    )
+    assert _triton_autotune_config_from_args(nulls) == AutotunePolicy(mode='pinned')
+    quoted = SimpleNamespace(triton_autotune={'mode': 'pinned', 'chaos': 'false'})
+    with pytest.raises(TypeError, match='chaos must be a bool'):
+        _triton_autotune_config_from_args(quoted)
+    unknown = SimpleNamespace(triton_autotune={'enumerate': True})
+    with pytest.raises(TypeError, match='Unknown AutotunePolicy option'):
+        _triton_autotune_config_from_args(unknown)
+
+
+def test_cli_config_invariant_list(parser):
+    empty = parser.parse_args(['--triton-autotune-config-invariant'])
+    assert _triton_autotune_config_from_args(empty).config_invariant == ()
+    named = parser.parse_args(['--triton-autotune-config-invariant', 'pkg.mod.kernel'])
+    assert _triton_autotune_config_from_args(named).config_invariant == ('pkg.mod.kernel',)

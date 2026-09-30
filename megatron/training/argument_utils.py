@@ -327,20 +327,11 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
 
 def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy | None:
     """Build a typed policy from flat CLI controls or a nested Python/YAML config."""
+    # Every policy field has a matching ``--triton-autotune-*`` flag, so a new field
+    # cannot be parsed and then silently dropped here.
     options = {
-        name: getattr(args, f'triton_autotune_{name}', None)
-        for name in (
-            'mode',
-            'modules',
-            'table_path',
-            'record_path',
-            'on_miss',
-            'verify_every',
-            'verify_strict',
-            'enumerate_autotuners',
-            'chaos',
-            'block_sizes',
-        )
+        field.name: getattr(args, f'triton_autotune_{field.name}', None)
+        for field in dataclasses.fields(AutotunePolicy)
     }
     options = {name: value for name, value in options.items() if value is not None}
     if options:
@@ -356,7 +347,8 @@ def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy | None:
     policy = dict(policy)
     if isinstance(policy.get('block_sizes'), (Namespace, types.SimpleNamespace)):
         policy['block_sizes'] = vars(policy['block_sizes'])
-    return AutotunePolicy(**policy)
+    # Null YAML values fall back to defaults, and unknown or mistyped keys raise.
+    return AutotunePolicy.from_mapping(policy)
 
 
 def core_transformer_config_from_args(args, config_class=None):

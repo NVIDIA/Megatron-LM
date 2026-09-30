@@ -2,11 +2,11 @@
 
 """Test Triton's real Autotuner, with focused CUDA and distributed coverage."""
 
-import inspect
 import json
+import logging
+import os
 from dataclasses import asdict
 from unittest.mock import Mock
-from weakref import WeakKeyDictionary
 
 import pytest
 
@@ -16,24 +16,6 @@ from megatron.core.tuning.policy import AutotunePolicy
 triton = pytest.importorskip("triton")
 import triton.language as tl
 from triton.runtime.autotuner import Autotuner
-
-
-@pytest.fixture
-def isolated_policy(monkeypatch):
-    """Keep the process-wide patch and diagnostics local to each test."""
-    monkeypatch.setattr(Autotuner, "run", inspect.unwrap(Autotuner.run))
-    monkeypatch.setattr(interception, "_installed", False)
-    monkeypatch.setattr(interception, "_policy", None)
-    monkeypatch.setattr(interception, "_explicit_policy", False, raising=False)
-    monkeypatch.setattr(interception, "_configured_policy", None, raising=False)
-    monkeypatch.setattr(interception, "_tables", {}, raising=False)
-    monkeypatch.setattr(interception, "_selected_configs", WeakKeyDictionary(), raising=False)
-    monkeypatch.setattr(interception, "_choice_log", {})
-    monkeypatch.setattr(interception, "_tune_records", {})
-    monkeypatch.setattr(interception, "_enumerated", set())
-    monkeypatch.setattr(selection, "_untuned_kernels_warned", set())
-    monkeypatch.setattr(selection, "arch_tag", lambda: "test_arch")
-    monkeypatch.setattr(interception.atexit, "register", lambda *_: None)
 
 
 def make_tuner(*, prune=None, fail=False, module="mamba_ssm.ops.triton.test"):
@@ -338,14 +320,19 @@ def test_record_mode_keeps_autotuning_and_captures_the_winner(
     monkeypatch.setattr(
         tuner, "_bench", lambda *args, config, **kwargs: -config.kwargs["BLOCK_SIZE"]
     )
+    # The rank is read while recording, when the process group still exists.
+    monkeypatch.setattr(interception, "safe_get_rank", lambda: 3)
     interception.install(AutotunePolicy(mode="record", record_path=str(tmp_path / "rec")))
     assert tuner.run(None, 128) == 128
-    record = interception._tune_records["test_arch"]["test_kernel"]["size=128"]
+    assert tuner.run(None, 128) == 128
+    kernel = "mamba_ssm.ops.triton.test.test_kernel"
+    record = interception._tune_records["test_arch"][kernel]["size=128"]
     assert record["kwargs"]["BLOCK_SIZE"] == 128
-    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setattr(interception, "safe_get_rank", lambda: 0)
     interception._dump_records()
     recorded = json.loads((tmp_path / "rec.rank3.json").read_text())
-    assert recorded["test_arch"]["test_kernel"]["size=128"] == record
+    assert recorded["test_arch"][kernel]["size=128"] == record
+    assert not list(tmp_path.glob("*.tmp.*"))
 
 
 def test_table_distinguishes_all_launch_options(isolated_policy):
@@ -387,10 +374,9 @@ def test_verification_compares_only_observed_choices(isolated_policy, monkeypatc
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: len(maps))
-    gathers = iter([list(range(len(maps))), maps])
 
     def gather(output, value, group=None):
-        output[:] = next(gathers)
+        output[:] = maps
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     monkeypatch.setattr(interception, "_policy", AutotunePolicy(verify_strict=True))
@@ -399,6 +385,39 @@ def test_verification_compares_only_observed_choices(isolated_policy, monkeypatc
     else:
         with pytest.raises(RuntimeError, match="Ranks disagree on 1 autotune choice"):
             interception.verify_choices()
+
+
+def test_verification_exchanges_only_new_choices(isolated_policy, monkeypatch, caplog):
+    import torch
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    sent = []
+    other_rank: dict = {}
+
+    def gather(output, value, group=None):
+        sent.append(dict(value))
+        output[:] = [value, dict(other_rank)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(interception, "_policy", AutotunePolicy(verify_every=1))
+    tuner, _ = make_tuner()
+    interception.install(AutotunePolicy(mode="pinned", verify_every=1))
+    assert tuner.run(None, 128) == 32
+    assert interception.verify_choices()
+    assert len(sent[-1]) == 1
+    # Steady state: nothing new was chosen, so nothing is exchanged.
+    assert tuner.run(None, 128) == 32
+    assert interception.verify_choices()
+    assert sent[-1] == {}
+    # A later report that contradicts an agreed choice is still caught.
+    (entry,) = interception.choice_log()
+    other_rank[entry] = "different;pinned"
+    with caplog.at_level(logging.WARNING, logger=interception.__name__):
+        assert interception.verify_choices() is False
+    assert "Ranks disagree on 1 autotune choice" in caplog.text
 
 
 def test_pinned_cuda_kernel_skips_benchmarks(isolated_policy, monkeypatch):
@@ -440,8 +459,155 @@ def test_verification_with_real_process_group(isolated_policy, monkeypatch):
     Utils.initialize_distributed()
     rank = torch.distributed.get_rank()
     monkeypatch.setattr(interception, "_policy", AutotunePolicy(verify_strict=True))
-    interception._choice_log.update({"shared": "same", f"stage{rank}": "local"})
+    interception._unverified.update({"shared": "same", f"stage{rank}": "local"})
     assert interception.verify_choices()
-    interception._choice_log["shared"] = str(rank % 2)
+    interception._unverified["shared"] = str(rank % 2)
     with pytest.raises(RuntimeError, match="Ranks disagree on 1 autotune choice"):
         interception.verify_choices()
+
+
+def _config(**overrides):
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    kwargs = dict(num_layers=1, hidden_size=16, num_attention_heads=1)
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.fixture
+def nondeterministic_torch(monkeypatch):
+    import torch
+
+    from megatron.core.tuning import policy as tuning_policy
+
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", None)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
+
+
+def test_explicit_policy_without_mode_follows_later_deterministic_config(
+    isolated_policy, nondeterministic_torch
+):
+    interception.install(AutotunePolicy(table_path=("/tables",), verify_every=10))
+    assert interception.active_policy().mode == "auto"
+    _config(deterministic_mode=True)
+    policy = interception.active_policy()
+    assert policy.mode == "pinned"
+    assert policy.table_path == ("/tables",) and policy.verify_every == 10
+
+
+def test_explicit_policy_without_mode_keeps_earlier_pinning(
+    isolated_policy, nondeterministic_torch
+):
+    _config(deterministic_mode=True)
+    interception.install(AutotunePolicy(verify_every=5))
+    assert interception.active_policy().mode == "pinned"
+    assert interception.active_policy().verify_every == 5
+    interception.install(AutotunePolicy(mode="auto"))
+    assert interception.active_policy().mode == "auto"
+
+
+def test_rejected_config_leaves_policy_unchanged(isolated_policy, nondeterministic_torch):
+    with pytest.raises(ValueError, match="num_attention_heads"):
+        _config(
+            hidden_size=48,
+            num_attention_heads=3,
+            tensor_model_parallel_size=2,
+            deterministic_mode=True,
+        )
+    assert interception.active_policy() is None
+    _config()
+    assert interception.active_policy().mode == "auto"
+
+
+def test_config_converts_mappings_and_rejects_other_types(isolated_policy, nondeterministic_torch):
+    config = _config(triton_autotune={"mode": "pinned", "table_path": None})
+    assert config.triton_autotune == AutotunePolicy(mode="pinned")
+    assert interception.active_policy().mode == "pinned"
+    with pytest.raises(TypeError, match="AutotunePolicy or a mapping"):
+        _config(triton_autotune=7)
+    # The rejected value never reached the adapter.
+    assert interception._configured_policy == AutotunePolicy(mode="pinned")
+    _config()
+    assert interception.active_policy().mode == "pinned"
+
+
+def test_pinned_launches_log_a_choice_only_when_it_is_made(isolated_policy, monkeypatch):
+    tuner, hooks = make_tuner()
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert tuner.run(None, 128) == 32
+    assert len(interception.choice_log()) == 1
+    recorded = Mock(wraps=interception._record_choice)
+    monkeypatch.setattr(interception, "_record_choice", recorded)
+    for _ in range(3):
+        assert tuner.run(None, 128) == 32
+    recorded.assert_not_called()
+    assert hooks == [32] * 4
+
+
+def test_out_of_scope_autotuners_are_enumerated_but_not_logged(
+    isolated_policy, monkeypatch, caplog
+):
+    tuner, _ = make_tuner(module="other_package.kernels")
+    monkeypatch.setattr(
+        tuner, "_bench", lambda *args, config, **kwargs: -config.kwargs["BLOCK_SIZE"]
+    )
+    interception.install(AutotunePolicy(mode="pinned", verify_every=1, enumerate_autotuners=True))
+    with caplog.at_level(logging.WARNING, logger=interception.__name__):
+        for size in range(100, 110):
+            assert tuner.run(None, size) == 128
+    assert interception.choice_log() == {}
+    assert "UNPINNED other_package.kernels.test_kernel (2 configs)" in caplog.text
+
+
+def test_config_invariant_kernels_keep_timed_choice(isolated_policy, monkeypatch, caplog):
+    tuner, _ = make_tuner()
+    timed = Mock(side_effect=lambda *args, config, **kwargs: -config.kwargs["BLOCK_SIZE"])
+    monkeypatch.setattr(tuner, "_bench", timed)
+    interception.install(
+        AutotunePolicy(
+            mode="pinned",
+            enumerate_autotuners=True,
+            config_invariant=("mamba_ssm.ops.triton.test.test_kernel",),
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger=interception.__name__):
+        assert tuner.run(None, 128) == 128
+    assert timed.call_count == 2
+    assert interception.choice_log() == {}
+    assert "TIMED    mamba_ssm.ops.triton.test.test_kernel" in caplog.text
+
+
+def test_record_mode_does_not_record_forced_singletons(isolated_policy, monkeypatch, tmp_path):
+    tuner, _ = make_tuner()
+    tuner.configs = tuner.configs[:1]
+    interception.install(AutotunePolicy(mode="record", record_path=str(tmp_path / "rec")))
+    assert tuner.run(None, 128) == 32
+    assert interception._tune_records == {}
+
+
+def test_record_path_is_checked_when_installed(isolated_policy, monkeypatch, tmp_path):
+    interception.install(AutotunePolicy(mode="pinned"))
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    with pytest.raises(PermissionError, match="Cannot write Triton autotune recordings"):
+        interception.install(AutotunePolicy(mode="record", record_path=str(tmp_path / "rec")))
+    # A policy that could not be installed changes nothing.
+    assert interception.active_policy().mode == "pinned"
+    assert interception._explicit_policy == AutotunePolicy(mode="pinned")
+
+
+def test_failed_record_dump_is_logged_not_raised(isolated_policy, monkeypatch, tmp_path, caplog):
+    tuner, _ = make_tuner()
+    monkeypatch.setattr(
+        tuner, "_bench", lambda *args, config, **kwargs: -config.kwargs["BLOCK_SIZE"]
+    )
+    interception.install(AutotunePolicy(mode="record", record_path=str(tmp_path / "rec")))
+    assert tuner.run(None, 128) == 128
+
+    def refuse(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("builtins.open", refuse)
+    with caplog.at_level(logging.ERROR, logger=interception.__name__):
+        interception._dump_records()
+    assert "Could not write Triton autotune recording" in caplog.text

@@ -28,8 +28,9 @@ first_layer = {
 @pytest.mark.parametrize("mode", ["auto", "pinned"])
 def test_layer_config_preserves_triton_autotune_policy(monkeypatch, mode):
     """Deriving a layer config preserves and installs the caller's typed policy."""
-    monkeypatch.setattr(interception, "_explicit_policy", False)
+    monkeypatch.setattr(interception, "_explicit_policy", None)
     monkeypatch.setattr(interception, "_configured_policy", None)
+    monkeypatch.setattr(interception, "_deterministic_requested", False)
     monkeypatch.setattr(interception, "_policy", None)
     installed = []
 

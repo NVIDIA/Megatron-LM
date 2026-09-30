@@ -9,6 +9,7 @@ Usage::
 """
 
 import argparse
+import collections
 import sys
 
 from megatron.core.tuning import table as table_mod
@@ -24,15 +25,27 @@ def _err(message: str) -> None:
     sys.stderr.write(message + "\n")
 
 
+def _load_votes(records):
+    """Count votes across recordings, or report which file could not be used."""
+    try:
+        votes = table_mod.count_votes(records)
+    except (OSError, ValueError) as exc:
+        _err(f"cannot read recordings: {exc}")
+        return None
+    if not votes:
+        _err("no records found")
+        return None
+    return votes
+
+
 def _merge(args) -> int:
     """Merge per-rank recordings into a single table file."""
-    try:
-        merged = table_mod.merge_records(args.records)
-    except OSError as exc:
-        _err(f"cannot read recordings: {exc}")
+    votes = _load_votes(args.records)
+    if votes is None:
         return 1
-    if not merged:
-        _err("no records found")
+    merged = table_mod.merge_votes(votes)
+    if args.arch and args.arch not in merged:
+        _err(f"no records for architecture {args.arch!r}; recordings cover {sorted(merged)}")
         return 1
     if len(merged) > 1 and not args.arch:
         _err(f"records span several architectures {sorted(merged)}; pass --arch")
@@ -40,7 +53,7 @@ def _merge(args) -> int:
 
     arch = args.arch or next(iter(merged))
     kernels = merged[arch]
-    disagreements = table_mod.disagreement_report(args.records)
+    disagreements = [k for k in table_mod.disagreements(votes) if k[0] == arch]
     table_mod.write(arch, kernels, args.output, source=args.source)
 
     entries = sum(len(v) for v in kernels.values())
@@ -55,21 +68,17 @@ def _merge(args) -> int:
 
 def _report(args) -> int:
     """Summarize recordings without writing a table."""
-    try:
-        merged = table_mod.merge_records(args.records)
-    except OSError as exc:
-        _err(f"cannot read recordings: {exc}")
+    votes = _load_votes(args.records)
+    if votes is None:
         return 1
-    if not merged:
-        _err("no records found")
-        return 1
-    disagreements = table_mod.disagreement_report(args.records)
+    merged = table_mod.merge_votes(votes)
+    disagreed = collections.Counter((a, k) for a, k, _ in table_mod.disagreements(votes))
     for arch, kernels in sorted(merged.items()):
         entries = sum(len(v) for v in kernels.values())
         _out(f"{arch}: {len(kernels)} kernels, {entries} entries")
         for kernel in sorted(kernels):
-            disagreed = sum(1 for (a, k, _) in disagreements if a == arch and k == kernel)
-            note = f"  <- {disagreed} disagreed across ranks" if disagreed else ""
+            count = disagreed[(arch, kernel)]
+            note = f"  <- {count} disagreed across ranks" if count else ""
             _out(f"   {kernel}: {len(kernels[kernel])} entries{note}")
     return 0
 

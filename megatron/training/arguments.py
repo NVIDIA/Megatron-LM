@@ -2667,7 +2667,17 @@ def _add_triton_autotune_args(parser):
         nargs='+',
         default=None,
         metavar='MODULE',
-        help='Kernel module prefixes to cover; replaces the default external and in-tree SSM scope.',
+        help='Kernel module prefixes to cover; replaces the default scope '
+        '(mamba_ssm, transformer_engine, megatron.core).',
+    )
+    group.add_argument(
+        '--triton-autotune-config-invariant',
+        nargs='*',
+        default=None,
+        metavar='MODULE.KERNEL',
+        help='Qualified names of kernels whose outputs do not depend on the launch config; '
+        'they keep timed autotuning when pinned. Replaces the default list; pass no names to '
+        'pin every covered kernel.',
     )
     group.add_argument(
         '--triton-autotune-table-path',

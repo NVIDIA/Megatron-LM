@@ -8,12 +8,29 @@ what makes a run reproducible: the cheapest config is as deterministic as the
 fastest one, it is just slower.
 """
 
+import functools
 import hashlib
 import json
+import logging
 import os
-import warnings
+
+logger = logging.getLogger(__name__)
 
 _untuned_kernels_warned: set = set()
+_mamba_env_warned = False
+
+
+def reset_warnings() -> None:
+    """Forget which once-per-policy notices were issued, so a new policy reports again."""
+    _untuned_kernels_warned.clear()
+
+
+@functools.lru_cache(maxsize=None)
+def _arch_for_device(index: int) -> str:
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(index)
+    return f"sm{major}{minor}"
 
 
 def arch_tag() -> str:
@@ -21,12 +38,11 @@ def arch_tag() -> str:
     import torch
 
     try:
-        major, minor = torch.cuda.get_device_capability()
+        return _arch_for_device(torch.cuda.current_device())
     except (AssertionError, RuntimeError):
         # No CUDA device, or the driver is unavailable: the caller only needs a
         # stable label, and "unknown" simply never matches a recorded table.
         return "unknown"
-    return f"sm{major}{minor}"
 
 
 def kernel_name(autotuner) -> str:
@@ -124,8 +140,13 @@ def deterministic_choice(
     block-size override, then the cheapest config.
     """
     name = kernel_name(autotuner)
+    qualified = f"{kernel_module(autotuner)}.{name}"
     if table is not None:
-        tuned = table.lookup(name, tuning_key(autotuner, args, kwargs), candidates)
+        key = tuning_key(autotuner, args, kwargs)
+        # Recordings name kernels by module; older tables use the bare function name.
+        tuned = table.lookup(qualified, key, candidates)
+        if tuned is None:
+            tuned = table.lookup(name, key, candidates)
         if tuned is not None:
             return tuned
     filtered = filter_configs_by_block_sizes(candidates, block_sizes)
@@ -133,16 +154,18 @@ def deterministic_choice(
         return filtered[0]
     if on_miss == "error":
         raise RuntimeError(
-            f"No tuned config for triton kernel {name!r} on {arch_tag()} and "
+            f"No tuned config for triton kernel {qualified!r} on {arch_tag()} and "
             "on_miss='error'. Record a table, or allow the "
             "deterministic min-cost fallback."
         )
-    if name not in _untuned_kernels_warned:
-        _untuned_kernels_warned.add(name)
-        warnings.warn(
-            f"No pre-tuned config for triton kernel {name!r} on {arch_tag()}; using the "
-            "cheapest config, which is deterministic but may be slower. Record a table "
-            "with AutotunePolicy(mode='record', record_path=...) to recover the throughput."
+    if qualified not in _untuned_kernels_warned:
+        _untuned_kernels_warned.add(qualified)
+        logger.warning(
+            "No pre-tuned config for triton kernel %r on %s; using the cheapest config, "
+            "which is deterministic but may be slower. Record a table with "
+            "AutotunePolicy(mode='record', record_path=...) to recover the throughput.",
+            qualified,
+            arch_tag(),
         )
     return cheapest(candidates)
 
@@ -153,10 +176,9 @@ def chaos_choice(autotuner, candidates, args, kwargs):
     A positive control: every other check is a negative one, and "the runs
     matched" cannot distinguish a working divergence detector from a blind one.
     """
-    seed = (
-        f"{os.environ.get('RANK', '0')}|{kernel_name(autotuner)}"
-        f"|{tuning_key(autotuner, args, kwargs)}"
-    )
+    from megatron.core._rank_utils import safe_get_rank
+
+    seed = f"{safe_get_rank()}|{kernel_name(autotuner)}|{tuning_key(autotuner, args, kwargs)}"
     index = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % len(candidates)
     return candidates[index]
 
@@ -180,3 +202,25 @@ def autotune_configs(configs):
     if filtered:
         return filtered
     return [cheapest(configs)]
+
+
+def warn_if_mamba_env_ignored(policy) -> None:
+    """Point out, once, that ``MAMBA_DETERMINISTIC`` does not pin Megatron's kernels.
+
+    The variable still controls the external ``mamba_ssm`` package, but Megatron's
+    own Triton kernels follow ``deterministic_mode`` and PyTorch's deterministic
+    flag, so setting only the variable leaves them on timed autotuning.
+    """
+    global _mamba_env_warned
+
+    if _mamba_env_warned or policy.mode != "auto":
+        return
+    if not os.environ.get("MAMBA_DETERMINISTIC", "").startswith("1"):
+        return
+    _mamba_env_warned = True
+    logger.warning(
+        "MAMBA_DETERMINISTIC=1 only affects the external mamba_ssm package. Megatron's "
+        "Triton kernels, including megatron.core.ssm.ops, follow deterministic_mode "
+        "(--deterministic-mode) or torch.use_deterministic_algorithms(True); set one of "
+        "those, or AutotunePolicy(mode='pinned'), to pin their configurations."
+    )

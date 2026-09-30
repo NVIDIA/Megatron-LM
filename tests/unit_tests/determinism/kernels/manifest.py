@@ -373,7 +373,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_autotune_kernels.py", K + "test_ssm_kernels.py"),
         kind="dispatch",
         notes="Bit-exact reduction replay through the Autotuner adapter using min-cost and "
-        "JSON-table choices; SSM replay covers decoration-time pinning with autotune caching on/off.",
+        "JSON-table choices; every candidate of each config-invariant kernel must give "
+        "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
+        "pinning, with autotune caching on and off.",
     ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
@@ -415,8 +417,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
-        notes="determinism.py provides ordered workspaces and re-exports the shared tuning policy; "
-        "SSM replay verifies the relocated policy still pins configs when autotune caching is enabled.",
+        notes="determinism.py provides ordered workspaces and re-exports the shared tuning "
+        "policy; SSM replay checks that runtime pinning covers the module-level autotuners, "
+        "with Triton's autotune cache enabled and disabled.",
     ),
     KernelEntry(
         name="ssm_gdp_kernels",
