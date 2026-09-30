@@ -839,7 +839,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             or ddp_config.num_distributed_optimizer_instances != 1
         ):
             raise ValueError(
-                "MFSDP v2 per-token loss currently requires PP=1 and a single optimizer instance."
+                "MFSDP v2 per-token loss has not been tested with PP>1 "
+                "or multiple optimizer instances."
             )
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")

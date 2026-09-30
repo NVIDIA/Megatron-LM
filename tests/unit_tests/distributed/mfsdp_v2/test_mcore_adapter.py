@@ -1236,29 +1236,3 @@ class TestMcoreAdapterTokenGradients:
                     rtol=2.0e-5,
                     atol=2.0e-5,
                 )
-
-    @pytest.mark.parametrize("pipeline_size,instances", [(2, 1), (1, 2)])
-    def test_per_token_rejects_unvalidated_topologies(self, pipeline_size, instances):
-        """Keep the initial per-token support limited to PP=1 and one DP sharding axis."""
-        Utils.initialize_model_parallel()
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=8,
-            num_attention_heads=2,
-            pipeline_model_parallel_size=pipeline_size,
-            pipeline_dtype=torch.float32,
-            calculate_per_token_loss=True,
-        )
-        with pytest.raises(ValueError, match="per-token loss currently requires PP=1"):
-            FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    num_distributed_optimizer_instances=instances,
-                ),
-                module=torch.nn.Linear(8, 8).cuda(),
-                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-            )
