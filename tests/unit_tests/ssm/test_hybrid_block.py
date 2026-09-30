@@ -550,6 +550,145 @@ def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch, qk_layerno
         )
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    Utils.world_size < 2 or Utils.world_size % 2 != 0,
+    reason="Run this test with an even WORLD_SIZE >= 2.",
+)
+@pytest.mark.parametrize(
+    ("fp32_residual_connection", "residual_replay", "batch_size"),
+    [(False, False, 2), (True, True, 16)],
+    ids=("native", "fp32-replay"),
+)
+def test_attention_shortcut_wide_residual_ep2_serial_overlap_parity(
+    fp32_residual_connection, residual_replay, batch_size
+):
+    """Real EP=2 all-to-all preserves wide-shortcut serial/overlap numerics."""
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        def build(parallel):
+            replay_config = {}
+            if residual_replay:
+                replay_config = {
+                    "recompute_granularity": "selective",
+                    "recompute_modules": ["residual_stream"],
+                    "residual_stream_recompute_num_layers": 1,
+                }
+            config = TransformerConfig(
+                hidden_size=256,
+                num_layers=2,
+                num_attention_heads=4,
+                bf16=fp32_residual_connection,
+                params_dtype=(torch.bfloat16 if fp32_residual_connection else torch.float32),
+                fp32_residual_connection=fp32_residual_connection,
+                num_moe_experts=2,
+                expert_model_parallel_size=2,
+                moe_ffn_hidden_size=512,
+                moe_router_topk=1,
+                moe_router_pre_softmax=True,
+                moe_router_load_balancing_type="none",
+                moe_token_dispatcher_type="alltoall",
+                moe_shortcut_connection=True,
+                moe_shortcut_parallel=parallel,
+                moe_shared_expert_intermediate_size=256,
+                add_bias_linear=False,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                use_cpu_initialization=True,
+                wide_residual=WideResidualConfig(num_streams=3),
+                **replay_config,
+            )
+            layer_config_list = validate_segment_layers(Symbols.ATTENTION + Symbols.MOE, config)
+            return (
+                HybridStack(
+                    config=config,
+                    submodules=wide_residual_hybrid_stack_spec.submodules,
+                    layer_config_list=layer_config_list,
+                    pp_layer_offset=0,
+                    pg_collection=pg_collection,
+                )
+                .cuda()
+                .to(dtype=config.params_dtype)
+            )
+
+        serial = build(parallel=False)
+        overlap = build(parallel=True)
+        overlap.load_state_dict(serial.state_dict(), strict=True)
+        serial.train()
+        overlap.train()
+
+        torch.manual_seed(456)
+        sequence_length = 16
+        input_dtype = torch.bfloat16 if fp32_residual_connection else torch.float32
+        base_hidden = torch.randn(
+            sequence_length, batch_size, 256, device=torch.cuda.current_device(), dtype=input_dtype
+        )
+        torch.distributed.broadcast(base_hidden, src=0)
+        attention_mask = torch.triu(
+            torch.ones(
+                1, 1, sequence_length, sequence_length, dtype=torch.bool, device=base_hidden.device
+            ),
+            diagonal=1,
+        )
+
+        residual_write_dtypes = {"serial": [], "overlap": []}
+
+        def record_residual_writes(model, mode):
+            def hook(_module, _args, kwargs, output):
+                if kwargs.get("operation") == "write":
+                    residual_write_dtypes[mode].append(output.dtype)
+
+            model.layers[0].moe_layer.residual_connection_mlp.register_forward_hook(
+                hook, with_kwargs=True
+            )
+
+        record_residual_writes(serial, "serial")
+        record_residual_writes(overlap, "overlap")
+
+        def run(model):
+            model.zero_grad(set_to_none=True)
+            hidden_states = base_hidden.detach().clone().requires_grad_(True)
+            output = model(hidden_states, attention_mask=attention_mask)
+            output.float().square().mean().backward()
+            gradients = {
+                name: parameter.grad.detach().float().clone()
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            }
+            return output.detach().float(), hidden_states.grad.detach().float(), gradients
+
+        serial_output, serial_input_grad, serial_gradients = run(serial)
+        overlap_output, overlap_input_grad, overlap_gradients = run(overlap)
+
+        expected_residual_dtype = torch.float32 if fp32_residual_connection else input_dtype
+        assert residual_write_dtypes["serial"]
+        assert residual_write_dtypes["overlap"]
+        assert all(dtype == expected_residual_dtype for dtype in residual_write_dtypes["serial"])
+        assert all(dtype == expected_residual_dtype for dtype in residual_write_dtypes["overlap"])
+        if fp32_residual_connection:
+            assert serial.layers[0].shortcut_residual_read.read_map.logit.dtype == torch.bfloat16
+            assert overlap.layers[0].shortcut_residual_read.read_map.logit.dtype == torch.bfloat16
+        torch.testing.assert_close(overlap_output, serial_output, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(overlap_input_grad, serial_input_grad, rtol=1e-5, atol=1e-6)
+        assert overlap_gradients.keys() == serial_gradients.keys()
+        for name in serial_gradients:
+            torch.testing.assert_close(
+                overlap_gradients[name], serial_gradients[name], rtol=1e-5, atol=1e-6
+            )
+
+        shortcut_grad = overlap.layers[0].shortcut_residual_read.read_map.logit.grad
+        assert shortcut_grad is not None
+        assert torch.isfinite(shortcut_grad).all()
+    finally:
+        Utils.destroy_model_parallel()
+
+
 _BF16 = {"bf16": True, "params_dtype": torch.bfloat16}
 # Current scaling, not delayed: delayed scaling opens one outer fp8 context for the whole stack
 # and the per-layer factory degenerates to nullcontext, so the block's interleaving of the two
@@ -999,6 +1138,96 @@ class TestHybridBlock:
             assert torch.isfinite(norm.weight.grad).all()
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
+
+    @pytest.mark.parametrize("compute_symbol", [Symbols.MAMBA, Symbols.ATTENTION])
+    def test_wide_shortcut_replay_matches_eager_forward_backward(self, compute_symbol):
+        """A shortcut pair is one atomic physical unit for residual-stream replay."""
+
+        common_config = dict(
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=False,
+            moe_shortcut_post_norm=True,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp32_residual_connection=True,
+            wide_residual=WideResidualConfig(num_streams=3),
+        )
+        torch.manual_seed(1234)
+        reference = self.get_hybrid_block(
+            compute_symbol + Symbols.MOE,
+            stack_spec=wide_residual_hybrid_stack_spec,
+            **common_config,
+        ).cuda()
+        torch.manual_seed(1234)
+        recomputed = self.get_hybrid_block(
+            compute_symbol + Symbols.MOE,
+            stack_spec=wide_residual_hybrid_stack_spec,
+            recompute_granularity="selective",
+            recompute_modules=["residual_stream"],
+            residual_stream_recompute_num_layers=1,
+            **common_config,
+        ).cuda()
+        recomputed.load_state_dict(reference.state_dict())
+
+        reference_input = torch.randn(
+            128,
+            2,
+            reference.config.hidden_size,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        recomputed_input = reference_input.detach().clone().requires_grad_(True)
+        attention_mask = None
+        if compute_symbol == Symbols.ATTENTION:
+            attention_mask = torch.triu(
+                torch.ones(1, 1, 128, 128, dtype=torch.bool, device="cuda"), diagonal=1
+            )
+
+        def run(block, hidden_states):
+            block.train()
+            model_parallel_cuda_manual_seed(4321)
+            output = block(hidden_states, attention_mask=attention_mask)
+            output.float().square().mean().backward()
+            gradients = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in block.named_parameters()
+                if parameter.grad is not None
+            }
+            return output.detach(), gradients
+
+        reference_output, reference_gradients = run(reference, reference_input)
+        recomputed_output, recomputed_gradients = run(recomputed, recomputed_input)
+
+        shortcut = recomputed.layers[0]
+        compute_read = getattr(shortcut.attn_layer, "residual_connection", None)
+        if compute_read is None:
+            compute_read = shortcut.attn_layer.residual_connection_self_attn
+        independent_reads = (
+            shortcut.shortcut_residual_read,
+            compute_read,
+            shortcut.moe_layer.residual_connection_mlp,
+        )
+        assert all(residual_read is not None for residual_read in independent_reads)
+        assert len({id(read.read_map.logit) for read in independent_reads}) == 3
+        for residual_read in independent_reads:
+            gradient = residual_read.read_map.logit.grad
+            assert gradient is not None
+            assert torch.isfinite(gradient).all()
+
+        torch.testing.assert_close(recomputed_output, reference_output)
+        torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
+        assert recomputed_gradients.keys() == reference_gradients.keys()
+        for name in reference_gradients:
+            torch.testing.assert_close(recomputed_gradients[name], reference_gradients[name])
 
     def test_shortcut_pair_supports_a_residual_returning_pre_mlp_norm(self):
         """A fused residual pre-MLP norm spec is honoured, not rejected."""
