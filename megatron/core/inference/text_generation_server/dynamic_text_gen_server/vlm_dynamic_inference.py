@@ -142,14 +142,13 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
         return False
 
     _, checkpoint_args = result
-    # MIMO VLM checkpoints nest the language model under ``language_model.module.module.``.
+    # MIMO VLM checkpoints nest the language model under language_model.module.module.
     # Run text inference on that language model alone as a HybridModel, loading only its keys.
     if getattr(checkpoint_args, 'model_provider', None) in _MIMO_MODEL_PROVIDERS:
         if 'model_provider' not in user_passed_attrs:
             args.model_provider = 'hybrid'
         args.checkpoint_model_prefix = _MIMO_LANGUAGE_MODEL_PREFIX
-        # These checkpoints come from a fork whose ShortcutMoEBlock names its first sublayer
-        # ``compute_layer``; Megatron-LM names it ``attn_layer``.
+        # Map ShortcutMoEBlock's sublayer compute_layer to the current model's attn_layer.
         args.checkpoint_model_key_renames = {'.attn_layer.': '.compute_layer.'}
         return False
     if not hasattr(checkpoint_args, 'language_model_type'):

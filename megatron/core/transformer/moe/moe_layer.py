@@ -470,15 +470,8 @@ class MoELayer(BaseMoELayer):
         # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
         self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
-    def select_token_dispatcher(self) -> None:
-        """Select the training or inference token dispatcher.
-
-        The active dispatcher depends on whether the inference engine is currently using the
-        model, and only switches when the inference dispatcher was set up
-        (config.transformer_impl == "inference_optimized"). ``forward`` calls this itself;
-        schedules such as Shortcut-MoE that call the decomposed route/dispatch/compute/combine
-        methods directly must call it before starting that sequence.
-        """
+    def select_token_dispatcher(self) -> None
+        """Select the inference token dispatcher if active, otherwise use training dispatcher."""
         if not hasattr(self, "_inference_token_dispatcher"):
             return
         if InferenceMode.is_active():
