@@ -2,7 +2,6 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
-import contextlib
 import logging
 import os
 from dataclasses import replace
