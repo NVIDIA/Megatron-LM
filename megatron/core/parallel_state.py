@@ -2656,8 +2656,8 @@ def _abort_created_process_groups():
     def abort_group(group):
         group._get_backend(torch.device("cuda")).abort()
 
-    # Like nvrx, start all aborts together: outstanding work on different
-    # communicators can depend on one another (pytorch#119797).
+    # Start all aborts together: outstanding work on different communicators can
+    # depend on one another, so aborting them one at a time can block.
     first_error = None
     with ThreadPoolExecutor(max_workers=len(groups)) as executor:
         futures = [executor.submit(abort_group, group) for group in groups]
@@ -2745,7 +2745,6 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
 
     # DTensor's sharding cache compares meshes by layout, not process-group identity.
     # A later initialization with the same layout would reuse specs naming dead groups.
-    # Clear both the Python LRU and the optional C++ dispatch cache (pytorch#167051).
     _clear_dtensor_sharding_cache()
 
     global _MODEL_PARALLEL_GROUP

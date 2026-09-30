@@ -106,8 +106,9 @@ def _check_te_autocast_exited() -> None:
 
     On exit, an open context can reduce FP8 scaling statistics over its process group,
     which teardown destroys, and it reads the global state that teardown resets. A
-    negative depth is accepted: nvrx resets TE before the interrupted main thread
-    unwinds its autocast, whose exit then decrements the reset depth below zero.
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
     """
     if _te_autocast_depth() > 0:
         raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
