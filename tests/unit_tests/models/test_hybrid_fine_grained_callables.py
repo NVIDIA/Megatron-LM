@@ -12,6 +12,7 @@ import megatron.core.models.common.utils as node_utils
 import megatron.core.models.hybrid.fine_grained_callables as hybrid_callables
 import megatron.core.pipeline_parallel.utils as schedule_utils
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 
 
@@ -174,6 +175,23 @@ def test_attention_half_layer_forward_and_wgrad_are_scheduled(symbol):
     layer.init_backward_dw_wrapper.assert_called_once_with()
     assert backward_dw["pre_dispatch_computation"] == [backward_dw_wrapper]
     assert not is_moe
+
+
+@pytest.mark.parametrize("delay_wgrad_compute", [False, True])
+@pytest.mark.parametrize("mamba_mixer", [False, True])
+def test_mamba_pre_layer_wgrad_requires_a_mixer_that_defers_it(delay_wgrad_compute, mamba_mixer):
+    """A mixer without delayed wgrad must fail when built, not skip its weight gradients."""
+    mixer = MambaMixer.__new__(MambaMixer) if mamba_mixer else SimpleNamespace()
+    layer = SimpleNamespace(config=_config(delay_wgrad_compute=delay_wgrad_compute), mixer=mixer)
+    if delay_wgrad_compute and not mamba_mixer:
+        with pytest.raises(ValueError, match="SimpleNamespace mixer"):
+            hybrid_callables.build_hybrid_stack_callables(layer, Symbols.MAMBA)
+    else:
+        _, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(
+            layer, Symbols.MAMBA
+        )
+        assert backward_dw["pre_dispatch_computation"] == [layer]
+        assert not is_moe
 
 
 @pytest.mark.parametrize("zero_copy", [False, True])
