@@ -1716,94 +1716,6 @@ def _reset_dsa_indexer_modules(model, seed: int) -> int:
         return _reset_dsa_indexer_modules_with_current_rng(model)
 
 
-def _reset_simplified_dsa_indexers_from_main_q(model, rescale: bool = False) -> int:
-    """Initialize simplified indexer Q from the mean loaded main-Q projection."""
-    if not isinstance(model, list):
-        model = [model]
-
-    reset_count = 0
-    for model_chunk in model:
-        for module in model_chunk.modules():
-            core_attention = getattr(module, "core_attention", None)
-            indexer = getattr(core_attention, "indexer", None)
-            linear_qkv = getattr(module, "linear_qkv", None)
-            if indexer is None or linear_qkv is None:
-                continue
-            indexer_config = getattr(indexer, "config", None)
-            if getattr(indexer_config, "dsa_indexer_mode", "standard") != "simplified":
-                continue
-
-            main_weight = getattr(linear_qkv, "weight", None)
-            indexer_weight = getattr(getattr(indexer, "linear_q", None), "weight", None)
-            if main_weight is None or indexer_weight is None:
-                raise RuntimeError(
-                    "Main-Q reset requires exposed main linear_qkv and indexer linear_q weights."
-                )
-            tp_group = indexer.pg_collection.tp
-            tp_size = get_pg_size(tp_group)
-            if tp_size > 1:
-                gathered_weights = [torch.empty_like(main_weight) for _ in range(tp_size)]
-                torch.distributed.all_gather(
-                    gathered_weights, main_weight.detach().contiguous(), group=tp_group
-                )
-                full_qkv_weight = torch.cat(gathered_weights, dim=0)
-            else:
-                full_qkv_weight = main_weight.detach()
-
-            num_query_heads = indexer_config.num_attention_heads
-            head_dim = indexer_config.kv_channels
-            query_rows = num_query_heads * head_dim
-            if full_qkv_weight.ndim != 2 or full_qkv_weight.size(0) < query_rows:
-                raise RuntimeError(
-                    "Unable to extract main query heads from linear_qkv weight with shape "
-                    f"{tuple(full_qkv_weight.shape)}; expected at least {query_rows} output rows."
-                )
-            if indexer_weight.shape != (head_dim, full_qkv_weight.size(1)):
-                raise RuntimeError(
-                    "Simplified indexer Q weight shape does not match the main attention head: "
-                    f"indexer={tuple(indexer_weight.shape)}, expected="
-                    f"{(head_dim, full_qkv_weight.size(1))}."
-                )
-
-            main_q_heads = full_qkv_weight[:query_rows].reshape(
-                num_query_heads, head_dim, full_qkv_weight.size(1)
-            )
-            main_q_heads_float = main_q_heads.float()
-            mean_q_weight = main_q_heads_float.mean(dim=0)
-            if rescale:
-                target_norm_sq = main_q_heads_float.square().sum(dim=(1, 2)).mean()
-                mean_norm_sq = mean_q_weight.square().sum()
-                if mean_norm_sq > 0:
-                    mean_q_weight = mean_q_weight * torch.sqrt(target_norm_sq / mean_norm_sq)
-            mean_q_weight = mean_q_weight.to(dtype=indexer_weight.dtype)
-            with torch.no_grad():
-                indexer_weight.copy_(mean_q_weight)
-                indexer_linear_k = getattr(indexer, "linear_k", None)
-                indexer_k_weight = getattr(indexer_linear_k, "weight", None)
-                if indexer_k_weight is not None:
-                    k_row_start = query_rows * (
-                        2 if getattr(indexer_config, "attention_output_gate", False) else 1
-                    )
-                    k_row_end = k_row_start + head_dim
-                    if full_qkv_weight.size(0) < k_row_end:
-                        raise RuntimeError(
-                            "Unable to extract main K projection from linear_qkv weight with "
-                            f"shape {tuple(full_qkv_weight.shape)}; expected at least "
-                            f"{k_row_end} output rows."
-                        )
-                    main_k_weight = full_qkv_weight[k_row_start:k_row_end]
-                    if indexer_k_weight.shape != main_k_weight.shape:
-                        raise RuntimeError(
-                            "Simplified learned-K weight shape does not match main attention K: "
-                            f"indexer={tuple(indexer_k_weight.shape)}, "
-                            f"main={tuple(main_k_weight.shape)}."
-                        )
-                    indexer_k_weight.copy_(main_k_weight.to(dtype=indexer_k_weight.dtype))
-            reset_count += 1
-
-    return reset_count
-
-
 def _global_dsa_indexer_reset_count(local_reset_count: int) -> int:
     """Sum reset modules across ranks so PP stages without DSA layers remain valid."""
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -1971,19 +1883,9 @@ def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args):
         for child_optimizer in optimizers_to_check
     ):
         raise RuntimeError("DSA indexer reset-on-load does not support optimizer CPU offload.")
-    reset_method = getattr(args, "dsa_indexer_reset_method", "random")
-    if reset_method in ("main-q-mean", "main-q-mean-rescaled"):
-        rescale = reset_method == "main-q-mean-rescaled"
-        reset_count = _reset_simplified_dsa_indexers_from_main_q(model, rescale=rescale)
-        reset_description = (
-            "from the norm-rescaled mean loaded main-Q projection"
-            if rescale
-            else "from the mean loaded main-Q projection"
-        )
-    else:
-        seed = _get_dsa_indexer_reset_seed(args)
-        reset_count = _reset_dsa_indexer_modules(model, seed)
-        reset_description = f"with seed {seed}"
+    seed = _get_dsa_indexer_reset_seed(args)
+    reset_count = _reset_dsa_indexer_modules(model, seed)
+    reset_description = f"with seed {seed}"
     global_reset_count = _global_dsa_indexer_reset_count(reset_count)
     if global_reset_count == 0:
         raise RuntimeError(

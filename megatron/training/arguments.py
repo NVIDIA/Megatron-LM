@@ -1079,11 +1079,6 @@ def validate_args(args, defaults={}):
     if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-indexer-mode simplified requires --experimental-attention-variant dsa'
-    if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
-        assert getattr(args, 'dsa_reset_indexer_on_load', False), \
-            '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
-        assert getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified', \
-            '--dsa-indexer-reset-method main-Q methods require simplified DSA'
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
@@ -3822,18 +3817,6 @@ def _add_experimental_attention_variant_args(parser):
         '--dsa-reset-indexer-on-load',
         action='store_true',
         help='Reset DSA indexer parameters and clear their optimizer state after checkpoint load.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-reset-method',
-        type=str,
-        default='random',
-        choices=['random', 'main-q-mean', 'main-q-mean-rescaled'],
-        help=(
-            'Indexer reset method. main-q-mean uses the arithmetic mean of the loaded main-Q '
-            'projection weights. main-q-mean-rescaled additionally restores the RMS '
-            'per-head Frobenius energy of those weights. For simplified learned-K, both '
-            'methods also initialize the indexer K from the loaded main-attention K.'
-        ),
     )
     _maybe_add_argument(
         '--dsa-indexer-loss-coeff',
