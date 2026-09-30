@@ -19,6 +19,7 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -33,6 +34,7 @@ from megatron.core.utils import init_method_normal
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
@@ -488,13 +490,42 @@ class TestTEWrappers:
         k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-        def fn(q, k, v):
-            return module(q, k, v, None, AttnMaskType.causal)
+        cp_group = parallel_state.get_context_parallel_group()
+        assert cp_group.size() == 1
+        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        assert module.cp_group is None
+        reference = None
 
         try:
-            assert_replays_bit_exact(
-                fn, (q, k, v), replays=4, contention=True, what=f"TEDotProductAttention[{backend}]"
-            )
+            # Runtime CP1 retains its singleton metadata but must dispatch the same
+            # CP-off kernels as the legacy path, including after metadata is removed.
+            for packed_seq_params in (None, runtime_cp1, None):
+
+                def fn(q, k, v):
+                    output = module(
+                        q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params
+                    )
+                    assert module.cp_group is None
+                    return output
+
+                result = assert_replays_bit_exact(
+                    fn,
+                    (q, k, v),
+                    replays=4,
+                    contention=True,
+                    what=f"TEDotProductAttention[{backend},runtime_cp1={packed_seq_params is not None}]",
+                )
+                assert len(result[1]) == 3  # Replay covers dQ, dK, and dV.
+                assert runtime_cp1.cp_group is cp_group
+                assert runtime_cp1.local_cp_size == 1
+                assert module.cp_group is None
+                if reference is None:
+                    reference = result
+                for expected, actual in zip(reference, result):
+                    assert actual.keys() == expected.keys()
+                    for name in expected:
+                        assert torch.isfinite(actual[name]).all()
+                        assert bytes_equal(expected[name], actual[name]), name
         except (RuntimeError, AssertionError) as error:
             if "backend" in str(error).lower() and "avail" in str(error).lower():
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")
@@ -533,3 +564,53 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_te_quantile_balancing_histogram_replays(dtype):
+    """Exercise the QB-capable TE dispatch, including its atomic histogram output."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function_supports_qb,
+    )
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+
+    if not fused_topk_with_score_function_supports_qb:
+        pytest.skip("requires the Transformer Engine QB fused-router API")
+    seeded()
+    num_tokens, num_experts = 8192, 64
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=dtype, requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, 128, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    fused=True,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        return (
+            torch.cat([output[0] for output in outputs]),
+            torch.cat([output[1] for output in outputs]),
+            histogram,
+        )
+
+    outputs, grads = assert_replays_bit_exact(
+        fn,
+        (logits, histogram),
+        grad_outputs={"out[0]": torch.randn(num_tokens, num_experts, device="cuda")},
+        replays=3,
+        contention=True,
+        what=f"TE quantile balancing[{dtype}]",
+    )
+    assert torch.all(outputs["out[2]"].sum(dim=-1) == num_tokens)
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert grads["in[0]"].abs().sum() > 0
