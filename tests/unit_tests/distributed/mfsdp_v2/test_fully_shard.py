@@ -97,6 +97,40 @@ class TiedLM(nn.Module):
         return self.lm_head(self.embed_tokens(token_ids)).float().sum()
 
 
+class TinySharedMTP(nn.Module):
+    """Two MTP depths with shifted token embeddings and one shared residual block."""
+
+    def __init__(self, width: int, vocab_size: int) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, width)
+        self.enorm = nn.LayerNorm(width, bias=False)
+        self.hnorm = nn.LayerNorm(width, bias=False)
+        self.eh_proj = nn.Linear(2 * width, width, bias=False)
+        self.shared_block = nn.Sequential(
+            nn.LayerNorm(width, bias=False),
+            nn.Linear(width, width, bias=False),
+            nn.GELU(),
+            nn.Linear(width, width, bias=False),
+        )
+        self.output = nn.Linear(width, vocab_size, bias=False)
+
+    def forward(self, token_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Condition each depth on the previous depth and sum its next-token loss."""
+        seq_length = hidden_states.size(1)
+        losses = []
+        for depth in (1, 2):
+            # At position t, depth k consumes token t+k and predicts token t+k+1.
+            embeddings = self.embedding(token_ids[:, depth : depth + seq_length])
+            hidden_states = self.eh_proj(
+                torch.cat((self.enorm(embeddings), self.hnorm(hidden_states)), dim=-1)
+            )
+            hidden_states = hidden_states + self.shared_block(hidden_states)
+            logits = self.output(hidden_states)
+            targets = token_ids[:, depth + 1 : depth + 1 + seq_length]
+            losses.append(nn.functional.cross_entropy(logits.flatten(0, 1), targets.flatten()))
+        return torch.stack(losses).sum()
+
+
 class SaveNonLeafWeightView(torch.autograd.Function):
     """Autograd function that saves a non-leaf parameter view for backward."""
 
@@ -256,39 +290,47 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_repeated_module_backward_matches_baseline(distributed_setup):
-    """Two calls to one sharded layer share a single parameter-gradient accumulation."""
+def test_shared_mtp_backward_matches_baseline(distributed_setup):
+    """Both MTP depths train the shared block and propagate gradients to the backbone."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     width = 2 * world_size
+    vocab_size = 4 * width
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(1234)
-    baseline = nn.Linear(width, width, bias=False).to(device)
-    model = nn.Linear(width, width, bias=False).to(device)
+    baseline = TinySharedMTP(width, vocab_size).to(device)
+    model = TinySharedMTP(width, vocab_size).to(device)
     model.load_state_dict(baseline.state_dict())
     with fully_shard_context(device=device):
+        fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     torch.manual_seed(5678 + rank)
-    x = torch.randn(2, width, device=device, requires_grad=True)
-    baseline_x = x.detach().clone().requires_grad_()
-    h1 = model(x)
-    h2 = model(h1)
-    loss = h1.square().mean() + h2.square().mean()
-    baseline_h1 = baseline(baseline_x)
-    baseline_h2 = baseline(baseline_h1)
-    baseline_loss = baseline_h1.square().mean() + baseline_h2.square().mean()
+    seq_length = 4
+    token_ids = torch.randint(vocab_size, (2, seq_length + 3), device=device)
+    hidden_states = torch.randn(2, seq_length, width, device=device, requires_grad=True)
+    baseline_hidden_states = hidden_states.detach().clone().requires_grad_()
+    loss = model(token_ids, hidden_states)
+    baseline_loss = baseline(token_ids, baseline_hidden_states)
     loss.backward()
     baseline_loss.backward()
 
     torch.testing.assert_close(loss, baseline_loss)
-    torch.testing.assert_close(x.grad, baseline_x.grad)
-    dist.all_reduce(baseline.weight.grad)
-    baseline.weight.grad.div_(world_size)
-    torch.testing.assert_close(
-        model.weight.grad.to_local(), baseline.weight.grad.chunk(world_size, dim=0)[rank]
-    )
+    torch.testing.assert_close(hidden_states.grad, baseline_hidden_states.grad)
+    for name, parameter in model.named_parameters():
+        baseline_grad = baseline.get_parameter(name).grad
+        dist.all_reduce(baseline_grad)
+        baseline_grad.div_(world_size)
+        # FSDP packs parameters together, so individual row shards can be uneven or empty.
+        local_grad = parameter.grad.to_local()
+        row_counts = [None] * world_size
+        dist.all_gather_object(row_counts, local_grad.size(0))
+        assert sum(row_counts) == baseline_grad.size(0)
+        row_start = sum(row_counts[:rank])
+        torch.testing.assert_close(
+            local_grad, baseline_grad.narrow(0, row_start, local_grad.size(0))
+        )
 
 
 def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
