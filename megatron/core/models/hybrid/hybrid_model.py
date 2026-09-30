@@ -334,8 +334,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Bracketed-group patterns give every logical layer the structure of a
         # transformer layer, so their checkpoints are made key-compatible with
         # GPTModel. Derived from the full pattern rather than this rank's segment so
-        # every PP stage agrees on the naming. Non-grouped patterns keep the
-        # historical hybrid keys, which existing hybrid checkpoints were saved with.
+        # every PP stage agrees on the naming. Ungrouped patterns use the HybridModel
+        # checkpoint keys.
         transformer_sharded_keys = Symbols.GROUP_START in (parsed.main_pattern or '')
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
@@ -978,8 +978,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        # Match GPTModel checkpoint compatibility: old GPT checkpoints do not include
-        # output layer extra state, and the TE extra state should be empty.
+        # Like GPTModel, publish only the output layer weight: drop its TE extra state,
+        # which is expected to be empty.
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
         assert not (
             output_extra_state and output_extra_state.data

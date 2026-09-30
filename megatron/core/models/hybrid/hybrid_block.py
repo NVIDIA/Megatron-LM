@@ -128,7 +128,7 @@ class HybridStack(MegatronModule):
             segment. Defaults to 0.
         logical_layer_offset (int, optional): the global logical layer offset for this
             pipeline segment; bracketed groups count as one logical layer. Used for
-            checkpoint keys. Defaults to ``pp_layer_offset`` for legacy direct callers.
+            checkpoint keys. Defaults to ``pp_layer_offset``.
         is_layer_group_stack (bool, optional): whether this stack is the nested stack built
             for a bracketed group. Defaults to False.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -178,8 +178,8 @@ class HybridStack(MegatronModule):
                 checkpoint keys (``final_layernorm`` instead of ``final_norm``) so the
                 checkpoint is interchangeable with a ``GPTModel`` one. Only set for
                 bracketed-group patterns, whose logical layers map one-to-one onto
-                transformer layers; leaving it off keeps the historical hybrid keys so
-                existing non-grouped hybrid checkpoints stay loadable.
+                transformer layers; when off, the final norm is published as
+                ``final_norm``, the HybridModel checkpoint key.
             name (str | None): module instance name passed top-down from its paranet module
         """
         if (layer_type_list is None) == (layer_config_list is None):
@@ -1089,8 +1089,9 @@ class HybridStack(MegatronModule):
         ):
             state_dict_prefix = f'{layer_prefix}{local_layer_idx}.'  # module list index
             # Shortcut blocks collapse adjacent physical layers, while bracketed groups
-            # already occupy one logical slot. Keep the index from before shortcut
-            # grouping so both the shortcut and subsequent layers retain their old keys.
+            # already occupy one logical slot. Use the index from before shortcut
+            # grouping so a shortcut block and the layers after it are keyed by their
+            # logical layer index.
             logical_layer_idx = (
                 self.logical_layer_offset
                 if self.is_layer_group_stack
@@ -1126,11 +1127,10 @@ class HybridStack(MegatronModule):
                 module_sharded_state_dict = sharded_state_dict_default(
                     module, module_prefix, sharded_offsets, metadata, tp_group=self.tp_group
                 )
-                # The registered submodule stays ``final_norm`` (local state-dict keys
-                # are unchanged), but grouped stacks publish the sharded key under
-                # TransformerBlock's ``final_layernorm`` name so their checkpoints
-                # cross-load with GPTModel. Non-grouped stacks keep ``final_norm`` so
-                # hybrid checkpoints written before this feature still load.
+                # Ungrouped stacks publish the final norm as ``final_norm``; grouped
+                # stacks publish it as ``final_layernorm``, matching TransformerBlock, so
+                # their checkpoints cross-load with GPTModel. The registered submodule
+                # (and so the local state-dict key) is ``final_norm`` in both cases.
                 if name == 'final_norm' and self.transformer_sharded_keys:
                     replace_prefix_for_sharding(
                         module_sharded_state_dict, module_prefix, f'{prefix}final_layernorm.'
