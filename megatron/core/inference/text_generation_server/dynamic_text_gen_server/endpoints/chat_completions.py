@@ -435,7 +435,8 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
 def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
-    This only normalizes tool-call argument payloads inside each message:
+    This lowers structured media content according to the model prompt contract
+    and normalizes tool-call argument payloads inside each message:
     - messages[*].tool_calls[*].function.arguments is coerced to a dict.
 
     Example transformation:
@@ -451,8 +452,10 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
         return messages
     sanitized = []
     media_modalities_by_message = {}
+    media_sentinels_by_message = {}
     for _sentinel, modality, message_index in media_slots:
         media_modalities_by_message.setdefault(message_index, set()).add(modality)
+        media_sentinels_by_message.setdefault(message_index, set()).add(_sentinel)
 
     for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -472,6 +475,11 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
+            if prompt_config is not None and prompt_config.content_part_order == "media_first":
+                media_sentinels = media_sentinels_by_message.get(message_index, set())
+                media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
+                non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
+                text_chunks = media_chunks + non_media_chunks
             separator = ""
             message_modalities = media_modalities_by_message.get(message_index, set())
             if message_modalities:

@@ -916,7 +916,7 @@ class TorchDistLoadShardedStrategy:
 
             # Regular tensor
             sharded_metadata[k] = ShardedTensor.from_rank_offsets(
-                k, torch.empty(tp.size, **tp.properties.__dict__, device='meta')
+                k, torch.empty(tp.size, dtype=tp.properties.dtype, device='meta')
             ).without_data()
         return sharded_metadata
 
