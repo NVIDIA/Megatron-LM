@@ -12,7 +12,7 @@ from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
+from ..utils import PARAM_READY_CALLBACK_ATTR, get_cpu_resident_parameter_ids, log_single_rank
 
 try:
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
@@ -735,7 +735,10 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         Syncs parameters across all DP ranks.
         """
+        cpu_resident_parameters = get_cpu_resident_parameter_ids(self.module)
         for param in self.module.parameters():
+            if id(param) in cpu_resident_parameters:
+                continue
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
