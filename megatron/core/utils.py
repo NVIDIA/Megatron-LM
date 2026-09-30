@@ -2610,12 +2610,12 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             else batch["cu_seqlens"]
         )[0]
         SEQUENCE_KEYS = (
-            'tokens',
-            'labels',
-            'loss_mask',
-            'position_ids',
-            'decoder_input',
-            'mtp_input_mask',
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "decoder_input",
+            "mtp_input_mask",
         )
         sequence_tensor = next(
             (batch.get(key) for key in SEQUENCE_KEYS if batch.get(key) is not None), None

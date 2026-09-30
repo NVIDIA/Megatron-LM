@@ -8,6 +8,7 @@ import argparse
 from typing import List
 
 from examples.mimo.training.topology import ModuleGridSpec
+from examples.mimo.utils.hetero import get_language_sample_parallel_size
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
@@ -98,9 +99,9 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
-    gtp_weight_remat_size, _ = resolve_hetero_gtp_degrees(args)
     if args.mimo_llm_cp < 1:
         raise ValueError("--mimo-llm-cp must be positive")
+    llm_data_parallel_size = get_language_sample_parallel_size(args)
 
     if getattr(args, "mimo_encoder_ddp_overlap", False) and not getattr(
         args, "overlap_grad_reduce", False
@@ -120,13 +121,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"--mimo-llm-ep ({args.mimo_llm_ep})"
         )
 
-    llm_size = (
-        args.mimo_llm_tp
-        * gtp_weight_remat_size
-        * args.mimo_llm_cp
-        * args.mimo_llm_pp
-        * args.mimo_llm_dp
-    )
+    llm_size = args.mimo_llm_tp * args.mimo_llm_cp * args.mimo_llm_pp * llm_data_parallel_size
 
     if args.mimo_llm_only:
         if getattr(args, "mimo_encoder_ddp_overlap", False):
@@ -147,13 +142,12 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 
     # Fan-out divisibility: the bridge splits every LLM data lane across
     # mimo_encoder_dp encoder lanes; the split must be exact.
-    llm_data_parallel_size = args.mimo_llm_dp * gtp_weight_remat_size
     if (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp != 0:
         raise ValueError(
-            "--micro-batch-size * --mimo-llm-dp * GTP must be divisible by "
+            "--micro-batch-size * language sample lanes must be divisible by "
             "--mimo-encoder-dp "
-            f"(got {args.micro_batch_size} * {args.mimo_llm_dp} * "
-            f"{gtp_weight_remat_size} % {args.mimo_encoder_dp} != 0)"
+            f"(got {args.micro_batch_size} * {llm_data_parallel_size} "
+            f"% {args.mimo_encoder_dp} != 0)"
         )
 
     encoder_size = args.mimo_encoder_tp * args.mimo_encoder_dp
@@ -191,6 +185,7 @@ def build_module_grid_specs(
         pp=args.mimo_llm_pp,
         ep=args.mimo_llm_ep,
         gtp_remat=gtp_weight_remat_size,
+        gtp_remat_fold_cp=getattr(args, "gtp_remat_fold_cp", False),
         rank_offset=args.mimo_llm_offset,
         expt_tp=args.mimo_llm_expt_tp or 1,
         expt_gtp_remat=expert_gtp_weight_remat_size,

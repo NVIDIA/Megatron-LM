@@ -49,7 +49,11 @@ class MimoModel(MegatronModule):
     """
 
     def __init__(
-        self, mimo_config: MimoModelConfig, cp_group=None, tp_group=None, tp_cp_group=None
+        self,
+        mimo_config: MimoModelConfig,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         """Initialize the multimodal model.
 

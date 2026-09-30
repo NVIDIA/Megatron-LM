@@ -60,12 +60,12 @@ def _get_batch_on_this_cp_rank_contiguous(
     cp_rank = torch.distributed.get_rank(cp_group)
 
     sequence_keys = (
-        'tokens',
-        'labels',
-        'loss_mask',
-        'position_ids',
-        'decoder_input',
-        'mtp_input_mask',
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "decoder_input",
+        "mtp_input_mask",
     )
     if cp_size == 1:
         return batch
@@ -116,12 +116,12 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
 
     sequence_tensor = None
     sequence_keys = (
-        'tokens',
-        'labels',
-        'loss_mask',
-        'position_ids',
-        'decoder_input',
-        'mtp_input_mask',
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "decoder_input",
+        "mtp_input_mask",
     )
     for key in sequence_keys:
         sequence_tensor = batch.get(key)
@@ -298,13 +298,13 @@ def get_batches_on_this_cp_rank(
     has_sequence_data = any(
         batch.get(key) is not None
         for key in (
-            'tokens',
-            'labels',
-            'loss_mask',
-            'position_ids',
-            'attention_mask',
-            'decoder_input',
-            'mtp_input_mask',
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "attention_mask",
+            "decoder_input",
+            "mtp_input_mask",
         )
     )
     if has_sequence_data and cp_size > 1:

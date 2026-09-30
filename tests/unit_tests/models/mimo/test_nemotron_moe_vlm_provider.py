@@ -609,7 +609,8 @@ def test_language_rank_placement_uses_language_parallelism():
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("use_groups", [False, True])
-def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
+@pytest.mark.parametrize("cp_outer", [1, 2])
+def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, cp_outer):
     from types import SimpleNamespace
 
     from examples.mimo.model_providers import nemotron_moe_vlm as provider
@@ -629,6 +630,10 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
         lambda args: SimpleNamespace(context_parallel_size=8, calculate_per_token_loss=True),
     )
     grid = SimpleNamespace(shape=[1, cp_size, 1], dim_names=["tp", "cp", "pp"])
+    if cp_outer > 1:
+        grid.shape.append(cp_outer)
+        grid.dim_names.append("cp_outer")
+    cp_size *= cp_outer
     groups = None
     if use_groups:
         groups = SimpleNamespace(
