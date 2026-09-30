@@ -287,6 +287,15 @@ def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
     """
     main_param = getattr(p, "main_param", None)
     if main_param is not None:
+        if not main_param.is_cuda:
+            # A CPU-bound master here means chunked optimizer-state offload has already
+            # started (or not yet finished) moving it; its pinned buffer may be an in-flight
+            # D2H/H2D target, so staging from it would silently gather stale weights.
+            raise RuntimeError(
+                "fp8 param-gather staging found a CPU-resident fp32 master; restore the "
+                "optimizer masters (ensure_master_weights_for_param_sync) before dispatching "
+                "a LayerWise parameter all-gather under chunked optimizer-state offload"
+            )
         return main_param.detach().to(torch.bfloat16)
     if is_float8tensor(p):
         return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
@@ -333,9 +342,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
         raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
-            Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
+            "CustomRecipe recipe is not available in this version of \n"
+            "            Transformer Engine. Please make sure you are using TE version \n"
+            "            >= 2.9.0.dev0."
         )
     return custom_recipe
 
