@@ -1097,6 +1097,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if use_fa4 and torch.cuda.get_device_capability(q.device)[0] == 9:
             # FA4's automatic heuristic can select SplitKV, which Hopper does not support.
             fa4_num_splits = 1
+            if (
+                self.flash_attention_version is None
+                and k.shape[1] % 256 == 0
+                and (q.shape[-1] % 16 != 0 or v.shape[-1] % 16 != 0)
+            ):
+                # Hopper's FA4 non-TMA paged path requires 16-aligned head dimensions.
+                # These page sizes are supported by FA2; retain FA4 for smaller pages,
+                # which can use its TMA path and are not necessarily supported by FA2.
+                use_fa4, use_fa3 = False, HAVE_FA3
 
         # Flash attn kernel.
         if not is_decode_only:

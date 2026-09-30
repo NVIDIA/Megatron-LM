@@ -153,6 +153,88 @@ def test_fa4_split_kv_respects_device_support(
 
 
 @pytest.mark.parametrize("is_decode_only", [False, True])
+@pytest.mark.parametrize(
+    ("capability", "head_dim", "head_dim_v", "page_size", "pinned", "have_fa3", "expected_version"),
+    [
+        ((9, 0), 8, 8, 256, None, False, 2),
+        ((9, 0), 8, 16, 256, None, True, 3),
+        ((9, 0), 16, 8, 256, None, False, 2),
+        ((9, 0), 16, 16, 256, None, False, 4),
+        ((9, 0), 64, 64, 256, None, True, 4),
+        ((10, 0), 8, 8, 256, None, False, 4),
+        ((11, 0), 8, 8, 256, None, True, 4),
+        ((9, 0), 8, 8, 256, 4, True, 4),
+        ((9, 0), 8, 8, 256, 2, True, 2),
+        ((9, 0), 8, 8, 256, 3, True, 3),
+        ((9, 0), 8, 8, 128, None, False, 4),
+        ((9, 0), 8, 8, 128, None, True, 4),
+        ((9, 0), 8, 8, 512, None, False, 2),
+    ],
+)
+def test_paged_attention_auto_selection_handles_hopper_head_dimensions(
+    monkeypatch,
+    is_decode_only,
+    capability,
+    head_dim,
+    head_dim_v,
+    page_size,
+    pinned,
+    have_fa3,
+    expected_version,
+):
+    """Auto selection handles small heads without overriding an explicit backend."""
+    attention = object.__new__(SelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.config = SimpleNamespace(
+        window_size=None, window_attn_skip_freq=None, attn_logit_softcapping=None
+    )
+    attention.layer_number = 1
+    attention.batch_invariant_mode = False
+    attention.flash_attention_version = pinned
+    attention.train(False)
+
+    q = torch.ones(2, 1, 4, head_dim)
+    calls = []
+
+    def kernel(version, returns_tuple=False):
+        def run(q, *_args, **kwargs):
+            calls.append((version, kwargs["softmax_scale"]))
+            output = q.new_full((*q.shape[:-1], head_dim_v), version)
+            return (output, None) if returns_tuple else output
+
+        return run
+
+    monkeypatch.setattr(attention_module, "HAVE_FA4", True)
+    monkeypatch.setattr(attention_module, "HAVE_FA3", have_fa3)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    monkeypatch.setattr(attention_module, "flash_attn4_varlen_func", kernel(4, True))
+    monkeypatch.setattr(attention_module, "flash_attn_varlen_func", kernel(2))
+    monkeypatch.setattr(attention_module, "flash_attn_with_kvcache", kernel(2))
+    monkeypatch.setattr(attention_module, "flash_attn3_with_kvcache", kernel(3), raising=False)
+
+    def fa3_prefill(q, _k, _v, *_args, **_kwargs):
+        return kernel(3)(q, softmax_scale=_args[-1])
+
+    monkeypatch.setattr(attention, "_flash_attention_3_forward_wrapper", fa3_prefill)
+    output = attention.flash_decode_and_prefill(
+        q=q,
+        k=torch.zeros(2, page_size, 4, head_dim),
+        v=torch.zeros(2, page_size, 4, head_dim_v),
+        max_seqlen_q=1,
+        max_seqlen_k=page_size,
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        cu_seqlens_k=None,
+        seqlens_k=torch.tensor([page_size, page_size], dtype=torch.int32),
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        is_decode_only=is_decode_only,
+    )
+
+    assert calls == [(expected_version, head_dim**-0.5)]
+    assert output.shape == (2, 1, 4, head_dim_v)
+    assert torch.equal(output, torch.full_like(output, expected_version))
+
+
+@pytest.mark.parametrize("is_decode_only", [False, True])
 @pytest.mark.parametrize("has_sink", [False, True])
 def test_fa4_requests_lse_for_sink_correction(monkeypatch, is_decode_only, has_sink):
     """FA4 omits LSE during inference unless the caller explicitly requests it."""
