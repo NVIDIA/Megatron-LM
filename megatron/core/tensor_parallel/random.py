@@ -27,11 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.tensor_observation import suspend_tensor_observations
-from megatron.core.utils import (
-    is_te_min_version,
-    is_torch_min_version,
-    safely_set_viewless_tensor_data,
-)
+from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
