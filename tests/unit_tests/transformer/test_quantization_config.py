@@ -17,6 +17,7 @@ from megatron.core.quantization.quant_config import (
     RecipeConfig,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.config.instantiate_utils import instantiate
 
 try:
     from megatron.core.extensions.kitchen import (
@@ -75,8 +76,8 @@ def test_recipe_config_round_trip() -> None:
         },
     )
 
-    config_dict = deepcopy(recipe_config.to_cfg_dict())
-    deserialized = RecipeConfig.from_config_dict(config_dict)
+    config_dict = deepcopy(recipe_config.as_dict())
+    deserialized = RecipeConfig.from_config_dict(config_dict["config"])
 
     assert deserialized.configs == recipe_config.configs
     assert [type(matcher) for matcher in deserialized.matchers] == [
