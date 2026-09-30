@@ -1201,9 +1201,7 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
-    if args.moe_megakernel_backend == "mok" and (
-        args.use_megatron_fsdp or args.use_torch_fsdp2
-    ):
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:
@@ -3350,8 +3348,9 @@ def _add_regularization_args(parser):
         '--muon-fp32-matmul-prec',
         type=str,
         default='medium',
-        choices=['low', 'medium', 'high'],
-        help='FP32 matmul precision for Newton-Schulz iteration',
+        choices=['medium', 'high', 'highest'],
+        help='PyTorch FP32 matmul precision for Newton-Schulz iteration. '
+        'Use highest to retain full FP32 arithmetic.',
     )
     group.add_argument(
         '--muon-coefficient-type',

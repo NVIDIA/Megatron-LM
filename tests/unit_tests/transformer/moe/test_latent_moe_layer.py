@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
@@ -73,6 +73,43 @@ def test_rmsnorm_duplicated_linear_checkpoint_metadata(monkeypatch):
     assert checkpoint_call["axis_map"] is None
     assert checkpoint_call["kwargs"]["tp_group"] is tp_group
     assert checkpoint_call["kwargs"]["dp_cp_group"] is dp_cp_group
+
+
+@pytest.mark.skipif(
+    not is_te_min_version("1.7.0.dev0"),
+    reason="Transformer Engine linear layers require TE 1.7.0 or later.",
+)
+@pytest.mark.parametrize("linear_cls", [TELinear, TERMSNormDuplicatedLinear])
+def test_duplicated_linear_has_replicated_tensor_parallel_metadata(linear_cls):
+    """Duplicated TE linears must not retain TE's default dim-0 shard metadata."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+    )
+    kwargs = {}
+    if linear_cls is TERMSNormDuplicatedLinear:
+        kwargs["tp_group"] = _FakeProcessGroup()
+    layer = linear_cls(
+        16,
+        32,
+        parallel_mode="duplicated",
+        config=config,
+        init_method=config.output_layer_init_method,
+        bias=False,
+        skip_bias_add=False,
+        skip_weight_param_allocation=False,
+        **kwargs,
+    )
+
+    for name, param in layer.named_parameters():
+        assert not getattr(param, "tensor_model_parallel", True), name
+        assert getattr(param, "partition_dim", None) == -1, name
+        assert getattr(param, "partition_stride", None) == 1, name
 
 
 class TestLatentMoELayer:
