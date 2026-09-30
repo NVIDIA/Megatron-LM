@@ -155,7 +155,7 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import FaultInjectorConfig
-from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.container import PretrainConfigContainer, finalize_optimizer_config
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
@@ -209,6 +209,7 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
 try:
@@ -3015,7 +3016,7 @@ def setup_model_and_optimizer(
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
-        cfg.finalize_optimizer_config(config)
+        finalize_optimizer_config(config, cfg.logger)
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -4965,7 +4966,6 @@ def train(
         else:
             et = None
         def trace_handler(p):
-            cfg = get_run_config()
             profile_dir = Path(f"{cfg.logger.tensorboard_dir}/../torch_profile")
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")

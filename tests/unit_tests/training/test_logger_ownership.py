@@ -59,9 +59,28 @@ def test_cli_aliases_and_native_config_match(run_config):
     assert asdict(config) == asdict(expected)
 
 
-def test_normalization_does_not_alias_or_mutate_args():
-    args = Namespace(modules_to_filter=['module'], log_interval=7, iteration=12)
-    config = _default_config_from_args(LoggerConfig, args)
+@pytest.mark.parametrize('inference', [False, True])
+def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training import argument_utils, training
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.modules_to_filter = ['module']
+    args.log_interval = 7
+    monkeypatch.setattr(
+        training, 'get_megatron_optimizer_config', lambda args: (OptimizerConfig(), None)
+    )
+    monkeypatch.setattr(
+        training, 'get_megatron_ddp_config', lambda args: DistributedDataParallelConfig()
+    )
+    if inference:
+        cfg = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
+    else:
+        cfg = argument_utils.pretrain_cfg_container_from_args(args)
+    config = cfg.logger
     args.modules_to_filter.append('stale')
     assert config.modules_to_filter == ['module']
     config.log_interval = 11
@@ -548,7 +567,8 @@ def test_inference_reuses_matching_config_and_preserves_provider_override(
 
 
 @pytest.mark.parametrize('enabled', [False, True])
-def test_optimizer_receives_owned_logging_settings(monkeypatch, enabled, run_config):
+@pytest.mark.parametrize('bootstrap', ['pretrain', 'args_only'])
+def test_optimizer_receives_owned_logging_settings(monkeypatch, enabled, bootstrap, run_config):
     from megatron.training import training
 
     args = Namespace(
@@ -559,6 +579,13 @@ def test_optimizer_receives_owned_logging_settings(monkeypatch, enabled, run_con
         use_gloo_process_groups=False,
         dump_param_to_param_group_map=None,
     )
+    if bootstrap == 'args_only':
+        monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', None)
+        monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
+        monkeypatch.setattr(global_vars, 'initialize_runtime_services', Mock())
+        global_vars.set_global_variables(args, build_tokenizer=False)
+        run_config = global_vars.get_run_config()
+        assert not hasattr(run_config, 'optimizer')
     config = Namespace(barrier_with_L1_time=not enabled, log_num_zeros_in_grad=not enabled)
     monkeypatch.setattr(training, 'get_args', lambda: args)
     monkeypatch.setattr(training, 'get_timers', Mock())

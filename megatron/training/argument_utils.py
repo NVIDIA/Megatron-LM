@@ -499,7 +499,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
             kwargs[f.name] = getattr(args, f.name)
 
     if return_instance:
-        return cls(**deepcopy(kwargs))
+        return cls(**kwargs)
     else:
         return kwargs
 
@@ -729,7 +729,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         ddp=ddp_config,
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
@@ -795,7 +795,7 @@ def inference_cfg_container_from_args(
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )
 

@@ -27,10 +27,7 @@ from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
-from megatron.training.argument_utils import (
-    gpt_config_from_args,
-    hybrid_config_from_args,
-)
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.models import (
     GPTModelBuilder,

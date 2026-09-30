@@ -39,6 +39,12 @@ from megatron.training.models import GPTModelConfig, Serializable, HybridModelCo
 T = TypeVar("T", bound="ConfigContainerBase")
 
 
+def finalize_optimizer_config(optimizer: OptimizerConfig, logger: LoggerConfig) -> None:
+    """Derive optimizer logging inputs for native and args-only training."""
+    optimizer.log_num_zeros_in_grad = logger.log_num_zeros_in_grad
+    optimizer.barrier_with_L1_time = logger.barrier_with_L1_time
+
+
 def _finalize_model_config(model_config: object, logger: LoggerConfig) -> None:
     """Derive logging inputs for native models and legacy transformer configs."""
     if model_config is None:
@@ -332,8 +338,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> None:
         """Derive logging inputs for native and legacy optimizer construction."""
-        optimizer.log_num_zeros_in_grad = self.logger.log_num_zeros_in_grad
-        optimizer.barrier_with_L1_time = self.logger.barrier_with_L1_time
+        finalize_optimizer_config(optimizer, self.logger)
 
 
 @dataclass(kw_only=True)

@@ -411,7 +411,6 @@ def report_memory(name, process_group=None):
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
     cfg = get_run_config()
-    args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
