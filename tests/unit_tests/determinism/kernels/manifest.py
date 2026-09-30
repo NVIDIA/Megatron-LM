@@ -109,7 +109,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_bias_swiglu.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
-        notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
+        notes="Elementwise, including exact clamp-boundary replays; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
     ),
     KernelEntry(
         name="fused_bias_geglu",

@@ -11,6 +11,27 @@ import torch.nn.functional as F
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
+
+def _clamp_includes_boundaries():
+    """Read the installed scalar-clamp subgradient without initializing CUDA or RNGs."""
+    # PyTorch changed this within the 2.14 development series, so a version check
+    # cannot distinguish builds. FunctionsManual.cpp at b2c75dd062 uses strict
+    # inequalities; 4fdf77b940 uses inclusive ones. Probe both scalar-clamp forms
+    # once on CPU, including imports under no_grad or inference_mode.
+    with torch.inference_mode(False), torch.enable_grad():
+        gate = torch.tensor(1.0, dtype=torch.float32, device="cpu", requires_grad=True)
+        linear = torch.tensor([-1.0, 1.0], dtype=torch.float32, device="cpu", requires_grad=True)
+        gate_grad, linear_grad = torch.autograd.grad(
+            gate.clamp(max=1.0) + linear.clamp(min=-1.0, max=1.0).sum(), (gate, linear)
+        )
+    gradients = [gate_grad.item(), *linear_grad.tolist()]
+    if gradients not in ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]):
+        raise RuntimeError(f"Unsupported scalar-clamp boundary gradients: {gradients}")
+    return gradients[0] == 1.0
+
+
+_CLAMP_INCLUDES_BOUNDARIES = _clamp_includes_boundaries()
+
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
 
@@ -163,14 +184,20 @@ def clamped_swiglu_back(g, y, clamp_value):
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1c = y_1.clamp(min=None, max=clamp_value)
     y_2c = y_2.clamp(min=-clamp_value, max=clamp_value)
+    if _CLAMP_INCLUDES_BOUNDARIES:
+        gate_mask = y_1 <= clamp_value
+        linear_mask = (y_2 >= -clamp_value) & (y_2 <= clamp_value)
+    else:
+        gate_mask = y_1 < clamp_value
+        linear_mask = (y_2 > -clamp_value) & (y_2 < clamp_value)
     res = torch.cat(
         (
             g
             * torch.sigmoid(y_1c)
             * (1 + y_1c * (1 - torch.sigmoid(y_1c)))
             * y_2c
-            * (y_1 <= clamp_value).to(g.dtype),
-            g * F.silu(y_1c) * ((y_2 >= -clamp_value) & (y_2 <= clamp_value)).to(g.dtype),
+            * gate_mask.to(g.dtype),
+            g * F.silu(y_1c) * linear_mask.to(g.dtype),
         ),
         -1,
     )

@@ -110,6 +110,23 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
 
 
+@pytest.mark.parametrize("weighted", [False, True])
+def test_clamped_swiglu_boundaries_replay_bit_exactly(weighted):
+    seeded()
+    # Exact endpoints occur frequently in BF16; cover both clamp branches explicitly.
+    bounds = torch.tensor(
+        [-10.0625, -10.0, -9.9375, 9.9375, 10.0, 10.0625], device="cuda", dtype=DTYPE
+    )
+    x = torch.cat((bounds, bounds)).repeat(32, 1).requires_grad_(True)
+    if weighted:
+        fn = lambda x, w: weighted_bias_swiglu_impl(x, None, w, clamp_value=10.0)
+        inputs = (x, _weights(32))
+    else:
+        fn = lambda x: bias_swiglu_impl(x, None, clamp_value=10.0)
+        inputs = (x,)
+    assert_replays_bit_exact(fn, inputs, replays=3, what="clamped SwiGLU boundaries")
+
+
 # --- plain compiled activations -----------------------------------------------------------
 
 ACTIVATION_CASES = {

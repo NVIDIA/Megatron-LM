@@ -5,7 +5,11 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    _clamp_includes_boundaries,
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -47,6 +51,20 @@ def test_clamped_swiglu_config_rejects_linear_offset():
 def test_clamped_swiglu_config_rejects_unsupported_paths(kwargs, match):
     with pytest.raises(ValueError, match=match):
         _clamped_swiglu_config(**kwargs)
+
+
+@pytest.mark.parametrize("context", [torch.enable_grad, torch.no_grad, torch.inference_mode])
+def test_clamp_boundary_probe_preserves_context_and_rng(context):
+    rng_state = torch.get_rng_state()
+    cuda_initialized = torch.cuda.is_initialized()
+    with context():
+        grad_enabled = torch.is_grad_enabled()
+        inference_enabled = torch.is_inference_mode_enabled()
+        assert isinstance(_clamp_includes_boundaries(), bool)
+        assert torch.is_grad_enabled() == grad_enabled
+        assert torch.is_inference_mode_enabled() == inference_enabled
+    assert torch.equal(torch.get_rng_state(), rng_state)
+    assert torch.cuda.is_initialized() == cuda_initialized
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
@@ -215,6 +233,66 @@ def test_clamped_bias_swiglu_impl(input_dtype, with_bias):
             bias.grad.flatten().float().unsqueeze(0), bias_fused.grad.flatten().float().unsqueeze(0)
         ).item()
         assert bias_grad_cos > 0.999, f"bias.grad cosine similarity = {bias_grad_cos:.6f}"
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("variant", ["plain", "biased", "weighted"])
+def test_clamped_swiglu_boundary_gradients(input_dtype, variant):
+    """Match the installed clamp subgradient at both bounds and their BF16 neighbors."""
+    x = torch.tensor(
+        [
+            [
+                9.9375,
+                10.0,
+                10.0625,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                -10.0625,
+                -10.0,
+                -9.9375,
+                9.9375,
+                10.0,
+                10.0625,
+            ]
+        ],
+        dtype=input_dtype,
+        device="cuda",
+        requires_grad=True,
+    )
+    bias = torch.zeros(18, dtype=input_dtype, device="cuda") if variant == "biased" else None
+    weights = (
+        torch.full((1, 1), 2.0, dtype=torch.float32, device="cuda")
+        if variant == "weighted"
+        else None
+    )
+    effective = x.float() if bias is None else x.float() + bias.float()
+    gate, linear = effective.chunk(2, dim=-1)
+    expected = F.silu(gate.clamp(max=10.0)) * linear.clamp(min=-10.0, max=10.0)
+    if weights is not None:
+        expected = expected * weights
+    expected = expected.to(input_dtype)
+    expected.sum().backward()
+
+    actual_x = x.detach().clone().requires_grad_(True)
+    if weights is None:
+        actual = bias_swiglu_impl(actual_x, bias, clamp_value=10.0)
+    else:
+        actual = weighted_bias_swiglu_impl(actual_x, None, weights, clamp_value=10.0)
+    actual.sum().backward()
+    tols = (
+        dict(rtol=2.0e-2, atol=1.0e-3)
+        if input_dtype == torch.bfloat16
+        else dict(rtol=1.0e-6, atol=1.0e-6)
+    )
+    torch.testing.assert_close(actual, expected, **tols)
+    torch.testing.assert_close(actual_x.grad, x.grad, **tols)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
