@@ -297,6 +297,7 @@ markers = [
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
     "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
+    "e2e: opt-in end-to-end GPU tests that spawn their own torchrun (require MCORE_CHECKPOINT_E2E=1).",
 ]
 
 [tool.coverage.run]
