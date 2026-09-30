@@ -465,6 +465,10 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer
         placements = list(self.placements)
+        # A single all-gather over a flattened mesh may be faster. For now, reuse
+        # existing axis groups for simplicity until we have a clear owner for
+        # the combined process group's lifetime and cleanup. Revisit this as a
+        # potential performance optimization.
         for axis in axes:
             if out.is_symmetric_memory:
                 out.rendezvous(axis)
