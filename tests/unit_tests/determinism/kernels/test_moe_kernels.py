@@ -32,6 +32,8 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.virtual_expert_load_balancer import plan_virtual_expert_routes
+from megatron.core.transformer.moe.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -52,6 +54,36 @@ HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
+
+
+def test_virtual_expert_alignment_replay():
+    """Bit-exact planner replay across alignment changes on one shared workspace."""
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    group = ProcessGroupCollection.use_mpu_process_groups().ep
+    device = torch.device('cuda', torch.cuda.current_device())
+    workspace = VirtualExpertPlannerWorkspace(num_experts=8, device=device, group=group)
+    routes = (torch.arange(257, device=device)[:, None] + torch.arange(3, device=device)) % 5
+    expected = {}
+    try:
+        for alignment in (1, 32, 128, 256, 1, 256, 32, 128):
+            plan = plan_virtual_expert_routes(routes, workspace, alignment)
+            torch.distributed.barrier(group=group)
+            if alignment not in expected:
+                expected[alignment] = (plan.virtual_experts.clone(), plan.experts_to_copy.clone())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = plan_virtual_expert_routes(routes, workspace, alignment)
+            torch.distributed.barrier(group=group)
+            for _ in range(3):
+                graph.replay()
+                torch.distributed.barrier(group=group)
+                for value, reference in zip(
+                    (captured.virtual_experts, captured.experts_to_copy), expected[alignment]
+                ):
+                    torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    finally:
+        workspace.destroy()
+        Utils.destroy_model_parallel()
 
 
 def _routing(num_tokens=NUM_TOKENS, num_experts=NUM_EXPERTS, topk=TOPK):
