@@ -39,9 +39,12 @@ def _split_keys(prefix, num_householder, sections, is_conv, trailing=()):
     out, offset = {}, 0
     for name, size in zip(names, sections):
         shape = (size, 1, 4) if is_conv else (size, 3)
-        out[f"{prefix}.{name}"] = torch.arange(
-            offset, offset + size, dtype=torch.float32
-        ).reshape(-1, *([1] * (len(shape) - 1))).expand(shape).contiguous()
+        out[f"{prefix}.{name}"] = (
+            torch.arange(offset, offset + size, dtype=torch.float32)
+            .reshape(-1, *([1] * (len(shape) - 1)))
+            .expand(shape)
+            .contiguous()
+        )
         offset += size
     return out
 
@@ -71,17 +74,25 @@ class TestGdpSplitNames:
 
     def test_in_proj_order(self):
         assert _gdp_split_names(3, is_conv=False) == [
-            "z", "V0", "V1", "V2", "K0", "K1", "K2", "Q", "b0", "b1", "b2", "a"
+            "z",
+            "V0",
+            "V1",
+            "V2",
+            "K0",
+            "K1",
+            "K2",
+            "Q",
+            "b0",
+            "b1",
+            "b2",
+            "a",
         ]
 
     def test_conv_order(self):
-        assert _gdp_split_names(3, is_conv=True) == [
-            "V0", "V1", "V2", "K0", "K1", "K2", "Q"
-        ]
+        assert _gdp_split_names(3, is_conv=True) == ["V0", "V1", "V2", "K0", "K1", "K2", "Q"]
 
     def test_single_householder(self):
         assert _gdp_split_names(1, is_conv=False) == ["z", "V0", "K0", "Q", "b0", "a"]
-
 
 
 class TestMergeRefusesStackedBlocks:
@@ -90,12 +101,11 @@ class TestMergeRefusesStackedBlocks:
         section axis, so concatenating would splice layers together."""
         args = _gdp_args(num_householder=1, heads=2, head_dim=4, groups=2, state=4)
         in_proj_w, _ = _gdp_widths(args)
-        base = "decoder.layers.mixer.in_proj.weight"   # stacked: no .{idx}.
+        base = "decoder.layers.mixer.in_proj.weight"  # stacked: no .{idx}.
         names = _gdp_split_names(1, is_conv=False)
         tensors = {f"{base}.{n}": torch.zeros(3, 2) for n in names}
         with pytest.raises(NotImplementedError, match="no explicit layer index"):
             _merge_deltaproduct_projections(tensors)
-
 
 
 class TestHybridLayerRenumbering:
@@ -121,15 +131,15 @@ class TestHybridLayerRenumbering:
         assert index_map == {prefix: {old: new for new, old in enumerate(self.SPARSE)}}
         out, n = _renumber_hybrid_layers(keys, index_map)
         assert n == len(self.SPARSE)
-        got = sorted(
-            int(k[len(prefix):].split(".")[0]) for k in out
-        )
+        got = sorted(int(k[len(prefix) :].split(".")[0]) for k in out)
         assert got == list(range(len(self.SPARSE)))
 
     def test_namespaces_are_independent(self):
         """A sparse decoder must not drag an already-dense vision stack with it."""
-        keys = {**self._keys(self.SPARSE),
-                **self._keys(range(4), prefix="vision_model.decoder.layers.")}
+        keys = {
+            **self._keys(self.SPARSE),
+            **self._keys(range(4), prefix="vision_model.decoder.layers."),
+        }
         index_map = _hybrid_layer_index_map(keys)
         assert set(index_map) == {"language_model.decoder.layers."}
         out, _ = _renumber_hybrid_layers(keys, index_map)
@@ -143,14 +153,11 @@ class TestHybridLayerRenumbering:
         assert len(index_map) == 2
         out, n = _renumber_hybrid_layers(keys, index_map)
         assert n == 2 * len(self.SPARSE)
-        assert f"{prefix}7.mixer.out_proj.weight" in out   # old index 9 -> new 7
+        assert f"{prefix}7.mixer.out_proj.weight" in out  # old index 9 -> new 7
 
     def test_inner_nesting_uses_the_innermost_layers_segment(self):
-        keys = {
-            "language_model.mtp.layers.0.mtp_model_layer.layers.0.x.weight": torch.zeros(1)
-        }
+        keys = {"language_model.mtp.layers.0.mtp_model_layer.layers.0.x.weight": torch.zeros(1)}
         assert _hybrid_layer_index_map(keys) == {}
-
 
 
 class TestRenumberingGuards:
@@ -158,30 +165,42 @@ class TestRenumberingGuards:
         """A layer frozen out of the optimizer state leaves the two namespaces with
         different index sets, but nothing is renumbered, so it must not abort."""
         model = {f"model.module.decoder.layers.{i}.a.weight": torch.zeros(1) for i in range(4)}
-        opt = {f"optimizer.state.module.module.decoder.layers.{i}.a.weight": torch.zeros(1)
-               for i in (0, 1, 2)}
+        opt = {
+            f"optimizer.state.module.module.decoder.layers.{i}.a.weight": torch.zeros(1)
+            for i in (0, 1, 2)
+        }
         assert _hybrid_layer_index_map({**model, **opt}) == {}
 
     def test_disagreeing_namespaces_raise(self):
         """A layer present for the model but absent from the optimizer must not be
         renumbered independently."""
-        model = {f"model.module.language_model.decoder.layers.{i}.a.weight": torch.zeros(1)
-                 for i in [0, 1, 3]}
-        opt = {f"optimizer.state.module.module.language_model.decoder.layers.{i}.a.weight":
-               torch.zeros(1) for i in [0, 3]}
+        model = {
+            f"model.module.language_model.decoder.layers.{i}.a.weight": torch.zeros(1)
+            for i in [0, 1, 3]
+        }
+        opt = {
+            f"optimizer.state.module.module.language_model.decoder.layers.{i}.a.weight": torch.zeros(
+                1
+            )
+            for i in [0, 3]
+        }
         with pytest.raises(NotImplementedError, match="disagree on which layers exist"):
             _hybrid_layer_index_map({**model, **opt})
 
     def test_agreeing_namespaces_are_fine(self):
         idx = [0, 1, 3]
-        model = {f"model.module.language_model.decoder.layers.{i}.a.weight": torch.zeros(1)
-                 for i in idx}
-        opt = {f"optimizer.state.module.module.language_model.decoder.layers.{i}.a.weight":
-               torch.zeros(1) for i in idx}
+        model = {
+            f"model.module.language_model.decoder.layers.{i}.a.weight": torch.zeros(1) for i in idx
+        }
+        opt = {
+            f"optimizer.state.module.module.language_model.decoder.layers.{i}.a.weight": torch.zeros(
+                1
+            )
+            for i in idx
+        }
         index_map = _hybrid_layer_index_map({**model, **opt})
         assert len(index_map) == 2
         assert all(m == {0: 0, 1: 1, 3: 2} for m in index_map.values())
-
 
 
 class TestParamGroupRenumberingDoesNotAlias:
@@ -201,10 +220,10 @@ class TestParamGroupRenumberingDoesNotAlias:
         index_map = {prefix: {3: 1}}
         pgm = {f"{prefix}3.a.weight": "g", "model.module.embedding.word_embeddings.weight": "e"}
         out = _renumber_param_group_map(pgm, index_map)
-        assert out == {f"{prefix}1.a.weight": "g",
-                       "model.module.embedding.word_embeddings.weight": "e"}
-
-
+        assert out == {
+            f"{prefix}1.a.weight": "g",
+            "model.module.embedding.word_embeddings.weight": "e",
+        }
 
 
 class TestMergeDeltaProductProjections:
@@ -214,11 +233,21 @@ class TestMergeDeltaProductProjections:
 
     def _sections(self, is_conv):
         a = self.ARGS
-        d_inner, gds, m = a.mamba_num_heads * a.mamba_head_dim, a.mamba_num_groups * a.mamba_state_dim, a.gdp_num_householder
+        d_inner, gds, m = (
+            a.mamba_num_heads * a.mamba_head_dim,
+            a.mamba_num_groups * a.mamba_state_dim,
+            a.gdp_num_householder,
+        )
         if is_conv:
             return [d_inner] * m + [gds] * m + [gds]
-        return ([d_inner] + [d_inner] * m + [gds] * m + [gds]
-                + [a.mamba_num_heads] * m + [a.mamba_num_heads])
+        return (
+            [d_inner]
+            + [d_inner] * m
+            + [gds] * m
+            + [gds]
+            + [a.mamba_num_heads] * m
+            + [a.mamba_num_heads]
+        )
 
     def test_in_proj_sections_concatenate_in_mcore_order(self):
         pre = "model.module.decoder.layers.0.mixer.in_proj.weight"
@@ -246,12 +275,16 @@ class TestMergeDeltaProductProjections:
         base = "optimizer.state.module.module.decoder.layers.0.mixer.in_proj.weight"
         sections = self._sections(is_conv=False)
         split = _split_keys(base, self.ARGS.gdp_num_householder, sections, is_conv=False)
-        out, n, _merged = _merge_deltaproduct_projections({f"{k}.exp_avg": v for k, v in split.items()})
+        out, n, _merged = _merge_deltaproduct_projections(
+            {f"{k}.exp_avg": v for k, v in split.items()}
+        )
         assert n == 1 and f"{base}.exp_avg" in out
 
     def test_incomplete_section_set_raises(self):
         pre = "model.module.decoder.layers.0.mixer.in_proj.weight"
-        tensors = _split_keys(pre, self.ARGS.gdp_num_householder, self._sections(False), is_conv=False)
+        tensors = _split_keys(
+            pre, self.ARGS.gdp_num_householder, self._sections(False), is_conv=False
+        )
         del tensors[f"{pre}.a"]
         with pytest.raises(NotImplementedError, match="Refusing to guess"):
             _merge_deltaproduct_projections(tensors)
@@ -283,12 +316,7 @@ class TestParseDeltaProductSubKey:
             ),
             (
                 "decoder.layers.3.mixer.in_proj.weight.b10.exp_avg_sq.step",
-                (
-                    "decoder.layers.3.mixer.in_proj.weight",
-                    "in_proj",
-                    "b10",
-                    ".exp_avg_sq.step",
-                ),
+                ("decoder.layers.3.mixer.in_proj.weight", "in_proj", "b10", ".exp_avg_sq.step"),
             ),
         ],
     )
@@ -321,8 +349,9 @@ class TestMergeLeavesOtherMixersAlone:
 
     def test_gdn_self_attention_sections_pass_through(self):
         pre = "model.module.decoder.layers.0.self_attention.in_proj.weight"
-        keys = {f"{pre}.{n}": torch.zeros(2, 2)
-                for n in ("query", "key", "value", "z", "beta", "alpha")}
+        keys = {
+            f"{pre}.{n}": torch.zeros(2, 2) for n in ("query", "key", "value", "z", "beta", "alpha")
+        }
         out, n, _merged = _merge_deltaproduct_projections(dict(keys))
         assert n == 0 and set(out) == set(keys)
 
