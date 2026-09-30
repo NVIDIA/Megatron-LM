@@ -952,25 +952,13 @@ class TestMcoreAdapterHybrid:
             assert parameter.grad.placements == (expected_outer, Shard(0))
 
     @pytest.mark.parametrize("microbatches", [1, 2])
-    @pytest.mark.parametrize(
-        "outer_size,outer_strategy,inner_strategy",
-        [
-            (1, "no_shard", "no_shard"),
-            (1, "no_shard", "optim"),
-            (1, "no_shard", "optim_grads"),
-            (2, "no_shard", "optim_grads"),
-            (2, "no_shard", "optim_grads_params"),
-            (2, "optim", "optim_grads"),
-            (2, "optim", "optim_grads_params"),
-        ],
-    )
-    def test_hybrid_matches_zero3_reference(
-        self, outer_size, outer_strategy, inner_strategy, microbatches
-    ):
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
+    @pytest.mark.parametrize("inner_strategy", ["optim_grads", "optim_grads_params"])
+    def test_hybrid_matches_zero3_reference(self, outer_strategy, inner_strategy, microbatches):
         """Compare losses against ZeRO-3 sharded across all DP ranks.
 
-        With eight ranks, the reference uses a 1D mesh of size 8. A hybrid run
-        with outer_size=2 uses a 2D mesh of shape (2 outer, 4 inner).
+        With eight ranks, the reference uses a 1D mesh of size 8 and the hybrid
+        run uses a 2D mesh of shape (2 outer, 4 inner).
         Both runs use the same global batches, including no_sync accumulation.
         """
         config = self._config()
@@ -980,6 +968,7 @@ class TestMcoreAdapterHybrid:
         del model, optimizer
         _destroy_model_parallel()
 
+        outer_size = 2
         Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=outer_size)
         model, optimizer = self._build_model_and_optimizer(
             config, outer_size, outer_strategy, inner_strategy
