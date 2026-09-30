@@ -1727,7 +1727,9 @@ class _NCCLEPManager(_DispatchManager):
             topk_idx,
             topk_weights,
             recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
-            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
+            recv_topk_weights=(
+                _NCCLEPManager._zc_recv_topk_weights_buf if self._zc_quant else None
+            ),
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if not self.eager:
@@ -1783,7 +1785,7 @@ class _NCCLEPManager(_DispatchManager):
             self._buffer,
             hidden_states,
             num_local_tokens=self.num_local_tokens,
-            grad_out=_NCCLEPManager._zc_bwd_token_buf,
+            grad_out=_NCCLEPManager._zc_bwd_token_buf if self.zero_copy else None,
         )
         # Drop the buffer; backward keeps handle_mem alive via save_for_backward.
         self._buffer = None

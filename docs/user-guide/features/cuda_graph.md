@@ -53,6 +53,12 @@ Operationally, this path is tightly integrated into MCore training and inference
 - users select the mode through config flags only; there is no separate helper API to
   wire into a custom training loop or a separate need to handle static input buffers
 
+Capture failures propagate to the caller after clearing the process-wide capture
+and warmup state, including Transformer Engine capture state. This prevents a failed
+capture from making subsequent eager DDP backwards skip gradient accumulation.
+Custom validation loops that retain eager reference outputs should detach those
+outputs after backward before capture, releasing autograd nodes tied to the warmup stream.
+
 ### Usage
 
 ```bash

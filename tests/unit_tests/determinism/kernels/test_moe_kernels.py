@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -42,7 +43,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     deterministic_algorithms,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -573,4 +574,54 @@ class TestMoEModules:
         with deterministic_algorithms(True):
             assert_module_replays_bit_exact(
                 layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
+            )
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not is_nccl_ep_available(), reason="NCCL EP unavailable")
+    def test_nccl_ep_eager_replays_with_cached_zero_copy_buffers(self, monkeypatch):
+        """Old static buffers must not alter eager dispatch/combine outputs or gradients."""
+        if Utils.world_size < 2 or Utils.world_size % 2:
+            pytest.skip("needs a world size divisible by EP=2")
+        self._init(ep=2)
+        seeded()
+        config = _moe_config(
+            hidden_size=128,
+            ffn_hidden_size=256,
+            expert_model_parallel_size=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+        )
+        manager = _NCCLEPManager(
+            group=ProcessGroupCollection.use_mpu_process_groups().ep,
+            num_local_experts=4,
+            router_topk=2,
+            num_experts=8,
+            config=config,
+        )
+        # Deliberately incompatible cached capacities reproduce a prior quantized
+        # model's residue without requiring quantized kernels on this GPU.
+        for name in ("_zc_fwd_token_buf", "_zc_bwd_token_buf"):
+            monkeypatch.setattr(
+                _NCCLEPManager, name, torch.empty(1, 128, dtype=torch.bfloat16, device="cuda")
+            )
+        monkeypatch.setattr(
+            _NCCLEPManager, "_zc_recv_topk_weights_buf", torch.empty(1, device="cuda")
+        )
+        routing_map, probs = _routing(num_tokens=64, num_experts=8, topk=2)
+        probs.requires_grad_()
+        hidden = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+        def roundtrip(tokens, weights):
+            manager.setup_metadata(routing_map, weights)
+            received = manager.dispatch(tokens)
+            weighted = (received * manager.dispatched_probs.unsqueeze(-1)).to(tokens.dtype)
+            return manager.combine(weighted)
+
+        with deterministic_algorithms(True):
+            assert_replays_bit_exact(
+                roundtrip,
+                (hidden, probs),
+                replays=3,
+                grad_outputs={"out": torch.randn_like(hidden)},
+                what="NCCL EP eager dispatch/combine after zero-copy",
             )
