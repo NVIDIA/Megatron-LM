@@ -236,7 +236,7 @@ def test_dense_batch_and_head_layout_parity(
 
 def test_pre_fusion_rejects_deterministic_mode(model_parallel):
     with pytest.raises(ValueError, match="Pre-GDR fusion is non-deterministic"):
-        _model(True, deterministic_mode=True)
+        _model(True, deterministic_mode=True, gdn_kernel_backend='torch')
 
 
 @pytest.mark.parametrize("value_heads", [16, 64])
