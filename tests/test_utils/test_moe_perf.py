@@ -36,7 +36,11 @@ def test_benchmark_entrypoint_preserves_pytest_exit_code(monkeypatch, exit_code)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RNG streams require a GPU")
-def test_benchmark_repeats_routing_without_resetting_other_rng_streams(monkeypatch):
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+def test_benchmark_matches_historical_routing_without_resetting_other_rng_streams(
+    monkeypatch, rank, logits_dtype
+):
     benchmark = importlib.import_module(BENCHMARK_MODULE)
     monkeypatch.setattr(benchmark, "WARMUP_ITERS", 1)
     monkeypatch.setattr(benchmark, "MEASURE_ITERS", 3)
@@ -44,6 +48,7 @@ def test_benchmark_repeats_routing_without_resetting_other_rng_streams(monkeypat
     tracker = CudaRNGStatesTracker()
     monkeypatch.setattr(benchmark, "get_cuda_rng_tracker", lambda: tracker)
     monkeypatch.setattr(moe_utils, "get_cuda_rng_tracker", lambda: tracker)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
 
     randn = torch.randn
 
@@ -63,7 +68,7 @@ def test_benchmark_repeats_routing_without_resetting_other_rng_streams(monkeypat
             self.backward_grads = []
 
         def forward(self, input_tensor):
-            output = moe_utils.RandomSTE.apply(input_tensor)
+            output = moe_utils.RandomSTE.apply(input_tensor.to(logits_dtype))
             self.routing_logits.append(output.detach().clone())
             with tracker.fork("other-stream"):
                 self.other_draws.append(torch.rand(4, device=input_tensor.device))
@@ -86,17 +91,33 @@ def test_benchmark_repeats_routing_without_resetting_other_rng_streams(monkeypat
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         tracker.add(get_expert_parallel_rng_tracker_name(), 123)
         tracker.add("other-stream", 456)
+        with tracker.fork(get_expert_parallel_rng_tracker_name()):
+            torch.rand(7, device="cuda")
         reference_generator = torch.Generator(device="cuda").manual_seed(456)
+        default_generator = torch.Generator(device="cuda")
+        default_generator.set_state(torch.cuda.get_rng_state())
         layer = SyntheticLayer()
 
         metrics = benchmark._benchmark_moe_layer(layer, case)
 
         assert len(layer.routing_logits) == 4
         assert len(layer.backward_grads) == 4
+        # This is the pre-#2641 RandomSTE draw used when the baselines were recorded.
+        historical_generator = torch.Generator(device="cuda").manual_seed(42 + rank)
+        historical_logits = torch.empty_like(layer.routing_logits[0]).normal_(
+            generator=historical_generator
+        )
         for logits in layer.routing_logits:
-            torch.testing.assert_close(logits, layer.routing_logits[0], rtol=0, atol=0)
+            torch.testing.assert_close(logits, historical_logits, rtol=0, atol=0)
         for draw in layer.other_draws:
             expected = torch.rand(4, device="cuda", generator=reference_generator)
             torch.testing.assert_close(draw, expected, rtol=0, atol=0)
+        for grad in layer.backward_grads:
+            torch.randn(8, 8, device="cuda", generator=default_generator)
+            expected = torch.randn(
+                grad.shape, device="cuda", dtype=grad.dtype, generator=default_generator
+            )
+            torch.testing.assert_close(grad, expected, rtol=0, atol=0)
+        assert torch.equal(torch.cuda.get_rng_state(), default_generator.get_state())
         assert len(metrics["forward_timings"]) == 3
         assert len(metrics["backward_timings"]) == 3

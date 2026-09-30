@@ -211,7 +211,12 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
     input_tensor.requires_grad_(True)
     rng_tracker = get_cuda_rng_tracker()
     expert_rng_name = get_expert_parallel_rng_tracker_name()
-    expert_rng_state = rng_tracker.get_states()[expert_rng_name].clone()
+    # The baselines used RandomSTE's former private generator, seeded by global rank.
+    # Preserve that routing workload with the current expert RNG tracker.
+    routing_generator = torch.Generator(device="cuda").manual_seed(
+        42 + torch.distributed.get_rank()
+    )
+    expert_rng_state = routing_generator.get_state()
     for iteration in range(WARMUP_ITERS + MEASURE_ITERS):
         # RandomSTE uses the expert RNG stream. Repeat routing without resetting
         # the other streams used by the benchmark or the layer.
