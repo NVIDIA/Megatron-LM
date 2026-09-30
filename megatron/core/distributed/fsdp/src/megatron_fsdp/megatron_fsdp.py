@@ -38,6 +38,7 @@ from .param_and_grad_buffer import (
     PrefetchOrder,
     _check_nan_in_grad,
     override_sharded_param_methods_with_safety_checks,
+    resolve_fsdp_unit_filter,
     to_local_if_dtensor,
 )
 from .utils import (
@@ -149,8 +150,11 @@ class MegatronFSDP(torch.nn.Module):
             should be treated as an FSDP Unit, i.e. the minimum releasable model unit.
             It affects the granularity of the communication parameter grouping and
             triggers aggregate collective communication in FP8 mixed precision training.
-        fsdp_unit_filter (Optional[Callable]): Instance filter applied to modules matching
-            fsdp_unit_modules, for both communication buckets and parameter lifecycle hooks.
+            Shorthand for an fsdp_unit_filter that matches instances of these classes.
+        fsdp_unit_filter (Optional[Callable]): Predicate that returns True for modules that
+            should be treated as an FSDP Unit, for both communication buckets and parameter
+            lifecycle hooks. More general than fsdp_unit_modules, e.g. it can select some
+            instances of a class but not others. Pass at most one of the two.
         device (torch.device): Target device for the sharded model. Used to migrate
             all model parameters to an expected device. If init_model_with_meta_device=True,
             this argument is ignored.
@@ -337,11 +341,9 @@ class MegatronFSDP(torch.nn.Module):
             if fsdp_unit_modules is not None
             else []
         )
-        # Optional caller-supplied filter run after the isinstance check; lets the
-        # adapter exclude specific class instances (e.g. an outer wrapper that
-        # shares its class with the actual FSDP-unit instances) without leaking
-        # model knowledge into this library.
-        self.fsdp_unit_filter = fsdp_unit_filter
+        # Every FSDP unit check goes through this one predicate; fsdp_unit_modules is
+        # shorthand for a class-based one.
+        self.fsdp_unit_filter = resolve_fsdp_unit_filter(self.fsdp_unit_modules, fsdp_unit_filter)
 
         # Determine if we should delay the gradient reduction. Only if no parameter class
         # shards gradients, since a sharded class reduces on every backward pass.
@@ -437,7 +439,6 @@ class MegatronFSDP(torch.nn.Module):
             self.module,
             bucketing_policy=BucketingPolicy(
                 suggested_bucket_size=self.bucket_size,
-                fsdp_unit_modules=self.fsdp_unit_modules,
                 fsdp_unit_filter=self.fsdp_unit_filter,
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
                 expert_data_parallel_sharding_strategy=(
@@ -515,19 +516,8 @@ class MegatronFSDP(torch.nn.Module):
         return cls
 
     def _is_fsdp_unit_module(self, module: nn.Module) -> bool:
-        """Whether ``module`` should be treated as an FSDP unit.
-
-        Default: ``isinstance(module, tuple(fsdp_unit_modules))``. When the
-        caller provides ``fsdp_unit_filter``, the filter runs after the
-        isinstance check and can exclude specific instances -- useful when a
-        wrapping container shares its class with the actual unit instances
-        (so a pure class-based match would register the wrong layer).
-        """
-        if not isinstance(module, tuple(self.fsdp_unit_modules)):
-            return False
-        if self.fsdp_unit_filter is not None:
-            return self.fsdp_unit_filter(module)
-        return True
+        """Whether ``module`` should be treated as an FSDP unit."""
+        return self.fsdp_unit_filter is not None and self.fsdp_unit_filter(module)
 
     def all_gather_and_wait_parameters_ready(
         self,

@@ -86,13 +86,14 @@ def test_nested_fsdp_unit_bucketing(filter_outer, grouped_layers):
         second = Stack(second, is_group=True)
     outer = Stack(first, second)
     model = torch.nn.Sequential(outer)
-    policy = BucketingPolicy(
-        fsdp_unit_modules=[Stack, torch.nn.Linear],
-        fsdp_unit_filter=(
-            (lambda module: getattr(module, "is_group", True)) if filter_outer else None
-        ),
-        data_parallel_sharding_strategy="optim_grads_params",
-    )
+    if filter_outer:
+        unit_selection = dict(
+            fsdp_unit_filter=lambda module: isinstance(module, (Stack, torch.nn.Linear))
+            and getattr(module, "is_group", True)
+        )
+    else:
+        unit_selection = dict(fsdp_unit_modules=[Stack, torch.nn.Linear])
+    policy = BucketingPolicy(data_parallel_sharding_strategy="optim_grads_params", **unit_selection)
     groups, param_to_group, _ = _get_parameter_groups(model, policy, {})
 
     def unit_ids(module):
@@ -101,6 +102,17 @@ def test_nested_fsdp_unit_bucketing(filter_outer, grouped_layers):
     assert unit_ids(first) == {0}
     assert unit_ids(second) == ({1} if filter_outer else {0})
     assert {group.fsdp_unit_id for group in groups} == ({0, 1} if filter_outer else {0})
+
+
+def test_fsdp_unit_modules_is_shorthand_for_fsdp_unit_filter():
+    """A unit class list becomes the equivalent filter; passing both is rejected."""
+    policy = BucketingPolicy(fsdp_unit_modules=[torch.nn.Linear])
+    assert policy.fsdp_unit_filter(torch.nn.Linear(2, 2))
+    assert not policy.fsdp_unit_filter(torch.nn.Sequential())
+    assert BucketingPolicy().fsdp_unit_filter is None
+
+    with pytest.raises(ValueError, match="either fsdp_unit_modules or fsdp_unit_filter"):
+        BucketingPolicy(fsdp_unit_modules=[torch.nn.Linear], fsdp_unit_filter=lambda _: True)
 
 
 def test_all_gather_pipeline_prefetch_size():

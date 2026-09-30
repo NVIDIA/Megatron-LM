@@ -12,11 +12,10 @@ identically through two paths:
 
 Both paths use ``fsdp_unit_modules=[HybridStack]`` so meta-device
 materialization traversal is identical and the seed lands on the same
-parameter each draw -- a precondition for bit-exact comparison. The outer
-HybridStack root (``is_layer_group_stack=False``) is filtered out of the
-FSDP unit set by ``MegatronFSDP._is_fsdp_unit_module`` so each bracket
-group's inner HybridStack is its own unit; this test also asserts that
-property directly.
+parameter each draw -- a precondition for bit-exact comparison. The FSDP
+adapter's unit filter leaves out the outer HybridStack root
+(``is_layer_group_stack=False``) so each bracket group's inner HybridStack is
+its own unit; this test also asserts that property directly.
 """
 
 import gc
