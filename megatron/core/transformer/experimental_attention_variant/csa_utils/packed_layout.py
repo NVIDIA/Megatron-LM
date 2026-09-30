@@ -31,8 +31,9 @@ def _compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, c
     local_comp_cu = _prefix(counts)
     comp_cu = _prefix(torch.div(cu[1:] - cu[:-1], ratio, rounding_mode="floor"))
     rows = torch.arange(capacity, dtype=torch.int32, device=cu.device)
-    # Avoid compiled bucketize mismatches observed with the sliced prefix. For
-    # nonnegative rows, subtracting the leading zero preserves empty-document handling.
+    # Avoid sliced-prefix bucketize mismatches in PyTorch 2.13.0a0+8145d630e8.nv26.06.
+    # All prefixes here start at zero and rows are nonnegative: subtracting that
+    # leading boundary preserves right=True semantics, including empty documents.
     seq = (torch.bucketize(rows, local_comp_cu, right=True) - 1).clamp_max(cu.numel() - 2)
     valid = rows < local_comp_cu[-1]
     group_ids = first[seq] + rows - local_comp_cu[seq]
