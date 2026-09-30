@@ -5105,11 +5105,11 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
         # and again under HFSDP when DP-Shard holds a single rank.
         grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.SUM
-    elif ddp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
-        # Fused SUM reduction.
-        reduce_op = torch.distributed._make_nccl_premul_sum(scaling_factor)
     else:
-        # Scale gradients with SUM reduction.
+        # MFSDP v1 coalesces buckets with different gradient dtypes. PyTorch uses the
+        # first bucket's ReduceOp for the entire coalesced call, so mixing FP32
+        # PREMUL_SUM with pre-scaled BF16 SUM silently applies the wrong scaling.
+        # Disable division fusion until coalescing respects reduction operators.
         grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.SUM
 
