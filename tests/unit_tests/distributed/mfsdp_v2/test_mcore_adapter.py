@@ -19,9 +19,6 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-    uneven_dtensor_to_full_tensor,
-)
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -1092,24 +1089,11 @@ class _TokenGradientModel(torch.nn.Module):
         return self.gain * self.moe(self.dense(value))
 
 
-def _clear_token_gradient_test_caches() -> None:
-    """Drop DTensor layouts that retain process groups across topology changes."""
-    DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding.cache_clear()
-    clear_cpp_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
-    if clear_cpp_cache is not None:
-        clear_cpp_cache()
-
-
 class TestMcoreAdapterTokenGradients:
     """Compare normalization, clipping, and updates with an unsharded reference."""
 
-    def setup_method(self):
-        """Discard layouts referring to groups destroyed by an earlier test."""
-        _clear_token_gradient_test_caches()
-
     def teardown_method(self):
         """Release every model-parallel process group allocated by a test."""
-        _clear_token_gradient_test_caches()
         _destroy_model_parallel()
 
     @pytest.mark.parametrize("cp_size", [1, 2])
@@ -1155,6 +1139,15 @@ class TestMcoreAdapterTokenGradients:
             fsdp_unit_modules=[torch.nn.Sequential],
             pg_collection=groups,
         )
+        # Record the reference slices, including uneven and empty local shards.
+        reference_slices = {}
+        for name, parameter in model.module.named_parameters():
+            group = groups.expt_dp if ep_size > 1 and "experts" in name else groups.dp_cp
+            sizes = [None] * group.size()
+            torch.distributed.all_gather_object(sizes, parameter.to_local().shape[0], group=group)
+            assert sum(sizes) == parameter.shape[0]
+            offset = sum(sizes[: group.rank()])
+            reference_slices[name] = slice(offset, offset + sizes[group.rank()])
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
                 optimizer="adam",
@@ -1214,8 +1207,8 @@ class TestMcoreAdapterTokenGradients:
 
             for name, parameter in model.module.named_parameters():
                 torch.testing.assert_close(
-                    uneven_dtensor_to_full_tensor(parameter.grad),
-                    reference_parameters[name].grad,
+                    parameter.grad.to_local(),
+                    reference_parameters[name].grad[reference_slices[name]],
                     rtol=2.0e-5,
                     atol=2.0e-5,
                 )
@@ -1232,14 +1225,14 @@ class TestMcoreAdapterTokenGradients:
             torch.testing.assert_close(torch.as_tensor(norm, device="cuda"), reference_norm)
             for name, parameter in model.module.named_parameters():
                 torch.testing.assert_close(
-                    uneven_dtensor_to_full_tensor(parameter.grad),
-                    reference_parameters[name].grad,
+                    parameter.grad.to_local(),
+                    reference_parameters[name].grad[reference_slices[name]],
                     rtol=2.0e-5,
                     atol=2.0e-5,
                 )
                 torch.testing.assert_close(
-                    uneven_dtensor_to_full_tensor(parameter),
-                    reference_parameters[name],
+                    parameter.to_local(),
+                    reference_parameters[name][reference_slices[name]],
                     rtol=2.0e-5,
                     atol=2.0e-5,
                 )
