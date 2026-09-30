@@ -14,10 +14,11 @@ def _run_split_hook(
     use_local_indexer_varlen=True,
     single_packed_thd_sequence=True,
     cp_size=1,
+    config=None,
 ):
     marker = object()
     result = dsa_kernels.run_fused_qk_topk(
-        object(),
+        object() if config is None else config,
         marker,
         marker,
         marker,
@@ -77,10 +78,11 @@ def _run_split_loss_hook(
     use_local_indexer_varlen=True,
     single_packed_thd_sequence=True,
     cp_size=1,
+    config=None,
 ):
     marker = object()
     result = dsa_kernels.run_fused_qk_topk_with_loss(
-        object(),
+        object() if config is None else config,
         marker,
         marker,
         marker,
@@ -99,6 +101,50 @@ def _run_split_loss_hook(
         varlen_is_plain_causal=varlen_is_plain_causal,
     )
     return result, marker
+
+
+@pytest.mark.parametrize("runner", [_run_split_hook, _run_split_loss_hook])
+def test_config_deterministic_mode_reaches_compatible_split_hook(monkeypatch, runner):
+    calls = []
+    expected = object()
+
+    def hook(*, deterministic=False, **_kwargs):
+        calls.append(deterministic)
+        return expected
+
+    config = type("Config", (), {"deterministic_mode": True})()
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: hook)
+    monkeypatch.setattr(dsa_kernels.torch, "are_deterministic_algorithms_enabled", lambda: False)
+
+    result, _marker = runner(config=config)
+
+    assert result is expected
+    assert calls == [True]
+
+
+def test_hook_kwarg_signature_is_inspected_once(monkeypatch):
+    inspected = []
+    original_signature = dsa_kernels.inspect.signature
+
+    def hook(*, varlen_is_plain_causal=False):
+        return varlen_is_plain_causal
+
+    def track_signature(fn):
+        inspected.append(fn)
+        return original_signature(fn)
+
+    monkeypatch.setattr(dsa_kernels.inspect, "signature", track_signature)
+
+    expected = {"varlen_is_plain_causal": True}
+    assert (
+        dsa_kernels._hook_kwargs_accepting(hook, varlen_is_plain_causal=True, unsupported=True)
+        == expected
+    )
+    assert (
+        dsa_kernels._hook_kwargs_accepting(hook, varlen_is_plain_causal=True, unsupported=True)
+        == expected
+    )
+    assert inspected == [hook]
 
 
 def test_legacy_exact_split_hook_excludes_new_optional_kwarg(monkeypatch):
@@ -207,6 +253,49 @@ def test_split_hook_type_error_propagates_without_retry(monkeypatch):
     with pytest.raises(TypeError, match="backend implementation failed"):
         _run_split_hook(varlen_is_plain_causal=True)
     assert calls == 1
+
+
+def test_sparse_attention_hook_filters_static_row_certificate_for_legacy_signature(monkeypatch):
+    """The fixed-row certificate must not break an older exact backend hook."""
+    expected = object()
+
+    def legacy_hook(query, key, topk_indices, softmax_scale, v_channels, topk_length):
+        del query, key, topk_indices, softmax_scale, v_channels, topk_length
+        return expected
+
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: legacy_hook)
+
+    marker = object()
+    result = dsa_kernels.run_fused_absorbed_sparse_attention(
+        object(), marker, marker, marker, 1.0, 8, marker, all_topk_rows_nonempty=True
+    )
+
+    assert result is expected
+
+
+def test_opaque_sparse_attention_hook_receives_no_static_row_certificate(monkeypatch):
+    """An opaque out-of-tree hook receives only its established positional contract."""
+    calls = []
+    expected = object()
+
+    def opaque_hook(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    def fail_signature(_fn):
+        raise ValueError("opaque callable")
+
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: opaque_hook)
+    monkeypatch.setattr(core_utils.inspect, "signature", fail_signature)
+
+    marker = object()
+    result = dsa_kernels.run_fused_absorbed_sparse_attention(
+        object(), marker, marker, marker, 1.0, 8, marker, all_topk_rows_nonempty=True
+    )
+
+    assert result is expected
+    assert len(calls[0][0]) == 6
+    assert calls[0][1] == {}
 
 
 def test_legacy_exact_full_hook_excludes_new_optional_kwarg(monkeypatch):

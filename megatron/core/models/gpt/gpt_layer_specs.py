@@ -793,6 +793,25 @@ def get_gpt_mtp_block_spec_for_backend(
     if num_layers_to_build == 0:
         return None
 
+    if config.mtp_repeated_layer_shared_components:
+        if config.pipeline_model_parallel_layout is not None:
+            layout = config.pipeline_model_parallel_layout
+            assert isinstance(
+                layout, PipelineParallelLayerLayout
+            ), f"Invalid pipeline model parallel layout: {layout}"
+            local_decoder_layer_ids = layout.get_layer_id_list(
+                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+            )
+        else:
+            decoder_offset = get_transformer_layer_offset(
+                config, vp_stage=vp_stage, pp_rank=pp_rank
+            )
+            decoder_count = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+            local_decoder_layer_ids = range(decoder_offset, decoder_offset + decoder_count)
+        _validate_dsa_mtp_index_share_pipeline_split(
+            config, local_decoder_layer_ids, mtp_layer_number=config.num_layers + 1
+        )
+
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = copy.copy(spec.layer_specs[-1])
@@ -830,3 +849,40 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_block_spec = None
 
     return mtp_block_spec
+
+
+def _validate_dsa_mtp_index_share_pipeline_split(
+    config: TransformerConfig, local_decoder_layer_ids, mtp_layer_number: int
+) -> None:
+    """Ensure repeated-MTP sharing can obtain ordinary DSA top-k on this PP/VPP segment."""
+    if (
+        config.experimental_attention_variant != "dsa"
+        or not config.mtp_repeated_layer_shared_components
+        or config.dsa_indexer_topk_freq <= 1
+    ):
+        return
+
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    if not is_dsa_skip_topk_layer(
+        mtp_layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+    ):
+        return
+
+    source_layer_number = source_dsa_compute_layer(
+        mtp_layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+    )
+    local_decoder_layer_numbers = {layer_id + 1 for layer_id in local_decoder_layer_ids}
+    if source_layer_number not in local_decoder_layer_numbers:
+        raise RuntimeError(
+            "DSA repeated-MTP IndexShare pipeline split is invalid: MTP layer "
+            f"{mtp_layer_number} reuses top-k indices from computing layer "
+            f"{source_layer_number}, but that decoder layer is not in the same PP/VPP "
+            "execution segment. Cross-layer top-k sharing does not cross PP/VPP boundaries. "
+            "Place the source decoder layer with MTP or adjust "
+            f"dsa_indexer_topk_freq={config.dsa_indexer_topk_freq} and "
+            f"dsa_indexer_skip_topk_offset={config.dsa_indexer_skip_topk_offset}."
+        )

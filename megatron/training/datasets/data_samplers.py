@@ -2,7 +2,6 @@
 
 """Dataloaders."""
 
-
 import random
 
 import numpy as np
@@ -20,6 +19,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     if dataset is None:
         return None
+    # Empty split (e.g. valid/test when --eval-iters 0): return null loader
+    try:
+        if len(dataset) == 0:
+            return None
+    except TypeError:
+        pass
     args = get_args()
 
     if hasattr(dataset, 'split'):

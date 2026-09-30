@@ -17,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import _validate_dsa_mtp_index_share_pipeline_split
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -33,6 +34,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _DSAIndexSharingPayload,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -56,10 +58,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     build_causal_mask_from_positions,
     build_dsattention_forward_mask,
     build_fused_indexer_varlen_bounds,
+    can_prove_all_topk_rows_nonempty,
+    extract_query_valid_rows_from_packed_seq_params,
     generate_varlen_mask_params_for_positions,
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
+from megatron.core.transformer.forward_sharing import get_forward_sharing_state
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -118,6 +123,23 @@ class TestDSAIndexShareHelpers:
         with pytest.raises(RuntimeError, match="pipeline split is invalid"):
             _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
 
+    @pytest.mark.parametrize("shared_components", [["latent_kv"], ["sparse_attention_index"]])
+    def test_repeated_mtp_index_share_rejects_cross_segment_source(self, shared_components):
+        config = SimpleNamespace(
+            experimental_attention_variant="dsa",
+            mtp_repeated_layer_shared_components=shared_components,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=3,
+        )
+
+        _validate_dsa_mtp_index_share_pipeline_split(
+            config, local_decoder_layer_ids=[2], mtp_layer_number=4
+        )
+        with pytest.raises(RuntimeError, match="repeated-MTP IndexShare pipeline split"):
+            _validate_dsa_mtp_index_share_pipeline_split(
+                config, local_decoder_layer_ids=[], mtp_layer_number=4
+            )
+
     def test_skip_layer_does_not_build_indexer(self, monkeypatch):
         def fail_build_module(*_args, **_kwargs):
             raise AssertionError("skip layers must not build indexer modules")
@@ -130,6 +152,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
 
@@ -147,11 +170,12 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
-    def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
+    def test_index_share_state_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -165,19 +189,20 @@ class TestDSAIndexShareHelpers:
         )
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(None, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(None, attention_mask)
+        index_payload = attention._get_dsa_index_sharing_payload(None, attention_mask)
 
-        assert topk_holder is getattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(None, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(config, "_forward_sharing_state")
 
-    def test_index_share_holder_uses_packed_seq_params_when_available(self):
+    def test_index_share_state_uses_packed_seq_params_when_available(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -192,15 +217,13 @@ class TestDSAIndexShareHelpers:
         packed_seq_params = PackedSeqParams(qkv_format="thd")
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(
-            packed_seq_params, attention_mask
-        )
+        index_payload = attention._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
 
-        assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(attention_mask, "_forward_sharing_state")
 
 
 def _build_packed_causal_mask_for_test(
@@ -544,6 +567,128 @@ def test_dsa_kernel_backend_loader_cache_and_import_errors(monkeypatch):
         dsa_kernels._load_backend(Config)
 
 
+def test_dsa_all_topk_rows_nonempty_certificate():
+    common = {
+        "computes_topk": True,
+        "indexer_topk": 2,
+        "kv_sequence_length": 4,
+        "attention_mask": None,
+        "query_valid_rows": None,
+        "varlen_is_plain_causal": True,
+        "use_local_indexer_varlen": False,
+        "varlen_starts": None,
+        "varlen_ends": None,
+        "key_positions": None,
+    }
+    assert can_prove_all_topk_rows_nonempty(**common)
+
+    packed_local = {
+        **common,
+        "varlen_is_plain_causal": False,
+        "use_local_indexer_varlen": True,
+        "varlen_starts": torch.tensor([0, 0]),
+        "varlen_ends": torch.tensor([1, 2]),
+    }
+    assert can_prove_all_topk_rows_nonempty(**packed_local)
+
+    unsupported = [
+        {"computes_topk": False},
+        {"indexer_topk": 0},
+        {"kv_sequence_length": 0},
+        {"attention_mask": torch.zeros((1, 1, 2, 4), dtype=torch.bool)},
+        {"query_valid_rows": torch.ones((1, 2), dtype=torch.bool)},
+        {"varlen_is_plain_causal": False},
+        {**packed_local, "key_positions": torch.arange(4)},
+        {**packed_local, "varlen_ends": None},
+    ]
+    for override in unsupported:
+        assert not can_prove_all_topk_rows_nonempty(**{**common, **override})
+
+
+def test_dsa_packed_cp_padding_preserves_nonempty_local_varlen_rows():
+    """Padded THD rows still have causal KV coverage without a real-token mask."""
+    device = torch.device("cpu")
+    cp_size = 2
+    global_rows = 12
+    local_rows = global_rows // cp_size
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32, device=device)
+    cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32, device=device)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        pad_between_seqs=True,
+    )
+    query_valid_rows = extract_query_valid_rows_from_packed_seq_params(
+        packed_seq_params, b=1, sq=local_rows, device=device
+    )
+    assert query_valid_rows is None
+
+    padding_positions = torch.tensor([3, 8, 9, 10, 11], device=device)
+    all_query_positions = []
+    for cp_rank in range(cp_size):
+        query_positions = build_packed_allgather_cp_local_positions(
+            cu_seqlens_padded,
+            cp_size,
+            cp_rank,
+            device,
+            output_size=local_rows,
+            cu_seqlens_cover_output=True,
+        )
+        all_query_positions.append(query_positions)
+        float_mask, varlen_params, varlen_is_plain_causal = build_dsattention_forward_mask(
+            sq=local_rows,
+            skv=global_rows,
+            b=1,
+            device=device,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            cp_comm_type="allgather",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            packed_query_positions=query_positions,
+        )
+        assert float_mask is None
+        assert not varlen_is_plain_causal
+        assert varlen_params is not None
+        starts, ends, key_positions = varlen_params
+        assert key_positions is None
+
+        physical_key_positions = torch.arange(global_rows, device=device)
+        row_has_key = (
+            (physical_key_positions.unsqueeze(0) >= starts.unsqueeze(1))
+            & (physical_key_positions.unsqueeze(0) < ends.unsqueeze(1))
+        ).any(dim=1)
+        assert torch.all(row_has_key)
+        assert torch.any((query_positions.unsqueeze(1) == padding_positions).any(dim=1))
+        assert can_prove_all_topk_rows_nonempty(
+            computes_topk=True,
+            indexer_topk=2,
+            kv_sequence_length=global_rows,
+            attention_mask=None,
+            query_valid_rows=query_valid_rows,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_local_indexer_varlen=True,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=key_positions,
+        )
+
+    torch.testing.assert_close(
+        torch.cat(all_query_positions).sort().values,
+        torch.arange(global_rows, device=device),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
     class Config:
         attention_backend = "auto"
@@ -630,7 +775,9 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
         is None
     )
     assert (
-        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, starts.view(1, 1, 1), 1.0, 1)
+        dsa_kernels.run_fused_absorbed_sparse_attention(
+            Config, q, q, starts.view(1, 1, 1), 1.0, 1, all_topk_rows_nonempty=True
+        )
         is None
     )
     assert (
@@ -694,8 +841,9 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
         seen["loss_kwargs"] = kwargs
         return expected_topk_loss
 
-    def run_fused_absorbed_sparse_attention(*args):
+    def run_fused_absorbed_sparse_attention(*args, all_topk_rows_nonempty=False):
         seen["sparse_args"] = args
+        seen["all_topk_rows_nonempty"] = all_topk_rows_nonempty
         return expected_sparse
 
     def run_fused_dsa_attention(**kwargs):
@@ -766,11 +914,12 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
         dsa_kernels.run_fused_absorbed_sparse_attention(
-            Config, q, k, topk_indices, 1.0, 1, topk_length
+            Config, q, k, topk_indices, 1.0, 1, topk_length, all_topk_rows_nonempty=True
         )
         is expected_sparse
     )
     assert seen["sparse_args"][-1] is topk_length
+    assert seen["all_topk_rows_nonempty"] is True
 
     assert (
         dsa_kernels.run_fused_dsa_attention(
@@ -806,6 +955,67 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     assert seen["full_kwargs"]["varlen_is_plain_causal"] is True
     assert seen["full_kwargs"]["use_local_indexer_varlen"] is False
     assert seen["full_kwargs"]["packed_thd_causal_identity_layout"] is True
+
+
+def test_dsa_deterministic_mode_splits_combined_fusion_and_marks_sparse_backward(monkeypatch):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "cudnn"
+        deterministic_mode = True
+
+    q = torch.zeros((1, 1, 1, 1))
+    topk_indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+    expected_sparse = torch.ones_like(q)
+    seen = {}
+
+    def fail_combined(**_kwargs):
+        raise AssertionError("deterministic DSA must decline the combined autograd function")
+
+    def sparse_attention(*_args, deterministic=False, **_kwargs):
+        seen["deterministic"] = deterministic
+        return expected_sparse
+
+    monkeypatch.setattr(
+        dsa_kernels,
+        "_load_backend",
+        lambda _config: SimpleNamespace(
+            run_fused_dsa_attention=fail_combined,
+            run_fused_absorbed_sparse_attention=sparse_attention,
+        ),
+    )
+
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=q,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=q[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.01,
+            sparse_loss=True,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=True,
+        )
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, topk_indices, 1.0, 1)
+        is expected_sparse
+    )
+    assert seen["deterministic"] is True
 
 
 def test_dsa_kernel_dependency_validation(monkeypatch):

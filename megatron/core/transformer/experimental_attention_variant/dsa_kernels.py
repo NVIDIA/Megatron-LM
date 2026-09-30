@@ -9,6 +9,7 @@ from importlib import import_module
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Tuple
 
+import torch
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
@@ -125,6 +126,13 @@ def use_fused_dsa_kernels(config: TransformerConfig) -> bool:
     return _get_dsa_kernel_backend(config) != "none"
 
 
+def _deterministic_dsa_requested(config: TransformerConfig) -> bool:
+    """Return whether DSA must use bitwise-repeatable implementations."""
+    return bool(
+        getattr(config, "deterministic_mode", False) or torch.are_deterministic_algorithms_enabled()
+    )
+
+
 def run_fused_qk_topk(
     config: TransformerConfig,
     q: Tensor,
@@ -174,6 +182,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -249,6 +258,7 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -269,12 +279,27 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    result = fn(
+        query,
+        key,
+        topk_indices,
+        softmax_scale,
+        v_channels,
+        topk_length,
+        **filter_kwargs_for_callable(
+            fn,
+            {
+                "all_topk_rows_nonempty": all_topk_rows_nonempty,
+                "deterministic": _deterministic_dsa_requested(config),
+            },
+        ),
+    )
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
@@ -317,6 +342,12 @@ def run_fused_dsa_attention(
     Packed-layout backend kwargs are CP-only; CP-independent facts use optional,
     signature-filtered kwargs.
     """
+    if _deterministic_dsa_requested(config):
+        # The combined autograd function precomputes indexer gradients and runs sparse-attention
+        # backward internally. Keep deterministic mode on the split route so each backward can
+        # independently select a bitwise-repeatable implementation.
+        _log_declined_hook(config, "run_fused_dsa_attention", "deterministic mode")
+        return None
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None

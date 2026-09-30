@@ -165,6 +165,38 @@ This implementation does not create inference CUDA graphs. For inference, use
 --no-check-for-nan-in-loss-and-grad
 ```
 
+### THD Sequence Packing (fixed schedule)
+
+Full-iteration capture is supported with the THD sequence packing schedulers under a
+fixed-schedule, static-shape contract:
+
+- `num_microbatches` must stay constant across warmup, capture and replay. The packing scheduler
+  and dataset must produce the same number of packed microbatches every step; a change after
+  capture raises a signature-mismatch error instead of silently replaying the stale graph.
+- `--pad-packed-seq-alignment max` (or a value equal to `--max-seqlen-per-dp-cp-rank`),
+  `--max-seqlen-per-dp-cp-rank` and `--thd-max-packed-sequences` are required. Every packed
+  microbatch is canonicalized outside the graph to the per-rank token capacity and a fixed
+  `thd_max_packed_sequences + 1` cu_seqlens width; the real sequence count, `cu_seqlens` content
+  and padding distribution may still change per step when context parallel size is 1.
+- With context parallel size greater than 1, each static microbatch slot must also keep identical
+  packed boundaries across eager warmup, capture and replay. CP routes contain Python split sizes
+  and host-derived layout metadata that are baked into the graph. The batch loader validates the
+  exact boundaries and fails before capture/replay rather than reuse stale route metadata. At
+  least one eager warmup step is required so consumers can materialize host-derived device layout
+  caches before capture.
+- Dynamic context parallel remains disabled by default for full-iteration capture. A workload
+  whose realized schedule is deliberately invariant may opt in with
+  `--cuda-graph-static-dynamic-cp` together with `--dynamic-context-parallel` and
+  `--sequence-packing-scheduler default_dynamic_cp`. The flag does not make full-iteration
+  capture generally dynamic: every static microbatch slot must keep the same microbatch count,
+  effective CP size, process-group identity and ordered membership, partition mode, and (for
+  CP>1) exact packed boundaries and route-defining geometry. Layout changes are detected before
+  capture or replay and rejected by all ranks together. At effective CP1, tensor-backed
+  cu_seqlens and masks may change while the realized group remains fixed.
+- Pipeline parallel send/recv use the static CP-local token capacity instead of the per-step
+  variable-shape handshake.
+- Validation/eval runs eager: a dedicated fixed-shape validation graph is not implemented yet.
+
 ---
 
 ## Common Configuration Examples
