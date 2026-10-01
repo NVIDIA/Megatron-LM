@@ -257,7 +257,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
         }
     )
     stream.finish()
-    parser = StreamingChatParser(lambda text: (text, {}))
+    parser = StreamingChatParser(lambda text, finished=False: (text, {}))
 
     records = [
         record
@@ -293,8 +293,8 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
         }
     ]
 
-    def parse(text):
-        return Qwen3CoderToolParser.parse(text, tools=tools)
+    def parse(text, finished=False):
+        return Qwen3CoderToolParser.parse(text, tools=tools, finished=finished)
 
     parser = StreamingChatParser(parse, marker_prefixes=Qwen3CoderToolParser.streaming_markers)
     model_output = (
@@ -377,7 +377,9 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
     )
 
     parser = StreamingChatParser(
-        lambda text: Qwen3CoderToolParser.parse(text, tools=tools),
+        lambda text, finished=False: Qwen3CoderToolParser.parse(
+            text, tools=tools, finished=finished
+        ),
         marker_prefixes=Qwen3CoderToolParser.streaming_markers,
     )
     model_output = (

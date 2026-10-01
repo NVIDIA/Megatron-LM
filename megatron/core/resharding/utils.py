@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Mapping, Optional
 import torch
 import torch.distributed as dist
 
+from megatron.core.fp8_utils import get_grouped_tensor_members, is_grouped_tensor
+from megatron.core.utils import copy_parameter_metadata
+
 if TYPE_CHECKING:
     from .transforms import ReshardTransform
 
@@ -151,7 +154,7 @@ class ReshardPlan:
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
     transform: Optional["ReshardTransform"] = None
-    # Cache of canonical persistent-buffer dtypes keyed by raw module path.
+    # Cache of persistent-buffer dtypes keyed by local destination module path.
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.
     buffer_dtypes: Optional[dict[str, torch.dtype]] = None
@@ -163,6 +166,10 @@ class ReshardPlan:
     # Number of globally coordinated batches in send_ops/recv_ops. Backends
     # that require one stable model-wide registration can opt out at execution.
     num_batches: int = 1
+    # Total number of transfers (task ids) in the global schedule, identical on
+    # every rank. Lets a copy service size its submissions from plan-global data
+    # rather than from this rank's own op count, so all ranks decide alike.
+    total_tasks: int | None = None
     # Effective soft execution limit after ranks agree on the smallest
     # configured value. Native backends may reuse this coordinated value for
     # their own grouped submissions.
@@ -288,9 +295,23 @@ def named_refit_tensors(module: torch.nn.Module):
     Used by the refit planner and executor to enumerate which tensors should
     travel during resharding.  Persistent buffers are included alongside
     parameters because they may carry training state (see
-    ``named_persistent_buffers``).
+    ``named_persistent_buffers``). TE single-grouped BF16/MXFP8 parameters are
+    exposed as their stable per-expert views so their names and shapes match
+    the discrete ``weight0..weightN`` representation. This also avoids passing
+    metadata-only GroupedTensor wrappers to communication backends.
     """
-    yield from module.named_parameters(recurse=True)
+    for name, param in module.named_parameters(recurse=True):
+        if not is_grouped_tensor(param):
+            yield name, param
+            continue
+
+        for index, member in enumerate(get_grouped_tensor_members(param, create_if_missing=True)):
+            # Megatron stamps expert/TP/GTP metadata on the registered grouped
+            # parameter. Its TE member views share storage but do not inherit
+            # arbitrary Python attributes, so propagate the planning metadata.
+            copy_parameter_metadata(member, param)
+            yield f"{name}{index}", member
+
     for full_name, _sub, _buf_name, buf in named_persistent_buffers(module):
         yield full_name, buf
 
