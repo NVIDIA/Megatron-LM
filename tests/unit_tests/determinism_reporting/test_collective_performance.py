@@ -667,8 +667,9 @@ def test_startup_package_does_not_select_head_production(adapter, tmp_path):
     (base / "megatron").mkdir(parents=True)
     (base / "megatron/__init__.py").write_text("ORIGIN = 'base'\n")
     root = SCRIPTS.parents[3]
-    if not (root / "megatron/determinism/__init__.py").exists():
-        pytest.skip("Integration control requires the companion early startup API (#7419)")
+    required = ("megatron/determinism/__init__.py", "tools/determinism/capture_recipe.py")
+    if not all((root / path).exists() for path in required):
+        pytest.skip("Requires megatron/determinism and tools/determinism/capture_recipe.py")
     code = f"""
 from pathlib import Path
 import sys, torch

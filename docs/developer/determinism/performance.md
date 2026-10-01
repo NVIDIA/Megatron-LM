@@ -276,7 +276,7 @@ not establish hardware latency, correctness, replay coverage or usable budgets.
 `benchmark_collectives.py` measures the six direct TP/SP mappings supported by
 the recipe capture adapter, using its actual rank-local
 input and upstream-gradient bytes. This optional adapter needs the capture and
-replay producer (#7260/#7317) and the early startup API (#7419). It runs on the
+replay tools in `tools/determinism/` and the early startup API in `megatron/determinism/`. It runs on the
 capture's original single-node allocation; a capture from a different physical
 GPU assignment cannot supply these measurements.
 
