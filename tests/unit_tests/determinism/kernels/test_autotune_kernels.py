@@ -27,9 +27,6 @@ def isolated_policy(monkeypatch):
     for name, value in {
         "_installed": False,
         "_policy": None,
-        "_explicit_policy": None,
-        "_configured_policy": None,
-        "_deterministic_requested": False,
         "_tables": {},
         "_selected_configs": WeakKeyDictionary(),
         "_scopes": WeakKeyDictionary(),

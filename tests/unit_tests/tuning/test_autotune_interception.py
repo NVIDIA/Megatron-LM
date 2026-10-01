@@ -62,10 +62,9 @@ def test_install_is_cuda_lazy(isolated_policy, monkeypatch):
     assert interception.install(AutotunePolicy(mode="pinned"))
 
 
-def test_model_config_pins_in_tree_tuner_created_before_install(isolated_policy, monkeypatch):
+def test_install_pins_in_tree_tuner_created_before_install(isolated_policy, monkeypatch):
     import torch
 
-    from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.tuning import policy as tuning_policy
 
     monkeypatch.setattr(tuning_policy, "_deterministic_override", None)
@@ -75,25 +74,18 @@ def test_model_config_pins_in_tree_tuner_created_before_install(isolated_policy,
     assert selection.autotune_configs(original_configs) is original_configs
     assert len(original_configs) == 2
     monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
-
     policy = AutotunePolicy()
     supplied_settings = asdict(policy)
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=16,
-        num_attention_heads=1,
-        deterministic_mode=True,
-        triton_autotune=policy,
-    )
+
+    interception.install(policy, deterministic=True)
 
     assert tuner.run(None, 128) == 32
     assert tuner.run(None, 128) == 32
     assert hooks == [32, 32]
     assert tuner.configs is original_configs
     assert tuner.nargs is None
-    # Installation and cached launches keep results outside the model's settings.
-    assert config.triton_autotune is policy
-    assert asdict(config.triton_autotune) == supplied_settings
+    # Installation and cached launches keep results outside the caller's settings.
+    assert asdict(policy) == supplied_settings
     assert policy.mode is None
     assert interception.active_policy().mode == "pinned"
     assert interception.choice_log()
@@ -270,25 +262,25 @@ def test_install_can_upgrade_an_observer_to_pinning(isolated_policy, monkeypatch
     assert interception.active_policy().mode == "pinned"
 
 
-def test_framework_install_respects_explicit_policy(isolated_policy):
-    policy = AutotunePolicy(mode="pinned", modules=("my_kernels",))
-    interception.install(policy)
-    interception.install_from_config(AutotunePolicy(mode="auto"))
-    assert interception.active_policy() == policy
+def test_install_replaces_the_previous_policy(isolated_policy, nondeterministic_torch):
+    interception.install(AutotunePolicy(mode="pinned", modules=("my_kernels",), verify_every=3))
+    interception.install(AutotunePolicy(mode="auto"))
+    assert interception.active_policy() == AutotunePolicy(mode="auto")
+    interception.install(AutotunePolicy(mode="pinned"))
+    interception.install()
+    assert interception.active_policy() == AutotunePolicy(mode="auto")
 
 
-def test_framework_install_preserves_configured_policy_for_default_components(isolated_policy):
-    policy = AutotunePolicy(mode="pinned", modules=("my_kernels",), verify_every=3)
-    interception.install_from_config(policy)
-    interception.install_from_config()
-    assert interception.active_policy() == policy
-
-
-def test_framework_determinism_preserves_configured_controls(isolated_policy):
+def test_install_derives_an_omitted_mode(isolated_policy, nondeterministic_torch):
     policy = AutotunePolicy(modules=("my_kernels",), verify_every=3)
-    interception.install_from_config(policy)
-    interception.install_from_config(deterministic=True)
+    interception.install(policy, deterministic=True)
     assert interception.active_policy() == policy.resolve(deterministic=True)
+    assert interception.active_policy().mode == "pinned"
+    interception.install(policy)
+    assert interception.active_policy().mode == "auto"
+    # An explicit mode wins over the deterministic request.
+    interception.install(AutotunePolicy(mode="auto"), deterministic=True)
+    assert interception.active_policy().mode == "auto"
 
 
 def test_in_tree_selection_uses_explicit_block_sizes(isolated_policy, monkeypatch):
@@ -343,21 +335,6 @@ def test_table_distinguishes_all_launch_options(isolated_policy):
     assert selection.config_signature(ordinary) != selection.config_signature(clustered)
     table = TunedTable("test_arch", {"test_kernel": {"*": selection.config_data(clustered)}})
     assert table.lookup("test_kernel", "size=128", [ordinary, clustered]) is clustered
-
-
-def test_transformer_config_requests_pinning(isolated_policy, monkeypatch):
-    import torch
-
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    monkeypatch.setenv("MAMBA_DETERMINISTIC", "0")
-    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
-    TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1, deterministic_mode=True)
-    assert interception.active_policy().mode == "pinned"
-    TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
-    assert interception.active_policy().mode == "pinned"
-    interception.install_from_config(AutotunePolicy(mode="auto"))
-    assert interception.active_policy().mode == "auto"
 
 
 @pytest.mark.parametrize(
@@ -466,14 +443,6 @@ def test_verification_with_real_process_group(isolated_policy, monkeypatch):
         interception.verify_choices()
 
 
-def _config(**overrides):
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    kwargs = dict(num_layers=1, hidden_size=16, num_attention_heads=1)
-    kwargs.update(overrides)
-    return TransformerConfig(**kwargs)
-
-
 @pytest.fixture
 def nondeterministic_torch(monkeypatch):
     import torch
@@ -484,51 +453,13 @@ def nondeterministic_torch(monkeypatch):
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
 
 
-def test_explicit_policy_without_mode_follows_later_deterministic_config(
-    isolated_policy, nondeterministic_torch
-):
-    interception.install(AutotunePolicy(table_path=("/tables",), verify_every=10))
-    assert interception.active_policy().mode == "auto"
-    _config(deterministic_mode=True)
-    policy = interception.active_policy()
-    assert policy.mode == "pinned"
-    assert policy.table_path == ("/tables",) and policy.verify_every == 10
-
-
-def test_explicit_policy_without_mode_keeps_earlier_pinning(
-    isolated_policy, nondeterministic_torch
-):
-    _config(deterministic_mode=True)
-    interception.install(AutotunePolicy(verify_every=5))
-    assert interception.active_policy().mode == "pinned"
-    assert interception.active_policy().verify_every == 5
-    interception.install(AutotunePolicy(mode="auto"))
-    assert interception.active_policy().mode == "auto"
-
-
-def test_rejected_config_leaves_policy_unchanged(isolated_policy, nondeterministic_torch):
-    with pytest.raises(ValueError, match="num_attention_heads"):
-        _config(
-            hidden_size=48,
-            num_attention_heads=3,
-            tensor_model_parallel_size=2,
-            deterministic_mode=True,
-        )
-    assert interception.active_policy() is None
-    _config()
-    assert interception.active_policy().mode == "auto"
-
-
-def test_config_converts_mappings_and_rejects_other_types(isolated_policy, nondeterministic_torch):
-    config = _config(triton_autotune={"mode": "pinned", "table_path": None})
-    assert config.triton_autotune == AutotunePolicy(mode="pinned")
-    assert interception.active_policy().mode == "pinned"
+def test_install_converts_mappings_and_rejects_other_types(isolated_policy, nondeterministic_torch):
+    interception.install({"mode": "pinned", "table_path": None})
+    assert interception.active_policy() == AutotunePolicy(mode="pinned")
     with pytest.raises(TypeError, match="AutotunePolicy or a mapping"):
-        _config(triton_autotune=7)
+        interception.install(7)
     # The rejected value never reached the adapter.
-    assert interception._configured_policy == AutotunePolicy(mode="pinned")
-    _config()
-    assert interception.active_policy().mode == "pinned"
+    assert interception.active_policy() == AutotunePolicy(mode="pinned")
 
 
 def test_pinned_launches_log_a_choice_only_when_it_is_made(isolated_policy, monkeypatch):
@@ -593,7 +524,6 @@ def test_record_path_is_checked_when_installed(isolated_policy, monkeypatch, tmp
         interception.install(AutotunePolicy(mode="record", record_path=str(tmp_path / "rec")))
     # A policy that could not be installed changes nothing.
     assert interception.active_policy().mode == "pinned"
-    assert interception._explicit_policy == AutotunePolicy(mode="pinned")
 
 
 def test_failed_record_dump_is_logged_not_raised(isolated_policy, monkeypatch, tmp_path, caplog):

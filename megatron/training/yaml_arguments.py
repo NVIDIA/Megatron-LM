@@ -362,6 +362,9 @@ def validate_yaml(args, defaults={}):
         assert not args.model_parallel.fp16, \
             "Expert parallelism is not supported with fp16 training."
 
+    # Built here so a bad section fails now; training installs it in initialize_megatron.
+    args.triton_autotune = _triton_autotune_config_from_args(args)
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -416,7 +419,6 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
-    args.triton_autotune = _triton_autotune_config_from_args(args)
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
     

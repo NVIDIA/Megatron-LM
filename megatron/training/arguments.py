@@ -152,7 +152,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         if _triton_autotune_config_from_args(args) is not None:
             raise ValueError(
                 'Triton autotune CLI arguments cannot be combined with --yaml-cfg; '
-                'set language_model.triton_autotune in the YAML configuration instead.'
+                'set triton_autotune in the YAML configuration instead.'
             )
         if _wide_residual_config_from_args(args) is not None:
             raise ValueError(
@@ -1746,6 +1746,9 @@ def validate_args(args, defaults={}):
 
         apply_determinism_to_args(args)
 
+    # Built here so a bad option fails now; training installs it in initialize_megatron.
+    args.triton_autotune = _triton_autotune_config_from_args(args)
+
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
@@ -2481,7 +2484,6 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
-        "triton_autotune",
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
@@ -2595,7 +2597,7 @@ def _parse_triton_autotune_block_size(value):
 
 
 def _add_triton_autotune_args(parser):
-    """Add CLI controls for the nested ``TransformerConfig.triton_autotune`` policy."""
+    """Add CLI controls for the process-wide Triton autotune policy."""
     group = parser.add_argument_group(title='Triton autotune policy')
     group.add_argument(
         '--triton-autotune-mode',

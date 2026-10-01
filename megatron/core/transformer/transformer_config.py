@@ -33,7 +33,6 @@ from megatron.core.transformer.enums import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.tuning import AutotunePolicy
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -1314,28 +1313,6 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # miscellaneous
     ####################
-    triton_autotune: Optional[AutotunePolicy] = None
-    """Configuration inputs for selecting Triton kernel launch parameters.
-
-    ``AutotunePolicy`` is an immutable settings object containing the selection
-    mode, module scope, table paths, and diagnostic options. Autotuning results
-    and runtime caches are stored separately; installation never writes them
-    into this field.
-
-    This field lets library callers configure kernel selection alongside
-    ``deterministic_mode`` without going through Megatron's training initializer.
-    A mapping, such as a parsed YAML section, is converted to ``AutotunePolicy``.
-    Construction applies the settings once the configuration has passed its own
-    validation, before model kernels run. They apply to the whole process, so
-    models in one process share the effective policy. With no explicit policy,
-    deterministic mode enables pinning and ordinary execution keeps Triton's
-    autotuning; later default configs preserve a policy already configured in
-    the process.
-
-    See the configuration, precedence, and recording examples in
-    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tuning/README.md.
-    """
-
     clone_scatter_output_in_embedding: bool = True
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
     to facilitate garbage collection of input."""
@@ -1716,12 +1693,6 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
-
-        # Keep the kernel-selection policy typed even when a caller passes a mapping, such as
-        # a parsed YAML section. It is installed at the end of this method, after validation.
-        from megatron.core.tuning import coerce_policy
-
-        self.triton_autotune = coerce_policy(self.triton_autotune)
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -3915,15 +3886,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
-
-        # Library users may construct models without the training initializer, so apply
-        # their kernel-selection settings here, before the first kernel call. This runs
-        # last so that a configuration rejected by the checks above leaves the
-        # process-wide policy untouched. Installation is idempotent; runtime tables,
-        # choices, and caches stay in the tuning adapter, outside this configuration.
-        from megatron.core.tuning import install_from_config
-
-        install_from_config(self.triton_autotune, deterministic=self.deterministic_mode)
 
 
 @dataclass

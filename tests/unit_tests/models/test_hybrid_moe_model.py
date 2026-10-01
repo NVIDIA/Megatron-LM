@@ -342,7 +342,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tp_comm_split_rs": True,
     "tp_only_amax_red": False,
     "transformer_impl": "transformer_engine",
-    "triton_autotune": None,
     "use_cpu_initialization": None,
     "use_fused_mhc": False,
     "use_fused_weighted_squared_relu": False,

@@ -18,9 +18,10 @@ Typical use::
 
     install(AutotunePolicy(mode="pinned", verify_every=10))
 
-Model callers can instead pass ``triton_autotune=AutotunePolicy(...)`` to
-``TransformerConfig``. Without an explicit policy mode, recording and model or
-PyTorch deterministic settings determine the mode.
+Megatron's training initializer installs the policy built from the
+``--triton-autotune-*`` arguments, or the ``triton_autotune`` YAML section,
+before any kernel runs. Without an explicit mode, a recording path, the
+``deterministic`` argument or PyTorch's deterministic flag determines it.
 
 Recording a table for a new architecture::
 
@@ -39,13 +40,11 @@ from megatron.core.tuning.interception import (
     choice_digest,
     choice_log,
     install,
-    install_from_config,
     maybe_verify_choices,
     verify_choices,
 )
 from megatron.core.tuning.policy import (
     AutotunePolicy,
-    coerce_policy,
     set_deterministic_mode,
     use_deterministic_mode,
 )
@@ -57,9 +56,7 @@ __all__ = [
     "autotune_configs",
     "choice_digest",
     "choice_log",
-    "coerce_policy",
     "install",
-    "install_from_config",
     "maybe_verify_choices",
     "set_deterministic_mode",
     "use_deterministic_mode",

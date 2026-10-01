@@ -13,7 +13,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
-from megatron.core.tuning import AutotunePolicy, interception
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -23,45 +22,6 @@ first_layer = {
     "attention": {"no_op": False, "replace_with_linear": False, "num_query_groups": 8},
     "mlp": {"no_op": False, "replace_with_linear": False, "ffn_hidden_size": 14336},
 }
-
-
-@pytest.mark.parametrize("mode", ["auto", "pinned"])
-def test_layer_config_preserves_triton_autotune_policy(monkeypatch, mode):
-    """Deriving a layer config preserves and installs the caller's typed policy."""
-    monkeypatch.setattr(interception, "_explicit_policy", None)
-    monkeypatch.setattr(interception, "_configured_policy", None)
-    monkeypatch.setattr(interception, "_deterministic_requested", False)
-    monkeypatch.setattr(interception, "_policy", None)
-    installed = []
-
-    def capture_install(policy):
-        installed.append(policy)
-        return True
-
-    monkeypatch.setattr(interception, "_install", capture_install)
-    policy = AutotunePolicy(mode=mode, modules=("custom.kernels",), verify_every=7)
-    config = HeterogeneousTransformerConfig(
-        num_layers=1,
-        hidden_size=16,
-        num_attention_heads=4,
-        deterministic_mode=True,
-        triton_autotune=policy,
-        heterogeneous_layers_config_encoded_json=json.dumps(
-            {
-                "block_configs": [
-                    {"attention": {"num_query_groups": 2}, "mlp": {"ffn_hidden_size": 32}}
-                ]
-            }
-        ),
-    )
-
-    layer_config = config.get_config_for_layer(1)
-
-    assert config.triton_autotune is policy
-    assert layer_config.triton_autotune is policy
-    assert layer_config.num_query_groups == 2
-    assert layer_config.ffn_hidden_size == 32
-    assert installed == [policy, policy]
 
 
 @pytest.fixture

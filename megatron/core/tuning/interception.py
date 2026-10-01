@@ -14,6 +14,7 @@ import atexit
 import json
 import logging
 import os
+from collections.abc import Mapping
 from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -26,13 +27,6 @@ logger = logging.getLogger(__name__)
 
 _installed = False
 _policy: AutotunePolicy | None = None
-# Unresolved inputs. install() supplies an explicit policy, which wins over the
-# policies framework configuration supplies through install_from_config().
-_explicit_policy: AutotunePolicy | None = None
-_configured_policy: AutotunePolicy | None = None
-# Once any component requests determinism, later components that leave the mode
-# to be derived keep pinning; only an explicitly configured mode overrides it.
-_deterministic_requested = False
 _tables: dict = {}
 # Keep each autotuner's live configs (and hooks) separate, even for equal names.
 _selected_configs: WeakKeyDictionary = WeakKeyDictionary()
@@ -213,57 +207,23 @@ def maybe_verify_choices(iteration: int, group=None) -> bool | None:
     return verify_choices(group=group)
 
 
-def install(policy: AutotunePolicy | None = None) -> bool:
-    """Apply a process-wide policy that takes precedence over framework configuration.
+def install(policy: AutotunePolicy | Mapping | None = None, *, deterministic: bool = False) -> bool:
+    """Apply ``policy`` to the whole process, replacing the previous one.
 
-    Install once during initialization, before kernels execute. The policy wins
-    over policies supplied through ``install_from_config``; ``install(None)``
-    withdraws it. An omitted ``mode`` is still derived from recording and
-    determinism settings, including deterministic requests made by later
-    framework configuration. Repeated calls reuse the same adapter rather than
-    nesting patches.
+    Call during initialization, before kernels run. Megatron's training
+    initializer does this from the ``--triton-autotune-*`` arguments; library
+    callers that build models directly call it themselves. ``None`` applies the
+    default policy, and a mapping is converted. An omitted ``mode`` is derived:
+    a recording path selects ``record``, ``deterministic`` or PyTorch's
+    deterministic flag selects ``pinned``, and anything else ``auto``. A policy
+    that fails to install, such as one whose recording path is not writable,
+    leaves the previous one in place. Repeated calls reuse the same adapter
+    rather than nesting patches.
+
+    Returns whether the adapter is installed.
     """
-    global _explicit_policy, _deterministic_requested
-
-    policy = coerce_policy(policy)
-    installed, _deterministic_requested = _apply(
-        policy, _configured_policy, _deterministic_requested
-    )
-    _explicit_policy = policy
-    return installed
-
-
-def install_from_config(
-    policy: AutotunePolicy | None = None, *, deterministic: bool = False
-) -> bool:
-    """Apply framework configuration, subordinate to an explicit :func:`install`.
-
-    A ``None`` policy keeps the policy configured earlier. ``deterministic`` is
-    sticky: a later component's default ``False`` does not undo another
-    component's request, and an explicitly configured mode still takes precedence.
-    """
-    global _configured_policy, _deterministic_requested
-
-    # Validate before touching process-wide state, so a rejected value leaves it as it was.
-    policy = coerce_policy(policy)
-    configured = _configured_policy if policy is None else policy
-    installed, _deterministic_requested = _apply(
-        _explicit_policy, configured, _deterministic_requested or deterministic
-    )
-    _configured_policy = configured
-    return installed
-
-
-def _apply(explicit, configured, deterministic: bool) -> tuple[bool, bool]:
-    """Install the effective policy; return (installed, deterministic still requested).
-
-    Callers commit their inputs only after this returns, so a policy that fails to
-    install leaves the previous inputs in place.
-    """
-    source = explicit or configured or AutotunePolicy()
-    resolved = source.resolve(deterministic=deterministic)
-    installed = _install(resolved)
-    return installed, deterministic or (source.mode is None and resolved.mode == "pinned")
+    policy = coerce_policy(policy) or AutotunePolicy()
+    return _install(policy.resolve(deterministic=deterministic))
 
 
 def _reset_runtime_state() -> None:
@@ -406,7 +366,6 @@ __all__ = [
     "choice_digest",
     "choice_log",
     "install",
-    "install_from_config",
     "maybe_verify_choices",
     "verify_choices",
 ]

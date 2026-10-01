@@ -5,77 +5,56 @@ ranks or cold runs. Those tilings can change floating-point reduction order.
 Pinning chooses a configuration without benchmarking; it does not establish
 determinism inside the kernel or across the whole training job.
 
-## Configure through Python or training arguments
+## Configure through training arguments or Python
 
 `AutotunePolicy` is an immutable configuration object. It holds user-supplied
 settings such as selection mode, module scope, table paths, and verification
-cadence. Library callers pass these settings through `TransformerConfig`:
+cadence. Installing it applies the settings to the whole process, so it is
+installed once, during initialization, before any Triton kernel runs.
 
-```python
-from megatron.core.transformer import TransformerConfig
-from megatron.core.tuning import AutotunePolicy
-
-config = TransformerConfig(
-    num_layers=2,
-    hidden_size=128,
-    num_attention_heads=4,
-    deterministic_mode=True,
-    triton_autotune=AutotunePolicy(
-        table_path=("/path/to/tables",),
-        on_miss="error",
-        verify_every=10,
-        verify_strict=True,
-    ),
-)
-```
-
-`TransformerConfig.triton_autotune` exposes kernel-selection settings alongside
-`deterministic_mode` to library callers, including applications that do not use
-Megatron's training initializer. Constructing the config applies these settings
-before the model executes its kernels.
-
-Installation reads the settings and resolves an omitted mode into a separate
-policy value. It does not modify the supplied `AutotunePolicy` or store results
-in `TransformerConfig`. The runtime adapter in `interception.py` separately
-owns loaded tables, selected-config caches, recorded winners, and diagnostics.
-For example, `table_path` specifies where to read a table; the table's entries
-are loaded into runtime state when a pinned kernel first executes.
-
-Standalone kernel callers can instead call `install(AutotunePolicy(...))` before
-launching kernels. An explicit `install(policy)` takes precedence over the
-policies framework configuration supplies, and `install(None)` withdraws it.
-Framework initialization calls `install_from_config()` from
-`initialize_megatron` and at the end of `TransformerConfig.__post_init__`, so a
-configuration rejected by its own validation leaves the process-wide policy
-unchanged; a mapping is converted to `AutotunePolicy` and any other type is
-rejected first. A policy that fails to install, such as one whose recording path
-is not writable, also leaves the previous policy in place. Installation does not
-query CUDA. Architecture tables load on the first pinned kernel invocation.
-
-The policy is process-wide. A later component without a policy preserves the
-configured policy, and its default `deterministic_mode=False` does not undo an
-earlier request for pinning. A policy that omits `mode`, including an explicitly
-installed one, keeps deriving it: a deterministic request made before or after
-installation selects `pinned`. An explicitly set mode takes precedence.
-Changing the effective policy clears selected configurations, tables, and
-diagnostics. The adapter does not add thread-safety to Triton's mutable state.
-
-Training accepts the corresponding `--triton-autotune-*` arguments. Legacy
-`--yaml-cfg` users can put the policy under `language_model.triton_autotune`:
+Training builds the policy from the `--triton-autotune-*` arguments while
+validating them, and `initialize_megatron` installs it right after enabling
+batch-invariant mode, before distributed initialization, so the kernel warm-up
+before model construction already runs under it. `--deterministic-mode` selects
+`pinned` for a policy that leaves `mode` unset. `--yaml-cfg` users put the policy
+in a top-level `triton_autotune` section:
 
 ```yaml
-language_model:
-  deterministic_mode: true
-  triton_autotune:
-    table_path: ["/path/to/tables"]
-    on_miss: error
-    verify_every: 10
-    verify_strict: true
+triton_autotune:
+  table_path: ["/path/to/tables"]
+  on_miss: error
+  verify_every: 10
+  verify_strict: true
 ```
 
 Autotune CLI arguments cannot be combined with `--yaml-cfg`; put the options in
-the YAML policy instead. Model configuration retains the nested policy for
-normal configuration serialization.
+the YAML section instead.
+
+Applications that build models without Megatron's training initializer call
+`install` themselves before launching kernels:
+
+```python
+from megatron.core.tuning import AutotunePolicy, install
+
+install(
+    AutotunePolicy(table_path=("/path/to/tables",), on_miss="error", verify_every=10),
+    deterministic=True,
+)
+```
+
+`install` replaces the previous policy, and `install()` restores the default. A
+mapping is converted to `AutotunePolicy` and any other type is rejected first. A
+policy that fails to install, such as one whose recording path is not writable,
+leaves the previous policy in place. Installation does not query CUDA, and
+architecture tables load on the first pinned kernel invocation. Changing the
+policy clears selected configurations, tables, and diagnostics. The adapter does
+not add thread-safety to Triton's mutable state.
+
+Installation resolves an omitted mode into a separate policy value and never
+modifies the supplied `AutotunePolicy`. The runtime adapter in `interception.py`
+owns loaded tables, selected-config caches, recorded winners, and diagnostics.
+For example, `table_path` specifies where to read a table; the table's entries
+are loaded into runtime state when a pinned kernel first executes.
 
 ## Selection and scope
 
@@ -138,7 +117,8 @@ later recover its discarded candidates.
 | `record` | Triton chooses normally and the adapter records winners. |
 
 An explicit mode wins. Otherwise, `record_path` selects `record`; otherwise,
-model or PyTorch deterministic mode selects `pinned`; ordinary execution uses
+the `deterministic` argument of `install` (`--deterministic-mode` in training)
+or PyTorch's deterministic flag selects `pinned`; ordinary execution uses
 `auto`. Recording intentionally permits benchmarking and requires a file prefix.
 `MAMBA_DETERMINISTIC` does not select `pinned`: it only controls the external
 `mamba_ssm` package, and the adapter logs a notice when it is set while the

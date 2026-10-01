@@ -194,8 +194,9 @@ class AutotunePolicy:
     def resolve(self, *, deterministic: bool = False) -> "AutotunePolicy":
         """Resolve an omitted mode, leaving explicit configuration unchanged.
 
-        A recording path implies ``record``. Otherwise, model/PyTorch
-        deterministic mode implies ``pinned``; ordinary execution uses ``auto``.
+        A recording path implies ``record``. Otherwise, ``deterministic`` or
+        PyTorch's deterministic flag implies ``pinned``; ordinary execution uses
+        ``auto``.
         """
         if self.mode is not None:
             return self
@@ -229,5 +230,5 @@ def coerce_policy(value) -> AutotunePolicy | None:
     if isinstance(value, Mapping):
         return AutotunePolicy.from_mapping(value)
     raise TypeError(
-        f"triton_autotune must be an AutotunePolicy or a mapping, got {type(value).__name__}"
+        f"An autotune policy must be an AutotunePolicy or a mapping, got {type(value).__name__}"
     )

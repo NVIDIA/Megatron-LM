@@ -464,7 +464,6 @@ def core_transformer_config_from_args(args, config_class=None):
     if wide_residual is not None or 'wide_residual' not in kw_args:
         kw_args['wide_residual'] = wide_residual
 
-    kw_args['triton_autotune'] = _triton_autotune_config_from_args(args)
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."

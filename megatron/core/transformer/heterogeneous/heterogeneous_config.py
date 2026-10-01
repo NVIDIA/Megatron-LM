@@ -255,8 +255,6 @@ class HeterogeneousTransformerConfig(TransformerConfig):
             keys_to_update['ffn_hidden_size'] = block_config.mlp.ffn_hidden_size
 
         transformer_config_dict = asdict(self)
-        # asdict recursively converts nested dataclasses; keep this immutable policy typed.
-        transformer_config_dict['triton_autotune'] = self.triton_autotune
 
         # remove keys that are not in TransformerConfig
         transformer_config_field_names = {f.name for f in fields(TransformerConfig)}
