@@ -2,9 +2,8 @@
 
 """MIMO provider pairing a hybrid language model with a 2D-RoPE ViT and an MLP projector.
 
-The ViT follows the Pixtral design: RMSNorm, gated SiLU MLP, no biases, interleaved 2D RoPE,
-a pre-transformer norm, and a 2x2 patch merger, followed by a two-layer GELU MLP projector to
-the language hidden size. Its sizes come from the --mimo-vision-* arguments.
+The ViT architecture comes entirely from the --mimo-vision-* arguments; unset choices fall back
+to the TransformerConfig and ViTModel defaults rather than to the language model's settings.
 """
 
 from __future__ import annotations
@@ -17,7 +16,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from examples.mimo.model_providers import MimoProvider
-from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+from examples.mimo.model_providers.nemotron_moe_vlm import (
+    _nemotron_bridge_recv_shape,
+    language_model_spec,
+)
 from examples.mimo.model_providers.radio_encoder import (
     _base_config,
     _disable_gtp,
@@ -43,8 +45,6 @@ if TYPE_CHECKING:
     from examples.mimo.training.topology import HeteroTopology
 
 ROPE2D_VIT_VLM_MODEL_PROVIDER = "rope2d-vit-vlm"
-# The ViT merges 2x2 patches into one token before the projection.
-_SPATIAL_MERGE_SIZE = 2
 _REQUIRED_VISION_ARGS = (
     "mimo_vision_num_layers",
     "mimo_vision_hidden_size",
@@ -58,14 +58,113 @@ def _unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
     return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
 
+_PROJECTOR_ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "fast_gelu": _unfused_fast_gelu}
+
+
+def add_rope2d_vit_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register the --mimo-vision-* architecture args of --model-provider rope2d-vit-vlm."""
+    group = parser.add_argument_group("rope2d-vit-vlm vision encoder")
+    group.add_argument("--mimo-vision-num-layers", type=int, default=None, help="ViT layers.")
+    group.add_argument("--mimo-vision-hidden-size", type=int, default=None, help="ViT width.")
+    group.add_argument(
+        "--mimo-vision-ffn-hidden-size", type=int, default=None, help="ViT MLP hidden size."
+    )
+    group.add_argument(
+        "--mimo-vision-num-attention-heads", type=int, default=None, help="ViT attention heads."
+    )
+    group.add_argument(
+        "--mimo-vision-num-query-groups",
+        type=int,
+        default=None,
+        help="ViT key/value head groups. Defaults to the number of attention heads.",
+    )
+    group.add_argument(
+        "--mimo-vision-kv-channels",
+        type=int,
+        default=None,
+        help="ViT attention head dim. Defaults to hidden size / attention heads.",
+    )
+    group.add_argument(
+        "--mimo-vision-normalization",
+        choices=["LayerNorm", "RMSNorm"],
+        default="LayerNorm",
+        help="ViT normalization layer.",
+    )
+    group.add_argument(
+        "--mimo-vision-norm-epsilon", type=float, default=1e-5, help="ViT normalization epsilon."
+    )
+    group.add_argument(
+        "--mimo-vision-swiglu",
+        action="store_true",
+        help="Use a gated SiLU MLP in the ViT instead of GELU.",
+    )
+    group.add_argument(
+        "--mimo-vision-disable-bias-linear",
+        action="store_true",
+        help="Disable biases in the ViT and projector linear layers.",
+    )
+    group.add_argument(
+        "--mimo-vision-add-qkv-bias", action="store_true", help="Add a bias to the ViT QKV layer."
+    )
+    group.add_argument(
+        "--mimo-vision-rotary-interleaved",
+        action="store_true",
+        help="Rotate interleaved channel pairs in the ViT 2D RoPE.",
+    )
+    group.add_argument(
+        "--mimo-vision-disable-ln-pre",
+        action="store_true",
+        help="Skip the ViT normalization before the first transformer layer.",
+    )
+    group.add_argument(
+        "--mimo-vision-spatial-merge-size",
+        type=int,
+        choices=[2],
+        default=None,
+        help=(
+            "Merge each 2x2 patch block into one token after the ViT. The example data pipeline "
+            "emits 1/4 as many image tokens only with --pixel-shuffle, so the two go together."
+        ),
+    )
+    group.add_argument(
+        "--mimo-vision-projector-activation",
+        choices=sorted(_PROJECTOR_ACTIVATIONS),
+        default="gelu",
+        help="Activation of the two-layer MLP projecting ViT features to the language model.",
+    )
+    group.add_argument(
+        "--mimo-vision-encoder-name",
+        type=str,
+        default="vision_encoder",
+        help=(
+            "Module name of the vision encoder. It is part of every vision weight key, so it "
+            "must match the name the checkpoint was saved with."
+        ),
+    )
+    return parser
+
+
 def _check_vision_args(args: argparse.Namespace) -> None:
     missing = [name for name in _REQUIRED_VISION_ARGS if getattr(args, name, None) is None]
     if missing:
         flags = ", ".join("--" + name.replace("_", "-") for name in missing)
         raise ValueError(f"rope2d-vit-vlm requires {flags}")
-    if args.mimo_vision_hidden_size % args.mimo_vision_num_attention_heads:
+    heads = args.mimo_vision_num_attention_heads
+    if args.mimo_vision_kv_channels is None and args.mimo_vision_hidden_size % heads:
         raise ValueError(
-            "--mimo-vision-hidden-size must be divisible by --mimo-vision-num-attention-heads"
+            "--mimo-vision-hidden-size must be divisible by --mimo-vision-num-attention-heads "
+            "unless --mimo-vision-kv-channels is set"
+        )
+    if heads % (args.mimo_vision_num_query_groups or heads):
+        raise ValueError(
+            "--mimo-vision-num-attention-heads must be divisible by --mimo-vision-num-query-groups"
+        )
+    if (args.mimo_vision_spatial_merge_size is not None) != bool(
+        getattr(args, "pixel_shuffle", False)
+    ):
+        raise ValueError(
+            "--mimo-vision-spatial-merge-size and --pixel-shuffle must be set together so the "
+            "image-token count matches the merged ViT output"
         )
 
 
@@ -103,24 +202,27 @@ def _finalize_tower_config(config: TransformerConfig, args, tp_size: int, pp_siz
     config.sequence_parallel = False
 
 
-def rope2d_vision_config(
-    args: argparse.Namespace, tp_size: int, pp_size: int
-) -> TransformerConfig:
-    """Build the ViT TransformerConfig from the --mimo-vision-* sizes."""
+def rope2d_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) -> TransformerConfig:
+    """Build the ViT TransformerConfig from the --mimo-vision-* arguments."""
+    heads = args.mimo_vision_num_attention_heads
     config = deepcopy(_base_config(args))
     config.num_layers = args.mimo_vision_num_layers
     config.hidden_size = args.mimo_vision_hidden_size
     config.ffn_hidden_size = args.mimo_vision_ffn_hidden_size
-    config.num_attention_heads = args.mimo_vision_num_attention_heads
-    config.num_query_groups = args.mimo_vision_num_attention_heads
-    config.kv_channels = args.mimo_vision_hidden_size // args.mimo_vision_num_attention_heads
-    config.normalization = "RMSNorm"
-    config.layernorm_epsilon = 1.0e-5
-    config.activation_func = torch.nn.functional.silu
-    config.gated_linear_unit = True
-    config.add_bias_linear = False
-    config.add_qkv_bias = False
-    config.rotary_interleaved = True
+    config.num_attention_heads = heads
+    config.num_query_groups = args.mimo_vision_num_query_groups or heads
+    config.kv_channels = args.mimo_vision_kv_channels or args.mimo_vision_hidden_size // heads
+    config.normalization = args.mimo_vision_normalization
+    config.layernorm_epsilon = args.mimo_vision_norm_epsilon
+    if args.mimo_vision_swiglu:
+        config.activation_func = torch.nn.functional.silu
+        config.gated_linear_unit = True
+    else:
+        config.activation_func = torch.nn.functional.gelu
+        config.gated_linear_unit = False
+    config.add_bias_linear = not args.mimo_vision_disable_bias_linear
+    config.add_qkv_bias = args.mimo_vision_add_qkv_bias
+    config.rotary_interleaved = args.mimo_vision_rotary_interleaved
     config.qk_layernorm = False
     config.layernorm_zero_centered_gamma = False
     config.hidden_dropout = 0.0
@@ -139,17 +241,17 @@ def rope2d_vision_config(
 
 
 def rope2d_projection_config(args: argparse.Namespace, tp_size: int) -> TransformerConfig:
-    """Build W2(FastGELU(W1(z))) with both hidden widths matching the language model."""
+    """Build W2(act(W1(z))) with both hidden widths matching the language model."""
     config = deepcopy(_base_config(args))
     config.num_layers = 1
     config.hidden_size = int(args.hidden_size)
     config.ffn_hidden_size = int(args.hidden_size)
     config.num_attention_heads = 1
-    config.activation_func = _unfused_fast_gelu
+    config.activation_func = _PROJECTOR_ACTIVATIONS[args.mimo_vision_projector_activation]
     config.gated_linear_unit = False
     config.bias_activation_fusion = False
     config.bias_dropout_fusion = False
-    config.add_bias_linear = False
+    config.add_bias_linear = not args.mimo_vision_disable_bias_linear
     _finalize_tower_config(config, args, tp_size, 1)
     return config
 
@@ -183,10 +285,10 @@ def rope2d_vision_submodules_spec(
             "img_w": args.img_w,
             "add_class_token": False,
             "class_token_len": 0,
-            "ln_pre": True,
+            "ln_pre": not args.mimo_vision_disable_ln_pre,
             "pos_emb_type": "rope2d",
-            "use_merger": True,
-            "spatial_merge_size": _SPATIAL_MERGE_SIZE,
+            "use_merger": args.mimo_vision_spatial_merge_size is not None,
+            "spatial_merge_size": args.mimo_vision_spatial_merge_size or 2,
             "pg_collection": pg_collection,
         },
     )
@@ -210,11 +312,6 @@ def rope2d_vision_submodules_spec(
             "input_projections": [projection],
         },
     )
-
-
-def _bridge_recv_shape(batch: dict, encoder_name: str, hidden_size: int) -> tuple[int, int]:
-    """Derive the local projected-vision receive shape from precomputed token indices."""
-    return batch["modality_token_indices"][encoder_name].numel(), hidden_size
 
 
 def build_rope2d_vit_vlm_communicator(
@@ -241,8 +338,8 @@ def build_rope2d_vit_vlm_communicator(
         bridge_recv_shape_fns=(
             {
                 encoder_name: partial(
-                    _bridge_recv_shape,
-                    encoder_name=encoder_name,
+                    _nemotron_bridge_recv_shape,
+                    image_token_id=int(args.image_token_id),
                     hidden_size=int(language_config.hidden_size),
                 )
             }
@@ -253,7 +350,7 @@ def build_rope2d_vit_vlm_communicator(
 
 
 def rope2d_vit_vlm_provider(args: argparse.Namespace) -> MimoProvider:
-    """Return the provider for the ViT sized by the --mimo-vision-* arguments."""
+    """Return the provider for the ViT described by the --mimo-vision-* arguments."""
     _check_vision_args(args)
     name = args.mimo_vision_encoder_name
     return MimoProvider(

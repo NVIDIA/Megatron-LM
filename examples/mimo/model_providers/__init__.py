@@ -22,7 +22,7 @@ class MimoProvider:
     special_token_ids: ``(args) -> {module_name: token_id}``.
     build_communicator: ``(args, topology) -> MultiModulePipelineCommunicator``.
 
-    Providers are built by (args) -> MimoProvider factories registered in MODEL_PROVIDERS.
+    Providers are built by args -> MimoProvider factories registered in MODEL_PROVIDERS.
     """
 
     encoder_module_names: Sequence[str]

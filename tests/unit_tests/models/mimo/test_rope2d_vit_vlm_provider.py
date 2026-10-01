@@ -17,6 +17,7 @@ from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAM
 from examples.mimo.model_providers.rope2d_vit_vlm import (
     ROPE2D_VIT_VLM_MODEL_PROVIDER,
     Rope2dViTModel,
+    add_rope2d_vit_args,
     build_rope2d_vit_vlm_communicator,
 )
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -35,8 +36,28 @@ VISION_SIZES = {
 }
 
 
+# Every architecture choice set away from its default.
+NON_DEFAULT_ARCH = {
+    "mimo_vision_num_query_groups": 2,
+    "mimo_vision_kv_channels": 32,
+    "mimo_vision_normalization": "RMSNorm",
+    "mimo_vision_norm_epsilon": 1e-6,
+    "mimo_vision_swiglu": True,
+    "mimo_vision_disable_bias_linear": True,
+    "mimo_vision_add_qkv_bias": True,
+    "mimo_vision_rotary_interleaved": True,
+    "mimo_vision_disable_ln_pre": True,
+    "mimo_vision_spatial_merge_size": 2,
+    "pixel_shuffle": True,
+    "mimo_vision_projector_activation": "fast_gelu",
+}
+
+
 def _provider_args(**overrides):
+    parser = argparse.ArgumentParser()
+    add_rope2d_vit_args(parser)
     values = {
+        **vars(parser.parse_args([])),
         "bf16": True,
         "fp16": False,
         "hidden_size": LANGUAGE_HIDDEN_SIZE,
@@ -44,6 +65,7 @@ def _provider_args(**overrides):
         "img_h": 224,
         "img_w": 224,
         "patch_dim": 16,
+        "pixel_shuffle": False,
         "model_provider": ROPE2D_VIT_VLM_MODEL_PROVIDER,
         "mimo_vision_encoder_name": ENCODER_NAME,
         **VISION_SIZES,
@@ -91,21 +113,24 @@ def _encoder_spec(monkeypatch, **arg_overrides):
     return provider, args, provider.encoder_specs[ENCODER_NAME](args, None, None)
 
 
+def _built_configs(monkeypatch, **arg_overrides):
+    provider, args, spec = _encoder_spec(monkeypatch, **arg_overrides)
+    encoder = spec.submodules["encoders"][ENCODER_NAME]
+    (projection,) = spec.submodules["input_projections"]
+    return provider, args, encoder, projection
+
+
 @pytest.mark.parametrize(
     ("encoder_backend", "encoder_flash_version"),
     ((None, None), (AttnBackend.flash, 4), (AttnBackend.fused, None)),
 )
-def test_vision_tower_and_projector(monkeypatch, encoder_backend, encoder_flash_version):
-    from examples.mimo.model_providers import rope2d_vit_vlm
-
-    provider, args, spec = _encoder_spec(
+def test_vision_tower_and_projector_defaults(monkeypatch, encoder_backend, encoder_flash_version):
+    provider, args, encoder, projection = _built_configs(
         monkeypatch,
         mimo_vision_encoder_attention_backend=encoder_backend,
         mimo_vision_encoder_flash_attention_version=encoder_flash_version,
     )
-    encoder = spec.submodules["encoders"][ENCODER_NAME]
     vision_config = encoder.params["transformer_config"]
-    (projection,) = spec.submodules["input_projections"]
     projection_config = projection.params["config"]
 
     assert provider.encoder_module_names == (ENCODER_NAME,)
@@ -118,23 +143,23 @@ def test_vision_tower_and_projector(monkeypatch, encoder_backend, encoder_flash_
         vision_config.ffn_hidden_size,
         vision_config.num_attention_heads,
     ) == tuple(VISION_SIZES.values())
-    # MHA with the head dim derived from the hidden size.
+    # Unset choices use TransformerConfig/ViTModel defaults, not the language model's settings.
     assert vision_config.num_query_groups == 4
     assert vision_config.kv_channels == 16
-    assert vision_config.normalization == "RMSNorm"
-    assert vision_config.activation_func is torch.nn.functional.silu
-    assert vision_config.gated_linear_unit is True
-    assert vision_config.add_bias_linear is False
+    assert vision_config.normalization == "LayerNorm"
+    assert vision_config.layernorm_epsilon == 1e-5
+    assert vision_config.activation_func is torch.nn.functional.gelu
+    assert vision_config.gated_linear_unit is False
+    assert vision_config.add_bias_linear is True
     assert vision_config.add_qkv_bias is False
-    assert vision_config.rotary_interleaved is True
+    assert vision_config.rotary_interleaved is False
     assert vision_config.attention_backend is (encoder_backend or AttnBackend.unfused)
     assert vision_config.flash_attention_version == (encoder_flash_version or 2)
     assert encoder.params["pos_emb_type"] == "rope2d"
     assert encoder.params["patch_dim"] == args.patch_dim
     assert encoder.params["add_class_token"] is False
     assert encoder.params["ln_pre"] is True
-    assert encoder.params["use_merger"] is True
-    assert encoder.params["spatial_merge_size"] == 2
+    assert encoder.params["use_merger"] is False
 
     # Two-layer MLP from the ViT width to the language hidden size.
     assert projection.module is MultimodalProjector
@@ -142,18 +167,41 @@ def test_vision_tower_and_projector(monkeypatch, encoder_backend, encoder_flash_
     assert projection.params["input_size"] == VISION_SIZES["mimo_vision_hidden_size"]
     assert projection_config.hidden_size == LANGUAGE_HIDDEN_SIZE
     assert projection_config.ffn_hidden_size == LANGUAGE_HIDDEN_SIZE
+    assert projection_config.activation_func is torch.nn.functional.gelu
+    assert projection_config.gated_linear_unit is False
+    assert projection_config.add_bias_linear is True
+    assert vision_config.context_parallel_size == 1
+    assert projection_config.context_parallel_size == 1
+    _assert_gtp_disabled(vision_config)
+    _assert_gtp_disabled(projection_config)
+
+
+def test_architecture_follows_args(monkeypatch):
+    from examples.mimo.model_providers import rope2d_vit_vlm
+
+    _, _, encoder, projection = _built_configs(monkeypatch, **NON_DEFAULT_ARCH)
+    vision_config = encoder.params["transformer_config"]
+    projection_config = projection.params["config"]
+
+    assert vision_config.num_query_groups == 2
+    assert vision_config.kv_channels == 32
+    assert vision_config.normalization == "RMSNorm"
+    assert vision_config.layernorm_epsilon == 1e-6
+    assert vision_config.activation_func is torch.nn.functional.silu
+    assert vision_config.gated_linear_unit is True
+    assert vision_config.add_bias_linear is False
+    assert vision_config.add_qkv_bias is True
+    assert vision_config.rotary_interleaved is True
+    assert encoder.params["ln_pre"] is False
+    assert encoder.params["use_merger"] is True
+    assert encoder.params["spatial_merge_size"] == 2
+    assert projection_config.add_bias_linear is False
     assert projection_config.activation_func is rope2d_vit_vlm._unfused_fast_gelu
     activation_input = torch.tensor([-2.0, -0.5, 0.0, 1.0, 3.0])
     torch.testing.assert_close(
         projection_config.activation_func(activation_input),
         torch.nn.functional.gelu(activation_input, approximate="tanh"),
     )
-    assert projection_config.gated_linear_unit is False
-    assert projection_config.add_bias_linear is False
-    assert vision_config.context_parallel_size == 1
-    assert projection_config.context_parallel_size == 1
-    _assert_gtp_disabled(vision_config)
-    _assert_gtp_disabled(projection_config)
 
 
 @pytest.mark.parametrize("missing", sorted(VISION_SIZES))
@@ -166,6 +214,23 @@ def test_provider_requires_vision_sizes(missing):
 def test_rejects_heads_that_do_not_divide_hidden_size():
     with pytest.raises(ValueError, match="divisible"):
         resolve_provider(_provider_args(mimo_vision_num_attention_heads=5))
+    # An explicit head dim lifts the requirement.
+    resolve_provider(_provider_args(mimo_vision_num_attention_heads=5, mimo_vision_kv_channels=8))
+
+
+def test_rejects_query_groups_that_do_not_divide_heads():
+    with pytest.raises(ValueError, match="num-query-groups"):
+        resolve_provider(_provider_args(mimo_vision_num_query_groups=3))
+
+
+@pytest.mark.parametrize(
+    ("merge_size", "pixel_shuffle"), [(2, False), (None, True)], ids=["merge-only", "shuffle-only"]
+)
+def test_merger_and_pixel_shuffle_go_together(merge_size, pixel_shuffle):
+    with pytest.raises(ValueError, match="--pixel-shuffle"):
+        resolve_provider(
+            _provider_args(mimo_vision_spatial_merge_size=merge_size, pixel_shuffle=pixel_shuffle)
+        )
 
 
 def test_rejects_projection_on_language_ranks(monkeypatch):
@@ -226,9 +291,7 @@ def test_build_communicator_wires_bridge_contract(monkeypatch, skip_shape_exchan
     captured = {}
     communicator = object()
     topology = SimpleNamespace(grids={ENCODER_NAME: object(), MIMO_LANGUAGE_MODULE_KEY: object()})
-    language_config = SimpleNamespace(
-        hidden_size=LANGUAGE_HIDDEN_SIZE, params_dtype=torch.bfloat16
-    )
+    language_config = SimpleNamespace(hidden_size=LANGUAGE_HIDDEN_SIZE, params_dtype=torch.bfloat16)
     monkeypatch.setattr(
         rope2d_vit_vlm,
         "language_model_spec",
@@ -243,13 +306,13 @@ def test_build_communicator_wires_bridge_contract(monkeypatch, skip_shape_exchan
 
     args = _provider_args(mimo_bridge_skip_shape_exchange=skip_shape_exchange)
     assert (
-        build_rope2d_vit_vlm_communicator(args, topology, encoder_name=ENCODER_NAME)
-        is communicator
+        build_rope2d_vit_vlm_communicator(args, topology, encoder_name=ENCODER_NAME) is communicator
     )
     assert captured["bridge_comm_dtypes"] == {ENCODER_NAME: torch.bfloat16}
     shape_fns = captured["bridge_recv_shape_fns"]
     if skip_shape_exchange:
-        batch = {"modality_token_indices": {ENCODER_NAME: torch.tensor([2, 5, 9])}}
+        # A real batch carries only input_ids; image tokens there size the receive buffer.
+        batch = {"input_ids": torch.tensor([[1, 10, 10, 2], [10, 3, 4, 5]])}
         assert shape_fns[ENCODER_NAME](batch) == (3, LANGUAGE_HIDDEN_SIZE)
     else:
         assert shape_fns is None
@@ -273,6 +336,9 @@ def test_radio_provider_contract_remains_unchanged():
             3,
             "wide_residual_gated_delta_product_stack_spec",
         ),
+        # Aliases resolve to their canonical spec before taking the wide-residual variant.
+        ("gdp_stack_spec", 3, "wide_residual_gated_delta_product_stack_spec"),
+        ("mamba_stack_spec", 3, "wide_residual_hybrid_stack_spec"),
     ],
 )
 def test_language_stack_spec_follows_spec_arg(spec_name, wide_residual, expected_name):
@@ -286,6 +352,24 @@ def test_language_stack_spec_follows_spec_arg(spec_name, wide_residual, expected
     specs = {**vars(mamba_layer_specs), **vars(hybrid_layer_specs)}
 
     assert _language_stack_spec(args, config) is specs[expected_name]
+
+
+def test_language_stack_spec_rejects_specs_without_wide_residual_variant(monkeypatch):
+    import sys
+    import types
+
+    from examples.mimo.model_providers.nemotron_moe_vlm import _language_stack_spec
+
+    custom_specs = types.ModuleType("custom_stack_specs")
+    custom_specs.custom_stack_spec = object()
+    monkeypatch.setitem(sys.modules, "custom_stack_specs", custom_specs)
+    args = SimpleNamespace(spec=["custom_stack_specs", "custom_stack_spec"])
+
+    assert _language_stack_spec(args, SimpleNamespace(wide_residual=None)) is (
+        custom_specs.custom_stack_spec
+    )
+    with pytest.raises(ValueError, match="no wide_residual_ variant"):
+        _language_stack_spec(args, SimpleNamespace(wide_residual=3))
 
 
 def test_model_provider_args():

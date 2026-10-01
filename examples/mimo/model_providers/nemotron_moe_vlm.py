@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 from copy import deepcopy
 from functools import partial
 from typing import TYPE_CHECKING, Optional
@@ -58,7 +59,11 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     ``arguments.py`` owns the ``TransformerConfig`` field flags and
     ``radio_encoder`` owns the RADIO-encoder knobs.
     """
+    # Imported lazily: rope2d_vit_vlm imports language_model_spec from this module.
+    from examples.mimo.model_providers.rope2d_vit_vlm import add_rope2d_vit_args
+
     add_radio_encoder_args(parser)
+    add_rope2d_vit_args(parser)
     provider = parser.add_argument_group("mimo model provider")
     provider.add_argument(
         "--model-provider",
@@ -89,39 +94,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
             "FlashAttention version requested by the vision encoder. Defaults to "
             "--flash-attention-version. Transformer Engine version selection is process-wide, "
             "so colocated encoder and language modules must use compatible settings."
-        ),
-    )
-    provider.add_argument(
-        "--mimo-vision-num-layers",
-        type=int,
-        default=None,
-        help="ViT transformer layers for --model-provider rope2d-vit-vlm.",
-    )
-    provider.add_argument(
-        "--mimo-vision-hidden-size",
-        type=int,
-        default=None,
-        help="ViT hidden size for --model-provider rope2d-vit-vlm.",
-    )
-    provider.add_argument(
-        "--mimo-vision-ffn-hidden-size",
-        type=int,
-        default=None,
-        help="ViT MLP hidden size for --model-provider rope2d-vit-vlm.",
-    )
-    provider.add_argument(
-        "--mimo-vision-num-attention-heads",
-        type=int,
-        default=None,
-        help="ViT attention heads for --model-provider rope2d-vit-vlm.",
-    )
-    provider.add_argument(
-        "--mimo-vision-encoder-name",
-        type=str,
-        default="vision_encoder",
-        help=(
-            "Module name of the rope2d-vit-vlm vision encoder. It is part of every vision weight "
-            "key, so it must match the name the checkpoint was saved with."
         ),
     )
     provider.add_argument(
@@ -261,16 +233,21 @@ def _language_stack_spec(args: argparse.Namespace, config: TransformerConfig) ->
 
     --spec selects the layer types, e.g. the gated-delta-product stack. With wide residuals the
     named spec's wide_residual_ variant is used, since wide-residual layers are built only from
-    wide-residual specs.
+    wide-residual specs. Aliases such as gdp_stack_spec resolve to their canonical spec first.
     """
     wide_residual = getattr(config, "wide_residual", None) is not None
     spec = getattr(args, "spec", None)
     if spec is None:
         return wide_residual_hybrid_stack_spec if wide_residual else mamba_stack_spec
     base_path, name = spec
-    if wide_residual and not name.startswith("wide_residual_"):
-        name = "wide_residual_" + name
-    return import_module((base_path, name))
+    stack_spec = import_module((base_path, name))
+    if not wide_residual or name.startswith("wide_residual_"):
+        return stack_spec
+    specs = vars(importlib.import_module(base_path))
+    for candidate, value in specs.items():
+        if value is stack_spec and "wide_residual_" + candidate in specs:
+            return specs["wide_residual_" + candidate]
+    raise ValueError(f"--spec {name} has no wide_residual_ variant in {base_path}")
 
 
 def language_model_spec(
