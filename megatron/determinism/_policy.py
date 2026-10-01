@@ -34,6 +34,10 @@ AUX_LOSS_FUSION_ARG = "moe_router_aux_loss_fusion"
 # Env-var defaults required for bit-exact reproducibility.
 DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
     "NCCL_ALGO": "Ring",
+    # NCCL EP's count-exchange path assigns expert slots with atomic counters.
+    # Scan mode preserves token order, and therefore expert wgrad reduction order.
+    # NCCL EP snapshots this setting when its group is created.
+    "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     # The legacy helper leaves caching unset. The complete startup API pins 0
@@ -73,7 +77,10 @@ ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset(
 #     other truthy spelling ("true", "yes") would silently read as opted out.
 #     Both settings are accepted. The complete startup API defaults to 0;
 #     the legacy environment helper leaves it unset. See the pairing rule below.
+#   - ``NCCL_EP_HT_EM_AG_SCAN_MODE``: require the canonical enabled value to
+#     preserve expert token order instead of using atomic slot assignment.
 ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
+    "NCCL_EP_HT_EM_AG_SCAN_MODE": frozenset({"1"}),
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": frozenset({"0"}),
     "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
     "TRITON_CACHE_AUTOTUNING": frozenset({"0", "1"}),
@@ -87,8 +94,8 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
       :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
-    * ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` / ``CUBLAS_WORKSPACE_CONFIG`` —
-      if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
+    * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
+      ``CUBLAS_WORKSPACE_CONFIG`` — if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
     * ``MAMBA_DETERMINISTIC`` / ``CAUSAL_CONV1D_DETERMINISTIC`` — if set
       (non-empty), must start with ``'1'``; unset auto-follows
       :func:`torch.are_deterministic_algorithms_enabled`.

@@ -73,6 +73,7 @@ Each variable may be set by the launcher or left unset. Startup validates all su
 | Variable | Accepted values (or unset) | Default filled if unset | Reason |
 |---|---|---|---|
 | `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}` | `Ring` | Retains the existing default; actual reduction order still depends on topology and communicator construction |
+| `NCCL_EP_HT_EM_AG_SCAN_MODE` | `1` | `1` | NCCL EP's count-exchange path otherwise assigns expert slots with atomic counters; scan mode preserves token order and therefore the expert weight-gradient reduction order. NCCL EP reads it when its group is created |
 | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | `0` | `0` | Forces Transformer Engine to use deterministic algorithms |
 | `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` or `:16:8` | `:4096:8` | Deterministic cuBLAS workspace (both sizes are reproducible per NVIDIA docs; `:4096:8` is faster, `:16:8` uses less memory) |
 | `TRITON_CACHE_AUTOTUNING` | `0` or `1` | `0` (complete startup API); unset (legacy helper) | Cached autotuning is opt-in. The default pins the cheapest config without a cache — see [Triton autotuning](#triton-autotuning) |
