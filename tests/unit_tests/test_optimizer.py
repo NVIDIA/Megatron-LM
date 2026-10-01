@@ -1522,12 +1522,16 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
         )
 
-    # Test 6: An explicit collection can omit Gloo groups or supply its own.
+    # Test 6: Enabling Gloo requires the collection to supply its Gloo groups.
     pg_collection_complete.mp = None  # Explicitly set to None as allowed
     pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
 
+    with pytest.raises(ValueError, match="use_gloo_process_groups=True requires"):
+        ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg_collection_complete, model_chunks, use_gloo_process_groups=True
+        )
     groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-        pg_collection_complete, model_chunks, use_gloo_process_groups=True
+        pg_collection_complete, model_chunks, use_gloo_process_groups=False
     )
     assert groups['intra_dp_cp_group_gloo'] is None
     assert groups['intra_expt_dp_group_gloo'] is None
@@ -1563,18 +1567,23 @@ def test_get_megatron_optimizer_with_gloo_collection(mocker, create_gloo, use_gl
         'use_mpu_process_groups',
         side_effect=AssertionError('explicit collection must not read the global grid'),
     )
-    optimizer = get_megatron_optimizer(
-        OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True),
-        [model],
-        pg_collection=pg_collection,
-        use_gloo_process_groups=use_gloo,
-    )
-    assert len(optimizer.chained_optimizers) == 1
-    distributed_optimizer = optimizer.chained_optimizers[0]
-    assert isinstance(distributed_optimizer, DistributedOptimizer)
-    assert distributed_optimizer.data_parallel_group_gloo is (
-        pg_collection.intra_dp_cp_gloo if use_gloo else None
-    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+    if use_gloo and not create_gloo:
+        # Gloo was requested but the job has no Gloo groups: that is an error, not a downgrade.
+        with pytest.raises(ValueError, match="use_gloo_process_groups=True requires"):
+            get_megatron_optimizer(
+                optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+            )
+    else:
+        optimizer = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=use_gloo
+        )
+        assert len(optimizer.chained_optimizers) == 1
+        distributed_optimizer = optimizer.chained_optimizers[0]
+        assert isinstance(distributed_optimizer, DistributedOptimizer)
+        assert distributed_optimizer.data_parallel_group_gloo is (
+            pg_collection.intra_dp_cp_gloo if use_gloo else None
+        )
 
 
 def _chain_member(param_groups):

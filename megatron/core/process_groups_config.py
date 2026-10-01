@@ -557,11 +557,20 @@ class ProcessGroupCollection:
             gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
             expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
 
-            # Gloo groups come from the collection. They are optional: a job built with
-            # create_gloo_process_groups=False legitimately has none.
-            if use_gloo_process_groups:
-                intra_dp_cp_group_gloo = getattr(pg_collection, 'intra_dp_cp_gloo', None)
-                intra_expt_dp_group_gloo = getattr(pg_collection, 'intra_expt_dp_gloo', None)
+            # Gloo groups come from the collection. GTP_remat jobs build no Gloo groups (their
+            # optimizer uses DCP), so only those may enable Gloo without supplying the groups.
+            gtp_active = (gtp_remat_group is not None and gtp_remat_group.size() > 1) or (
+                expt_gtp_remat_group is not None and expt_gtp_remat_group.size() > 1
+            )
+            if use_gloo_process_groups and not gtp_active:
+                intra_dp_cp_group_gloo = vars(pg_collection).get('intra_dp_cp_gloo')
+                intra_expt_dp_group_gloo = vars(pg_collection).get('intra_expt_dp_gloo')
+                if intra_dp_cp_group_gloo is None or intra_expt_dp_group_gloo is None:
+                    raise ValueError(
+                        "use_gloo_process_groups=True requires the intra_dp_cp_gloo and "
+                        "intra_expt_dp_gloo groups in pg_collection. Build the job with Gloo "
+                        "process groups or pass use_gloo_process_groups=False."
+                    )
             else:
                 intra_dp_cp_group_gloo = None
                 intra_expt_dp_group_gloo = None
