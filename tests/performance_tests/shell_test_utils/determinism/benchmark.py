@@ -51,7 +51,7 @@ def mode_environment(parent: dict[str, str], mode: str) -> dict[str, str]:
         raise ValueError(f"Unknown mode: {mode}")
     environment = {key: value for key, value in parent.items() if key not in MODE_ENV}
     environment.update(DET_ENV if mode == "det" else DEFAULT_ENV)
-    environment.update(DETERMINISM_PERF_MODE=mode, PYTHONHASHSEED="0")
+    environment.update(PYTHONHASHSEED="0")
     environment.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     return environment
 
@@ -299,8 +299,22 @@ def main(argv: list[str] | None = None) -> int:
         command = [sys.executable, str(Path(__file__).with_name("run_kernel.py").resolve())]
         for option in ("kernel_case", "phase", "tokens", "hidden_size", "dtype", "warmup", "steps"):
             command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
+        command += ["--mode", "{mode}", "--log-dir", "{log_dir}"]
     elif not command:
-        command = [sys.executable, str(Path(__file__).with_name("run_training.py").resolve())]
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("run_training.py").resolve()),
+            "--recipe",
+            args.recipe,
+            "--gpus",
+            str(args.gpus),
+            "--mode",
+            "{mode}",
+            "--train-iters",
+            "{train_iters}",
+            "--log-dir",
+            "{log_dir}",
+        ]
     checkouts = {"head": Path.cwd()}
     if args.base_checkout:
         checkouts["base"] = args.base_checkout.resolve()
@@ -337,14 +351,13 @@ def main(argv: list[str] | None = None) -> int:
                 run_dir = output / f"pair-{pair}" / f"{label}-{mode}"
                 run_dir.mkdir(parents=True)
                 environment = mode_environment(dict(os.environ), mode)
-                environment.update(
-                    DETERMINISM_PERF_LOG_DIR=str(run_dir),
-                    DETERMINISM_PERF_TRAIN_ITERS=str(args.warmup + args.steps),
-                    DETERMINISM_PERF_RECIPE=args.recipe,
-                    DETERMINISM_PERF_GPUS=str(args.gpus),
-                    DETERMINISM_PERF_PROFILE="0",
-                    PYTHONPATH=str(checkouts[label]),
-                )
+                environment.update(PYTHONPATH=str(checkouts[label]))
+                values = {
+                    "{mode}": mode,
+                    "{log_dir}": str(run_dir),
+                    "{train_iters}": str(args.warmup + args.steps),
+                }
+                arm_command = [values.get(token, token) for token in command]
                 run = {
                     "pair": pair,
                     "revision_label": label,
@@ -369,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Benchmark pair {pair + 1}/{args.pairs}: {label}, {mode}", flush=True)
                 with (run_dir / "launcher.log").open("w") as log:
                     subprocess.run(
-                        command,
+                        arm_command,
                         cwd=checkouts[label],
                         env=environment,
                         stdout=log,

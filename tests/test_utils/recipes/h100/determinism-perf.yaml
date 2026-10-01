@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: "determinism_perf_{environment}_{platforms}"
   model: gpt
   nodes: 1
   build: mcore-pyt-{environment}
@@ -30,8 +30,6 @@ spec:
     unset RO_API_TOKEN
     set -euo pipefail
     cd /opt/megatron-lm
-    export DETERMINISM_PERF_RECIPE={perf_recipe}
-    export DETERMINISM_PERF_GPUS={gpus}
     bash tests/performance_tests/shell_test_utils/determinism/perf_breakdown.sh \
       "{assets_dir}/logs/perf-leaderboards" \
       "{assets_dir}/logs"
@@ -43,26 +41,7 @@ products:
   - test_case: [determinism_perf]
     products:
       - environment: [dev]
-        perf_recipe: [dense]
         scope: [mr-github]
-        platforms: [dgx_h100]
-        n_repeat: [1]
-        time_limit: [3600]
-  - test_case: [determinism_perf_moe]
-    products:
-      - environment: [dev]
-        perf_recipe: [moe]
-        scope: [L1]
-        cadence: [nightly]
-        platforms: [dgx_h100]
-        n_repeat: [1]
-        time_limit: [3600]
-  - test_case: [determinism_perf_hybrid]
-    products:
-      - environment: [dev]
-        perf_recipe: [hybrid]
-        scope: [L1]
-        cadence: [nightly]
         platforms: [dgx_h100]
         n_repeat: [1]
         time_limit: [3600]

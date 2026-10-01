@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 
 
@@ -82,11 +81,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--warmup", type=int, required=True)
     parser.add_argument("--steps", type=int, required=True)
+    parser.add_argument("--mode", choices=("det", "default"), required=True)
+    parser.add_argument("--log-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    measurement = vars(args)
+    mode = args.mode
+    log_dir = args.log_dir
+    measurement = {
+        key: value for key, value in vars(args).items() if key not in ("mode", "log_dir")
+    }
     import torch
 
-    mode = os.environ["DETERMINISM_PERF_MODE"]
     if (
         mode not in ("det", "default")
         or min(args.tokens, args.hidden_size, args.steps) < 1
@@ -133,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         result["samples_ms"] = measure(
             torch, lambda: function(*arguments), inputs, args.phase, args.warmup, args.steps
         )
-    path = Path(os.environ["DETERMINISM_PERF_LOG_DIR"]) / "kernel.json"
+    path = log_dir / "kernel.json"
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     temporary.replace(path)

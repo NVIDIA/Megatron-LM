@@ -4,11 +4,13 @@ orphan: true
 
 # Determinism performance measurements
 
-`perf_breakdown.sh` reports repeated **unprofiled** training timings; its
-uncalibrated CI pilot does not enforce performance budgets. Nsight is an
-optional separate diagnostic. JSON and Markdown artifacts retain all paired
-runs, per-step samples, revisions, GPU identifiers, driver/package versions,
-and effective mode settings. A timing pass does not establish determinism.
+`benchmark.py` reports repeated **unprofiled** training timings for a
+deterministic/default pair of runs. It runs only when invoked; the existing
+`determinism_perf` CI job (`perf_breakdown.sh`, an Nsight-profiled per-range
+breakdown with its own step-time check) is unchanged. JSON and Markdown
+artifacts retain all paired runs, per-step samples, revisions, GPU identifiers,
+driver/package versions, and effective mode settings. A timing pass does not
+establish determinism.
 
 ## Protocol
 
@@ -26,8 +28,8 @@ The report uses the median iteration time of each run, then ratios within each
 pair. A paired bootstrap interval describes run-to-run uncertainty. Fewer than
 three pairs or an interval that straddles the limit produces `inconclusive`
 (exit 2), not a pass. A confirmed regression or invalid/incomplete timing log
-exits 1. A valid pass exits 0. Three pairs are an initial CI budget, not a
-guarantee that rare noise is characterized; increase the count when calibrating.
+exits 1. A valid pass exits 0. Three pairs are a minimum, not a guarantee that
+rare noise is characterized; increase the count when calibrating.
 
 Training comparisons default to a 1.35 deterministic/default limit. The optional
 base-to-head comparison defaults to 1.05. Thresholds are configurable through
@@ -51,8 +53,9 @@ Presets are `dense`, `moe`, and `hybrid`, using BF16 mock-data training. The
 hybrid preset includes Mamba, attention, and MLP layers. Presets require an even
 GPU count because TP is 2; MoE requires a multiple of four for TP=2 and EP=2.
 Additional workloads can supply a launcher command
-after `--`; it must honor `DETERMINISM_PERF_MODE`, `DETERMINISM_PERF_LOG_DIR`, and
-`DETERMINISM_PERF_TRAIN_ITERS`, and emit the same iteration log contract.
+after `--`. The tokens `{mode}` (`det` or `default`), `{log_dir}` and
+`{train_iters}` are replaced for each arm; the command must write the same
+iteration log contract to that directory.
 
 To measure the PR against a base source checkout on the **same allocation**:
 
@@ -71,15 +74,11 @@ default/base default. This catches slowdowns shared by both execution modes.
 
 Outputs must use a fresh directory. Failed attempts are retained, never
 overwritten by a retry. Dirty source trees or unavailable GPU provenance yield
-an inconclusive result. Optional profiling through
-`DETERMINISM_PERF_PROFILE=1 bash .../perf_breakdown.sh OUT LOGS` runs afterward;
-the NVTX range table describes host annotations and must not be summed as GPU
-kernel time or used as the latency gate.
-
-The H100 dense row runs in L1 at every cadence, including the merge queue.
-The MoE/hybrid and GB200 rows run in L1 at nightly cadence; labels that bypass
-cadence also select them. The GPU presets and initial
-budgets require runtime validation before treating their reports as baselines.
+an inconclusive result. For attribution, `perf_breakdown.sh` produces the
+Nsight per-NVTX-range breakdown; the range table describes host annotations and
+must not be summed as GPU kernel time or used as a latency gate. The GPU presets
+and default limits need runtime validation on the target hardware before their
+reports are treated as baselines.
 
 ## Kernel leaderboard pilot
 
@@ -130,5 +129,5 @@ changed-kernel budgets remains separate from publishing measurements.
 
 ### Diagnose a timing difference
 
-Use the separate Nsight breakdown described above for attribution. Benchmark
-acceptance uses only unprofiled CUDA-event or training-step samples.
+Use the Nsight breakdown from `perf_breakdown.sh` for attribution. Benchmark
+results use only unprofiled CUDA-event or training-step samples.

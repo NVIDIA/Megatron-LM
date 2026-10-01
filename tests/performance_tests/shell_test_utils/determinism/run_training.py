@@ -4,17 +4,17 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
 
-def training_command(environment: dict[str, str]) -> list[str]:
+def training_command(
+    recipe: str, mode: str, gpus: int, train_iters: int, log_dir: str, profile: bool = False
+) -> list[str]:
     """Build identical model configurations for the two execution policies."""
-    recipe = environment.get("DETERMINISM_PERF_RECIPE", "dense")
-    mode = environment["DETERMINISM_PERF_MODE"]
-    if recipe not in ("dense", "moe", "hybrid") or mode not in ("det", "default", "nondet"):
+    if recipe not in ("dense", "moe", "hybrid") or mode not in ("det", "default"):
         raise ValueError("Unknown benchmark recipe or mode")
-    gpus = int(environment.get("DETERMINISM_PERF_GPUS", "8"))
     if gpus < 2 or gpus % 2:
         raise ValueError("These TP=2 recipes require a positive even GPU count")
     script = "pretrain_hybrid.py" if recipe == "hybrid" else "pretrain_gpt.py"
@@ -45,7 +45,7 @@ def training_command(environment: dict[str, str]) -> list[str]:
         "-m",
         "torch.distributed.run",
         "--log-dir",
-        environment["DETERMINISM_PERF_LOG_DIR"],
+        str(log_dir),
         "--tee",
         f"0:3,{gpus - 1}:3",
         "--redirects",
@@ -67,7 +67,7 @@ def training_command(environment: dict[str, str]) -> list[str]:
         "--global-batch-size",
         "16",
         "--train-iters",
-        environment.get("DETERMINISM_PERF_TRAIN_ITERS", "70"),
+        str(train_iters),
         "--lr",
         "1e-4",
         "--lr-decay-style",
@@ -111,17 +111,31 @@ def training_command(environment: dict[str, str]) -> list[str]:
     ]
     if mode == "det":
         command.append("--deterministic-mode")
-    if environment.get("DETERMINISM_PERF_PROFILE") == "1":
+    if profile:
         command.extend(
             ["--profile", "--nvtx-ranges", "--profile-step-start", "5", "--profile-step-end", "7"]
         )
     return command
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    """Replace this process with the training launch for one benchmark arm."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--recipe", choices=("dense", "moe", "hybrid"), default="dense")
+    parser.add_argument("--gpus", type=int, default=8)
+    parser.add_argument("--mode", choices=("det", "default"), required=True)
+    parser.add_argument("--train-iters", type=int, default=70)
+    parser.add_argument("--log-dir", required=True)
+    parser.add_argument("--profile", action="store_true", help="Add Nsight profiler ranges")
+    args = parser.parse_args(argv)
     from benchmark import mode_environment
 
-    mode = os.environ["DETERMINISM_PERF_MODE"]
-    environment = mode_environment(dict(os.environ), "default" if mode == "nondet" else mode)
-    argv = training_command(environment)
-    os.execve(argv[0], argv, environment)
+    environment = mode_environment(dict(os.environ), args.mode)
+    command = training_command(
+        args.recipe, args.mode, args.gpus, args.train_iters, args.log_dir, args.profile
+    )
+    os.execve(command[0], command, environment)
+
+
+if __name__ == "__main__":
+    main()

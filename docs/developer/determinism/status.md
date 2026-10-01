@@ -39,12 +39,11 @@ environment values.
     parallelism, and virtual pipeline parallelism
   - FP8 and FP4 recipes
   - Scheduling stressors to surface latent ordering races
-- **Performance measurement**
+- **Performance gate**
   (`tests/performance_tests/shell_test_utils/determinism/`): Runs a small
-  recipe in deterministic and default mode as alternating fresh-process pairs
-  and reports paired step-time ratios with bootstrap intervals. The CI job is
-  report-only until per-recipe budgets are calibrated; an optional Nsight
-  Systems run gives a per-range breakdown for diagnosis.
+  recipe in deterministic and default mode under Nsight Systems, reports a
+  per-range leaderboard, and fails when the deterministic step time exceeds the
+  documented threshold.
 - **End-to-end verification**: Compares full-precision training metrics across
   two independent runs (refer to the glossary's "Verification" note). The
   functional tests do the same against checked-in golden values: every

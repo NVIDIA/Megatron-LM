@@ -142,14 +142,8 @@ def test_shared_slowdown_is_detected_by_revision_comparison():
 
 @pytest.mark.parametrize("recipe", ["dense", "moe", "hybrid"])
 def test_training_arguments_differ_only_by_policy_flag(recipe):
-    environment = {
-        "DETERMINISM_PERF_RECIPE": recipe,
-        "DETERMINISM_PERF_LOG_DIR": "/tmp/logs",
-        "DETERMINISM_PERF_GPUS": "4",
-        "DETERMINISM_PERF_MODE": "default",
-    }
-    default = launcher.training_command(environment)
-    deterministic = launcher.training_command({**environment, "DETERMINISM_PERF_MODE": "det"})
+    default = launcher.training_command(recipe, "default", 4, 70, "/tmp/logs")
+    deterministic = launcher.training_command(recipe, "det", 4, 70, "/tmp/logs")
     assert deterministic == default + ["--deterministic-mode"]
     assert "--profile" not in default
     assert "--seed" in default
@@ -166,18 +160,15 @@ def test_subprocess_measurements_and_artifacts(tmp_path, monkeypatch, incomplete
     monkeypatch.setattr(benchmark, "_machine", lambda: {"gpus": ["test-only fixture"]})
     program = tmp_path / "fixture.py"
     program.write_text("""
-import json, os
+import json, os, sys
 from pathlib import Path
-root = Path(os.environ['DETERMINISM_PERF_LOG_DIR'])
+root, mode, count, incomplete = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
 (root / 'env.json').write_text(json.dumps(dict(os.environ)))
-timing = 12 if os.environ['DETERMINISM_PERF_MODE'] == 'det' else 10
-count = int(os.environ['DETERMINISM_PERF_TRAIN_ITERS'])
-if os.environ.get('FIXTURE_INCOMPLETE'):
+timing = 12 if mode == 'det' else 10
+if incomplete == 'incomplete':
     count -= 1
 (root / 'stdout.log').write_text(''.join(f'iteration {i}/ 4 | elapsed time per iteration (ms): {timing} |\\n' for i in range(1, count + 1)))
 """)
-    if incomplete:
-        monkeypatch.setenv("FIXTURE_INCOMPLETE", "1")
     output = tmp_path / "output"
     rc = benchmark.main(
         [
@@ -193,6 +184,10 @@ if os.environ.get('FIXTURE_INCOMPLETE'):
             "--",
             sys.executable,
             str(program),
+            "{log_dir}",
+            "{mode}",
+            "{train_iters}",
+            "incomplete" if incomplete else "complete",
         ]
     )
     report = json.loads((output / "benchmark.json").read_text())
@@ -304,10 +299,11 @@ from pathlib import Path
 options = dict(zip((arg[2:].replace('-', '_') for arg in sys.argv[1::2]), sys.argv[2::2]))
 for key in ('tokens', 'hidden_size', 'warmup', 'steps'):
     options[key] = int(options[key])
-mode = os.environ['DETERMINISM_PERF_MODE']
+mode = options.pop('mode')
+log_dir = Path(options.pop('log_dir'))
 result = dict(measurement=options, mode=mode, deterministic_algorithms=mode == 'det',
               samples_ms=[12.0 if mode == 'det' else 10.0] * options['steps'])
-(Path(os.environ['DETERMINISM_PERF_LOG_DIR']) / 'kernel.json').write_text(json.dumps(result))
+(log_dir / 'kernel.json').write_text(json.dumps(result))
 """)
     real_run = subprocess.run
     monkeypatch.setattr(

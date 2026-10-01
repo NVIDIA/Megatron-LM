@@ -29,4 +29,4 @@ This reference includes:
 The roadmap is tracked dynamically in
 [issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785).
 
-See [paired performance and leaderboard](performance.md) for measurement and CI rollout.
+See [paired performance and leaderboard](performance.md) for on-demand performance measurements.
