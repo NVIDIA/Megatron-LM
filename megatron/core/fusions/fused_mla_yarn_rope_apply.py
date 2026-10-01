@@ -195,6 +195,8 @@ def _mla_rope_fwd_inplace_kernel(
     else:
         x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
         x_right_off = x_left_off + emb_dim // 2
+        # The halves overwrite pairs that other threads of this program may not have loaded yet.
+        tl.debug_barrier()
         tl.store(Q + x_left_off, x_left, mask=mask)
         tl.store(Q + x_right_off, x_right, mask=mask)
 
@@ -314,6 +316,10 @@ def _mla_rope_bwd_kernel(
     x_1 = x_left * cos_left + x_right * sin_right
     x_2 = -x_left * sin_left + x_right * cos_right
 
+    if not REMOVE_INTERLEAVING:
+        # In place, the pairs overwrite halves that other threads of this program may not have
+        # loaded yet.
+        tl.debug_barrier()
     tl.store(DO_OUT + x_1_off, x_1, mask=mask)
     tl.store(DO_OUT + x_2_off, x_2, mask=mask)
 
