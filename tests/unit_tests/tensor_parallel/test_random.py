@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -184,6 +187,21 @@ def test_model_parallel_cuda_manual_seed():
     model_parallel_cuda_manual_seed(0, force_reset_rng=True)
     rng_tracker = get_cuda_rng_tracker()
     assert rng_tracker.get_states()['model-parallel-rng'] is not None
+    Utils.destroy_model_parallel()
+
+
+def test_expert_parallel_seed_differs_across_pipeline_ranks():
+    Utils.initialize_model_parallel(1, 1)
+    expert_states = []
+    # Ranks with the same pp_rank + ep_rank used to end up with the same expert seed.
+    for pp_rank, ep_rank in [(0, 1), (1, 0)]:
+        _set_random_seed(
+            123,
+            pp_group=SimpleNamespace(rank=lambda: pp_rank),
+            ep_group=SimpleNamespace(rank=lambda: ep_rank),
+        )
+        expert_states.append(get_cuda_rng_tracker().get_states()['expert-parallel-rng'])
+    assert not torch.equal(expert_states[0], expert_states[1])
     Utils.destroy_model_parallel()
 
 
