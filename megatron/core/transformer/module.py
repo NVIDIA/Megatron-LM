@@ -776,6 +776,13 @@ class GraphableMegatronModule(MegatronModule):
         """
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
+        if getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk" and not getattr(
+            self, 'is_cuda_graph_chunk_callable', False
+        ):
+            # The decoder block is the TE callable; its layers run their ordinary forward
+            # inside that outer capture instead of following the per-layer capture protocol.
+            return False
+
         return (
             self.config.cuda_graph_impl == "transformer_engine"
             and self.training

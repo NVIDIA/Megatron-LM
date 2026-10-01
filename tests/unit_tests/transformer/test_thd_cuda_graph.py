@@ -1242,8 +1242,10 @@ class TestDecomposeReconstruct:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_reconstruct_preserves_cu_tensors_and_uses_conservative_padding_flag(self):
-        """Reconstruction preserves cu tensors and uses a graph-static padding flag."""
+    @pytest.mark.parametrize("scope", ["layer", "block"])
+    def test_reconstruct_preserves_cu_tensors_and_uses_conservative_padding_flag(self, scope):
+        """Reconstruction preserves cu tensors and uses a graph-static padding flag — for a layer
+        callable and for the chunk-granularity block callable alike."""
         psp = _make_psp([100, 50, 30])
         orig = {
             k: getattr(psp, k).clone()
@@ -1254,7 +1256,10 @@ class TestDecomposeReconstruct:
                 'cu_seqlens_kv_padded',
             )
         }
-        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        if scope == "layer":
+            layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        else:
+            layer = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8).decoder
         # Use the non-default mode so losing it during reconstruction is observable.
         layer.config.cp_partition_mode = "contiguous"
         kw = {'packed_seq_params': psp, 'other': 'kept'}
@@ -1305,6 +1310,277 @@ class TestDecomposeReconstruct:
         assert set(kw.keys()) == keys
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
         assert set(kw.keys()) == keys
+
+
+def _build_chunk_gpt_model(
+    H, nh, nkv, ffn, max_seqlen, max_num_seqs, *, tp=1, sp=False, mtp_layers=0, vocab=128
+):
+    """GPTModel under the chunk-graph configuration of a packed-sequence (THD) training run."""
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_spec,
+        get_gpt_mtp_block_spec,
+    )
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=H,
+        num_attention_heads=nh,
+        num_query_groups=nkv,
+        ffn_hidden_size=ffn,
+        tensor_model_parallel_size=tp,
+        sequence_parallel=sp,
+        max_seqlen_per_dp_cp_rank=max_seqlen,
+        thd_max_packed_sequences=max_num_seqs,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        mtp_num_layers=mtp_layers or None,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_granularity="chunk",
+        cuda_graph_modules=[],
+        cuda_graph_dynamic_microbatches=True,
+        sequence_packing_scheduler="dp_balanced",
+        pad_packed_seq_alignment="max",
+        use_cpu_initialization=True,
+    )
+    layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    mtp_spec = (
+        get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True)
+        if mtp_layers
+        else None
+    )
+    model_parallel_cuda_manual_seed(42)
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=layer_spec,
+        vocab_size=vocab,
+        max_sequence_length=max_seqlen,
+        position_embedding_type="rope",
+        mtp_block_spec=mtp_spec,
+    ).cuda()
+
+
+@pytest.mark.internal
+class TestChunkStaticInputs:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_decoder_static_inputs(self):
+        block = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8).decoder
+
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        assert static_inputs["cu_seqlens_q"].shape == (9,)
+        assert static_inputs["cu_seqlens_kv_padded"].shape == (9,)
+        assert static_inputs["padding_mask"].shape == (1, 128)
+        assert not static_inputs["padding_mask"].any()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_postprocess_block_is_attached_and_excluded_from_state_dict(self):
+        model = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8)
+        block = model.postprocess_block
+        assert block is not None and block.post_process and not block.pre_process
+        assert block.output_layer is model.output_layer
+        assert not any(key.startswith('postprocess_block.') for key in model.state_dict())
+        assert not any(key.startswith('postprocess_block.') for key in model.sharded_state_dict())
+        # Loading the model's own state dict must not report the shared block parameters missing.
+        model.load_state_dict(model.state_dict(), strict=True)
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["labels"].shape == (1, 128)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        # Without MTP the post-process consumes neither the tokens nor the padding mask, and a
+        # last stage without MTP does not even receive tokens / position ids (a captured keyword
+        # that is None at replay would make the graphed callable raise).
+        assert "input_ids" not in static_inputs
+        assert "position_ids" not in static_inputs
+        assert "padding_mask" not in static_inputs
+
+
+def _thd_batch(seqlens, vocab, seed, capacity, max_num_seqs):
+    """One packed micro-batch padded to the static THD capacity exactly like the data pipeline
+    (``--pad-packed-seq-alignment max --thd-max-packed-sequences N``: tokens to ``capacity`` with a
+    dummy tail sequence, cu_seqlens to ``N + 1`` entries); identical on every rank (CPU seed)."""
+    total = sum(seqlens)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    tokens = torch.randint(0, vocab, (1, total + 1), generator=generator).cuda()
+    position_ids = torch.cat([torch.arange(length) for length in seqlens]).unsqueeze(0).cuda()
+    alignment, target_len, padded_num_seqs = get_thd_padding_kwargs(
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=capacity,
+        thd_max_packed_sequences=max_num_seqs,
+        cuda_graph_static=True,
+    )
+    input_ids, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+        pad_sequence_for_thd(
+            tokens[:, :-1].contiguous(),
+            tokens[:, 1:].contiguous(),
+            torch.ones(1, total, dtype=torch.float32, device="cuda"),
+            position_ids,
+            _make_psp(seqlens),
+            alignment=alignment,
+            target_len=target_len,
+            max_num_seqs=padded_num_seqs,
+        )
+    )
+    assert input_ids.shape == (1, capacity)
+    assert packed_seq_params.cu_seqlens_q.numel() == max_num_seqs + 1
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        position_ids=position_ids,
+        loss_mask=loss_mask,
+        padding_mask=padding_mask,
+        packed_seq_params=packed_seq_params,
+    )
+
+
+def _train_step(model, batch):
+    """Forward + backward without an optimizer step; returns (per-token loss, {name: grad})."""
+    for param in model.parameters():
+        # Caller-owned leaf-grad buffers: with a leaf grad of None, AccumulateGrad may adopt TE's
+        # recyclable static grad buffer instead of copying out of it.
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        else:
+            param.grad.zero_()
+    per_token_loss = model(
+        input_ids=batch["input_ids"],
+        position_ids=batch["position_ids"],
+        attention_mask=None,
+        labels=batch["labels"],
+        loss_mask=batch["loss_mask"],
+        padding_mask=batch["padding_mask"],
+        packed_seq_params=batch["packed_seq_params"],
+    )
+    # Under graphs the model returns a view of TE's recyclable static output, owned only until
+    # its backward: retain the values before crossing that boundary.
+    loss_values = per_token_loss.detach().float().clone()
+    loss = (per_token_loss.float() * batch["loss_mask"]).sum() / batch["loss_mask"].sum()
+    loss.backward()
+    grads = {
+        name: param.grad.detach().float().clone()
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    }
+    return loss_values, grads
+
+
+@pytest.mark.internal
+class TestChunkGraphRegression:
+    """Real chunk-graph capture and replay on a small packed-sequence GPT, checked against eager.
+
+    Guards the failure modes fixed during review: a captured kwarg missing at replay, the SP-scattered
+    padding mask reaching the post-process, the MTP-gated static inputs, and recompute or losses that
+    silently drift once graphs exist. Numerical comparisons: no dropout, no MoE routing randomness.
+    """
+
+    @_REQUIRES_TWO_RANKS
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("mtp_layers", [1, 0])
+    def test_thd_tp2_sp_mtp_capture_replay_matches_eager(self, monkeypatch, mtp_layers):
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator,
+        )
+        from megatron.core.tensor_parallel.random import initialize_rng_tracker
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        # The capture sizes its TE warm-up from the run's micro-batch count.
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=2,
+            micro_batch_size=1,
+            data_parallel_size=1,
+        )
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        helper = None
+        try:
+            tokens, max_num_seqs, vocab = 128, 4, 128
+            model = _build_chunk_gpt_model(
+                256,
+                4,
+                4,
+                512,
+                tokens,
+                max_num_seqs,
+                tp=2,
+                sp=True,
+                mtp_layers=mtp_layers,
+                vocab=vocab,
+            )
+            model.train()
+            # LM head + loss (+ MTP when present) are captured as the post-process callable.
+            assert model.postprocess_block is not None
+            assert model.mtp_process == bool(mtp_layers)
+            # The helper's post-capture reset calls the DDP wrapper's zero_grad_buffer(); this
+            # test drives the bare model and zeroes gradients itself in _train_step.
+            model.zero_grad_buffer = lambda: None
+
+            # Four packings under the static capacity and the bound on sequences (the padding
+            # tail becomes a dummy sequence, so at most max_num_seqs - 1 real sequences).
+            batches = [
+                _thd_batch(seqlens, vocab, seed, tokens, max_num_seqs)
+                for seed, seqlens in enumerate(([120], [60, 60], [32, 88], [16, 40, 60]))
+            ]
+
+            # Eager reference on the same weights (no optimizer step anywhere in this test).
+            reference = [_train_step(model, batch) for batch in batches]
+            for first, second in zip(reference, reference[1:]):
+                assert not torch.allclose(first[0], second[0]), "batches must differ"
+
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=tokens, micro_batch_size=1
+            )
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(model.decoder.cuda_graphs) > 0
+            assert len(model.postprocess_block.cuda_graphs) > 0
+
+            replays = []
+            original_replay = torch.cuda.CUDAGraph.replay
+
+            def counting_replay(graph, *args, **kwargs):
+                replays.append(graph)
+                return original_replay(graph, *args, **kwargs)
+
+            monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counting_replay)
+
+            # Two rounds in different orders: every replay must reflect the batch it was given.
+            for order in ((0, 1, 2, 3), (3, 1, 0, 2)):
+                for index in order:
+                    before = len(replays)
+                    per_token_loss, grads = _train_step(model, batches[index])
+                    # decoder forward + backward, post-process forward + backward
+                    assert len(replays) - before >= 4, (index, len(replays) - before)
+                    ref_loss, ref_grads = reference[index]
+                    torch.testing.assert_close(per_token_loss, ref_loss, rtol=1e-3, atol=1e-3)
+                    assert grads.keys() == ref_grads.keys()
+                    for name, ref_grad in ref_grads.items():
+                        error = (grads[name] - ref_grad).norm()
+                        assert error <= 2e-2 * ref_grad.norm() + 1e-6, (
+                            name,
+                            index,
+                            error.item(),
+                            ref_grad.norm().item(),
+                        )
+        finally:
+            torch.cuda.synchronize()
+            if helper is not None and helper.graphs_created():
+                helper.delete_cuda_graphs()
+            destroy_num_microbatches_calculator()
+            Utils.destroy_model_parallel()
 
 
 class TestStaticInputs:

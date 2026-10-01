@@ -866,9 +866,14 @@ class AbsorbedMLASelfAttention(Attention):
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
+        # import here to avoid circular import (recompute imports TransformerLayer)
+        from megatron.core.recompute import checkpoint_activations
+
+        hidden_states = checkpoint_activations(
+            self.config,
             custom_forward,
             False,
+            self.pg_collection.tp,
             q_absorbed,
             k_compressed,
             hidden_states,

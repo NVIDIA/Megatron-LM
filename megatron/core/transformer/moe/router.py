@@ -785,20 +785,31 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 use_dense_indices = routing_map.dtype != torch.bool
+                token_counts = None
                 if padding_mask is not None:
                     flat_mask = padding_mask.reshape(-1)
                     assert (
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
                     if use_dense_indices:
-                        routing_map = routing_map[~flat_mask]
+                        # Weight padded tokens by zero instead of boolean-indexing them out:
+                        # the shapes stay static and no host synchronization is needed, so the
+                        # update can run inside a captured (recomputed) CUDA graph.
+                        token_counts = (
+                            (~flat_mask)
+                            .to(self.local_tokens_per_expert.dtype)
+                            .unsqueeze(-1)
+                            .expand_as(routing_map)
+                            .reshape(-1)
+                        )
                     else:
                         routing_map = routing_map & (~flat_mask).unsqueeze(-1)
                 if use_dense_indices:
                     expert_indices = routing_map.reshape(-1).to(torch.long)
-                    token_counts = torch.ones_like(
-                        expert_indices, dtype=self.local_tokens_per_expert.dtype
-                    )
+                    if token_counts is None:
+                        token_counts = torch.ones_like(
+                            expert_indices, dtype=self.local_tokens_per_expert.dtype
+                        )
                     if torch.are_deterministic_algorithms_enabled():
                         self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
                     else:

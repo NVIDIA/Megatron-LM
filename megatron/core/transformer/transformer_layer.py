@@ -1008,8 +1008,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             moe_kwargs["packed_seq_params"] = packed_seq_params
 
         if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
-                # import here to avoid circular import
+            # import here to avoid circular import
+            from megatron.core.recompute import use_te_checkpoint
+
+            if use_te_checkpoint(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 mlp_output_with_bias = te_checkpoint(
@@ -2493,7 +2495,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             moe_kwargs['packed_seq_params'] = packed_seq_params
 
         if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
+            # import here to avoid circular import
+            from megatron.core.recompute import use_te_checkpoint
+
+            if use_te_checkpoint(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 mlp_output_with_bias = te_checkpoint(
@@ -3263,7 +3268,10 @@ class MoETransformerLayer(TransformerLayer):
             )
 
             if self.moe_layer_recompute:
-                if self.config.fp8 or self.config.fp4:
+                # import here to avoid circular import
+                from megatron.core.recompute import use_te_checkpoint
+
+                if use_te_checkpoint(self.config):
                     from megatron.core.extensions.transformer_engine import te_checkpoint
 
                     result = te_checkpoint(

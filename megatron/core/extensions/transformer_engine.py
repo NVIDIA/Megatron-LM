@@ -3348,6 +3348,10 @@ def te_checkpoint(
 
     from transformer_engine.pytorch.distributed import checkpoint
 
+    from megatron.core.utils import with_current_cuda_device
+
+    forward_func = with_current_cuda_device(forward_func)
+
     if is_te_min_version("1.5.0"):
         return checkpoint(
             forward_func,
