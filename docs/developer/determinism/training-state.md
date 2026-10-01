@@ -17,6 +17,14 @@ Use a clean checkout and an output directory outside the source tree:
 # CPU training validates the harness; it is not MCore GPU evidence.
 python -m tools.determinism.run_state_replay \
   --backend cpu --output /tmp/state-replay-cpu
+
+# One node, one worker per GPU, TP=4. Requires the MCore GPU dependency stack.
+python -m tools.determinism.run_state_replay \
+  --backend mcore_gpt --world-size 4 --output /tmp/state-replay-gpu
+
+# Actual pretrain_gpt loop: TP=2, DP=2, BF16 and distributed optimizer/checkpoints.
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --output /tmp/state-replay-training
 ```
 
 The output directory must be new. By default the protocol runs four steps,
@@ -27,47 +35,167 @@ saves a checkpoint at step 2, and performs four separate process launches:
 3. A new process that loads the reference checkpoint and executes steps 3–4.
 4. A resume that omits RNG restore, which must produce an observed mismatch.
 
-`--control optimizer`, `--control scheduler` and `--control dataloader` select
-other deliberately omitted restores.
+Both GPU adapters use the early `megatron.determinism` API. Each worker configures
+the shared policy before importing training or Core, whose optional GPU backends
+can initialize CUDA during import. The training entrypoint validates the resolved
+recipe again. The CPU harness does not require the GPU startup package.
+
+For `cpu` and `mcore_gpt`, `--control optimizer`, `--control scheduler` and
+`--control dataloader` select other deliberately omitted restores. The real
+`megatron_gpt` training adapter supports only the RNG control, using the
+checkpoint loader's `no_load_rng` flag.
 Fresh replay compares every step; resumed runs compare every post-checkpoint
 step. Every declared rank is required, including ranks without logged loss.
 
-The CPU pilot trains a small MLP with dropout, Torch AdamW, StepLR and generated
-data in one process. It validates the snapshot format, the comparator and the
-four-launch protocol, including the omitted-restore controls. It does not
-certify any MCore GPU model, parallel layout, distributed optimizer, mixed
-precision, FP8/FP4 or production data loader; those need their own adapters and
-validation. The CPU protocol needs no GPU, and the unit tests run it end to end.
+The CPU pilot trains a small MLP with dropout. The GPU pilot trains a two-layer,
+64-hidden-size MCore GPT using TP=1/2/4/8, FP32 parameters and gradients, Torch
+AdamW, StepLR, dropout, and generated data. Its objective is mean squared local
+logits, not language-model cross entropy. DP/PP/VPP/EP/FSDP, MCore's distributed
+optimizer, mixed-precision master weights, FP8/FP4 and production data loaders
+need additional adapters and validation. This pilot does not certify those
+paths.
+
+These checks run only when invoked; no CI job runs them. Run them on one node
+with every GPU (`--world-size 8` on an eight-GPU node, `--world-size 4` on a
+four-GPU node). A typical validation set is the per-step protocol for both GPU
+adapters plus the stop-point comparisons below (steps 3 and 5 of a five-step
+schedule) for both GPU adapters and TP=2/PP=2 training with one or two virtual
+chunks.
 
 ## Compare selected stop points
 
-Per-step state capture enumerates and copies all state after every step.
+Per-step state capture synchronizes the device and copies state to the host.
 To remove that diagnostic work between steps, launch independent protocols
 that each capture only one selected boundary:
 
 ```bash
 python -m tools.determinism.run_state_replay \
-  --backend cpu --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --backend megatron_gpt --world-size 4 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
   --output /tmp/state-stop-points
 ```
 
-This runs eight independent worker launches: fresh reference, fresh repeat,
-resume and omitted-restore control for step 3, then four new launches for step 5.
+This runs eight independent worker groups: fresh reference, fresh repeat,
+resume and omitted-restore control for step 3, then four new groups for step 5.
 Every target must follow the checkpoint and be at most `--steps`. Each rank
 must publish exactly one snapshot and completion step; earlier capture files,
 missing ranks, mismatched capture declarations and failed workers are unverified.
 The aggregate passes only when every requested target passes all three comparisons.
 Each resume identifies its own target's reference checkpoint.
 
-`--steps` remains the original training horizon: the scheduler and data recipe
-are unchanged, and the worker stops after the target step. Before the target,
-the worker skips diagnostic state collection and scalar extraction; it still
-saves and records the checkpoint.
+`--steps` remains the original training horizon. The real Megatron adapter uses
+`--exit-interval` to stop at the target while preserving `--train-iters`, the
+learning-rate schedule and dataset indexing. It observes the existing exit
+decision and accepts only a successful target-step exit after training cleanup.
+It keeps the original post-step callbacks and checkpoint save/load behavior.
+The TP-only/CPU worker similarly skips diagnostic state collection, explicit
+device synchronization and scalar extraction before the target.
 
-The result is still a scoped diagnostic recipe. These runs do not reproduce a
-production recipe's execution or contention. Use the original recipe for
-performance measurements and add a complete adapter before making a production
-acceptance claim.
+The result is still a scoped diagnostic recipe. Normal logging, callbacks and
+synchronous checkpoints remain, including checkpoint identity checks. These
+runs do not prove an absence of all synchronization, validate unsupported
+overlap modes or reproduce a production recipe's contention. Use the original
+recipe for performance measurements and extend the adapter before making a
+production acceptance claim.
+
+## Real Megatron training adapter
+
+`megatron_gpt` executes the repository's `pretrain_gpt.py`, including its real
+language-model loss, forward/backward schedule, distributed Adam optimizer,
+learning-rate scheduler, sampler, and synchronous `torch_dist` save/load path.
+By default it uses TP=2, PP=CP=1 and DP=2/4 on four/eight GPUs, BF16 model weights and FP32
+master parameters, dropout, and two 128-hidden-size transformer layers.
+MockGPT uses 512 documents with maximum document length 64; those explicit
+test-data dimensions are recorded alongside the full training arguments.
+
+Select `--pipeline-size 2` with `--backend megatron_gpt` to exercise the existing
+pipeline schedule with one layer per stage. On four GPUs this is TP=2/PP=2/DP=1;
+on eight GPUs it is TP=2/PP=2/DP=2. Global batch size remains the world size, so
+each step uses four microbatches and covers pipeline warmup, steady state and
+cooldown. For example:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --pipeline-size 2 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-pipeline-stop-points
+```
+
+Every rank records its actual TP/PP/DP/CP group sizes and coordinates. The
+coordinator requires each TP/PP/DP coordinate exactly once, with the expected
+data-loader owners. With two stages, both first and last stages construct data
+on TP rank zero; their TP peers receive the broadcast. Capture also checks one
+model chunk, the local layer count, and the embedding/output endpoint roles.
+All stages must supply model state, gradients and local optimizer moments;
+missing stage records cannot pass. The actual synchronous distributed checkpoint
+is retained and verified for every rank, including both pipeline stages.
+
+Add `--virtual-pipeline-size 2` to the PP=2 recipe to exercise four transformer
+layers with two virtual chunks per physical stage, one layer per chunk:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 \
+  --pipeline-size 2 --virtual-pipeline-size 2 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-virtual-pipeline-stop-points
+```
+
+Megatron requires P2P overlap for this two-stage interleaved schedule. The
+adapter requires its ordinary overlap policy with output deallocation enabled,
+non-batched P2P, and warmup/flush overlap disabled. The existing schedule waits
+on sends before output deallocation, drains backward sends, and asserts its
+receive-work queues are empty before returning. The observer retains that
+schedule and captures after optimizer/scheduler updates; target capture also
+synchronizes the device. Grad/parameter-gather overlap and deferred embedding
+weight gradients remain unsupported.
+
+Every virtual chunk has an explicit identity, global layer number, endpoint
+role, communication policy and loader slot in provenance. Missing, reordered
+or duplicated chunks cannot pass. With this layout only chunk zero on physical
+stage zero owns embeddings/data, and chunk one on physical stage one owns the
+output/loss data; only TP rank zero builds their loaders. Other local slots
+explicitly record that they have no loader. Each live chunk iterator retains
+its own data/index arrays, RNG and checked actual sample cursor. Model and
+gradient state include both chunks; the optimizer adapter includes all local
+parameter/moment shards. The reference's actual distributed checkpoint must
+restore all of them.
+
+Only the documented PP=1/2 recipes and the two-chunk PP=2 virtual recipe are
+supported. Other pipeline sizes, virtual layouts and overlap policies require
+additional state/boundary validation. Declaring more ranks does not enable them.
+
+The diagnostic worker temporarily observes the training module's loader,
+train, checkpoint and post-step callbacks. The callbacks retain their original
+behavior and return values. Capture runs after optimizer/scheduler updates and
+consumed-sample bookkeeping, before checkpoint save and the next zero-grad.
+Successful entrypoint completion (or the validated stop-point exit) and every
+required capture remain mandatory.
+
+The optimizer adapter reads each chained optimizer's **inner** state dict and
+local master-parameter groups. The distributed optimizer's outer `state_dict`
+intentionally omits parameter-dependent moments and is insufficient. Both Adam
+moments, group/step state, local master parameters/gradients, loss scale and
+scaler state are captured without gathering shards. Every rank is required.
+
+The loader adapter supports the single-pass MockGPT sampler with zero workers.
+It records the actual index arrays, document lengths, cached masks/positions,
+dedicated loader RNG and sampler configuration. It derives the absolute next
+sample from the iterator's observed yields plus its initial sampler position,
+then checks that against training's consumed-sample counter. A resumed iterator
+has a different local yield count; its canonical next sample must match.
+Worker prefetch, cyclic/external loaders and real-data content identity require
+additional adapters. They are rejected, rather than represented as only a cursor.
+
+The reference records every file in the completed distributed checkpoint
+directory. Resume validates that same directory before and after Megatron's
+load and checks the returned iteration. Comparison rechecks the real files;
+changed, missing or additional shards invalidate the evidence. Checkpoint
+hashes identify the loaded files; state comparisons still use raw bytes.
+
+FP8/FP4, precision-aware/offloaded optimizers, other communication overlap policies,
+broader PP/VPP/CP/EP/FSDP layouts, real datasets and production recipe stop-point validation
+remain separate work. Unsupported state formats fail visibly.
 
 ## Capture contract
 
@@ -106,10 +234,8 @@ The pilot saves each rank's checkpoint with `checkpoint_path` and
 reference run, rank, step and checksum. Checkpoint checksums establish which
 file was loaded; state equality is checked using the complete captured bytes,
 not hashes. `record_checkpoint_directory` and `read_checkpoint_record` provide
-the corresponding identity contract for directory checkpoints, such as
-distributed checkpoints. An adapter must record the checkpoint that the
-framework's existing save path wrote and verify it around the existing restore
-path, rather than relabel this pilot's files.
+the corresponding identity contract for the real distributed checkpoint;
+the adapter continues to use Megatron's existing producer/restore path.
 
 ## Inspect results
 
@@ -131,7 +257,7 @@ To compare existing captures without running training:
 
 ```bash
 python -m tools.determinism.training_state /tmp/run/reference /tmp/run/resume \
-  --comparison resume --world-size 1 --steps 3 4 --output /tmp/comparison.json
+  --comparison resume --world-size 4 --steps 3 4 --output /tmp/comparison.json
 ```
 
 The comparison command exits 0 for equal, 1 for different and 2 for unverified.

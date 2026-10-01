@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import uuid
+from itertools import product
 from pathlib import Path
 
 from tools.determinism.training_state import (
@@ -24,8 +25,25 @@ from tools.determinism.training_state import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _validate_pipeline_size(
+    backend: str, pipeline_size: int, virtual_pipeline_size: int = 1
+) -> None:
+    if (
+        type(pipeline_size) is not int
+        or pipeline_size not in (1, 2)
+        or (pipeline_size != 1 and backend != "megatron_gpt")
+    ):
+        raise ValueError("Only the Megatron training adapter supports PP=2")
+    if (
+        type(virtual_pipeline_size) is not int
+        or virtual_pipeline_size not in (1, 2)
+        or (virtual_pipeline_size == 2 and (backend != "megatron_gpt" or pipeline_size != 2))
+    ):
+        raise ValueError("VPP=2 requires the Megatron training adapter with PP=2")
+
+
 def _run_worker(command: list[str], env: dict, log, *, timeout: float = 600) -> int:
-    """Terminate the worker's whole process group if a phase times out or is interrupted."""
+    """Give torchrun time to terminate its workers if a phase times out."""
     with subprocess.Popen(
         command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
     ) as child:
@@ -61,6 +79,51 @@ def _verify_stop_point(directory: Path, world_size: int, capture: dict) -> None:
             raise UnverifiedState(f"Missing or incompatible stop-point declaration: {directory}")
 
 
+def _verify_megatron_layout(
+    directory: Path, world_size: int, pipeline_size: int, virtual_pipeline_size: int = 1
+) -> None:
+    """Require every physical coordinate, virtual chunk and actual loader owner."""
+    data_size = world_size // (2 * pipeline_size)
+    expected = set(product(range(2), range(pipeline_size), range(data_size)))
+    observed = set()
+    for rank in range(world_size):
+        completion = json.loads((directory / f"complete-rank-{rank:06d}.json").read_text())
+        layout = completion["provenance"]["rank_layout"]
+        if (
+            layout["global_rank"] != rank
+            or layout["world_size"] != world_size
+            or layout["sizes"] != {"TP": 2, "PP": pipeline_size, "DP": data_size, "CP": 1}
+            or layout["CP"] != 0
+            or layout["VPP"] != (2 if virtual_pipeline_size == 2 else None)
+            or layout["owns_loader"] is not (layout["TP"] == 0)
+        ):
+            raise UnverifiedState(f"Unexpected Megatron rank layout: {directory}, rank {rank}")
+        if virtual_pipeline_size == 2:
+            chunks = [
+                {
+                    "VP": index,
+                    "pre_process": layout["PP"] == 0 and index == 0,
+                    "post_process": layout["PP"] == 1 and index == 1,
+                    "layers": [index * pipeline_size + layout["PP"] + 1],
+                    "owns_loader": layout["TP"] == 0 and index == layout["PP"],
+                    "p2p": {
+                        "overlap_p2p_comm": True,
+                        "batch_p2p_comm": False,
+                        "deallocate_pipeline_outputs": True,
+                        "overlap_p2p_comm_warmup_flush": False,
+                    },
+                }
+                for index in range(2)
+            ]
+            if layout.get("chunks") != chunks:
+                raise UnverifiedState(
+                    f"Missing or incompatible virtual chunks: {directory}, rank {rank}"
+                )
+        observed.add((layout["TP"], layout["PP"], layout["DP"]))
+    if observed != expected:
+        raise UnverifiedState(f"Missing or duplicated Megatron TP/PP/DP coordinates: {directory}")
+
+
 def run_protocol(
     output: Path,
     *,
@@ -70,6 +133,8 @@ def run_protocol(
     checkpoint_step: int,
     control: str,
     stop_step: int | None = None,
+    pipeline_size: int = 1,
+    virtual_pipeline_size: int = 1,
     phase_timeout: float = 600,
 ) -> dict:
     """Run two independent trainings, a resume, and a deliberately broken resume.
@@ -80,10 +145,13 @@ def run_protocol(
     capture = capture_configuration(steps, checkpoint_step, stop_step)
     if not math.isfinite(phase_timeout) or phase_timeout <= 0:
         raise ValueError("Phase timeout must be finite and positive")
-    if backend != "cpu":
-        raise ValueError(f"Unsupported backend: {backend}")
-    if world_size != 1:
+    if backend not in ("cpu", "mcore_gpt", "megatron_gpt") or world_size not in (1, 2, 4, 8):
+        raise ValueError("Unsupported backend or world size")
+    if backend == "cpu" and world_size != 1:
         raise ValueError("The CPU harness validation recipe uses one process")
+    if backend == "megatron_gpt" and (world_size not in (4, 8) or control != "rng"):
+        raise ValueError("Megatron training uses four/eight ranks and an omitted-RNG control")
+    _validate_pipeline_size(backend, pipeline_size, virtual_pipeline_size)
     if not 0 < checkpoint_step < steps or control not in (
         "rng",
         "optimizer",
@@ -98,6 +166,8 @@ def run_protocol(
         "status": "not_verified",
         "backend": backend,
         "world_size": world_size,
+        "pipeline_size": pipeline_size,
+        "virtual_pipeline_size": virtual_pipeline_size,
         "steps": steps,
         "checkpoint_step": checkpoint_step,
         "control_injection": f"omit_restore_{control}",
@@ -119,11 +189,26 @@ def run_protocol(
         ) or key.startswith("TORCHELASTIC_"):
             worker_env.pop(key)
     try:
+        if backend != "cpu" and not (ROOT / "megatron/determinism/__init__.py").is_file():
+            raise UnverifiedState("GPU state replay requires the megatron.determinism package")
         for name in ("reference", "repeat", "resume", "control"):
-            command = [
-                sys.executable,
+            command = [sys.executable]
+            if backend != "cpu":
+                command += [
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nnodes=1",
+                    f"--nproc-per-node={world_size}",
+                    "--max-restarts=0",
+                ]
+            command += [
                 "-m",
-                "tools.determinism.state_replay_worker",
+                (
+                    "tools.determinism.megatron_state_worker"
+                    if backend == "megatron_gpt"
+                    else "tools.determinism.state_replay_worker"
+                ),
                 "--backend",
                 backend,
                 "--output",
@@ -137,6 +222,9 @@ def run_protocol(
             ]
             if stop_step is not None:
                 command += ["--stop-step", str(stop_step)]
+            if backend == "megatron_gpt":
+                command += ["--pipeline-size", str(pipeline_size)]
+                command += ["--virtual-pipeline-size", str(virtual_pipeline_size)]
             if name in ("resume", "control"):
                 command += ["--resume", str(output / "reference")]
             if name == "control":
@@ -150,6 +238,11 @@ def run_protocol(
         if stop_step is not None:
             for name in ("reference", "repeat", "resume", "control"):
                 _verify_stop_point(output / name, world_size, capture)
+        if backend == "megatron_gpt":
+            for name in ("reference", "repeat", "resume", "control"):
+                _verify_megatron_layout(
+                    output / name, world_size, pipeline_size, virtual_pipeline_size
+                )
         result["fresh"] = compare_runs(
             output / "reference",
             output / "repeat",
@@ -216,11 +309,14 @@ def run_stop_points(
     checkpoint_step: int,
     control: str,
     stop_steps: list[int],
+    pipeline_size: int = 1,
+    virtual_pipeline_size: int = 1,
     phase_timeout: float = 600,
 ) -> dict:
     """Run a separate four-launch protocol for every selected target step."""
     if not math.isfinite(phase_timeout) or phase_timeout <= 0:
         raise ValueError("Phase timeout must be finite and positive")
+    _validate_pipeline_size(backend, pipeline_size, virtual_pipeline_size)
     if not stop_steps or len(set(stop_steps)) != len(stop_steps):
         raise ValueError("Require a nonempty list of unique stop steps")
     for step in stop_steps:
@@ -232,6 +328,8 @@ def run_stop_points(
         "status": "not_verified",
         "backend": backend,
         "world_size": world_size,
+        "pipeline_size": pipeline_size,
+        "virtual_pipeline_size": virtual_pipeline_size,
         "steps": steps,
         "checkpoint_step": checkpoint_step,
         "stop_steps": sorted(stop_steps),
@@ -249,6 +347,8 @@ def run_stop_points(
                 checkpoint_step=checkpoint_step,
                 control=control,
                 stop_step=step,
+                pipeline_size=pipeline_size,
+                virtual_pipeline_size=virtual_pipeline_size,
                 phase_timeout=phase_timeout,
             )
             result["targets"].append(target)
@@ -264,7 +364,7 @@ def main() -> int:
     """Run the protocol and return a gate status; unverified evidence cannot pass."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--backend", choices=("cpu",), required=True)
+    parser.add_argument("--backend", choices=("cpu", "mcore_gpt", "megatron_gpt"), required=True)
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument(
         "--phase-timeout",
@@ -272,6 +372,8 @@ def main() -> int:
         default=600,
         help="Seconds allowed for each fresh worker phase",
     )
+    parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
     parser.add_argument(
@@ -287,6 +389,8 @@ def main() -> int:
             args.output,
             backend=args.backend,
             world_size=args.world_size,
+            pipeline_size=args.pipeline_size,
+            virtual_pipeline_size=args.virtual_pipeline_size,
             phase_timeout=args.phase_timeout,
             steps=args.steps,
             checkpoint_step=args.checkpoint_step,
