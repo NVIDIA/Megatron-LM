@@ -23,7 +23,10 @@ from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -326,10 +329,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
-        assert pg_collection is not None, (
-            "Attention requires an explicit pg_collection with tp/cp; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
+            # run_realtime_tests also reads dp from the collection.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            )
         assert 'tp' in vars(pg_collection), "Attention pg_collection must have tp process group"
         assert 'cp' in vars(pg_collection), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection

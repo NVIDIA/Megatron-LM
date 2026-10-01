@@ -2,13 +2,40 @@
 
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
+import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Set, Union
 
 import torch
 
 from megatron.core import parallel_state
+
+_warned_global_process_group_fallbacks: Set[str] = set()
+
+
+def warn_global_process_group_fallback(owner: str, argument: str = "pg_collection") -> None:
+    """Warn, once per ``owner``, that a missing process-group argument uses the global grid.
+
+    Callers that omit ``argument`` keep the previous behavior for one deprecation period: the
+    caller resolves the groups from ``megatron.core.parallel_state``. That global grid belongs to
+    a single model, so the fallback is deprecated and ``argument`` will become required in a
+    future release. See docs/developer/parallel-state-deprecation.md.
+
+    Args:
+        owner: Name of the class or function whose caller omitted ``argument``.
+        argument: Name of the omitted process-group argument.
+    """
+    if owner in _warned_global_process_group_fallbacks:
+        return
+    _warned_global_process_group_fallbacks.add(owner)
+    warnings.warn(
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        f"in megatron.core.parallel_state. This fallback is deprecated and `{argument}` will be "
+        "required in a future release; pass the owning model's process groups explicitly.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 class ProcessGroupHelperMeta(type):
