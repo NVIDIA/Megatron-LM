@@ -29,12 +29,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_s
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.layers.utils import Symbols
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
-from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 try:
     import causal_conv1d  # noqa: F401
@@ -68,15 +66,10 @@ LR = 0.01
 def _hybrid_config(hybrid_layer_pattern, num_moe_experts=8, extra_kwargs=None):
     """Build a TransformerConfig usable by HybridModel + EP overlap."""
     extra_kwargs = dict(extra_kwargs or {})
-    config_cls = TransformerConfig
-    if Symbols.MLA in hybrid_layer_pattern:
-        # The pattern has multi-latent attention (MLA) layers, which need an
-        # MLATransformerConfig. Its default MLA dimensions are fine for this test.
-        config_cls = MLATransformerConfig
     # HybridModel derives effective num_layers from the pattern; we still pass
     # the flattened count so TransformerConfig.__post_init__ checks pass.
     flat = hybrid_layer_pattern.replace("[", "").replace("]", "")
-    return config_cls(
+    return TransformerConfig(
         # ``deterministic_mode`` (utils.deterministic_mode) sets
         # ``NVTE_FUSED_ATTN=0`` for reproducibility; the default attention
         # backend ``auto`` asserts that env is unset, so pin it to ``unfused``
