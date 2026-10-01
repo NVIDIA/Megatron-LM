@@ -1063,11 +1063,17 @@ def _mla_rope_fwd_kv_split_kernel(
     cp_rank,
     cp_size,
     REMOVE_INTERLEAVING: tl.constexpr,
+    K_BLOCK: tl.constexpr,
+    V_BLOCK: tl.constexpr,
+    ROT_BLOCK: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
     Forward pass: split KV into key and value, apply RoPE to k_pos_emb,
     and concatenate the result onto key.
+
+    k_dim, v_dim and emb_dim // 2 need not be powers of two: they are covered by K_BLOCK,
+    V_BLOCK and ROT_BLOCK lanes (the next powers of two), and the lanes past them are masked.
 
     Input:
         KV: [seq_len, batch_size, head_num, k_dim + v_dim]
@@ -1092,55 +1098,64 @@ def _mla_rope_fwd_kv_split_kernel(
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
 
-    cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-    sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-    cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
-    sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+    # Lane masks are only built for padded dims; power-of-two dims need none.
+    rot_mask = None if ROT_BLOCK == emb_dim // 2 else tl.arange(0, ROT_BLOCK) < emb_dim // 2
+    cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, ROT_BLOCK), mask=rot_mask)
+    sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, ROT_BLOCK), mask=rot_mask)
+    cos_right = tl.load(
+        COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, ROT_BLOCK), mask=rot_mask
+    )
+    sin_right = tl.load(
+        SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, ROT_BLOCK), mask=rot_mask
+    )
 
     KV_ptr = KV + pid_m * stride_kv_seq + pid_head * BLOCK_H * stride_kv_nheads
     kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
     mask = kv_off < head_num * stride_kv_nheads
-    k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
-    v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
-    k = tl.load(KV_ptr + k_in_off, mask=mask)
-    v = tl.load(KV_ptr + v_in_off, mask=mask)
+    k_in_off = kv_off + tl.arange(0, K_BLOCK)[None, :]
+    v_in_off = kv_off + k_dim + tl.arange(0, V_BLOCK)[None, :]
+    k_mask = mask if K_BLOCK == k_dim else mask & (tl.arange(0, K_BLOCK)[None, :] < k_dim)
+    v_mask = mask if V_BLOCK == v_dim else mask & (tl.arange(0, V_BLOCK)[None, :] < v_dim)
+    k = tl.load(KV_ptr + k_in_off, mask=k_mask)
+    v = tl.load(KV_ptr + v_in_off, mask=v_mask)
 
     K_ptr = O_KEY + pid_m * stride_k_seq + pid_head * BLOCK_H * stride_k_nheads
     V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
 
-    k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, k_dim)[None, :]
-    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
-    tl.store(K_ptr + k_out_off, k, mask=mask)
-    tl.store(V_ptr + v_out_off, v, mask=mask)
+    k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, K_BLOCK)[None, :]
+    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, V_BLOCK)[None, :]
+    tl.store(K_ptr + k_out_off, k, mask=k_mask)
+    tl.store(V_ptr + v_out_off, v, mask=v_mask)
 
     EMB = K_POS_EMB + pid_m * stride_emb_seq
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
-    x_1 = tl.load(EMB + tl.arange(0, emb_dim // 2) * 2)
-    x_2 = tl.load(EMB + tl.arange(0, emb_dim // 2) * 2 + 1)
+    x_1 = tl.load(EMB + tl.arange(0, ROT_BLOCK) * 2, mask=rot_mask)
+    x_2 = tl.load(EMB + tl.arange(0, ROT_BLOCK) * 2 + 1, mask=rot_mask)
 
     x_left = x_1 * cos_left - x_2 * sin_left
     x_right = x_2 * cos_right + x_1 * sin_right
-    x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
-    x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, ROT_BLOCK)
+    x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, ROT_BLOCK)
+    x_mask = mask if rot_mask is None else mask & rot_mask[None, :]
 
     if REMOVE_INTERLEAVING:
         x_1_off = (
             tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
             + k_dim
-            + tl.arange(0, emb_dim // 2)[None, :] * 2
+            + tl.arange(0, ROT_BLOCK)[None, :] * 2
         )
         x_2_off = x_1_off + 1
-        tl.store(K_ptr + x_1_off, x_left, mask=mask)
-        tl.store(K_ptr + x_2_off, x_right, mask=mask)
+        tl.store(K_ptr + x_1_off, x_left, mask=x_mask)
+        tl.store(K_ptr + x_2_off, x_right, mask=x_mask)
     else:
         x_left_off = (
             tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
             + k_dim
-            + tl.arange(0, emb_dim // 2)[None, :]
+            + tl.arange(0, ROT_BLOCK)[None, :]
         )
         x_right_off = x_left_off + emb_dim // 2
-        tl.store(K_ptr + x_left_off, x_left, mask=mask)
-        tl.store(K_ptr + x_right_off, x_right, mask=mask)
+        tl.store(K_ptr + x_left_off, x_left, mask=x_mask)
+        tl.store(K_ptr + x_right_off, x_right, mask=x_mask)
 
 
 @triton.autotune(
@@ -1181,10 +1196,16 @@ def _mla_rope_bwd_kv_split_kernel(
     cp_rank,
     cp_size,
     REMOVE_INTERLEAVING: tl.constexpr,
+    K_BLOCK: tl.constexpr,
+    V_BLOCK: tl.constexpr,
+    ROT_BLOCK: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
     Backward pass for the KV-split RoPE.
+
+    K_BLOCK, V_BLOCK and ROT_BLOCK pad k_dim, v_dim and emb_dim // 2 to powers of two, as in
+    the forward pass.
 
     Input:
         dK: [seq_len, batch_size, head_num, emb_dim + k_dim]
@@ -1210,35 +1231,39 @@ def _mla_rope_bwd_kv_split_kernel(
     dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
     dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
     mask = dkv_off < head_num * stride_dkv_nheads
-    dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
-    dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
+    dk_out_off = dkv_off + tl.arange(0, K_BLOCK)[None, :]
+    dv_out_off = dkv_off + k_dim + tl.arange(0, V_BLOCK)[None, :]
+    k_mask = mask if K_BLOCK == k_dim else mask & (tl.arange(0, K_BLOCK)[None, :] < k_dim)
+    v_mask = mask if V_BLOCK == v_dim else mask & (tl.arange(0, V_BLOCK)[None, :] < v_dim)
 
     dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
     dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
-    dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
-    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
-    dk = tl.load(dK_ptr + dk_in_off, mask=mask)
-    dv = tl.load(dV_ptr + dv_in_off, mask=mask)
-    tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
-    tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
+    dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, K_BLOCK)[None, :]
+    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, V_BLOCK)[None, :]
+    dk = tl.load(dK_ptr + dk_in_off, mask=k_mask)
+    dv = tl.load(dV_ptr + dv_in_off, mask=v_mask)
+    tl.store(dKV_ptr + dk_out_off, dk, mask=k_mask)
+    tl.store(dKV_ptr + dv_out_off, dv, mask=v_mask)
 
     if pid_head == 0:
-        x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
-        x_right_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
+        rot_mask = None if ROT_BLOCK == emb_dim // 2 else tl.arange(0, ROT_BLOCK) < emb_dim // 2
+        x_left_accum = tl.zeros((BLOCK_H, ROT_BLOCK), dtype=tl.float32)
+        x_right_accum = tl.zeros((BLOCK_H, ROT_BLOCK), dtype=tl.float32)
         for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
             dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
             x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
             mask = x_off < head_num * stride_dk_nheads
+            x_mask = mask if rot_mask is None else mask & rot_mask[None, :]
             if REMOVE_INTERLEAVING:
-                x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+                x_1_off = x_off + tl.arange(0, ROT_BLOCK)[None, :] * 2
                 x_2_off = x_1_off + 1
-                x_left = tl.load(dK_ptr + x_1_off, mask=mask)
-                x_right = tl.load(dK_ptr + x_2_off, mask=mask)
+                x_left = tl.load(dK_ptr + x_1_off, mask=x_mask)
+                x_right = tl.load(dK_ptr + x_2_off, mask=x_mask)
             else:
-                x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+                x_left_off = x_off + tl.arange(0, ROT_BLOCK)[None, :]
                 x_right_off = x_left_off + emb_dim // 2
-                x_left = tl.load(dK_ptr + x_left_off, mask=mask)
-                x_right = tl.load(dK_ptr + x_right_off, mask=mask)
+                x_left = tl.load(dK_ptr + x_left_off, mask=x_mask)
+                x_right = tl.load(dK_ptr + x_right_off, mask=x_mask)
             x_left_accum += x_left
             x_right_accum += x_right
         x_left_accum = tl.sum(x_left_accum, axis=0)
@@ -1246,16 +1271,20 @@ def _mla_rope_bwd_kv_split_kernel(
         x_left_accum = x_left_accum.to(dEMB.dtype.element_ty)
         x_right_accum = x_right_accum.to(dEMB.dtype.element_ty)
 
-        cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-        sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-        cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
-        sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+        cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, ROT_BLOCK), mask=rot_mask)
+        sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, ROT_BLOCK), mask=rot_mask)
+        cos_right = tl.load(
+            COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, ROT_BLOCK), mask=rot_mask
+        )
+        sin_right = tl.load(
+            SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, ROT_BLOCK), mask=rot_mask
+        )
 
         x_1 = x_left_accum * cos_left + x_right_accum * sin_right
         x_2 = -x_left_accum * sin_left + x_right_accum * cos_right
         dEMB_ptr = dEMB + pid_m * stride_demb_seq
-        tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2, x_1)
-        tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2 + 1, x_2)
+        tl.store(dEMB_ptr + tl.arange(0, ROT_BLOCK) * 2, x_1, mask=rot_mask)
+        tl.store(dEMB_ptr + tl.arange(0, ROT_BLOCK) * 2 + 1, x_2, mask=rot_mask)
 
 
 class _FusedMLARoPEKVSplit(torch.autograd.Function):
@@ -1340,6 +1369,9 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             cp_rank,
             cp_size,
             REMOVE_INTERLEAVING=remove_interleaving,
+            K_BLOCK=triton.next_power_of_2(k_dim),
+            V_BLOCK=triton.next_power_of_2(v_dim),
+            ROT_BLOCK=triton.next_power_of_2(emb_dim // 2),
         )
         ctx.save_for_backward(cos, sin)
         ctx.remove_interleaving = remove_interleaving
@@ -1410,6 +1442,9 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             ctx.cp_rank,
             ctx.cp_size,
             REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            K_BLOCK=triton.next_power_of_2(ctx.k_dim),
+            V_BLOCK=triton.next_power_of_2(ctx.v_dim),
+            ROT_BLOCK=triton.next_power_of_2(ctx.emb_dim // 2),
         )
         if ctx.cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
