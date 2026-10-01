@@ -2,16 +2,20 @@
 
 
 import dataclasses
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+import megatron.core.models.gpt.fine_grained_callables as fine_grained_callables
 import megatron.core.parallel_state as parallel_state
 import megatron.core.transformer.moe.router as router_mod
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
@@ -132,13 +136,86 @@ def test_token_count_reduction_composes_runtime_cp_and_tp(monkeypatch):
     routing_map = torch.tensor([[True, False], [False, True]])
 
     tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
-        routing_map, reduce_group=cp_group, reduce_groups=(cp_group, tp_group), topk=1
+        routing_map, reduce_group=(cp_group, tp_group), topk=1
     )
 
     assert calls == [cp_group, tp_group]
     assert torch.equal(tokens_per_expert, torch.tensor([6, 6]))
     assert local_tokens == 2
     assert total_tokens == 12
+
+
+def test_token_count_reduction_preserves_positional_api(monkeypatch):
+    group = _ProcessGroup(2)
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.moe_utils.reduce_from_tensor_model_parallel_region",
+        lambda value, pg: value * pg.size(),
+    )
+    routing_map = torch.tensor([[True, False], [False, False]])
+    counts, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, group, 1, True
+    )
+    assert torch.equal(counts, torch.tensor([2, 0]))
+    assert local_tokens == 1
+    assert total_tokens == 2
+
+
+def test_fine_grained_router_receives_runtime_cp(monkeypatch):
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=_ProcessGroup(2))
+    hidden = torch.randn(4, 1, 8)
+    probs = torch.ones(4, 2)
+    mlp = Mock(spec=MoELayer)
+    mlp.use_shared_expert = False
+    mlp.route.return_value = (probs, probs.bool())
+    mlp.preprocess.return_value = (hidden, probs)
+    layer = SimpleNamespace(
+        mlp=mlp,
+        config=SimpleNamespace(moe_token_dispatcher_type="alltoall"),
+        _forward_attention=Mock(return_value=(hidden, None)),
+        _forward_mlp=lambda hidden_states: hidden_states,
+        offload_mlp_norm=False,
+        recompute_pre_mlp_layernorm=False,
+        _pre_mlp_layernorm_returns_residual=False,
+        pre_mlp_layernorm=torch.nn.Identity(),
+        init_backward_dw_wrapper=Mock(),
+        backward_dw_wrapper=Mock(),
+    )
+    node = SimpleNamespace(
+        chunk_state=SimpleNamespace(
+            attention_mask=None,
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            packed_seq_params=packed,
+            sequence_len_offset=None,
+        ),
+        layer_state=SimpleNamespace(),
+        detach=lambda tensor: tensor.detach(),
+    )
+    monkeypatch.setattr(
+        fine_grained_callables, "off_interface", lambda _enabled, tensor, _name: nullcontext(tensor)
+    )
+    forward_funcs, _ = fine_grained_callables.build_transformer_layer_callables(layer)
+    forward_funcs[0](node, hidden)
+    mlp.route.assert_called_once_with(hidden, packed_seq_params=packed)
+
+
+def test_shortcut_router_receives_runtime_cp():
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=_ProcessGroup(2))
+    hidden = torch.randn(4, 1, 8)
+    padding_mask = torch.tensor([[False, False, True, True]])
+    probs = torch.ones(4, 2)
+    mlp = Mock(spec=MoELayer)
+    mlp.route.return_value = (probs, probs.bool())
+    block = SimpleNamespace(
+        recompute_shortcut_pre_mlp_layernorm=False,
+        shortcut_pre_mlp_layernorm=torch.nn.Identity(),
+        moe_layer=SimpleNamespace(
+            mlp=mlp, _maybe_unflatten_for_moe=Mock(return_value=(hidden, padding_mask, None, None))
+        ),
+    )
+    ShortcutMoEBlock._moe_router_preprocess(block, hidden, padding_mask, packed)
+    mlp.route.assert_called_once_with(hidden, padding_mask, packed_seq_params=packed)
 
 
 def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatch):
@@ -268,8 +345,7 @@ class TestDynamicCPRouterDistributed:
 
         tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
             routing_map,
-            reduce_group=runtime_cp_group,
-            reduce_groups=(runtime_cp_group, self.router.tp_group),
+            reduce_group=(runtime_cp_group, self.router.tp_group),
             topk=1,
             with_padding_mask=True,
         )

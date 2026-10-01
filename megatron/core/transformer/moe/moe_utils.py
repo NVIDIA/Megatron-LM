@@ -3,7 +3,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -268,17 +268,18 @@ def get_capacity(
 
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
-    reduce_group: torch.distributed.ProcessGroup,
-    reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
+    reduce_group: Union[torch.distributed.ProcessGroup, Tuple[torch.distributed.ProcessGroup, ...]],
     topk: int = None,
     with_padding_mask: bool = False,
 ) -> torch.Tensor:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+
+    ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
+    (for example runtime CP followed by TP). The single-group positional API is preserved.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
-    if reduce_groups is None:
-        reduce_groups = (reduce_group,)
+    reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
 
     # The reduction all-reduces contiguous tensors in place; reduce a copy so
     # local_tokens_per_expert keeps this rank's counts for local_num_tokens below.
