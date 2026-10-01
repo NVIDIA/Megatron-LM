@@ -649,6 +649,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
+        deterministic_mode=False,
         num_layers=1,
         mtp_num_layers=0,
     )
