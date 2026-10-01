@@ -15,6 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Literal, cast
@@ -82,6 +83,8 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
+        self._unused_parameter_modules: IndexedOrder[FsdpModule] = IndexedOrder()
+        self._pending_unused_reductions: deque[FsdpModule] = deque()
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -120,6 +123,9 @@ class FsdpContext:
 
         for root in reversed(roots):
             _collect_backward_order(cast(nn.Module, root), self.backward_order)
+        for module in self.backward_order:
+            if module._allow_unused_parameters:
+                self._unused_parameter_modules.append(module)
 
         self._registered_modules.clear()
         self._is_finalized = True
@@ -137,8 +143,32 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this context's gradient reductions."""
+        already_pending = set(self._pending_unused_reductions)
+        pending = [
+            module
+            for module in self._unused_parameter_modules
+            if module.phase is FsdpModule.Phase.BACKWARD and module not in already_pending
+        ]
+        for module in pending:
+            module._complete_unused_gradients()
+        self._pending_unused_reductions.extend(pending)
+        self._drain_unused_reductions()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
         self._post_backward_hook_registered = False
+
+    def _drain_unused_reductions(self) -> None:
+        """Reduce opted-in units in the same order on every rank, including delayed TE work."""
+        reduced = False
+        while self._pending_unused_reductions:
+            module = self._pending_unused_reductions[0]
+            if not module._gradients_ready:
+                break
+            self._pending_unused_reductions.popleft()
+            module._finish_backward()
+            reduced = True
+        if reduced:
+            # TE may finish after the autograd completion callback has already returned.
+            self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def register_post_backward_hook(self) -> None:
         """Register one context-level final callback for the current backward.
@@ -175,6 +205,8 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
+    _allow_unused_parameters: bool
+    _gradients_ready: bool
     _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -200,6 +232,7 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        allow_unused_parameters: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -208,6 +241,8 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
+        self._allow_unused_parameters = allow_unused_parameters
+        self._gradients_ready = False
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -517,10 +552,37 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
+        if self._allow_unused_parameters:
+            # Even a fully-used rank must wait: another rank can have missing gradients
+            # in this unit. Reducing early there would change collective order.
+            self._gradients_ready = True
+            self.context._drain_unused_reductions()
+            return
+        self._finish_backward()
+
+    def _finish_backward(self) -> None:
+        """Release weights and reduce a unit whose gradients are all ready."""
         self.reshard()
         self._reduce_gradient_groups()
+        self._gradients_ready = False
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
+
+    @torch.no_grad()
+    def _complete_unused_gradients(self) -> None:
+        """Supply zeros for gradients absent after autograd, without completing TE work."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            for fsdp_parameter in group.fsdp_parameters:
+                parameter = fsdp_parameter.unsharded
+                if parameter.grad is not None or getattr(
+                    parameter, "skip_backward_post_hook", False
+                ):
+                    continue
+                parameter.grad = torch.zeros_like(parameter)
+                if self._trainable_parameter_countdown.decrement():
+                    self.post_backward()
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
