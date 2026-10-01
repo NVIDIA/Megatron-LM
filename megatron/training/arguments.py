@@ -2598,7 +2598,12 @@ def _parse_triton_autotune_block_size(value):
 
 def _add_triton_autotune_args(parser):
     """Add CLI controls for the process-wide Triton autotune policy."""
-    group = parser.add_argument_group(title='Triton autotune policy')
+    group = parser.add_argument_group(
+        title='Triton autotune policy',
+        description=(
+            'See megatron/core/tuning/README.md for modes, scope, tables and configuration.'
+        ),
+    )
     group.add_argument(
         '--triton-autotune-mode',
         choices=('auto', 'pinned', 'record'),

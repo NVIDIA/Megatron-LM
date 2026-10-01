@@ -74,6 +74,8 @@ class AutotunePolicy:
     This object contains settings only. Installation resolves defaults into a
     separate policy value; loaded tables, selected configs, and recorded winners
     belong to the runtime adapter in :mod:`megatron.core.tuning.interception`.
+    See ``megatron/core/tuning/README.md`` for modes, scope, tables and
+    configuration.
     """
 
     mode: Literal["auto", "pinned", "record"] | None = None
