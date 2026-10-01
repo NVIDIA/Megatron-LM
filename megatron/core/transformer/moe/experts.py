@@ -35,6 +35,10 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.dead_recompute import (
+    skip_te_grouped_gemm,
+    skipping_dead_recompute,
+)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1010,7 +1014,15 @@ class TEGroupedMLP(MegatronModule):
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        if skipping_dead_recompute(self.config):
+            # the recompute re-run: fc2's output is read by nobody (its backward needs its input
+            # and weight), so build the graph and save the tensors without launching the GEMM
+            with skip_te_grouped_gemm():
+                output, output_bias = apply_module(self.linear_fc2)(
+                    bias_act_output, tokens_per_expert
+                )
+        else:
+            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
