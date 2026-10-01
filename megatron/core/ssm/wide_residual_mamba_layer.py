@@ -83,7 +83,7 @@ class WideResidualMambaLayer(MambaLayer):
 
         return self.residual_connection
 
-    def _prepare_mixer_input(
+    def _prepare_mixer_state(
         self,
         hidden_states: Tensor,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
@@ -115,7 +115,7 @@ class WideResidualMambaLayer(MambaLayer):
             hidden_states = apply_module(self.norm)(hidden_states)
         return hidden_states, residual, connection_state, recompute_context
 
-    def _apply_mixer_bda(
+    def _apply_mixer_update(
         self,
         mixer_out_with_bias,
         residual: Tensor,
@@ -155,7 +155,7 @@ class WideResidualMambaLayer(MambaLayer):
         """Project the mixer output and write it to the saved wide-residual stream."""
 
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
-        return self._apply_mixer_bda(
+        return self._apply_mixer_update(
             mixer_out_with_bias,
             residual,
             connection_state,

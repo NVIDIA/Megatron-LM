@@ -49,7 +49,7 @@ class TestMambaLayer:
         assert self.layer.norm.eps == self.layer.config.layernorm_epsilon
 
     @pytest.mark.parametrize("fp32_residual", [False, True], ids=["bf16", "fp32"])
-    def test_ordinary_mixer_helpers_ignore_wide_replay_state(self, fp32_residual, monkeypatch):
+    def test_ordinary_mixer_hooks_preserve_helper_contract(self, fp32_residual, monkeypatch):
         self.layer.config = replace(
             self.layer.config,
             bf16=True,
@@ -65,10 +65,18 @@ class TestMambaLayer:
             pytest.fail("Ordinary Mamba helpers must not consult a wide-residual connection")
 
         monkeypatch.setattr(self.layer, "_get_residual_connection", fail_connection_lookup)
+        prepare_residual = Mock(wraps=self.layer._prepare_residual)
+        prepare_input = Mock(wraps=self.layer._prepare_mixer_input)
+        apply_bda = Mock(wraps=self.layer._apply_mixer_bda)
+        monkeypatch.setattr(self.layer, "_prepare_residual", prepare_residual)
+        monkeypatch.setattr(self.layer, "_prepare_mixer_input", prepare_input)
+        monkeypatch.setattr(self.layer, "_apply_mixer_bda", apply_bda)
         context = object()
-        branch_input, residual, state, replay = self.layer._prepare_mixer_input(
+        branch_input, residual, state, replay = self.layer._prepare_mixer_state(
             hidden_states, residual_stream_recompute_context=context
         )
+        prepare_residual.assert_called_once_with(hidden_states)
+        prepare_input.assert_called_once_with(hidden_states)
         assert branch_input is hidden_states
         assert state is None
         assert replay is None
@@ -76,12 +84,11 @@ class TestMambaLayer:
         assert norm.call_args.args[0] is hidden_states
         torch.testing.assert_close(residual, hidden_states.to(residual.dtype), rtol=0, atol=0)
 
-        output = self.layer._apply_mixer_bda(
-            (torch.zeros_like(branch_input), None),
-            residual,
-            connection_state=(hidden_states,),
-            recompute_context=context,
+        mixer_output = (torch.zeros_like(branch_input), None)
+        output = self.layer._apply_mixer_update(
+            mixer_output, residual, connection_state=(hidden_states,), recompute_context=context
         )
+        apply_bda.assert_called_once_with(mixer_output, residual)
         assert output.dtype == residual.dtype
         torch.testing.assert_close(output, residual, rtol=0, atol=0)
 
@@ -137,7 +144,10 @@ class TestMambaLayer:
             pytest.fail("Wide Mamba must dispatch residual policy through its own overrides")
 
         monkeypatch.setattr(MambaLayer, "_prepare_mixer_input", fail_base_residual_policy)
+        monkeypatch.setattr(MambaLayer, "_prepare_residual", fail_base_residual_policy)
         monkeypatch.setattr(MambaLayer, "_apply_mixer_bda", fail_base_residual_policy)
+        monkeypatch.setattr(MambaLayer, "_prepare_mixer_state", fail_base_residual_policy)
+        monkeypatch.setattr(MambaLayer, "_apply_mixer_update", fail_base_residual_policy)
         dtype = torch.float32 if fp32_residual else torch.bfloat16
         hidden_states = torch.randn(16, 2, 3 * config.hidden_size, device="cuda", dtype=dtype)
         atomic_input = hidden_states.detach().clone().requires_grad_(True)
@@ -169,7 +179,7 @@ class TestMambaLayer:
             layer.forward_post_core_attn(*stage_state[:2])
 
         write = Mock(return_value=split_output)
-        monkeypatch.setattr(layer, "_apply_mixer_bda", write)
+        monkeypatch.setattr(layer, "_apply_mixer_update", write)
         recompute_context = object()
         assert (
             layer.forward_post_core_attn(
