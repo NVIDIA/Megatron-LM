@@ -69,10 +69,24 @@ def residual_stream_recompute_enabled(config: TransformerConfig, training: bool)
 def build_residual_stream_recompute_plan(
     num_layers: int, block_size: int | None, *, atomic_layer_pairs: Sequence[tuple[int, int]] = ()
 ) -> list[ResidualStreamRecomputeContext]:
-    """Partition local layers into independent ordered replay blocks.
+    """Partition local physical layers into independent ordered replay blocks.
 
-    ``atomic_layer_pairs`` keeps adjacent physical layers in the same replay block when the
-    first layer produces a replay-owned activation consumed by the second.
+    Shortcut MoE's predecessor (e.g. attention or Mamba) and paired MoE layer share
+    replay-owned intermediates, so a replay block must not end between them.
+
+    Args:
+        num_layers: Local physical layer count, before shortcut wrapper grouping.
+        block_size: Target maximum physical layers per block; None uses the entire local stack.
+            A pair stays intact even when block_size=1, forming a two-layer block.
+        atomic_layer_pairs: Disjoint adjacent pairs of zero-based local physical layer indices
+            that must share one replay manager.
+
+    Returns:
+        One context per physical layer, sharing a manager within each block. Only the block's
+        final layer has is_block_end=True.
+
+    For example, four layers with block_size=3 and pairs (0, 1), (2, 3) form blocks
+    [0, 1] and [2, 3], not [0, 1, 2] and [3].
     """
 
     if num_layers < 0:
@@ -107,6 +121,7 @@ def build_residual_stream_recompute_plan(
         paired_indices.update((start, end))
 
     effective_block_size = block_size or num_layers
+    # Treat each unpaired layer or complete pair as one indivisible unit.
     atomic_units = []
     layer_index = 0
     while layer_index < num_layers:
@@ -114,6 +129,7 @@ def build_residual_stream_recompute_plan(
         atomic_units.append((layer_index, unit_end))
         layer_index = unit_end + 1
 
+    # Pack whole units in order, shortening a block instead of splitting a pair.
     block_ends: set[int] = set()
     layers_in_block = 0
     for unit_start, unit_end in atomic_units:
@@ -127,6 +143,7 @@ def build_residual_stream_recompute_plan(
             layers_in_block = 0
     block_ends.add(num_layers - 1)
 
+    # Keep physical-layer indexing while sharing one manager across each replay block.
     contexts = []
     manager = CheckpointWithoutOutputManager()
     for layer_index in range(num_layers):
