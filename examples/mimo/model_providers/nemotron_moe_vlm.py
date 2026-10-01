@@ -56,8 +56,9 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     """Register the model-provider args for hetero MIMO examples.
 
     Only the provider/vision knobs this PR consumes are declared here; stock
-    ``arguments.py`` owns the ``TransformerConfig`` field flags and
-    ``radio_encoder`` owns the RADIO-encoder knobs.
+    ``arguments.py`` owns the ``TransformerConfig`` field flags,
+    ``radio_encoder`` owns the RADIO-encoder knobs, and rope2d_vit_vlm owns the
+    --mimo-vision-* architecture knobs.
     """
     # Imported lazily: rope2d_vit_vlm imports language_model_spec from this module.
     from examples.mimo.model_providers.rope2d_vit_vlm import add_rope2d_vit_args

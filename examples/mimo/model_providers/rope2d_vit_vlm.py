@@ -54,7 +54,11 @@ _REQUIRED_VISION_ARGS = (
 
 
 def _unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
-    """Fast GELU without the global MCore torch.compile decorator."""
+    """Fast GELU without the global MCore torch.compile decorator.
+
+    The projector input's token count varies with the number and size of images per batch, so a
+    compiled activation would recompile for each new shape.
+    """
     return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
 
