@@ -2,17 +2,15 @@
 
 """Side-by-side leaderboard from ``nsys stats nvtx_sum`` CSVs (det vs nondet).
 
-Usage: ``python print_nsys_leaderboard.py LEADERBOARD_DIR [LOG_DIR]``.
-If LOG_DIR is given, also check det/nondet step-time ratio < MAX_DET_NONDET_RATIO.
+Usage: ``python print_nsys_leaderboard.py LEADERBOARD_DIR``.
+This is an attribution report; performance gates use unprofiled paired measurements.
 """
+
 import csv
-import glob
 import re
 import sys
 from pathlib import Path
 
-MAX_DET_NONDET_RATIO = 1.35
-MEASUREMENT_ITER = 5  # steady-state; iter 7 is noisy under nsys profile teardown
 LEADERBOARD_TOP_N = 20
 # Strip per-call-site ``, op_id = N`` and autograd-engine ``, seq = N`` so
 # identical op kinds aggregate across det/nondet.
@@ -82,45 +80,15 @@ def print_leaderboard(det, non, top_n=LEADERBOARD_TOP_N):
     _print_table("op-level — aten / NCCL / kernels", buckets["op"], det, non, top_n)
 
 
-def step_time_from_log_dir(log_dir, mode, iteration):
-    """Read ``elapsed time per iteration (ms)`` for ``iteration`` from torchrun stdout."""
-    pat = re.compile(r"iteration\s+(\d+)/\s*\d+.*elapsed time per iteration \(ms\):\s*([\d.]+)")
-    pattern = f"{glob.escape(log_dir)}/torchrun-{mode}/**/stdout.log"
-    for path in glob.glob(pattern, recursive=True):
-        with open(path) as f:
-            for line in f:
-                m = pat.search(line)
-                if m and int(m.group(1)) == iteration:
-                    return float(m.group(2))
-    return None
-
-
-def check_step_time_ratio(log_dir):
-    det_ms = step_time_from_log_dir(log_dir, "det", MEASUREMENT_ITER)
-    non_ms = step_time_from_log_dir(log_dir, "nondet", MEASUREMENT_ITER)
-    if det_ms is None or non_ms is None:
-        return f"missing step time for iter {MEASUREMENT_ITER} (det={det_ms}, nondet={non_ms})"
-    ratio = det_ms / non_ms
-    print(
-        f"\nstep_time iter={MEASUREMENT_ITER}: det={det_ms:.2f}ms nondet={non_ms:.2f}ms "
-        f"ratio={ratio:.2f}x (threshold {MAX_DET_NONDET_RATIO:.2f}x)"
-    )
-    if ratio > MAX_DET_NONDET_RATIO:
-        return f"det {ratio:.2f}x slower than nondet (> {MAX_DET_NONDET_RATIO:.2f}x)"
-    return None
-
-
 def main():
+    if len(sys.argv) > 2:
+        sys.exit("Usage: print_nsys_leaderboard.py LEADERBOARD_DIR (diagnostic only)")
     leaderboard_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "logs/perf-leaderboards")
     det = load_nsys_csv(leaderboard_dir / "nsys-det.csv")
     non = load_nsys_csv(leaderboard_dir / "nsys-nondet.csv")
     if not (det and non):
         sys.exit(f"need both CSVs: det={len(det)}, nondet={len(non)} rows")
     print_leaderboard(det, non)
-    if len(sys.argv) > 2 and sys.argv[2]:
-        failure = check_step_time_ratio(sys.argv[2])
-        if failure:
-            sys.exit(f"FAIL: {failure}")
 
 
 if __name__ == "__main__":

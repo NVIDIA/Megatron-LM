@@ -18,5 +18,4 @@ for MODE in det nondet; do
   nsys stats --force-export=true --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"
 done
 
-# LOG_DIR (if set by caller) enables the step-time regression check.
-python "$(dirname "$0")/print_nsys_leaderboard.py" "$OUT" ${LOG_DIR:+"$LOG_DIR"}
+python "$(dirname "$0")/print_nsys_leaderboard.py" "$OUT"
