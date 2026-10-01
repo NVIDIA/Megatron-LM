@@ -3,34 +3,43 @@
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
 
+from functools import cache
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
 
-def _clamp_includes_boundaries():
-    """Read the installed scalar-clamp subgradient without initializing CUDA or RNGs."""
+@cache
+def _probe_clamp_boundaries():
+    """Read the installed scalar-clamp subgradient using only CPU constants."""
     # PyTorch changed this within the 2.14 development series, so a version check
     # cannot distinguish builds. FunctionsManual.cpp at b2c75dd062 uses strict
     # inequalities; 4fdf77b940 uses inclusive ones. Probe both scalar-clamp forms
-    # once on CPU, including imports under no_grad or inference_mode.
-    with torch.inference_mode(False), torch.enable_grad():
+    # once on CPU, including calls under no_grad or inference_mode.
+    # This zero-input probe needs real CPU constants, even during fake tracing.
+    with unset_fake_temporarily(), torch.inference_mode(False), torch.enable_grad():
         gate = torch.tensor(1.0, dtype=torch.float32, device="cpu", requires_grad=True)
         linear = torch.tensor([-1.0, 1.0], dtype=torch.float32, device="cpu", requires_grad=True)
         gate_grad, linear_grad = torch.autograd.grad(
             gate.clamp(max=1.0) + linear.clamp(min=-1.0, max=1.0).sum(), (gate, linear)
         )
-    gradients = [gate_grad.item(), *linear_grad.tolist()]
+        gradients = [gate_grad.item(), *linear_grad.tolist()]
     if gradients not in ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]):
         raise RuntimeError(f"Unsupported scalar-clamp boundary gradients: {gradients}")
     return gradients[0] == 1.0
 
 
-_CLAMP_INCLUDES_BOUNDARIES = _clamp_includes_boundaries()
+@torch.compiler.assume_constant_result
+def _clamp_includes_boundaries():
+    # Delay autograd initialization until this clamped backward is actually used.
+    # Keep the cached probe outside tracing and specialize only its Python bool.
+    return _probe_clamp_boundaries()
+
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
@@ -184,7 +193,7 @@ def clamped_swiglu_back(g, y, clamp_value):
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1c = y_1.clamp(min=None, max=clamp_value)
     y_2c = y_2.clamp(min=-clamp_value, max=clamp_value)
-    if _CLAMP_INCLUDES_BOUNDARIES:
+    if _clamp_includes_boundaries():
         gate_mask = y_1 <= clamp_value
         linear_mask = (y_2 >= -clamp_value) & (y_2 <= clamp_value)
     else:
