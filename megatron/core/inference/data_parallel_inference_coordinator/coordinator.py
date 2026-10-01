@@ -18,6 +18,7 @@ from megatron.core.inference.config import (
     MediaCacheCoordinatorPolicy,
     PrefixCachingCoordinatorPolicy,
 )
+from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.utils import detokenize_tokens
@@ -87,6 +88,8 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
+    disagg: DisaggCoordinatorRuntime | None = None
+
     # Exposed as a class attribute for backwards compatibility; the canonical
     # definition lives in state.py.
     CoordinatorState = CoordinatorState
@@ -113,6 +116,7 @@ class DataParallelInferenceCoordinator:
         vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
     ):
         """
         Initializes the inference coordinator.
@@ -263,6 +267,7 @@ class DataParallelInferenceCoordinator:
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
+        self.disagg = DisaggCoordinatorRuntime(self) if disaggregated else None
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -312,6 +317,8 @@ class DataParallelInferenceCoordinator:
         rebuild are acceptable because the number of connected engines is small; optimize
         only if dynamic registration/deregistration at high engine counts becomes a use case.
         """
+        if identity not in self.identities_of_data_parallel_ranks:
+            return
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
         self._media_cache_affinity = OrderedDict(
@@ -343,28 +350,32 @@ class DataParallelInferenceCoordinator:
             if new_row:
                 new_hash_table[h] = new_row
         self._hash_table = new_hash_table
+        # Remove role routing and fail disaggregated work assigned to the dead engine.
+        if self.disagg is not None:
+            self.disagg.remove_engine(identity)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, frames):
-        """Send a message to an engine, removing it from the pool if unreachable.
+    def _send_to_engine(self, identity, frames, *, remove_unreachable=True):
+        """Send a message to an engine, optionally removing it if unreachable.
 
         Args:
             identity: ZMQ identity of the target engine.
             frames (list): Raw frames to send, metadata frame first.
 
         Returns:
-            True if the send succeeded, False if the engine was unreachable and removed.
+            True if the send succeeded, otherwise False.
         """
         try:
             self.router_socket.send_multipart([identity, *frames])
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
-                self._remove_engine(identity)
+                if remove_unreachable:
+                    self._remove_engine(identity)
                 return False
             raise
 
@@ -660,6 +671,7 @@ class DataParallelInferenceCoordinator:
         vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -704,6 +716,7 @@ class DataParallelInferenceCoordinator:
             vision_embedding_cache_enabled=vision_embedding_cache_enabled,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            disaggregated=disaggregated,
         )
         ready_event.set()
         try:

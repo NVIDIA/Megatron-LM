@@ -63,6 +63,31 @@ def message_handler(*headers):
     return decorator
 
 
+@message_handler(Headers.REGISTER_ROLE)
+def handle_register_role(coordinator, sender_identity, metadata, bodies):
+    """Register a coordinator-native prefill or decode engine."""
+
+    try:
+        if coordinator.disagg is None:
+            raise ValueError("REGISTER_ROLE requires a disaggregated coordinator")
+        _, role, transport, instance_meta = metadata
+        coordinator.disagg.register_engine(sender_identity, role, transport, instance_meta)
+    except (KeyError, TypeError, ValueError) as error:
+        logging.warning(
+            "Coordinator: rejecting role registration from %r: %s", sender_identity, error
+        )
+        coordinator.router_socket.send_multipart(
+            [
+                sender_identity,
+                msgpack.packb([Headers.REQUEST_ERROR.value, str(error)], use_bin_type=True),
+            ]
+        )
+        return
+    coordinator.router_socket.send_multipart(
+        [sender_identity, msgpack.packb([Headers.REGISTER_ROLE_ACK.value], use_bin_type=True)]
+    )
+
+
 @message_handler(Headers.CONNECT)
 def handle_connect(coordinator, sender_identity, metadata, bodies):
     """Handshake with a new client, replying with a CONNECT_ACK.
@@ -141,6 +166,14 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     media_frame = bodies[2]
     offload_frame = bodies[3]
 
+    disagg_prompt = None
+    if coordinator.disagg is not None:
+        media_payload = msgpack.unpackb(media_frame, raw=False)
+        assert (
+            not media_meta and not media_payload
+        ), "native disaggregation does not support multimodal requests"
+        disagg_prompt = msgpack.unpackb(prompt_frame, raw=False)
+
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
     request_id = coordinator.next_request_id
@@ -148,6 +181,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
+
+    if coordinator.disagg is not None:
+        coordinator.disagg.route_submit(request_id, disagg_prompt, sampling_params)
+        return
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
@@ -395,6 +432,18 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
+        if coordinator.disagg is not None and fid in coordinator.disagg.hop1_request_ids:
+            finished_request = msgpack.unpackb(body, raw=False)
+            coordinator.disagg.handle_prefill_done(fid, finished_request)
+            continue
+
+        if fid not in coordinator.request_id_to_client_id:
+            logging.warning(
+                "Coordinator: ignoring duplicate or late ENGINE_REPLY for request %d from %r",
+                fid,
+                sender_identity,
+            )
+            continue
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
@@ -406,6 +455,8 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             if idx is not None:
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
+        if coordinator.disagg is not None:
+            coordinator.disagg.handle_decode_done(fid)
 
         if needs_detokenize:
             # Detokenization writes generated_text into the reply, so the body must
@@ -419,6 +470,89 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
         coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
+
+
+@message_handler(Headers.KV_READ_DONE)
+def handle_kv_read_done(coordinator, sender_identity, metadata, bodies):
+    """Release prefill-owned cache storage after decode imports it."""
+
+    if coordinator.disagg is None:
+        logging.warning("Coordinator: ignoring KV_READ_DONE without disaggregation enabled")
+        return
+    coordinator.disagg.handle_kv_read_done(sender_identity, int(metadata[1]))
+
+
+@message_handler(Headers.KV_TRANSFER_READY)
+def handle_kv_transfer_ready(coordinator, sender_identity, metadata, bodies):
+    """Start NCCL sends after decode commits the matching destinations."""
+
+    if coordinator.disagg is None:
+        logging.warning("Coordinator: ignoring KV_TRANSFER_READY without disaggregation enabled")
+        return
+    coordinator.disagg.handle_kv_transfer_ready(sender_identity, int(metadata[1]), int(metadata[2]))
+
+
+@message_handler(Headers.REQUEST_ERROR)
+def handle_request_error(coordinator, sender_identity, metadata, bodies):
+    """Forward a terminal engine-side request failure to its client."""
+
+    request_id, reason, source_safe = int(metadata[1]), str(metadata[2]), bool(metadata[3])
+    if coordinator.disagg is not None:
+        coordinator.disagg.handle_engine_failure(request_id, reason, source_safe=source_safe)
+        return
+
+    client_identity = coordinator.request_id_to_client_id.get(request_id)
+    client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+    if client_identity is None or client_request_id is None:
+        return
+    coordinator.router_socket.send_multipart(
+        [
+            client_identity,
+            msgpack.packb(
+                [Headers.REQUEST_ERROR.value, client_request_id, reason, source_safe],
+                use_bin_type=True,
+            ),
+        ]
+    )
+    if source_safe:
+        coordinator.request_id_to_client_id.pop(request_id, None)
+        coordinator.request_id_to_client_request_id.pop(request_id, None)
+        coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+        assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+        if assigned_rank is not None:
+            index = coordinator.identity_to_rank_index.get(assigned_rank)
+            if index is not None and coordinator._pending_counts[index] > 0:
+                coordinator._pending_counts[index] -= 1
+
+
+@message_handler(Headers.REQUEST_ABORTED)
+def handle_request_aborted(coordinator, sender_identity, metadata, bodies):
+    """Forward engine cancellation completion to the requesting client."""
+
+    request_id, source_safe = int(metadata[1]), bool(metadata[2])
+    if coordinator.disagg is not None:
+        coordinator.disagg.handle_engine_aborted(request_id, source_safe=source_safe)
+        return
+    if not source_safe:
+        return
+    client_identity = coordinator.request_id_to_client_id.pop(request_id, None)
+    client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
+    assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+    if assigned_rank is not None:
+        index = coordinator.identity_to_rank_index.get(assigned_rank)
+        if index is not None and coordinator._pending_counts[index] > 0:
+            coordinator._pending_counts[index] -= 1
+    if client_identity is None or client_request_id is None:
+        return
+    coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+    coordinator.router_socket.send_multipart(
+        [
+            client_identity,
+            msgpack.packb(
+                [Headers.REQUEST_ABORTED.value, client_request_id, source_safe], use_bin_type=True
+            ),
+        ]
+    )
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
@@ -441,8 +575,13 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
         return
     for request_id, body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[request_id]
-        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+        if client_identity is None or client_request_id is None:
+            logging.warning(
+                "Coordinator: ignoring late ENGINE_REPLY_PARTIAL for request %d", request_id
+            )
+            continue
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
         coordinator.router_socket.send_multipart(
@@ -472,6 +611,9 @@ def handle_abort_request(coordinator, sender_identity, metadata, bodies):
     client_request_id = int(metadata[1])
     request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
     if request_id is None:
+        return
+    if coordinator.disagg is not None:
+        coordinator.disagg.abort_request(request_id)
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)
     if assigned_rank is not None:

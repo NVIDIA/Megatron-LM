@@ -59,6 +59,49 @@ def test_coordinator_registers_client_kv_handoff_handlers():
     assert Headers.RELEASE_KV in HANDLERS
 
 
+def test_invalid_role_registration_replies_without_raising():
+    coordinator = unittest.mock.MagicMock()
+    coordinator.disagg = None
+
+    HANDLERS[Headers.REGISTER_ROLE](
+        coordinator, b"engine", [Headers.REGISTER_ROLE.value, "prefill", "nixl", []], []
+    )
+
+    reply = msgpack.unpackb(
+        coordinator.router_socket.send_multipart.call_args.args[0][1], raw=False
+    )
+    assert Headers(reply[0]) == Headers.REQUEST_ERROR
+
+
+def test_native_disaggregation_asserts_on_multimodal_requests():
+    coordinator = unittest.mock.MagicMock(
+        known_clients={b"client"},
+        next_request_id=0,
+        request_id_to_client_id={},
+        request_id_to_client_request_id={},
+        client_request_to_request_id={},
+    )
+
+    with pytest.raises(
+        AssertionError, match="native disaggregation does not support multimodal requests"
+    ):
+        HANDLERS[Headers.SUBMIT_REQUEST](
+            coordinator,
+            b"client",
+            [Headers.SUBMIT_REQUEST.value, 7, {}, None],
+            [
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+                msgpack.packb({"image": [b"image"]}, use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+        )
+
+    coordinator.disagg.route_submit.assert_not_called()
+    assert coordinator.next_request_id == 0
+    assert not coordinator.request_id_to_client_id
+
+
 class _StubCoordinator:
     """Minimal stand-in exposing only what the submit handlers touch."""
 
@@ -228,6 +271,8 @@ class DummyEngine(DynamicInferenceEngine):
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
+        self._disagg_config = None
+        self._kv_transfer_role = None
         self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
@@ -1032,6 +1077,59 @@ class TestRoutingPolicies:
         assert coord.tokenizer.detokenize_calls == [[10, 11, 12]]
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
+
+        # A duplicated or delayed completion cannot be routed after the first
+        # reply releases its client mapping, but it must not kill the coordinator.
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", *reply(11))
+        assert "duplicate or late ENGINE_REPLY" in caplog.text
+        assert coord.router_socket.send_multipart.call_count == 1
+
+    def test_unsafe_terminal_error_keeps_routing_until_safety_ack(self):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {11: b"rank-0"}
+        coord._pending_counts[0] = 1
+
+        HANDLERS[Headers.REQUEST_ERROR](
+            coord, b"rank-0", [Headers.REQUEST_ERROR.value, 11, "failed", False], []
+        )
+
+        assert coord.request_id_to_client_id == {11: b"client-A"}
+        assert coord.request_id_to_client_request_id == {11: 7}
+        assert coord.client_request_to_request_id == {(b"client-A", 7): 11}
+        assert coord.request_id_to_rank == {11: b"rank-0"}
+        assert coord._pending_counts[0] == 1
+
+        HANDLERS[Headers.REQUEST_ABORTED](
+            coord, b"rank-0", [Headers.REQUEST_ABORTED.value, 11, True], []
+        )
+
+        assert coord.request_id_to_client_id == {}
+        assert coord.request_id_to_client_request_id == {}
+        assert coord.client_request_to_request_id == {}
+        assert coord.request_id_to_rank == {}
+        assert coord._pending_counts[0] == 0
+
+    def test_late_partial_reply_is_ignored(self, caplog):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {}
+        coord.request_id_to_client_request_id = {}
+
+        with caplog.at_level(logging.WARNING):
+            HANDLERS[Headers.ENGINE_REPLY_PARTIAL](
+                coord,
+                b"rank-0",
+                [Headers.ENGINE_REPLY_PARTIAL.value, [11]],
+                [msgpack.packb({"request_id": 11}, use_bin_type=True)],
+            )
+
+        assert "late ENGINE_REPLY_PARTIAL" in caplog.text
+        coord.router_socket.send_multipart.assert_not_called()
 
 
 def test_engine_reply_defaults_to_detokenizing():
