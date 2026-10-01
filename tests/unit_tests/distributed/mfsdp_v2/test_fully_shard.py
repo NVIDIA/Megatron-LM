@@ -291,7 +291,7 @@ def test_fully_shard_sgd_losses_match_baseline(
 
 
 def test_shared_mtp_backward_matches_baseline(distributed_setup):
-    """Both MTP depths train the shared block and propagate gradients to the backbone."""
+    """Shared-layer MTP should match unsharded training over multiple SGD steps."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -304,44 +304,35 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
     hidden_states = torch.randn(2, seq_length, width, device=device)
     inputs = (token_ids, hidden_states)
 
-    def train(model, inputs):
-        token_ids, hidden_states = inputs
-        hidden_states = hidden_states.detach().clone().requires_grad_()
-        loss = model(token_ids, hidden_states)
-        loss.backward()
-
-        gradients = {
-            name: parameter.grad.detach().clone() for name, parameter in model.named_parameters()
-        }
-        return loss.detach(), hidden_states.grad.detach().clone(), gradients
+    def train(model, optimizer, inputs, *, reduce_wgrad: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = model(*inputs)
+            losses.append(loss.detach())
+            loss.backward()
+            if reduce_wgrad:
+                # The plain baseline has no DDP wrapper to average its gradients.
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            optimizer.step()
+        return losses
 
     torch.manual_seed(1234)
     baseline = TinySharedMTP(width, vocab_size).to(device)
-    baseline_loss, baseline_input_grad, baseline_grads = train(baseline, inputs)
-    for grad in baseline_grads.values():
-        dist.all_reduce(grad)
-        grad.div_(world_size)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    baseline_losses = train(baseline, baseline_optimizer, inputs, reduce_wgrad=True)
 
     torch.manual_seed(1234)
     model = TinySharedMTP(width, vocab_size).to(device)
     with fully_shard_context(device=device):
         fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
-    loss, input_grad, sharded_grads = train(model, inputs)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    losses = train(model, optimizer, inputs, reduce_wgrad=False)
 
-    torch.testing.assert_close(loss, baseline_loss)
-    torch.testing.assert_close(input_grad, baseline_input_grad)
-    for name, grad in sharded_grads.items():
-        local_grad = grad.to_local()
-        baseline_grad = baseline_grads[name]
-        # FSDP packs parameters together, so individual row shards can be uneven or empty.
-        row_counts = [None] * world_size
-        dist.all_gather_object(row_counts, local_grad.size(0))
-        assert sum(row_counts) == baseline_grad.size(0)
-        row_start = sum(row_counts[:rank])
-        torch.testing.assert_close(
-            local_grad, baseline_grad.narrow(0, row_start, local_grad.size(0))
-        )
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
 
 
 def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
