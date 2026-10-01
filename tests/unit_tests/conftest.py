@@ -29,6 +29,14 @@ def pytest_configure(config):
     """
     os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    # Determinism tests declare their evidence cases with these markers; the
+    # opt-in tools.determinism.pytest_plugin records them when it is loaded.
+    config.addinivalue_line(
+        "markers", "determinism_case(op_id, implementation): measured kernel replay case"
+    )
+    config.addinivalue_line(
+        "markers", "determinism_model(model_id, parallelism=None): model output/gradient replay"
+    )
 
 
 def pytest_addoption(parser):

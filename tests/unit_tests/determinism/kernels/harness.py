@@ -19,10 +19,15 @@ Sizing matters more than replay count: a reduction with two contending blocks ca
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
+import json
+import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from tests.unit_tests.determinism.comparison import _as_bytes, bytes_equal
 from tests.unit_tests.determinism.utils import (
     RacingStreams,
     capture_rng_state,
@@ -30,10 +35,82 @@ from tests.unit_tests.determinism.utils import (
     restore_rng_state,
     zero_grads,
 )
+from tools.determinism.coverage import (
+    ReplayMismatch,
+    is_recording,
+    observe_replay,
+    runtime_signature,
+)
 
 # Shapes that make many CTAs contend on shared outputs. A token count of a few thousand
 # with a hidden size of ~1-4k puts dozens of blocks on every reduction.
 CONTENTION_TOKENS = 4096
+
+
+def _input_signature(value):
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "stride": list(value.stride()),
+            "dtype": str(value.dtype),
+            "requires_grad": value.requires_grad,
+        }
+    if isinstance(value, dict):
+        return {str(key): _input_signature(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_input_signature(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    return {"type": type(value).__qualname__}
+
+
+def replay_signature(inputs: Any, *, backward: bool, configuration: Optional[dict] = None) -> dict:
+    """Share the actual dispatch signature with checks of the same outputs/gradients."""
+    signature = {
+        "inputs": _input_signature(inputs),
+        "phase": "forward_backward" if backward else "forward",
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "runtime": runtime_signature(torch),
+    }
+    if configuration is not None:
+        # Require explicit JSON values, not a lossy type-only encoding of
+        # opaque objects (e.g. two different torch.dtype settings).
+        signature["configuration"] = json.loads(json.dumps(configuration, allow_nan=False))
+    return signature
+
+
+def _recorded_replay(replay):
+    """Observe the existing protocol only inside explicitly annotated pytest cases."""
+
+    @functools.wraps(replay)
+    def wrapped(*args, **kwargs):
+        if not is_recording():
+            return replay(*args, **kwargs)
+        bound = inspect.signature(replay).bind(*args, **kwargs)
+        bound.apply_defaults()
+        options = bound.arguments
+        signature = replay_signature(
+            options["inputs"], backward=options["backward"], configuration=options["configuration"]
+        )
+        protocol = {key: options[key] for key in ("replays", "contention", "restore_rng")}
+        protocol["contention_requested"] = protocol["contention"]
+        protocol["contention"] = bool(
+            protocol["contention"] and os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "8") != "1"
+        )
+        protocol.update(
+            scope="same_process_outputs_and_gradients",
+            what=options["what"],
+            warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+        with observe_replay(signature, protocol) as observation:
+            result = replay(*args, **kwargs)
+            observation.update(
+                compared_outputs=sum(t.numel() > 0 for t in result[0].values()),
+                compared_gradients=sum(t.numel() > 0 for t in result[1].values()),
+            )
+            return result
+
+    return wrapped
 
 
 def _clone_preserving_layout(t: torch.Tensor) -> torch.Tensor:
@@ -86,25 +163,6 @@ def flatten_tensors(obj: Any, prefix: str = "out") -> Dict[str, torch.Tensor]:
 
 def _leaf_inputs(inputs: Any, prefix: str = "in") -> Dict[str, torch.Tensor]:
     return {name: t for name, t in flatten_tensors(inputs, prefix).items() if t.requires_grad}
-
-
-def _as_bytes(t: torch.Tensor) -> torch.Tensor:
-    """The logical contents of ``t`` as a flat ``uint8`` tensor (layout-independent)."""
-    return t.detach().contiguous().reshape(-1).view(torch.uint8)
-
-
-def bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """True iff ``a`` and ``b`` have the same shape and dtype and identical bit patterns.
-
-    Stricter than ``torch.equal``: ``+0.0`` and ``-0.0`` differ, and NaNs only match when
-    their payloads match. Strides are not compared -- both operands are read in logical
-    order -- so a kernel may return a differently laid out tensor with the same contents.
-    """
-    if a.shape != b.shape or a.dtype != b.dtype:
-        return False
-    if a.numel() == 0:
-        return True
-    return bool(torch.equal(_as_bytes(a), _as_bytes(b)))
 
 
 def _describe_mismatch(name: str, a: torch.Tensor, b: torch.Tensor) -> str:
@@ -164,6 +222,7 @@ def run_once(
     return {k: v.detach().clone() for k, v in outputs.items()}, grads
 
 
+@_recorded_replay
 def assert_replays_bit_exact(
     fn: Callable[..., Any],
     inputs: Any,
@@ -174,6 +233,7 @@ def assert_replays_bit_exact(
     contention: bool = False,
     restore_rng: bool = False,
     what: str = "kernel",
+    configuration: Optional[dict] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Assert that ``replays`` runs of ``fn`` on identical inputs are byte-identical.
 
@@ -192,6 +252,9 @@ def assert_replays_bit_exact(
         restore_rng: snapshot every RNG before the reference run and restore it before
             each replay -- for kernels that consume random numbers (dropout).
         what: label for error messages.
+        configuration: JSON dispatch options held outside the input arguments;
+            included in evidence signatures so a recipe without an adapter cannot
+            reuse a closure's or module's incomplete input signature.
 
     Returns:
         The reference outputs and gradients (for follow-up assertions).
@@ -218,7 +281,7 @@ def assert_replays_bit_exact(
 def _assert_replay_matches(i, ref_out, ref_grad, out, grad, what) -> None:
     """Raise if replay ``i`` differs from the reference in any output or gradient tensor."""
     if out.keys() != ref_out.keys() or grad.keys() != ref_grad.keys():
-        raise AssertionError(
+        raise ReplayMismatch(
             f"{what}: replay {i} returned different tensors "
             f"({sorted(out)}/{sorted(grad)} vs {sorted(ref_out)}/{sorted(ref_grad)})"
         )
@@ -232,7 +295,7 @@ def _assert_replay_matches(i, ref_out, ref_grad, out, grad, what) -> None:
         if not bytes_equal(ref_grad[name], grad[name])
     ]
     if mismatches:
-        raise AssertionError(
+        raise ReplayMismatch(
             f"{what} is not bit-exact across replays (replay {i} vs 1):\n  "
             + "\n  ".join(mismatches)
         )
@@ -309,6 +372,7 @@ def _module_fwd_bwd(module, inputs, grad_output, backward):
     return {k: v.detach().clone() for k, v in outputs.items()}, grads
 
 
+@_recorded_replay
 def assert_module_replays_bit_exact(
     module: torch.nn.Module,
     inputs: Any,
@@ -319,6 +383,7 @@ def assert_module_replays_bit_exact(
     contention: bool = False,
     restore_rng: bool = True,
     what: str = "module",
+    configuration: Optional[dict] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Module-level twin of ``assert_replays_bit_exact``.
 
