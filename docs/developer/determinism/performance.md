@@ -187,7 +187,7 @@ python tests/performance_tests/shell_test_utils/determinism/baseline.py publish 
   --coverage /tmp/coverage-logs/determinism-coverage.json \
   --leaderboard /tmp/perf-logs/kernel-leaderboard/leaderboard.json \
   --revision <full-source-revision> \
-  --origin <CI-run-or-execution-reference> \
+  --origin <run-reference> \
   --store /shared/determinism-baselines
 ```
 
@@ -216,15 +216,16 @@ python tests/performance_tests/shell_test_utils/determinism/baseline.py verify \
 
 Verification checks the complete file inventory and recomputes the numerical
 evidence/timing join again. Hashes check integrity, not execution authenticity;
-the origin is supplied by the publisher and should reference the actual CI run.
+the origin is supplied by the publisher and should identify the run that produced
+the inputs.
 The coverage aggregate retains observations and checks; this tool does not
 reconstruct it from pytest shards or independently rerun GPU comparisons.
 
 Unbudgeted bundles remain `not_gated`. Publication never assigns limits, promotes
 historical timings into a performance pass, or makes cross-allocation timings
 equivalent to paired base/head measurements. H100 and GB200 remain separate
-contexts. Retain the content-addressed store in durable storage; the ordinary CI
-log artifact's retention period alone does not provide permanent publication.
+contexts. Keep the content-addressed store in durable storage; temporary run
+outputs alone do not provide permanent publication.
 
 ### Compare retained calibration runs
 
