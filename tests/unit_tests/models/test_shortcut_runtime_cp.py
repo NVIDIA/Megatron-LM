@@ -19,9 +19,10 @@ def test_shortcut_router_receives_runtime_cp_metadata(cp_size):
     packed = PackedSeqParams(local_cp_size=cp_size, cp_group=SimpleNamespace(size=lambda: cp_size))
     calls = []
 
-    def unflatten(value, padding_mask, packed_seq_params):
+    def unflatten(value, padding_mask, input_ids, packed_seq_params):
+        assert input_ids is None
         assert padding_mask is mask and packed_seq_params is packed
-        return value, padding_mask, None
+        return value, padding_mask, None, None
 
     def route(value, padding_mask, packed_seq_params=None):
         assert padding_mask is mask and packed_seq_params is packed
