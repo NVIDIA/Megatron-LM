@@ -335,8 +335,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                 required_pgs=['tp', 'cp', 'dp']
             )
-        assert 'tp' in vars(pg_collection), "Attention pg_collection must have tp process group"
-        assert 'cp' in vars(pg_collection), "Attention pg_collection must have cp process group"
+        for group_name in ('tp', 'cp'):
+            if group_name not in vars(pg_collection):
+                raise ValueError(f"Attention pg_collection must have {group_name} process group")
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -1836,9 +1837,10 @@ class SelfAttention(Attention):
         # Q & K layernorm parameters.
         # Only this consistency check needs the DP group, so it is required here rather than in
         # __init__, which requires tp/cp only.
-        assert (
-            getattr(self.pg_collection, 'dp', None) is not None
-        ), "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
+        if vars(self.pg_collection).get('dp') is None:
+            raise ValueError(
+                "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
+            )
         dp_group = self.pg_collection.dp
         rank = dp_group.rank()
         inputs = torch.stack(

@@ -2336,13 +2336,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
         for group_name in ('tp', 'cp', 'pp'):
-            assert (
-                getattr(pg_collection, group_name, None) is not None
-            ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
-        if self.config.mtp_hsm:
-            assert 'dp' in vars(
-                pg_collection
-            ), "MultiTokenPredictionBlock with HSM requires a dp process group"
+            if vars(pg_collection).get(group_name) is None:
+                raise ValueError(
+                    f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
+                )
+        if self.config.mtp_hsm and 'dp' not in vars(pg_collection):
+            raise ValueError("MultiTokenPredictionBlock with HSM requires a dp process group")
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."

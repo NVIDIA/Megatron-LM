@@ -2231,9 +2231,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 pg_collection, "cp"
             ), "TEDotProductAttention pg_collection must have cp pg"
             if cp_comm_type == "a2a+p2p":
-                assert "hcp" in vars(
-                    pg_collection
-                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+                if "hcp" not in vars(pg_collection):
+                    raise ValueError(
+                        "TEDotProductAttention pg_collection must have hierarchical cp pg"
+                    )
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
