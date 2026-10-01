@@ -268,6 +268,7 @@ class ShortcutMoEBlock(MegatronModule):
         else:
             shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
         if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            # Replay reconstructs this norm output; exclude it from saved-tensor offloading.
             self.off_interface.mark_not_offload(shortcut_input)
         shortcut_input, padding_mask, _, _ = self.moe_layer._maybe_unflatten_for_moe(
             shortcut_input, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
@@ -287,14 +288,14 @@ class ShortcutMoEBlock(MegatronModule):
         Returns:
             `(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)`.
         """
-        replay_kwargs = (
-            {"residual_stream_recompute_context": recompute_context}
-            if recompute_context is not None
-            else {}
-        )
-        pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
-            hidden_states, **replay_kwargs
-        )
+        if recompute_context is None:
+            pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+                hidden_states
+            )
+        else:
+            pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+                hidden_states, residual_stream_recompute_context=recompute_context
+            )
         pre_mlp_output, _, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
             pre_mlp_output, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
         )
@@ -330,18 +331,20 @@ class ShortcutMoEBlock(MegatronModule):
                 output = apply_module(self.shortcut_post_norm)(post_norm_input)
         output = post_norm_manager.group_offload(output, forced_released_tensors=[post_norm_input])
         if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            # Residual replay manages this write input; exclude it from saved-tensor offloading.
             self.off_interface.mark_not_offload(output)
         output = self.moe_layer._maybe_reflatten_from_moe(
             output, packed_seq_params, moe_unflatten_mbs
         )
-        replay_kwargs = (
-            {"residual_stream_recompute_context": recompute_context}
-            if recompute_context is not None
-            else {}
-        )
-        output = self.moe_layer._apply_mlp_bda_step(
-            (output, None), residual, mlp_state, **replay_kwargs
-        )
+        if recompute_context is None:
+            output = self.moe_layer._apply_mlp_bda_step((output, None), residual, mlp_state)
+        else:
+            output = self.moe_layer._apply_mlp_bda_step(
+                (output, None),
+                residual,
+                mlp_state,
+                residual_stream_recompute_context=recompute_context,
+            )
         return output[0] if isinstance(output, tuple) else output
 
     def _launch_dispatch(
@@ -414,11 +417,6 @@ class ShortcutMoEBlock(MegatronModule):
             if attn_recompute_context.is_block_end:
                 raise ValueError("A residual replay block cannot end inside a ShortcutMoE pair.")
 
-        attn_replay_kwargs = (
-            {"residual_stream_recompute_context": attn_recompute_context}
-            if attn_recompute_context is not None
-            else {}
-        )
         attn_config = self.attn_layer.config
         moe_config = self.moe_layer.config
         if cp_layout_state is not None:
@@ -449,14 +447,23 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            paired_state = self.attn_layer.forward_pre_attn_and_core_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                **attn_replay_kwargs,
-            )
+            if attn_recompute_context is None:
+                paired_state = self.attn_layer.forward_pre_attn_and_core_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                )
+            else:
+                paired_state = self.attn_layer.forward_pre_attn_and_core_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    residual_stream_recompute_context=attn_recompute_context,
+                )
 
         # Launch the dispatch, experts, and combine
         with quant_context_factory(moe_config, self.moe_layer_idx):
@@ -480,9 +487,12 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the output layer of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            attn_layer_output = self.attn_layer.forward_post_core_attn(
-                *paired_state, **attn_replay_kwargs
-            )
+            if attn_recompute_context is None:
+                attn_layer_output = self.attn_layer.forward_post_core_attn(*paired_state)
+            else:
+                attn_layer_output = self.attn_layer.forward_post_core_attn(
+                    *paired_state, residual_stream_recompute_context=attn_recompute_context
+                )
             if isinstance(attn_layer_output, tuple):
                 attn_layer_output = attn_layer_output[0]
 
