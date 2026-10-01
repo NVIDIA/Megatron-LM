@@ -32,6 +32,26 @@ both new examples and by the `advanced/` scripts.
 
 ### Offline inference
 
+#### Startup and checkpoint loading
+
+Generation entrypoints use `initialize_runtime_services_for_inference(args)` and
+`initialize_megatron(inference=True)`. They do not initialize the training
+microbatch calculator, training progress, autoresume, or training signal handlers.
+Request batching remains owned by the inference engine. The shared CLI parser
+still accepts legacy training batch-size flags; inference runtime setup does not
+consume them.
+
+`load_checkpoint_for_inference()` shares model loading and compatibility checks
+with training, but does not restore optimizer, scheduler, rerun, or consumed-sample
+state. Training-only iteration overrides are not applied. Existing
+`--no-load-rng` and `--finetune` behavior still controls RNG restoration.
+
+The training `--tp-comm-overlap` option is explicitly rejected by inference
+initialization until an inference-specific user-buffer sizing contract is
+validated. Inference-specific communication optimizations are unchanged.
+Forward-only evaluation through training schedules continues to use training
+initialization.
+
 `offline_inference.py` runs synthetic-load inference on a Megatron model and
 prints a setup-prefix line, a "Unique prompts + outputs" table, and a
 throughput summary. Optional JSON dump for regression testing via

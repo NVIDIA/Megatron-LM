@@ -52,7 +52,7 @@ from megatron.inference.utils import (
 )
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services_for_inference
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -268,8 +268,8 @@ def main():
         extra_args_provider=add_offline_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    initialize_runtime_services_for_inference(args)
+    initialize_megatron(inference=True)
     _validate_high_level_api_args(args)
 
     if os.environ.get("NSIGHT_PREFIX"):

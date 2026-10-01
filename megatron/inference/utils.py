@@ -28,7 +28,7 @@ from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.checkpointing import load_checkpoint
+from megatron.training.checkpointing import load_checkpoint_for_inference
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
 try:
@@ -97,10 +97,8 @@ def get_model_for_inference() -> MegatronModule:
     # Load checkpoint.
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
-    load_checkpoint(
-        ddp_model=model,
-        optimizer=None,
-        opt_param_scheduler=None,
+    load_checkpoint_for_inference(
+        model,
         strict=not args.inference_ckpt_non_strict,
     )
 

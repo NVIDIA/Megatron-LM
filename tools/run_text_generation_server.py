@@ -30,7 +30,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services_for_inference
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -46,7 +46,7 @@ sys.path.append(
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import load_checkpoint
+from megatron.training.checkpointing import load_checkpoint_for_inference
 from megatron.training.initialize import initialize_megatron
 
 
@@ -128,8 +128,8 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    initialize_runtime_services_for_inference(args)
+    initialize_megatron(inference=True)
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -158,7 +158,7 @@ def main(model_type: str = "gpt"):
             )
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None, strict=False)
+        _ = load_checkpoint_for_inference(model, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]

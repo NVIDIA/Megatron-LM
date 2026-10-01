@@ -23,7 +23,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
+from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint_for_inference
 
 # NOTE: ``get_model`` below does a ``from model import model_provider`` for the
 # ``examples/multimodal/model.py`` file, whose siblings use bare imports like
@@ -240,12 +240,7 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
-    load_checkpoint(
-        ddp_model=model,
-        optimizer=None,
-        opt_param_scheduler=None,
-        strict=not args.inference_ckpt_non_strict,
-    )
+    load_checkpoint_for_inference(model, strict=not args.inference_ckpt_non_strict)
 
     assert len(model) == 1, "Virtual PP not supported for VLM inference"
     model = model[0]
