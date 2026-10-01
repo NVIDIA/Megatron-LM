@@ -316,7 +316,7 @@ if _TRITON_AVAILABLE:
         kernel = _triton_sinkhorn_fwd_kernel
         launch_kwargs = {}
         if torch.are_deterministic_algorithms_enabled():
-            # Fix the reduction layout, ignoring any earlier timing-selected cache entry.
+            # Fix the reduction layout, bypassing any timing-selected autotuner cache entry.
             kernel = kernel.fn
             launch_kwargs = {"num_warps": 4}
         kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations, **launch_kwargs)
