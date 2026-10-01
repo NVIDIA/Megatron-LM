@@ -162,6 +162,36 @@ def test_timers_use_owned_settings(monkeypatch, run_config):
     factory.assert_called_once_with(2, 'all')
 
 
+def test_finetune_reuses_registered_config(monkeypatch, run_config):
+    import torch
+
+    from tasks import finetune_utils
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.epochs, args.iteration = 0, 1
+    args.main_grads_dtype = args.main_params_dtype = torch.float32
+    args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
+    timers = Mock()
+    monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TIMERS', None)
+    monkeypatch.setattr(global_vars, 'Timers', Mock(return_value=timers))
+    global_vars._set_timers(args)
+    model, optimizer, scheduler = Mock(), Mock(), Mock()
+
+    def setup(*unused):
+        assert global_vars.get_run_config() is run_config
+        return model, optimizer, scheduler
+
+    monkeypatch.setattr(finetune_utils, 'setup_model_and_optimizer', setup)
+    callback = Mock()
+    finetune_utils.finetune(Mock(), Mock(), end_of_epoch_callback_provider=lambda: callback)
+    callback.assert_called_once_with(model, epoch=-1, output_predictions=True)
+    assert global_vars.get_run_config() is run_config
+    assert global_vars.get_timers() is timers
+
+
 def test_tensorboard_metadata_uses_config(monkeypatch, run_config):
     from megatron.training import initialize
 
