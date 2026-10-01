@@ -134,6 +134,12 @@ def test_gb300_recipes_reference_existing_goldens(workloads):
         assert path.is_file() or config.get("ENV_VARS", {}).get("SKIP_PYTEST") in (1, "1"), path
         if spec["test_case"] in {
             "deepseek_proxy_mfsdp_v1_ep2",
+            "gpt3_7b_tp1_pp4_memory_speed",
+            "gpt3_7b_tp4_pp1_memory_speed",
+            "gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4",
+            "gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute",
+            "gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer",
+            "gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph",
             "nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200",
         }:
             assert path.name == "golden_values_dev_dgx_gb300.json"
