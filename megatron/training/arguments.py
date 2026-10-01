@@ -1780,7 +1780,9 @@ def validate_args(args, defaults={}):
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
     assert not (
-        args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'
+        args.cross_entropy_loss_fusion
+        and args.cross_entropy_fusion_impl == 'te'
+        and not is_te_min_version("2.19.0")
     ), (
         "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
@@ -3096,8 +3098,11 @@ def _add_rl_args(parser):
 def _add_training_args(parser):
     from megatron.training.config import ProfilingConfig, TrainingConfig
 
-    prof_factory = ArgumentGroupFactory(ProfilingConfig)
+    prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["use_nsys_profiler"])
     prof_group = prof_factory.build_group(parser, "profiling")
+    prof_group.add_argument('--profile', action='store_true', 
+                       help='Enable nsys profiling. When using this option, nsys '
+                       'options should be specified in commandline.')
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")

@@ -613,7 +613,7 @@ class TestMcoreAdapterCudaGraph:
         cuda_graph_forward_backward = FullCudaGraphWrapper(
             forward_backward, cuda_graph_warmup_steps=1
         )
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        with torch.profiler.profile() as prof:
             graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
 
         graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
