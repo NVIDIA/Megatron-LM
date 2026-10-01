@@ -77,27 +77,6 @@ def _config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
-def test_inference_rmsnorm_preserves_compute_dtype(input_dtype):
-    """FP32 residual inputs use BF16 normalization and replay without changing bits."""
-    from megatron.core.tensor_parallel.inference_layers import _te_rms_norm_kernel
-
-    seeded()
-    x = torch.randn(256, 1, 2048, device="cuda", dtype=input_dtype)
-    weight = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
-
-    with set_batch_invariant_mode(False):
-
-        def norm(value):
-            return _te_rms_norm_kernel(value, weight, 1e-5)
-
-        output = norm(x)
-        assert output.dtype == weight.dtype
-        assert output.shape == x.shape
-        assert bytes_equal(output, norm(x.to(weight.dtype)))
-        assert_replays_bit_exact(norm, (x,), backward=False, what="inference RMSNorm")
-
-
 class TestTEWrappers:
     def setup_method(self, method):
         Utils.initialize_model_parallel()

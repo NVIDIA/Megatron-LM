@@ -48,22 +48,18 @@ except ImportError:
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     # Use the same RMSNorm kernel as the training recompute.
-    # A wide FP32 residual can feed a BF16 inference norm. TE expects the input
-    # and weight dtypes to match; preserve the norm's compute dtype on output.
-    if x.dtype != weight.dtype:
-        x = x.to(weight.dtype)
     if is_batch_invariant_mode_enabled() and get_batch_invariant_backend() != "te_native":
         # te_native keeps the native TE RMSNorm: the 64-multiple alignment
         # discipline holds its M%32 reduction bit-class constant, so kernel
         # substitution is unnecessary (and native is faster).
-        return rmsnorm_batch_invariant(x, weight, eps)
+        return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
         x, weight, eps, None, None, TE_DType[x.dtype], 16, False  # sm-margin  # zero centered gamma
     )
     out = out.view(*x_shape[:-1], -1)
-    return out
+    return out.to(x.dtype)
 
 
 def _apply_linear(

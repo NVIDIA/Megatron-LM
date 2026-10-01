@@ -682,7 +682,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="inference_tp_layers",
         sources=("megatron/core/tensor_parallel/inference_layers.py",),
-        tests=(K + "test_te_wrappers.py",),
         kind="dispatch",
         training_path=False,
         exempt_reason="Inference-only TP layers composing tex.rmsnorm_fwd (the TE norm kernel is "
