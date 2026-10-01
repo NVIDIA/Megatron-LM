@@ -170,13 +170,6 @@ def set_global_variables(args, build_tokenizer=True):
 def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
     """Construct services independently of CLI parsing and config construction."""
 
-    cfg = get_run_config()
-    cfg.rng.resolve_cuda_graphs(
-        transformer_impl=getattr(args, "transformer_impl", "local"),
-        cuda_graph_impl=getattr(args, "cuda_graph_impl", "none"),
-        rank=args.rank,
-    )
-
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.

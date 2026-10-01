@@ -2065,16 +2065,13 @@ def validate_args(args, defaults={}):
         args.cpu_offloading = True
 
     # CUDA Graphs
-    from megatron.training.argument_utils import _default_config_from_args
-    from megatron.training.config import RNGConfig
-
-    rng_config = _default_config_from_args(RNGConfig, args)
-    rng_config.resolve_cuda_graphs(
-        transformer_impl=args.transformer_impl, cuda_graph_impl=args.cuda_graph_impl, rank=args.rank
-    )
-    # Preserve normalized CLI output; runtime consumers use the subsequently built RNGConfig.
-    args.te_rng_tracker = rng_config.te_rng_tracker
     if args.cuda_graph_impl != "none":
+        if (
+            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
+            and not args.te_rng_tracker
+        ):
+            args.te_rng_tracker = True
+            warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
         if args.cuda_graph_impl == "transformer_engine":
             assert (
                 "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
@@ -3222,6 +3219,12 @@ def _add_initialization_args(parser):
 
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
+
+    group.add_argument('--te-rng-tracker', action='store_true',
+                       help='Use the Transformer Engine version of the random number generator. '
+                            'Required for CUDA graphs support.')
+    group.add_argument('--inference-rng-tracker', action='store_true',
+                       help='Use a random number generator configured for inference.')
 
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')

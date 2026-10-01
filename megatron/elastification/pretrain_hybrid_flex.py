@@ -28,6 +28,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -39,7 +40,6 @@ from megatron.core.utils import (
     get_batch_on_this_tp_rank,
 )
 from megatron.elastification.arguments import add_flextron_args
-from megatron.training.argument_utils import get_transformer_config
 from megatron.training import (
     get_args,
     get_timers,
@@ -50,7 +50,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
@@ -122,7 +122,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         return model
 
     print_rank_0('building Mamba model ...')
-    config = get_transformer_config(args, config)
+    config = core_transformer_config_from_args(args, TransformerConfig)
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
@@ -180,7 +180,7 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = get_transformer_config(args)
+    config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()

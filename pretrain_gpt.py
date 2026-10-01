@@ -49,7 +49,6 @@ from megatron.core.utils import (
     get_te_version,
     get_torch_version,
 )
-from megatron.training.argument_utils import get_transformer_config
 from megatron.training import (
     get_args,
     get_timers,
@@ -58,12 +57,9 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (
-    gpt_config_from_args,
-    pretrain_cfg_container_from_args,
-)
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
@@ -108,7 +104,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
 
     args = get_args()
-    config = get_transformer_config(args)
+    config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
@@ -408,7 +404,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = get_transformer_config(args)
+    config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
@@ -549,7 +545,7 @@ def get_embedding_ranks(pp_ranks: List[int]):
         args = get_args()
         if not args.untie_embeddings_and_output_weights:
             embedding_ranks.append(pp_ranks[-1])
-        config = get_transformer_config(args)
+        config = core_transformer_config_from_args(args)
         mtp_ranks = get_mtp_ranks(pp_ranks, config)
         embedding_ranks.extend(mtp_ranks)
     embedding_ranks = list(set(embedding_ranks))

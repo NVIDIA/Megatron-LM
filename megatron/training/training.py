@@ -1654,7 +1654,6 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
-    cfg_container.finalize()
     cfg_container.validate()
 
     callback_manager = normalize_callbacks(callbacks)
@@ -2923,7 +2922,6 @@ def setup_model_and_optimizer(
             start_memory_history_recording(cfg_container.profiling)
 
             cfg = cfg_container
-            cfg.finalize()
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)

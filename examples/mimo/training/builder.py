@@ -21,7 +21,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-from megatron.training.global_vars import get_args, get_run_config
+from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
 _LANGUAGE_SEED_OFFSET = 0
@@ -116,8 +116,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             special_token_ids=special_token_ids,
             module_to_grid_map=topology.grids,
         )
-        cfg = get_run_config()
-        cfg.finalize_model_config(mimo_config)
         return MimoModel(
             mimo_config,
             cp_group=active_pg.cp if is_language else None,

@@ -324,8 +324,8 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
-def core_transformer_config_from_args(args, config_class=None, **config_overrides):
-    """Build a transformer config, with explicit config-owned inputs taking precedence."""
+def core_transformer_config_from_args(args, config_class=None):
+    """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
     from megatron.core.quantization.utils import (
@@ -350,9 +350,7 @@ def core_transformer_config_from_args(args, config_class=None, **config_override
     # Translate args to core transformer configuration
     kw_args = {}
     for f in dataclasses.fields(config_class):
-        if f.name in config_overrides:
-            kw_args[f.name] = config_overrides[f.name]
-        elif hasattr(args, f.name):
+        if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
@@ -420,8 +418,7 @@ def core_transformer_config_from_args(args, config_class=None, **config_override
 
         normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
 
-    if 'inference_sampling_seed' not in config_overrides:
-        kw_args['inference_sampling_seed'] = args.seed
+    kw_args['inference_sampling_seed'] = args.seed
 
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
@@ -450,7 +447,6 @@ def core_transformer_config_from_args(args, config_class=None, **config_override
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
     # Build config.
-    kw_args.update(config_overrides)
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
@@ -661,40 +657,6 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
-def get_transformer_config(
-    args: Namespace,
-    config: TransformerConfig | None = None,
-    *,
-    use_yaml: bool = False,
-    reuse_model_config: bool = True,
-) -> TransformerConfig:
-    """Resolve native or legacy model inputs using the current run configuration.
-
-    Explicit/native/YAML sampling seeds are independent of the training seed.
-    Only legacy CLI construction derives the sampling seed from ``cfg.rng.seed``.
-    Separate models, such as refit destinations or explicit provider overrides,
-    can request fresh model inputs without mutating the current model config.
-    """
-    from megatron.training.global_vars import get_run_config
-
-    cfg = get_run_config()
-    if config is None and reuse_model_config:
-        config = getattr(cfg.model, "transformer", None)
-    if config is None:
-        if use_yaml and args.yaml_cfg is not None:
-            from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-
-            config = core_transformer_config_from_yaml(args, "language_model")
-        else:
-            config = core_transformer_config_from_args(
-                args,
-                inference_sampling_seed=cfg.rng.seed,
-                inference_rng_tracker=cfg.rng.inference_rng_tracker,
-            )
-    cfg.finalize_model_config(config)
-    return config
-
-
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -751,7 +713,6 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
     )
 
-    cfg.finalize()
     return cfg
 
 
@@ -812,5 +773,4 @@ def inference_cfg_container_from_args(
         profiling=profiling_config_from_args(args),
     )
 
-    cfg.finalize()
     return cfg

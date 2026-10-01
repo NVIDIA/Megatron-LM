@@ -98,31 +98,6 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
-@pytest.mark.parametrize("legacy_seed", [None, 123])
-def test_core_config_uses_explicit_rng_inputs(legacy_seed):
-    """Runtime config inputs replace stale or absent legacy RNG arguments."""
-    parser = ArgumentParser()
-    add_megatron_arguments(parser)
-    args = parser.parse_args([])
-    args.params_dtype = torch.float32
-    if legacy_seed is None:
-        del args.seed
-        del args.inference_rng_tracker
-    else:
-        args.seed = legacy_seed
-        args.inference_rng_tracker = False
-
-    config = core_transformer_config_from_args(
-        args,
-        config_class=CapturingTransformerConfig,
-        inference_sampling_seed=987,
-        inference_rng_tracker=True,
-    )
-
-    assert config.inference_sampling_seed == 987
-    assert config.inference_rng_tracker is True
-
-
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
     monkeypatch, explicit_hash_vocab_size

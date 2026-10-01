@@ -7,7 +7,6 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
-from megatron.training.argument_utils import get_transformer_config
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -16,7 +15,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import (
@@ -39,7 +38,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     print_rank_0('building BERT model ...')
 
     args = get_args()
-    config = get_transformer_config(args, config)
+    if config is None:
+        config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
 
     if args.spec is None:

@@ -10,13 +10,6 @@ class RNGConfig:
     seed: int = 1234
     """Random seed used for python, numpy, pytorch, and cuda."""
 
-    te_rng_tracker: bool = False
-    """Use the Transformer Engine version of the random number generator.
-    Required for CUDA graphs support."""
-
-    inference_rng_tracker: bool = False
-    """Use a random number generator configured for inference."""
-
     data_parallel_random_init: bool = False
     """Enable random initialization of params across data parallel ranks"""
 
@@ -24,20 +17,6 @@ class RNGConfig:
         """Validate the seed before training runtime initialization."""
         if self.seed is None or self.seed <= 0:
             raise ValueError("Seed must be a positive integer.")
-
-    def resolve_cuda_graphs(
-        self, *, transformer_impl: str, cuda_graph_impl: str, rank: int
-    ) -> None:
-        """Resolve the tracker required by the supplied model/graph implementation."""
-        if (
-            cuda_graph_impl != "none"
-            and "transformer_engine" in (transformer_impl, cuda_graph_impl)
-            and not self.te_rng_tracker
-        ):
-            from megatron.training.utils import warn_rank_0
-
-            self.te_rng_tracker = True
-            warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", rank)
 
 
 @dataclass(kw_only=True)

@@ -17,13 +17,18 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
 from megatron.core.transformer.spec_utils import import_module
-from megatron.training.argument_utils import get_transformer_config
 from megatron.training import get_args, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
-    config = get_transformer_config(args, config, use_yaml=True)
+    if config is None:
+        if args.yaml_cfg is not None:
+            config = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            config = core_transformer_config_from_args(args)
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:

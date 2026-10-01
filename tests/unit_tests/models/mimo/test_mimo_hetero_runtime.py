@@ -390,9 +390,7 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
         builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
 
 
-def test_configure_module_rng_forwards_rng_tracker_options(mocker, run_config):
-    run_config.rng.te_rng_tracker = True
-    run_config.rng.inference_rng_tracker = True
+def test_configure_module_rng_forwards_rng_tracker_options(mocker):
     pg_collection = SimpleNamespace(
         pp=object(),
         dp=object(),

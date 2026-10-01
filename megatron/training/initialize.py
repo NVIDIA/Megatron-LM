@@ -137,17 +137,12 @@ def initialize_megatron(
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
-            cfg.rng.resolve_cuda_graphs(
-                transformer_impl=args.transformer_impl,
-                cuda_graph_impl=args.cuda_graph_impl,
-                rank=args.rank,
-            )
             print_rank_0("> setting random seeds to {} ...".format(cfg.rng.seed))
             _set_random_seed(
                 cfg.rng.seed,
                 cfg.rng.data_parallel_random_init,
-                cfg.rng.te_rng_tracker,
-                cfg.rng.inference_rng_tracker,
+                args.te_rng_tracker,
+                args.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,

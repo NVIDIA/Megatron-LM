@@ -61,35 +61,19 @@ def get_model_builder(
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
     """
-    from megatron.training.argument_utils import get_transformer_config
-    from megatron.training.global_vars import get_run_config
-    from megatron.training.models import GPTModelConfig, HybridModelConfig
-
-    cfg = get_run_config()
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        config_cls, factory, builder_cls = GPTModelConfig, gpt_config_from_args, GPTModelBuilder
-    elif provider in ("hybrid", "mamba"):
+        return GPTModelBuilder(gpt_config_from_args(args))
+    if provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
                 '"mamba" model provider is deprecated. Use "hybrid" instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
-        config_cls, factory, builder_cls = HybridModelConfig, hybrid_config_from_args, HybridModelBuilder
-    else:
-        raise ValueError(f"Invalid model provider {provider}")
-
-    if isinstance(cfg.model, config_cls):
-        config = cfg.model
-    else:
-        transformer = get_transformer_config(
-            args, use_yaml=provider == "gpt", reuse_model_config=False
-        )
-        config = factory(args, config=transformer)
-    cfg.finalize_model_config(config)
-    return builder_cls(config)
+        return HybridModelBuilder(hybrid_config_from_args(args))
+    raise ValueError(f"Invalid model provider {provider}")
 
 
 def get_model_for_inference() -> MegatronModule:
