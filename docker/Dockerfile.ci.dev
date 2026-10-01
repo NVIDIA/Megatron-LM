@@ -68,7 +68,6 @@ EOF
 
 COPY pyproject.toml uv.lock /workspace/
 COPY docker/patches/mamba-cxx20.patch /workspace/mamba-cxx20.patch
-COPY docker/patches/transformer-engine-nccl-window-offset.patch /workspace/transformer-engine-nccl-window-offset.patch
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
@@ -106,14 +105,8 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
         export NVTE_BUILD_MAX_JOBS="${NVTE_BUILD_MAX_JOBS:-$(( (${MAX_JOBS:-$(nproc)} + NVTE_BUILD_THREADS_PER_JOB - 1) / NVTE_BUILD_THREADS_PER_JOB ))}"
     fi
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
-    # Build the development TE pin below with its PyTorch 26.09 compatibility backport.
-    TE_INSTALL_ARGS=()
-    if [ "$IMAGE_TYPE" != "lts" ]; then
-        TE_INSTALL_ARGS=(--no-install-package transformer-engine)
-    fi
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
         --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
-        "${TE_INSTALL_ARGS[@]}" \
         --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
@@ -133,59 +126,15 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
 
+    # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
+    # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
     TE_REV=$(sed -n 's/^transformer-engine = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
     test -n "${TE_REV}"
-    TE_BUILD_DIR=""
-    if [ "$IMAGE_TYPE" != "lts" ]; then
-        # Backport NVIDIA/TransformerEngine#3447/#3466 without updating TE or its submodules.
-        # New torch NCCL windows start at the signal pad, before the payload buffer.
-        test "${TE_REV}" = "5e52befd5262c06289106338c308079d6adb391f"
-        echo 'afc3b81e6b373697cc55776d6fa8db330de3aee499d481a582d629ef9a342b1c  /workspace/transformer-engine-nccl-window-offset.patch' | sha256sum -c -
-        TE_BUILD_DIR=$(mktemp -d)
-        trap 'rm -rf "${TE_BUILD_DIR}"' EXIT
-        git -C "${TE_BUILD_DIR}" init
-        git -C "${TE_BUILD_DIR}" fetch --depth 1 https://github.com/NVIDIA/TransformerEngine.git "${TE_REV}"
-        git -C "${TE_BUILD_DIR}" checkout --detach "${TE_REV}"
-        # Match uv's locked local version even with a shallow checkout.
-        git -C "${TE_BUILD_DIR}" config core.abbrev 8
-        git -C "${TE_BUILD_DIR}" submodule update --init --recursive --depth 1
-        patch --batch --forward --fuzz=0 -p1 -d "${TE_BUILD_DIR}" < /workspace/transformer-engine-nccl-window-offset.patch
-        uv pip install --no-deps --no-build-isolation -v "${TE_BUILD_DIR}"
-        mkdir -p /opt/transformer-engine-build-info
-        git -C "${TE_BUILD_DIR}" rev-parse HEAD > /opt/transformer-engine-build-info/revision
-        git -C "${TE_BUILD_DIR}" submodule status --recursive > /opt/transformer-engine-build-info/submodules
-        cp /workspace/transformer-engine-nccl-window-offset.patch /opt/transformer-engine-build-info/
-        (cd "${TE_BUILD_DIR}" && sha256sum transformer_engine/pytorch/csrc/extensions/ep.cpp) \
-            > /opt/transformer-engine-build-info/patched-files.sha256
-        python - <<'PY'
-import hashlib
-import sys
-from importlib.metadata import version
-from pathlib import Path
-
-import transformer_engine as te
-from transformer_engine.pytorch import ep
-import transformer_engine_torch as tex
-
-assert version("transformer-engine") == "2.19.0+5e52befd"
-assert callable(ep.ep_bootstrap) and callable(tex.ep_initialize)
-for module in (te, ep, tex):
-    assert Path(module.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
-extension = Path(tex.__file__).resolve()
-digest = hashlib.sha256(extension.read_bytes()).hexdigest()
-Path("/opt/transformer-engine-build-info/native-extension.sha256").write_text(
-    f"{digest}  {extension}\n"
-)
-PY
-        NCCL_EP_JIT_HEADERS=$(find "${TE_BUILD_DIR}/3rdparty" -type d \
-            -path "*/build/include/nccl_ep" -print -quit)
-    else
-        TE_SHORT_REV="${TE_REV:0:8}"
-        NCCL_EP_JIT_HEADERS=$(find /root/.cache/uv/git-v0/checkouts -type d \
-            -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" -print -quit)
-    fi
-    # The compiled extension embeds a build-time JIT header path. Persist the headers
-    # before deleting its source checkout or leaving the BuildKit cache mount.
+    TE_SHORT_REV="${TE_REV:0:8}"
+    NCCL_EP_JIT_HEADERS=$(find /root/.cache/uv/git-v0/checkouts \
+        -type d \
+        -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
+        -print -quit)
     test -n "${NCCL_EP_JIT_HEADERS}"
     test -f "${NCCL_EP_JIT_HEADERS}/device/ht_ep.cuh"
     mkdir -p /opt/nccl-ep/include
@@ -193,10 +142,6 @@ PY
     cp -a "${NCCL_EP_JIT_HEADERS}/../nccl_ep.h" /opt/nccl-ep/include/
     test -f /opt/nccl-ep/include/nccl_ep/device/ht_ep.cuh
     test -f /opt/nccl-ep/include/nccl_ep.h
-    if [ -n "${TE_BUILD_DIR}" ]; then
-        rm -rf "${TE_BUILD_DIR}"
-        trap - EXIT
-    fi
 
     # Backport state-spaces/mamba#1000 without changing the pinned runtime sources.
     # PyTorch's ATen headers now require C++20 for both host and CUDA compilation.
