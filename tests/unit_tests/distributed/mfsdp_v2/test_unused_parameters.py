@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unused trainable weights in MFSDP units, as in text-only multimodal batches."""
+"""Conditionally used trainable weights with mixed text-only and text-vision microbatches."""
 
 import pytest
 import torch
@@ -28,11 +28,11 @@ class ConditionalUnit(nn.Module):
         self.text = nn.Linear(8, 8)
         self.image = nn.Linear(8, 8)
 
-    def forward(self, hidden, use_image):
+    def forward(self, hidden, image=None):
         """The image path can be absent from an individual microbatch."""
         output = self.text(hidden)
-        if use_image:
-            output = output + self.image(hidden)
+        if image is not None:
+            output = output + self.image(image)
         return output.tanh()
 
 
@@ -45,13 +45,13 @@ class ConditionalModel(nn.Module):
         self.head = nn.Linear(8, 8)
         self.recompute = recompute
 
-    def forward(self, hidden, use_image):
+    def forward(self, hidden, images):
         """Run every unit, selecting its optional path separately."""
-        for unit, enabled in zip(self.layers, use_image):
+        for unit, image in zip(self.layers, images):
             if self.recompute is None:
-                hidden = unit(hidden, enabled)
+                hidden = unit(hidden, image)
             else:
-                hidden = checkpoint(unit, hidden, enabled, use_reentrant=self.recompute)
+                hidden = checkpoint(unit, hidden, image, use_reentrant=self.recompute)
         return self.head(hidden)
 
 
@@ -60,7 +60,7 @@ class ConditionalModel(nn.Module):
     [(1, False), (2, False), (2, True)],
     ids=["single-unit", "two-units", "root-owner"],
 )
-@pytest.mark.parametrize("usage", ["never", "alternating", "rank_local", "frozen_text"])
+@pytest.mark.parametrize("usage", ["mixed", "never", "alternating", "rank_local", "frozen_text"])
 @pytest.mark.parametrize(
     "recompute", [None, False, True], ids=["eager", "non_reentrant", "reentrant"]
 )
@@ -95,24 +95,38 @@ def test_unused_parameters_match_zero_gradient_baseline(
 
     torch.manual_seed(4321 + rank)
     inputs = torch.randn(
-        5, 2, 4, 8, device=device, requires_grad=recompute is True or usage == "frozen_text"
+        5, 4, 4, 8, device=device, requires_grad=recompute is True or usage == "frozen_text"
     )
+    images = torch.randn_like(inputs)
     targets = torch.randn_like(inputs)
 
-    def train(model, inputs, targets, *, reduce_wgrad: bool) -> list[torch.Tensor]:
+    def train(model, inputs, images, targets, *, reduce_wgrad: bool) -> list[torch.Tensor]:
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.1)
         if not reduce_wgrad:
             fully_shard_optimizer(optimizer)
         losses = []
-        for step, (step_inputs, step_targets) in enumerate(zip(inputs, targets)):
+        for step, (step_inputs, step_images, step_targets) in enumerate(
+            zip(inputs, images, targets)
+        ):
             optimizer.zero_grad()
-            for chunk, (hidden, target) in enumerate(zip(step_inputs, step_targets)):
-                use_image = [
-                    usage not in ("never", "frozen_text")
-                    and (step + index + (chunk + rank if usage == "rank_local" else 0)) % 2 == 0
-                    for index in range(num_units)
-                ]
-                loss = torch.nn.functional.mse_loss(model(hidden, use_image), target)
+            for chunk, (hidden, image, target) in enumerate(
+                zip(step_inputs, step_images, step_targets)
+            ):
+                if usage == "mixed":
+                    # Accumulate text, text+image, text, text+image before optimizer.step().
+                    unit_images = [None if chunk % 2 == 0 else image] * num_units
+                else:
+                    unit_images = [
+                        (
+                            image
+                            if usage not in ("never", "frozen_text")
+                            and (step + index + (chunk + rank if usage == "rank_local" else 0)) % 2
+                            == 0
+                            else None
+                        )
+                        for index in range(num_units)
+                    ]
+                loss = torch.nn.functional.mse_loss(model(hidden, unit_images), target)
                 losses.append(loss.detach())
                 (loss / len(step_inputs)).backward()
                 if not reduce_wgrad:
@@ -130,13 +144,14 @@ def test_unused_parameters_match_zero_gradient_baseline(
             optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, inputs, targets, reduce_wgrad=True)
-    sharded_losses = train(model, inputs, targets, reduce_wgrad=False)
+    baseline_losses = train(baseline, inputs, images, targets, reduce_wgrad=True)
+    sharded_losses = train(model, inputs, images, targets, reduce_wgrad=False)
     torch.testing.assert_close(torch.stack(sharded_losses), torch.stack(baseline_losses))
     # Expose permanently unused projections too, so skipping their weight decay fails.
     with torch.no_grad():
         torch.testing.assert_close(
-            model(inputs[-1, 0], [True] * num_units), baseline(inputs[-1, 0], [True] * num_units)
+            model(inputs[-1, 0], [images[-1, 0]] * num_units),
+            baseline(inputs[-1, 0], [images[-1, 0]] * num_units),
         )
 
 
