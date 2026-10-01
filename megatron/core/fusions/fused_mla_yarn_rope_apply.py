@@ -765,7 +765,7 @@ def _mla_rope_concat_fwd_kernel(
         nope_row = NOPE + seq_idx * stride_nope_seq + batch_idx * stride_nope_batch
         rope_row = ROPE + seq_idx * stride_rope_seq + batch_idx * stride_rope_batch
 
-    head_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_idx = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)
     head_mask = head_idx < head_num
 
     nope_idx = tl.arange(0, NOPE_BLOCK)
