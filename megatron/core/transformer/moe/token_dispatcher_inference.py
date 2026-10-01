@@ -699,3 +699,45 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             output = output + self._shared_expert_output
             self._shared_expert_output = None
         return output
+
+
+class MegaLocalPassthroughDispatcher(NCCLAllGatherDispatcher):
+    """Dispatcher for FlashInfer mega MoE, in inference and in parity-mode training.
+
+    Tokens stay on the local EP rank; cross-rank movement is fused inside the
+    FlashInfer mega kernel, so Megatron's NCCL/NVLS gather/scatter must not run.
+    Every stage is a pass-through; only the shared valid-tokens bookkeeping is
+    kept so the other fused-MoE readers stay consistent.
+
+    Shapes are inherited from MoEAllGatherTokenDispatcher: dispatch_preprocess
+    flattens [S/TP, B, H] to [S*B/TP, H] and caches routing_map, and
+    combine_postprocess restores the original shape. Local token count is
+    preserved end to end, so both work unchanged.
+    """
+
+    def token_dispatch(self, hidden_states, probs):
+        """No-op transport; record the local token count for the fused kernels."""
+        local_tokens = hidden_states.shape[0]
+        # The valid-tokens scalar is allocated by the inference context, so it is
+        # absent when this dispatcher runs the value pass of the training forward
+        # (moe_inference_training_forward). Nothing on the mega path reads it --
+        # the megakernel takes the routing map directly -- so skip the bookkeeping
+        # rather than allocating inference state during training.
+        if self._runs_metadata_sync and (
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor is not None
+        ):
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(local_tokens)
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens
+        return hidden_states, probs
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        """Pass-through: the megakernel permutes internally."""
+        return hidden_states, None, probs
+
+    def combine_preprocess(self, expert_output):
+        """Pass-through: unpermute happens inside the megakernel."""
+        return expert_output
+
+    def token_combine(self, hidden_states):
+        """Pass-through: the megakernel already reduced across EP ranks."""
+        return hidden_states.to(torch.bfloat16)

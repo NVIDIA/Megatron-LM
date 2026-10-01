@@ -520,6 +520,51 @@ class TestMoEModules:
             )
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
 
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+    def test_mega_value_pass_replays(self, precision):
+        """``flashinfer_mega`` value pass, shared-scratch repack and recompute backward replay.
+
+        The repack into the shared kernel-weight scratch (including the MXFP8
+        requantization) runs on every forward, so a nondeterministic pack would
+        move the logprobs between two identical forwards just as the megakernel
+        itself would.
+        """
+        from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
+        from megatron.core.inference.moe.mega._deps import _HAVE_FLASHINFER_MOE_EP
+        from megatron.core.inference.moe.mega.training_weights import reset_training_scratches
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+        )
+        from tests.unit_tests.inference.test_mega_training_forward import (
+            NUM_EXPERTS,
+            _build_layer,
+            _config,
+            _hidden,
+        )
+
+        if not _HAVE_FLASHINFER_MOE_EP or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("flashinfer_mega needs FlashInfer moe_ep and Blackwell")
+        if NUM_EXPERTS % Utils.world_size:
+            pytest.skip(f"num_experts={NUM_EXPERTS} must divide EP={Utils.world_size}")
+        self._init(ep=Utils.world_size)
+        seeded()
+        config = _config(mega_training=True, inference_mega_precision=precision)
+        try:
+            layer = _build_layer(config)
+            hidden = _hidden(config, seed=1, tokens=64).requires_grad_()
+            with deterministic_algorithms(True):
+                assert_module_replays_bit_exact(
+                    layer,
+                    (hidden,),
+                    replays=3,
+                    contention=True,
+                    what=f"mega value pass[{precision}]",
+                )
+        finally:
+            reset_training_scratches()
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
+            MegatronMegaMoEAdapter.reset_shared_training()
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])
     def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser):

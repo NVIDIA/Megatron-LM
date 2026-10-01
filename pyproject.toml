@@ -103,7 +103,8 @@ dev = [
     "megatron-energon[av_decode]~=7.0",
     "av",
     "Pillow",
-    "flashinfer-python>=0.5.0,<0.7.0",
+    # flashinfer.moe_ep (>= 0.7) backs inference_grouped_gemm_backend='flashinfer_mega'.
+    "flashinfer-python>=0.5.0,<0.8.0",
     "nvidia-cudnn-frontend[cutedsl]==1.28.0",
     "wget",
     "onnxscript",

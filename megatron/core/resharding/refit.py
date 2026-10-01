@@ -631,13 +631,23 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
-    if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
+    if tgt_core is not None:
         refreshed = False
         for module in tgt_core.modules():
-            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
-            if refresh is not None:
-                refreshed = bool(refresh()) or refreshed
+            if isinstance(transform, MXFP8ReshardTransform):
+                refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
+                if refresh is not None:
+                    refreshed = bool(refresh()) or refreshed
+            # Not gated on the transform, unlike the MXFP8 refresh above: the
+            # megakernel keeps its own transformed copy of the expert weights
+            # under every precision, including bf16, so a refit that needs no
+            # transform still leaves that copy stale.
+            refresh_mega = getattr(module, "refresh_mega_weights", None)
+            if refresh_mega is not None:
+                refreshed = bool(refresh_mega()) or refreshed
         if refreshed:
             # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
-            torch.cuda.synchronize()
+            # that read these derived weight buffers. Scoped to the current stream
+            # because the repack is a set of copy_ calls issued on it, so it is the only
+            # stream that has to drain.
+            torch.cuda.current_stream().synchronize()

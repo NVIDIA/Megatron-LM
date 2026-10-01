@@ -856,9 +856,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # exist). The EP>1 dispatchers below reallocate it as part of their own buffer
         # setup, which is harmless.
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
-        if self._nccl_ep_dispatcher:
+        #
+        # flashinfer_mega runs MegaLocalPassthroughDispatcher, which moves no tokens
+        # itself (the megakernel owns EP transport via symmetric memory), so the
+        # scalar above is the only per-step buffer it needs.
+        _mega_moe = (
+            model_config.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_MEGA
+        )
+        if self._nccl_ep_dispatcher and not _mega_moe:
             NCCLAllGatherDispatcher.allocate_buffers()
-        elif self._nvls_dispatcher:
+        elif self._nvls_dispatcher and not _mega_moe:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
