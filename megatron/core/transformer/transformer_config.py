@@ -711,6 +711,17 @@ class TransformerConfig(ModelParallelConfig):
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
+    recompute_reuse_gathered_input: bool = False
+    """If True, a column-parallel Transformer Engine linear that runs inside an activation-recompute
+    re-run (recompute_granularity 'selective' with 'mla_up_proj', 'mlp', 'moe', 'shared_experts',
+    ...; or 'full') keeps the sequence-parallel all-gather of its input that its forward performs
+    and hands it to its backward's weight-gradient GEMM instead of gathering the same local input a
+    second time (tensor_parallel/recompute_gather_cache.py).  Values and gradients are unchanged:
+    the two gathers have identical inputs.  The cost is the gathered input of each recomputed
+    linear staying alive between the re-run and that linear's backward.  Requires sequence
+    parallelism over a tensor-parallel group of size > 1, Megatron's own checkpoint functions
+    (not the Transformer Engine one used under fp8/fp4) and no quantized gathers."""
+
     ####################
     # fp8 related
     ####################
@@ -2676,6 +2687,23 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
+
+        if self.recompute_reuse_gathered_input:
+            if self.recompute_granularity is None:
+                raise ValueError(
+                    "recompute_reuse_gathered_input needs activation recompute (recompute_granularity "
+                    "'selective' or 'full'): without a re-run there is no second gather to reuse."
+                )
+            if not self.sequence_parallel or self.tensor_model_parallel_size <= 1:
+                raise ValueError(
+                    "recompute_reuse_gathered_input needs sequence parallelism over a tensor-parallel "
+                    "group of size > 1: only then does a column-parallel linear gather its input."
+                )
+            if self.fp8 or self.fp4:
+                raise ValueError(
+                    "recompute_reuse_gathered_input is not supported with fp8/fp4 (quantized gathers, "
+                    "and the Transformer Engine checkpoint function does not mark the re-run)."
+                )
 
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
