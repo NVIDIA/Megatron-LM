@@ -3,6 +3,7 @@
 """CPU tests of recipe evidence matching and opt-in capture adapters."""
 
 import copy
+import importlib.util
 import json
 import os
 import subprocess
@@ -14,8 +15,9 @@ import pytest
 import torch
 import torch.utils.deterministic
 
-from tools.determinism import capture_recipe
+from tools.determinism import capture_recipe, pytest_plugin
 from tools.determinism.capture_recipe import Inventory, install_bindings
+from tools.determinism.coverage import triton_signature
 from tools.determinism.recipe_coverage import (
     DETERMINISTIC,
     NONDETERMINISTIC,
@@ -252,7 +254,7 @@ def test_triton_changes_require_new_evidence(monkeypatch, key, value):
     monkeypatch.setenv("TRITON_CACHE_DIR", "/shared/cache")
     monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "64")
     request, proof = inventory(), evidence()
-    original = capture_recipe.triton_signature()
+    original = triton_signature()
     request["context"]["environment"] = original
     proof["context"]["environment"] = original
     request["operations"][0]["signature"]["runtime"]["triton"] = original
@@ -260,7 +262,7 @@ def test_triton_changes_require_new_evidence(monkeypatch, key, value):
     assert build_report([request], [proof])["counts"][DETERMINISTIC] == 1
     monkeypatch.setenv(key, value)
     # Even a call-time override after capture startup must stop evidence reuse.
-    request["operations"][0]["signature"]["runtime"]["triton"] = capture_recipe.triton_signature()
+    request["operations"][0]["signature"]["runtime"]["triton"] = triton_signature()
     assert build_report([request], [proof])["counts"][UNVERIFIED] == 1
 
 
@@ -836,6 +838,91 @@ def test_bound_call_styles_share_one_signature_with_defaults():
     wrapped(value, 2)
     assert len(observed.operations) == 1
     assert next(iter(observed.operations.values()))["calls"] == 3
+
+
+@pytest.fixture(scope="module")
+def harness():
+    """Load the replay harness without the kernel package's GPU bootstrap."""
+    path = Path(__file__).resolve().parents[3] / "tests/unit_tests/determinism/kernels/harness.py"
+    spec = importlib.util.spec_from_file_location("_recipe_replay_harness", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scaled_sum(value, bias, scale=2.0, *, store=False):
+    return (value + bias) * scale
+
+
+SCALED = {"target": "test:scaled_sum", "op_id": "scaled", "implementation": "eager:scaled_sum"}
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda fn, value, bias: fn(value, bias),
+        lambda fn, value, bias: fn(value, bias, 2.0),
+        lambda fn, value, bias: fn(value, bias, scale=2.0, store=False),
+        lambda fn, value, bias: fn(bias=bias, value=value),
+    ],
+    ids=["positional", "explicit_default", "keyword_defaults", "keywords"],
+)
+def test_capture_encodes_calls_like_the_replay_harness(harness, call):
+    """A production call matches a replay case that passes only non-default arguments."""
+    value = torch.ones(2, 4, requires_grad=True)
+    bias = torch.zeros(4, requires_grad=True)
+    observed = Inventory(torch, 10)
+    call(observed.wrap(scaled_sum, SCALED), value, bias)
+    (operation,) = observed.operations.values()
+    replay = harness.replay_signature((value, bias), backward=False)
+    replay.update(op_id=SCALED["op_id"], implementation=SCALED["implementation"])
+    assert operation["signature"] == replay
+    assert signature_key(operation["signature"]) == signature_key(replay)
+
+
+def test_non_default_arguments_select_a_different_replay_case(harness):
+    value = torch.ones(2, 4, requires_grad=True)
+    bias = torch.zeros(4, requires_grad=True)
+    observed = Inventory(torch, 10)
+    wrapped = observed.wrap(scaled_sum, SCALED)
+    wrapped(value, bias, 3.0)
+    wrapped(value, bias, store=True)
+    inputs = [operation["signature"]["inputs"] for operation in observed.operations.values()]
+    positional = harness.replay_signature((value, bias), backward=False)["inputs"]
+    assert harness.replay_signature((value, bias, 3.0), backward=False)["inputs"] in inputs
+    assert {"args": positional, "kwargs": {"store": True}} in inputs
+    assert positional not in inputs
+
+
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_capture_uses_the_replay_provenance_and_ignores_only_run_outputs(tmp_path):
+    assert capture_recipe.source_context(torch) == pytest_plugin.source_context(
+        capture_recipe.ROOT, torch
+    )
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "kernel.py").write_text("VALUE = 1\n")
+    _git(repo, "add", "kernel.py")
+    _git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    outputs = repo / "capture"
+    outputs.mkdir()
+    (outputs / "rank-0.json").write_text("{}")
+    assert pytest_plugin.source_context(repo, torch)["dirty"]
+    assert not pytest_plugin.source_context(repo, torch, output_roots=[outputs])["dirty"]
+    (repo / "notes.txt").write_text("untracked source\n")
+    assert pytest_plugin.source_context(repo, torch, output_roots=[outputs])["dirty"]
+    (repo / "notes.txt").unlink()
+    (repo / "kernel.py").write_text("VALUE = 2\n")
+    assert pytest_plugin.source_context(repo, torch, output_roots=[outputs])["dirty"]
 
 
 def test_opaque_input_is_an_issue_without_interrupting_training():

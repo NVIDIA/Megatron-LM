@@ -390,7 +390,7 @@ def prepare_replay(
     preparation errors across ranks before entering any mapping collective.
     Runtime mismatches are rejected, never fixed by relabelling the capture.
     """
-    from tools.determinism.capture_recipe import runtime_signature
+    from tools.determinism.coverage import runtime_signature
 
     signature = event["signature"]
     collective = signature["configuration"]["collective"]
@@ -513,7 +513,8 @@ class CollectiveCapture:
 
 def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> Callable:
     """Capture supported mapping calls with their actual group and tensor bytes."""
-    from tools.determinism.capture_recipe import input_signature, runtime_signature
+    from tools.determinism.capture_recipe import input_signature
+    from tools.determinism.coverage import runtime_signature
 
     store = inventory.collectives
     if store is None:

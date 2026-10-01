@@ -235,10 +235,16 @@ PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reportin
 
 ### Capture and launcher failure contracts
 
-Generic Python bindings canonicalize arguments with `inspect.signature().bind()`
-and include defaults before encoding positional and keyword-only inputs. Evidence
-producers must use that same complete argument form. Opaque objects are capture
-issues, never type-only signatures. Non-finite scalar arguments use tagged strings.
+Generic Python bindings bind each call with `inspect.signature().bind()`, omit
+arguments equal to their declared defaults, and encode the remaining positional
+arguments as a list; keyword-only arguments that remain use
+`{"args": [...], "kwargs": {...}}`. This is the form the kernel replay harness
+records for `fn(*inputs)`, so a production call that spells out default values
+matches a replay case that calls the same function with only the arguments it
+needs. A replay case that passes a dictionary of keyword inputs, or wraps the
+function in a closure with an explicit `configuration`, does not match a generic
+binding. Opaque objects are capture issues, never type-only signatures.
+Non-finite scalar arguments use tagged strings.
 Returned leaf tensors do not receive persistent backward hooks; their missing
 backward observation is reported as a capture issue.
 
@@ -252,7 +258,9 @@ NCCL user buffers) needs a dedicated replay adapter; copying environment variabl
 alone does not recreate that allocator. Preserve exact storage offsets within the
 byte limit. Large parent-buffer views remain explicitly unsupported.
 
-Capture excludes its declared inventory, collective and checkpoint output roots
-from untracked-file checks, while tracked modifications remain visible. Use output
+Captures record the same source/environment context as replay shards
+(`tools.determinism.pytest_plugin.source_context`). Capture excludes its declared
+inventory, collective and checkpoint output roots from untracked-file checks,
+while tracked modifications remain visible. Use output
 paths outside the checkout for evidence that will be joined to other producers;
 those producers independently audit the checkout and may flag untracked outputs.

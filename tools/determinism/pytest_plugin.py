@@ -39,9 +39,35 @@ ENVIRONMENT_KEYS = (
 )
 
 
-def _context(root: Path) -> dict:
-    import torch
+def _dirty(root: Path, output_roots) -> bool:
+    """Tracked edits, or untracked files outside the given generated-output roots."""
+    tracked = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, stderr=subprocess.PIPE
+    )
+    untracked = (
+        subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=root,
+            stderr=subprocess.PIPE,
+        )
+        .decode()
+        .split("\0")
+    )
+    outputs = [Path(path).resolve() for path in output_roots if path is not None]
+    return bool(tracked) or any(
+        name and not any((root / name).resolve().is_relative_to(path) for path in outputs)
+        for name in untracked
+    )
 
+
+def source_context(root: Path, torch, *, output_roots=()) -> dict:
+    """Record source, software, device and environment provenance for evidence.
+
+    Replay shards and recipe inventories use this one definition, and consumers
+    require the contexts to be equal. ``output_roots`` lists directories that the
+    run itself writes (inventories, captures, checkpoints); untracked files under
+    them do not make the checkout dirty. Tracked edits always do.
+    """
     versions: dict[str, str | None] = {}
     for name in (
         "torch",
@@ -60,13 +86,7 @@ def _context(root: Path) -> dict:
         revision = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.PIPE
         ).strip()
-        dirty = bool(
-            subprocess.check_output(
-                ["git", "status", "--porcelain", "--untracked-files=normal"],
-                cwd=root,
-                stderr=subprocess.PIPE,
-            )
-        )
+        dirty = _dirty(root, output_roots)
     except (OSError, subprocess.CalledProcessError):
         revision, dirty = None, True
         provenance_error = (
@@ -109,6 +129,13 @@ def _context(root: Path) -> dict:
             **triton_signature(),
         },
     }
+
+
+def _context(root: Path) -> dict:
+    """Return this session's shard provenance."""
+    import torch
+
+    return source_context(root, torch)
 
 
 class EvidencePlugin:

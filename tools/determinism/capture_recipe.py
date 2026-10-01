@@ -14,52 +14,58 @@ import argparse
 import contextlib
 import functools
 import importlib
-import importlib.metadata
 import inspect
 import json
 import math
 import os
-import platform
 import runpy
-import subprocess
 import sys
 from pathlib import Path
 
+from tools.determinism import pytest_plugin
+from tools.determinism.coverage import runtime_signature
 from tools.determinism.recipe_coverage import signature_key
 
-ENVIRONMENT_KEYS = (
-    "CUDA_DEVICE_MAX_CONNECTIONS",
-    "CUBLAS_WORKSPACE_CONFIG",
-    "NCCL_ALGO",
-    "NCCL_PROTO",
-    "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
-    "MAMBA_DETERMINISTIC",
-    "CAUSAL_CONV1D_DETERMINISTIC",
-)
+ROOT = Path(__file__).resolve().parents[2]
 
 
-def triton_signature() -> dict:
-    """Match the replay producer's cache policy and SSM block override fields."""
-    keys = {"TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR"}
-    keys.update(key for key in os.environ if key.startswith("TRITON_AUTOTUNE_BLOCK_"))
-    return {key: os.environ.get(key) for key in sorted(keys)}
+def source_context(torch, *, output_roots=()) -> dict:
+    """Return the replay producer's provenance for this checkout.
+
+    Inventories are joined to replay evidence only when both contexts are equal,
+    so this delegates to the evidence plugin's definition. Untracked files under
+    ``output_roots`` are outputs of the captured run, not source changes.
+    """
+    return pytest_plugin.source_context(ROOT, torch, output_roots=output_roots)
 
 
-def runtime_signature(torch) -> dict:
-    """Match the replay producer's schema-1 runtime settings."""
-    from torch.utils import deterministic
+def _is_default(value, default) -> bool:
+    if value is default:
+        return True
+    scalar = (type(None), bool, int, float, str)
+    return type(value) is type(default) and isinstance(value, scalar) and value == default
 
-    return {
-        "fill_uninitialized_memory": deterministic.fill_uninitialized_memory,
-        "autocast": torch.is_autocast_enabled(),
-        "autocast_dtype": str(torch.get_autocast_dtype("cuda")),
-        "float32_matmul_precision": torch.get_float32_matmul_precision(),
-        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
-        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
-        "cudnn_deterministic": torch.backends.cudnn.deterministic,
-        "cudnn_benchmark": torch.backends.cudnn.benchmark,
-        "triton": triton_signature(),
-    }
+
+def call_inputs(function, args, kwargs):
+    """Return a call's arguments in the replay harness's input form.
+
+    The harness records ``fn(*inputs)`` as the list of ``inputs``. Bind the call,
+    omit arguments that equal their declared defaults (the harness passes only
+    the arguments a case needs), and return the remaining positional arguments,
+    plus keyword-only ones as ``{"args": ..., "kwargs": ...}``. Equivalent call
+    styles therefore share one signature, and a production call that spells out
+    default values matches a replay case that omits them.
+    """
+    signature = inspect.signature(function)
+    bound = signature.bind(*args, **kwargs)
+    for name, parameter in signature.parameters.items():
+        if (
+            name in bound.arguments
+            and parameter.default is not inspect.Parameter.empty
+            and _is_default(bound.arguments[name], parameter.default)
+        ):
+            del bound.arguments[name]
+    return {"args": bound.args, "kwargs": bound.kwargs} if bound.kwargs else bound.args
 
 
 def input_signature(value, tensor_type) -> object:
@@ -84,73 +90,6 @@ def input_signature(value, tensor_type) -> object:
     raise ValueError(f"Opaque argument cannot establish a signature: {type(value).__qualname__}")
 
 
-def source_context(torch, *, output_roots=()) -> dict:
-    """Use the replay producer's versioned provenance fields."""
-    versions: dict[str, str | None] = {}
-    for name in (
-        "torch",
-        "triton",
-        "transformer-engine",
-        "causal-conv1d",
-        "mamba-ssm",
-        "flash-attn",
-    ):
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
-    driver: list[str] | None
-    try:
-        driver = sorted(
-            set(
-                subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], text=True
-                )
-                .strip()
-                .splitlines()
-            )
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        driver = None
-    root = Path(__file__).resolve().parents[2]
-    outputs = [Path(path).resolve() for path in output_roots if path is not None]
-    # Always inspect tracked edits. Only generated, untracked output paths are
-    # excluded; cwd changes in a recipe cannot redirect the provenance query.
-    tracked = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=root
-    )
-    untracked = (
-        subprocess.check_output(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=root
-        )
-        .decode()
-        .split("\0")
-    )
-    dirty = bool(tracked) or any(
-        name and not any((root / name).resolve().is_relative_to(path) for path in outputs)
-        for name in untracked
-    )
-    return {
-        "revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True
-        ).strip(),
-        "dirty": dirty,
-        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
-        "python": platform.python_version(),
-        "versions": versions,
-        "cuda": torch.version.cuda,
-        "driver": driver,
-        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
-        "capability": (
-            list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
-        ),
-        "environment": {
-            **{key: os.environ.get(key) for key in ENVIRONMENT_KEYS},
-            **triton_signature(),
-        },
-    }
-
-
 class Inventory:
     """Collect distinct signatures with bounded memory and visible truncation."""
 
@@ -172,12 +111,7 @@ class Inventory:
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
             try:
-                bound = inspect.signature(function).bind(*args, **kwargs)
-                bound.apply_defaults()
-                inputs = (
-                    {"args": bound.args, "kwargs": bound.kwargs} if bound.kwargs else bound.args
-                )
-                encoded = input_signature(inputs, self.torch.Tensor)
+                encoded = input_signature(call_inputs(function, args, kwargs), self.torch.Tensor)
             except (ValueError, TypeError) as error:
                 self.issues.add(f"{binding['target']}: {error}")
                 return function(*args, **kwargs)
