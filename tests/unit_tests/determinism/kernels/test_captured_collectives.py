@@ -17,10 +17,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip(
-    "tools.determinism.pytest_plugin", reason="requires tools.determinism.pytest_plugin"
-)
-
 from tests.unit_tests.determinism.comparison import bytes_equal
 from tests.unit_tests.determinism.kernels.harness import (
     _assert_replay_matches,

@@ -27,22 +27,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("An existing capture directory and positive byte limit are required")
     try:
         from megatron.determinism import bootstrap_training_determinism
-        from tools.determinism import pytest_plugin
-    except ImportError as error:
-        if error.name not in (
-            "megatron.determinism",
-            "tools.determinism.pytest_plugin",
-            "tools.determinism",
-        ):
+    except ModuleNotFoundError as error:
+        if error.name != "megatron.determinism":
             raise
-        parser.exit(
-            2,
-            "Collective replay requires megatron.determinism and "
-            "tools.determinism.pytest_plugin.\n",
-        )
+        parser.exit(2, "Collective replay requires the megatron.determinism startup API.\n")
 
     bootstrap_training_determinism(["--deterministic-mode"])
     import pytest
+
+    from tools.determinism import pytest_plugin
 
     # Generic unit-test conftest sets NCCL defaults that may differ from the
     # original recipe. This dedicated fixture owns its groups and needs no data.

@@ -986,9 +986,7 @@ def test_replay_launcher_requires_a_passed_case(tmp_path, monkeypatch, passes, e
     capture.mkdir()
     policy = ModuleType("megatron.determinism")
     policy.bootstrap_training_determinism = lambda _: None
-    plugin = ModuleType("tools.determinism.pytest_plugin")
     monkeypatch.setitem(sys.modules, policy.__name__, policy)
-    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
     monkeypatch.setattr(os, "environ", dict(os.environ))
 
     def run(args, plugins):
