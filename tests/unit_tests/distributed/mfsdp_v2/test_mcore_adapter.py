@@ -24,12 +24,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -631,38 +633,44 @@ class TestMcoreAdapterCudaGraph:
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
 
-    def setup_method(self):
-        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if self.world_size < 2 or self.world_size % 2:
+    def setup_class(cls):
+        # Reuse this topology across variants so cached DTensor layouts keep live groups.
+        cls.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if cls.world_size < 2 or cls.world_size % 2:
             pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        assert self.pg_collection.ep.size() == 2
-        assert self.pg_collection.expt_dp.size() == self.world_size // 2
-        self.reference_group = torch.distributed.new_group(
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert cls.pg_collection.ep.size() == 2
+        assert cls.pg_collection.expt_dp.size() == cls.world_size // 2
+        cls.reference_group = torch.distributed.new_group(
             [torch.distributed.get_rank()], use_local_synchronization=True
         )
-        self.reference_pg_collection = ProcessGroupCollection(
-            tp=self.reference_group,
-            expt_tp=self.reference_group,
-            cp=self.reference_group,
-            pp=self.reference_group,
-            tp_cp=self.reference_group,
-            tp_dp_cp=self.reference_group,
-            ep=self.reference_group,
-            tp_ep=self.reference_group,
-            expt_dp=self.reference_group,
-            dp=self.reference_group,
-            dp_cp=self.reference_group,
+        cls.reference_pg_collection = ProcessGroupCollection(
+            tp=cls.reference_group,
+            expt_tp=cls.reference_group,
+            cp=cls.reference_group,
+            pp=cls.reference_group,
+            tp_cp=cls.reference_group,
+            tp_dp_cp=cls.reference_group,
+            ep=cls.reference_group,
+            tp_ep=cls.reference_group,
+            expt_dp=cls.reference_group,
+            dp=cls.reference_group,
+            dp_cp=cls.reference_group,
             embd=None,
             pos_embd=None,
         )
         model_parallel_cuda_manual_seed(1234)
 
-    def teardown_method(self):
+    def teardown_class(cls):
         _destroy_model_parallel()
 
-    def test_build_train_step_and_clip(self):
+    @pytest.mark.parametrize(
+        "shortcut, custom_units",
+        [(False, False), (True, False), (True, True)],
+        ids=["standard", "shortcut", "shortcut-custom-units"],
+    )
+    def test_build_train_step_and_clip(self, shortcut, custom_units):
         """Shard experts over expert-DP and clip their combined gradients."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
@@ -677,6 +685,9 @@ class TestMcoreAdapterExpertParallel:
             moe_router_topk=2,
             moe_grouped_gemm=True,
             moe_ffn_hidden_size=128,
+            moe_shortcut_connection=shortcut,
+            moe_shortcut_post_norm=shortcut,
+            moe_shared_expert_intermediate_size=128 if shortcut else None,
             add_bias_linear=False,
             use_cpu_initialization=True,
             params_dtype=torch.float32,
@@ -708,6 +719,9 @@ class TestMcoreAdapterExpertParallel:
         for model_layer, reference_layer in zip(
             model.decoder.layers, reference_model.decoder.layers
         ):
+            if isinstance(model_layer, ShortcutMoEBlock):
+                model_layer = model_layer.moe_layer
+                reference_layer = reference_layer.moe_layer
             if not isinstance(model_layer, MoETransformerLayer):
                 continue
             for fc in ("linear_fc1", "linear_fc2"):
@@ -722,6 +736,14 @@ class TestMcoreAdapterExpertParallel:
                         if model_parameter is not None:
                             model_parameter.data.copy_(reference_parameter.data)
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        fsdp_unit_modules = None
+        if custom_units:
+            fsdp_unit_modules = [
+                TransformerLayer,
+                MoETransformerLayer,
+                MoELayer,
+                type(model.decoder.layers[0].shortcut_pre_mlp_layernorm),
+            ]
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -730,12 +752,28 @@ class TestMcoreAdapterExpertParallel:
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 fsdp_all_gather_in_start_param_sync=False,
+                # Shortcut norms execute outside static module order (see #7764).
+                suggested_communication_unit_size=0 if custom_units else None,
             ),
             module=model,
+            fsdp_unit_modules=fsdp_unit_modules,
             pg_collection=self.pg_collection,
         )
         assert isinstance(model.module, FsdpModule)
-        assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+        if shortcut:
+            block = model.module.decoder.layers[0]
+            assert isinstance(block, ShortcutMoEBlock)
+            assert isinstance(block, FsdpModule)
+            assert not isinstance(block.attn_layer, FsdpModule)
+            assert not isinstance(block.moe_layer, FsdpModule)
+            assert not isinstance(block.moe_layer.mlp, FsdpModule)
+            assert isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule) == custom_units
+            experts = block.moe_layer.mlp.experts
+        else:
+            experts = model.module.decoder.layers[1].mlp.experts
+        assert isinstance(experts, FsdpModule)
+        for parameter in experts.parameters():
+            assert parameter.device_mesh.get_group("expert_dp") == self.pg_collection.expt_dp
 
         optimizer_config = OptimizerConfig(
             lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
