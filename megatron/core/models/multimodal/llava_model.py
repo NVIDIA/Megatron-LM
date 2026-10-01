@@ -99,7 +99,7 @@ class LLaVAModel(MegatronModule):
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
         language_rope_scaling_factor (float): RoPE scaling factor. Defaults to 8.
-        logit_dtype (torch.dtype, optional): Dtype of the hybrid language model's output-layer GEMM.
+        logit_dtype (torch.dtype, optional): Dtype of the language model's output-layer GEMM.
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         conv_merging (bool): Account for a native 2x2 vision-token merger.
@@ -290,6 +290,7 @@ class LLaVAModel(MegatronModule):
                     rotary_base=language_rotary_base,
                     rope_scaling=language_rope_scaling,
                     rope_scaling_factor=language_rope_scaling_factor,
+                    logit_dtype=logit_dtype,
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
