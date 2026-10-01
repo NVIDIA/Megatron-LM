@@ -347,7 +347,13 @@ def _build_split_loaders(
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
     data_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp
-    base_seed = args.seed + module_seed_offset + get_pg_rank(data_group)
+    lane_rank = get_pg_rank(data_group)
+    if pg_collection.dp_cp_gtp_remat is not None:
+        # The combined group orders CP first (fastest), then GTP and DP.
+        # CP replicas consume the same full batch before the model shards it;
+        # GTP and DP remain distinct data lanes, matching the bridge topology.
+        lane_rank //= pg_collection.cp.size()
+    base_seed = args.seed + module_seed_offset + lane_rank
     common = _mock_loader_kwargs(args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
