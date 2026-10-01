@@ -779,13 +779,16 @@ class TestRouterAuxLoss:
     @pytest.mark.parametrize("with_padding", [False, True])
     def test_global_aux_loss_uneven_token_counts(self, with_padding):
         """Constant routing frequencies must stay normalized across uneven microbatches."""
+        # Keep TE's FP32 GEMM rounding out of the normalization comparison.
         router = self.new_router(
             moe_router_load_balancing_type="global_aux_loss",
             moe_aux_loss_coeff=1.0,
-            moe_router_dtype="fp32",
+            moe_router_dtype="fp64",
             moe_router_topk=1,
+            moe_router_pre_softmax=True,
             num_moe_experts=4,
             num_attention_heads=4,
+            num_query_groups=4,
             bf16=False,
             params_dtype=torch.float32,
             calculate_per_token_loss=False,
