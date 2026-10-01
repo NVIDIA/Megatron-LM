@@ -60,7 +60,7 @@ def test_rejects_omitted_field(explicit_groups, field):
     delattr(explicit_groups, field)
     # Declared but unset collection fields are visible to hasattr and resolve to None.
     assert hasattr(explicit_groups, field)
-    with pytest.raises(AssertionError, match=f'must explicitly define {field}'):
+    with pytest.raises(ValueError, match=f'must explicitly define {field}'):
         LanguageModule(config(), pg_collection=explicit_groups)
 
 
@@ -68,7 +68,7 @@ def test_rejects_omitted_field(explicit_groups, field):
 def test_live_model_requires_participating_axes(mocker, explicit_groups, field):
     mocker.patch('torch.distributed.is_initialized', return_value=True)
     setattr(explicit_groups, field, None)
-    with pytest.raises(AssertionError, match=f'participating {field} group'):
+    with pytest.raises(ValueError, match=f'participating {field} group'):
         LanguageModule(config(), pg_collection=explicit_groups)
 
 
@@ -77,7 +77,7 @@ def test_live_model_requires_participating_axes(mocker, explicit_groups, field):
 def test_rejects_nonmember_sentinel(mocker, explicit_groups, initialized, field):
     mocker.patch('torch.distributed.is_initialized', return_value=initialized)
     setattr(explicit_groups, field, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-    with pytest.raises(AssertionError, match=f'{field} cannot be NON_GROUP_MEMBER'):
+    with pytest.raises(ValueError, match=f'{field} cannot be NON_GROUP_MEMBER'):
         LanguageModule(config(), pg_collection=explicit_groups)
 
 
