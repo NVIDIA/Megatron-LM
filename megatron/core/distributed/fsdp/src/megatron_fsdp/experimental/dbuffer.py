@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import changed_mesh_axis
+from .placement import BlockAtomic, TensorAtomic, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,6 +58,16 @@ def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
     """Convert a DTensor Partial reduction name to a torch.distributed op."""
     reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
     return reduce_ops[partial_placement.reduce_op]
+
+
+def _validate_layout(layout: GlobalLayout, placements: Iterable[Placement]) -> None:
+    """Check layout coordinates satisfy each requested shard placement."""
+    for placement in placements:
+        if isinstance(placement, TensorAtomic):
+            layout.validate_for_tensor_atomic()
+        elif isinstance(placement, Shard):
+            block_size = placement.block_size if isinstance(placement, BlockAtomic) else 1
+            layout.validate_for_row_atomic(block_size=block_size)
 
 
 class DBuffer:
@@ -101,12 +111,11 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
-
+        _validate_layout(layout, placements)
         self.mesh = mesh
         self.placements = placements
 
         self.layout = layout
-
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
 
@@ -121,11 +130,21 @@ class DBuffer:
         *,
         block_size: int = 1,
     ) -> "DBuffer":
-        """Build a layout from logical tensor shapes and allocate its local buffer."""
-        layout = GlobalLayout.build(
-            tuple(torch.Size(shape) for shape in tensor_shapes),
-            dp_size=mesh.size(),
-            block_size=block_size,
+        """Build a RowAtomic or BlockAtomic layout and allocate its local buffer.
+
+        For TensorAtomic, use ``GlobalLayout.build_for_tensor_atomic`` and pass
+        the resulting layout to the DBuffer constructor.
+
+        Args:
+            mesh: Device mesh whose dimensions correspond to ``placements``.
+            placements: Per-mesh-axis DBuffer placements.
+            tensor_shapes: Logical shapes that the DBuffer manages.
+            dtype: Dtype for the local buffer.
+            device: Device for the local buffer.
+            block_size: Number of consecutive rows kept together on one rank.
+        """
+        layout = GlobalLayout.build_for_row_atomic(
+            tensor_shapes, dp_size=mesh.size(), block_size=block_size
         )
         return cls(mesh, placements, layout, dtype, device)
 
@@ -213,6 +232,8 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
+        _validate_layout(layout, placements)
+
         if local_buffer.dim() != 1:
             raise ValueError("local_buffer must be a flat 1D tensor.")
         if not local_buffer.is_contiguous():
@@ -237,7 +258,7 @@ class DBuffer:
         """Return a storage-sharing buffer with supported ``placements``.
 
         Views preserve placements, relabel a full local buffer, or locally slice
-        one full local buffer to Flat. A view that changes a Partial placement is
+        one full local buffer to RowAtomic. A view that changes a Partial placement is
         only a storage destination: callers must populate it with a reduction
         before reading it.
         """
@@ -269,7 +290,7 @@ class DBuffer:
             return DBuffer.from_local(self.local_buffer, self.mesh, placements, self.layout)
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
-            "or a Replicate/Partial-to-Flat slice, "
+            "or a Replicate/Partial-to-RowAtomic slice, "
             f"got {self.placements!r} -> {placements!r}."
         )
 
@@ -280,7 +301,7 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         *,
-        block_size: int = 1,
+        layout: GlobalLayout | None = None,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -289,12 +310,15 @@ class DBuffer:
                 shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
+            layout: Prebuilt layout matching the input tensor shapes and order. If
+                omitted, build a RowAtomic layout. Use the GlobalLayout builders
+                to supply a TensorAtomic or BlockAtomic layout.
 
         Returns:
             A DBuffer whose real local storage matches ``placements``. Ranges
             corresponding to meta tensors are left uninitialized.
         """
-        tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
+        tensors = tuple(tensors)
         if not tensors:
             raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
 
@@ -304,28 +328,33 @@ class DBuffer:
                 raise ValueError("All tensors in a DBuffer must have the same dtype.")
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
-        buffer = cls.empty(
-            mesh=mesh,
-            placements=placements,
-            tensor_shapes=tensor_shapes,
-            dtype=dtype,
-            device=mesh.device_type,
-            block_size=block_size,
+        if layout is None:
+            layout = GlobalLayout.build_for_row_atomic(tensor_shapes, dp_size=mesh.size())
+        elif layout.tensor_shapes != tensor_shapes:
+            raise ValueError("Layout tensor shapes must match the input tensors in order.")
+        buffer = cls(
+            mesh=mesh, placements=placements, layout=layout, dtype=dtype, device=mesh.device_type
         )
-        # Only logical tensor ranges are initialized. Padding and layout gaps are not
-        # observable through get_tensor_view() and can remain unspecified.
         for index, tensor in enumerate(tensors):
-            owned_range = buffer._get_owned_range(index)
-            if owned_range is None or tensor.is_meta:
-                continue
-
-            source_slice = tensor.view(-1).narrow(
-                0, owned_range.tensor_relative_offset, owned_range.numel
-            )
-            buffer.local_buffer.narrow(
-                0, owned_range.buffer_relative_offset, owned_range.numel
-            ).copy_(source_slice)
+            buffer.copy_from(index, tensor)
         return buffer
+
+    def copy_from(self, index: int, tensor: torch.Tensor) -> None:
+        """Copy a full logical tensor's local owned range into this buffer.
+
+        Meta tensors leave their owned range unspecified. Padding and layout gaps
+        are not observable through ``get_tensor_view()`` and remain unspecified.
+        """
+        owned_range = self._get_owned_range(index)
+        if owned_range is None or tensor.is_meta:
+            return
+        tensor = tensor.detach().contiguous()
+        source_slice = tensor.view(-1).narrow(
+            0, owned_range.tensor_relative_offset, owned_range.numel
+        )
+        self.local_buffer.narrow(0, owned_range.buffer_relative_offset, owned_range.numel).copy_(
+            source_slice
+        )
 
     def _create_or_validate_out(
         self,
@@ -376,8 +405,8 @@ class DBuffer:
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
-        Flat -> Replicate, Partial -> Replicate, Partial -> Flat,
-        Replicate -> Flat, and Replicate -> Partial. Other placement changes are
+        RowAtomic -> Replicate, Partial -> Replicate, Partial -> RowAtomic,
+        Replicate -> RowAtomic, and Replicate -> Partial. Other placement changes are
         intentionally unsupported.
         """
         new_placements = tuple(new_placements)
@@ -508,7 +537,7 @@ class DBuffer:
     def get_tensor_view(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
 
-        Flat placements shard dim 0, so the returned view preserves all
+        RowAtomic placements shard dim 0, so the returned view preserves all
         non-leading dimensions and only changes the leading dimension.
         """
         shape = self.layout.tensor_shapes[index]
@@ -532,7 +561,7 @@ class DBuffer:
         """Return logical tensor ``index`` as a DTensor."""
         local_tensor = self.get_tensor_view(index)
         tensor_shape = self.layout.tensor_shapes[index]
-        # Keep internal storage details (e.g. Flat and BlockAtomic) out of DTensor placements.
+        # Keep internal storage details (e.g. RowAtomic and BlockAtomic) out of DTensor placements.
         dtensor_placements = tuple(
             Shard(placement.dim) if isinstance(placement, Shard) else placement
             for placement in self.placements
