@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Focused tests for the 2D-RoPE ViT VLM MIMO provider."""
+"""Tests for the 2D-RoPE ViT VLM MIMO provider."""
 
 import argparse
 from types import SimpleNamespace
