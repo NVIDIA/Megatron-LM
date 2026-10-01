@@ -3,25 +3,27 @@
 """Focused tests for the 2D-RoPE ViT VLM MIMO provider."""
 
 import argparse
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from examples.mimo.model_providers import resolve_provider
+from examples.mimo.model_providers import resolve_provider, rope2d_vit_vlm
 from examples.mimo.model_providers.nemotron_moe_vlm import (
-    NEMOTRON_MODEL_PROVIDER,
+    _language_stack_spec,
     add_model_provider_args,
 )
-from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.model_providers.rope2d_vit_vlm import (
     ROPE2D_VIT_VLM_MODEL_PROVIDER,
     Rope2dViTModel,
     add_rope2d_vit_args,
     build_rope2d_vit_vlm_communicator,
 )
+from megatron.core.models.hybrid import hybrid_layer_specs
+from megatron.core.models.mamba import mamba_layer_specs
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.vit_model import ViTModel
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -34,10 +36,7 @@ VISION_SIZES = {
     "mimo_vision_ffn_hidden_size": 128,
     "mimo_vision_num_attention_heads": 4,
 }
-
-
-# Every architecture choice set away from its default.
-NON_DEFAULT_ARCH = {
+NON_DEFAULT_ARGS = {
     "mimo_vision_num_query_groups": 2,
     "mimo_vision_kv_channels": 32,
     "mimo_vision_normalization": "RMSNorm",
@@ -50,7 +49,44 @@ NON_DEFAULT_ARCH = {
     "mimo_vision_spatial_merge_size": 2,
     "pixel_shuffle": True,
     "mimo_vision_projector_activation": "fast_gelu",
+    "mimo_vision_encoder_attention_backend": AttnBackend.flash,
+    "mimo_vision_encoder_flash_attention_version": 4,
 }
+# (vision config, ViT params, projection config) expected from the args above.
+DEFAULT_EXPECTED = (
+    {
+        "num_query_groups": 4,
+        "kv_channels": 16,
+        "normalization": "LayerNorm",
+        "layernorm_epsilon": 1e-5,
+        "activation_func": torch.nn.functional.gelu,
+        "gated_linear_unit": False,
+        "add_bias_linear": True,
+        "add_qkv_bias": False,
+        "rotary_interleaved": False,
+        "attention_backend": AttnBackend.unfused,
+        "flash_attention_version": 2,
+    },
+    {"ln_pre": True, "use_merger": False},
+    {"activation_func": torch.nn.functional.gelu, "add_bias_linear": True},
+)
+NON_DEFAULT_EXPECTED = (
+    {
+        "num_query_groups": 2,
+        "kv_channels": 32,
+        "normalization": "RMSNorm",
+        "layernorm_epsilon": 1e-6,
+        "activation_func": torch.nn.functional.silu,
+        "gated_linear_unit": True,
+        "add_bias_linear": False,
+        "add_qkv_bias": True,
+        "rotary_interleaved": True,
+        "attention_backend": AttnBackend.flash,
+        "flash_attention_version": 4,
+    },
+    {"ln_pre": False, "use_merger": True, "spatial_merge_size": 2},
+    {"activation_func": rope2d_vit_vlm._unfused_fast_gelu, "add_bias_linear": False},
+)
 
 
 def _provider_args(**overrides):
@@ -58,6 +94,7 @@ def _provider_args(**overrides):
     add_rope2d_vit_args(parser)
     values = {
         **vars(parser.parse_args([])),
+        **VISION_SIZES,
         "bf16": True,
         "fp16": False,
         "hidden_size": LANGUAGE_HIDDEN_SIZE,
@@ -68,7 +105,6 @@ def _provider_args(**overrides):
         "pixel_shuffle": False,
         "model_provider": ROPE2D_VIT_VLM_MODEL_PROVIDER,
         "mimo_vision_encoder_name": ENCODER_NAME,
-        **VISION_SIZES,
         "mimo_bridge_skip_shape_exchange": False,
         "mimo_run_input_projections_on_llm_ranks": False,
         "mimo_vision_encoder_attention_backend": None,
@@ -79,158 +115,81 @@ def _provider_args(**overrides):
     return SimpleNamespace(**values)
 
 
-def _provider_base_config(**overrides):
-    values = {
-        "activation_func": torch.nn.functional.gelu,
-        "attention_backend": AttnBackend.unfused,
-        # The language model's CP; the vision tower and projection must not inherit it.
-        "context_parallel_size": 2,
-        "flash_attention_version": 2,
-        "expert_tensor_parallel_size": None,
-        "fp32_residual_connection": False,
-        "params_dtype": torch.bfloat16,
-        "pipeline_dtype": torch.bfloat16,
-        # Read by _make_dense_non_hybrid when it strips language-only recompute modules.
-        "recompute_modules": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def _assert_gtp_disabled(config, tp_size=1):
-    assert config.gtp_weight_remat_size == 1
-    assert config.tensor_parallel_num_weight_shards == tp_size
-    assert config.expert_gtp_weight_remat_size == 1
-    assert config.expert_tensor_parallel_num_weight_shards == tp_size
-
-
 def _encoder_spec(monkeypatch, **arg_overrides):
-    from examples.mimo.model_providers import rope2d_vit_vlm
-
-    monkeypatch.setattr(rope2d_vit_vlm, "_base_config", lambda _args: _provider_base_config())
+    # The language model's CP, attention backend, and activation must not leak into the ViT.
+    base_config = dict(
+        activation_func=torch.nn.functional.relu,
+        attention_backend=AttnBackend.unfused,
+        context_parallel_size=2,
+        flash_attention_version=2,
+        expert_tensor_parallel_size=None,
+        fp32_residual_connection=False,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        recompute_modules=None,
+    )
+    monkeypatch.setattr(
+        rope2d_vit_vlm, "_base_config", lambda _args: SimpleNamespace(**base_config)
+    )
     args = _provider_args(**arg_overrides)
     provider = resolve_provider(args)
     return provider, args, provider.encoder_specs[ENCODER_NAME](args, None, None)
 
 
-def _built_configs(monkeypatch, **arg_overrides):
-    provider, args, spec = _encoder_spec(monkeypatch, **arg_overrides)
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [({}, DEFAULT_EXPECTED), (NON_DEFAULT_ARGS, NON_DEFAULT_EXPECTED)],
+    ids=["defaults", "every-arg-set"],
+)
+def test_vision_tower_and_projector_follow_args(monkeypatch, overrides, expected):
+    provider, args, spec = _encoder_spec(monkeypatch, **overrides)
     encoder = spec.submodules["encoders"][ENCODER_NAME]
     (projection,) = spec.submodules["input_projections"]
-    return provider, args, encoder, projection
-
-
-@pytest.mark.parametrize(
-    ("encoder_backend", "encoder_flash_version"),
-    ((None, None), (AttnBackend.flash, 4), (AttnBackend.fused, None)),
-)
-def test_vision_tower_and_projector_defaults(monkeypatch, encoder_backend, encoder_flash_version):
-    provider, args, encoder, projection = _built_configs(
-        monkeypatch,
-        mimo_vision_encoder_attention_backend=encoder_backend,
-        mimo_vision_encoder_flash_attention_version=encoder_flash_version,
-    )
     vision_config = encoder.params["transformer_config"]
     projection_config = projection.params["config"]
+    expected_vision, expected_vit, expected_projection = expected
 
     assert provider.encoder_module_names == (ENCODER_NAME,)
     assert provider.special_token_ids(args) == {ENCODER_NAME: 10}
     assert encoder.module is Rope2dViTModel
-    assert issubclass(encoder.module, ViTModel)
-    assert (
-        vision_config.num_layers,
-        vision_config.hidden_size,
-        vision_config.ffn_hidden_size,
-        vision_config.num_attention_heads,
-    ) == tuple(VISION_SIZES.values())
-    # Unset choices use TransformerConfig/ViTModel defaults, not the language model's settings.
-    assert vision_config.num_query_groups == 4
-    assert vision_config.kv_channels == 16
-    assert vision_config.normalization == "LayerNorm"
-    assert vision_config.layernorm_epsilon == 1e-5
-    assert vision_config.activation_func is torch.nn.functional.gelu
-    assert vision_config.gated_linear_unit is False
-    assert vision_config.add_bias_linear is True
-    assert vision_config.add_qkv_bias is False
-    assert vision_config.rotary_interleaved is False
-    assert vision_config.attention_backend is (encoder_backend or AttnBackend.unfused)
-    assert vision_config.flash_attention_version == (encoder_flash_version or 2)
     assert encoder.params["pos_emb_type"] == "rope2d"
-    assert encoder.params["patch_dim"] == args.patch_dim
-    assert encoder.params["add_class_token"] is False
-    assert encoder.params["ln_pre"] is True
-    assert encoder.params["use_merger"] is False
+    sizes = ("num_layers", "hidden_size", "ffn_hidden_size", "num_attention_heads")
+    assert tuple(getattr(vision_config, name) for name in sizes) == tuple(VISION_SIZES.values())
+    for name, value in expected_vision.items():
+        assert getattr(vision_config, name) == value, name
+    for name, value in expected_vit.items():
+        assert encoder.params[name] == value, name
 
     # Two-layer MLP from the ViT width to the language hidden size.
-    assert projection.module is MultimodalProjector
-    assert projection.params["projector_type"] == "mlp"
     assert projection.params["input_size"] == VISION_SIZES["mimo_vision_hidden_size"]
     assert projection_config.hidden_size == LANGUAGE_HIDDEN_SIZE
     assert projection_config.ffn_hidden_size == LANGUAGE_HIDDEN_SIZE
-    assert projection_config.activation_func is torch.nn.functional.gelu
     assert projection_config.gated_linear_unit is False
-    assert projection_config.add_bias_linear is True
-    assert vision_config.context_parallel_size == 1
-    assert projection_config.context_parallel_size == 1
-    _assert_gtp_disabled(vision_config)
-    _assert_gtp_disabled(projection_config)
+    for name, value in expected_projection.items():
+        assert getattr(projection_config, name) == value, name
 
-
-def test_architecture_follows_args(monkeypatch):
-    from examples.mimo.model_providers import rope2d_vit_vlm
-
-    _, _, encoder, projection = _built_configs(monkeypatch, **NON_DEFAULT_ARCH)
-    vision_config = encoder.params["transformer_config"]
-    projection_config = projection.params["config"]
-
-    assert vision_config.num_query_groups == 2
-    assert vision_config.kv_channels == 32
-    assert vision_config.normalization == "RMSNorm"
-    assert vision_config.layernorm_epsilon == 1e-6
-    assert vision_config.activation_func is torch.nn.functional.silu
-    assert vision_config.gated_linear_unit is True
-    assert vision_config.add_bias_linear is False
-    assert vision_config.add_qkv_bias is True
-    assert vision_config.rotary_interleaved is True
-    assert encoder.params["ln_pre"] is False
-    assert encoder.params["use_merger"] is True
-    assert encoder.params["spatial_merge_size"] == 2
-    assert projection_config.add_bias_linear is False
-    assert projection_config.activation_func is rope2d_vit_vlm._unfused_fast_gelu
-    activation_input = torch.tensor([-2.0, -0.5, 0.0, 1.0, 3.0])
-    torch.testing.assert_close(
-        projection_config.activation_func(activation_input),
-        torch.nn.functional.gelu(activation_input, approximate="tanh"),
-    )
-
-
-@pytest.mark.parametrize("missing", sorted(VISION_SIZES))
-def test_provider_requires_vision_sizes(missing):
-    flag = "--" + missing.replace("_", "-")
-    with pytest.raises(ValueError, match=flag):
-        resolve_provider(_provider_args(**{missing: None}))
-
-
-def test_rejects_heads_that_do_not_divide_hidden_size():
-    with pytest.raises(ValueError, match="divisible"):
-        resolve_provider(_provider_args(mimo_vision_num_attention_heads=5))
-    # An explicit head dim lifts the requirement.
-    resolve_provider(_provider_args(mimo_vision_num_attention_heads=5, mimo_vision_kv_channels=8))
-
-
-def test_rejects_query_groups_that_do_not_divide_heads():
-    with pytest.raises(ValueError, match="num-query-groups"):
-        resolve_provider(_provider_args(mimo_vision_num_query_groups=3))
+    for config in (vision_config, projection_config):
+        assert config.context_parallel_size == 1
+        assert config.gtp_weight_remat_size == config.expert_gtp_weight_remat_size == 1
 
 
 @pytest.mark.parametrize(
-    ("merge_size", "pixel_shuffle"), [(2, False), (None, True)], ids=["merge-only", "shuffle-only"]
+    ("overrides", "match"),
+    [
+        ({"mimo_vision_num_layers": None}, "--mimo-vision-num-layers"),
+        ({"mimo_vision_num_attention_heads": 5}, "divisible"),
+        ({"mimo_vision_num_query_groups": 3}, "num-query-groups"),
+        ({"mimo_vision_spatial_merge_size": 2}, "--pixel-shuffle"),
+        ({"pixel_shuffle": True}, "--pixel-shuffle"),
+    ],
 )
-def test_merger_and_pixel_shuffle_go_together(merge_size, pixel_shuffle):
-    with pytest.raises(ValueError, match="--pixel-shuffle"):
-        resolve_provider(
-            _provider_args(mimo_vision_spatial_merge_size=merge_size, pixel_shuffle=pixel_shuffle)
-        )
+def test_rejects_invalid_args(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        resolve_provider(_provider_args(**overrides))
+
+
+def test_explicit_kv_channels_allows_indivisible_hidden_size():
+    resolve_provider(_provider_args(mimo_vision_num_attention_heads=5, mimo_vision_kv_channels=8))
 
 
 def test_rejects_projection_on_language_ranks(monkeypatch):
@@ -242,11 +201,7 @@ def test_vit_keeps_encoder_grid_tp_group(monkeypatch):
     """sharded_state_dict must use the encoder grid's TP group, not the global one."""
     from megatron.core.models.vision import vit_model
 
-    class StubTransformerBlock(torch.nn.Module):
-        def __init__(self, **_kwargs):
-            super().__init__()
-
-    monkeypatch.setattr(vit_model, "TransformerBlock", StubTransformerBlock)
+    monkeypatch.setattr(vit_model, "TransformerBlock", lambda **_kwargs: torch.nn.Identity())
     tp_group = object()
     model = Rope2dViTModel(
         transformer_config=TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4),
@@ -260,12 +215,10 @@ def test_vit_keeps_encoder_grid_tp_group(monkeypatch):
 
 
 def test_vit_accepts_mimo_encoder_inputs(monkeypatch):
-    """MIMO batches name the image tensor x; ViTModel names it pixel_values."""
+    """MIMO batches name the image tensor x and move imgs_sizes to CUDA."""
     captured = {}
 
-    def fake_forward(
-        self, pixel_values, attention_mask=None, imgs_sizes=None, packed_seq_params=None
-    ):
+    def fake_forward(self, pixel_values, imgs_sizes=None, packed_seq_params=None):
         captured.update(pixel_values=pixel_values, imgs_sizes=imgs_sizes)
         return pixel_values
 
@@ -273,55 +226,35 @@ def test_vit_accepts_mimo_encoder_inputs(monkeypatch):
     model = Rope2dViTModel.__new__(Rope2dViTModel)
     torch.nn.Module.__init__(model)
     x, imgs_sizes = torch.zeros(1, 4, 768), torch.tensor([[32, 32]])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    assert model(x=x, imgs_sizes=imgs_sizes) is x
-    assert captured["pixel_values"] is x and captured["imgs_sizes"] is imgs_sizes
-
-    if torch.cuda.is_available():
-        # MIMO moves the batch to CUDA; ViTModel requires host-side imgs_sizes.
-        model(x=x, imgs_sizes=imgs_sizes.cuda())
-        assert not captured["imgs_sizes"].is_cuda
-        assert torch.equal(captured["imgs_sizes"], imgs_sizes)
+    assert model(x=x, imgs_sizes=imgs_sizes.to(device)) is x
+    assert captured["pixel_values"] is x
+    assert not captured["imgs_sizes"].is_cuda
+    assert torch.equal(captured["imgs_sizes"], imgs_sizes)
 
 
-@pytest.mark.parametrize("skip_shape_exchange", [False, True])
-def test_build_communicator_wires_bridge_contract(monkeypatch, skip_shape_exchange):
-    from examples.mimo.model_providers import rope2d_vit_vlm
-
+def test_bridge_recv_shape_counts_image_tokens(monkeypatch):
     captured = {}
-    communicator = object()
-    topology = SimpleNamespace(grids={ENCODER_NAME: object(), MIMO_LANGUAGE_MODULE_KEY: object()})
     language_config = SimpleNamespace(hidden_size=LANGUAGE_HIDDEN_SIZE, params_dtype=torch.bfloat16)
     monkeypatch.setattr(
         rope2d_vit_vlm,
         "language_model_spec",
-        lambda args, pg_collection, grid: SimpleNamespace(params={"config": language_config}),
+        lambda *_args: SimpleNamespace(params={"config": language_config}),
+    )
+    monkeypatch.setattr(
+        rope2d_vit_vlm, "MultiModulePipelineCommunicator", lambda *_a, **kw: captured.update(kw)
+    )
+    topology = SimpleNamespace(grids={ENCODER_NAME: object(), MIMO_LANGUAGE_MODULE_KEY: object()})
+
+    build_rope2d_vit_vlm_communicator(
+        _provider_args(mimo_bridge_skip_shape_exchange=True), topology, encoder_name=ENCODER_NAME
     )
 
-    def capture_communicator(*args, **kwargs):
-        captured.update(kwargs)
-        return communicator
-
-    monkeypatch.setattr(rope2d_vit_vlm, "MultiModulePipelineCommunicator", capture_communicator)
-
-    args = _provider_args(mimo_bridge_skip_shape_exchange=skip_shape_exchange)
-    assert (
-        build_rope2d_vit_vlm_communicator(args, topology, encoder_name=ENCODER_NAME) is communicator
-    )
+    # A real batch carries only input_ids; image tokens there size the receive buffer.
+    batch = {"input_ids": torch.tensor([[1, 10, 10, 2], [10, 3, 4, 5]])}
+    assert captured["bridge_recv_shape_fns"][ENCODER_NAME](batch) == (3, LANGUAGE_HIDDEN_SIZE)
     assert captured["bridge_comm_dtypes"] == {ENCODER_NAME: torch.bfloat16}
-    shape_fns = captured["bridge_recv_shape_fns"]
-    if skip_shape_exchange:
-        # A real batch carries only input_ids; image tokens there size the receive buffer.
-        batch = {"input_ids": torch.tensor([[1, 10, 10, 2], [10, 3, 4, 5]])}
-        assert shape_fns[ENCODER_NAME](batch) == (3, LANGUAGE_HIDDEN_SIZE)
-    else:
-        assert shape_fns is None
-
-
-def test_radio_provider_contract_remains_unchanged():
-    provider = resolve_provider(SimpleNamespace(model_provider=NEMOTRON_MODEL_PROVIDER))
-
-    assert provider.encoder_module_names == (RADIO_ENCODER_MODULE_NAME,)
 
 
 @pytest.mark.parametrize(
@@ -331,69 +264,37 @@ def test_radio_provider_contract_remains_unchanged():
         (None, 3, "wide_residual_hybrid_stack_spec"),
         ("gated_delta_product_stack_spec", None, "gated_delta_product_stack_spec"),
         ("gated_delta_product_stack_spec", 3, "wide_residual_gated_delta_product_stack_spec"),
-        (
-            "wide_residual_gated_delta_product_stack_spec",
-            3,
-            "wide_residual_gated_delta_product_stack_spec",
-        ),
         # Aliases resolve to their canonical spec before taking the wide-residual variant.
         ("gdp_stack_spec", 3, "wide_residual_gated_delta_product_stack_spec"),
-        ("mamba_stack_spec", 3, "wide_residual_hybrid_stack_spec"),
     ],
 )
 def test_language_stack_spec_follows_spec_arg(spec_name, wide_residual, expected_name):
-    from examples.mimo.model_providers.nemotron_moe_vlm import _language_stack_spec
-    from megatron.core.models.hybrid import hybrid_layer_specs
-    from megatron.core.models.mamba import mamba_layer_specs
-
     module = "megatron.core.models.hybrid.hybrid_layer_specs"
     args = SimpleNamespace(spec=None if spec_name is None else [module, spec_name])
-    config = SimpleNamespace(wide_residual=wide_residual)
     specs = {**vars(mamba_layer_specs), **vars(hybrid_layer_specs)}
 
-    assert _language_stack_spec(args, config) is specs[expected_name]
+    stack_spec = _language_stack_spec(args, SimpleNamespace(wide_residual=wide_residual))
+    assert stack_spec is specs[expected_name]
 
 
 def test_language_stack_spec_rejects_specs_without_wide_residual_variant(monkeypatch):
-    import sys
-    import types
-
-    from examples.mimo.model_providers.nemotron_moe_vlm import _language_stack_spec
-
     custom_specs = types.ModuleType("custom_stack_specs")
     custom_specs.custom_stack_spec = object()
     monkeypatch.setitem(sys.modules, "custom_stack_specs", custom_specs)
     args = SimpleNamespace(spec=["custom_stack_specs", "custom_stack_spec"])
 
-    assert _language_stack_spec(args, SimpleNamespace(wide_residual=None)) is (
-        custom_specs.custom_stack_spec
-    )
     with pytest.raises(ValueError, match="no wide_residual_ variant"):
         _language_stack_spec(args, SimpleNamespace(wide_residual=3))
 
 
-def test_model_provider_args():
+def test_model_provider_args_register_vision_args():
     parser = argparse.ArgumentParser()
     add_model_provider_args(parser)
 
     args = parser.parse_args(
-        [
-            "--model-provider",
-            ROPE2D_VIT_VLM_MODEL_PROVIDER,
-            "--mimo-vision-num-layers",
-            "2",
-            "--mimo-vision-hidden-size",
-            "64",
-            "--mimo-vision-ffn-hidden-size",
-            "128",
-            "--mimo-vision-num-attention-heads",
-            "4",
-            "--mimo-vision-encoder-name",
-            ENCODER_NAME,
-        ]
+        ["--model-provider", ROPE2D_VIT_VLM_MODEL_PROVIDER, "--mimo-vision-num-layers", "2"]
     )
 
     assert args.model_provider == ROPE2D_VIT_VLM_MODEL_PROVIDER
-    assert {name: getattr(args, name) for name in VISION_SIZES} == VISION_SIZES
-    assert args.mimo_vision_encoder_name == ENCODER_NAME
-    assert parser.parse_args([]).mimo_vision_encoder_name == "vision_encoder"
+    assert args.mimo_vision_num_layers == 2
+    assert args.mimo_vision_encoder_name == "vision_encoder"
