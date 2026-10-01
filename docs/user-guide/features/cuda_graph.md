@@ -122,16 +122,16 @@ This implementation does not create inference CUDA graphs. For inference, use
 
 ### Requirements
 
-- `--no-check-for-nan-in-loss-and-grad` is required: NaN checks involve CPU-GPU synchronization
-  which cannot run inside a CUDA graph.
+- Loss and gradient checks remain enabled. Values passed to the rerun state machine during
+  capture are snapshotted at their validation sites. Host-side checks run after each replay,
+  before the training loop decides whether to rerun or update the optimizer.
 - `--cuda-graph-modules` must be omitted (or left empty): per-module selection has no meaning
   when the entire iteration is captured as a single graph.
 
 ### Example
 
 ```bash
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ---
@@ -152,8 +152,7 @@ All three implementations work for dense models:
 # equivalent: --cuda-graph-impl transformer_engine --cuda-graph-modules attn mlp
 
 # Full-iteration
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ### MoE Model Training
@@ -174,7 +173,6 @@ graphs to be used on MoE models as well:
 
 ```bash
 --cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad \
 --moe-flex-dispatcher-backend hybridep \
 --use-transformer-engine-op-fuser \
 --moe-expert-rank-capacity-factor <float> \
