@@ -982,11 +982,65 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
+        assert block._residual_stream_atomic_layer_pairs == ()
         assert len({id(config) for config in block.layer_config_list}) == len(layer_pattern)
         assert all(
             layer.config is layer_config
             for layer, layer_config in zip(block.layers, block.layer_config_list)
         )
+
+    @pytest.mark.parametrize("pp_layer_offset", [0, 7])
+    def test_shortcut_replay_pairs_use_stage_local_indices(self, pp_layer_offset):
+        layer_pattern = (
+            Symbols.MLP
+            + Symbols.MAMBA
+            + Symbols.MOE
+            + Symbols.MLP
+            + Symbols.ATTENTION
+            + Symbols.MOE
+        )
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_pattern),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_shortcut_connection=True,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+            wide_residual=WideResidualConfig(num_streams=3),
+        )
+        block = HybridStack(
+            config,
+            wide_residual_hybrid_stack_spec.submodules,
+            layer_config_list=validate_segment_layers(layer_pattern, config),
+            pp_layer_offset=pp_layer_offset,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=self.get_pg_collection(),
+        )
+
+        assert block.num_layers_per_pipeline_rank == 6
+        assert len(block.layers) == 4
+        assert block._execution_layer_indices == [0, 1, 3, 4]
+        assert block._residual_stream_atomic_layer_pairs == ((1, 2), (4, 5))
+        contexts = hybrid_block_module.build_residual_stream_recompute_plan(
+            block.num_layers_per_pipeline_rank,
+            2,
+            atomic_layer_pairs=block._residual_stream_atomic_layer_pairs,
+        )
+        assert contexts[1].manager is contexts[2].manager
+        assert contexts[4].manager is contexts[5].manager
+        assert [context.is_block_end for context in contexts] == [
+            True,
+            False,
+            True,
+            True,
+            False,
+            True,
+        ]
 
     def test_wide_residual_gpu_forward_and_backward(self):
         """Hybrid boundaries stay at D while every physical layer carries K * D."""
@@ -1140,7 +1194,7 @@ class TestHybridBlock:
         assert torch.isfinite(hidden_states.grad).all()
 
     @pytest.mark.parametrize("compute_symbol", [Symbols.MAMBA, Symbols.ATTENTION])
-    def test_wide_shortcut_replay_matches_eager_forward_backward(self, compute_symbol):
+    def test_wide_shortcut_replay_matches_eager_forward_backward(self, compute_symbol, monkeypatch):
         """A shortcut pair is one atomic physical unit for residual-stream replay."""
 
         common_config = dict(
@@ -1176,6 +1230,13 @@ class TestHybridBlock:
             **common_config,
         ).cuda()
         recomputed.load_state_dict(reference.state_dict())
+        assert reference._residual_stream_atomic_layer_pairs == ((0, 1),)
+        assert recomputed._residual_stream_atomic_layer_pairs == ((0, 1),)
+
+        def fail_topology_scan():
+            pytest.fail("Shortcut topology must not be rediscovered during forward or replay")
+
+        monkeypatch.setattr(recomputed, "_shortcut_layer_pairs", fail_topology_scan)
 
         reference_input = torch.randn(
             128,

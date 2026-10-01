@@ -26,11 +26,7 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    checkpoint_residual_read,
-    checkpoint_residual_write,
-)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -151,41 +147,12 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         hidden_states: Tensor,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> tuple[Tensor, Tensor, tuple[Tensor, ...] | None, ResidualStreamRecomputeContext | None]:
-        """Read the residual branch and apply its pre-mixer normalization."""
+        """Save the ordinary residual and normalize the parameter-precision mixer input."""
 
-        residual_connection = self._get_residual_connection()
-        recompute_context = (
-            residual_stream_recompute_context if residual_connection is not None else None
-        )
-        connection_state = None
-        if residual_connection is not None:
-            if recompute_context is None:
-                hidden_states, connection_state = apply_module(residual_connection)(
-                    hidden_states,
-                    operation="read",
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
-            else:
-                hidden_states, connection_state = checkpoint_residual_read(
-                    residual_connection,
-                    hidden_states,
-                    recompute_context,
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
-            residual = residual_connection.residual_stream(connection_state)
-        else:
-            residual = (
-                hidden_states.float() if self.config.fp32_residual_connection else hidden_states
-            )
-
+        residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        if recompute_context is not None and not isinstance(self.norm, IdentityOp):
-            hidden_states = recompute_context.checkpoint(apply_module(self.norm), hidden_states)
-        else:
-            hidden_states = apply_module(self.norm)(hidden_states)
-        return hidden_states, residual, connection_state, recompute_context
+        hidden_states = apply_module(self.norm)(hidden_states)
+        return hidden_states, residual, None, None
 
     def _apply_mixer_bda(
         self,
@@ -194,29 +161,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         connection_state: tuple[Tensor, ...] | None = None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor:
-        """Write a connected mixer branch or apply the ordinary bias-dropout-add tail."""
-
-        residual_connection = self._get_residual_connection()
-        if residual_connection is not None:
-            if connection_state is None:
-                raise RuntimeError("Missing state for the Mamba residual connection.")
-            if recompute_context is not None and not recompute_context.is_block_end:
-                return checkpoint_residual_write(
-                    residual_connection,
-                    mixer_out_with_bias,
-                    connection_state,
-                    recompute_context,
-                    dropout_probability=self.hidden_dropout,
-                    training=self.training,
-                )
-            with self.bias_dropout_add_exec_handler():
-                return apply_module(residual_connection)(
-                    mixer_out_with_bias,
-                    operation="write",
-                    state=connection_state,
-                    dropout_probability=self.hidden_dropout,
-                    training=self.training,
-                )
+        """Apply the ordinary bias-dropout-add tail."""
 
         with self.bias_dropout_add_exec_handler():
             return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(

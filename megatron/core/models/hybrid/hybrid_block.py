@@ -411,6 +411,7 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
+        self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
@@ -665,7 +666,7 @@ class HybridStack(MegatronModule):
             build_residual_stream_recompute_plan(
                 self.num_layers_per_pipeline_rank,
                 self.config.residual_stream_recompute_num_layers,
-                atomic_layer_pairs=self._shortcut_layer_pairs(),
+                atomic_layer_pairs=self._residual_stream_atomic_layer_pairs,
             )
             if use_residual_stream_recompute
             else [None] * self.num_layers_per_pipeline_rank

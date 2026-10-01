@@ -169,35 +169,19 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        """Map the carried wide stream to one ordinary-width branch input."""
+        """Read in branch precision; the operator fixes the output shape and dtype."""
 
         if hidden_states.shape[-1] != self.residual_stream_hidden_size:
             raise ValueError(
                 "StreamwiseSigmoidWideResidualRead expected residual-stream hidden size "
                 f"{self.residual_stream_hidden_size}, got {hidden_states.shape[-1]}."
             )
-        branch_input = streamwise_sigmoid_read(
+        return streamwise_sigmoid_read(
             hidden_states,
             self.read_map(return_logits=True),
             self.num_streams,
             output_dtype=self.branch_input_dtype,
         )
-        if branch_input.shape[:-1] != hidden_states.shape[:-1]:
-            raise ValueError(
-                "StreamwiseSigmoidWideResidualRead changed non-hidden dimensions while "
-                f"reading: {tuple(hidden_states.shape)} -> {tuple(branch_input.shape)}."
-            )
-        if branch_input.shape[-1] != self.branch_hidden_size:
-            raise ValueError(
-                "StreamwiseSigmoidWideResidualRead expected branch hidden size "
-                f"{self.branch_hidden_size}, got {branch_input.shape[-1]}."
-            )
-        if branch_input.dtype != self.branch_input_dtype:
-            raise TypeError(
-                "StreamwiseSigmoidWideResidualRead expected branch dtype "
-                f"{self.branch_input_dtype}, got {branch_input.dtype}."
-            )
-        return branch_input
 
 
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
