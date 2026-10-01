@@ -175,7 +175,7 @@ functional:configure:
         --output-path "functional-test-job-lts-GB200.yaml" \
         ${RELEASE_ARGS[@]}
     - |
-      if [[ "$FUNCTIONAL_TEST_SCOPE" == "nightly" && -n "$CLUSTER_GB300" ]]; then
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "nightly" ]]; then
         export PYTHONPATH=$(pwd)
         python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
           ${ARGS[@]} \
@@ -435,7 +435,7 @@ functional:run_dev_dgx_gb300:
   rules:
     - if: $BUILD == "no"
       when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "nightly" && $CLUSTER_GB300 != ""
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "nightly"
       when: on_success
     - when: never
 

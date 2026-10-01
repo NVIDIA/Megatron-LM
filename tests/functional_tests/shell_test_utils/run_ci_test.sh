@@ -57,10 +57,6 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
-# Output names can identify the hardware while input references remain shared.
-ACTUAL_VALUES_PATH="${ACTUAL_VALUES_PATH:-${OUTPUT_PATH}/$(basename "$GOLDEN_VALUES_PATH")}"
-ACTUAL_VALUES_SECOND_RUN_PATH="${ACTUAL_VALUES_PATH%.json}_2nd.json"
-
 set -exo pipefail
 
 # Extract settings from params file
@@ -410,7 +406,7 @@ for i in $(seq 1 $N_REPEAT); do
             uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $FIRST_RUN_TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
-                --output-path "$ACTUAL_VALUES_PATH" \
+                --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                 "${EXTRACT_ARGS[@]}"
         fi
     fi
@@ -453,7 +449,7 @@ for i in $(seq 1 $N_REPEAT); do
             else
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
-                    --actual-values-path "$ACTUAL_VALUES_PATH" \
+                    --actual-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                     --train-iters $TRAIN_ITERS \
                     --model-config-path ${TRAINING_PARAMS_PATH} \
                     $ALLOW_NONDETERMINISTIC_ALGO_ARG
@@ -462,13 +458,13 @@ for i in $(seq 1 $N_REPEAT); do
                     uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                         --logs-dir "$_REPEAT_TENSORBOARD_PATH/run_2" \
                         --train-iters $TRAIN_ITERS \
-                        --output-path "$ACTUAL_VALUES_SECOND_RUN_PATH" \
+                        --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                         "${EXTRACT_ARGS[@]}"
                             
                     echo "Running pytest 1st vs 2nd run comparison"
                     uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
-                        --actual-values-first-run-path "$ACTUAL_VALUES_PATH" \
-                        --actual-values-second-run-path "$ACTUAL_VALUES_SECOND_RUN_PATH" \
+                        --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                        --actual-values-second-run-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                         --train-iters $TRAIN_ITERS \
                         --model-config-path ${TRAINING_PARAMS_PATH} \
                         $ALLOW_NONDETERMINISTIC_ALGO_ARG
@@ -495,11 +491,11 @@ for i in $(seq 1 $N_REPEAT); do
                 uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                     --logs-dir $TENSORBOARD_PATH \
                     --train-iters $TRAIN_ITERS \
-                    --output-path "$ACTUAL_VALUES_PATH" \
+                    --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                     "${EXTRACT_ARGS[@]}"
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_grpo_training_loop.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
-                    --test-values-path "$ACTUAL_VALUES_PATH" \
+                    --test-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                     --model-config-path ${TRAINING_PARAMS_PATH} \
                     $ALLOW_NONDETERMINISTIC_ALGO_ARG
             fi

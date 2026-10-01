@@ -251,9 +251,8 @@ variables:
   CLUSTER_GB300:
     value: "dgxgb300_oci-jhb"
     options:
-      - ""
       - "dgxgb300_oci-jhb"
-    description: "Cluster for GB300 nightly workloads; empty disables GB300"
+    description: "Cluster for GB300 workloads"
   PUBLISH:
     value: "no"
     options:

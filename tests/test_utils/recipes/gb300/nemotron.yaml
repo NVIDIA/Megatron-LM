@@ -47,7 +47,6 @@ spec:
     rm -f "$HOME/.netrc"
     unset RO_API_TOKEN
   script: |-
-    export ACTUAL_VALUES_PATH="{assets_dir}/golden_values_{environment}_{platforms}.json"
     rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
     set -euo pipefail

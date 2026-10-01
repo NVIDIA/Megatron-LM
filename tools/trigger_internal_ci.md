@@ -55,7 +55,7 @@ python tools/trigger_internal_ci.py \
 | `--functional-test-cases` | `all` | `FUNCTIONAL_TEST_CASES` pipeline variable |
 | `--functional-test-name` | commit SHA | `FUNCTIONAL_TEST_NAME` pipeline variable — names the run for `pre-release`/`release` scopes (used as the run name and W&B experiment). |
 | `--functional-test-time-limit` | *(scope-dependent)* | `FUNCTIONAL_TEST_TIME_LIMIT` pipeline variable, in seconds. Defaults to `14400` (4h) for the long-running `release` and `weekly` scopes; left unset otherwise. |
-| `--cluster-gb300` | *(pipeline default)* | `CLUSTER_GB300` pipeline variable. Nightly pipelines run the GB200 nightly matrix on `dgxgb300_oci-jhb` by default. Pass an empty string to disable GB300. |
+| `--cluster-gb300` | *(pipeline default)* | `CLUSTER_GB300` pipeline variable (override the default cluster). Nightly pipelines run the GB200 nightly matrix on `dgxgb300_oci-jhb` by default. |
 | `--dry-run` | off | Print what would happen without pushing or triggering |
 
 > For release testing, set `--functional-test-scope release` and name the run
