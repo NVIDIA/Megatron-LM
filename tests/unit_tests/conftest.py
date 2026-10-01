@@ -132,27 +132,13 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_test_data():
-    """Ensure test data is available at /opt/data by downloading if necessary."""
-    data_path = Path("/opt/data")
+    """Ensure test data is available at /opt/data, preparing it once per node if necessary.
 
-    # Check if data directory exists and has content
-    if not data_path.exists() or not any(data_path.iterdir()):
-        print("Test data not found at /opt/data. Downloading...")
-
-        try:
-            # Download assets to /opt/data
-            download_and_extract_asset(assets_dir=data_path)
-
-            print("Test data downloaded successfully.")
-
-        except ImportError as e:
-            print(f"Failed to import download function: {e}")
-            # Don't fail the tests, just warn
-        except Exception as e:
-            print(f"Failed to download test data: {e}")
-            # Don't fail the tests, just warn
-    else:
-        print("Test data already available at /opt/data")
+    Every rank runs this before ``torch.distributed`` is initialized, so the ranks serialize
+    on a file lock inside ``download_and_extract_asset``. A failure aborts the session with
+    its cause instead of letting tests run against missing data.
+    """
+    download_and_extract_asset(assets_dir=Path("/opt/data"))
 
 
 @pytest.fixture(autouse=True)
