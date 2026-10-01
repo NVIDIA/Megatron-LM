@@ -168,7 +168,8 @@ class T5Model(LanguageModule):
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         for _pg in ('tp', 'cp', 'pp'):
-            assert _pg in vars(pg_collection), f"T5Model pg_collection must have {_pg}"
+            if _pg not in vars(pg_collection):
+                raise ValueError(f"T5Model pg_collection must have {_pg}")
         if 'embd' not in vars(pg_collection):
             raise ValueError(
                 "T5Model pg_collection must have embd; explicitly set it to None when unused"

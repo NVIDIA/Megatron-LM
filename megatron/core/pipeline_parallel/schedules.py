@@ -794,9 +794,10 @@ def forward_backward_no_pipelining(
             partial(check_first_val_step, first_val_step, forward_only),
         )
     elif config.hybrid_context_parallel:
-        assert (
-            getattr(pg_collection, 'dp_cp', None) is not None
-        ), "pg_collection must have dp_cp when hybrid_context_parallel is enabled"
+        if vars(pg_collection).get('dp_cp') is None:
+            raise ValueError(
+                "pg_collection must have dp_cp when hybrid_context_parallel is enabled"
+            )
         forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
             forward_step_func,
             data_iterator,

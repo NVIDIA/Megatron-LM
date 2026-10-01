@@ -71,9 +71,8 @@ class DotProductAttention(MegatronModule):
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
-        assert (
-            getattr(pg_collection, 'tp', None) is not None
-        ), "DotProductAttention pg_collection must have tp process group"
+        if vars(pg_collection).get('tp') is None:
+            raise ValueError("DotProductAttention pg_collection must have tp process group")
         self.pg_collection = pg_collection
         self.tp_group = self.pg_collection.tp
 
