@@ -233,7 +233,7 @@ def test_constructor_embedding_group_contract(
         model = T5Model(**kwargs)
         assert model.embd_group is pg_collection.embd
     else:
-        with pytest.raises(AssertionError, match='embd'):
+        with pytest.raises(ValueError, match='embd'):
             T5Model(**kwargs)
     global_groups.assert_not_called()
 

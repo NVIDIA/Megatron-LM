@@ -162,18 +162,19 @@ class T5Model(LanguageModule):
     ):
 
         if pg_collection is not None:
-            assert 'embd' in vars(
-                pg_collection
-            ), "T5Model pg_collection must have embd; explicitly set it to None when unused"
+            if 'embd' not in vars(pg_collection):
+                raise ValueError(
+                    "T5Model pg_collection must have embd; explicitly set it to None when unused"
+                )
             if (
                 share_embeddings_and_output_weights
                 and config.pipeline_model_parallel_size > 1
                 and (pre_process or post_process)
+                and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
             ):
-                assert pg_collection.embd not in (
-                    None,
-                    torch.distributed.GroupMember.NON_GROUP_MEMBER,
-                ), "T5Model tied pipeline embedding/output stages require a usable embd group"
+                raise ValueError(
+                    "T5Model tied pipeline embedding/output stages require a usable embd group"
+                )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
 
         self.config: TransformerConfig = config
