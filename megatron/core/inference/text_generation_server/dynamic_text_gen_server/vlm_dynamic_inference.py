@@ -148,6 +148,19 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
         if 'model_provider' not in user_passed_attrs:
             args.model_provider = 'hybrid'
         args.checkpoint_model_prefix = _MIMO_LANGUAGE_MODEL_PREFIX
+        if (
+            getattr(checkpoint_args, 'moe_router_load_balancing_type', None) == 'quantile_balancing'
+            and getattr(checkpoint_args, 'moe_router_quantile_balancing_estimation_scope', None)
+            == 'global_batch'
+        ):
+            # These checkpoints store the global-batch QB correction in expert_bias,
+            # even when moe_router_enable_expert_bias was False during training.
+            # Evaluation uses ordinary score-function routing with that fixed bias;
+            # the saved histogram bounds are only needed to update it in training.
+            args.moe_router_enable_expert_bias = True
+            args.moe_router_load_balancing_type = 'none'
+            args.moe_aux_loss_coeff = 0.0
+            print_rank_0('Restoring global-batch QB expert biases for text-only inference.')
         return False
     if not hasattr(checkpoint_args, 'language_model_type'):
         return False

@@ -2025,8 +2025,16 @@ def validate_args(args, defaults={}):
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
-    assert not (args.moe_shortcut_connection and args.cuda_graph_impl != "none"), (
-        "CUDA graphs are not supported with --moe-shortcut-connection."
+    assert not (
+        args.moe_shortcut_connection
+        and args.cuda_graph_impl != "none"
+        and not (
+            args.cuda_graph_impl == "local"
+            and args.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        )
+    ), (
+        "--moe-shortcut-connection supports CUDA graphs only with "
+        "--cuda-graph-impl=local and --inference-cuda-graph-scope=block."
     )
 
     if args.multi_latent_attention:
