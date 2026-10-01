@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 
 from megatron.core._rank_utils import warn_single_rank
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
@@ -48,7 +48,13 @@ class MimoModel(MegatronModule):
             Configuration for the model, including language model and modality submodules
     """
 
-    def __init__(self, mimo_config: MimoModelConfig, cp_group=None, tp_group=None) -> None:
+    def __init__(
+        self,
+        mimo_config: MimoModelConfig,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> None:
         """Initialize the multimodal model.
 
         Example:
@@ -86,15 +92,14 @@ class MimoModel(MegatronModule):
         self.partition_adapter: Optional[PartitionAdapter] = None
         # Only on language-module ranks: encoder-only ranks never shard and would read
         # process groups they do not own.
-        if self.role.has_language_module and (
-            language_config.context_parallel_size > 1 or language_config.sequence_parallel
-        ):
+        if self.role.has_language_module:
             partition_config = PartitionConfig.from_mp_config(
                 mp=language_config,
                 max_seq_len=max_seq_len,
                 kv_format=mimo_config.kv_format,
                 cp_group=cp_group,
                 tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
             )
             self.partition_adapter = PartitionAdapter(partition_config)
 
@@ -621,7 +626,9 @@ class MimoModel(MegatronModule):
         loss_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
-        packing_kwargs: Optional[dict] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_padded: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass through the multimodal model.
@@ -642,20 +649,9 @@ class MimoModel(MegatronModule):
                         "whisper_encoder": {"input_features": whisper_features}
                     }
                 }
-            packing_kwargs: Optional dictionary of kwargs to construct PackedSeqParams
-                            if packed_seq_params is not provided. For example:
-                                {
-                                    "cu_seqlens_q": cu_seqlens,
-                                    "cu_seqlens_kv": cu_seqlens,
-                                    "cu_seqlens_q_padded": cu_seqlens_padded,
-                                    "cu_seqlens_kv_padded": cu_seqlens_padded,
-                                    "max_seqlen_q": torch.tensor(
-                                        max(seqlens_padded), dtype=torch.int32
-                                    ),
-                                    "max_seqlen_kv": torch.tensor(
-                                        max(seqlens_padded), dtype=torch.int32
-                                    ),
-                                }
+            cu_seqlens: Logical cumulative sequence lengths for a packed language batch.
+            cu_seqlens_padded: Physical cumulative sequence lengths including padding.
+            max_seqlen: Maximum physical sequence length in the packed language batch.
             modality_token_indices: Optional complete mapping from every active modality name,
                 including ``text``, to flat logical row-major ``torch.long`` indices in the
                 ``[B, S]`` input grid. Encoder-only ranks ignore this argument. Pass ``None`` to
@@ -679,7 +675,9 @@ class MimoModel(MegatronModule):
                 loss_mask,
                 labels,
                 modality_inputs,
-                packing_kwargs=packing_kwargs,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_padded=cu_seqlens_padded,
+                max_seqlen=max_seqlen,
                 modality_token_indices=modality_token_indices,
             )
 
@@ -696,7 +694,9 @@ class MimoModel(MegatronModule):
                     loss_mask,
                     labels,
                     input_tensors,
-                    packing_kwargs=packing_kwargs,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_padded=cu_seqlens_padded,
+                    max_seqlen=max_seqlen,
                     modality_token_indices=modality_token_indices,
                 )
 
@@ -812,44 +812,6 @@ class MimoModel(MegatronModule):
             (0, hidden_size), device=torch.cuda.current_device(), dtype=language_config.params_dtype
         )
 
-    def _build_packed_seq_params(self, packing_kwargs: Optional[dict]) -> Optional[PackedSeqParams]:
-        """Build THD ``PackedSeqParams`` from ``packing_kwargs`` (None if not packing)."""
-        if packing_kwargs is None:
-            return None
-        for key in packing_kwargs:
-            if 'cu_seqlens' in key and packing_kwargs[key] is not None:
-                packing_kwargs[key] = packing_kwargs[key].to(dtype=torch.int32)
-        packed_seq_params = PackedSeqParams(**packing_kwargs)
-        packed_seq_params.qkv_format = 'thd'
-        return packed_seq_params
-
-    def _shard_language_inputs(
-        self,
-        embeddings: Optional[torch.Tensor],
-        labels: Optional[torch.Tensor],
-        loss_mask: Optional[torch.Tensor],
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[PackedSeqParams],
-    ]:
-        """Apply CP/SP sharding via the partition adapter, or pass through if inactive.
-
-        ``embeddings`` are sequence-first ``(S, B, H)`` (``None`` on non-first PP stages)
-        and come back in ``(S/(cp*tp), B, H)``; labels/loss_mask are ``(B, S)``.
-        """
-        if self.partition_adapter is None:
-            return embeddings, labels, loss_mask, packed_seq_params
-
-        return self.partition_adapter.shard(
-            embeddings=embeddings,
-            labels=labels,
-            loss_mask=loss_mask,
-            packed_seq_params=packed_seq_params,
-        )
-
     def _language_model_owns_mtp(self) -> bool:
         """Return whether this rank executes the language model's MTP block."""
         if self.language_model is None:
@@ -873,14 +835,19 @@ class MimoModel(MegatronModule):
             mtp_input_mask &= input_ids != special_token_id
         return mtp_input_mask
 
-    def _prepare_mtp_inputs(
+    def _prepare_language_inputs(
         self,
+        embeddings: Optional[torch.Tensor],
         input_ids: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens_padded: Optional[torch.Tensor],
+        max_seqlen: Optional[torch.Tensor],
         owns_mtp: bool,
         text_token_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> ContextParallelBatch:
         """Prepare CP-local position IDs and optional MTP token metadata.
 
         MTP consumes token IDs only on the stage that owns its prediction block. Under
@@ -898,43 +865,36 @@ class MimoModel(MegatronModule):
                 input_ids, self.special_token_ids, text_token_indices=text_token_indices
             )
 
-        if self.partition_adapter is None or not self.partition_adapter.cfg.use_cp:
-            return mtp_input_ids, position_ids, mtp_input_mask
-
-        # PartitionAdapter shards batch-first [B, S, ...] metadata along dimension 1.
-        # Multidimensional RoPE positions arrive as [rope_dim, B, S], so expose their
-        # sequence dimension in the adapter's expected layout and restore it afterward.
-        is_multiaxis_position_ids = position_ids is not None and position_ids.dim() == 3
-        position_metadata = (
-            position_ids.movedim(0, -1).contiguous() if is_multiaxis_position_ids else position_ids
+        assert self.partition_adapter is not None
+        return self.partition_adapter.partition(
+            embeddings=embeddings,
+            input_ids=mtp_input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_padded=cu_seqlens_padded,
+            max_seqlen=max_seqlen,
         )
 
-        packed_mtp_metadata = mtp_input_ids
-        if mtp_input_mask is not None:
-            assert mtp_input_ids is not None
-            packed_mtp_metadata = torch.cat(
-                (mtp_input_ids, mtp_input_mask.to(dtype=mtp_input_ids.dtype)), dim=0
-            )
-
-        _, local_position_ids, packed_mtp_metadata, _ = self.partition_adapter.shard(
-            embeddings=None,
-            labels=position_metadata,
-            loss_mask=packed_mtp_metadata,
-            packed_seq_params=packed_seq_params,
+    def _forward_prepared_language_inputs(
+        self, cp_batch: ContextParallelBatch, attention_mask: Optional[torch.Tensor]
+    ) -> Any:
+        """Call the language model, including the dual-layout batch when present."""
+        batch = cp_batch.get_batch()
+        cp_kwargs = {"cp_batch": cp_batch} if len(cp_batch.batches_by_layout) > 1 else {}
+        return self.language_model(
+            input_ids=batch["tokens"],
+            position_ids=batch["position_ids"],
+            attention_mask=attention_mask,
+            decoder_input=batch["decoder_input"],
+            labels=batch["labels"],
+            loss_mask=batch["loss_mask"],
+            mtp_input_mask=batch["mtp_input_mask"],
+            packed_seq_params=cp_batch.get_packed_seq_params(),
+            **cp_kwargs,
         )
-
-        if mtp_input_mask is not None:
-            assert packed_mtp_metadata is not None
-            mtp_input_ids, mtp_input_mask = packed_mtp_metadata.chunk(2, dim=0)
-            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-        else:
-            mtp_input_ids = packed_mtp_metadata
-
-        if is_multiaxis_position_ids:
-            assert local_position_ids is not None
-            local_position_ids = local_position_ids.movedim(-1, 0).contiguous()
-
-        return mtp_input_ids, local_position_ids, mtp_input_mask
 
     def _forward_language_module(
         self,
@@ -944,7 +904,9 @@ class MimoModel(MegatronModule):
         loss_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
-        packing_kwargs: Optional[dict] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_padded: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[Any, Optional[torch.Tensor]]:
         """Forward pass for language module on this rank.
@@ -958,7 +920,9 @@ class MimoModel(MegatronModule):
             loss_mask: Loss mask for per-token loss normalization
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
-            packing_kwargs: Optional kwargs to construct packed (THD) sequence params.
+            cu_seqlens: Logical cumulative sequence lengths for a packed language batch.
+            cu_seqlens_padded: Physical cumulative sequence lengths including padding.
+            max_seqlen: Maximum physical sequence length in the packed language batch.
             modality_token_indices: Optional complete mapping of trusted flat logical row-major
                 token indices. See ``align_embeddings_by_token_positions``.
 
@@ -979,7 +943,6 @@ class MimoModel(MegatronModule):
                 "CP-sharded sequence)."
             )
 
-        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
         owns_mtp = self._language_model_owns_mtp()
 
         if self.role.is_first_stage(lang_name):
@@ -1017,47 +980,36 @@ class MimoModel(MegatronModule):
                 modality_token_indices=modality_token_indices,
             )
 
-            # Apply CP/SP sharding; combined_embeddings returns in [S/(cp*tp), B, H].
-            combined_embeddings, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+            # Partition every LM-aligned tensor together. Decoder embeddings return in
+            # [S/(cp*tp), B, H]; labels/loss metadata remain [B, S/cp].
+            cp_batch = self._prepare_language_inputs(
                 embeddings=combined_embeddings,
-                labels=labels,
-                loss_mask=loss_mask,
-                packed_seq_params=packed_seq_params,
-            )
-            mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
                 input_ids=input_ids,
                 position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
+                labels=labels,
+                loss_mask=loss_mask,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_padded=cu_seqlens_padded,
+                max_seqlen=max_seqlen,
                 owns_mtp=owns_mtp,
                 text_token_indices=(modality_token_indices or {}).get("text"),
             )
-
-            lm_output = self.language_model(
-                # decoder_input replaces the main embedding lookup, but MTP still
-                # needs token IDs to construct its shifted-token embeddings.
-                input_ids=mtp_input_ids,
-                position_ids=position_ids,
-                decoder_input=combined_embeddings,
-                labels=labels,
-                loss_mask=loss_mask,
-                mtp_input_mask=mtp_input_mask,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
+            lm_output = self._forward_prepared_language_inputs(
+                cp_batch, attention_mask=attention_mask
             )
         else:
             # Non-first stage: receive hidden states from previous LM stage.
             # Labels/loss_mask still need CP sharding so the loss on the last stage
             # lines up with the CP-local hidden states.
-            _, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+            cp_batch = self._prepare_language_inputs(
                 embeddings=None,
-                labels=labels,
-                loss_mask=loss_mask,
-                packed_seq_params=packed_seq_params,
-            )
-            mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
                 input_ids=input_ids,
                 position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
+                labels=labels,
+                loss_mask=loss_mask,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_padded=cu_seqlens_padded,
+                max_seqlen=max_seqlen,
                 owns_mtp=owns_mtp,
                 text_token_indices=(modality_token_indices or {}).get("text"),
             )
@@ -1070,18 +1022,11 @@ class MimoModel(MegatronModule):
                 if hasattr(underlying_lm, 'set_input_tensor'):
                     underlying_lm.set_input_tensor(hidden_states)
 
-            lm_output = self.language_model(
-                # Hidden states arrive via set_input_tensor; position_ids is
-                # still consumed by mRoPE on non-first PP stages.
-                input_ids=mtp_input_ids,
-                position_ids=position_ids,
-                decoder_input=None,
-                labels=labels,
-                loss_mask=loss_mask,
-                mtp_input_mask=mtp_input_mask,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
+            lm_output = self._forward_prepared_language_inputs(
+                cp_batch, attention_mask=attention_mask
             )
+
+        loss_mask = cp_batch.get_batch().get("loss_mask")
 
         # Key output for non-last stages so schedule can route to next LM stage
         if not self.role.is_last_stage(lang_name):
@@ -1138,14 +1083,15 @@ class MimoModel(MegatronModule):
         loss_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
-        packing_kwargs: Optional[dict] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_padded: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass when all modules are on all ranks (no multi-module PP).
 
         This is the original behavior, preserved for backward compatibility.
         """
-        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
         owns_mtp = self._language_model_owns_mtp()
 
         # 1. Process each modality to get embeddings
@@ -1190,36 +1136,24 @@ class MimoModel(MegatronModule):
         )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        # 3. Apply CP/SP sharding. combined_embeddings is [S, B, H] and returns
-        # [S/(cp*tp), B, H] for the LM (the adapter handles the CP batch-first transpose).
-        combined_embeddings, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+        # 3. Partition all LM-aligned inputs together. combined_embeddings is [S, B, H]
+        # and returns [S/(cp*tp), B, H] for the LM.
+        cp_batch = self._prepare_language_inputs(
             embeddings=combined_embeddings,
-            labels=labels,
-            loss_mask=loss_mask,
-            packed_seq_params=packed_seq_params,
-        )
-        mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
+            labels=labels,
+            loss_mask=loss_mask,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_padded=cu_seqlens_padded,
+            max_seqlen=max_seqlen,
             owns_mtp=owns_mtp,
             text_token_indices=(modality_token_indices or {}).get("text"),
         )
 
         # 5. Forward pass through language model
-        lm_output = self.language_model(
-            # decoder_input replaces the main embedding lookup, but MTP still
-            # needs token IDs to construct its shifted-token embeddings.
-            input_ids=mtp_input_ids,
-            position_ids=position_ids,
-            decoder_input=combined_embeddings,
-            labels=labels,
-            loss_mask=loss_mask,
-            mtp_input_mask=mtp_input_mask,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
+        lm_output = self._forward_prepared_language_inputs(cp_batch, attention_mask=None)
 
         logger.debug(f"Language model output shape: {lm_output.shape}")
 
-        return lm_output, loss_mask
+        return lm_output, cp_batch.get_batch().get("loss_mask")

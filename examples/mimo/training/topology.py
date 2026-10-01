@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch.distributed as dist
 
+from megatron.core.gtp_parallel_layout import GTPParallelLayout
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.parallel_state import default_embedding_ranks, default_position_embedding_ranks
@@ -18,6 +19,7 @@ from megatron.core.process_groups_config import (
 )
 
 _EXPERT_VIEW = "expert"
+_WEIGHT_VIEW = "weights"
 
 
 @dataclass
@@ -38,14 +40,19 @@ class ModuleGridSpec:
     # Experts default to TP=1 (set explicitly for MoE); intentionally not Megatron's etp=tp default.
     expt_tp: int = 1
     expt_gtp_remat: int = 1
+    gtp_remat_fold_cp: bool = False
+    """Share ranks between token and weight layouts while keeping ``gtp_remat`` fixed."""
+
     dp: int = field(init=False)
     expt_dp: int = field(init=False)
 
     def __post_init__(self) -> None:
         dense = self.tp * self.gtp_remat * self.cp * self.pp
+        if self.gtp_remat_fold_cp:
+            dense = self.gtp_layout.minimum_world_size
         if self.num_ranks % dense != 0:
             raise ValueError(
-                f"num_ranks ({self.num_ranks}) must be divisible by tp*gtp_remat*cp*pp ({dense})"
+                f"num_ranks ({self.num_ranks}) must be divisible by the dense layout size ({dense})"
             )
         self.dp = self.num_ranks // dense
         expert = self.expt_tp * self.ep * self.expt_gtp_remat * self.pp
@@ -60,6 +67,13 @@ class ModuleGridSpec:
     def size(self) -> int:
         """Total ranks spanned by this module's grid."""
         return self.num_ranks
+
+    @property
+    def gtp_layout(self) -> GTPParallelLayout:
+        """Weight and token ownership for the folded layout."""
+        return GTPParallelLayout(
+            self.num_ranks, self.tp, self.pp, self.cp, self.gtp_remat, self.rank_offset
+        )
 
 
 @dataclass
@@ -128,12 +142,38 @@ def _build_grid(
     spec: ModuleGridSpec, high_priority_stream_groups: Optional[list[str]] = None
 ) -> HyperCommGrid:
     """Create a dense grid plus its expert view and the process groups MIMO needs."""
+    layout = spec.gtp_layout if spec.gtp_remat_fold_cp else None
     grid = HyperCommGrid(
-        shape=[spec.tp, spec.cp, spec.gtp_remat, spec.dp, spec.pp],
-        dim_names=["tp", "cp", "gtp_remat", "dp", "pp"],
+        shape=(
+            [
+                spec.tp,
+                layout.overlap,
+                spec.gtp_remat // layout.overlap,
+                spec.cp // layout.overlap,
+                spec.dp,
+                spec.pp,
+            ]
+            if layout is not None
+            else [spec.tp, spec.cp, spec.gtp_remat, spec.dp, spec.pp]
+        ),
+        dim_names=(
+            ["tp", "cp", "gtp_remat", "cp_outer", "dp", "pp"]
+            if spec.gtp_remat_fold_cp
+            else ["tp", "cp", "gtp_remat", "dp", "pp"]
+        ),
         rank_offset=spec.rank_offset,
         backend="nccl",
     )
+    if layout is not None:
+        # The base grid describes tokens: cp x cp_outer share a sample, while
+        # gtp_remat contains only the extra-data extent outside CP. Weight groups
+        # use a separate view so replicas never reduce unrelated weight shards.
+        grid.register_view(
+            _WEIGHT_VIEW,
+            shape=[spec.tp, spec.gtp_remat, layout.replica_size, spec.pp],
+            dim_names=["tp", "gtp_remat", "dp", "pp"],
+            shared_dims=["tp", "pp"],
+        )
     # Expert factorization over the same rank span; pp is shared with the base view.
     grid.register_view(
         _EXPERT_VIEW,
@@ -148,19 +188,13 @@ def _build_grid(
         )
 
     try:
-        create_pg(["tp"], "tp")
-        create_pg(["gtp_remat"], "gtp_remat")
-        create_pg(["cp"], "cp")
-        create_pg(["pp"], "pp")
-        create_pg(["dp"], "dp")
-        create_pg(["dp", "cp"], "dp_cp")
-        create_pg(["gtp_remat", "dp"], "gtp_remat_dp")
-        create_pg(["cp", "gtp_remat", "dp"], "gtp_remat_dp_cp")
-        create_pg(["tp", "cp"], "tp_cp")
-        create_pg(["tp", "gtp_remat", "pp"], "mp")
-        create_pg(["tp", "gtp_remat", "dp"], "tp_dp")
-        create_pg(["tp", "cp", "gtp_remat", "dp"], "tp_dp_cp")
-        create_pg(["tp", "cp", "gtp_remat", "dp", "pp"], "intra_dist_opt_instance")
+        pg_names = {
+            "dp_gtp_remat": "gtp_remat_dp",
+            "dp_cp_gtp_remat": "gtp_remat_dp_cp",
+            "intra_dist_opt": "intra_dist_opt_instance",
+        }
+        for field_name, (dims, view) in _dense_group_dims(spec.gtp_remat_fold_cp).items():
+            create_pg(dims, pg_names.get(field_name, field_name), view=view)
 
         create_pg(["ep"], "ep", view=_EXPERT_VIEW)
         create_pg(["expt_tp"], "ep_tp", view=_EXPERT_VIEW)
@@ -176,6 +210,27 @@ def _build_grid(
         grid.destroy()
         raise
     return grid
+
+
+def _dense_group_dims(fold_cp: bool) -> dict[str, tuple[list[str], str | None]]:
+    """Map PGC fields to token or weight dimensions in the module grid."""
+    cp = ["cp", "cp_outer"] if fold_cp else ["cp"]
+    weights = _WEIGHT_VIEW if fold_cp else None
+    return {
+        "tp": (["tp"], None),
+        "gtp_remat": (["gtp_remat"], weights),
+        "cp": (cp, None),
+        "pp": (["pp"], None),
+        "dp": (["dp"], None),
+        "dp_cp": (["dp"] if fold_cp else ["dp", "cp"], weights),
+        "dp_gtp_remat": (["gtp_remat", "dp"], None),
+        "dp_cp_gtp_remat": (cp + ["gtp_remat", "dp"], None),
+        "tp_cp": (["tp"] + cp, None),
+        "mp": (["tp", "gtp_remat", "pp"], weights),
+        "tp_dp": (["tp", "gtp_remat", "dp"], None),
+        "tp_dp_cp": (["tp"] + cp + ["gtp_remat", "dp"], None),
+        "intra_dist_opt": (["tp"] + cp + ["gtp_remat", "dp", "pp"], None),
+    }
 
 
 def _get_pg_options(
@@ -231,20 +286,9 @@ def pg_collection_from_grid(
     Only the language module gets embedding groups; others leave ``embd``/``pos_embd`` as ``None``.
     """
     pgc = ProcessGroupCollection()
-    pgc.tp = grid.get_pg("tp")
-    pgc.cp = grid.get_pg("cp")
-    pgc.pp = grid.get_pg("pp")
-    pgc.dp = grid.get_pg("dp")
-    pgc.dp_gtp_remat = grid.get_pg(["gtp_remat", "dp"])
-    pgc.dp_cp = grid.get_pg(["dp", "cp"])
-    pgc.dp_cp_gtp_remat = grid.get_pg(["cp", "gtp_remat", "dp"])
+    for field_name, (dims, view) in _dense_group_dims("cp_outer" in grid.dim_names).items():
+        setattr(pgc, field_name, grid.get_pg(dims, view=view))
     pgc.intra_dp_cp = pgc.dp_cp
-    pgc.gtp_remat = grid.get_pg("gtp_remat")
-    pgc.tp_cp = grid.get_pg(["tp", "cp"])
-    pgc.tp_dp = grid.get_pg(["tp", "gtp_remat", "dp"])
-    pgc.tp_dp_cp = grid.get_pg(["tp", "cp", "gtp_remat", "dp"])
-    pgc.mp = grid.get_pg(["tp", "gtp_remat", "pp"])
-    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "gtp_remat", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pgc.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view=_EXPERT_VIEW)

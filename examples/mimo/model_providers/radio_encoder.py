@@ -106,6 +106,7 @@ def _disable_gtp(config: TransformerConfig) -> None:
     """Keep this module replicated across any LLM GTP axes."""
     config.tensor_parallel_num_weight_shards = config.tensor_model_parallel_size
     config.gtp_weight_remat_size = 1
+    config.gtp_remat_fold_cp = False
     expert_tp = config.expert_tensor_parallel_size or config.tensor_model_parallel_size
     config.expert_tensor_parallel_num_weight_shards = expert_tp
     config.expert_gtp_weight_remat_size = 1

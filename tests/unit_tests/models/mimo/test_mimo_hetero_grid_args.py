@@ -13,6 +13,7 @@ from examples.mimo.training.args import (
     build_module_grid_specs,
     validate_hetero_grid_args,
 )
+from examples.mimo.utils.hetero import get_language_sample_parallel_size
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
 WORLD_SIZE_8 = 8
@@ -106,6 +107,49 @@ def test_canonical_layout_validates_and_maps_specs():
     assert language_grid_spec.dp == 2
     # expt_tp defaults to 1 when --mimo-llm-expt-tp is unset.
     assert language_grid_spec.expt_tp == 1
+
+
+@pytest.mark.parametrize("llm_only", [False, True])
+def test_folded_cp_counts_only_independent_language_samples(llm_only):
+    args = _layout_8gpu_20l(
+        mimo_llm_dp=1,
+        mimo_llm_cp=2,
+        mimo_llm_ep=1,
+        tensor_parallel_num_weight_shards=8,
+        gtp_remat_fold_cp=True,
+        mimo_llm_only=llm_only,
+        mimo_llm_offset=0 if llm_only else 4,
+    )
+    world_size = 8 if llm_only else 12
+    specs = build_module_grid_specs(args, world_size, encoder_module_name="images")
+    language = specs[-1]
+    assert language.num_ranks == 8
+    assert language.dp == 1
+    assert language.gtp_remat == 4
+    assert language.gtp_remat_fold_cp
+    assert get_language_sample_parallel_size(args) == 2
+    if not llm_only:
+        assert specs[0].num_ranks == 4
+        assert not specs[0].gtp_remat_fold_cp
+
+
+@pytest.mark.parametrize("weight_shards", [1, 64])
+def test_cp128_preserves_requested_weight_shards(weight_shards):
+    args = _layout_8gpu_20l(
+        micro_batch_size=2,
+        mimo_llm_tp=1,
+        mimo_llm_cp=128,
+        mimo_llm_dp=1,
+        tensor_parallel_num_weight_shards=weight_shards,
+        gtp_remat_fold_cp=True,
+    )
+    encoder, language = build_module_grid_specs(args, 132, "vision")
+    assert encoder.num_ranks == 4
+    assert language.num_ranks == 128
+    assert language.cp == 128
+    assert language.gtp_remat == weight_shards
+    assert language.dp == 1
+    assert get_language_sample_parallel_size(args) == 1
 
 
 def test_gtp_layout_validates_and_maps_weight_shard_axes():

@@ -437,9 +437,8 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
-    # GTP_remat counts toward total_model_size (an independent weight-shard axis), so the
-    # args.data_parallel_size below is the replicate degree (matches
-    # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
+    # Resolve the actual weight degree before deriving the rank layout. Independent
+    # sample count is computed separately below, including when CP overlaps GTP.
     from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
     (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
         resolve_tensor_parallel_weight_shards(
@@ -454,6 +453,20 @@ def validate_args(args, defaults={}):
         * args.context_parallel_size
         * args.gtp_weight_remat_size
     )
+    if args.gtp_remat_fold_cp:
+        from megatron.core.gtp_parallel_layout import GTPParallelLayout
+
+        if args.ckpt_format != "torch_dist":
+            raise ValueError("GTP/CP overlap requires --ckpt-format torch_dist")
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError("GTP/CP overlap uses Megatron DDP, not FSDP")
+        total_model_size = GTPParallelLayout(
+            args.world_size,
+            args.tensor_model_parallel_size,
+            args.pipeline_model_parallel_size,
+            args.context_parallel_size,
+            args.gtp_weight_remat_size,
+        ).minimum_world_size
 
     # Total model size.
     assert args.world_size % total_model_size == 0, (
@@ -466,13 +479,12 @@ def validate_args(args, defaults={}):
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
-    total_model_size = (
+    args.data_parallel_size = args.world_size // total_model_size
+    args.sample_parallel_size = args.world_size // (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
-        * args.gtp_weight_remat_size
     )
-    args.data_parallel_size = args.world_size // total_model_size
 
     from megatron.training.config import RLConfig
 
@@ -675,7 +687,7 @@ def validate_args(args, defaults={}):
             'Cannot specify both --step-batch-size-schedule and --global-batch-size'
         )
     if args.global_batch_size is None:
-        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        args.global_batch_size = args.micro_batch_size * args.sample_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
@@ -684,15 +696,14 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
-    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
-    # divides eval_global_batch_size by the same product to get its microbatch count, and without
-    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
-    assert args.eval_global_batch_size % (
-        args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
-    ) == 0, \
-        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})" \
-        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
+    # Evaluation microbatches depend on independent sequences, not weight shards.
+    assert (
+        args.eval_global_batch_size % (args.eval_micro_batch_size * args.sample_parallel_size) == 0
+    ), (
+        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) "
+        f"* sample_parallel_size ({args.sample_parallel_size})"
+    )
 
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (

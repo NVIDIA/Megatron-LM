@@ -2733,6 +2733,8 @@ def load_checkpoint(
         run_world_size = getattr(args, 'world_size', 0)
         ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
         run_dp = getattr(args, 'data_parallel_size', 0)
+        ckpt_cp = getattr(ckpt_args, "context_parallel_size", 1)
+        run_cp = args.context_parallel_size
         mismatch_msg = '(TP, PP) mismatch after resume ({} vs {} from checkpoint)'.format(
             run_tp_pp, ckpt_tp_pp
         )
@@ -2872,6 +2874,7 @@ def load_checkpoint(
             ckpt_world_size == run_world_size
             and ckpt_tp_pp == run_tp_pp
             and ckpt_dp == run_dp
+            and ckpt_cp == run_cp
             and not release
             and not args.finetune
             and 'rerun_state_machine' in state_dict
@@ -2882,7 +2885,12 @@ def load_checkpoint(
                     data_iterator=None, ckpt_format=ckpt_format, force=True
                 )
                 ignore_rerun_state = False
-        if ckpt_world_size != run_world_size or ckpt_tp_pp != run_tp_pp or ckpt_dp != run_dp:
+        if (
+            ckpt_world_size != run_world_size
+            or ckpt_tp_pp != run_tp_pp
+            or ckpt_dp != run_dp
+            or ckpt_cp != run_cp
+        ):
             print_rank_0('Job sharding has changed: Rerun state will be ignored')
 
         # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model

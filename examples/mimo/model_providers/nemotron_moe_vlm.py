@@ -240,7 +240,7 @@ def language_model_spec(
         pp_rank = 0
         pp_size = get_grid_dim_size(llm_grid, "pp")
         tp_size = get_grid_dim_size(llm_grid, "tp")
-        cp_size = get_grid_dim_size(llm_grid, "cp")
+        cp_size = get_grid_dim_size(llm_grid, "cp") * get_grid_dim_size(llm_grid, "cp_outer")
         ep_size = getattr(args, "mimo_llm_ep", 1)
         expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:

@@ -59,7 +59,14 @@ def _get_batch_on_this_cp_rank_contiguous(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids')
+    sequence_keys = (
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "decoder_input",
+        "mtp_input_mask",
+    )
     if cp_size == 1:
         return batch
 
@@ -108,7 +115,15 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         return batch
 
     sequence_tensor = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    sequence_keys = (
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "decoder_input",
+        "mtp_input_mask",
+    )
+    for key in sequence_keys:
         sequence_tensor = batch.get(key)
         if sequence_tensor is not None:
             break
@@ -127,11 +142,12 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         index = rank_order_indices.view(cp_size, -1)[cp_rank]
         valid_index = index.clamp_min(0)
         padding = (index < 0) | ~source_valid.index_select(0, valid_index)
-        for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        for key in sequence_keys:
             tensor = batch.get(key)
             if tensor is not None:
                 local_tensor = tensor.index_select(1, valid_index)
-                batch[key] = local_tensor.masked_fill(padding.view(1, -1), 0)
+                padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
+                batch[key] = local_tensor.masked_fill(padding.view(padding_shape), 0)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
         max_seqlen = (target_cu_seqlens_padded[1:] - target_cu_seqlens_padded[:-1]).max()
@@ -185,7 +201,7 @@ def get_batches_on_this_cp_rank(
     batch: Dict[str, Any],
     boundary_layout: CPLayout,
     is_hybrid_cp: bool,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     additional_layouts: Iterable[CPLayout] = (),
     hybrid_cp_group_func: Callable[[int], torch.distributed.ProcessGroup] | None = None,
     use_per_sequence_balancing: bool = False,
@@ -205,12 +221,14 @@ def get_batches_on_this_cp_rank(
     sequence. The same rank ordering is used to build the zigzag batch tensors and their
     ``PackedSeqParams``. When both layouts are requested, it also defines the
     activation-conversion plan. All other cases use the standard batch sharder.
+
+    A ``None`` CP group represents a size-one CP domain and leaves sequence tensors unchanged.
     """
     from megatron.core.utils import get_batch_on_this_cp_rank
 
     requested_layouts = set(additional_layouts)
     requested_layouts.add(boundary_layout)
-    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
     build_packed_zigzag_view = (
         not is_hybrid_cp
@@ -279,9 +297,17 @@ def get_batches_on_this_cp_rank(
 
     has_sequence_data = any(
         batch.get(key) is not None
-        for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'attention_mask')
+        for key in (
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "attention_mask",
+            "decoder_input",
+            "mtp_input_mask",
+        )
     )
-    if has_sequence_data:
+    if has_sequence_data and cp_size > 1:
         # Copy the dictionary because the CP sharder replaces sequence-valued entries in place.
         batches_by_layout = {
             layout: get_batch_on_this_cp_rank(
@@ -295,7 +321,7 @@ def get_batches_on_this_cp_rank(
             for layout in requested_layouts
         }
     else:
-        # Intermediate PP stages receive activations rather than token-aligned tensors.
+        # CP size one needs no sharding; intermediate PP stages may also have metadata only.
         batches_by_layout = {layout: dict(batch) for layout in requested_layouts}
 
     # No shared conversion route exists in this path, so build metadata from each physical batch
