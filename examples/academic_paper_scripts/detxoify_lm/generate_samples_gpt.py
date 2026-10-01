@@ -23,7 +23,8 @@ from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
@@ -227,6 +228,7 @@ def main():
                                            'no_load_rng': True,
                                            'no_load_optim': True,
                                            'seq_length': 2048})
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
 

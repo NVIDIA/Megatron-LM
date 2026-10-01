@@ -23,7 +23,7 @@ from megatron.training.config.training_config import TokenizerConfig
 @pytest.fixture
 def isolated_globals(monkeypatch):
     """Avoid changing services owned by the distributed test harness."""
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
+    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
         monkeypatch.setattr(global_vars, name, None)
 
 
@@ -78,6 +78,7 @@ def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch,
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.set_global_variables(args)
     assert global_vars.get_args() is args
+    assert global_vars.get_run_config().dist.disable_jit_fuser is False
     initialize.assert_called_once_with(args, build_tokenizer=True)
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args)
@@ -160,7 +161,12 @@ def test_vocabulary_resolves_after_config_construction(
 def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals, args_only):
     args = _runtime_args()
     if not args_only:
+        from megatron.training.argument_utils import inference_cfg_container_from_args
+
         global_vars.set_args(args)
+        global_vars.set_run_config(
+            inference_cfg_container_from_args(args, build_model_config=False)
+        )
     calls = []
     microbatches = Mock(side_effect=lambda **kwargs: calls.append("microbatches"))
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)

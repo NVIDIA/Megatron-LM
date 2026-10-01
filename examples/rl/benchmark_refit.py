@@ -19,11 +19,12 @@ from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopySer
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.training import get_args
+from megatron.training import get_args, get_run_config
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -205,6 +206,7 @@ def print_results(timings):
 def benchmark_collocated():
     """Benchmark refit in collocated mode (both models on same GPUs)."""
     args = get_args()
+    cfg = get_run_config()
     world_size = torch.distributed.get_world_size()
 
     # Calculate parallelism
@@ -243,7 +245,7 @@ def benchmark_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
     dst_config = core_transformer_config_from_args(args)
@@ -292,6 +294,7 @@ def benchmark_collocated():
 def benchmark_non_collocated():
     """Benchmark refit in non-collocated mode (separate GPU sets)."""
     args = get_args()
+    cfg = get_run_config()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
@@ -335,7 +338,7 @@ def benchmark_non_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
     torch.distributed.barrier()
@@ -417,6 +420,7 @@ def main():
     )
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron(skip_dependency_compilation=True)
 

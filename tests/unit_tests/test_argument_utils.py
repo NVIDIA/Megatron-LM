@@ -1359,7 +1359,7 @@ class TestPretrainContainerFromArgsStructure:
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
-        mock_ddp.assert_called_once_with(args)
+        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
         assert result.ddp is mock_ddp_instance
 
 
