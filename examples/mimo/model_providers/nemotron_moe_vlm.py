@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from examples.mimo.model_providers import MimoProvider
+from examples.mimo.model_providers import DEFAULT_MODEL_PROVIDER, MODEL_PROVIDERS, MimoProvider
 from examples.mimo.model_providers.radio_encoder import (
     RADIO_ENCODER_MODULE_NAME,
     _base_config,
@@ -25,6 +25,7 @@ from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -35,7 +36,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -61,8 +62,8 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider = parser.add_argument_group("mimo model provider")
     provider.add_argument(
         "--model-provider",
-        choices=[NEMOTRON_MODEL_PROVIDER],
-        default=NEMOTRON_MODEL_PROVIDER,
+        choices=sorted(MODEL_PROVIDERS),
+        default=DEFAULT_MODEL_PROVIDER,
         help="Which MIMO model provider/preset to build.",
     )
     provider.add_argument("--freeze-lm", action="store_true")
@@ -88,6 +89,39 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
             "FlashAttention version requested by the vision encoder. Defaults to "
             "--flash-attention-version. Transformer Engine version selection is process-wide, "
             "so colocated encoder and language modules must use compatible settings."
+        ),
+    )
+    provider.add_argument(
+        "--mimo-vision-num-layers",
+        type=int,
+        default=None,
+        help="ViT transformer layers for --model-provider rope2d-vit-vlm.",
+    )
+    provider.add_argument(
+        "--mimo-vision-hidden-size",
+        type=int,
+        default=None,
+        help="ViT hidden size for --model-provider rope2d-vit-vlm.",
+    )
+    provider.add_argument(
+        "--mimo-vision-ffn-hidden-size",
+        type=int,
+        default=None,
+        help="ViT MLP hidden size for --model-provider rope2d-vit-vlm.",
+    )
+    provider.add_argument(
+        "--mimo-vision-num-attention-heads",
+        type=int,
+        default=None,
+        help="ViT attention heads for --model-provider rope2d-vit-vlm.",
+    )
+    provider.add_argument(
+        "--mimo-vision-encoder-name",
+        type=str,
+        default="vision_encoder",
+        help=(
+            "Module name of the rope2d-vit-vlm vision encoder. It is part of every vision weight "
+            "key, so it must match the name the checkpoint was saved with."
         ),
     )
     provider.add_argument(
@@ -222,6 +256,23 @@ def _nemotron_projection_spec(
     )
 
 
+def _language_stack_spec(args: argparse.Namespace, config: TransformerConfig) -> ModuleSpec:
+    """Return the language HybridStack spec: --spec when given, otherwise the Mamba stack.
+
+    --spec selects the layer types, e.g. the gated-delta-product stack. With wide residuals the
+    named spec's wide_residual_ variant is used, since wide-residual layers are built only from
+    wide-residual specs.
+    """
+    wide_residual = getattr(config, "wide_residual", None) is not None
+    spec = getattr(args, "spec", None)
+    if spec is None:
+        return wide_residual_hybrid_stack_spec if wide_residual else mamba_stack_spec
+    base_path, name = spec
+    if wide_residual and not name.startswith("wide_residual_"):
+        name = "wide_residual_" + name
+    return import_module((base_path, name))
+
+
 def language_model_spec(
     args: argparse.Namespace,
     pg_collection: Optional[ProcessGroupCollection],
@@ -262,7 +313,7 @@ def language_model_spec(
         module=MambaModel,
         params={
             "config": config,
-            "mamba_stack_spec": mamba_stack_spec,
+            "mamba_stack_spec": _language_stack_spec(args, config),
             "vocab_size": _vocab_size(args),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,
@@ -396,8 +447,8 @@ def build_nemotron_communicator(
     )
 
 
-def nemotron_provider() -> MimoProvider:
-    """Provider descriptor for the Nemotron6-MoE + RADIO VLM."""
+def nemotron_provider(args: Optional[argparse.Namespace] = None) -> MimoProvider:
+    """Provider descriptor for the Nemotron-MoE + RADIO VLM; its preset ignores args."""
     return MimoProvider(
         encoder_module_names=(RADIO_ENCODER_MODULE_NAME,),
         language_spec=language_model_spec,
