@@ -35,6 +35,8 @@ from tests.unit_tests.dist_checkpointing import (
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
 
