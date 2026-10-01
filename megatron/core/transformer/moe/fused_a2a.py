@@ -208,6 +208,74 @@ class FusedDispatch(torch.autograd.Function):
         return grad_x, None, grad_token_probs, None, None, None, None
 
 
+class CachedFusedDispatch(torch.autograd.Function):
+    """The re-run's dispatch through the forward's DeepEP handle (moe_cached_recompute_dispatch).
+
+    An activation-recompute re-run of a MoE layer dispatches the same tokens with the same
+    routing as its forward did.  Instead of DeepEP's normal-mode dispatch (``get_dispatch_layout``,
+    ``notify_dispatch``, the dispatch kernel and a host wait for the receive counts), this Function
+    issues DeepEP's CACHED dispatch through the forward's handle -- the dispatch kernel alone, the
+    path ``FusedCombine.backward`` already takes -- and returns the forward's dispatched routing
+    (indices, probs in DeepEP's received layout) and host counts unchanged.  ``token_probs`` is an
+    input and ``recv_token_probs`` an output so the routing weights' gradient reaches the router
+    exactly as through ``FusedDispatch``; the backward is ``FusedDispatch``'s (a combine through the
+    handle with the probs' gradient as ``topk_weights``)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        token_probs,
+        group,
+        handle,
+        recv_token_indices,
+        recv_token_probs,
+        tokens_per_expert,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Forward pass: the cached dispatch of ``x`` through ``handle``."""
+        previous_event = None
+        if async_finish:
+            previous_event = EventOverlap(EventHandle())
+        buffer = get_buffer(group, get_hidden_bytes(x))
+        recv_x, _, _, _, _, after_event_overlap = buffer.dispatch(
+            x,
+            handle=handle,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event_overlap.current_stream_wait()
+        ctx.group = group
+        ctx.handle = handle
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(
+        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
+    ):
+        """Backward pass: FusedDispatch's (a combine through the handle)."""
+        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = EventOverlap(EventHandle())
+        grad_x, grad_token_probs, after_event = buffer.combine(
+            grad_output.contiguous(),
+            ctx.handle,
+            topk_weights=grad_token_probs.float(),
+            previous_event=previous_event,
+            async_finish=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, grad_token_probs, None, None, None, None, None, None, None
+
+
 class FusedCombine(torch.autograd.Function):
     """Fused combine operation for MoE output combining computation and communication."""
 
@@ -303,6 +371,32 @@ if HAVE_DEEP_EP:
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
+    def cached_fused_dispatch(
+        x,
+        token_probs,
+        group,
+        handle,
+        recv_token_indices,
+        recv_token_probs,
+        tokens_per_expert,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """The re-run's dispatch through the forward's handle (moe_cached_recompute_dispatch):
+        DeepEP's cached dispatch of ``x`` and the forward's dispatched routing and counts, with
+        ``FusedDispatch``'s autograd contract (the probs' gradient reaches ``token_probs``)."""
+        return CachedFusedDispatch.apply(
+            x.contiguous(),
+            token_probs,
+            group,
+            handle,
+            recv_token_indices,
+            recv_token_probs,
+            tokens_per_expert,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP"""
         Buffer.set_num_sms(num_sms)
@@ -310,6 +404,7 @@ if HAVE_DEEP_EP:
 else:
     fused_dispatch = None
     fused_combine = None
+    cached_fused_dispatch = None
     set_deepep_num_sms = None
 
 
