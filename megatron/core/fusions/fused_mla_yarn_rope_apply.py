@@ -765,15 +765,17 @@ def _mla_rope_concat_fwd_kernel(
         nope_row = NOPE + seq_idx * stride_nope_seq + batch_idx * stride_nope_batch
         rope_row = ROPE + seq_idx * stride_rope_seq + batch_idx * stride_rope_batch
 
+    # The inputs may have any strides, and the absorbed MLA query (an einsum output) is
+    # head-major, so head and channel offsets can pass 2**31 too; keep these indices 64-bit.
     head_idx = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)
     head_mask = head_idx < head_num
 
-    nope_idx = tl.arange(0, NOPE_BLOCK)
+    nope_idx = tl.arange(0, NOPE_BLOCK).to(tl.int64)
     nope_mask = head_mask[:, None] & (nope_idx[None, :] < nope_dim)
     nope_offsets = head_idx[:, None] * stride_nope_head + nope_idx[None, :] * stride_nope_dim
     nope = tl.load(nope_row + nope_offsets, mask=nope_mask)
 
-    rope_idx = tl.arange(0, ROT_BLOCK)
+    rope_idx = tl.arange(0, ROT_BLOCK).to(tl.int64)
     rope_mask = head_mask[:, None] & (rope_idx[None, :] < emb_dim // 2)
     rope_base = head_idx[:, None] * stride_rope_head
     rope_pair = rope_idx[None, :] * 2 * stride_rope_dim

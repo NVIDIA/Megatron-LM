@@ -770,6 +770,53 @@ def test_mla_rope_concat_rows_past_int32_element_offsets():
         torch.testing.assert_close(actual[checked], reference, rtol=0, atol=0)
 
 
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("outermost", ["head", "channel"], ids=["head_major", "channel_major"])
+def test_mla_rope_concat_strided_inputs_past_int32_element_offsets(outermost):
+    """Fused MLA packing must not wrap the head or channel offsets of strided inputs.
+
+    The packing takes inputs of any strides. The absorbed-MLA query it packs is the output of
+    ``torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)``, which is head-major: head h of a
+    [t, n, d] query starts at element h * t * d. With the GLM-5 shape at TP 1, 64 heads of 512
+    channels, head 63 starts at element 2**31 or later from t = 66577 on. The inputs here are the
+    first rows of tensors whose heads (or channels) are outermost in memory and whose last heads
+    (or channels) start past 2**31, so only the head (or channel) offsets are large.
+    """
+    assert fused_mla_rope_concat is not None
+    num_heads, nope_dim, emb_dim, rows = 64, 512, 64, 16
+
+    def full_shape(dim):
+        if outermost == "head":
+            # Viewed as [t, num_heads, dim]: strides (dim, t * dim, 1), like the einsum output.
+            return (num_heads, -(-(2**31) // ((num_heads - 1) * dim)), dim)
+        # Viewed as [t, num_heads, dim]: strides (num_heads, 1, t * num_heads). The RoPE channels
+        # are read in pairs, so channel dim - 2 starts past 2**31 as well.
+        return (dim, -(-(2**31) // ((dim - 2) * num_heads)), num_heads)
+
+    shapes = (full_shape(nope_dim), full_shape(emb_dim))
+    # Two inputs of just over 2**31 elements each, in bf16.
+    _skip_unless_free_gpu_memory(sum(torch.Size(s).numel() for s in shapes) * 2 + 2**30)
+
+    torch.manual_seed(1234)
+    order = (1, 0, 2) if outermost == "head" else (1, 2, 0)
+    nope, rope = (
+        torch.randn(*shape, dtype=torch.bfloat16, device="cuda").permute(*order)[:rows]
+        for shape in shapes
+    )
+    freqs = torch.randn(rows, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    cu_seqlens = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+
+    # The same rows packed from contiguous copies, whose offsets cannot overflow.
+    expected = fused_mla_rope_concat(nope.contiguous(), rope.contiguous(), cos, sin, cu_seqlens)
+    actual = fused_mla_rope_concat(nope, rope, cos, sin, cu_seqlens)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 class TestApplyRotaryPosEmbMlaFusionConflict:
     """Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict."""
 
