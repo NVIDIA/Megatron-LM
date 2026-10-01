@@ -23,6 +23,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     CudaGraphSizingDistribution,
@@ -859,6 +860,13 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
+def reset_rounder():
+    """Restore the production rounders; set_rounder(64) would leave REQUEST_ROUNDER at 64."""
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
+
+
 def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     """Mock forward function to avoid numerics issues with random inputs."""
     return torch.randn(
@@ -877,8 +885,7 @@ class DynamicEngineTestConfig:
     random_seed = 123
     vocab_size = 100
 
-    set_rounder(4)
-    num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
+    num_requests: int = 8
     min_prompt_length: int = 4
     max_prompt_length: int = 16
     num_tokens_to_generate: Optional[int] = 4
@@ -2777,7 +2784,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
@@ -7941,7 +7948,7 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     @staticmethod

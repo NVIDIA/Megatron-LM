@@ -2,6 +2,7 @@
 
 import os
 import sys
+import unittest
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,12 @@ from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    reset_transient_process_state,
+    restore_process_state,
+    snapshot_process_state,
+)
 
 
 def pytest_configure(config):
@@ -167,3 +173,30 @@ def reset_env_vars():
     # After the test, restore the original environment
     os.environ.clear()
     os.environ.update(original_env)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def restore_module_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    restore_process_state(snapshot)
+
+
+@pytest.fixture(scope="class", autouse=True)
+def restore_class_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    restore_process_state(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def reset_process_state(request):
+    snapshot = snapshot_process_state()
+    yield
+    # pytest keeps every class-based test instance alive for the whole session,
+    # so anything a test stored on self stays allocated until it is dropped here.
+    instance = request.instance
+    if instance is not None and not isinstance(instance, unittest.TestCase):
+        instance.__dict__.clear()
+    reset_transient_process_state()
+    restore_process_state(snapshot)

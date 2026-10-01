@@ -17,6 +17,7 @@ from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -60,6 +61,7 @@ class TestPartialCudaGraphedA2AOverlap:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()

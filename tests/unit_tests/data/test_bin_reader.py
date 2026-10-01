@@ -100,9 +100,6 @@ class _LocalClient(S3Client):
         pass
 
 
-setattr(boto3, "client", _LocalClient)
-
-
 ##
 # Overload ClientError from botocore.exceptions
 ##
@@ -113,8 +110,6 @@ class _LocalClientError(Exception):
 
     pass
 
-
-setattr(exceptions, "ClientError", _LocalClientError)
 
 ##
 # Mock multistorageclient module
@@ -137,14 +132,19 @@ def _msc_resolve_storage_client(path):
     return StorageClient(), path.removeprefix(MSC_PREFIX + "default")
 
 
-setattr(msc, "open", open)
-setattr(msc, "download_file", _msc_download_file)
-setattr(msc, "resolve_storage_client", _msc_resolve_storage_client)
+@pytest.fixture
+def local_object_storage(monkeypatch):
+    """Point the boto3 and msc clients at the local filesystem for one test."""
+    monkeypatch.setattr(boto3, "client", _LocalClient, raising=False)
+    monkeypatch.setattr(exceptions, "ClientError", _LocalClientError, raising=False)
+    monkeypatch.setattr(msc, "open", open, raising=False)
+    monkeypatch.setattr(msc, "download_file", _msc_download_file, raising=False)
+    monkeypatch.setattr(msc, "resolve_storage_client", _msc_resolve_storage_client, raising=False)
 
 
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
-def test_bin_reader():
+def test_bin_reader(local_object_storage):
     with tempfile.TemporaryDirectory() as temp_dir:
         # set the default nltk data path
         os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
