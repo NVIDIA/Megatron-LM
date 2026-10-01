@@ -181,6 +181,28 @@ class HybridStack(MegatronModule):
                 )
                 for layer_config in self.layer_config_list
             )
+            if any(layout == "contiguous" for layout in layer_layouts):
+                # TransformerConfig permits a contiguous attention layout under context
+                # parallelism only for DSA over GQA, which all-gathers K and V and so does not
+                # need zigzag's causal load balance. The config cannot see the layer pattern, so
+                # the per-layer check belongs here: an MLA-based attention layer would run the
+                # ring/striped path in a layout its half-block masks do not describe.
+                # DSALayerConfig is DSA over *MLA*, not the all-gather path.
+                offending = sorted(
+                    {
+                        type(layer_config).__name__
+                        for layer_config, layout in zip(self.layer_config_list, layer_layouts)
+                        if layout == "contiguous"
+                        and type(layer_config)
+                        in (layer_utils.DSALayerConfig, layer_utils.MLALayerConfig)
+                    }
+                )
+                if offending:
+                    raise ValueError(
+                        "attention_cp_layout='contiguous' with context parallelism is supported "
+                        "for the DSA-over-GQA all-gather path only, but the layer pattern also "
+                        f"contains {offending}."
+                    )
             self._cp_layout_manager = ContextParallelLayoutManager(
                 layer_layouts=layer_layouts,
                 boundary_layout=boundary_layout,

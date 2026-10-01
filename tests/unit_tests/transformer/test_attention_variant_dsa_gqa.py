@@ -249,7 +249,13 @@ def test_transformer_config_accepts_min_memory_backend():
         assert config.dsa_kernel_backend == backend
 
 
-def _simplified_test_indexer(hidden_size, head_dim, topk):
+def _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=True):
+    """Build a simplified-indexer double.
+
+    ``learned_k=False`` leaves ``linear_k`` unset, which selects the routing path that scores
+    against the attention keys directly rather than a projected K. The default keeps the
+    learned-K double these tests have always used.
+    """
     indexer = SimpleNamespace(
         index_n_heads=1,
         index_head_dim=head_dim,
@@ -258,10 +264,14 @@ def _simplified_test_indexer(hidden_size, head_dim, topk):
         index_rotary_dim=0,
         rotary_pos_emb=None,
         pg_collection=_DummyPGCollection(),
-        config=SimpleNamespace(dsa_indexer_mode="simplified", rotary_interleaved=False),
+        config=SimpleNamespace(
+            dsa_indexer_mode="simplified",
+            dsa_simplified_use_learned_k=learned_k,
+            rotary_interleaved=False,
+        ),
     )
     indexer.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
-    indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False)
+    indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False) if learned_k else None
     return indexer
 
 
@@ -817,6 +827,7 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
                 layernorm_zero_centered_gamma=False,
             ),
             indexer=object(),
+            pg_collection=_DummyPGCollection(),
             softmax_scale=4**-0.5,
             training=False,
             layer_number=1,
@@ -867,6 +878,7 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
         ),
         dense_core_attention=_DenseCore(),
         indexer=object(),
+        pg_collection=_DummyPGCollection(),
         softmax_scale=4**-0.5,
         training=False,
         layer_number=1,

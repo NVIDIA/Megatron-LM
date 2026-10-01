@@ -24,7 +24,11 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor,
     _yarn_linear_ramp_mask,
 )
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_zigzag_allgather_cp_key_reorder,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
     ROUTER_KEY_SUB_BLOCK,
@@ -651,6 +655,150 @@ def _build_full_indexer_k(
         full_k_index[start:end] = block
     return full_k_index
 
+def _cp_group_size(pg_collection) -> int:
+    """Size of the context-parallel group, or 1 when there is none."""
+    cp_group = getattr(pg_collection, "cp", None)
+    return 1 if cp_group is None else cp_group.size()
+
+
+class _AllReduceIndexerLoss(torch.autograd.Function):
+    """Sum a scalar loss across a process group, keeping it differentiable.
+
+    Forward sums; backward broadcasts the incoming scalar gradient unchanged, because each rank's
+    partial contributed additively to the total. torch.distributed.all_reduce alone would detach
+    the scalar from the graph and silently zero the indexer's gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, loss: torch.Tensor, group) -> torch.Tensor:
+        loss = loss.clone()
+        torch.distributed.all_reduce(loss, group=group)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):
+        return grad_loss, None
+
+
+def _positions_are_contiguous(query_positions: Optional[torch.Tensor]) -> bool:
+    """Whether this rank's global query positions form a single ascending run.
+
+    That is exactly the attention_cp_layout='contiguous' case, where the all-gather already
+    lands in global position order and the zigzag reorder must be skipped. Zigzag gives a rank
+    two disjoint chunks, so the span exceeds the count. Derived from the positions rather than
+    passed down, because the autograd Function does not see the config.
+    """
+    if query_positions is None or query_positions.numel() == 0:
+        return True
+    span = int(query_positions[-1].item()) - int(query_positions[0].item())
+    return span == query_positions.numel() - 1
+
+
+def _tile_global_start(query_positions: Optional[torch.Tensor], q_start: int) -> int:
+    """Global position of the first query row in a tile whose local offset is ``q_start``.
+
+    ``q_start`` indexes the *local* shard and must stay local for slicing. Causality and the
+    indexer's rotary embedding need the *global* position instead: under context parallelism a
+    rank's queries no longer begin at position 0, and under the default zigzag layout they are not
+    even one contiguous range. Returning a per-tile scalar keeps every downstream consumer on the
+    scalar arithmetic it already uses -- the kernels' ``q_start`` argument is a position, so
+    passing this value leaves their signatures untouched.
+
+    ``None`` means no context parallelism, where local and global positions coincide.
+    """
+    if query_positions is None:
+        return q_start
+    return int(query_positions[q_start].item())
+
+
+def _validate_query_positions(
+    query_positions: Optional[torch.Tensor], sq: int, query_chunk_size: int
+) -> None:
+    """Reject tilings whose tiles straddle disjoint global position ranges.
+
+    The zigzag layout gives a rank two chunks, and a tile spanning both cannot be described by a
+    single scalar start. Checked once up front rather than per tile, because the failure is
+    silently wrong masking rather than an error.
+    """
+    if query_positions is None:
+        return
+    if query_positions.numel() != sq:
+        raise ValueError(
+            f"query_positions has {query_positions.numel()} entries for a local sequence of {sq}."
+        )
+    for q_start in range(0, sq, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, sq)
+        tile = query_positions[q_start:q_end]
+        expected = torch.arange(
+            int(tile[0].item()), int(tile[0].item()) + (q_end - q_start), device=tile.device
+        )
+        if not torch.equal(tile.to(expected.dtype), expected):
+            raise ValueError(
+                "Query tile spans a discontinuity in global positions "
+                f"(local rows {q_start}:{q_end}). The planner's query chunk "
+                f"({query_chunk_size}) must divide the context-parallel chunk length."
+            )
+
+
+def _project_full_indexer_k(
+    hidden_states,
+    linear_k_weight,
+    index_head_dim,
+    index_rotary_dim,
+    rotary_pos_emb,
+    rotary_interleaved,
+    use_indexer_rope,
+    simplified_input_norm,
+    pg_collection,
+    contiguous: bool = False,
+):
+    """Project the indexer's learned K for the whole sequence.
+
+    The projection is pointwise in the sequence dimension -- ``k_i`` depends only on token ``i``,
+    and the RMS input norm is per-token too -- so projecting each rank's shard and all-gathering
+    the result is identical to gathering ``hidden_states`` and projecting once. It is far cheaper:
+    the gathered tensor carries ``index_head_dim`` (128) rather than ``hidden_size`` (4096), about
+    32x less traffic and memory, and each rank projects only its own tokens instead of every rank
+    redundantly projecting the whole sequence.
+
+    RoPE is applied *after* the gather, where global positions are simply ``0..seq-1``. Applying it
+    before would need the rank's global positions threaded in, and rotary is pointwise as well, so
+    the order is free to choose.
+
+    ``contiguous`` mirrors the K/V gather: under attention_cp_layout='contiguous' the all-gather
+    already lands in global position order, so the zigzag reorder must be skipped or it would
+    permute an already-ordered tensor.
+    """
+    cp_size = _cp_group_size(pg_collection)
+    sq_local = hidden_states.size(0)
+    # Chunked: the projection is pointwise, so bounding the FP32 norm temporaries is free
+    # here too. At cp_size == 1 this reduces to exactly the non-CP path.
+    k_index = _build_full_indexer_k(
+        hidden_states,
+        linear_k_weight,
+        index_head_dim,
+        index_rotary_dim,
+        rotary_pos_emb,
+        rotary_interleaved,
+        use_indexer_rope and cp_size == 1,
+        simplified_input_norm,
+    )
+    if cp_size == 1:
+        return k_index
+
+    k_index = gather_from_sequence_parallel_region(
+        k_index, tensor_parallel_output_grad=True, group=pg_collection.cp
+    )
+    if not contiguous:
+        reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, k_index.device)
+        k_index = k_index[reorder]
+    if use_indexer_rope:
+        positions = torch.arange(k_index.size(0), device=k_index.device, dtype=torch.long)
+        k_index = _apply_rope_at_positions(
+            k_index, positions, index_head_dim, index_rotary_dim, rotary_pos_emb, rotary_interleaved
+        )
+    return k_index
+
 
 def _project_simplified_q_index_tile(
     hidden_states: torch.Tensor,
@@ -663,7 +811,10 @@ def _project_simplified_q_index_tile(
     rotary_interleaved: bool,
     use_indexer_rope: bool,
     simplified_input_norm=None,
+    q_pos_start: Optional[int] = None,
 ) -> torch.Tensor:
+    # q_start slices the local shard; q_pos_start is the tile's global position for RoPE.
+    q_pos_start = q_start if q_pos_start is None else q_pos_start
     hidden_tile = _apply_simplified_input_norm_tile(
         hidden_states[q_start:q_end], simplified_input_norm
     )
@@ -671,7 +822,9 @@ def _project_simplified_q_index_tile(
         q_end - q_start, hidden_states.size(1), 1, index_head_dim
     )
     if use_indexer_rope:
-        positions = torch.arange(q_start, q_end, device=q_index.device, dtype=torch.long)
+        positions = torch.arange(
+            q_pos_start, q_pos_start + (q_end - q_start), device=q_index.device, dtype=torch.long
+        )
         q_index = _apply_rope_at_positions(
             q_index, positions, index_head_dim, index_rotary_dim, rotary_pos_emb, rotary_interleaved
         )
@@ -898,7 +1051,10 @@ def _simplified_topk_index_tile(
     simplified_input_norm=None,
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
+    q_pos_start: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # q_start slices the local shard; q_pos_start is this tile's global position.
+    q_pos_start = q_start if q_pos_start is None else q_pos_start
     q_index = _project_simplified_q_index_tile(
         hidden_states,
         q_start,
@@ -910,8 +1066,12 @@ def _simplified_topk_index_tile(
         rotary_interleaved,
         use_indexer_rope,
         simplified_input_norm,
+        q_pos_start=q_pos_start,
     )
-    causal_key_limit = min(q_end, key.size(0))
+    # Causal visibility is a property of the tile's *global* last position, not its local one.
+    # Under context parallelism the key set is the full gathered sequence, so clamping with the
+    # local q_end would hide every key beyond this rank's shard length.
+    causal_key_limit = min(q_pos_start + (q_end - q_start), key.size(0))
     topk = min(index_topk, causal_key_limit)
     running_scores = None
     running_indices = None
@@ -941,14 +1101,14 @@ def _simplified_topk_index_tile(
             unit_weights,
             key_block[:, :, 0, :],
             block_topk,
-            q_start,
+            q_pos_start,
             k_start,
             apply_relu=False,
             score_scale=score_scale,
         )
         if triton_topk is None:
             block_scores = _simplified_index_scores_block(
-                q_index, key_block, score_scale, q_start, k_start
+                q_index, key_block, score_scale, q_pos_start, k_start
             )
             block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
             block_indices = block_indices + k_start
@@ -986,18 +1146,28 @@ def _simplified_sparse_forward_impl(
     selected_scores_cache: Optional[list] = None,
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
+    query_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     sq, batch_size, num_query_heads, _ = query.shape
     output = value.new_empty((sq, batch_size, num_query_heads, value.size(-1)))
     indexer_loss = query.new_zeros((), dtype=torch.float32)
-    total_positions = batch_size * sq
-    for q_start in range(0, sq, query_chunk_size):
-        q_end = min(q_start + query_chunk_size, sq)
+    # Under context parallelism sq is this rank's shard, but the indexer loss is a mean over the
+    # whole sequence: every rank must divide by the same global token count, or each contributes a
+    # share scaled by cp_size before the all-reduce.
+    cp_size = _cp_group_size(pg_collection)
+    total_positions = batch_size * sq * cp_size
+    for q_lo in range(0, sq, query_chunk_size):
+        q_hi = min(q_lo + query_chunk_size, sq)
+        # q_lo/q_hi index the local shard and are used for slicing; q_start/q_end carry the
+        # tile's global positions, which is what causality and RoPE need under context
+        # parallelism. Their difference is the tile length either way.
+        q_start = _tile_global_start(query_positions, q_lo)
+        q_end = q_start + (q_hi - q_lo)
         routing_scores, topk_indices, q_index = _simplified_topk_index_tile(
             hidden_states,
             key,
-            q_start,
-            q_end,
+            q_lo,
+            q_hi,
             linear_q_weight,
             index_topk,
             index_head_dim,
@@ -1010,11 +1180,12 @@ def _simplified_sparse_forward_impl(
             simplified_input_norm,
             linear_k_weight=linear_k_weight,
             full_k_index=full_k_index,
+            q_pos_start=q_start,
         )
         if routing_topk_cache is not None:
             routing_topk_cache.append(topk_indices)
-        query_tile = query[q_start:q_end]
-        output[q_start:q_end] = _sparse_attention_tile(
+        query_tile = query[q_lo:q_hi]
+        output[q_lo:q_hi] = _sparse_attention_tile(
             query_tile, key, value, topk_indices, attention_softmax_scale, q_start
         )
         if loss_coeff > 0:
@@ -1033,6 +1204,10 @@ def _simplified_sparse_forward_impl(
                 q_start,
                 pg_collection,
             )
+    if cp_size > 1:
+        # Each rank's KL covers only its own queries. The loss is a mean over the full sequence,
+        # so the partials must be summed; without this each rank backpropagates its share alone.
+        indexer_loss = _AllReduceIndexerLoss.apply(indexer_loss, pg_collection.cp)
     return output.reshape(sq, batch_size, num_query_heads * value.size(-1)), indexer_loss
 
 
@@ -1065,11 +1240,13 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_selected_scores: bool = False,
         cache_indexer_k: bool = False,
         use_triton: bool = True,
+        query_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         key_chunk_size = _plan_execution(
             query.size(1), query.size(0), key.size(0), use_triton, key_chunk_override=key_chunk_size
         ).routing_key_chunk
+        _validate_query_positions(query_positions, query.size(0), query_chunk_size)
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
         with _triton_dispatch_enabled(use_triton):
@@ -1080,7 +1257,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 # for keys whose values do not depend on the tile. cache_indexer_k decides only
                 # whether this survives into the backward pass, below; the forward projects once
                 # either way.
-                full_k_index = _build_full_indexer_k(
+                #
+                # Under context parallelism the result must span the *gathered* sequence, to
+                # match the global key set topk_indices address. The helper reduces to the
+                # plain chunked projection when there is no CP group.
+                full_k_index = _project_full_indexer_k(
                     hidden_states,
                     linear_k_weight,
                     index_head_dim,
@@ -1089,6 +1270,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     rotary_interleaved,
                     use_indexer_rope,
                     simplified_input_norm,
+                    pg_collection,
+                    contiguous=_positions_are_contiguous(query_positions),
                 )
                 output, indexer_loss = _simplified_sparse_forward_impl(
                     query,
@@ -1113,6 +1296,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     selected_scores_cache=selected_scores_cache,
                     linear_k_weight=linear_k_weight,
                     full_k_index=full_k_index,
+                    query_positions=query_positions,
                 )
 
         # Retaining it costs seq * batch * index_head_dim for the whole span between this
@@ -1141,6 +1325,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             tuple(selected_scores_cache) if selected_scores_cache is not None else None
         )
         ctx.use_triton = use_triton
+        ctx.query_positions = query_positions
+        ctx.cp_group = getattr(pg_collection, "cp", None) if pg_collection else None
         return output, indexer_loss
 
     @staticmethod
@@ -1182,9 +1368,14 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             and ctx.loss_coeff > 0
             and (grad_linear_q_weight is not None or grad_linear_k_weight is not None)
         )
+        # topk_indices address the gathered global key set, so this accumulator must span it.
+        # Sizing it at the local sq would put every index past this rank's shard out of bounds.
+        grad_k_seq_len = sq if ctx.query_positions is None else key.size(0)
         grad_k_linear_sequence = (
             torch.zeros(
-                (sq, batch_size, ctx.index_head_dim), device=query.device, dtype=torch.float32
+                (grad_k_seq_len, batch_size, ctx.index_head_dim),
+                device=query.device,
+                dtype=torch.float32,
             )
             if compute_loss_grad and grad_linear_k_weight is not None
             else None
@@ -1207,8 +1398,12 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     ctx.simplified_input_norm.eps,
                     ctx.simplified_input_norm.normalization,
                 )
-            for chunk_idx, q_start in enumerate(range(0, sq, ctx.query_chunk_size)):
-                q_end = min(q_start + ctx.query_chunk_size, sq)
+            for chunk_idx, q_lo in enumerate(range(0, sq, ctx.query_chunk_size)):
+                q_hi = min(q_lo + ctx.query_chunk_size, sq)
+                # See the forward loop: q_lo/q_hi slice locally, q_start/q_end are
+                # global positions for causality and RoPE.
+                q_start = _tile_global_start(ctx.query_positions, q_lo)
+                q_end = q_start + (q_hi - q_lo)
                 q_index = None
                 routing_scores = None
                 if ctx.routing_topk_cache is not None:
@@ -1219,8 +1414,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         routing_scores, topk_indices, q_index = _simplified_topk_index_tile(
                             hidden_states,
                             key,
-                            q_start,
-                            q_end,
+                            q_lo,
+                            q_hi,
                             linear_q_weight,
                             ctx.index_topk,
                             ctx.index_head_dim,
@@ -1233,13 +1428,14 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             ctx.simplified_input_norm,
                             linear_k_weight=linear_k_weight,
                             full_k_index=full_k_index,
+                            q_pos_start=q_start,
                         )
 
                 triton_attention_done = False
                 if use_triton_attention_backward:
-                    query_tile = query[q_start:q_end]
-                    grad_output_tile = grad_output[q_start:q_end]
-                    grad_query_tile = grad_query[q_start:q_end]
+                    query_tile = query[q_lo:q_hi]
+                    grad_output_tile = grad_output[q_lo:q_hi]
+                    grad_query_tile = grad_query[q_lo:q_hi]
                     if grad_key_accum is None and triton_sparse_attention_backward_supported(
                         query_tile, key, value, topk_indices, grad_output_tile, grad_query_tile
                     ):
@@ -1269,7 +1465,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 if not triton_attention_done:
                     attention_inputs = []
                     query_tile = (
-                        query[q_start:q_end].detach().requires_grad_(ctx.needs_input_grad[0])
+                        query[q_lo:q_hi].detach().requires_grad_(ctx.needs_input_grad[0])
                     )
                     key_leaf = key.detach().requires_grad_(ctx.needs_input_grad[1])
                     value_leaf = value.detach().requires_grad_(ctx.needs_input_grad[2])
@@ -1292,7 +1488,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         attention_grads = torch.autograd.grad(
                             output_tile,
                             attention_inputs,
-                            grad_outputs=grad_output[q_start:q_end],
+                            grad_outputs=grad_output[q_lo:q_hi],
                             retain_graph=False,
                             allow_unused=True,
                         )
@@ -1300,7 +1496,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         if ctx.needs_input_grad[0]:
                             grad = next(grad_iter)
                             if grad is not None:
-                                grad_query[q_start:q_end] = grad
+                                grad_query[q_lo:q_hi] = grad
                         if ctx.needs_input_grad[1]:
                             grad = next(grad_iter)
                             if grad is not None:
@@ -1315,8 +1511,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         if q_index is None:
                             q_index = _project_simplified_q_index_tile(
                                 hidden_states,
-                                q_start,
-                                q_end,
+                                q_lo,
+                                q_hi,
                                 linear_q_weight,
                                 ctx.index_head_dim,
                                 ctx.index_rotary_dim,
@@ -1324,6 +1520,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                 ctx.rotary_interleaved,
                                 ctx.use_indexer_rope,
                                 ctx.simplified_input_norm,
+                                q_pos_start=q_start,
                             )
                         # Projected once above, whether it came from ctx or was rebuilt here.
                         selected_score_k_index = full_k_index
@@ -1356,7 +1553,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                     )
                                 )
                         teacher = _teacher_scores_tile(
-                            query[q_start:q_end].detach(),
+                            query[q_lo:q_hi].detach(),
                             key.detach(),
                             topk_indices,
                             ctx.attention_softmax_scale,
@@ -1423,13 +1620,28 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     # then accumulate the WGRAD reduction in FP32.
                     grad_q_linear = grad_q_linear.to(dtype=hidden_states.dtype)
                     q_input_tile = _apply_simplified_input_norm_tile(
-                        hidden_states[q_start:q_end], ctx.simplified_input_norm
+                        hidden_states[q_lo:q_hi], ctx.simplified_input_norm
                     )
                     _accumulate_linear_weight_grad(
                         grad_linear_q_weight, grad_q_linear, q_input_tile
                     )
 
             if grad_k_linear_sequence is not None:
+                if ctx.query_positions is not None:
+                    # This rank's queries scatter gradient into *every* global key, including
+                    # keys other ranks own, so a row here holds only this rank's partial. The
+                    # learned-K all-gather in forward runs under torch.no_grad, so its
+                    # reduce-scatter backward never fires and cannot combine them for us --
+                    # sum across the CP group here instead. Slicing first would discard every
+                    # cross-rank contribution, leaving a gradient that is finite, wrong, and
+                    # silent. The dp_cp reduction that follows cannot recover it: it combines
+                    # rows across ranks, and by then the partials are already gone.
+                    cp_group = getattr(ctx, "cp_group", None)
+                    if cp_group is not None and cp_group.size() > 1:
+                        torch.distributed.all_reduce(grad_k_linear_sequence, group=cp_group)
+                    # Now pair each row with the activation that produced it; this rank holds
+                    # only its own tokens, and dp_cp sums those disjoint slices.
+                    grad_k_linear_sequence = grad_k_linear_sequence[ctx.query_positions]
                 _accumulate_simplified_learned_k_wgrad(
                     grad_k_linear_sequence,
                     hidden_states,
@@ -2119,6 +2331,7 @@ def dsa_min_memory_gqa(
     cache_selected_scores: bool = False,
     use_triton: bool = True,
     simplified_input_norm=None,
+    query_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
     _plan = _plan_execution(
@@ -2136,7 +2349,13 @@ def dsa_min_memory_gqa(
             value,
             hidden_states,
             _module_weight(indexer.linear_q),
-            _module_weight(indexer.linear_k),
+            # An empty tensor means "no learned K": the router then scores against the attention
+            # keys directly. _module_weight cannot express that, and linear_k may be absent.
+            (
+                _module_weight(indexer.linear_k)
+                if getattr(indexer.config, "dsa_simplified_use_learned_k", True)
+                else query.new_empty((0,))
+            ),
             indexer.index_topk,
             indexer.index_head_dim,
             indexer.index_rotary_dim,
@@ -2154,4 +2373,5 @@ def dsa_min_memory_gqa(
             cache_selected_scores,
             cache_indexer_k,
             use_triton,
+            query_positions,
         )

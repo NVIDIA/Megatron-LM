@@ -267,3 +267,59 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+def _make_cp_layout_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        context_parallel_size=2,
+        attention_cp_layout="contiguous",
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def _make_dsa_cp_layout_config(**overrides) -> TransformerConfig:
+    # The rest of the DSA validation block is unrelated to CP layouts but has to be satisfied
+    # for the config to construct at all: DSA asserts RMSNorm, unfused RoPE, no linear bias, and
+    # the simplified indexer currently asserts a single query group.
+    kwargs = dict(
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=16,
+        cp_comm_type="allgather",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        apply_rope_fusion=False,
+        num_query_groups=1,
+    )
+    kwargs.update(overrides)
+    return _make_cp_layout_config(**kwargs)
+
+
+def test_contiguous_attention_cp_layout_rejected_for_ring_attention():
+    # Ring and striped attention read the zigzag layout out of raw offsets, so a contiguous
+    # shard would be masked as if it sat at the front of the sequence.
+    with pytest.raises(ValueError, match="attention_cp_layout='contiguous'"):
+        _make_cp_layout_config()
+
+
+def test_contiguous_attention_cp_layout_allowed_for_dsa_over_gqa():
+    # DSA over GQA all-gathers K and V, so the layout only decides which global positions this
+    # rank's queries carry -- both layouts describe the same attention.
+    config = _make_dsa_cp_layout_config()
+
+    assert config.attention_cp_layout == "contiguous"
+
+
+def test_contiguous_attention_cp_layout_rejected_for_dsa_over_mla():
+    # DSA over MLA runs the upstream MLA CP path, not the GQA all-gather.
+    with pytest.raises(ValueError, match="attention_cp_layout='contiguous'"):
+        _make_dsa_cp_layout_config(multi_latent_attention=True)
+
+
+def test_contiguous_attention_cp_layout_is_unrestricted_without_context_parallelism():
+    config = _make_cp_layout_config(context_parallel_size=1)
+
+    assert config.attention_cp_layout == "contiguous"

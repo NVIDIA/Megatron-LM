@@ -26,6 +26,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_zigzag_allgather_cp_key_reorder,
+    build_zigzag_cp_local_positions,
+    normalize_cp_comm_type,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -34,6 +39,67 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type, contiguous=False):
+    """All-gather K and V along the sequence dimension over the context-parallel group.
+
+    Context parallelism shards the sequence, so a rank holds only its slice of Q, K and V. The
+    simplified indexer selects top-k over the *global* key set, which a ring or striped exchange
+    would turn into a distributed top-k merge; all-gathering K and V instead lets each rank run
+    both the indexer and attention locally against complete keys. This mirrors the strategy
+    upstream uses for DSA over MLA, hence the ``cp_comm_type='allgather'`` gate.
+
+    The gather is deliberately outside ``DSASimplifiedMinMemoryGQAFn`` so that it is an ordinary
+    node in the autograd graph. ``gather_from_sequence_parallel_region`` reduce-scatters in
+    backward, which sums every rank's contribution to a shared key before scattering the gradient
+    home. Gathering inside the custom Function would make that reduction our responsibility, and
+    omitting it yields finite but wrong dK/dV with no error.
+
+    Gathered tensors arrive concatenated in *rank* order. Under the default zigzag layout rank r
+    holds chunks r and 2*cp-r-1, so rank order is not position order, while the causal masks
+    downstream compare raw offsets. The reorder restores global position order; it is an indexing
+    op rather than an in-place write, so autograd permutes the gradient back before the
+    reduce-scatter sees it. ``contiguous=True`` (attention_cp_layout='contiguous') is the case
+    where rank order already is position order and neither step is needed.
+
+    Returns the gathered key and value plus this rank's global query positions, or ``None`` for
+    those positions when context parallelism is off.
+    """
+    cp_size = 1 if cp_group is None else cp_group.size()
+    if cp_size <= 1:
+        return key, value, None
+
+    if normalize_cp_comm_type(cp_comm_type) != "allgather":
+        raise NotImplementedError(
+            "DSA over GQA context parallelism supports cp_comm_type='allgather' only; "
+            f"got {cp_comm_type!r}."
+        )
+
+    sq_local = key.size(0)
+    gathered_key = gather_from_sequence_parallel_region(
+        key, tensor_parallel_output_grad=True, group=cp_group
+    )
+    gathered_value = gather_from_sequence_parallel_region(
+        value, tensor_parallel_output_grad=True, group=cp_group
+    )
+    if contiguous:
+        # attention_cp_layout='contiguous' shards the sequence in rank order, so the all-gather
+        # already lands in global position order and a rank's queries are one contiguous span:
+        # no reorder, no zigzag mapping. Setting it alongside linear_cp_layout='contiguous' --
+        # the layout the Mamba mixers want for their scan -- also removes the per-layer layout
+        # conversion a hybrid stack would otherwise run around every attention layer.
+        cp_rank = cp_group.rank()
+        query_positions = torch.arange(
+            cp_rank * sq_local, (cp_rank + 1) * sq_local, device=key.device, dtype=torch.int64
+        )
+        return gathered_key, gathered_value, query_positions
+
+    reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, key.device)
+    query_positions = build_zigzag_cp_local_positions(
+        sq_local * cp_size, cp_size, cp_group.rank(), key.device
+    )
+    return gathered_key[reorder], gathered_value[reorder], query_positions
 
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
@@ -692,6 +758,13 @@ class DSGQACoreAttention(MegatronModule):
     ):
         super().__init__(config=config)
         self.layer_number = layer_number
+        # config.cp_comm_type may be a per-layer list; the spec resolves it to one value here.
+        self.cp_comm_type = cp_comm_type
+        # Kept because the context-parallel K/V gather in _forward_min_memory needs the CP group.
+        # SelfAttention stores this too, but that is a different object; this core-attention
+        # submodule previously only forwarded pg_collection to the indexer and never kept it,
+        # which left cp_group None and silently disabled the gather for every CP run.
+        self.pg_collection = pg_collection
         self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         self.dense_core_attention = None
         if (
@@ -938,6 +1011,40 @@ class DSGQACoreAttention(MegatronModule):
                 f"dsa_kernel_backend='{dsa_kernel_backend}' requires full-sequence self "
                 "attention."
             )
+        # Only the DSA path consumes gathered K/V. dense_core_attention is a TransformerEngine
+        # module with its own CP handling, so it keeps the local shards; binding the gathered
+        # copies to separate names keeps the two from colliding.
+        cp_group = getattr(self.pg_collection, "cp", None) if self.pg_collection else None
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if cp_size > 1 and (dense_warmup or sparse_fwd_dense_loss):
+            # The dense-loss tiling loops in dsa_min_memory still derive positions from a local
+            # q_start, so their causal masks would be wrong under context parallelism. Refuse
+            # rather than produce a plausible loss curve from incorrect masking.
+            raise NotImplementedError(
+                "DSA over GQA context parallelism currently covers the sparse path only; "
+                "dsa_fwd_use_dense_attn and the dense indexer loss are not yet position-aware."
+            )
+        # The learned indexer K is projected per rank and all-gathered inside the min-memory
+        # path, which requires the full-sequence cache; without it K would be projected blockwise
+        # from the local hidden_states and cover only this rank's tokens.
+        if (
+            cp_size > 1
+            and getattr(self.config, "dsa_simplified_use_learned_k", False)
+            and not _dsa_caches_indexer_k(self.config)
+        ):
+            raise NotImplementedError(
+                "DSA over GQA context parallelism with --dsa-simplified-use-learned-k requires "
+                "--dsa-kernel-cache-indexer-k."
+            )
+        dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
+            key,
+            value,
+            cp_group,
+            # Unlike pg_collection, a missing comm type cannot fail silently: the helper only
+            # reads it when the CP group is real, and rejects anything but all-gather there.
+            getattr(self, "cp_comm_type", None),
+            contiguous=getattr(self.config, "attention_cp_layout", "zigzag") == "contiguous",
+        )
         if dense_warmup and getattr(self.config, "dsa_indexer_use_sparse_loss", False):
             raise NotImplementedError(
                 "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
@@ -1021,8 +1128,8 @@ class DSGQACoreAttention(MegatronModule):
         if not torch.is_grad_enabled():
             return dsa_min_memory_gqa_forward_only(
                 query=query,
-                key=key,
-                value=value,
+                key=dsa_key,
+                value=dsa_value,
                 hidden_states=hidden_states.detach(),
                 indexer=self.indexer,
                 softmax_scale=self.softmax_scale,
@@ -1048,8 +1155,8 @@ class DSGQACoreAttention(MegatronModule):
         sparse_loss_coeff = indexer_loss_coeff if sparse_indexer_loss else 0.0
         output, indexer_loss = dsa_min_memory_gqa(
             query=query,
-            key=key,
-            value=value,
+            key=dsa_key,
+            value=dsa_value,
             hidden_states=hidden_states.detach(),
             indexer=self.indexer,
             softmax_scale=self.softmax_scale,
@@ -1060,6 +1167,7 @@ class DSGQACoreAttention(MegatronModule):
             cache_indexer_k=_dsa_caches_indexer_k(self.config),
             cache_selected_scores=_dsa_caches_selected_scores(self.config),
             use_triton=dsa_kernel_backend == "min-memory-triton",
+            query_positions=query_positions,
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(
@@ -1096,6 +1204,9 @@ class DSGroupedSelfAttention(SelfAttention):
         pp_layer_offset: Optional[int] = None,
         # Upstream's TransformerLayer now passes a module instance name top-down.
         name: str | None = None,
+        # TransformerLayer sets this unconditionally in attention_optional_kwargs, so
+        # overriding __init__ without accepting it fails at model construction.
+        is_mtp_layer: bool = False,
     ):
         if config.experimental_attention_variant == "dsa":
             # Asserted here, not in transformer_config: the config cannot tell which attention class
@@ -1128,6 +1239,7 @@ class DSGroupedSelfAttention(SelfAttention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
     def _use_indexer_rope(

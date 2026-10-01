@@ -259,6 +259,22 @@ class TestHybridTHDScaling:
 class TestGatedDeltaProductFlops:
     """GDP FLOPs must use the Householder count from the model configuration."""
 
+    def test_dsa_derived_gdp_spec_is_recognized_as_gdp(self):
+        """gdp_dsa_stack_spec swaps only the attention layer, so FLOPs must match gdp_stack_spec.
+
+        The spec name is matched by suffix, so a stack derived for DSA over GQA has to be listed
+        alongside the ones it derives from or its Mamba layers are costed as plain Mamba.
+        """
+        args = _make_hybrid_args()
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
+        gdp_flops = num_floating_point_operations(args, 4)
+
+        args.spec = [
+            "megatron.core.transformer.experimental_attention_variant.dsa_layer_specs",
+            "gdp_dsa_stack_spec",
+        ]
+        assert num_floating_point_operations(args, 4) == gdp_flops
+
     def test_householder_count_changes_flops(self):
         args = _make_hybrid_args()
         args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
