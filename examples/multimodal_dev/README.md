@@ -70,6 +70,51 @@ Set `DRY_RUN=0` to execute it. `MODEL_VARIANT=flash` selects the full 43-layer
 decoder / 32-layer vision tower. The current image-span visibility path supports
 CP=1; context-parallel image spans require a later CSA/MDP transport extension.
 
+### Real-data SFT
+
+`data/deepseek_v4_vl.py` turns image-text conversations into the layout the
+model consumes. It ports the official `inference/image_processor.py`
+(resize under the 384-token budget, gray letterbox, `(x - 0.5) / 0.5`, 14x14
+`(C, P, P)` patches) and renders the official non-thinking chat template
+(`<bos><｜User｜>…<｜Assistant｜></think>answer<eos>`). Each
+`<｜deepseek_image｜>` becomes the position-dependent N-layout image block, loss
+is applied only to assistant turns, and samples whose image block would not fit
+`--total-seq-length` are skipped instead of truncated through the image.
+
+Two dataset providers are registered for `deepseek_v4_vision`:
+
+| `DATASET` | Source |
+|-----------|--------|
+| `cord_v2` | CORD-V2 receipt parsing from the Hugging Face hub |
+| `jsonl`   | `DATASET_PATH=train.jsonl[,valid.jsonl[,test.jsonl]]`, one `{"messages": [...]}` per line |
+
+```jsonc
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "image", "url": "images/0001.jpg"},   // path (relative to the JSONL), URL, data URL, or {"data": base64}
+    {"type": "text", "text": "What is the total?"}]},
+  {"role": "assistant", "content": "12.50"}]}
+```
+
+```bash
+# Proxy model, CORD-V2, from scratch (pipeline / loss-goes-down check)
+DATASET=cord_v2 MODEL_VARIANT=proxy SEQ_LEN=2048 TRAIN_ITERS=500 LR=1e-4 MIN_LR=1e-5 \
+  WARMUP_ITERS=20 GBS=32 DRY_RUN=0 bash examples/multimodal_dev/scripts/run_deepseek_v4_vision.sh
+
+# Full Flash-Vision SFT from a Megatron checkpoint
+DATASET=jsonl DATASET_PATH=/data/train.jsonl,/data/valid.jsonl LOAD=/ckpt/dsv4_flash_vision \
+  MODEL_VARIANT=flash NNODES=8 EP=64 SEQ_LEN=4096 EVAL_INTERVAL=200 EVAL_ITERS=10 DRY_RUN=0 \
+  bash examples/multimodal_dev/scripts/run_deepseek_v4_vision.sh
+```
+
+`LOAD` loads weights with `--finetune` (fresh optimizer, scheduler and
+iteration count). The tokenizer comes from `TOKENIZER_MODEL` (default
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`) and must keep the chat-template
+tokens and `<｜deepseek_image｜>` as single tokens; the dataset checks this at
+start-up. System prompts and thinking-mode rendering are not implemented yet.
+There is no Hugging Face to Megatron converter for the vision checkpoint yet,
+so the `flash` recipe needs a checkpoint produced elsewhere.
+
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 
 Convert a HuggingFace release to a Megatron-FSDP DTensor checkpoint via

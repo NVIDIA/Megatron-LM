@@ -62,7 +62,11 @@ MODEL_REGISTRY = {
             "mock": (
                 "examples.multimodal_dev.data.deepseek_v4_mock"
                 ".train_valid_test_datasets_provider"
-            )
+            ),
+            "cord_v2": (
+                "examples.multimodal_dev.data.deepseek_v4_vl.cord_v2_datasets_provider"
+            ),
+            "jsonl": "examples.multimodal_dev.data.deepseek_v4_vl.jsonl_datasets_provider",
         },
     },
     "qwen35_vl": {

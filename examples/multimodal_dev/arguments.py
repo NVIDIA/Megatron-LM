@@ -20,7 +20,19 @@ def add_multimodal_args(parser):
         help="Model variant (size). E.g. proxy, 9b, 397b_a17b",
     )
     group.add_argument(
-        "--dataset-provider", type=str, default="mock", help="Dataset provider: mock"
+        "--dataset-provider",
+        type=str,
+        default="mock",
+        help="Dataset provider registered for --model-arch (e.g. mock, cord_v2, jsonl)",
+    )
+    group.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help=(
+            "For --dataset-provider jsonl: train[,valid[,test]] JSONL files of "
+            '{"messages": [...]} conversations.'
+        ),
     )
     group.add_argument(
         "--image-token-id", type=int, default=248056, help="Token ID for image placeholder tokens"

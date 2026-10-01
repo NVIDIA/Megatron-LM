@@ -10,6 +10,12 @@
 # Small construction/smoke proxy:
 #   MODEL_VARIANT=proxy DRY_RUN=0 \
 #     bash examples/multimodal_dev/scripts/run_deepseek_v4_vision.sh
+# Real-data SFT (CORD-V2 from the HF hub, or local JSONL conversations):
+#   DATASET=cord_v2 MODEL_VARIANT=proxy DRY_RUN=0 \
+#     bash examples/multimodal_dev/scripts/run_deepseek_v4_vision.sh
+#   DATASET=jsonl DATASET_PATH=/data/train.jsonl,/data/valid.jsonl \
+#     LOAD=/ckpt/dsv4_flash_vision MODEL_VARIANT=flash NNODES=8 DRY_RUN=0 \
+#     bash examples/multimodal_dev/scripts/run_deepseek_v4_vision.sh
 
 set -euo pipefail
 
@@ -33,6 +39,31 @@ TRAIN_ITERS=${TRAIN_ITERS:-10}
 USE_FSDP=${USE_FSDP:-1}
 USE_PACKED_SEQUENCE=${USE_PACKED_SEQUENCE:-0}
 USE_EXTERNAL_VISION_EMBEDDINGS=${USE_EXTERNAL_VISION_EMBEDDINGS:-0}
+DATASET=${DATASET:-mock}          # mock | cord_v2 | jsonl
+DATASET_PATH=${DATASET_PATH:-}    # jsonl only: train[,valid[,test]]
+LOAD=${LOAD:-}                    # optional Megatron checkpoint to fine-tune from
+LR=${LR:-3.9e-6}
+MIN_LR=${MIN_LR:-3.9e-7}
+WARMUP_ITERS=${WARMUP_ITERS:-1}
+EVAL_INTERVAL=${EVAL_INTERVAL:-1000}
+EVAL_ITERS=${EVAL_ITERS:-0}
+SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
+NUM_WORKERS=${NUM_WORKERS:-0}
+
+case "$DATASET" in
+    mock) ;;
+    cord_v2) ;;
+    jsonl)
+        if [ -z "$DATASET_PATH" ]; then
+            echo "DATASET=jsonl requires DATASET_PATH=train.jsonl[,valid.jsonl[,test.jsonl]]." >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Unsupported DATASET=$DATASET (expected mock, cord_v2 or jsonl)" >&2
+        exit 1
+        ;;
+esac
 
 case "$MODEL_VARIANT" in
     flash)
@@ -171,12 +202,12 @@ MODEL_ARGS=(
 )
 
 DATA_ARGS=(
-    --dataset-provider mock
+    --dataset-provider "$DATASET"
     --use-vanilla-collate-fn
     --image-size "$IMAGE_SIZE"
     --total-seq-length "$SEQ_LEN"
     --dataloader-type cyclic
-    --num-workers 0
+    --num-workers "$NUM_WORKERS"
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-model "$TOKENIZER_MODEL"
 )
@@ -195,10 +226,10 @@ TRAINING_ARGS=(
     --micro-batch-size "$MBS"
     --global-batch-size "$GBS"
     --train-iters "$TRAIN_ITERS"
-    --lr 3.9e-6
-    --min-lr 3.9e-7
+    --lr "$LR"
+    --min-lr "$MIN_LR"
     --lr-decay-style cosine
-    --lr-warmup-iters 1
+    --lr-warmup-iters "$WARMUP_ITERS"
     --weight-decay 0.1
     --clip-grad 1.0
     --adam-beta1 0.9
@@ -211,13 +242,20 @@ TRAINING_ARGS=(
     --calculate-per-token-loss
     --enable-experimental
     --log-interval 1
-    --eval-interval 1000
-    --eval-iters 0
-    --save-interval 1000
+    --eval-interval "$EVAL_INTERVAL"
+    --eval-iters "$EVAL_ITERS"
+    --save-interval "$SAVE_INTERVAL"
     --save "$OUTPUT_DIR"
 )
 
 EXTRA_ARGS=()
+if [ -n "$DATASET_PATH" ]; then
+    EXTRA_ARGS+=(--dataset-path "$DATASET_PATH")
+fi
+if [ -n "$LOAD" ]; then
+    # Fine-tune: take weights only, start a fresh optimizer / scheduler / iteration count.
+    EXTRA_ARGS+=(--load "$LOAD" --finetune)
+fi
 if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
     EXTRA_ARGS+=(--use-packed-sequence)
 fi
@@ -243,7 +281,7 @@ cmd=(
     "${EXTRA_ARGS[@]}"
 )
 
-echo "DeepSeek-V4-Flash-Vision (MTP disabled)"
+echo "DeepSeek-V4-Flash-Vision (MTP disabled), dataset=$DATASET"
 echo "  hybrid pattern: $HYBRID_LAYER_PATTERN"
 echo "  compress ratios: $COMPRESS_RATIOS"
 echo "${cmd[@]}"
