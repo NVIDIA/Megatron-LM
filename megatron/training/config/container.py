@@ -47,6 +47,9 @@ class ConfigContainerBase:
 
     def validate(self) -> None:
         """Run each sub-config's explicit validation before runtime initialization."""
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            rng.finalize_model_config(getattr(self, "model", None))
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)

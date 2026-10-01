@@ -80,6 +80,9 @@ def initialize_megatron(
 
     args = get_args()
 
+    cfg = get_run_config()
+    cfg.validate()
+
     # set logging level
     setup_logging()
 
@@ -141,8 +144,8 @@ def initialize_megatron(
             _set_random_seed(
                 cfg.rng.seed,
                 cfg.rng.data_parallel_random_init,
-                args.te_rng_tracker,
-                args.inference_rng_tracker,
+                cfg.rng.te_rng_tracker,
+                cfg.rng.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,

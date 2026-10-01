@@ -50,8 +50,8 @@ def configure_module_rng(
     _set_random_seed(
         cfg.rng.seed + role_seed_offset,
         data_parallel_random_init,
-        te_rng_tracker=getattr(args, "te_rng_tracker", False),
-        inference_rng_tracker=getattr(args, "inference_rng_tracker", False),
+        te_rng_tracker=cfg.rng.te_rng_tracker,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
         use_cudagraphable_rng=getattr(args, "cuda_graph_impl", "none") != "none",
         pp_group=pg_collection.pp,
         dp_group=pg_collection.dp,

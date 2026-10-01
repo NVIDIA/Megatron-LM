@@ -3220,12 +3220,6 @@ def _add_initialization_args(parser):
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
 
-    group.add_argument('--te-rng-tracker', action='store_true',
-                       help='Use the Transformer Engine version of the random number generator. '
-                            'Required for CUDA graphs support.')
-    group.add_argument('--inference-rng-tracker', action='store_true',
-                       help='Use a random number generator configured for inference.')
-
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')
 

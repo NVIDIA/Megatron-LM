@@ -324,6 +324,16 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
+def _model_rng_config(args: Namespace) -> RNGConfig:
+    """Use parsed RNG inputs only during bootstrap, before a run config exists."""
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
+
+    if is_run_config_initialized():
+        cfg = get_run_config()
+        return cfg.rng
+    return _default_config_from_args(RNGConfig, args)
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -450,6 +460,7 @@ def core_transformer_config_from_args(args, config_class=None):
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
+    _model_rng_config(args).finalize_model_config(config)
 
     # Return config.
     return config

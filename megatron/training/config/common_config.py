@@ -10,6 +10,12 @@ class RNGConfig:
     seed: int = 1234
     """Random seed used for python, numpy, pytorch, and cuda."""
 
+    te_rng_tracker: bool = False
+    """Use Transformer Engine's RNG tracker. Authoritative over the model's derived copy."""
+
+    inference_rng_tracker: bool = False
+    """Use an RNG tracker configured for inference."""
+
     data_parallel_random_init: bool = False
     """Enable random initialization of params across data parallel ranks"""
 
@@ -17,6 +23,21 @@ class RNGConfig:
         """Validate the seed before training runtime initialization."""
         if self.seed is None or self.seed <= 0:
             raise ValueError("Seed must be a positive integer.")
+
+    def finalize_model_config(self, model_config: object) -> None:
+        """Derive Core tracker settings from this run's RNG policy."""
+        from megatron.core.transformer import TransformerConfig
+
+        transformer = getattr(model_config, "transformer", model_config)
+        if not isinstance(transformer, TransformerConfig):
+            return
+        if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
+            transformer.transformer_impl, transformer.cuda_graph_impl
+        ):
+            self.te_rng_tracker = True
+        # Core retains these fields for standalone use; within a run they are derived.
+        transformer.use_te_rng_tracker = self.te_rng_tracker
+        transformer.inference_rng_tracker = self.inference_rng_tracker
 
 
 @dataclass(kw_only=True)

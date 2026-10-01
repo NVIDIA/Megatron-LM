@@ -25,7 +25,7 @@ def _args_without_rng():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_tracker_cli_flags_remain_outside_rng_config(enabled):
+def test_tracker_cli_flags_populate_rng_config(enabled):
     from megatron.training.argument_utils import _default_config_from_args
 
     parser = ArgumentParser()
@@ -34,7 +34,108 @@ def test_tracker_cli_flags_remain_outside_rng_config(enabled):
     assert args.te_rng_tracker is enabled
     assert args.inference_rng_tracker is enabled
     config = _default_config_from_args(RNGConfig, args)
-    assert asdict(config) == {"seed": 1234, "data_parallel_random_init": False}
+    assert asdict(config) == {
+        "seed": 1234,
+        "data_parallel_random_init": False,
+        "te_rng_tracker": enabled,
+        "inference_rng_tracker": enabled,
+    }
+
+
+@pytest.mark.parametrize("model_kind", ["gpt", "hybrid"])
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("te_tracker", [False, True])
+@pytest.mark.parametrize("inference_tracker", [False, True])
+def test_container_derives_tracker_fields_one_way(
+    run_config, model_kind, inference, te_tracker, inference_tracker
+):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+    )
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    transformer = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        use_te_rng_tracker=not te_tracker,
+        inference_rng_tracker=not inference_tracker,
+    )
+    model_cls = GPTModelConfig if model_kind == "gpt" else HybridModelConfig
+    model = model_cls(transformer=transformer, vocab_size=128, seq_length=16)
+    cfg = (
+        InferenceConfigContainer(
+            model=model, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+        )
+        if inference
+        else run_config
+    )
+    cfg.model = model
+    cfg.rng = RNGConfig(te_rng_tracker=te_tracker, inference_rng_tracker=inference_tracker)
+    before = asdict(cfg.rng)
+    for _ in range(2):
+        cfg.validate()
+        assert transformer.use_te_rng_tracker is te_tracker
+        assert transformer.inference_rng_tracker is inference_tracker
+        assert asdict(cfg.rng) == before
+
+
+def test_native_cuda_graph_requirement_is_resolved_before_seeding(run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    transformer.cuda_graph_impl = "transformer_engine"
+    run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
+    run_config.rng = RNGConfig()
+    run_config.validate()
+    assert run_config.rng.te_rng_tracker is True
+    assert transformer.use_te_rng_tracker is True
+    run_config.validate()
+    assert run_config.rng.te_rng_tracker is True
+
+
+@pytest.mark.parametrize("yaml", [False, True])
+@pytest.mark.parametrize("registered", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shared_config_factories_use_run_rng_after_bootstrap(
+    monkeypatch, run_config, yaml, registered, enabled
+):
+    import torch
+
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.argument_utils import core_transformer_config_from_args
+    from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.params_dtype = torch.float32
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
+    args.te_rng_tracker = args.inference_rng_tracker = not enabled if registered else enabled
+    if yaml:
+        args.language_model = Namespace(
+            **vars(TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4))
+        )
+        args.language_model.activation_func = "gelu"
+        args.language_model.embedding_init_method = "xavier_uniform"
+        args.model_parallel = Namespace()
+    run_config.rng = RNGConfig(te_rng_tracker=enabled, inference_rng_tracker=enabled)
+    if not registered:
+        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    factory = core_transformer_config_from_yaml if yaml else core_transformer_config_from_args
+    config = factory(args)
+    assert config.use_te_rng_tracker is enabled
+    assert config.inference_rng_tracker is enabled
+    assert args.te_rng_tracker is (not enabled if registered else enabled)
+    if registered:
+        del args.te_rng_tracker, args.inference_rng_tracker
+        config = factory(args)
+        assert config.use_te_rng_tracker is enabled
+        assert config.inference_rng_tracker is enabled
 
 
 @pytest.mark.parametrize("deleted", [False, True])
@@ -84,8 +185,6 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
 ):
     args = _args_without_rng()
     args.lazy_mpu_init = lazy
-    args.te_rng_tracker = te_tracker
-    args.inference_rng_tracker = inference_tracker
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     for name in (
         "setup_logging",
@@ -100,7 +199,12 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_rank", Mock())
     seed = Mock()
     monkeypatch.setattr(initialize, "_set_random_seed", seed)
-    rng = RNGConfig(seed=919, data_parallel_random_init=True)
+    rng = RNGConfig(
+        seed=919,
+        data_parallel_random_init=True,
+        te_rng_tracker=te_tracker,
+        inference_rng_tracker=inference_tracker,
+    )
     run_config.rng = rng
     finish = initialize.initialize_megatron(
         allow_no_cuda=True, skip_random_seed=skip, skip_dependency_compilation=True
@@ -202,7 +306,7 @@ def test_tensorboard_records_owned_rng_values(monkeypatch, run_config):
     run_config.rng = RNGConfig(seed=321)
     initialize.write_args_to_tensorboard()
     writer.add_text.assert_any_call("seed", "321", global_step=19)
-    writer.add_text.assert_any_call("te_rng_tracker", "True", global_step=19)
+    writer.add_text.assert_any_call("te_rng_tracker", "False", global_step=19)
     assert vars(args) == {"iteration": 19, "seed": 1, "te_rng_tracker": True}
 
 
