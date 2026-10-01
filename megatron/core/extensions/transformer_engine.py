@@ -33,7 +33,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -2623,10 +2627,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
-            assert pg_collection is not None, (
-                "TEGroupedLinear requires an explicit pg_collection; "
-                "see docs/developer/parallel-state-deprecation.md"
-            )
+            if pg_collection is None:
+                warn_global_process_group_fallback(type(self).__name__)
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"
             tp_group = pg_collection.expt_tp

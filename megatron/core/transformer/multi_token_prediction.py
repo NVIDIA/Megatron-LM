@@ -22,7 +22,10 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
@@ -888,8 +891,7 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
-    *,
-    pp_group: torch.distributed.ProcessGroup,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
     vp_size: Optional[int] = None,
 ) -> bool:
     """
@@ -905,8 +907,13 @@ def mtp_on_this_rank(
           pipeline stage. The function returns True only on the last pipeline stage.
     """
     mtp_on_this_rank = False
-    pp_rank = get_pg_rank(pp_group)
-    pp_size = get_pg_size(pp_group)
+    if pp_group is None:
+        warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = None
+    else:
+        pp_rank = get_pg_rank(pp_group)
+        pp_size = get_pg_size(pp_group)
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:
@@ -927,6 +934,8 @@ def mtp_on_this_rank(
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
+            if pp_size is None:
+                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
                 assert (
@@ -2321,10 +2330,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
-        assert pg_collection is not None, (
-            "MultiTokenPredictionBlock requires an explicit pg_collection with tp/cp/pp; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
+            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
         for group_name in ('tp', 'cp', 'pp'):
             assert (

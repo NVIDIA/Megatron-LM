@@ -7,6 +7,10 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
@@ -489,7 +493,7 @@ def hybrid_context_parallel_forward_backward(
     total_num_tokens,
     check_first_val_step,
     model_type,
-    pg_collection,
+    pg_collection=None,
 ):
     """
     Scheduler for Hybrid Context Parallel.
@@ -509,6 +513,9 @@ def hybrid_context_parallel_forward_backward(
     """
     from .schedules import backward_step, forward_step
 
+    if pg_collection is None:
+        warn_global_process_group_fallback("hybrid_context_parallel_forward_backward")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'dp_cp'])
     tp_group = pg_collection.tp
     dp_cp_group = pg_collection.dp_cp
 

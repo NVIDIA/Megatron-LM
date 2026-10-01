@@ -15,7 +15,10 @@ from megatron.core.models.common.embeddings.relative_pos_embedding import Relati
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -161,10 +164,9 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        assert pg_collection is not None, (
-            "T5Model requires an explicit pg_collection with tp/cp/pp; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         for _pg in ('tp', 'cp', 'pp'):
             assert _pg in vars(pg_collection), f"T5Model pg_collection must have {_pg}"
         if 'embd' not in vars(pg_collection):

@@ -11,7 +11,10 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -65,10 +68,9 @@ class DotProductAttention(MegatronModule):
         projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        assert pg_collection is not None, (
-            "DotProductAttention requires an explicit pg_collection; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
         assert (
             getattr(pg_collection, 'tp', None) is not None
         ), "DotProductAttention pg_collection must have tp process group"

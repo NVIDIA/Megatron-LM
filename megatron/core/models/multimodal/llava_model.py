@@ -25,7 +25,10 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_ima
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -175,11 +178,11 @@ class LLaVAModel(MegatronModule):
             "LLaVA is work in progress. Features are missing and methods can change.",
         )
 
-        assert pg_collection is not None, (
-            "LLaVAModel requires an explicit pg_collection. A vision encoder and an LLM may run "
-            "on independent parallel grids, so the global grid is not a safe default; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            # A vision encoder and a language model may run on independent parallel grids, so the
+            # global grid is only a compatibility default.
+            warn_global_process_group_fallback(type(self).__name__)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
 
         # Constructor configuration and initial module state.

@@ -204,7 +204,7 @@ class TestSplitToContextParallelRanks:
         global_t = torch.arange(12, dtype=torch.float32, device="cuda").reshape(4, 3)
 
         local_t, global_pad = split_to_context_parallel_ranks(
-            global_t, parallel_state.get_context_parallel_group()
+            global_t, cp_group=parallel_state.get_context_parallel_group()
         )
 
         assert torch.equal(local_t, global_t)
@@ -251,7 +251,7 @@ class TestDynamicResCPDistributed:
         )
 
         gathered = gather_from_context_parallel_ranks_dynamic_res(
-            local_t, parallel_state.get_context_parallel_group()
+            local_t, cp_group=parallel_state.get_context_parallel_group()
         )
 
         total_tubelets = sum(r + 1 for r in range(cp_size))
@@ -275,7 +275,7 @@ class TestDynamicResCPDistributed:
         local_t = torch.full((1, 2, 4), float(cp_rank), dtype=torch.float32, device="cuda")
 
         gathered = gather_from_context_parallel_ranks_dynamic_res(
-            local_t, parallel_state.get_context_parallel_group(), num_padded_imgs=1
+            local_t, num_padded_imgs=1, cp_group=parallel_state.get_context_parallel_group()
         )
 
         # With cp_size=2 and one padded rank, only rank 0's tensor survives.
