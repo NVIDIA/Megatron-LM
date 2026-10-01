@@ -127,6 +127,9 @@ def _to_hf_deepseek_v3_config(cfg):
         attention_bias=False,
         attention_dropout=0.0,
         use_cache=False,
+        # Transformers v5 defaults to grouped_mm experts, which need 16-byte aligned strides;
+        # moe_intermediate_size=6 gives 12-byte bf16 rows, so use the eager per-expert loop.
+        experts_implementation="eager",
     )
 
 
@@ -147,11 +150,40 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
     return float(stats[0].item()), float((stats[0] / stats[1]).item())
 
 
-def _hf_state_dict_for_glm5_loader(model):
-    return {
+def _hf_state_dict_for_glm5_loader(model, native, cfg):
+    """Build the synthetic HF fixture, including GLM5-only DSA indexer weights.
+
+    Transformers v5 keeps the routed experts fused (``experts.gate_up_proj`` /
+    ``experts.down_proj``); GLM5 checkpoints store one tensor per expert.
+    """
+    from megatron.lite.model.glm5.lite.checkpoint import Glm5WeightSpec
+
+    state = {
         name: tensor.detach().cpu().contiguous().clone()
         for name, tensor in model.state_dict().items()
     }
+    for name, gate_up in list(state.items()):
+        if not name.endswith(".mlp.experts.gate_up_proj"):
+            continue
+        prefix = name.removesuffix(".gate_up_proj")
+        down = state.get(f"{prefix}.down_proj")
+        gate, up = gate_up.chunk(2, dim=1)
+        for expert_idx in range(gate_up.size(0)):
+            state[f"{prefix}.{expert_idx}.gate_proj.weight"] = gate[expert_idx].contiguous().clone()
+            state[f"{prefix}.{expert_idx}.up_proj.weight"] = up[expert_idx].contiguous().clone()
+            if down is not None:
+                state[f"{prefix}.{expert_idx}.down_proj.weight"] = (
+                    down[expert_idx].contiguous().clone()
+                )
+    spec = Glm5WeightSpec(cfg)
+    indexer_names = [name for name in native.state_dict() if ".indexer." in name]
+    assert indexer_names
+    for native_name in indexer_names:
+        mappings = spec.native_to_hf(native_name, native.state_dict()[native_name])
+        assert len(mappings) == 1
+        hf_name, tensor = mappings[0]
+        state[hf_name] = tensor.detach().cpu().contiguous().clone()
+    return state
 
 
 def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
@@ -181,7 +213,10 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch.distributed as dist
 
     from megatron.lite.primitive.modules.attention import build_rope_cache
-    from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp, zigzag_slice_for_cp
+    from megatron.lite.primitive.parallel.cp import (
+        contiguous_position_ids_for_cp,
+        contiguous_slice_for_cp,
+    )
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
@@ -199,23 +234,23 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(99)
     full_x = torch.randn(batch, seq, 128, device=device, dtype=torch.bfloat16)
-    local_x = zigzag_slice_for_cp(full_x, rank, world, seq_dim=1).detach().requires_grad_(True)
+    local_x = contiguous_slice_for_cp(full_x, rank, world, seq_dim=1).detach().requires_grad_(True)
     ref_x = full_x.detach().clone().requires_grad_(True)
 
     cos, sin = build_rope_cache(
         dim=64, max_position_embeddings=seq, rope_theta=1_000_000.0, device=device
     )
-    local_pos = zigzag_position_ids_for_cp(seq, rank, world, device).expand(batch, -1)
+    local_pos = contiguous_position_ids_for_cp(seq, rank, world, device).expand(batch, -1)
     full_pos = torch.arange(seq, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
 
     cp_out = cp_attn(local_x, cos=cos, sin=sin, position_ids=local_pos)
     ref_out = ref_attn(ref_x, cos=cos, sin=sin, position_ids=full_pos)
-    expected = zigzag_slice_for_cp(ref_out, rank, world, seq_dim=1)
+    expected = contiguous_slice_for_cp(ref_out, rank, world, seq_dim=1)
     torch.testing.assert_close(cp_out, expected, atol=3e-2, rtol=3e-2)
 
     cp_out.float().sum().backward()
     ref_out.float().sum().backward()
-    expected_grad = zigzag_slice_for_cp(ref_x.grad, rank, world, seq_dim=1)
+    expected_grad = contiguous_slice_for_cp(ref_x.grad, rank, world, seq_dim=1)
     assert local_x.grad is not None
     torch.testing.assert_close(local_x.grad, expected_grad, atol=8e-2, rtol=8e-2)
 
@@ -226,7 +261,7 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
+    from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
@@ -247,13 +282,14 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(100)
-    full_hidden = torch.randn(batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16)
-    local_hidden = zigzag_slice_for_cp(full_hidden, rank, world, seq_dim=1).contiguous()
+    full_ids = torch.randint(0, cfg.vocab_size, (batch, seq), device=device)
+    local_ids = contiguous_slice_for_cp(full_ids, rank, world, seq_dim=1)
 
     with torch.no_grad():
-        cp_hidden = cp_model(hidden_states=local_hidden)["hidden_states"]
-        ref_hidden = ref_model(hidden_states=full_hidden)["hidden_states"]
-    expected = zigzag_slice_for_cp(ref_hidden, rank, world, seq_dim=1)
+        cp_hidden = cp_model(input_ids=local_ids)["hidden_states"]
+        ref_hidden = ref_model(input_ids=full_ids)["hidden_states"]
+    # The model returns hidden states in sequence-major (SBH) layout.
+    expected = contiguous_slice_for_cp(ref_hidden, rank, world, seq_dim=0)
 
     torch.testing.assert_close(cp_hidden, expected, atol=1e-1, rtol=1e-1)
 
@@ -264,7 +300,7 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
+    from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
@@ -280,7 +316,7 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(55)
     full_ids = torch.randint(0, cfg.vocab_size, (batch, seq), device=device)
-    input_ids = zigzag_slice_for_cp(full_ids, rank, world, seq_dim=1).contiguous()
+    input_ids = contiguous_slice_for_cp(full_ids, rank, world, seq_dim=1)
 
     output = model(input_ids=input_ids)
     # The model contract keeps hidden states in sequence-major (SBH) layout.
@@ -397,7 +433,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
-    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
+    from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
@@ -410,18 +446,17 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
         device=device, dtype=torch.bfloat16
     )
     hf_ref.eval()
-    rank_tmp_path = tmp_path / f"rank{rank}"
-    save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref), str(rank_tmp_path))
-
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
     native = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     native.eval()
+    rank_tmp_path = tmp_path / f"rank{rank}"
+    save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref, native, cfg), str(rank_tmp_path))
     load_hf_weights(native, str(rank_tmp_path), cfg, ps)
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(311)
     full_ids = torch.randint(0, cfg.vocab_size, (batch, seq), device=device)
-    local_ids = zigzag_slice_for_cp(full_ids, rank, world, seq_dim=1).contiguous()
+    local_ids = contiguous_slice_for_cp(full_ids, rank, world, seq_dim=1)
 
     hf_layer_outputs = []
     native_layer_outputs = []
@@ -460,7 +495,9 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     for layer_idx, (actual, full_expected) in enumerate(
         zip(native_layer_outputs, hf_layer_outputs, strict=True)
     ):
-        expected = zigzag_slice_for_cp(full_expected, rank, world, seq_dim=1).contiguous()
+        expected = contiguous_slice_for_cp(full_expected, rank, world, seq_dim=1)
+        # Native layers return SBH hidden states; the HF decoder layers return BSH.
+        expected = expected.transpose(0, 1).contiguous()
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(
@@ -469,7 +506,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
             )
         torch.testing.assert_close(actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
 
-    expected = zigzag_slice_for_cp(hf_logits, rank, world, seq_dim=1).contiguous()
+    expected = contiguous_slice_for_cp(hf_logits, rank, world, seq_dim=1)
     max_abs, max_rel = _distributed_diff_stats(native_logits, expected)
     if rank == 0:
         print(
