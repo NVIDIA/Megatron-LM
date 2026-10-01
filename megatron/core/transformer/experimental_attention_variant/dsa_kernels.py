@@ -269,12 +269,21 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    result = fn(
+        query,
+        key,
+        topk_indices,
+        softmax_scale,
+        v_channels,
+        topk_length,
+        **filter_kwargs_for_callable(fn, {"all_topk_rows_nonempty": all_topk_rows_nonempty}),
+    )
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
