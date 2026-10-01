@@ -521,13 +521,16 @@ class ProcessGroupCollection:
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
-                    intra_dist_opt_group = None
+                    # Megatron-FSDP leaves ddp_config.use_distributed_optimizer False but still
+                    # reduces gradient statistics over this group when OptimizerConfig enables
+                    # the distributed optimizer, so pass it through like the parallel_state path.
+                    intra_dist_opt_group = pg_set.get('intra_dist_opt')
             else:
                 # No ddp_config available - use simple fallback
                 intra_dp_cp_group = dp_cp_group
                 intra_expt_dp_group = expt_dp_group
                 inter_dist_opt_group = None
-                intra_dist_opt_group = None
+                intra_dist_opt_group = pg_set.get('intra_dist_opt')
 
             # 5. Model communication groups
             if 'mp' not in pg_set:
