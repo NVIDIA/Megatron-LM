@@ -127,6 +127,9 @@ def _to_hf_deepseek_v3_config(cfg):
         attention_bias=False,
         attention_dropout=0.0,
         use_cache=False,
+        # Transformers v5 defaults to grouped_mm experts, which need 16-byte aligned strides;
+        # moe_intermediate_size=6 gives 12-byte bf16 rows, so use the eager per-expert loop.
+        experts_implementation="eager",
     )
 
 
@@ -147,11 +150,40 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
     return float(stats[0].item()), float((stats[0] / stats[1]).item())
 
 
-def _hf_state_dict_for_glm5_loader(model):
-    return {
+def _hf_state_dict_for_glm5_loader(model, native, cfg):
+    """Build the synthetic HF fixture, including GLM5-only DSA indexer weights.
+
+    Transformers v5 keeps the routed experts fused (``experts.gate_up_proj`` /
+    ``experts.down_proj``); GLM5 checkpoints store one tensor per expert.
+    """
+    from megatron.lite.model.glm5.lite.checkpoint import Glm5WeightSpec
+
+    state = {
         name: tensor.detach().cpu().contiguous().clone()
         for name, tensor in model.state_dict().items()
     }
+    for name, gate_up in list(state.items()):
+        if not name.endswith(".mlp.experts.gate_up_proj"):
+            continue
+        prefix = name.removesuffix(".gate_up_proj")
+        down = state.get(f"{prefix}.down_proj")
+        gate, up = gate_up.chunk(2, dim=1)
+        for expert_idx in range(gate_up.size(0)):
+            state[f"{prefix}.{expert_idx}.gate_proj.weight"] = gate[expert_idx].contiguous().clone()
+            state[f"{prefix}.{expert_idx}.up_proj.weight"] = up[expert_idx].contiguous().clone()
+            if down is not None:
+                state[f"{prefix}.{expert_idx}.down_proj.weight"] = (
+                    down[expert_idx].contiguous().clone()
+                )
+    spec = Glm5WeightSpec(cfg)
+    indexer_names = [name for name in native.state_dict() if ".indexer." in name]
+    assert indexer_names
+    for native_name in indexer_names:
+        mappings = spec.native_to_hf(native_name, native.state_dict()[native_name])
+        assert len(mappings) == 1
+        hf_name, tensor = mappings[0]
+        state[hf_name] = tensor.detach().cpu().contiguous().clone()
+    return state
 
 
 def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
@@ -413,12 +445,11 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
         device=device, dtype=torch.bfloat16
     )
     hf_ref.eval()
-    rank_tmp_path = tmp_path / f"rank{rank}"
-    save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref), str(rank_tmp_path))
-
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
     native = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     native.eval()
+    rank_tmp_path = tmp_path / f"rank{rank}"
+    save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref, native, cfg), str(rank_tmp_path))
     load_hf_weights(native, str(rank_tmp_path), cfg, ps)
 
     batch, seq = 1, _fused_dsa_seq_len(world)
