@@ -9,11 +9,13 @@ from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
+from megatron.training.global_vars import destroy_global_vars
 
 _NVTE_ATTN_ENV_VARS = (
     'NVTE_FLASH_ATTN',
@@ -46,6 +48,51 @@ def clear_nvte_env_vars():
     """Clear NVTE attention backend environment variables."""
     for name in _NVTE_ATTN_ENV_VARS:
         os.environ.pop(name, None)
+
+
+def reset_megatron_test_state() -> None:
+    """Reset process-wide Megatron state that can leak between unit tests.
+
+    This deliberately leaves the default ``torch.distributed`` process group
+    alive because the unit-test launcher owns it for the complete test session.
+    It resets only Megatron-managed model-parallel groups, training globals,
+    microbatch state, CUDA-graph state, and test-controlled NVTE environment
+    variables.
+    """
+    clear_nvte_env_vars()
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+
+    from megatron.core import full_cuda_graph
+    from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+    from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+    from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
+
+    try:
+        StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+        FullCudaGraphWrapper.curr_iteration = {"training": 0, "validation": 0}
+        FullCudaGraphWrapper.cuda_graph = {"training": None, "validation": None}
+        FullCudaGraphWrapper.result = {"training": None, "validation": None}
+        OptimizerCudaGraphWrapper.curr_iteration = 0
+        OptimizerCudaGraphWrapper.cuda_graph = None
+        OptimizerCudaGraphWrapper.result = None
+        full_cuda_graph._shared_graph_pool = None
+        full_cuda_graph._shared_capture_stream = None
+        CudaGraphManager.global_mempool = None
+        CudaGraphManager.fwd_mempools = None
+        CudaGraphManager.bwd_mempools = None
+        delete_cuda_graphs()
+    finally:
+        # Utils synchronizes and tears down model-parallel state on GPU, but
+        # returns early when CUDA is unavailable. The direct call also covers
+        # tests that initialized parallel_state without going through Utils.
+        try:
+            Utils.destroy_model_parallel()
+        finally:
+            try:
+                ps.destroy_model_parallel()
+            finally:
+                Utils.inited = False
 
 
 def is_nccl_ep_available():
