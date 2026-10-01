@@ -823,6 +823,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
+        if config.custom_recipe is not None:
+            raise ValueError("MFSDP v2 does not currently support custom quantization recipes.")
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
         if config.fp8 and config.fp8_recipe != "mxfp8":

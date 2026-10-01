@@ -15,6 +15,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.quantization.te_recipe import supports_save_original_input
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -145,12 +146,8 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
-        if (
-            self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
-        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
-            # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
+        if supports_save_original_input(self.config):
+            # For quantized training, the output of pre_mlp_layernorm is saved by router, and
             # the shared expert linear_fc1 also saves the quantized tensor of this output.
             # Here we set the linear_fc1 to save the original input tensors to avoid the extra
             # memory usage of the quantized tensor.

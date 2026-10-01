@@ -14,6 +14,7 @@ from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -1538,7 +1539,7 @@ class _NCCLEPManager(_DispatchManager):
         self.moe_expert_rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.eager = self.moe_expert_rank_capacity_factor is None
         self.zero_copy = config.moe_ncclep_zero_copy
-        self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
+        self._zc_quant = self.zero_copy and is_quantization_enabled(config)
         # Grown by grow_recv_capacity() after an overflow, to the peak the dropped step needed.
         self._recv_capacity_override = None
         if not self.eager:
@@ -1625,7 +1626,7 @@ class _NCCLEPManager(_DispatchManager):
         self.eager = self.moe_expert_rank_capacity_factor is None
         # TODO: support eager mode with zero_copy
         self.zero_copy = self.config.moe_ncclep_zero_copy and not self.eager
-        self._zc_quant = self.zero_copy and bool(self.config.fp8 or self.config.fp4)
+        self._zc_quant = self.zero_copy and is_quantization_enabled(self.config)
         # NCCL EP's HT backend requires max_dispatch_tokens_per_rank to be a multiple of the HT
         # chunk size (64); ncclEpCreateGroup otherwise fails with "invalid usage".
         # (nccl_ep device/hybridep_adapter.cu).

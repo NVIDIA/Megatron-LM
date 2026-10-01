@@ -1067,6 +1067,22 @@ class TestMegatronNetworkArgumentGeneration:
         with pytest.raises(ArgumentError, match="invalid choice"):
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
 
+    def test_custom_recipe_arguments_are_generated_from_transformer_config(self):
+        default_args = self._parser().parse_args([])
+        assert default_args.custom_recipe is None
+
+        args = self._parser().parse_args(
+            [
+                "--custom-recipe",
+                "package.module.factory",
+                "--fp8-dot-product-attention",
+                "--fp8-multi-head-attention",
+            ]
+        )
+        assert args.custom_recipe == "package.module.factory"
+        assert args.fp8_dot_product_attention is True
+        assert args.fp8_multi_head_attention is True
+
     def test_keep_mtp_in_bf16_flag(self):
         assert self._parser().parse_args([]).keep_mtp_in_bf16 is False
         assert self._parser().parse_args(["--keep-mtp-in-bf16"]).keep_mtp_in_bf16

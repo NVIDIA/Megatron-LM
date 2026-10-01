@@ -1,11 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.enums import Fp8Recipe
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
@@ -13,6 +15,8 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+from megatron.core.quantization.te_recipe import get_quantization_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
@@ -220,7 +224,14 @@ class TransformerLayerSchedulePlan:
 
     def get_low_precision_context(self):
         """Get the low-precision context for the transformer layer."""
-        return self.layer.get_inner_quantization_context()
+        if hasattr(self.layer, "get_inner_quantization_context"):
+            return self.layer.get_inner_quantization_context()
+        # HybridStack has no single layer number; its schedule nodes use the global recipe.
+        if is_quantization_enabled(self.layer.config) and not (
+            self.layer.config.fp8 and self.layer.config.fp8_recipe == Fp8Recipe.delayed
+        ):
+            return get_quantization_context(self.layer.config)
+        return nullcontext()
 
     @staticmethod
     def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
