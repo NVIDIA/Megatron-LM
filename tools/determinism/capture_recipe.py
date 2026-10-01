@@ -201,13 +201,11 @@ def install_bindings(inventory: Inventory, bindings: list[dict]):
             module = importlib.import_module(module_name)
             function = getattr(module, attribute)
             owner = getattr(function, "__self__", None)
-            autograd_base = getattr(getattr(inventory.torch, "autograd", None), "Function", None)
             autograd_alias = (
                 (inspect.ismethod(function) or inspect.isbuiltin(function))
                 and inspect.isclass(owner)
-                and getattr(function, "__name__", None) == "apply"
-                and autograd_base is not None
-                and issubclass(owner, autograd_base)
+                and function.__name__ == "apply"
+                and issubclass(owner, inventory.torch.autograd.Function)
             )
             native_function = inspect.isbuiltin(function) and (
                 owner is None or inspect.ismodule(owner)

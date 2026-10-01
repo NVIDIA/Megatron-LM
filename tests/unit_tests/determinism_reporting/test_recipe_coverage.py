@@ -514,8 +514,10 @@ def test_capture_preserves_result_records_backward_and_restores_binding(monkeypa
     monkeypatch.setattr(
         capture_recipe, "runtime_signature", lambda torch: {"fill_uninitialized_memory": True}
     )
-    torch = SimpleNamespace(Tensor=Tensor, are_deterministic_algorithms_enabled=lambda: True)
-    recorder = Inventory(torch, 10)
+    fake_torch = SimpleNamespace(
+        Tensor=Tensor, autograd=torch.autograd, are_deterministic_algorithms_enabled=lambda: True
+    )
+    recorder = Inventory(fake_torch, 10)
     module = ModuleType("fixture_kernel")
     original = lambda value: value
     module.fn = original
