@@ -11,6 +11,10 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 )
 
 
+def test_frontend_processes_use_spawn_context():
+    assert text_generation_server._SERVER_PROCESS_CONTEXT.get_start_method() == "spawn"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provide_config", [False, True])
 async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_config):
@@ -130,7 +134,9 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
 
     prompt_config = MultimodalPromptConfig(video_spec=MediaPromptSpec(model_token="<video>"))
     monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [])
-    monkeypatch.setattr(text_generation_server.mp, "Process", FakeProcess)
+    monkeypatch.setattr(
+        text_generation_server, "_SERVER_PROCESS_CONTEXT", SimpleNamespace(Process=FakeProcess)
+    )
 
     handed_in_socket = FakeSocket()
     text_generation_server.start_text_gen_server(
@@ -171,9 +177,9 @@ def test_start_server_is_noop_when_replicas_are_running(monkeypatch):
     existing_process = object()
     monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [existing_process])
     monkeypatch.setattr(
-        text_generation_server.mp,
-        "Process",
-        lambda **_kwargs: pytest.fail("must not create another process"),
+        text_generation_server,
+        "_SERVER_PROCESS_CONTEXT",
+        SimpleNamespace(Process=lambda **_kwargs: pytest.fail("must not create another process")),
     )
 
     text_generation_server.start_text_gen_server(

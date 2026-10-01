@@ -192,7 +192,7 @@ def _worker_custom_pgs_match_mpu(rank, world_size, port):
     grads_mpu = _full_grads(block_mpu, mpu_gtp_group)
 
     del block_mpu
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------------- Topology 2: custom collection, permuted gtp ranks ----------------
     mpu_ranks = sorted(dist.get_process_group_ranks(mpu_gtp_group))

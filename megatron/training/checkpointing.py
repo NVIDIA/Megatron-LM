@@ -45,6 +45,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
 from megatron.core.post_training.modelopt.checkpointing import (
     save_modelopt_state,
     save_sharded_modelopt_state,
@@ -60,7 +61,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -113,6 +114,14 @@ _LOADED_ITERATION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+
+_WIDE_RESIDUAL_ARG_DEFAULTS = (
+    ('wide_residual_num_streams', None),
+    ('wide_residual_streamwise_sigmoid_init_scale', 0.01),
+    ('wide_residual_learned_retention', False),
+    ('wide_residual_retention_init', 0.999),
+    ('wide_residual_retention_max_forget', 0.10),
+)
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
@@ -167,7 +176,14 @@ def finalize_deletion_processes(blocking=False):
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
-        assert _CHECKPOINT_VERSION == value, 'checkpoint versions do not match'
+        # This global feeds only fix_query_key_value_ordering, which branches on the major
+        # version. A minor bump marks a change elsewhere in the checkpoint (e.g. 3.0 -> 3.1
+        # changed optimizer key spelling), so a process that loads both a 3.0 teacher and a
+        # 3.1 student still agrees on the weight layout and must be allowed.
+        versions_match = value is not None and int(_CHECKPOINT_VERSION) == int(value)
+        assert versions_match, (
+            f'checkpoint versions do not match: {_CHECKPOINT_VERSION} vs {value}'
+        )
     _CHECKPOINT_VERSION = value
 
 
@@ -223,6 +239,18 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
+    if getattr(args, 'wide_residual_num_streams', None) is not None or hasattr(
+        checkpoint_args, 'wide_residual_num_streams'
+    ):
+        for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+            if arg_name in skip_args:
+                continue
+            checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(args, arg_name, default)
+            assert checkpoint_value == args_value, (
+                f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
+                f'the input argument value ({args_value}).'
+            )
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -1121,8 +1149,46 @@ def save_checkpoint(
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
+                # Save run_config.yaml
+                checkpoint_name = get_checkpoint_name(
+                    save_dir,
+                    release=release,
+                    iteration=iteration,
+                    return_base_dir=True,
+                )
+                if iteration > 0:
+                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+
+                    run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+
+                    # NOTE(@maanug-nv): this try-except is a temporary safeguard for
+                    # unit tests that do not create a config container.
+                    # in the future, run_config.to_yaml() should always run.
+                    try:
+                        run_config = get_run_config()
+                    except AssertionError as e:
+                        if str(e) != 'run config is not initialized.':
+                            raise
+                        warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+                    else:
+                        run_config.to_yaml(run_config_filename)
+
+                # Save tokenizer files for torch_dist checkpoints (if enabled)
+                if (
+                    args.save_tokenizer_assets
+                    and args.ckpt_format == 'torch_dist'
+                    and iteration > 0
+                ):
+                    config = _default_config_from_args(TokenizerConfig, args)
+                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
+                if args.log_progress and args.async_save:
+                    append_to_progress_log(
+                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                    )
+
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
+
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
                     f'checkpoint from iteration {int(iteration):7d} to {args.save} '
@@ -1130,21 +1196,6 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
-                # Save tokenizer files for torch_dist checkpoints (if enabled)
-                if (
-                    args.save_tokenizer_assets
-                    and args.ckpt_format == 'torch_dist'
-                    and iteration > 0
-                ):
-                    checkpoint_name = get_checkpoint_name(
-                        save_dir, iteration=iteration, return_base_dir=True
-                    )
-                    config = _default_config_from_args(TokenizerConfig, args)
-                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if args.log_progress and args.async_save:
-                    append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
-                    )
 
                 if save_retain_interval is not None:
                     if (
@@ -1650,7 +1701,7 @@ def generate_state_dict(
     # Arguments, iteration, and model.
     state_dict = {}
     state_dict['args'] = args
-    state_dict['checkpoint_version'] = 3.0
+    state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
 
@@ -2378,12 +2429,19 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('activation_func_tanh_clamp_scale', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+
+    # Restore wide-residual architecture settings. The enabling argument has a None
+    # default and remains command-line overridable; concrete-default controls follow
+    # the checkpoint in the same way as other fixed model settings above.
+    for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+        _set_arg(arg_name, force=default is not None)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
@@ -2793,6 +2851,15 @@ def load_checkpoint(
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+        # Optimizer load templates use the content version to select checkpoint-era FQNs.
+        sharded_sd_metadata['checkpoint_version'] = state_dict.get('checkpoint_version', 0)
+        if gen_sd_optim is not None and (sharded_sd_metadata['checkpoint_version'] or 0) < 3.1:
+            # Pre-3.1 distributed-optimizer FQNs spell the (param dtype, grad dtype) tuple of the
+            # run that saved the checkpoint. Recover those grad dtypes from the checkpoint's keys
+            # so that a run with a different main-grad dtype still addresses the same tensors.
+            sharded_sd_metadata['legacy_grad_dtypes'] = get_legacy_grad_dtypes(
+                dist_checkpointing.load_tensors_metadata(checkpoint_name).keys()
+            )
         if loading_pretrained_checkpoint and getattr(args, 'allow_llm_only_checkpoint', False):
             sharded_sd_metadata['load_from_llm_only_checkpoint'] = True
 
@@ -2900,6 +2967,11 @@ def load_checkpoint(
         optim_sd_kwargs = dict(
             metadata=_build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group),
             is_loading=True,
+        )
+        # Same as the torch_dist branch: optimizer load templates select checkpoint-era keys by
+        # version. fsdp_dtensor state has no dtype-keyed FQNs today; keep both paths identical.
+        optim_sd_kwargs['metadata']['checkpoint_version'] = (
+            state_dict.get('checkpoint_version') or 0
         )
 
         # Megatron-FSDP materializes optimizer slots with a dummy zero-gradient
