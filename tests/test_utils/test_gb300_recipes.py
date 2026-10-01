@@ -53,7 +53,7 @@ def test_gb300_platform_selects_every_gb200_nightly_case(scope, cadence):
 
 
 @pytest.mark.parametrize(("cadence", "expected_count"), [(None, 1), ("nightly", 0)])
-def test_gb300_mirror_uses_the_callers_cadence_filter(monkeypatch, cadence, expected_count):
+def test_gb300_recipes_use_the_callers_cadence_filter(monkeypatch, cadence, expected_count):
     test_case = "gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"
     load_and_flatten = recipe_parser.load_and_flatten
 
@@ -179,7 +179,7 @@ def test_platformless_nightly_lookups_keep_source_workloads(test_case):
         assert specs[0]["platforms"] == "dgx_gb200"
 
 
-def generate_pipeline(tmp_path, platform, cluster, options=()):
+def generate_pipeline(tmp_path, platform, cluster):
     output_path = tmp_path / "pipeline.yaml"
     result = CliRunner().invoke(
         generate_jet_trigger_job.main,
@@ -207,7 +207,6 @@ def generate_pipeline(tmp_path, platform, cluster, options=()):
             "--slurm-account",
             "mcore",
             "--no-enable-warmup",
-            *options,
         ],
     )
     assert result.exit_code == 0, result.output
@@ -215,9 +214,7 @@ def generate_pipeline(tmp_path, platform, cluster, options=()):
 
 
 def test_gb300_generated_jobs_have_24_hour_timeout_and_preserve_failure_status(tmp_path, workloads):
-    pipeline = generate_pipeline(
-        tmp_path, "dgx_gb300", "dgxgb300_oci-jhb", ["--job-timeout", "24 hours"]
-    )
+    pipeline = generate_pipeline(tmp_path, "dgx_gb300", "dgxgb300_oci-jhb")
     specs = {
         workload["spec"]["test_case"]: workload["spec"]
         for workload in workloads
@@ -253,13 +250,17 @@ def test_gb200_generated_jobs_keep_default_timeout_and_failure_behavior(tmp_path
         assert "cluster/oci-hsg" in job["tags"]
 
 
-@pytest.mark.parametrize("timeout", [None, "24 hours"])
-def test_empty_generated_pipeline_respects_timeout_option(monkeypatch, tmp_path, timeout):
+@pytest.mark.parametrize(
+    ("platform", "cluster", "timeout"),
+    [("dgx_gb200", "dgxgb200_oci-hsg", "7 days"), ("dgx_gb300", "dgxgb300_oci-jhb", "24 hours")],
+)
+def test_empty_generated_pipeline_uses_platform_timeout(
+    monkeypatch, tmp_path, platform, cluster, timeout
+):
     monkeypatch.setattr(recipe_parser, "load_workloads", lambda **kwargs: [])
-    options = ["--job-timeout", timeout] if timeout else []
-    pipeline = generate_pipeline(tmp_path, "dgx_gb300", "dgxgb300_oci-jhb", options)
+    pipeline = generate_pipeline(tmp_path, platform, cluster)
     job = pipeline["empty-pipeline-placeholder-job"]
-    assert job["timeout"] == (timeout or "7 days")
+    assert job["timeout"] == timeout
     assert job.get("allow_failure", False) is False
 
 
@@ -290,7 +291,7 @@ def test_gitlab_only_configures_gb300_nightly_jobs(scope, cluster, enabled):
     )
     arguments = result.stdout.splitlines()
     if enabled:
-        assert arguments[arguments.index("--job-timeout") + 1] == "24 hours"
+        assert "--job-timeout" not in arguments
         assert "--allow-failure" not in arguments
         assert arguments[arguments.index("--cluster") + 1] == cluster
     else:

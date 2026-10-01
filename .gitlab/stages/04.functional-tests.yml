@@ -182,7 +182,6 @@ functional:configure:
           --environment dev \
           --platform dgx_gb300 \
           --cluster "$CLUSTER_GB300" \
-          --job-timeout "24 hours" \
           --output-path "functional-test-job-dev-GB300.yaml"
       fi
   artifacts:

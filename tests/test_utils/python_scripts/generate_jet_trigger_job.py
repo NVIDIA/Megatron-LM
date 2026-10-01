@@ -37,12 +37,6 @@ def build_test_script(command: str) -> str:
 @click.option("--n-repeat", required=False, default=1, type=int)
 @click.option("--time-limit", required=False, default=1, type=int)
 @click.option(
-    "--job-timeout",
-    default="7 days",
-    show_default=True,
-    help="GitLab job timeout, including JET queueing and retries.",
-)
-@click.option(
     "--test-cases", required=True, type=str, help="Comma-separated list of test_cases, or 'all'"
 )
 @click.option("--platform", required=True, type=str, help="Platform to select")
@@ -123,11 +117,11 @@ def main(
     enable_warmup: Optional[bool] = None,
     cadence: Optional[str] = None,
     enable_error_extraction: bool = False,
-    job_timeout: str = "7 days",
 ) -> None:
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
     cadence_arg = cadence or None
+    job_timeout = "24 hours" if platform == "dgx_gb300" else "7 days"
 
     list_of_test_cases = [
         test_case
@@ -210,7 +204,7 @@ def main(
 
         for test_idx, test_case in enumerate(list_of_test_cases):
             job_tags = list(tags)
-            # Submit through the shared client; JET selects the SSH runner.
+            # JHB has no cluster-tagged submission runner; JET selects its GPU runner.
             if cluster != "dgxgb300_oci-jhb":
                 job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
