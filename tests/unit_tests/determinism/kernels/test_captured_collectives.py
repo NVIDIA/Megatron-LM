@@ -2,25 +2,23 @@
 
 """Replay actual recipe tensors from an explicitly selected collective capture.
 
-Set MCORE_DETERMINISM_COLLECTIVE_CAPTURE to a complete shared capture directory.
-This instrumented same-allocation protocol is separate from recipe state replay
-and performance. It never claims that unbound/native collectives were captured.
+Run through ``python -m tools.determinism.replay_collectives``, which passes
+``--collective-capture`` and ``--collective-max-bytes``. Without a capture every
+case is skipped. This instrumented same-allocation protocol is separate from
+recipe state replay and performance. It never claims that unbound/native
+collectives were captured.
 """
 
 import json
-import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-CAPTURE_PATH = os.environ.get("MCORE_DETERMINISM_COLLECTIVE_CAPTURE")
-if not CAPTURE_PATH:
-    pytest.skip("requires an explicit collective recipe capture", allow_module_level=True)
-
 pytest.importorskip(
-    "tools.determinism.pytest_plugin", reason="requires MCore #7317 coverage producer"
+    "tools.determinism.pytest_plugin", reason="requires tools.determinism.pytest_plugin"
 )
 
 from tests.unit_tests.determinism.comparison import bytes_equal
@@ -41,13 +39,49 @@ from tools.determinism.collective_reference import collective_reference, collect
 from tools.determinism.recipe_coverage import signature_key
 from tools.determinism.reference import assert_reference_close, assert_replay_sensitivity
 
-CAPTURE_ROOT = Path(os.environ["MCORE_DETERMINISM_COLLECTIVE_CAPTURE"])
-MAX_BYTES = int(os.environ.get("MCORE_DETERMINISM_COLLECTIVE_MAX_BYTES", 256 * 1024 * 1024))
-CAPTURES = load_captures(CAPTURE_ROOT, max_bytes=MAX_BYTES)
+pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NCCL GPUs")]
 
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NCCL GPUs"),
-]
+
+def capture_options(config):
+    """Return the selected capture, or None when the replay launcher did not pass one."""
+    root = config.getoption("collective_capture", default=None)
+    if root is None:
+        return None
+    max_bytes = config.getoption("collective_max_bytes")
+    return SimpleNamespace(
+        root=Path(root), max_bytes=max_bytes, reports=load_captures(Path(root), max_bytes=max_bytes)
+    )
+
+
+def pytest_generate_tests(metafunc):
+    """Declare one case per captured event; skip when no capture was selected."""
+    if "event_index" not in metafunc.fixturenames:
+        return
+    capture = capture_options(metafunc.config)
+    if capture is None:
+        skip = pytest.mark.skip(reason="requires an explicit collective recipe capture")
+        metafunc.parametrize("event_index", [pytest.param(None, id="no-capture", marks=skip)])
+        return
+    metafunc.parametrize(
+        "event_index",
+        [
+            pytest.param(
+                index,
+                id=f"event-{index}",
+                marks=pytest.mark.determinism_case(
+                    op_id="tensor_parallel_mappings",
+                    implementation=event["signature"]["implementation"],
+                ),
+            )
+            for index, event in enumerate(capture.reports[0]["events"])
+        ],
+    )
+
+
+@pytest.fixture(scope="module")
+def capture(request):
+    """The capture selected by the replay launcher."""
+    return capture_options(request.config)
 
 
 def group_key(collective):
@@ -56,25 +90,26 @@ def group_key(collective):
 
 
 @pytest.fixture(scope="module")
-def replay_groups():
+def replay_groups(capture):
     """Create every recorded group in the same global order on every rank."""
+    captures = capture.reports
     initialized = torch.distributed.is_initialized()
     Utils.initialize_distributed()
     rank = torch.distributed.get_rank()
-    assert torch.distributed.get_world_size() == len(CAPTURES), "Capture/replay world sizes differ"
+    assert torch.distributed.get_world_size() == len(captures), "Capture/replay world sizes differ"
     try:
         error = (
             None
-            if source_context(torch) == CAPTURES[rank]["context"]
+            if source_context(torch) == captures[rank]["context"]
             else "Capture source/environment differs"
         )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as caught:
         error = f"Capture provenance unavailable: {caught}"
-    errors = [None] * len(CAPTURES)
+    errors = [None] * len(captures)
     torch.distributed.all_gather_object(errors, error)
     assert not any(errors), errors
     specifications = {}
-    for report in CAPTURES:
+    for report in captures:
         for event in report["events"]:
             collective = event["signature"]["configuration"]["collective"]
             specifications[group_key(collective)] = collective
@@ -96,34 +131,21 @@ def replay_groups():
             torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize(
-    "event_index",
-    [
-        pytest.param(
-            index,
-            id=f"event-{index}",
-            marks=pytest.mark.determinism_case(
-                op_id="tensor_parallel_mappings",
-                implementation=event["signature"]["implementation"],
-            ),
-        )
-        for index, event in enumerate(CAPTURES[0]["events"])
-    ],
-)
-def test_captured_collective_replay(replay_groups, event_index):
+def test_captured_collective_replay(capture, replay_groups, event_index):
     """Compare all replay bytes and independent FP64 references from real inputs."""
+    captures, capture_root, max_bytes = capture.reports, capture.root, capture.max_bytes
     rank = torch.distributed.get_rank()
-    event = CAPTURES[rank]["events"][event_index]
+    event = captures[rank]["events"][event_index]
     signature = event["signature"]
     collective = signature["configuration"]["collective"]
     members = collective["group_ranks"]
     group = replay_groups[group_key(collective)]
     prepared, error = None, None
     try:
-        prepared = prepare_replay(event, CAPTURE_ROOT / f"rank-{rank}", group, max_bytes=MAX_BYTES)
+        prepared = prepare_replay(event, capture_root / f"rank-{rank}", group, max_bytes=max_bytes)
     except (ValueError, RuntimeError, OSError) as caught:
         error = f"{type(caught).__name__}: {caught}"
-    errors = [None] * len(CAPTURES)
+    errors = [None] * len(captures)
     torch.distributed.all_gather_object(errors, error)
     assert not any(errors), errors
     function, local, gradient = prepared
@@ -159,15 +181,15 @@ def test_captured_collective_replay(replay_groups, event_index):
     )
     inputs, gradients = [], []
     for member in members:
-        peer = CAPTURES[member]["events"][event_index]["signature"]["configuration"]["collective"]
+        peer = captures[member]["events"][event_index]["signature"]["configuration"]["collective"]
         inputs.append(
             load_tensor(
-                CAPTURE_ROOT / f"rank-{member}", peer["input"], max_bytes=MAX_BYTES
+                capture_root / f"rank-{member}", peer["input"], max_bytes=max_bytes
             ).detach()
         )
         gradients.append(
             load_tensor(
-                CAPTURE_ROOT / f"rank-{member}", peer["gradient"], max_bytes=MAX_BYTES
+                capture_root / f"rank-{member}", peer["gradient"], max_bytes=max_bytes
             ).detach()
             if backward
             else torch.zeros_like(actual[0]["out"], device="cpu")

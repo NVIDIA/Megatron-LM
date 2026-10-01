@@ -316,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     except ModuleNotFoundError as error:
         if error.name != "megatron.determinism":
             raise
-        parser.exit(2, "Recipe capture requires the shared startup API from MCore #7419.\n")
+        parser.exit(2, "Recipe capture requires the megatron.determinism startup API.\n")
 
     bootstrap_training_determinism(command[1:])
     import torch

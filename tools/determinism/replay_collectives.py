@@ -5,8 +5,15 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
+
+
+class CaptureOptions:
+    """Register the replay module's capture options for this pytest session."""
+
+    def pytest_addoption(self, parser):
+        parser.addoption("--collective-capture", type=Path, default=None)
+        parser.addoption("--collective-max-bytes", type=int, default=256 * 1024 * 1024)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,14 +36,14 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise
         parser.exit(
-            2, "Collective replay requires the startup API (#7419) and coverage producer (#7317).\n"
+            2,
+            "Collective replay requires megatron.determinism and "
+            "tools.determinism.pytest_plugin.\n",
         )
 
     bootstrap_training_determinism(["--deterministic-mode"])
     import pytest
 
-    os.environ["MCORE_DETERMINISM_COLLECTIVE_CAPTURE"] = str(args.capture.resolve())
-    os.environ["MCORE_DETERMINISM_COLLECTIVE_MAX_BYTES"] = str(args.max_bytes)
     # Generic unit-test conftest sets NCCL defaults that may differ from the
     # original recipe. This dedicated fixture owns its groups and needs no data.
     directory = Path(__file__).resolve().parents[2] / "tests/unit_tests/determinism/kernels"
@@ -54,10 +61,14 @@ def main(argv: list[str] | None = None) -> int:
             "--determinism-evidence-dir",
             str(args.evidence),
             "--confcutdir=" + str(directory),
+            "--collective-capture",
+            str(args.capture.resolve()),
+            "--collective-max-bytes",
+            str(args.max_bytes),
             str(directory / "test_captured_collectives.py"),
             "-q",
         ],
-        plugins=[pytest_plugin, results],
+        plugins=[pytest_plugin, CaptureOptions(), results],
     )
     if status == 0 and results.passed == 0:
         parser.exit(2, "Collective replay produced no passed cases; coverage is not verified.\n")

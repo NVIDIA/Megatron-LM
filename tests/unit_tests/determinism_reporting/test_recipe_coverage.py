@@ -566,7 +566,7 @@ def test_cli_strict_unknown_and_matching_failure(tmp_path):
 
 @pytest.mark.skipif(
     not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
-    reason="integration requires MCore #7419",
+    reason="integration requires megatron.determinism",
 )
 @pytest.mark.parametrize("exit_code,complete", [(0, True), (1, False)])
 def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(tmp_path, exit_code, complete):
@@ -609,7 +609,7 @@ def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(tmp_path, exi
 
 @pytest.mark.skipif(
     not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
-    reason="integration requires MCore #7419",
+    reason="integration requires megatron.determinism",
 )
 @pytest.mark.parametrize("mode", ["cli", "yaml", "yaml-overrides-cli"])
 def test_capture_bootstraps_effective_policy_before_binding_import(tmp_path, mode):
@@ -702,7 +702,7 @@ def test_capture_bootstraps_effective_policy_before_binding_import(tmp_path, mod
 
 @pytest.mark.skipif(
     not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
-    reason="integration requires MCore #7419",
+    reason="integration requires megatron.determinism",
 )
 @pytest.mark.parametrize("change", ["revision", "dirty", "environment"])
 def test_capture_rejects_context_drift_after_successful_training(tmp_path, monkeypatch, change):
