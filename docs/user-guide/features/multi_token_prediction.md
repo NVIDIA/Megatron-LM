@@ -53,6 +53,28 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 - For models with MTP layers, the final LayerNorm sits in the stage that contains the last decoder layer, not in the post-process stage. That can change gradient norm reduction slightly in deterministic mode when LayerNorm would otherwise live in another stage. For bitwise alignment, disable gradient norm clipping.
 - MTP loss is computed in the post-processing stage.
 
+### Per-token loss normalization
+
+With `calculate_per_token_loss=True`, MTP uses one main-token/MTP-token ratio
+per prediction depth and logical microbatch. Both counts are summed over the
+same DP/CP group before taking the ratio. This gives every token in that
+microbatch the same weight even when masking or sequence boundaries leave
+unequal valid-token counts on different ranks. The count reduction uses separate
+storage so the local counts used by loss logging are preserved.
+
+For microbatch `b`, let `N_b` be its main-token count, `M_b` its MTP-token count,
+and `S_b` its summed MTP loss, all over DP/CP. After gradient accumulation and
+main-token normalization, that depth contributes
+`alpha * sum_b(N_b * S_b / max(M_b, 1)) / sum_b(N_b)`, where
+`alpha = mtp_loss_scaling_factor / mtp_num_layers`. This preserves the
+microbatch-weighting contract; it does not replace it with a separate
+`sum_b(S_b) / sum_b(M_b)` objective across the entire optimizer step.
+
+`GPTModel` and `HybridModel` pass their `pg_collection.dp_cp` to
+`process_mtp_loss`. Standalone callers can pass `dp_cp_group` explicitly; callers
+that omit it retain the legacy MPU-group fallback. The group must match the
+DP/CP domain used for gradient normalization and exclude TP and PP.
+
 ## Unsupported Combinations
 
 Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
