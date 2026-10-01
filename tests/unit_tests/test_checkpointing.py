@@ -604,8 +604,9 @@ def test_load_base_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
+@pytest.mark.parametrize("iteration", [0, 123])
 def test_save_checkpoint(
-    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, run_config
+    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, iteration, run_config
 ):
     """Test save_checkpoint."""
     args = create_args
@@ -625,7 +626,6 @@ def test_save_checkpoint(
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
 
-    iteration = 123
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)
     optimizer = MockState({"optimizer": "optimizer_state"})
@@ -665,7 +665,7 @@ def test_save_checkpoint(
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())
 
-        ckpt_dir = args.save / "iter_0000123"
+        ckpt_dir = args.save / f"iter_{iteration:07d}"
 
         expected_ckpt_path = None
         if ckpt_format == "torch":
@@ -688,12 +688,14 @@ def test_save_checkpoint(
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 @pytest.mark.parametrize("owned_rng", [False, True])
+@pytest.mark.parametrize("iteration", [0, 123])
 def test_load_checkpoint(
     init_model_parallel,
     create_ckpt_load_args,
     tmp_path_dist_ckpt,
     ckpt_format,
     owned_rng,
+    iteration,
     run_config,
 ):
     """Test load_checkpoint."""
@@ -724,7 +726,6 @@ def test_load_checkpoint(
         set_args(args)
 
         # Create and save a checkpoint first.
-        iteration = 123
         config = TransformerConfig(num_layers=1, kv_channels=1)
         model = MockModel(config)
 
@@ -747,10 +748,10 @@ def test_load_checkpoint(
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
             assert serialized.call_args.args[0]["args"] is args
-            with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
-                saved_config = yaml.safe_load(f)
-            for field in fields(rng_config):
-                assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
+        with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
+            saved_config = yaml.safe_load(f)
+        for field in fields(rng_config):
+            assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
