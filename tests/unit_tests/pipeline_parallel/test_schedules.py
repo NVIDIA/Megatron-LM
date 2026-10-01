@@ -113,6 +113,8 @@ def test_deallocate_output_tensor_rejects_view():
     assert out._base is base
     with pytest.raises(AssertionError, match="counter-productive"):
         schedule.deallocate_output_tensor(out, deallocate_pipeline_outputs=True)
+
+
 @pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])
 def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     calculate_per_token_loss, expected_scale
