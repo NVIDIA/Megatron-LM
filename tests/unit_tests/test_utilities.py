@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import gc
 import os
 from argparse import Namespace
 from datetime import timedelta
@@ -153,7 +152,7 @@ def restore_process_state(state):
 
 
 def reset_transient_process_state():
-    """Drop the lazily built caches and class tensors no later test may inherit."""
+    """Drop the lazily built caches no later test may inherit."""
     reset_cuda_graph_global_state()
     # Sized at the first num_layers seen; TestMTPLossLoggingHelper reads it back.
     multi_token_prediction.MTPLossLoggingHelper.tracker.clear()
@@ -161,8 +160,6 @@ def reset_transient_process_state():
     # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
-    # DDP hooks and op-fuser experts form reference cycles; free them before the next test.
-    gc.collect()
 
 
 def is_nccl_ep_available():
