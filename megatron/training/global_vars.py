@@ -164,69 +164,56 @@ def set_global_variables(args, build_tokenizer=True):
     initialize_runtime_services(args, build_tokenizer=build_tokenizer)
 
 
-def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
-    """Construct services independently of CLI parsing and config construction."""
+def initialize_runtime_services(
+    args: Namespace, *, build_tokenizer: bool = True, inference: bool = False
+) -> None:
+    """Construct services independently of CLI parsing and config construction.
 
-    if args.step_batch_size_schedule is not None:
-        # Imported here, as elsewhere in this module: megatron.training.utils imports back
-        # into megatron.training, which imports this module.
-        from megatron.training.utils import print_rank_0
-        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+    Inference shares tokenizer, W&B, telemetry and runtime-flag setup, but does
+    not initialize training batch/progress state, training logging or signal
+    handlers. Request scheduling belongs to the inference engine.
+    """
+    if not inference:
+        if args.step_batch_size_schedule is not None:
+            # Imported here, as elsewhere in this module: megatron.training.utils imports back
+            # into megatron.training, which imports this module.
+            from megatron.training.utils import print_rank_0
+            print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
 
-    init_num_microbatches_calculator(
-        rank=args.rank,
-        global_batch_size=args.global_batch_size,
-        micro_batch_size=args.micro_batch_size,
-        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
-        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-        step_batch_size_schedule=args.step_batch_size_schedule,
-        seq_length=args.seq_length,
-    )
+        init_num_microbatches_calculator(
+            rank=args.rank,
+            global_batch_size=args.global_batch_size,
+            micro_batch_size=args.micro_batch_size,
+            # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
+            data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
+            decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+            step_batch_size_schedule=args.step_batch_size_schedule,
+            seq_length=args.seq_length,
+        )
     if build_tokenizer:
         _ = _build_tokenizer(args)
-    _set_tensorboard_writer(args)
+    if not inference:
+        _set_tensorboard_writer(args)
     _set_wandb_writer(args)
-    _set_one_logger(args)
-    _set_adlr_autoresume(args)
-    _set_timers(args)
-    _set_energy_monitor(args)
-    _set_telemetry(args)
-    _set_train_state()
+    if not inference:
+        _set_one_logger(args)
+        _set_adlr_autoresume(args)
+        _set_timers(args)
+        _set_energy_monitor(args)
+    _set_telemetry(args, include_training=not inference)
+    if not inference:
+        _set_train_state()
 
     if args.enable_experimental:
         set_experimental_flag(True)
 
-    if args.exit_signal_handler:
+    if not inference and args.exit_signal_handler:
         _set_signal_handler(args.exit_signal)
 
-    if args.exit_signal_handler_for_training:
+    if not inference and args.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
-    if args.disable_jit_fuser:
-        disable_jit_fuser()
-
-
-def initialize_runtime_services_for_inference(
-    args: Namespace, *, build_tokenizer: bool = True
-) -> None:
-    """Initialize inference services without training batch or progress state.
-
-    The caller registers arguments and the inference config before calling this
-    function. Inference engines own request scheduling; they do not use the
-    training microbatch calculator, autoresume, or training signal handlers.
-    """
-    if build_tokenizer:
-        _ = _build_tokenizer(args)
-    _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
-    _set_timers(args)
-    _set_energy_monitor(args)
-    _set_telemetry(args, include_training=False)
-
-    if args.enable_experimental:
-        set_experimental_flag(True)
     if args.disable_jit_fuser:
         disable_jit_fuser()
 

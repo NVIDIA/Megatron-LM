@@ -16,18 +16,14 @@ from megatron.training import arguments, global_vars, initialize
 def test_inference_services_without_training_arguments(monkeypatch, build_tokenizer):
     args = Namespace(enable_experimental=False, disable_jit_fuser=False)
     services = {}
-    for name in (
-        "_build_tokenizer",
-        "_set_tensorboard_writer",
-        "_set_wandb_writer",
-        "_set_timers",
-        "_set_energy_monitor",
-        "_set_telemetry",
-    ):
+    for name in ("_build_tokenizer", "_set_wandb_writer", "_set_telemetry"):
         services[name] = Mock()
         monkeypatch.setattr(global_vars, name, services[name])
     for name in (
         "init_num_microbatches_calculator",
+        "_set_tensorboard_writer",
+        "_set_timers",
+        "_set_energy_monitor",
         "_set_one_logger",
         "_set_adlr_autoresume",
         "_set_train_state",
@@ -35,16 +31,10 @@ def test_inference_services_without_training_arguments(monkeypatch, build_tokeni
     ):
         monkeypatch.setattr(global_vars, name, Mock(side_effect=AssertionError(name)))
 
-    global_vars.initialize_runtime_services_for_inference(args, build_tokenizer=build_tokenizer)
+    global_vars.initialize_runtime_services(args, build_tokenizer=build_tokenizer, inference=True)
 
     assert services["_build_tokenizer"].call_count == int(build_tokenizer)
-    for name in (
-        "_set_tensorboard_writer",
-        "_set_wandb_writer",
-        "_set_timers",
-        "_set_energy_monitor",
-    ):
-        services[name].assert_called_once_with(args)
+    services["_set_wandb_writer"].assert_called_once_with(args)
     services["_set_telemetry"].assert_called_once_with(args, include_training=False)
     assert vars(args) == {"enable_experimental": False, "disable_jit_fuser": False}
 

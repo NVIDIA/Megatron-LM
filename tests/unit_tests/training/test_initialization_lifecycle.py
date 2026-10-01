@@ -176,8 +176,9 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
         "_set_telemetry",
     ):
 
-        def record(received_args, service=name):
+        def record(received_args, service=name, **kwargs):
             assert received_args is args
+            assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
             calls.append(service)
 
         monkeypatch.setattr(global_vars, name, record)

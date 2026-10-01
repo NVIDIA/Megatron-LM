@@ -34,9 +34,11 @@ both new examples and by the `advanced/` scripts.
 
 #### Startup and checkpoint loading
 
-Generation entrypoints use `initialize_runtime_services_for_inference(args)` and
+Generation entrypoints use `initialize_runtime_services(args, inference=True)` and
 `initialize_megatron(inference=True)`. They do not initialize the training
 microbatch calculator, training progress, autoresume, or training signal handlers.
+TensorBoard, training timers and the energy monitor are also skipped; tokenizer,
+W&B, telemetry and runtime-flag setup are shared with training.
 Request batching remains owned by the inference engine. The shared CLI parser
 still accepts legacy training batch-size flags; inference runtime setup does not
 consume them.

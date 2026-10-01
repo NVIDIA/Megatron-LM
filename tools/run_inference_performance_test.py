@@ -38,7 +38,7 @@ from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services_for_inference
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
@@ -160,7 +160,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_runtime_services_for_inference(args)
+    initialize_runtime_services(args, inference=True)
     initialize_megatron(inference=True)
 
     args = get_args()
