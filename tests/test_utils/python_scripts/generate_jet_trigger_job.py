@@ -43,11 +43,6 @@ def build_test_script(command: str) -> str:
     help="GitLab job timeout, including JET queueing and retries.",
 )
 @click.option(
-    "--allow-failure",
-    is_flag=True,
-    help="Allow all generated test jobs to fail without blocking CI.",
-)
-@click.option(
     "--test-cases", required=True, type=str, help="Comma-separated list of test_cases, or 'all'"
 )
 @click.option("--platform", required=True, type=str, help="Platform to select")
@@ -129,7 +124,6 @@ def main(
     cadence: Optional[str] = None,
     enable_error_extraction: bool = False,
     job_timeout: str = "7 days",
-    allow_failure: bool = False,
 ) -> None:
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
@@ -187,8 +181,6 @@ def main(
                 },
             },
         }
-        if allow_failure:
-            gitlab_pipeline["empty-pipeline-placeholder-job"]["allow_failure"] = True
 
     else:
         list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x["spec"]["model"])
@@ -275,8 +267,7 @@ def main(
                 "needs": needs,
                 "script": [test_script],
                 "artifacts": {"paths": artifact_paths, "when": "always"},
-                "allow_failure": allow_failure
-                or test_case["spec"].get("allow_failure", False)
+                "allow_failure": test_case["spec"].get("allow_failure", False)
                 or test_case["spec"]["model"] == "gpt-nemo",
                 "retry": {
                     "max": 2,

@@ -130,6 +130,21 @@ def test_gb200_recipes_keep_cluster_default_mounts():
     assert all("launchers" not in workload for workload in workloads)
 
 
+@pytest.mark.parametrize(
+    "test_case", [None, "gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"]
+)
+def test_platformless_nightly_lookups_keep_source_workloads(test_case):
+    workloads = recipe_parser.load_workloads(
+        container_tag="validation", scope="nightly", environment="dev", test_case=test_case
+    )
+    specs = [workload["spec"] for workload in workloads if workload["type"] == "basic"]
+    assert specs
+    assert all(spec["platforms"] != "dgx_gb300" for spec in specs)
+    if test_case is not None:
+        assert len(specs) == 1
+        assert specs[0]["platforms"] == "dgx_gb200"
+
+
 def generate_pipeline(tmp_path, platform, cluster, options=()):
     output_path = tmp_path / "pipeline.yaml"
     result = CliRunner().invoke(
@@ -165,20 +180,24 @@ def generate_pipeline(tmp_path, platform, cluster, options=()):
     return yaml.safe_load(output_path.read_text())
 
 
-def test_gb300_generated_jobs_have_24_hour_timeout_and_allow_failure(tmp_path, workloads):
+def test_gb300_generated_jobs_have_24_hour_timeout_and_preserve_failure_status(tmp_path, workloads):
     pipeline = generate_pipeline(
-        tmp_path, "dgx_gb300", "dgxgb300_oci-jhb", ["--job-timeout", "24 hours", "--allow-failure"]
+        tmp_path, "dgx_gb300", "dgxgb300_oci-jhb", ["--job-timeout", "24 hours"]
     )
-    expected_names = {
-        workload["spec"]["test_case"] for workload in workloads if workload["type"] == "basic"
+    specs = {
+        workload["spec"]["test_case"]: workload["spec"]
+        for workload in workloads
+        if workload["type"] == "basic"
     }
     jobs = {
         name: job for name, job in pipeline.items() if isinstance(job, dict) and "script" in job
     }
-    assert jobs.keys() == expected_names
-    for job in jobs.values():
+    assert jobs.keys() == specs.keys()
+    for name, job in jobs.items():
         assert job["timeout"] == "24 hours"
-        assert job["allow_failure"] is True
+        assert job["allow_failure"] == (
+            specs[name].get("allow_failure", False) or specs[name]["model"] == "gpt-nemo"
+        )
         assert not any(tag.startswith("cluster/") for tag in job["tags"])
         assert job["needs"] == [{"pipeline": "$PARENT_PIPELINE_ID", "job": "functional:configure"}]
 
@@ -200,16 +219,14 @@ def test_gb200_generated_jobs_keep_default_timeout_and_failure_behavior(tmp_path
         assert "cluster/oci-hsg" in job["tags"]
 
 
-@pytest.mark.parametrize("allow_failure", [False, True])
-def test_empty_generated_pipeline_respects_timeout_and_failure_options(
-    monkeypatch, tmp_path, allow_failure
-):
+@pytest.mark.parametrize("timeout", [None, "24 hours"])
+def test_empty_generated_pipeline_respects_timeout_option(monkeypatch, tmp_path, timeout):
     monkeypatch.setattr(recipe_parser, "load_workloads", lambda **kwargs: [])
-    options = ["--job-timeout", "24 hours", "--allow-failure"] if allow_failure else []
+    options = ["--job-timeout", timeout] if timeout else []
     pipeline = generate_pipeline(tmp_path, "dgx_gb300", "dgxgb300_oci-jhb", options)
     job = pipeline["empty-pipeline-placeholder-job"]
-    assert job["timeout"] == ("24 hours" if allow_failure else "7 days")
-    assert job.get("allow_failure", False) is allow_failure
+    assert job["timeout"] == (timeout or "7 days")
+    assert job.get("allow_failure", False) is False
 
 
 @pytest.mark.parametrize(
@@ -240,7 +257,7 @@ def test_gitlab_only_configures_gb300_nightly_jobs(scope, cluster, enabled):
     arguments = result.stdout.splitlines()
     if enabled:
         assert arguments[arguments.index("--job-timeout") + 1] == "24 hours"
-        assert "--allow-failure" in arguments
+        assert "--allow-failure" not in arguments
         assert arguments[arguments.index("--cluster") + 1] == cluster
     else:
         assert not arguments

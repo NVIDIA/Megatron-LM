@@ -85,8 +85,9 @@ python tools/trigger_internal_ci.py \
   --functional-test-name release-testing/mcore-v0.17.0
 ```
 
-GB300 nightly jobs have a 24-hour GitLab timeout and allow failures. Their child
-pipeline runs asynchronously, so GB300 does not delay or fail the parent nightly
+GB300 nightly jobs have a 24-hour GitLab timeout. Their child pipeline runs
+asynchronously through an allow-failure trigger, so GB300 does not delay or fail
+the parent nightly pipeline. Individual test failures remain visible in the child
 pipeline. Existing per-workload Slurm limits are retained within that timeout.
 
 ## Expected behavior

@@ -424,7 +424,10 @@ def load_workloads(
         if file.stem.startswith("_build"):
             build_workloads.append(load_config(config_path=str(file)))
 
-    workloads += mirror_gb200_nightly_workloads(workloads, gb300_config)
+    # GB300 is a derived execution target. Keep platformless source lookups
+    # unambiguous for tools such as generate_local_jobs.py.
+    if platform == "dgx_gb300":
+        workloads += mirror_gb200_nightly_workloads(workloads, gb300_config)
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
