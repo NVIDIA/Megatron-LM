@@ -1645,9 +1645,20 @@ class TransformerConfig(ModelParallelConfig):
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
-            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            if (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            ) and not (
+                self.cuda_graph_impl == "local"
+                and not self.enable_cuda_graph
+                and not self.external_cuda_graph
+                and normalize_inference_cuda_graph_scope(
+                    self.inference_cuda_graph_scope, self.cuda_graph_impl
+                )
+                == InferenceCudaGraphScope.block
+            ):
                 raise NotImplementedError(
-                    "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
+                    "wide_residual supports CUDA graphs only with cuda_graph_impl='local' "
+                    "and inference_cuda_graph_scope='block'."
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
@@ -3348,8 +3359,16 @@ class TransformerConfig(ModelParallelConfig):
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
         assert not (
-            self.moe_shortcut_connection and self.cuda_graph_impl != "none"
-        ), "CUDA graphs are not supported with moe_shortcut_connection."
+            self.moe_shortcut_connection
+            and self.cuda_graph_impl != "none"
+            and not (
+                self.cuda_graph_impl == "local"
+                and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            )
+        ), (
+            "moe_shortcut_connection supports CUDA graphs only with "
+            "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
+        )
 
         if self.cuda_graph_impl != "none":
 

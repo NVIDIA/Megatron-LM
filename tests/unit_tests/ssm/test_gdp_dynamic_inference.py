@@ -220,16 +220,18 @@ class _FakeSSM(SSMDynamicInferenceMixin):
     ("batch_invariant_mode", "num_requests", "tokens_per_request", "padded_token_count"),
     [
         (False, 40, 1, 40),
+        (False, 40, 1, 64),
         (True, 40, 1, 40),
         (True, 40, 1, 64),
         (False, 20, 3, 60),
+        (False, 20, 3, 64),
         (True, 20, 3, 64),
     ],
 )
-def test_decode_ssm_preserves_batch_invariant_token_padding(
+def test_decode_ssm_preserves_token_padding(
     batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
 ):
-    """Only batch-invariant token-only rows bypass SSM decode."""
+    """Token-only padding must bypass SSM decode in every execution mode."""
     metadata_token_count = num_requests * tokens_per_request
     projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
         padded_token_count, 1, 4
