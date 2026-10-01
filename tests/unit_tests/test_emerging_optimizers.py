@@ -731,9 +731,7 @@ class TestMuonOptimizerMultiRank:
         optimizer_config_distributed = OptimizerConfig(
             optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=True
         )
-        with pytest.raises(
-            AssertionError, match='requires use_layer_wise_distributed_optimizer=True'
-        ):
+        with pytest.raises(ValueError, match='requires use_layer_wise_distributed_optimizer=True'):
             get_megatron_optimizer(config=optimizer_config_distributed, model_chunks=[model])
 
         # Test 3: Invalid num_ns_steps should raise exception
