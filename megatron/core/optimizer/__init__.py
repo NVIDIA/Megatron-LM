@@ -698,9 +698,8 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    assert pg_collection is not None and hasattr(
-        pg_collection, 'tp'
-    ), "pg_collection with tp must be resolved by get_megatron_optimizer"
+    if pg_collection is None:
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
     tp_group = pg_collection.tp
     expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
@@ -793,7 +792,8 @@ def _get_megatron_emerging_optimizer(
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
-    assert pg_collection is not None, "pg_collection must be resolved by get_megatron_optimizer"
+    if pg_collection is None:
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
