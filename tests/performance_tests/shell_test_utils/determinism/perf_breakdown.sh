@@ -2,8 +2,7 @@
 # Repeated unprofiled timing, with an optional separate Nsight diagnostic run.
 set -euo pipefail
 
-OUT="${1:?usage: $0 LEADERBOARD_DIR LOG_DIR}"
-LOG_DIR="${2:?usage: $0 LEADERBOARD_DIR LOG_DIR}"
+OUT="${1:?usage: $0 OUTPUT_DIR}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"

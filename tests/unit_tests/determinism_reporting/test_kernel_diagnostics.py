@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Profiled artifacts must remain ineligible after removing the optional profiler."""
+"""The benchmark has no profiler option, and profiled artifacts cannot supply timings."""
 
 import pytest
 

@@ -29,7 +29,7 @@ three pairs or an interval that straddles the limit produces `inconclusive`
 exits 1. A valid pass exits 0. Three pairs are an initial CI budget, not a
 guarantee that rare noise is characterized; increase the count when calibrating.
 
-The existing 1.35 deterministic/default limit is retained. The optional
+Training comparisons default to a 1.35 deterministic/default limit. The optional
 base-to-head comparison defaults to 1.05. Thresholds are configurable through
 the Python CLI and should be calibrated on the target recipe and hardware.
 
@@ -76,9 +76,9 @@ an inconclusive result. Optional profiling through
 the NVTX range table describes host annotations and must not be summed as GPU
 kernel time or used as the latency gate.
 
-The H100 dense recipe remains in L1. Broader MoE/hybrid and GB200 rows are
-scheduled at nightly cadence within L1, which the current workflow selects.
-Labels that bypass cadence also select those rows. The GPU presets and initial
+The H100 dense row runs in L1 at every cadence, including the merge queue.
+The MoE/hybrid and GB200 rows run in L1 at nightly cadence; labels that bypass
+cadence also select them. The GPU presets and initial
 budgets require runtime validation before treating their reports as baselines.
 
 ## Kernel leaderboard pilot
@@ -131,7 +131,4 @@ changed-kernel budgets remains separate from publishing measurements.
 ### Diagnose a timing difference
 
 Use the separate Nsight breakdown described above for attribution. Benchmark
-acceptance uses unprofiled event or training-step samples. An integrated
-telemetry sampler, compiler-cache inventory and post-timing Torch profiler are
-outside this benchmark's scope. Reports marked diagnostic-only remain ineligible
-for author performance evidence or baseline publication.
+acceptance uses only unprofiled CUDA-event or training-step samples.
