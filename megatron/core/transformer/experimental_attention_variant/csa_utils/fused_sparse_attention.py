@@ -157,6 +157,11 @@ _flash_mla_sparse_fwd = None
 _DSA = None
 
 _CSA_TEACHER_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
+# Upper bound for one query chunk's fp32 indexer score block ``(rows, max_seqlen_kv)``
+# on the dense fallback path when the caller only needs Top-K results
+# (``_indexer_topk_core(scores_output="topk" | "none")``).
+_CSA_INDEXER_SCORE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
+_CSA_INDEXER_SCORE_CHUNK_ROW_ALIGNMENT = 512
 
 
 class _DeferredReduceScatterState:
@@ -1749,8 +1754,23 @@ def _indexer_topk_core(
     compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
     precision: str = "bf16",
     deterministic: bool = False,
+    scores_output: str = "full",
 ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     """Layout-agnostic core for :func:`indexer_topk`.
+
+    ``scores_output`` controls the third return on the dense fallback path
+    (the compact path never materializes scores and always returns ``None``):
+
+    * ``"full"`` (default): the dense fp32 score matrix.
+    * ``"topk"``: only the scores at the returned indices, shaped like the
+      indices, ``-inf`` at ``-1`` slots.
+    * ``"none"``: ``None``.
+
+    With ``"topk"`` / ``"none"`` the fallback processes query rows in chunks
+    whose fp32 score block stays under ``_CSA_INDEXER_SCORE_CHUNK_MAX_BYTES``,
+    so peak score memory is ``chunk_rows * max_seqlen_kv * 4`` bytes instead
+    of ``total_q * max_seqlen_kv * 4``. Indices and lengths are identical to
+    ``"full"`` because each row's Top-K depends only on that row.
 
     Wraps cuDNN Frontend's CuTe-DSL indexer-forward kernels. On SM10x,
     ``use_compact=True`` selects the combined forward + Top-K wrapper when it
@@ -1786,6 +1806,8 @@ def _indexer_topk_core(
     """
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"Unsupported DSA indexer precision: {precision!r}")
+    if scores_output not in ("full", "topk", "none"):
+        raise ValueError(f"scores_output must be 'full', 'topk' or 'none', got {scores_output!r}")
     if precision == "mxfp8" and not use_compact:
         raise ValueError("MXFP8 indexer precision requires the compact forward + Top-K path")
 
@@ -1997,6 +2019,23 @@ def _indexer_topk_core(
         b, sq = q.shape[:2]
         return (topk_indices.view(b, sq, topk), topk_length.view(b, sq), None, compact_softmax)
 
+    if scores_output != "full":
+        topk_indices, topk_length, topk_scores = _indexer_topk_row_chunked(
+            q,
+            k,
+            w,
+            topk,
+            ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            q_causal_offsets=q_causal_offsets,
+            deterministic=deterministic,
+            return_topk_scores=scores_output == "topk",
+        )
+        return topk_indices, topk_length, topk_scores, None
+
     if is_thd:
         # Kernel wants k as 3-D ``(total_k, h_kv, idx_hd)``.
         forward_kwargs = dict(
@@ -2072,6 +2111,149 @@ def _indexer_topk_core(
         scores_flat.view(b, sq, sk),
         None,
     )
+
+
+def _indexer_score_chunk_rows(total_rows: int, max_seqlen_kv: int) -> int:
+    """Query rows whose fp32 score block fits ``_CSA_INDEXER_SCORE_CHUNK_MAX_BYTES``."""
+    bytes_per_row = max(1, max_seqlen_kv) * torch.finfo(torch.float32).bits // 8
+    rows = max(1, _CSA_INDEXER_SCORE_CHUNK_MAX_BYTES // bytes_per_row)
+    alignment = _CSA_INDEXER_SCORE_CHUNK_ROW_ALIGNMENT
+    if rows >= alignment:
+        rows = rows // alignment * alignment
+    return max(1, min(total_rows, rows))
+
+
+def _gather_topk_scores(scores_flat: Tensor, topk_indices: Tensor) -> Tensor:
+    """Scores at ``topk_indices`` (row-wise), ``-inf`` where the index is ``-1``."""
+    max_index = max(scores_flat.shape[-1] - 1, 0)
+    safe_indices = topk_indices.clamp(min=0, max=max_index).long()
+    selected = torch.gather(scores_flat, dim=-1, index=safe_indices)
+    return selected.masked_fill(topk_indices < 0, float("-inf"))
+
+
+def _sparse_indexer_predict(topk_scores: Tensor, topk_indices: Tensor) -> Tensor:
+    """Indexer distribution over its own Top-K: softmax with ``-1`` slots masked out.
+
+    Matches ``csa_indexer_loss_kernels.prepare_sparse_loss`` on the full score
+    matrix, given scores already gathered at ``topk_indices``.
+    """
+    masked_scores = torch.where(topk_indices >= 0, topk_scores, torch.finfo(torch.float32).min)
+    return torch.softmax(masked_scores, dim=-1)
+
+
+def _indexer_topk_row_chunked(
+    q: Tensor,
+    k: Tensor,
+    w: Tensor,
+    topk: int,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor],
+    cu_seqlens_kv: Optional[Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_kv: Optional[int],
+    q_causal_offsets: Optional[Tensor],
+    deterministic: bool,
+    return_topk_scores: bool,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Dense-fallback indexer Top-K that never keeps the whole score matrix.
+
+    Query rows are processed in chunks. Each chunk is expressed in the THD form
+    the indexer kernel already supports: the chunk's slice of every sequence
+    becomes one segment, and ``q_causal_offsets`` carries each segment's first
+    row position so the ``ratio`` causal rule is evaluated at true positions.
+    BSHD inputs are viewed as THD with ``b`` equal-length segments. The chunk
+    count depends only on tensor shapes, so the loop is CUDA-graph friendly.
+    """
+    is_thd = cu_seqlens_q is not None
+    if is_thd:
+        total_q = q.shape[0]
+        sk = int(max_seqlen_kv)
+    else:
+        b, sq = q.shape[:2]
+        sk = k.shape[1]
+        total_q = b * sq
+
+    core_kwargs = dict(use_compact=False, deterministic=deterministic)
+    chunk_rows = _indexer_score_chunk_rows(total_q, sk)
+    if chunk_rows >= total_q:
+        # Everything fits in one block: reuse the single-pass path unchanged.
+        topk_indices, topk_length, scores, _ = _indexer_topk_core(
+            q,
+            k,
+            w,
+            topk,
+            ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            q_causal_offsets=q_causal_offsets,
+            **core_kwargs,
+        )
+        topk_scores = None
+        if return_topk_scores:
+            topk_scores = _gather_topk_scores(
+                scores.reshape(total_q, -1), topk_indices.reshape(total_q, topk)
+            ).view(topk_indices.shape)
+        del scores
+        return topk_indices, topk_length, topk_scores
+
+    device = q.device
+    if is_thd:
+        q_rows, k_rows, w_rows = q, k, w
+        cu_q = cu_seqlens_q
+        cu_k = cu_seqlens_kv
+        max_q = int(max_seqlen_q)
+    else:
+        q_rows = q.reshape(total_q, *q.shape[2:])
+        w_rows = w.reshape(total_q, w.shape[-1])
+        k_rows = k.reshape(b * sk, k.shape[-1])
+        cu_q = torch.arange(b + 1, device=device, dtype=torch.int32) * sq
+        cu_k = torch.arange(b + 1, device=device, dtype=torch.int32) * sk
+        max_q = sq
+
+    segment_starts = cu_q[:-1]
+    base_offsets = (
+        q_causal_offsets if q_causal_offsets is not None else torch.zeros_like(segment_starts)
+    )
+
+    index_chunks = []
+    length_chunks = []
+    score_chunks = [] if return_topk_scores else None
+    for row_start in range(0, total_q, chunk_rows):
+        row_end = min(row_start + chunk_rows, total_q)
+        # Clip every segment to [row_start, row_end) and re-base it to the chunk.
+        chunk_cu_q = (cu_q.clamp(min=row_start, max=row_end) - row_start).to(cu_q.dtype)
+        chunk_offsets = (base_offsets + (row_start - segment_starts).clamp(min=0)).to(torch.int32)
+        chunk_indices, chunk_length, chunk_scores, _ = _indexer_topk_core(
+            q_rows[row_start:row_end],
+            k_rows,
+            w_rows[row_start:row_end],
+            topk,
+            ratio,
+            cu_seqlens_q=chunk_cu_q,
+            cu_seqlens_kv=cu_k,
+            max_seqlen_q=min(max_q, row_end - row_start),
+            max_seqlen_kv=sk,
+            q_causal_offsets=chunk_offsets,
+            **core_kwargs,
+        )
+        index_chunks.append(chunk_indices)
+        length_chunks.append(chunk_length)
+        if return_topk_scores:
+            score_chunks.append(_gather_topk_scores(chunk_scores, chunk_indices))
+        del chunk_scores
+
+    topk_indices = torch.cat(index_chunks, dim=0)
+    topk_length = torch.cat(length_chunks, dim=0)
+    topk_scores = torch.cat(score_chunks, dim=0) if return_topk_scores else None
+    if not is_thd:
+        topk_indices = topk_indices.view(b, sq, topk)
+        topk_length = topk_length.view(b, sq)
+        if topk_scores is not None:
+            topk_scores = topk_scores.view(b, sq, topk)
+    return topk_indices, topk_length, topk_scores
 
 
 def indexer_topk(
@@ -2177,6 +2359,7 @@ def indexer_topk(
         compact_workspace=compact_workspace,
         precision=precision,
         deterministic=deterministic,
+        scores_output="none",
     )
     if return_softmax:
         return topk_indices, topk_length, compact_softmax
@@ -2647,7 +2830,13 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             compact_workspace=compact_workspace,
             precision=indexer_precision,
             deterministic=deterministic,
+            # On the dense fallback, sparse loss only needs the selected scores,
+            # so score rows in bounded chunks; dense loss keeps the full matrix.
+            scores_output=("none" if loss_coeff <= 0 else ("topk" if sparse_loss else "full")),
         )
+        indexer_topk_scores = None
+        if loss_coeff > 0 and sparse_loss:
+            indexer_topk_scores, indexer_scores = indexer_scores, None
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
         indexer_physical_idxs = None
@@ -2813,6 +3002,15 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                         predict = predict.masked_fill(row_mask, 0)
                         if indexer_physical_idxs is not None:
                             indexer_physical_idxs = indexer_physical_idxs.masked_fill(row_mask, -1)
+                elif indexer_topk_scores is not None:
+                    # Dense fallback scored rows in chunks and kept only the
+                    # selected scores: invalidate padding rows, then softmax.
+                    if padding_row_mask is not None:
+                        row_mask = padding_row_mask.unsqueeze(-1)
+                        topk_indices_cmp = topk_indices_cmp.masked_fill(row_mask, -1)
+                        if indexer_physical_idxs is not None:
+                            indexer_physical_idxs = indexer_physical_idxs.masked_fill(row_mask, -1)
+                    predict = _sparse_indexer_predict(indexer_topk_scores, topk_indices_cmp)
                 else:
                     assert indexer_scores is not None
                     # The fused row kernel invalidates CUDA-graph padding rows
