@@ -181,8 +181,24 @@ class KimiDeltaAttention(_GDNBase):
         beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
         return raw_g, {"beta": beta.contiguous()}
 
-    @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply output RMSNorm and KDA's sigmoid gate, optionally fused."""
+        if self.config.gdn_gated_output_norm_fusion:
+            from megatron.core.fusions.fused_gated_norm import fused_gated_norm, validate_gated_norm
+
+            validate_gated_norm(self, x, gate, gate_activation="sigmoid")
+            return fused_gated_norm(
+                x,
+                gate,
+                self.out_norm.weight,
+                self.out_norm.eps,
+                self.out_norm.zero_centered_gamma,
+                gate_activation="sigmoid",
+            ).reshape(-1, self.value_head_dim)
+        return self._apply_gated_norm_unfused(x, gate)
+
+    @jit_fuser
+    def _apply_gated_norm_unfused(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
 
         x_dtype = x.dtype
