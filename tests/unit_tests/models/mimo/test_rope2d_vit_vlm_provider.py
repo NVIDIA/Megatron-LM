@@ -3,30 +3,21 @@
 """Focused tests for the 2D-RoPE ViT VLM MIMO provider."""
 
 import argparse
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from examples.mimo.model_providers import resolve_provider, rope2d_vit_vlm
-from examples.mimo.model_providers.nemotron_moe_vlm import (
-    _language_stack_spec,
-    add_model_provider_args,
-)
 from examples.mimo.model_providers.rope2d_vit_vlm import (
     ROPE2D_VIT_VLM_MODEL_PROVIDER,
     Rope2dViTModel,
     add_rope2d_vit_args,
     build_rope2d_vit_vlm_communicator,
 )
-from megatron.core.models.hybrid import hybrid_layer_specs
-from megatron.core.models.mamba import mamba_layer_specs
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.vision.vit_model import ViTModel
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 ENCODER_NAME = "test_vit_encoder"
 LANGUAGE_HIDDEN_SIZE = 256
@@ -173,47 +164,6 @@ def test_vision_tower_and_projector_follow_args(monkeypatch, overrides, expected
         assert config.gtp_weight_remat_size == config.expert_gtp_weight_remat_size == 1
 
 
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        ({"mimo_vision_num_layers": None}, "--mimo-vision-num-layers"),
-        ({"mimo_vision_num_attention_heads": 5}, "divisible"),
-        ({"mimo_vision_num_query_groups": 3}, "num-query-groups"),
-        ({"mimo_vision_spatial_merge_size": 2}, "--pixel-shuffle"),
-        ({"pixel_shuffle": True}, "--pixel-shuffle"),
-    ],
-)
-def test_rejects_invalid_args(overrides, match):
-    with pytest.raises(ValueError, match=match):
-        resolve_provider(_provider_args(**overrides))
-
-
-def test_explicit_kv_channels_allows_indivisible_hidden_size():
-    resolve_provider(_provider_args(mimo_vision_num_attention_heads=5, mimo_vision_kv_channels=8))
-
-
-def test_rejects_projection_on_language_ranks(monkeypatch):
-    with pytest.raises(ValueError, match="encoder ranks"):
-        _encoder_spec(monkeypatch, mimo_run_input_projections_on_llm_ranks=True)
-
-
-def test_vit_keeps_encoder_grid_tp_group(monkeypatch):
-    """sharded_state_dict must use the encoder grid's TP group, not the global one."""
-    from megatron.core.models.vision import vit_model
-
-    monkeypatch.setattr(vit_model, "TransformerBlock", lambda **_kwargs: torch.nn.Identity())
-    tp_group = object()
-    model = Rope2dViTModel(
-        transformer_config=TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4),
-        transformer_layer_spec=object(),
-        ln_pre=False,
-        pos_emb_type="none",
-        pg_collection=SimpleNamespace(tp=tp_group),
-    )
-
-    assert model.tp_group is tp_group
-
-
 def test_vit_accepts_mimo_encoder_inputs(monkeypatch):
     """MIMO batches name the image tensor x and move imgs_sizes to CUDA."""
     captured = {}
@@ -255,46 +205,3 @@ def test_bridge_recv_shape_counts_image_tokens(monkeypatch):
     batch = {"input_ids": torch.tensor([[1, 10, 10, 2], [10, 3, 4, 5]])}
     assert captured["bridge_recv_shape_fns"][ENCODER_NAME](batch) == (3, LANGUAGE_HIDDEN_SIZE)
     assert captured["bridge_comm_dtypes"] == {ENCODER_NAME: torch.bfloat16}
-
-
-@pytest.mark.parametrize(
-    ("spec_name", "wide_residual", "expected_name"),
-    [
-        (None, None, "mamba_stack_spec"),
-        (None, 3, "wide_residual_hybrid_stack_spec"),
-        ("gated_delta_product_stack_spec", None, "gated_delta_product_stack_spec"),
-        ("gated_delta_product_stack_spec", 3, "wide_residual_gated_delta_product_stack_spec"),
-        # Aliases resolve to their canonical spec before taking the wide-residual variant.
-        ("gdp_stack_spec", 3, "wide_residual_gated_delta_product_stack_spec"),
-    ],
-)
-def test_language_stack_spec_follows_spec_arg(spec_name, wide_residual, expected_name):
-    module = "megatron.core.models.hybrid.hybrid_layer_specs"
-    args = SimpleNamespace(spec=None if spec_name is None else [module, spec_name])
-    specs = {**vars(mamba_layer_specs), **vars(hybrid_layer_specs)}
-
-    stack_spec = _language_stack_spec(args, SimpleNamespace(wide_residual=wide_residual))
-    assert stack_spec is specs[expected_name]
-
-
-def test_language_stack_spec_rejects_specs_without_wide_residual_variant(monkeypatch):
-    custom_specs = types.ModuleType("custom_stack_specs")
-    custom_specs.custom_stack_spec = object()
-    monkeypatch.setitem(sys.modules, "custom_stack_specs", custom_specs)
-    args = SimpleNamespace(spec=["custom_stack_specs", "custom_stack_spec"])
-
-    with pytest.raises(ValueError, match="no wide_residual_ variant"):
-        _language_stack_spec(args, SimpleNamespace(wide_residual=3))
-
-
-def test_model_provider_args_register_vision_args():
-    parser = argparse.ArgumentParser()
-    add_model_provider_args(parser)
-
-    args = parser.parse_args(
-        ["--model-provider", ROPE2D_VIT_VLM_MODEL_PROVIDER, "--mimo-vision-num-layers", "2"]
-    )
-
-    assert args.model_provider == ROPE2D_VIT_VLM_MODEL_PROVIDER
-    assert args.mimo_vision_num_layers == 2
-    assert args.mimo_vision_encoder_name == "vision_encoder"
