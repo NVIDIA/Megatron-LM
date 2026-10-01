@@ -17,13 +17,27 @@ re-exported here for backwards compatibility with older standalone callers.
 """
 
 import json
+import re
 from functools import partial
 
+import torch
+
+from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.models.vision.encoder_registry import get_spec
 from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
+from megatron.training.checkpointing import (
+    get_checkpoint_name,
+    get_checkpoint_tracker_filename,
+    get_loaded_iteration,
+    load_args_from_checkpoint,
+    load_checkpoint,
+    read_metadata,
+)
 
 # NOTE: ``get_model`` below does a ``from model import model_provider`` for the
 # ``examples/multimodal/model.py`` file, whose siblings use bare imports like
@@ -119,11 +133,144 @@ def _print_resolved_args(title, args):
     print_rank_0("------------ end of VLM argument provenance -------------")
 
 
+_MIMO_LANGUAGE_MODEL_PREFIX = 'language_model.module.module.'
+# Captures (modality submodule prefix, encoder name) from a MIMO vision encoder key.
+_MIMO_ENCODER_KEY = re.compile(r'(modality_submodules\.[^.]+\.(?:module\.)*)encoders\.([^.]+)\.')
+# Training-only buffers that checkpoints may carry but inference models never build.
+_TRAINING_ONLY_CHECKPOINT_SUFFIXES = ('router.qb_bin_bounds',)
+
+# MIMO checkpoints don't record the LLaVA image geometry; it comes from the encoder registry.
+_ENCODER_REGISTRY_ATTRS = {
+    'patch_dim': 'patch_dim',
+    'img_h': 'default_img_h',
+    'img_w': 'default_img_w',
+    'pixel_shuffle': 'pixel_shuffle',
+    'conv_merging': 'conv_merging',
+    'dynamic_resolution': 'dynamic_resolution',
+    'dynamic_resolution_max_patches': 'dynamic_resolution_max_patches',
+}
+
+
+def _checkpoint_tensor_keys(args):
+    """Return the tensor keys of the checkpoint iteration that --load resolves to."""
+    if args.ckpt_step is not None:
+        release = False
+    else:
+        _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+    checkpoint_dir = get_checkpoint_name(
+        args.load, get_loaded_iteration(), release, return_base_dir=True
+    )
+    return dist_checkpointing.load_tensors_metadata(checkpoint_dir).keys()
+
+
+def _mimo_checkpoint_prefix_map(args):
+    """Map LLaVAModel key prefixes to the MIMO checkpoint prefixes they load from.
+
+    Returns None for a checkpoint without a vision encoder.
+    """
+    encoders = set()
+    for key in _checkpoint_tensor_keys(args):
+        match = _MIMO_ENCODER_KEY.match(key)
+        if match is not None:
+            encoders.add(match.groups())
+    if not encoders:
+        return None
+    if len(encoders) > 1:
+        raise ValueError(f"Expected one vision encoder in the MIMO checkpoint, found {encoders}")
+    ((modality_prefix, encoder_name),) = encoders
+    return {
+        'language_model.': _MIMO_LANGUAGE_MODEL_PREFIX,
+        'vision_model.': f'{modality_prefix}encoders.{encoder_name}.',
+        'vision_projection.': f'{modality_prefix}input_projections.0.',
+    }
+
+
+def _resolve_mimo_vision_args(args, checkpoint_args, user_passed_attrs):
+    """Fill the LLaVA vision args of a MIMO checkpoint, recording where each value came from."""
+    if 'vision_model_type' not in user_passed_attrs:
+        raise ValueError("MIMO checkpoint inference requires --vision-model-type")
+    spec = get_spec(args.vision_model_type)
+    sources = {
+        attr: ('encoder registry', getattr(spec, spec_attr))
+        for attr, spec_attr in _ENCODER_REGISTRY_ATTRS.items()
+    }
+    if not spec.dynamic_resolution_max_patches:  # 0 leaves the patch budget to the arguments.
+        del sources['dynamic_resolution_max_patches']
+    sources['image_token_id'] = ('checkpoint', getattr(checkpoint_args, 'image_token_id', None))
+
+    resolution = []
+    for attr, (source, value) in sources.items():
+        parser_value = getattr(args, attr, _MISSING)
+        checkpoint_value = value if source == 'checkpoint' else _MISSING
+        if attr in user_passed_attrs:
+            source, note = 'cli', 'explicit CLI value preserved'
+        else:
+            setattr(args, attr, value)
+            note = f'copied from {source}'
+        resolved_value = getattr(args, attr)
+        resolution.append(
+            {
+                "attr": attr,
+                "source": source,
+                "parser_value": parser_value,
+                "checkpoint_value": checkpoint_value,
+                "resolved_value": resolved_value,
+                "parser_changed_by_resolution": _arg_value_changed(parser_value, resolved_value),
+                "checkpoint_overridden": (
+                    source == 'cli'
+                    and checkpoint_value not in (_MISSING, None)
+                    and _arg_value_changed(checkpoint_value, resolved_value)
+                ),
+                "note": note,
+            }
+        )
+    args._vlm_arg_resolution = resolution
+
+
+def _check_mimo_checkpoint_fully_loaded(args, model):
+    """Fail if the checkpoint holds language or vision tensors that the model did not load.
+
+    A MIMO checkpoint also stores modules this model never builds, so the load itself cannot
+    reject unused checkpoint tensors; a module the model omits (e.g. from a config default that
+    differs from training) would otherwise be dropped silently.
+    """
+    requested = {
+        value.key
+        for value in nested_values(model.sharded_state_dict())
+        if isinstance(value, (ShardedTensor, ShardedTensorFactory))
+    }
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, sorted(requested))
+
+    unloaded = []
+    if torch.distributed.get_rank() == 0:
+        requested = set().union(*gathered)
+        checkpoint_prefixes = tuple(args.mimo_checkpoint_prefix_map.values())
+        unloaded = sorted(
+            key
+            for key in _checkpoint_tensor_keys(args)
+            if key.startswith(checkpoint_prefixes)
+            and not key.endswith(_TRAINING_ONLY_CHECKPOINT_SUFFIXES)
+            # Factories (e.g. fused in_proj) expand into sub-keys of the requested key.
+            and key not in requested
+            and not any(key.startswith(f"{requested_key}.") for requested_key in requested)
+        )
+    # Every rank must fail together, not just the one that inspected the checkpoint.
+    shared = [unloaded]
+    torch.distributed.broadcast_object_list(shared, src=0)
+    unloaded = shared[0]
+    if unloaded:
+        raise RuntimeError(
+            f"{len(unloaded)} checkpoint model tensors were not loaded; the model config does "
+            f"not match the checkpoint: {unloaded[:20]}"
+        )
+
+
 def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     """Peek at the checkpoint's saved training args to detect VLM vs GPT.
 
     Returns True if the checkpoint was trained as a VLM (has
-    ``language_model_type``), False otherwise. As a side-effect, copies
+    ``language_model_type``, or is a MIMO checkpoint), False otherwise. As a side-effect, copies
     VLM-specific args from the checkpoint into the current args namespace
     so the multimodal model_provider can access them, and records resolution
     provenance on ``args._vlm_arg_resolution`` for the diagnostic dump.
@@ -138,6 +285,15 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
         return False
 
     _, checkpoint_args = result
+    # MIMO training records its module-grid layout (--mimo-llm-*), and its checkpoints nest each
+    # module under its own prefix; load a vision checkpoint into a LLaVAModel that uses those
+    # key names.
+    if hasattr(checkpoint_args, 'mimo_llm_tp'):
+        prefix_map = _mimo_checkpoint_prefix_map(args)
+        if prefix_map is not None:
+            args.mimo_checkpoint_prefix_map = prefix_map
+            _resolve_mimo_vision_args(args, checkpoint_args, user_passed_attrs)
+            return True
     if not hasattr(checkpoint_args, 'language_model_type'):
         return False
     if checkpoint_args.language_model_type is None:
@@ -228,7 +384,12 @@ def get_model(is_vlm: bool) -> MegatronModule:
     """Build and load the model; dispatches to the right model_provider."""
     args = get_args()
 
-    if is_vlm:
+    is_mimo = getattr(args, 'mimo_checkpoint_prefix_map', None) is not None
+    if is_vlm and is_mimo:
+        from mimo_checkpoint_model import model_provider  # examples/multimodal
+
+        model = _get_model(model_provider, wrap_with_ddp=False)
+    elif is_vlm:
         from model import model_provider  # examples/multimodal/model.py
 
         model = _get_model(partial(model_provider), wrap_with_ddp=False)
@@ -246,6 +407,8 @@ def get_model(is_vlm: bool) -> MegatronModule:
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
     )
+    if is_mimo:
+        _check_mimo_checkpoint_fully_loaded(args, model[0])
 
     assert len(model) == 1, "Virtual PP not supported for VLM inference"
     model = model[0]
