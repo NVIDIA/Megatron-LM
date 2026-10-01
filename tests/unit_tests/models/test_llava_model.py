@@ -667,7 +667,7 @@ class TestLLaVAModelHybridLanguageModel:
 
     @pytest.mark.internal
     def test_is_hybrid_model_builds_hybrid_language_model(self):
-        # No hybrid language_model_type name: the config flag alone selects HybridModel.
+        # The config flag selects HybridModel.
         language_config = TransformerConfig(
             num_layers=2,
             hidden_size=64,

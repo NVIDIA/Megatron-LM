@@ -179,10 +179,7 @@ class LLaVAModel(MegatronModule):
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        language_model_type = getattr(language_transformer_config, "language_model_type", "")
-        is_hybrid_language_model = language_transformer_config.is_hybrid_model or (
-            language_model_type.startswith(('nemotron5-hybrid', 'nemotron6-moe', 'nemotron6-super'))
-        )
+        is_hybrid_language_model = language_transformer_config.is_hybrid_model
 
         # Constructor configuration and initial module state.
         self.pre_process = pre_process
