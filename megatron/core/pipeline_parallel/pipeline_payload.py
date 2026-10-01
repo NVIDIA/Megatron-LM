@@ -3,13 +3,14 @@
 """Typed activation boundaries for models with differentiable pipeline side inputs."""
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Callable, Iterable
 
 import torch
 
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.utils import make_viewless_tensor
 
 
 @dataclass(frozen=True)
@@ -140,15 +141,15 @@ class _PipelineBackwardState:
 
     specs: tuple[PipelineTensorSpec, ...]
     device: torch.device
-    outputs: tuple[torch.Tensor, ...]
+    outputs: tuple[torch.Tensor | None, ...]
 
 
 class PipelinePayload:
     """A model-owned snapshot whose tensors may share storage with the local graph.
 
     After posting a send, the transport transfers the original outputs to a strong
-    backward record. Storage is never pseudo-deallocated. Integer fields and
-    floating fields without gradient eligibility are excluded from backward.
+    backward record. Only explicitly owned viewless roots may be pseudo-deallocated.
+    Integer fields and floating fields without gradient eligibility are excluded from backward.
     """
 
     tensors: tuple[torch.Tensor, ...]
@@ -162,7 +163,7 @@ class PipelinePayload:
     @property
     def metadata(self) -> tuple[int, ...]:
         """Return model-owned host integers for reconstructing the input payload."""
-        return (0, 0)
+        return ()
 
     @property
     def boundary_id(self) -> str:
@@ -181,16 +182,33 @@ class PipelinePayload:
             return self._backward_state.device
         return self.tensors[0].device
 
-    def release_output(self) -> None:
-        """Move original outputs into the backward record without mutating shared storage.
+    @property
+    def releasable_tensor_indices(self) -> tuple[int, ...]:
+        """Return exclusively owned tensor objects whose storage can be released after send."""
+        return ()
 
-        Work handles separately own detached send buffers. Strong references are
-        intentional: the boundary path does not pseudo-deallocate shared outputs.
+    def release_output(self) -> None:
+        """Retain autograd roots and release only explicitly owned tensor objects.
+
+        Work handles keep detached send buffers alive until communication completes.
+        Shared side fields are never shrunk; saved tensors retain storage as needed.
         """
         if self._backward_state is not None:
             return
         specs = self.tensor_specs
-        state = _PipelineBackwardState(specs, self.device, self.tensors)
+        packed_specs = tuple(spec for spec in specs if spec.present)
+        roots = tuple(
+            tensor if spec.requires_grad and tensor.requires_grad else None
+            for spec, tensor in zip(packed_specs, self.tensors)
+        )
+        state = _PipelineBackwardState(specs, self.device, roots)
+        for index in self.releasable_tensor_indices:
+            tensor = state.outputs[index]
+            if tensor is None:
+                continue
+            if tensor._base is not None:
+                raise ValueError("Releasable pipeline outputs must be viewless owned tensors")
+            tensor.data = tensor.new_empty((1,))
         # Model payloads can be frozen dataclasses: their forward schema remains
         # immutable, but ownership is explicitly transferred to backward here.
         object.__setattr__(self, "_backward_state", state)
@@ -209,6 +227,7 @@ class TensorStatePayload(PipelinePayload):
 
     tensors: tuple[torch.Tensor, ...]
     spec: PipelinePayloadSpec
+    _owns_hidden: bool = field(default=False, repr=False, compare=False)
 
     @property
     def tensor_specs(self):
@@ -222,13 +241,25 @@ class TensorStatePayload(PipelinePayload):
     def boundary_id(self):
         return self.spec.boundary_id
 
+    @property
+    def releasable_tensor_indices(self):
+        """Only the dedicated hidden root is owned; shared state retains its storage."""
+        return (0,) if self._owns_hidden else ()
+
     @classmethod
     def from_state(cls, hidden, state, schema: TensorSchema, *, boundary_id="state"):
         """Publish explicit producer edges; do not detach or clone shared tensors."""
         hidden_field = TensorField("__hidden__", tuple(hidden.shape), hidden.dtype, "strided", True)
         fields = (hidden_field, *schema.fields)
         specs = tuple(PipelineTensorSpec.from_field(field) for field in fields)
-        return cls((hidden, *schema.pack(state)), PipelinePayloadSpec(specs, (), boundary_id))
+        # Force a new viewless tensor object without copying storage. Shrinking
+        # this root cannot mutate a caller's tensor, saved activation or relay.
+        owned_hidden = make_viewless_tensor(
+            hidden.view_as(hidden), requires_grad=hidden.requires_grad, keep_graph=True
+        )
+        return cls(
+            (owned_hidden, *schema.pack(state)), PipelinePayloadSpec(specs, (), boundary_id), True
+        )
 
     def restore(self):
         """Restore a fresh per-microbatch state mapping after the receive is complete."""
@@ -299,12 +330,16 @@ def backward_pipeline_payload(
     scalar loss uses the normal loss scaler; received activation gradients are
     already scaled.
     """
-    input_specs = (
-        () if input_payload is None else tuple(s for s in input_payload.tensor_specs if s.present)
-    )
+    input_roots, input_specs = (), ()
     if input_payload is not None:
-        for tensor, spec in zip(input_payload.tensors, input_specs):
-            if spec.requires_grad and tensor.requires_grad:
+        # An identity stage may return its received payload directly. Its send
+        # already moved the leaves into the backward record, so use that snapshot.
+        incoming = input_payload._backward_state
+        specs = input_payload.tensor_specs if incoming is None else incoming.specs
+        input_specs = tuple(spec for spec in specs if spec.present)
+        input_roots = input_payload.tensors if incoming is None else incoming.outputs
+        for tensor, spec in zip(input_roots, input_specs):
+            if tensor is not None and spec.requires_grad and tensor.requires_grad:
                 tensor.retain_grad()
 
     if isinstance(output_grad, PipelineGradientMessage):
@@ -327,7 +362,7 @@ def backward_pipeline_payload(
                     raise ValueError(f"Invalid gradient for pipeline field {spec.name}")
                 # Receivers allocate leaves using static eligibility. A frozen
                 # sender has no local edge even when the receiver used the value.
-                if not root.requires_grad:
+                if root is None or not root.requires_grad:
                     continue
                 # Two declared outputs may be the very same Tensor. Sum their
                 # contributions by identity, never by storage/data_ptr aliases.
@@ -341,7 +376,17 @@ def backward_pipeline_payload(
             elif grad is not None:
                 raise ValueError(f"Unexpected gradient for pipeline field {spec.name}")
         if outputs:
-            torch.autograd.backward(outputs, grad_tensors=grads)
+            # As in schedules.custom_backward, bypass only the root-shape check:
+            # an owned root may have had its .data released after the send.
+            torch.autograd.Variable._execution_engine.run_backward(
+                tensors=tuple(outputs),
+                grad_tensors=tuple(grads),
+                keep_graph=False,
+                create_graph=False,
+                inputs=(),
+                allow_unreachable=True,
+                accumulate_grad=True,
+            )
         if state is not None:
             state.outputs = ()
     else:
@@ -355,6 +400,6 @@ def backward_pipeline_payload(
     if input_payload is None:
         return None
     return tuple(
-        tensor.grad if spec.requires_grad else None
-        for tensor, spec in zip(input_payload.tensors, input_specs)
+        tensor.grad if tensor is not None and spec.requires_grad else None
+        for tensor, spec in zip(input_roots, input_specs)
     )

@@ -21,6 +21,7 @@ from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelinePayloadPlan,
     PipelinePayloadSpec,
     PipelineTensorSpec,
+    TensorStatePayload,
     backward_pipeline_payload,
 )
 from megatron.core.pipeline_parallel.schedules import (
@@ -41,7 +42,7 @@ from megatron.core.pipeline_parallel.typed_p2p_communication import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
-from megatron.core.transformer.state_boundary import TensorField
+from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -523,7 +524,7 @@ def test_overlap_constructs_payload_after_header_and_waits_before_data_use(
                 request.received_value = (
                     wire_header.numel()
                     if request.buffer().shape == (1,) and request.buffer().dtype == torch.int64
-                    else wire_header if request.buffer().dtype == torch.int64 else 7
+                    else wire_header if request.buffer().dtype == torch.uint8 else 7
                 )
         return result
 
@@ -648,7 +649,7 @@ def test_warmup_prefetch_defers_header_and_preserves_peer_order(
         result = post(**kwargs)
         for name, request in result.items():
             tensor = request.buffer()
-            is_header = name == "recv_prev" and tensor.dtype == torch.int64
+            is_header = name == "recv_prev" and tensor.dtype in (torch.int64, torch.uint8)
             is_length = is_header and tensor.numel() == 1
             posted.append(
                 (name, "length" if is_length else "header" if is_header else tuple(tensor.shape))
@@ -756,7 +757,7 @@ def test_retiring_send_advances_prefetched_data_before_wait(delayed_transport, m
                 request.received_value = (
                     wire_header.numel()
                     if request.buffer().shape == (1,) and request.buffer().dtype == torch.int64
-                    else wire_header if request.buffer().dtype == torch.int64 else 9
+                    else wire_header if request.buffer().dtype == torch.uint8 else 9
                 )
         return result
 
@@ -1157,3 +1158,114 @@ def test_typed_1f1b_actual_transport(
             assert any("send" in name for name in config.timers)
         if rank > 0 or not forward_only:
             assert any("recv" in name for name in config.timers)
+
+
+@pytest.mark.parametrize("view", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_owned_hidden_release_preserves_saved_aliases_and_joint_gradients(view, empty):
+    leaf = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
+    expected_leaf = leaf.detach().clone().requires_grad_()
+    hidden, expected_hidden = leaf.sigmoid(), expected_leaf.sigmoid()
+    if view:
+        hidden, expected_hidden = hidden.t(), expected_hidden.t()
+    if empty:
+        hidden, expected_hidden = hidden[:0], expected_hidden[:0]
+    shared = hidden  # Deliberately share the very same Tensor with the state.
+    schema = TensorSchema((TensorField("shared", hidden.shape, hidden.dtype, "local", True),))
+    payload = TensorStatePayload.from_state(hidden, {"shared": shared}, schema)
+    wire = payload.tensors[0].detach().contiguous()
+    snapshot = hidden.detach().clone()
+    payload.release_output()
+    assert payload._backward_state.outputs[0].numel() == 1
+    assert hidden.shape == snapshot.shape and shared is hidden
+    torch.testing.assert_close(hidden, snapshot)
+    torch.testing.assert_close(wire, snapshot)
+    backward_pipeline_payload(
+        None, payload, (torch.ones_like(snapshot), torch.full_like(snapshot, 2))
+    )
+    (expected_hidden.sum() * 3).backward()
+    torch.testing.assert_close(leaf.grad, expected_leaf.grad)
+    assert payload._backward_state.outputs == ()
+
+
+def test_owned_hidden_release_does_not_retain_an_unaliased_output_storage():
+    leaf = torch.ones(4096, requires_grad=True)
+    hidden = leaf * 2
+    reference = weakref.ref(hidden)
+    payload = TensorStatePayload.from_state(hidden, {}, TensorSchema(()))
+    del hidden
+    gc.collect()
+    assert reference() is None
+    payload.release_output()
+    root = payload._backward_state.outputs[0]
+    assert root.numel() == 1 and root.untyped_storage().nbytes() == root.element_size()
+    backward_pipeline_payload(None, payload, (torch.ones_like(leaf),))
+    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
+
+
+def test_bad_gradient_length_is_rejected_without_consuming_forward(delayed_transport):
+    communicator, requests, _ = delayed_transport
+    descriptor = PipelinePayloadSpec((_spec("hidden", (3,), torch.float32, True),), ())
+    record = _MessageRecord(descriptor, 0, 0)
+    communicator._received[0].append(record)
+    with pytest.raises(ValueError, match="match the incoming field slots"):
+        communicator.send_backward((), is_first_stage=False)
+    assert communicator._received[0][0] is record
+    assert not requests
+
+
+def test_prepared_identity_is_checked_before_forward_handoff(delayed_transport, monkeypatch):
+    communicator, _, post = delayed_transport
+    communicator.forward_only = True
+    descriptor = _Payload((torch.ones(3), torch.empty(0))).descriptor
+    communicator.payload_plans = [
+        PipelinePayloadPlan((None,), (descriptor,)),
+        PipelinePayloadPlan((descriptor,), (None,)),
+    ]
+
+    def receive(**kwargs):
+        works = post(**kwargs)
+        for name, work in works.items():
+            if name == "recv_prev":
+                work.received_value = (
+                    torch.tensor((99, 1, descriptor.fingerprint))
+                    if work.buffer().dtype == torch.int64
+                    else 1
+                )
+        return works
+
+    monkeypatch.setattr("megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", receive)
+    payload, _ = communicator.send_forward_recv_forward(
+        None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
+    )
+    with pytest.raises(ValueError, match="forward microbatch/chunk/boundary"):
+        communicator.resolve_forward(payload)
+
+
+def test_release_drops_readonly_outputs_after_the_wire_owns_them():
+    leaf = torch.ones(4, requires_grad=True)
+    ids = torch.arange(4)
+    reference = weakref.ref(ids)
+    payload = TensorStatePayload.from_state(
+        leaf * 2,
+        {"ids": ids},
+        TensorSchema((TensorField("ids", (4,), torch.int64, "local", False),)),
+    )
+    wire = payload.tensors[1].detach()
+    del ids
+    payload.release_output()
+    gc.collect()
+    assert reference() is None and payload._backward_state.outputs[1] is None
+    torch.testing.assert_close(wire, torch.arange(4))
+    backward_pipeline_payload(None, payload, (torch.ones_like(leaf), None))
+    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
+
+
+def test_released_identity_payload_still_returns_input_gradients():
+    hidden = torch.ones(4, requires_grad=True)
+    ids = torch.arange(4)
+    incoming = _Payload((hidden, ids))
+    incoming.release_output()  # The stage returns exactly its received payload.
+    gradients = backward_pipeline_payload(incoming, incoming, (torch.full_like(hidden, 3), None))
+    torch.testing.assert_close(gradients[0], torch.full_like(hidden, 3))
+    assert gradients[1] is None

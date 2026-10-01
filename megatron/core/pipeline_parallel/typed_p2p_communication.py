@@ -180,7 +180,7 @@ class _ForwardReceive:
         if length <= 0:
             raise ValueError("Invalid typed pipeline descriptor length")
         self._header = None
-        header = torch.empty(length, dtype=torch.int64, device=communicator.control_device)
+        header = torch.empty(length, dtype=torch.uint8, device=communicator.control_device)
         communicator._transfer(recv_prev=[header])
         self._payload, tensors = communicator._make_received_payload(
             header, self._chunk_id, self._microbatch
@@ -283,6 +283,7 @@ class TypedP2PCommunicator(P2PCommunicator):
         self._pending: dict[_P2PWork | _ForwardReceive, None] = {}
         self._control_sends = []
         self._control_receives = []
+        self._forward_controls = {}
         self._forward_header: _ForwardReceive | None = None
         if payload_plans is not None and (
             len(payload_plans) != num_chunks
@@ -491,7 +492,13 @@ class TypedP2PCommunicator(P2PCommunicator):
         self, received: PipelinePayload | _ForwardReceive | None
     ) -> PipelinePayload | None:
         """Resolve a prefetched input before storing the concrete payload for backward."""
-        return received.take_payload() if isinstance(received, _ForwardReceive) else received
+        if isinstance(received, _ForwardReceive):
+            return received.take_payload()
+        handle = self._forward_controls.pop(id(received), None)
+        if handle is not None:
+            handle.wait()
+            handle.wait_control()
+        return received
 
     @nvtx_decorator()
     def _release_sent_output(self, output: PipelinePayload | None) -> None:
@@ -558,25 +565,24 @@ class TypedP2PCommunicator(P2PCommunicator):
                     length = torch.tensor(
                         [len(values)], dtype=torch.int64, device=self.control_device
                     )
-                    header = torch.tensor(values, dtype=torch.int64, device=self.control_device)
+                    header = torch.tensor(values, dtype=torch.uint8, device=self.control_device)
                     forward_sends = [length, header, *output.tensors]
                 self._send_microbatch[forward_send_chunk_id] += 1
                 if not self.forward_only:
                     self._sent[forward_send_chunk_id].append(record)
 
             if gradients is not None:
-                record = self._received[backward_send_chunk_id].popleft()
+                record = self._received[backward_send_chunk_id][0]
                 if isinstance(gradients, PipelineGradientMessage):
                     gradients = gradients.resolve()
+                wire_gradients = self._gradient_tensors(gradients, record.descriptor.tensor_specs)
+                self._received[backward_send_chunk_id].popleft()
                 indices = record.descriptor.schema.grad_tensor_indices
                 active = tuple(int(gradients[i] is not None) for i in indices)
                 control = torch.tensor(
                     (*record.identity(), *active), dtype=torch.int64, device=self.control_device
                 )
-                backward_sends = [
-                    control,
-                    *self._gradient_tensors(gradients, record.descriptor.tensor_specs),
-                ]
+                backward_sends = [control, *wire_gradients]
 
             # Reserve all fields of a previous dynamic forward before another
             # receive can advance the same peer's ordered stream.
@@ -655,6 +661,7 @@ class TypedP2PCommunicator(P2PCommunicator):
                     handles["recv_prev"] = received
                 else:
                     handles["recv_prev"].validation = (forward_receives[0], forward_identity)
+                    self._forward_controls[id(received)] = handles["recv_prev"]
             if defer_backward:
                 received.post_data()
                 handles.update(self._transfer(recv_next=backward_receives, overlap=True))
@@ -673,7 +680,7 @@ class TypedP2PCommunicator(P2PCommunicator):
                 and self.device.type == "cuda"
             ):
                 torch.cuda.synchronize()
-            return received, backward_message
+            return self.resolve_forward(received), backward_message
         finally:
             if timer is not None:
                 timer.stop()
@@ -793,6 +800,7 @@ class TypedP2PCommunicator(P2PCommunicator):
         for handle in self._control_receives:
             handle.wait_control()
         self._control_receives.clear()
+        self._forward_controls.clear()
         for request, _tensor in self._control_sends:
             request.wait()
         self._control_sends.clear()

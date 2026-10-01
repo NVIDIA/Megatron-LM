@@ -9,10 +9,14 @@ boundaries without encoding any attention architecture.
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence, get_args
 
 import torch
 from torch import Tensor
+
+StateLayout = Literal[
+    "contiguous", "zigzag", "replicated", "local", "strided", "sbhd", "bshd", "thd"
+]
 
 
 @dataclass(frozen=True)
@@ -27,7 +31,7 @@ class TensorField:
     key: str
     shape: tuple[int, ...]
     dtype: torch.dtype
-    layout: str
+    layout: StateLayout
     differentiable: bool
     present: bool = True
 
@@ -40,6 +44,8 @@ class TensorField:
             or not isinstance(self.shape, tuple)
         ):
             raise ValueError("A state field requires a stable key, layout and tuple shape")
+        if self.layout not in get_args(StateLayout):
+            raise ValueError(f"Unsupported state layout: {self.layout}")
         if not isinstance(self.dtype, torch.dtype) or any(
             type(flag) is not bool for flag in (self.present, self.differentiable)
         ):

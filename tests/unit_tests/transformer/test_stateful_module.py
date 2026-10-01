@@ -248,7 +248,8 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
         hidden, {"shared": hidden, "readonly": hidden, "absent": None}, schema
     )
     restored, state = payload.restore()
-    assert restored is hidden and state["shared"] is hidden
+    assert restored is not hidden and restored.data_ptr() == hidden.data_ptr()
+    assert state["shared"] is hidden
     assert not state["readonly"].requires_grad
     assert state["readonly"].data_ptr() == hidden.data_ptr()
     assert state["absent"] is None
@@ -312,3 +313,97 @@ def test_graph_with_real_te_normalized_projection_and_shared_output(backend, dty
         torch.testing.assert_close(p.grad, q.grad)
     del output, reference, state, reference_state
     graphs.close()
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+@pytest.mark.parametrize("mode", ["no_grad", "frozen"])
+def test_graph_outputs_survive_forward_only_slot_reuse(backend, mode):
+    region = StatefulModule(_Branches(), output_fields=_fields())
+    if mode == "frozen":
+        region.requires_grad_(False)
+    sample = torch.ones(4, 1, 8, device="cuda", requires_grad=mode != "frozen")
+    graphs = StatefulGraphs(region, sample, {}, backend=backend)
+    try:
+        with torch.set_grad_enabled(mode != "no_grad"):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                hidden, state = graphs.run(sample, {})
+                wire = tuple(
+                    t.detach().contiguous() for t in (hidden, state["memory"], state["ids"])
+                )
+                expected = tuple(t.clone() for t in wire)
+            second = (sample.detach() * 3).requires_grad_(sample.requires_grad)
+            next_hidden, next_state = graphs.run(second, {})
+            torch.cuda.current_stream().wait_stream(stream)
+            for original, snapshot in zip(wire, expected):
+                torch.testing.assert_close(original, snapshot)
+            assert hidden.data_ptr() != next_hidden.data_ptr()
+            assert state["memory"].data_ptr() != next_state["memory"].data_ptr()
+            assert state["ids"].data_ptr() != next_state["ids"].data_ptr()
+            del hidden, state, next_hidden, next_state, wire
+    finally:
+        graphs.close()
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_abort_rejects_old_backward_without_retiring_new_invocation(backend):
+    region = StatefulModule(_Branches(), output_fields=_fields())
+    sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, backend=backend)
+    old, old_state = graphs.run(sample, {})
+    old_loss = _loss(old, old_state, "used")
+    graphs.abort()
+    fresh, state = graphs.run(sample, {})
+    with pytest.raises(RuntimeError, match="aborted"):
+        old_loss.backward()
+    with pytest.raises(RuntimeError, match="outstanding"):
+        graphs.run(sample, {})
+    _loss(fresh, state, "used").backward()
+    del old, old_state, old_loss, fresh, state
+    graphs.close()
+
+
+def test_graph_module_validation_can_run_outside_replay():
+    region = StatefulModule(_Branches(), output_fields=_fields())
+    sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, debug_checks=True)
+    region.eval()
+    with pytest.raises(ValueError, match="training mode"):
+        graphs.validate_module()
+    with pytest.raises(ValueError, match="training mode"):
+        graphs.run(sample, {})
+    graphs.close()
+
+
+def test_layout_typo_is_rejected_at_schema_construction():
+    with pytest.raises(ValueError, match="Unsupported state layout"):
+        TensorField("memory", (4, 1, 8), torch.float32, "contigous", True)
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_capture_failure_restores_process_settings(backend):
+    from transformer_engine.pytorch import graph as te_graph
+
+    from megatron.core.transformer import cuda_graphs
+
+    class Broken(nn.Module):
+        def forward(self, hidden, state):
+            raise RuntimeError("intentional warmup failure")
+
+    before_call = StatefulModule.__call__
+    before_mcore = cuda_graphs.is_graph_capturing()
+    before_te = te_graph.is_graph_capturing()
+    get_override = getattr(torch._C, "_override_stale_capture_stream", None)
+    before_override = None if get_override is None else get_override()
+    sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
+    with pytest.raises(RuntimeError, match="intentional warmup failure"):
+        StatefulGraphs(StatefulModule(Broken()), sample, {}, backend=backend)
+    assert StatefulModule.__call__ is before_call
+    assert cuda_graphs.is_graph_capturing() == before_mcore
+    assert te_graph.is_graph_capturing() == before_te
+    if get_override is not None:
+        assert get_override() == before_override

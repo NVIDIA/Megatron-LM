@@ -117,6 +117,7 @@ class _GraphOutputs(torch.autograd.Function):
     def forward(ctx, owner, slot, *outputs):
         """Track a graph slot's outputs without materializing absent gradients."""
         ctx.owner, ctx.slot = owner, slot
+        ctx.generation = owner._generation[slot]
         ctx.active = tuple(t.requires_grad for t in outputs)
         ctx.set_materialize_grads(False)
         result = tuple(t.view_as(t) for t in outputs)
@@ -126,6 +127,8 @@ class _GraphOutputs(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         """Validate output gradients and release the slot after captured backward."""
+        if ctx.owner is not None and ctx.generation != ctx.owner._generation[ctx.slot]:
+            raise RuntimeError("This graph invocation was aborted; discard its outputs")
         if ctx.owner is None:
             raise RuntimeError("Stateful graph outputs support one backward per invocation")
         if any(active and grad is None for active, grad in zip(ctx.active, grads)):
@@ -136,6 +139,8 @@ class _GraphOutputs(torch.autograd.Function):
         # Releasing before the nested captured backward runs would let a new
         # microbatch overwrite its buffers. Retire the slot at engine completion.
         owner, slot = ctx.owner, ctx.slot
+        for parameter in owner._fused_grad_params[slot]:
+            parameter.grad_added_to_main_grad = True
         ctx.owner = None
         torch.autograd.Variable._execution_engine.queue_callback(lambda: owner._release(slot))
         return (None, None, *grads)
@@ -159,12 +164,15 @@ class StatefulGraphs:
         slots: int = 1,
         backend: str = "torch",
         num_warmup_iters: int = 3,
+        debug_checks: bool = False,
     ) -> None:
         if not hidden.is_cuda or slots < 1:
             raise ValueError("Stateful CUDA graphs require a CUDA sample and positive slot count")
+        te_graph = None
         if backend == "torch":
             capture = torch.cuda.make_graphed_callables
         elif backend == "transformer_engine":
+            from transformer_engine.pytorch import graph as te_graph
             from transformer_engine.pytorch import make_graphed_callables
             from transformer_engine.pytorch.distributed import (
                 get_all_rng_states,
@@ -184,10 +192,12 @@ class StatefulGraphs:
         else:
             raise ValueError(f"Unsupported stateful graph backend: {backend}")
         self.region, self.device = region, hidden.device
-        self._module_profile = self._profile_module()
+        self.debug_checks = debug_checks
         samples = (hidden, *region.inputs.pack(state))
         self._signature = tuple(self._tensor_signature(t) for t in samples)
         self._busy = [False] * slots
+        self._generation = [0] * slots
+        self._fused_grad_params = []
         self._events = [torch.cuda.Event() for _ in range(slots)]
         self._recorded = [False] * slots
         self._callables = []
@@ -197,9 +207,90 @@ class StatefulGraphs:
             wrapper.training = region.training
             self._wrappers.append(wrapper)
             args = tuple(t.detach().clone().requires_grad_(t.requires_grad) for t in samples)
-            self._callables.append(
-                capture(wrapper, args, num_warmup_iters=num_warmup_iters, allow_unused_input=True)
+            with self._capture_grad_state(te_graph) as fused:
+                self._callables.append(
+                    capture(
+                        wrapper, args, num_warmup_iters=num_warmup_iters, allow_unused_input=True
+                    )
+                )
+            self._fused_grad_params.append(tuple(fused))
+        self._module_profile = self._profile_module()
+
+    @contextmanager
+    def _capture_grad_state(self, te_graph):
+        """Keep warmup/capture out of DDP reduction and preserve accumulated gradients."""
+        from megatron.core.transformer import cuda_graphs
+
+        missing = object()
+        original_call = StatefulModule.__dict__.get("__call__", missing)
+        te_was_capturing = te_graph is not None and te_graph.is_graph_capturing()
+        saved = [
+            (
+                p,
+                p.grad,
+                getattr(p, "main_grad", None),
+                getattr(p, "grad_added_to_main_grad", missing),
             )
+            for p in self.region.parameters()
+        ]
+        backups = [None if main is None else main.clone() for _, _, main, _ in saved]
+        was_capturing = cuda_graphs.is_graph_capturing()
+        # DDP retains AccumulateGrad nodes created before the capture stream.
+        # Match MCore's full-graph setup, but restore this process-global switch.
+        get_stream_override = getattr(torch._C, "_override_stale_capture_stream", None)
+        previous_override = None if get_stream_override is None else get_stream_override()
+        if previous_override is not None:
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+        cuda_graphs._set_capture_start()
+        fused = []
+        for p, _, _, flag in saved:
+            p.grad = None
+            if flag is not missing:
+                p.grad_added_to_main_grad = False
+        try:
+            yield fused
+            fused.extend(p for p, _, _, _ in saved if getattr(p, "grad_added_to_main_grad", False))
+        finally:
+            try:
+                for (p, grad, main, flag), backup in zip(saved, backups):
+                    if main is not None:
+                        main.copy_(backup)
+                    p.grad = grad
+                    if flag is missing:
+                        if hasattr(p, "grad_added_to_main_grad"):
+                            delattr(p, "grad_added_to_main_grad")
+                    else:
+                        p.grad_added_to_main_grad = flag
+            finally:
+                if te_graph is not None:
+                    if original_call is missing:
+                        if "__call__" in StatefulModule.__dict__:
+                            delattr(StatefulModule, "__call__")
+                    else:
+                        StatefulModule.__call__ = original_call
+                    if not te_was_capturing:
+                        te_graph.set_capture_end()
+                if previous_override is not None:
+                    torch.autograd.graph.set_override_stale_capture_stream(previous_override)
+                if not was_capturing:
+                    cuda_graphs._set_capture_end()
+
+    def validate_module(self) -> None:
+        """Check stable parameter storage and training mode outside the replay hot path."""
+        if self._profile_module() != self._module_profile:
+            raise ValueError("Stateful graph module storage or training mode changed after capture")
+
+    def abort(self) -> None:
+        """Retire a discarded iteration after its communication has been drained.
+
+        Old outputs must be discarded; backward through them is rejected. Call
+        only once the caller has stopped scheduling work for this graph set.
+        """
+        torch.cuda.synchronize(self.device)
+        for slot in range(len(self._busy)):
+            self._generation[slot] += 1
+            self._busy[slot] = False
+            self._recorded[slot] = False
 
     @staticmethod
     def _tensor_signature(tensor):
@@ -245,8 +336,8 @@ class StatefulGraphs:
         """Replay one reserved slot and publish its side outputs into a fresh mapping."""
         if not 0 <= slot < len(self._callables) or self._busy[slot]:
             raise RuntimeError("Graph slot is invalid or still belongs to an outstanding backward")
-        if self._profile_module() != self._module_profile:
-            raise ValueError("Stateful graph module storage or training mode changed after capture")
+        if self.debug_checks:
+            self.validate_module()
         args = (hidden, *self.region.inputs.pack(state))
         if tuple(self._tensor_signature(t) for t in args) != self._signature:
             raise ValueError("Stateful graph input profile differs from capture")
@@ -256,4 +347,9 @@ class StatefulGraphs:
         if torch.is_grad_enabled() and any(t.requires_grad for t in outputs):
             self._busy[slot] = True
             outputs = _GraphOutputs.apply(self, slot, *outputs)
+        else:
+            # An eval/frozen invocation has no backward to hold the slot. Give
+            # callers (including asynchronous P2P) independent output storage.
+            outputs = tuple(output.clone() for output in outputs)
+            self._release(slot)
         return self.region.restore_result(outputs, state)

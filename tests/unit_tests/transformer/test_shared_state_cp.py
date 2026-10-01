@@ -115,3 +115,61 @@ def test_cp_collective_region_matches_eager_in_recompute_and_graphs(cp, mode):
     if mode != "recompute":
         del output, reference
         graphs.close()
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "zigzag"])
+def test_tp_sp_cp_gather_orders_tokens_and_sums_owner_gradients(layout):
+    """Exercise TP2 x CP2 using independent global-token and gradient oracles."""
+    if Utils.world_size < 4 or Utils.world_size % 4:
+        pytest.skip("Requires TP2 x CP2")
+    Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
+    groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp", "tp_cp"])
+    options = dict(sequence_parallel=True, tp_group=groups.tp, tp_cp_group=groups.tp_cp)
+    try:
+        logical_rank = groups.cp.rank() * 2 + groups.tp.rank()
+        whole = torch.arange(64, device="cuda").float().reshape(32, 2)
+        value = whole[logical_rank * 8 : (logical_rank + 1) * 8].clone().requires_grad_()
+        ids = torch.arange(logical_rank * 8, (logical_rank + 1) * 8, device="cuda")
+        schema = TensorSchema(
+            (
+                TensorField("value", (8, 2), torch.float32, "contiguous", True),
+                TensorField("ids", (8,), torch.int64, "contiguous", False),
+            )
+        )
+        state = {"value": value, "ids": ids}
+        if layout == "zigzag":
+            state, schema = redistribute_state(state, schema, "zigzag", groups.cp, **options)
+            segment = groups.cp.rank() if groups.tp.rank() == 0 else 3 - groups.cp.rank()
+            torch.testing.assert_close(state["value"], whole[segment * 8 : (segment + 1) * 8])
+            restored, _ = redistribute_state(state, schema, "contiguous", groups.cp, **options)
+            torch.testing.assert_close(restored["value"], value)
+        gathered, _ = gather_state(state, schema, groups.cp, **options)
+        torch.testing.assert_close(gathered["value"], whole)
+        torch.testing.assert_close(gathered["ids"], torch.arange(32, device="cuda"))
+        (gathered["value"].square().sum() * (logical_rank + 1)).backward()
+        torch.testing.assert_close(value.grad, 20 * value)
+        for function, args in (
+            (gather_state, (state, schema, groups.cp)),
+            (redistribute_state, (state, schema, layout, groups.cp)),
+        ):
+            with pytest.raises(ValueError, match="tp_group is required"):
+                function(*args, sequence_parallel=True)
+            with pytest.raises(ValueError, match="tp_cp_group is required"):
+                function(*args, sequence_parallel=True, tp_group=groups.tp)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_zigzag_gather_needs_only_one_collective_per_field(cp, monkeypatch):
+    state, schema = _state(cp)
+    state, schema = redistribute_state(state, schema, "zigzag", cp)
+
+    def unexpected_exchange(*args, **kwargs):
+        pytest.fail("Zigzag gather must not perform a preliminary all-to-all")
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", unexpected_exchange)
+    gathered, _ = gather_state(state, schema, cp)
+    torch.testing.assert_close(
+        gathered["shared"], torch.arange(32, device="cuda").float().reshape(16, 2)
+    )
+    torch.testing.assert_close(gathered["ids"], torch.arange(16, device="cuda"))

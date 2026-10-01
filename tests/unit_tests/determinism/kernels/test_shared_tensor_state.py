@@ -68,20 +68,31 @@ def test_shared_region_replays_forward_and_all_gradients(mode):
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("operation", ["gather", "layout"])
-def test_shared_cp_state_replays_forward_and_gradients(operation):
+@pytest.mark.parametrize("operation", ["gather", "layout", "zigzag_gather"])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_shared_cp_state_replays_forward_and_gradients(operation, sequence_parallel):
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip("Requires an even number of workers")
-    Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
-    group = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["cp"]).cp
-    seeded()
+    if sequence_parallel and (Utils.world_size < 4 or Utils.world_size % 4):
+        pytest.skip("Requires TP2 x CP2")
+    Utils.initialize_model_parallel(2 if sequence_parallel else 1, 1, context_parallel_size=2)
+    groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["cp", "tp", "tp_cp"])
+    group = groups.cp
+    options = dict(
+        sequence_parallel=sequence_parallel, tp_group=groups.tp, tp_cp_group=groups.tp_cp
+    )
+    seeded(1234 + Utils.rank)
     schema = TensorSchema((TensorField("memory", (16, 4), torch.float32, "contiguous", True),))
 
     def run(value):
         if operation == "gather":
-            result, _ = gather_state({"memory": value}, schema, group)
+            result, _ = gather_state({"memory": value}, schema, group, **options)
         else:
-            result, _ = redistribute_state({"memory": value}, schema, "zigzag", group)
+            result, layout = redistribute_state(
+                {"memory": value}, schema, "zigzag", group, **options
+            )
+            if operation == "zigzag_gather":
+                result, _ = gather_state(result, layout, group, **options)
         return result["memory"]
 
     try:
