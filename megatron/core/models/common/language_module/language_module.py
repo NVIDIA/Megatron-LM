@@ -17,7 +17,10 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
@@ -43,12 +46,11 @@ class LanguageModule(MegatronModule):
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
-        assert pg_collection is not None, (
-            "LanguageModule requires an explicit pg_collection. The global parallel grid is not a "
-            "safe default: a model built on independent grids (vision encoder + LLM, GTP, MIMO) "
-            "would silently get the wrong one. "
-            "See docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            # The global grid is only a compatibility default: a model built on independent grids
+            # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it.
+            warn_global_process_group_fallback(type(self).__name__)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         for pg_name in ('tp', 'cp', 'pp', 'embd'):
             assert pg_name in vars(pg_collection), (
                 f"LanguageModule pg_collection must explicitly define {pg_name}; "

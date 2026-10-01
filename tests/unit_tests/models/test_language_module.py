@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -38,10 +38,21 @@ def config():
 
 
 @pytest.mark.parametrize('pass_none', [False, True])
-def test_requires_explicit_collection(explicit_groups, pass_none):
+def test_omitted_collection_warns_and_uses_global_groups(mocker, explicit_groups, pass_none):
+    """Omitting the collection is deprecated: it warns and keeps using the global grid."""
+    mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
+    global_groups = mocker.patch.object(
+        ProcessGroupCollection, 'use_mpu_process_groups', return_value=explicit_groups
+    )
+    mocker.patch('torch.distributed.is_initialized', return_value=True)
     kwargs = {'pg_collection': None} if pass_none else {}
-    with pytest.raises(AssertionError, match='requires an explicit pg_collection'):
-        LanguageModule(config(), **kwargs)
+    with pytest.warns(
+        DeprecationWarning, match='LanguageModule was called without `pg_collection`'
+    ):
+        model = LanguageModule(config(), **kwargs)
+    global_groups.assert_called_once_with()
+    assert model.pg_collection is explicit_groups
+    assert model.tp_group is explicit_groups.tp
 
 
 @pytest.mark.parametrize('field', ['tp', 'cp', 'pp', 'embd'])
