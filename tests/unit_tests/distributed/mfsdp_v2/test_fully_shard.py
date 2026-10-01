@@ -298,32 +298,43 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
     width = 2 * world_size
     vocab_size = 4 * width
     mesh = init_device_mesh(device.type, (world_size,))
-    torch.manual_seed(1234)
-    baseline = TinySharedMTP(width, vocab_size).to(device)
-    model = TinySharedMTP(width, vocab_size).to(device)
-    model.load_state_dict(baseline.state_dict())
-    with fully_shard_context(device=device):
-        fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
     torch.manual_seed(5678 + rank)
     seq_length = 4
     token_ids = torch.randint(vocab_size, (2, seq_length + 3), device=device)
-    hidden_states = torch.randn(2, seq_length, width, device=device, requires_grad=True)
-    baseline_hidden_states = hidden_states.detach().clone().requires_grad_()
-    loss = model(token_ids, hidden_states)
-    baseline_loss = baseline(token_ids, baseline_hidden_states)
-    loss.backward()
-    baseline_loss.backward()
+    hidden_states = torch.randn(2, seq_length, width, device=device)
+
+    def run_backward(shard_model):
+        # Each run starts from the same weights and its own copy of the backbone output.
+        torch.manual_seed(1234)
+        model = TinySharedMTP(width, vocab_size).to(device)
+        if shard_model:
+            with fully_shard_context(device=device):
+                fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
+                fully_shard(model, mesh=mesh, placements=_default_placements())
+
+        inputs = hidden_states.detach().clone().requires_grad_()
+        loss = model(token_ids, inputs)
+        loss.backward()
+
+        gradients = {}
+        for name, parameter in model.named_parameters():
+            grad = parameter.grad
+            if shard_model:
+                grad = grad.to_local()
+            else:
+                dist.all_reduce(grad)
+                grad.div_(world_size)
+            gradients[name] = grad.detach().clone()
+        return loss.detach(), inputs.grad.detach().clone(), gradients
+
+    baseline_loss, baseline_input_grad, baseline_grads = run_backward(shard_model=False)
+    loss, input_grad, sharded_grads = run_backward(shard_model=True)
 
     torch.testing.assert_close(loss, baseline_loss)
-    torch.testing.assert_close(hidden_states.grad, baseline_hidden_states.grad)
-    for name, parameter in model.named_parameters():
-        baseline_grad = baseline.get_parameter(name).grad
-        dist.all_reduce(baseline_grad)
-        baseline_grad.div_(world_size)
+    torch.testing.assert_close(input_grad, baseline_input_grad)
+    for name, local_grad in sharded_grads.items():
+        baseline_grad = baseline_grads[name]
         # FSDP packs parameters together, so individual row shards can be uneven or empty.
-        local_grad = parameter.grad.to_local()
         row_counts = [None] * world_size
         dist.all_gather_object(row_counts, local_grad.size(0))
         assert sum(row_counts) == baseline_grad.size(0)
