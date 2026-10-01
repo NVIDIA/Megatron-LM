@@ -6,6 +6,7 @@ These exercise selection, the tuned table and policy resolution directly, so
 they need neither a GPU nor a working triton install.
 """
 
+import importlib
 import json
 import logging
 import os
@@ -313,6 +314,27 @@ def test_packaged_tables_are_loadable():
         table = table_mod.load(arch)
         assert table, f"packaged table for {arch} is empty"
         assert table.provenance["arch"] == arch
+
+
+def test_packaged_entries_name_live_candidates():
+    """Each packaged entry for an in-tree kernel must name one of its current candidates.
+
+    A stale entry does not fail at run time: it misses, and the kernel quietly falls
+    back to the cheapest candidate.
+    """
+    autotuner = pytest.importorskip("triton.runtime.autotuner")
+    for arch in ("sm100", "sm103"):
+        table = table_mod.load(arch)
+        for kernel, entries in table.kernels.items():
+            if not kernel.startswith("megatron.core."):
+                continue
+            module_name, name = kernel.rsplit(".", 1)
+            tuner = getattr(importlib.import_module(module_name), name)
+            if not isinstance(tuner, autotuner.Autotuner):
+                pytest.skip(f"{kernel} is not built with this triton install")
+            assert f"{selection.kernel_module(tuner)}.{selection.kernel_name(tuner)}" == kernel
+            for key in entries:
+                assert table.lookup(kernel, key, tuner.configs) is not None, (arch, kernel, key)
 
 
 def test_verify_cadence_requires_the_interception():

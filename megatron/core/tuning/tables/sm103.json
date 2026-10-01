@@ -158,9 +158,380 @@
     "num_stages": 3,
     "num_warps": 4
    }
+  },
+  "megatron.core.fusions.fused_mhc_kernels._triton_h_agg_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_C": 512,
+     "BLOCK_S": 4
+    },
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  },
+  "megatron.core.fusions.fused_mhc_kernels._triton_hpb_bwd_g_hp_hr_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_C": 256,
+     "BLOCK_S": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.fusions.fused_mhc_kernels._triton_hpb_bwd_g_x_orig_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_C": 256,
+     "BLOCK_S": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.fusions.fused_mhc_kernels._triton_hpb_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_C": 512,
+     "BLOCK_S": 1
+    },
+    "num_stages": 3,
+    "num_warps": 2
+   },
+   "C=2688|N=4|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_C": 128,
+     "BLOCK_S": 4
+    },
+    "num_stages": 3,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.fusions.fused_mhc_kernels._triton_sinkhorn_bwd_kernel": {
+   "*": {
+    "kwargs": {},
+    "num_stages": 3,
+    "num_warps": 1
+   }
+  },
+  "megatron.core.fusions.fused_mhc_kernels._triton_sinkhorn_fwd_kernel": {
+   "*": {
+    "kwargs": {},
+    "num_stages": 3,
+    "num_warps": 1
+   }
+  },
+  "megatron.core.fusions.fused_mla_yarn_rope_apply._mla_rope_bwd_inplace_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 32
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=128|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 16
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 16
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=1|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=1|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 1
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=2|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=2|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=4|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=4|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=64|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=8|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=8|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.fusions.fused_mla_yarn_rope_apply._mla_rope_bwd_kv_split_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=128|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=128|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=1|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 1
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=1|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 1
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=2|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 2
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=32|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 16
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=32|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 16
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=64|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=64|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=8|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=8|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.fusions.fused_mla_yarn_rope_apply._mla_rope_fwd_inplace_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 16
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=1|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 1
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=2|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=4|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=8|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|head_num=8|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.fusions.fused_mla_yarn_rope_apply._mla_rope_fwd_kv_split_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=128|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=128|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 16
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=1|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 1
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=2|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 4
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=32|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 32
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=32|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 32
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=64|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16": {
+    "kwargs": {
+     "BLOCK_H": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "emb_dim=64|k_dim=128|v_dim=128|head_num=64|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.int32": {
+    "kwargs": {
+     "BLOCK_H": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
   }
  },
  "packages": {},
- "source": "nemotron_3_ultra 96-GPU recording, majority vote over ranks",
+ "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown",
  "triton": ""
 }

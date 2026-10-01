@@ -117,9 +117,11 @@ movement, Transformer Engine's MoE permutation kernels: even elementwise
 arithmetic can round differently between configurations, because the layout
 decides whether values are computed packed or promoted and whether multiplies
 and adds are fused. A GPU test forces every candidate of each default entry and
-checks for bit-identical outputs. Covered reductions, such as the MLA RoPE and
-mHC backward kernels, fall back to the cheapest candidate without a table; record
-one to recover their throughput.
+checks for bit-identical outputs. A pinned kernel without a table entry falls
+back to the cheapest candidate, which can be several times slower than the
+fastest one. The packaged `sm100` and `sm103` tables carry entries for the
+in-tree MLA RoPE and mHC kernels; on other architectures, record a table to
+recover their throughput.
 
 In-tree SSM kernels also use `autotune_configs()` at decoration time. That helper
 uses the explicit deterministic-mode setter or PyTorch's deterministic flag and,
@@ -189,6 +191,14 @@ hooks; it cannot introduce new candidate configurations. Unmatched entries
 follow `on_miss`. Majority vote resolves ties by serialized configuration and
 does not establish global performance optimality. A version mismatch warns;
 bundled tables have empty version metadata and provide no compatibility proof.
+
+An entry keyed `*` applies to every tuning key of its kernel that has no entry of
+its own. The packaged MLA RoPE and mHC entries come from two sweeps that timed
+every candidate at 2k, 8k and 32k tokens, since the token count is not part of
+these kernels' tuning keys, keeping the config with the smallest worst-case
+slowdown: one `*` entry per kernel, plus an entry for each swept shape whose own
+best config beats `*` there by more than 5%. They were measured on `sm103`; the
+`sm100` entries are copies that have not been measured on that architecture.
 
 ## Diagnostics and configuration reference
 
