@@ -47,7 +47,6 @@ CAPTURES = load_captures(CAPTURE_ROOT, max_bytes=MAX_BYTES)
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NCCL GPUs"),
-    pytest.mark.launch_on_gb200,
 ]
 
 

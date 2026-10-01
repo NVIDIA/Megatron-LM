@@ -57,9 +57,8 @@ unused or calls bypass the binding.
 The capture entrypoint uses `megatron.determinism.bootstrap_training_determinism`
 before importing bound modules or initializing CUDA. It honors both
 `--deterministic-mode` and the effective `--yaml-cfg` policy, including YAML
-precedence over CLI flags. This requires the early MCore startup API from
-[#7419](https://github.com/NVIDIA/Megatron-LM/pull/7419). The training program
-still validates its full configuration. Capture with determinism disabled does
+precedence over CLI flags. The training program still validates its full
+configuration. Capture with determinism disabled does
 not opt the recipe into deterministic mode.
 
 Bindings are explicit because a function name alone cannot establish the
@@ -88,16 +87,16 @@ dtype, mode, implementation, and phase matches are exact; no shape-range or
 backend equivalence is inferred. Driver versions and call-time autocast, TF32,
 cuDNN settings and the memory-fill flag are part of that match. Both inventory
 and replay must record `runtime.fill_uninitialized_memory` as an explicit boolean.
-Missing or non-boolean values remain unverified, including when both old records
-omit the field. The consumer does not infer a setting from source revision or a
-current default. If backward uses another runtime policy, its fill flag must also
-be explicit. Historical reports are not rewritten to the new default.
+Missing or non-boolean values remain unverified, even when both sides omit the
+field. The consumer does not infer a setting from the source revision or a
+library default. If backward uses another runtime policy, its fill flag must also
+be explicit.
 Triton cache policy/directory and all
 `TRITON_AUTOTUNE_BLOCK_*` overrides are matched at startup and at each call,
-including changes made after capture starts. Older evidence without these fields
-does not match a new capture. A cache directory is provenance, not proof that
-cache contents or selected configurations are unchanged.
-New captures retain source/environment context before and after training. A
+including changes made after capture starts. Evidence without these fields does
+not match. A cache directory is provenance, not proof that cache contents or
+selected configurations are unchanged.
+Captures record source/environment context before and after training. A
 changed revision, dirty-tree status, or recorded environment prevents completion
 and leaves the inventory unverified. The consumer independently rejects recorded
 context drift, even if a capture claims completion. These boundary checks do not
@@ -150,7 +149,7 @@ microbenchmarks by dropping their seeds, hashes or other configuration fields.
 For bounded diagnostics, a binding can select `"adapter": "tensor_parallel_collective"`.
 This mode **copies tensor contents to host memory and synchronizes device work**.
 Use the original uninstrumented recipe for final state replay and performance.
-The default metadata-only mode retains its behavior.
+Bindings without an adapter remain metadata-only.
 
 Example binding at an actual call site:
 
@@ -172,7 +171,7 @@ writes a manifest and SHA-256-addressed binary blobs. Raw tensor contents remain
 there; coverage JSON contains metadata and hashes. The byte limit applies per
 rank, including a bound on the storage needed to restore each tensor.
 `--max-signatures` also limits the number of recorded collective events. Exceeded
-limits and unsupported invocations produce capture issues, preventing D coverage
+limits and unsupported invocations produce capture issues, preventing verified-deterministic coverage
 while allowing the original training calls to proceed.
 
 The adapter supports the six direct TP/SP mappings (copy, reduce, first/last
@@ -200,18 +199,20 @@ python -m torch.distributed.run --nproc-per-node 8 \
 ```
 
 Use the recipe's actual GPU count rather than assuming eight. The launcher uses
-the existing evidence plugin with a dedicated fixture, excluding generic
+the coverage evidence plugin with a dedicated fixture, excluding generic
 unit-test defaults that would change the recipe's NCCL settings. Every rank's
 manifest, blob hashes and peer contracts are checked before collective replay.
 Groups are recreated with their recorded options; identical memberships with
 different options remain distinct. Options that cannot be restored exactly are
 rejected. Split communicators require a separate adapter for their parent group.
-The initial protocol requires the same mapping/invocation/phase order on all
+Replay requires the same mapping/invocation/phase order on all
 global ranks; disjoint TP groups are supported. Each event runs three times with
 side-stream contention, compares all output/input-gradient bytes, and checks an
 independent CPU FP64 reference using the captured rank inputs. Forward and
 forward/backward evidence are produced separately, with their complete matching
-signatures. The existing consumer joins the resulting report to the inventory.
+signatures. Aggregate the replay shards with
+`python -m tools.determinism.coverage /shared/replay-evidence --output /shared/replay-coverage.json`
+and pass that report to `tools.determinism.recipe_coverage --evidence`.
 
 Implicit groups, TP1, uneven splits, global buffers, alternate output-gradient
 semantics, higher-order autograd, mixed forward/backward runtime, incompatible
@@ -222,7 +223,7 @@ results do not certify full training state, restarts, collective interactions,
 cross-allocation behavior, or performance.
 
 Full automatic operation discovery, first-divergence tensor comparison, and
-checkpoint-state certification are separate extensions; this PR provides the
+checkpoint-state certification are out of scope; this tool provides the
 inventory-to-evidence contract and a bounded runtime producer.
 
 CPU contract tests:
@@ -241,10 +242,9 @@ issues, never type-only signatures. Non-finite scalar arguments use tagged strin
 Returned leaf tensors do not receive persistent backward hooks; their missing
 backward observation is reported as a capture issue.
 
-Strict coverage returns 1 for a matching N, 2 for incomplete or unknown coverage,
-and 3 for invalid input or report-write failures. The replay launcher returns 2
-if no cases pass, including a CUDA skip. Startup/replay require #7419 and #7317;
-standalone branch tests skip only those integration cases until they are present.
+Strict coverage returns 1 for a matching nondeterministic operation, 2 for
+incomplete or unknown coverage, and 3 for invalid input or report-write failures.
+The replay launcher returns 2 if no cases pass, including a CUDA skip.
 
 Replay `--max-bytes` must equal capture `--max-collective-bytes`. Replay names any
 NCCL environment keys that differ. Programmatic allocator setup (for example

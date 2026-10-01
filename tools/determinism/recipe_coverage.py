@@ -39,7 +39,7 @@ def signature_key(signature: dict) -> str:
 
 
 def _has_memory_fill_policy(signature: dict) -> bool:
-    """Legacy or malformed policy records cannot establish a recipe match."""
+    """Require an explicit boolean memory-fill policy for every runtime in the signature."""
     runtimes = [signature.get("runtime")]
     if "backward_runtime" in signature:
         runtimes.append(signature["backward_runtime"])
@@ -296,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Fail on known N; exit 2 for unknown/incomplete coverage",
+        help="Exit 1 on a matching nondeterministic operation, 2 on unknown or incomplete coverage",
     )
     args = parser.parse_args(argv)
     try:

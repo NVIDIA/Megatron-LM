@@ -44,7 +44,7 @@ DTYPES = {str(dtype): dtype for dtype in (torch.float32, torch.bfloat16)}
 
 
 def nccl_environment() -> dict:
-    """Retain explicit NCCL/PyTorch communication overrides, including new keys."""
+    """Record every NCCL_* and TORCH_NCCL_* variable plus the tracked NCCL keys (None if unset)."""
     keys = set(NCCL_KEYS) | {key for key in os.environ if key.startswith(("NCCL_", "TORCH_NCCL_"))}
     return {key: os.environ.get(key) for key in sorted(keys)}
 
@@ -199,7 +199,7 @@ def load_tensor(
 def load_captures(root: Path, *, max_bytes: int) -> list[dict]:
     """Validate all rank schedules and blobs before any replay collective starts.
 
-    The initial replay protocol requires the same mapping/phase order on every
+    Replay requires the same mapping/phase order on every
     global rank, allowing disjoint equal-sized TP groups. Other schedules need
     an explicit adapter; ranks are never pooled or silently reordered.
     """
@@ -339,8 +339,8 @@ def load_captures(root: Path, *, max_bytes: int) -> list[dict]:
         if (
             len(
                 {
-                    (e["call_id"], s["implementation"], s["phase"])
-                    for e, s in zip(events, signatures)
+                    (event["call_id"], signature["implementation"], signature["phase"])
+                    for event, signature in zip(events, signatures)
                 }
             )
             != 1
