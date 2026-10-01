@@ -248,7 +248,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         dynamic_resolution=getattr(args, 'dynamic_resolution', False),
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
-        spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
+        # A native 2x2 merger needs even patch grids, like pixel shuffle.
+        spatial_merge_size=2 if getattr(args, 'conv_merging', False) else 1,
         dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
         dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),
