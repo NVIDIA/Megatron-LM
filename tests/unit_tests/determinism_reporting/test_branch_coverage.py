@@ -20,6 +20,10 @@ def branch_project(pytester, monkeypatch):
     root = Path(__file__).resolve().parents[3]
     monkeypatch.setenv("PYTHONPATH", str(root))
     monkeypatch.setenv("RANK", "0")
+    # CI runs the unit tests under `coverage run` with multiprocessing concurrency, which exports
+    # COVERAGE_RCFILE. A nested `coverage run` would inherit that config, whose `omit` covers
+    # /tmp, and measure nothing in this project.
+    monkeypatch.delenv("COVERAGE_RCFILE", raising=False)
     pytester.makeini("[pytest]\n")
     pytester.makeconftest("""
 from tools.determinism import pytest_plugin
@@ -227,7 +231,11 @@ def test_different_branch_denominators_are_rejected(field, value):
         aggregate(rows)
 
 
-def test_source_changes_during_collection_are_rejected(tmp_path):
+def test_source_changes_during_collection_are_rejected(tmp_path, monkeypatch):
+    # Use a private branch collector even when the suite itself runs under CI's statement-only
+    # `coverage run`; rejecting that collector is covered by
+    # test_statement_only_outer_collector_is_rejected.
+    monkeypatch.setattr(coverage.Coverage, "current", classmethod(lambda cls: None))
     source = tmp_path / "op.py"
     source.write_text("def f(x):\n    if x:\n        return 1\n    return 0\n")
     recorder = BranchRecorder(tmp_path, ["op.py"], tmp_path / "raw.json")
