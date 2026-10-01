@@ -214,6 +214,151 @@ def _test_fused_mla_rope_inplace(
     )
 
 
+def _packed_thd_positions(cu_seqlens, num_rows, cp_size, cp_rank):
+    """Reference position of every CP-local row of a packed THD batch.
+
+    The rows of each sequence follow those of the previous one. With context parallelism, a
+    sequence is split into ``2 * cp_size`` equal chunks and rank ``r`` holds chunks ``r`` and
+    ``2 * cp_size - 1 - r``, in that order. Rows past ``cu_seqlens[-1] // cp_size`` (CUDA-graph
+    padding) belong to no sequence and use position 0.
+    """
+    positions = torch.zeros(num_rows, dtype=torch.int64)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if cp_size == 1:
+            positions[start:end] = torch.arange(end - start)
+            continue
+        chunk = (end - start) // (2 * cp_size)
+        row = start // cp_size
+        for chunk_id in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            positions[row : row + chunk] = chunk_id * chunk + torch.arange(chunk)
+            row += chunk
+    return positions.to(cu_seqlens.device)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("kernel", ["inplace", "concat", "kv_split"])
+def test_mla_rope_many_packed_thd_sequences_match_reference_positions(monkeypatch, kernel, cp_size):
+    """Every packed THD row must be rotated with the position it has in its own sequence.
+
+    The in-place, packing and key/value split kernels look up the sequence of each row in
+    ``cu_seqlens``. Use hundreds of short sequences, zero-length ones (first, last and a run in
+    the middle), CUDA-graph padding rows and every CP rank, forward and backward. Run the batch
+    also without its last, zero-length sequence, so that the last sequence has rows. The result
+    must equal, bit for bit, the same kernel on an SBHD view with batch size 1 (which reads the
+    cos/sin row of its own row index) with the tables gathered at the reference positions.
+    """
+    triton = pytest.importorskip("triton")
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    # One BLOCK_H for both layouts: the key/value split backward sums the heads in tiles of
+    # BLOCK_H. A single-config autotuner runs that config without benchmarking.
+    autotuners = {
+        "inplace": ("_mla_rope_fwd_inplace_kernel", "_mla_rope_bwd_kernel"),
+        "concat": ("_mla_rope_concat_fwd_kernel", "_mla_rope_concat_bwd_kernel"),
+        "kv_split": ("_mla_rope_fwd_kv_split_kernel", "_mla_rope_bwd_kv_split_kernel"),
+    }[kernel]
+    for name in autotuners:
+        monkeypatch.setattr(getattr(rope_kernels, name), "configs", [triton.Config({"BLOCK_H": 2})])
+
+    emb_dim, num_heads, num_seqs, padding_rows = 64, 4, 300, 5
+    generator = torch.Generator().manual_seed(1234)
+    # Context parallelism needs every sequence length to be a multiple of 2 * cp_size.
+    multiple = 1 if cp_size == 1 else 2 * cp_size
+    lengths = torch.randint(1, 33, (num_seqs,), generator=generator) * multiple
+    lengths[::7] = 0
+    lengths[100:104] = 0
+    lengths[-1] = 0
+    cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    cu_seqlens = cu_seqlens.to(device="cuda", dtype=torch.int32)
+    num_rows = int(cu_seqlens[-1]) // cp_size + padding_rows
+    freqs = torch.randn(int(lengths.max()), emb_dim, generator=generator).cuda()
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+
+    if kernel == "inplace":
+        nope_dim = 64
+        shapes = [(num_heads, nope_dim + emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            # remove_interleaving=True stores every channel where it was loaded.
+            out = rope_kernels.fused_mla_rope_inplace(
+                inputs[0],
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                remove_interleaving=True,
+            )
+            return (out,)
+
+    elif kernel == "concat":
+        nope_dim = 128
+        shapes = [(num_heads, nope_dim), (num_heads, emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            nope, rope = inputs
+            out = rope_kernels.fused_mla_rope_concat(
+                nope, rope, cos, sin, cu_seqlens, cp_rank, cp_size
+            )
+            return (out,)
+
+    else:
+        k_dim = v_dim = 32
+        shapes = [(num_heads, k_dim + v_dim), (1, emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            kv, k_pos_emb = inputs
+            return rope_kernels.fused_mla_rope_kv_split(
+                kv,
+                k_pos_emb,
+                cos,
+                sin,
+                emb_dim,
+                k_dim,
+                v_dim,
+                cu_seqlens_kv=cu_seqlens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+
+    # Without its last, zero-length sequence, the batch has the same rows and positions, but the
+    # last sequence of cu_seqlens is no longer empty.
+    batches = [(cu, rank) for cu in (cu_seqlens, cu_seqlens[:-1]) for rank in range(cp_size)]
+    for batch_cu_seqlens, cp_rank in batches:
+        positions = _packed_thd_positions(batch_cu_seqlens, num_rows, cp_size, cp_rank)
+        values = [
+            torch.randn(num_rows, *shape, dtype=torch.bfloat16, device="cuda") for shape in shapes
+        ]
+        thd_inputs = [v.clone().requires_grad_(True) for v in values]
+        sbhd_inputs = [v.unsqueeze(1).clone().requires_grad_(True) for v in values]
+        thd_outputs = run(thd_inputs, cos, sin, batch_cu_seqlens, cp_rank, cp_size)
+        sbhd_outputs = run(sbhd_inputs, cos[positions], sin[positions])
+        label = f"{len(batch_cu_seqlens) - 1} sequences, cp_rank {cp_rank}"
+        for thd, sbhd in zip(thd_outputs, sbhd_outputs):
+            torch.testing.assert_close(
+                thd, sbhd.squeeze(1), rtol=0, atol=0, msg=lambda msg: f"{label} fwd: {msg}"
+            )
+        grads = [torch.randn_like(out) for out in thd_outputs]
+        torch.autograd.backward(thd_outputs, [g.clone() for g in grads])
+        torch.autograd.backward(sbhd_outputs, [g.unsqueeze(1).clone() for g in grads])
+        for thd, sbhd in zip(thd_inputs, sbhd_inputs):
+            torch.testing.assert_close(
+                thd.grad,
+                sbhd.grad.squeeze(1),
+                rtol=0,
+                atol=0,
+                msg=lambda msg: f"{label} bwd: {msg}",
+            )
+
+
 @pytest.mark.experimental
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
