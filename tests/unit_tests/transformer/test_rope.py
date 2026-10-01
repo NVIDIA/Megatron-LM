@@ -72,9 +72,7 @@ def _cpu_multimodal_rope(kv_channels: int = 64) -> MultimodalRotaryEmbedding:
     dim = kv_channels
     emb.rotary_interleaved = False
     emb.seq_len_interpolation_factor = None
-    emb.inv_freq = 1.0 / (
-        10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-    )
+    emb.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     emb.cp_group = None
     return emb
 
@@ -88,7 +86,9 @@ class TestMultimodalRotaryEmbeddingPackedSeqCP:
         seq_len = 8
         mrope_section = [8, 12, 12]
         # Distinct T/H/W positions so a wrong CP slice would change values, not only shape.
-        position_ids = torch.arange(seq_len, dtype=torch.float32).view(1, 1, seq_len).repeat(3, 1, 1)
+        position_ids = (
+            torch.arange(seq_len, dtype=torch.float32).view(1, 1, seq_len).repeat(3, 1, 1)
+        )
         position_ids[1] = position_ids[1] + 10
         position_ids[2] = position_ids[2] + 20
 
@@ -113,9 +113,7 @@ class TestMultimodalRotaryEmbeddingPackedSeqCP:
             'megatron.core.models.common.embeddings.rotary_pos_embedding.get_pos_emb_on_this_cp_rank',
             return_value=sliced,
         ) as mock_slice:
-            out = rope(
-                position_ids, mrope_section, packed_seq=False, cp_group=_FakeCPGroup(0, 2)
-            )
+            out = rope(position_ids, mrope_section, packed_seq=False, cp_group=_FakeCPGroup(0, 2))
 
         mock_slice.assert_called_once()
         assert out.shape[0] == seq_len // 2
@@ -131,9 +129,7 @@ class TestMultimodalRotaryEmbeddingPackedSeqCP:
         with patch(
             'megatron.core.models.common.embeddings.rotary_pos_embedding.get_pos_emb_on_this_cp_rank'
         ) as mock_slice:
-            out = rope(
-                position_ids, mrope_section, packed_seq=True, cp_group=_FakeCPGroup(1, 2)
-            )
+            out = rope(position_ids, mrope_section, packed_seq=True, cp_group=_FakeCPGroup(1, 2))
 
         mock_slice.assert_not_called()
         assert out.shape[0] == seq_len
