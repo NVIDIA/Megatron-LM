@@ -139,8 +139,7 @@ revision**, containing both features. Reports from separate PR heads cannot be
 joined. The shared adapter records its own source hash, input fingerprints,
 strict Torch policy (including warn-only and memory-fill settings), autocast/TF32/
 cuDNN settings, CUDA/driver/GPU details, package versions and environment overrides.
-Default and deterministic timing arms must differ only in the declared policy;
-old reports lacking this contract remain ineligible for author evidence.
+Default and deterministic timing arms must differ only in the declared policy.
 
 After collecting the coverage report and the twelve-row leaderboard:
 
@@ -174,5 +173,4 @@ The CLI writes JSON and Markdown plus hashes of its input artifacts before
 returning. Exit 0 means complete, nonfailing evidence; exit 1 means a numerical or
 performance failure; exit 2 means missing/incompatible/uncertain evidence. Add
 `--require-performance-pass` to also return 2 for an unbudgeted bundle. Existing
-reports are not overwritten. Combining compatible coverage/performance CI jobs
-and calibrated PR-wide enforcement still needs the combined GPU workflow.
+reports are not overwritten.
