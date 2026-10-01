@@ -89,7 +89,6 @@ def policy_environment(parent: dict, context: dict, collective: dict, mode: str)
             env.pop(key, None)
         else:
             env[key] = value
-    env["DETERMINISM_PERF_MODE"] = mode
     env["PYTHONHASHSEED"] = "0"
     return env
 

@@ -339,6 +339,6 @@ missing accuracy evidence fail and leave the partial attempt for diagnosis.
 Ratios are report-only unless explicit reviewed `--max-overhead-ratio` and/or
 `--max-regression-ratio` limits are supplied; fewer than three pairs remain
 inconclusive. Local-activation leaderboard and calibration reports retain their
-own format. Use the explicit collective publication and artifact-consumer paths
-below for this report kind. Reviewed baseline promotion and production-recipe
-performance acceptance remain separate work.
+own format; collective reports have their own bundle and calibration format.
+Reviewed baseline promotion and production-recipe performance acceptance remain
+separate work.
