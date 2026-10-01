@@ -885,6 +885,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
+        # Main parameter groups put FP32 shards before FP16/BF16-derived shards.
+        # Rebuild the checkpoint lookup in that order instead of buffer traversal order,
+        # which can differ when a parameter group contains both model dtypes.
+        self.model_param_group_index_map = {
+            model_param: (group_index, group_order)
+            for group_index, (fp32_params, float16_params) in enumerate(
+                zip(self.model_fp32_groups, self.model_float16_groups)
+            )
+            for group_order, model_param in enumerate(fp32_params + float16_params)
+        }
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
