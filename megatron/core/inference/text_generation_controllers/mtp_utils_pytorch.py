@@ -14,6 +14,7 @@ def rewind_kv_cache(
     num_speculative_tokens,
     block_size_tokens,
     num_active_requests=None,
+    keep_extra_blocks=False,
 ):
     """Update the KV cache bookkeeping for speculative decoding.
 
@@ -27,6 +28,10 @@ def rewind_kv_cache(
        - Reduce kv_block_counts
        - Update last_kv_block_id to point to the previous block
        - Clear the entry in kv_block_ids for the released block
+
+    With keep_extra_blocks=True, retain all owned blocks as MTP lookahead and move
+    only the main write pointer and token offsets. This keeps the upcoming draft loop
+    within allocated memory even after rejection crosses a block boundary.
 
     Mutates the input tensors in-place.
 
@@ -85,6 +90,16 @@ def rewind_kv_cache(
         # 4. Clear the entry in kv_block_ids for the released block
         # 5. Release the block back to the allocator
         blocks_to_release[i] = last_block
+
+        if keep_extra_blocks:
+            # Rejection moves the main pointer back, but the next MTP draft loop still
+            # needs the lookahead reserved before verification. Retain ownership until
+            # the request advances into these blocks or releases its entire row.
+            if prefill != 1:
+                last_position = kv_length - num_to_rewind + num_speculative_tokens
+                last_kv_block_id[i] = kv_block_ids_list[i][last_position // block_size_tokens]
+            remove_mask[i] = False
+            continue
 
         # Reduce block counts for requests that crossed back
         new_block_count = block_count - 1 if remove else block_count

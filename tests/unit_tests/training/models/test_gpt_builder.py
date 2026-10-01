@@ -12,6 +12,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import gpt_config_from_args
 from megatron.training.arguments import parse_args, validate_args
@@ -842,22 +843,22 @@ class TestMtpBlockSpec:
         result = mtp_block_spec(config, spec)
         assert result is None
 
+    @pytest.mark.parametrize("attention_variant", [None, "gdn", "gdn2", "dsa", "dsv4_hybrid"])
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
-    def test_uses_explicit_spec_when_layer_specs_nonempty(self, mock_get_mtp):
+    def test_reuses_last_resolved_decoder_layer_spec(self, mock_get_mtp, attention_variant):
         config = self._make_config(mtp_num_layers=1)
-        spec = Mock(spec=ModuleSpec)
-        spec.layer_specs = [Mock()]  # Non-empty
+        config.transformer.experimental_attention_variant = attention_variant
+        layer_specs = [ModuleSpec(module=object), ModuleSpec(module=object)]
+        spec = TransformerBlockSubmodules(layer_specs=layer_specs)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        with patch(
-            "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
-        ) as mock_decoder_specs:
-            mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec)
+        result = mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
 
-        # When layer_specs is non-empty, use the last decoder spec (not the explicit spec arg)
-        passed_spec = mock_get_mtp.call_args.args[1]
-        assert passed_spec is mock_decoder_specs.return_value[-1]
+        mock_get_mtp.assert_called_once_with(
+            config.transformer, layer_specs[-1], use_transformer_engine=True, vp_stage=3, pp_rank=7
+        )
+        assert mock_get_mtp.call_args.args[1] is layer_specs[-1]
+        assert result is mock_get_mtp.return_value
 
     @patch("megatron.training.models.gpt._te_or_local_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
@@ -865,17 +866,17 @@ class TestMtpBlockSpec:
         self, mock_get_mtp, mock_te_or_local
     ):
         config = self._make_config(mtp_num_layers=1)
-        spec = Mock(spec=ModuleSpec)
-        spec.layer_specs = []  # Empty → falls back to _te_or_local_layer_spec
+        spec = TransformerBlockSubmodules(layer_specs=[])
         fallback_spec = Mock(spec=ModuleSpec)
         mock_te_or_local.return_value = fallback_spec
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        mtp_block_spec(config, spec, vp_stage=4)
+        mtp_block_spec(config, spec, vp_stage=4, pp_rank=7)
 
         mock_te_or_local.assert_called_once_with(config, 4)
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is fallback_spec
+        assert mock_get_mtp.call_args.kwargs["pp_rank"] == 7
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_passes_vp_stage_and_use_te_to_get_gpt_mtp_block_spec(self, mock_get_mtp):
@@ -883,12 +884,10 @@ class TestMtpBlockSpec:
         spec = ModuleSpec(module=object)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        with patch(
-            "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
-        ) as mock_decoder_specs:
-            mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
+        result = mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
 
+        assert result is mock_get_mtp.return_value
+        assert mock_get_mtp.call_args.args[1] is spec
         call_kwargs = mock_get_mtp.call_args.kwargs
         assert call_kwargs["use_transformer_engine"] is True
         assert call_kwargs["vp_stage"] == 3
@@ -900,12 +899,9 @@ class TestMtpBlockSpec:
         spec = ModuleSpec(module=object)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        with patch(
-            "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
-        ) as mock_decoder_specs:
-            mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec)
+        mtp_block_spec(config, spec)
 
+        assert mock_get_mtp.call_args.args[1] is spec
         assert mock_get_mtp.call_args.kwargs["use_transformer_engine"] is False
 
 

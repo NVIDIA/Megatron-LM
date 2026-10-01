@@ -20,6 +20,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -27,6 +28,7 @@ from megatron.training.global_vars import (
     get_args,
     set_args,
     set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import (
     force_param_sync,
@@ -64,6 +66,18 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+
+
+def _gtp_grad_fence():
+    """GTP's pre-DP-sync fence; no-op when GTP is unavailable (gtp_api guards its exports)."""
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import (
+            wait_for_gtp_grad_reduction_on_current_stream,
+        )
+
+        wait_for_gtp_grad_reduction_on_current_stream()
 
 
 class TestFP8Param:
@@ -169,6 +183,9 @@ class TestFP8Param:
 
         validate_args(args)
         set_global_variables(args, False)
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        set_run_config(pretrain_cfg_container_from_args(args))
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -443,6 +460,9 @@ class TestFP8Param:
             loss.backward()
 
             if args.overlap_grad_reduce:
+                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
+                # grad sync and is what flushes an accumulated wgrad.
+                _gtp_grad_fence()
                 gpt_model[0].finish_grad_sync()
 
             for name, param in gpt_model[0].named_parameters():
@@ -757,6 +777,9 @@ class TestFP8Param:
             )
             output.mean().backward()
             if args.overlap_grad_reduce:
+                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
+                # grad sync and is what flushes an accumulated wgrad.
+                _gtp_grad_fence()
                 model[0].finish_grad_sync()
             update_successful, _, _ = optimizer.step()
             assert update_successful

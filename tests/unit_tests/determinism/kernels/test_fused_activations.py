@@ -95,6 +95,11 @@ GATED_CASES = {
         lambda x, w: weighted_squared_relu_impl(x, w, clamp_scale=10.0),
         (_act((TOKENS, FFN)), _weights(TOKENS)),
     ),
+    # Unweighted clamped path (weights=None) used by the dense MLP; saves only x for backward.
+    "clamped_squared_relu": lambda: (
+        lambda x: weighted_squared_relu_impl(x, None, clamp_scale=10.0),
+        (_act((TOKENS, FFN)),),
+    ),
 }
 
 
@@ -194,21 +199,25 @@ class TestFusedCrossEntropy:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
     @pytest.mark.xfail(
         strict=False,
         reason="op-catalog lists the fused cross entropy as non-deterministic; recorded, not gated",
     )
-    def test_fused_vocab_parallel_cross_entropy_replays(self):
+    def test_fused_vocab_parallel_cross_entropy_replays(self, dtype):
+        """Both logits dtypes: fp32 logits skip the internal upcast, and the backward must
+        hand back a gradient in the logits dtype rather than a hardcoded one."""
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        logits = _act((TOKENS, 32768))
+        logits = _act((TOKENS, 32768), dtype=dtype)
         target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
-        assert_replays_bit_exact(
+        _, grads = assert_replays_bit_exact(
             lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group),
             (logits, target),
             replays=4,
             what="fused_vocab_parallel_cross_entropy",
         )
+        assert grads["in[0]"].dtype == dtype
 
 
 # --- DeepSeek-V4 hybrid attention: compiled query RMS norm -----------------------------------
