@@ -9,9 +9,9 @@ declared cases actually completed a replay protocol on a particular revision,
 software stack, GPU, and rank count.
 
 The producer annotates local fused activations, TE normalization and attention,
-single-rank embedding accumulation, the MoE router GEMM, and SSM decode. These
-selected cases cover an incremental subset of manifest families, not every
-variant within them.
+single-rank embedding accumulation, the MoE router GEMM, SSM decode, and explicit-group
+tensor/sequence-parallel collective mappings. These selected cases cover an
+incremental subset of manifest families, not every variant within them.
 The distributed cross-entropy test is not annotated: its process-group contract
 needs a separate adapter. Other kernel families
 remain visible in `inventory_without_declared_cases`; they are not included in
@@ -57,6 +57,118 @@ The current protocol compares outputs and gradients within one process. It does
 not certify fresh-process dispatch, checkpoint restart, arbitrary shapes,
 unobserved internal kernels, or complete mutable training state. Correctness
 against an independent reference is a separate check.
+
+## Independent accuracy and sensitivity
+
+Kernel cases can emit `checks` alongside their replay `observations`. A reference
+check compares every output and input gradient against an independent graph.
+Its per-tensor diagnostics retain maximum absolute/relative error, the mixed
+`atol + rtol * abs(reference)` tolerance, violating/nonfinite counts, and a sample
+location. Zero references participate in the absolute tolerance; relative error
+excludes them and is null when there is no nonzero finite reference. Nonfinite
+values fail, even when they match. Failed checks retain their diagnostics.
+
+A sensitivity check first accepts the unchanged baseline, then requires the
+actual replay comparator to reject one bit flip separately in every output and
+gradient. This measures comparator wiring, not exposure to a real scheduling
+race. It does not emit synthetic `verified_nondeterministic` observations.
+
+`check_status` summarizes `reference` and `sensitivity` separately as `passed`,
+`failed`, or `not_verified`. A pass requires complete, clean, current replay
+evidence and checks for every replay signature on every required rank, with
+matching output/gradient counts. Unmatched checks cannot provide a pass. An
+observed, matching accuracy failure remains a failed reference check, even when
+pytest xfails; it never becomes a replay mismatch. Raw replay observations remain
+available, but a failed test phase makes the overall replay case unverified.
+
+Adapters can attach observed runtime fields with
+`tools.determinism.coverage.replay_configuration`. The active fields are included
+in replay, reference and sensitivity signatures, including nested scopes and
+failed checks. For example, an adapter that verifies the actual loaded backend
+binary can record its build identity once around all three checks. Different
+build identities still fail the exact-signature match; the context does not
+infer a dependency identity or make older incomplete evidence eligible.
+
+`author_requirements` lists the exact cases required by the manifest, including
+missing cases. `--require-author-checks` fails for any missing, failed or unverified
+requirement, and for an empty requirement set. The evidence runner applies
+this gate to the kernel scope. Legacy families with no `author_tests` remain replay-only; this is
+incremental onboarding, not an accuracy percentage for the repository.
+
+The first six required cases cover biased SwiGLU, weighted SwiGLU and weighted
+squared ReLU in BF16/FP32 with FP32 token weights, 4,096 tokens and FFN width
+8,192. The shared `tests/performance_tests/shell_test_utils/determinism/kernel_case.py`
+adapter generates native-dtype inputs from seed 1234 and uses all-ones upstream
+gradients. Author cases use strict Torch mode with
+warn-only disabled and restore prior settings after execution. A versioned
+`configuration.kernel_case` records the adapter source hash, exact input-byte
+fingerprints, complete positional arguments and actual GPU/software/runtime
+settings.
+
+The cases compare independent **FP64 eager autograd** outputs and every input
+gradient and inject both numerical and byte-comparator errors. Replays run with
+side-stream contention. Pointwise tolerances remain `rtol=0.02, atol=0.001` for
+BF16 and `rtol=atol=1e-6` for FP32, taken from existing weighted-fusion tests.
+The versioned `eager_fp64_autograd_staged_reductions:v2` reference explicitly
+rounds the per-token bias gradient to the input dtype **before** summation,
+matching the custom backward's interface. The report also retains errors against
+the ideal FP64 mathematical gradient; staging does not erase those differences.
+
+Reduction gradients require **both** a per-component bound and an L2 guard.
+For `n` independent terms, let `S = sum(abs(term))`, inflated for FP64 summation
+rounding, and `E = eps(term_dtype)*S` (`E = 0` for exact input terms). The
+component budget is `B = E + gamma_acc(n-1)*(S+E) + gamma64(n-1)*S`, plus
+`eps(output_dtype)*(abs(FP64_sum)+B)` for final casts, where `gamma_acc` uses the
+declared accumulation dtype (FP32 by default), `gamma(k)=k*u/(1-k*u)` and
+`u=eps/2`. This uses the conservative summation bound
+without assuming a compiler reduction tree; see
+[Higham's summation analysis, equation 2.6](https://nhigham.com/wp-content/uploads/2023/10/high93s.pdf).
+The additional guard requires
+`norm(actual-reference) <= atol*sqrt(component_count) + rtol*norm(reference)`.
+It retains the original tolerances and rejects systematic drift that the
+conservative component budget could admit. The report records term counts,
+precision, rounding, conditioning, component violations and both norm values.
+This is an explicit test policy, not a proof of intrinsic accuracy or a license
+to accept arbitrary per-component relative error near cancellation.
+
+Every tensor must reject a finite perturbation exceeding its numerical budget,
+including the smallest reference component. Missing controls cannot receive
+passing credit. Eighteen additional accuracy-only tests exercise two independent
+seeds, non-power-of-two widths, exact cancellation, and squared-ReLU dynamic
+range. They retain numerical checks in JUnit properties and do not add replay
+coverage credit. CPU contract tests do not establish GPU results.
+
+## Tensor and sequence parallel collectives
+
+`test_collective_mappings.py` declares 48 cases: six public mappings, FP32/BF16,
+contiguous/strided tensors, and TP2/full-allocation groups. The cases exercise
+all-reduce in forward and backward, plus first/last-dimension all-gather and
+reduce-scatter with their backward counterparts. Explicit groups have at least
+two members. Their ordered global ranks, local group rank, NCCL version and
+configuration are recorded alongside input/upstream-gradient hashes and layouts.
+Rank-distinct random inputs include exact routing and cancellation sentinels.
+
+Each case completes three forward/backward executions before comparing results.
+This deferred comparison prevents a local mismatch from skipping a later
+collective and stranding peers. An operation/runtime failure can still require
+launcher cleanup. The harness clones explicit upstream gradients for every
+execution because all-reduce backward can mutate its gradient argument.
+
+Independent references use the materialized CPU input and upstream-gradient
+tensors from every rank, never the observed collective output. Copy/gather
+results must match bytes exactly. Reductions use CPU FP64 sums and the same
+componentwise-plus-L2 evaluation described above, with exact input terms (`E=0`)
+and `gamma` computed for the input dtype. The BF16 contract does not assume
+FP32 accumulation inside NCCL. The separate L2 guard uses
+`rtol=gamma_dtype(group_size-1)+eps(dtype)` and `atol=0`; these are declared
+test policies, not fitted tolerances. Every output/gradient also runs numerical
+and byte-comparator negative controls.
+
+The evidence establishes same-process replay for the tested allocation and
+explicit configuration. `NCCL_ALGO=Ring` does not pin physical reduction order
+across allocations. Multi-node, GTP, quantized and overlapped collectives remain
+separate requirements. GTP keeps its manifest exemption. These mapping
+checks are not registered as `author_tests`.
 
 ## Running and reporting
 
@@ -252,3 +364,6 @@ mismatch alongside passing cases.
 Reports record requested and effective contention separately.
 `CUDA_DEVICE_MAX_CONNECTIONS=1` serializes side-stream traffic; those rows prove
 replay under that policy, not concurrent-stream stress.
+
+Reduction budgets charge the materialized term precision, not the output `atol`,
+to every term; the L2 guard and corruption controls are always required.

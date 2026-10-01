@@ -32,7 +32,7 @@ POLICY_ENVIRONMENT = {
 }
 
 SCOPES = {
-    "kernel": ("tests/unit_tests/determinism/kernels", []),
+    "kernel": ("tests/unit_tests/determinism/kernels", ["--require-author-checks"]),
     "model": ("tests/unit_tests/determinism/correctness", ["--require-parallelism"]),
 }
 

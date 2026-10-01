@@ -31,7 +31,9 @@ def launches(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("scope,views", [("kernel", []), ("model", ["--require-parallelism"])])
+@pytest.mark.parametrize(
+    "scope,views", [("kernel", ["--require-author-checks"]), ("model", ["--require-parallelism"])]
+)
 def test_runner_collects_one_session_then_applies_the_scope_gates(
     launches, tmp_path, monkeypatch, scope, views
 ):
