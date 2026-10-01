@@ -495,7 +495,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         qkvzba = qkvzba.transpose(0, 1)
 
         # Split the tensor into q, k, v, gate (z), beta, and alpha.
-        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
+        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len, cp_size)
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
@@ -550,7 +550,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
         kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, cp_size, beta, alpha
         )
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
