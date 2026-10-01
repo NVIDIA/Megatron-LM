@@ -123,7 +123,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                probs, routing_map = layer.mlp.route(
+                    pre_mlp_layernorm_output, packed_seq_params=packed_seq_params
+                )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )

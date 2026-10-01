@@ -507,8 +507,7 @@ class TopKRouter(Router):
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=aux_loss_groups.loss_reduce_groups[0],
-                reduce_groups=aux_loss_groups.loss_reduce_groups,
+                reduce_group=aux_loss_groups.loss_reduce_groups,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -566,8 +565,7 @@ class TopKRouter(Router):
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=aux_loss_groups.loss_reduce_groups[0],
-                reduce_groups=aux_loss_groups.loss_reduce_groups,
+                reduce_group=aux_loss_groups.loss_reduce_groups,
                 with_padding_mask=with_padding_mask,
                 topk=self.topk * bsz,
             )
