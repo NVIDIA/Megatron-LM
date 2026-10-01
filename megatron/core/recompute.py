@@ -5,7 +5,7 @@ from typing import List, Optional, Set, Tuple, Union
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel import ContextParallelLayoutState
+from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
@@ -32,6 +32,7 @@ def checkpointed_forward(
     packed_seq_params: PackedSeqParams,
     use_inner_quantization_context: bool,
     padding_mask: Optional[Tensor] = None,
+    padding_mask_by_layout: Optional[dict[CPLayout, Optional[Tensor]]] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
@@ -92,6 +93,11 @@ def checkpointed_forward(
                     )
                 # Keep both residuals in the layer's layout, inside the CP conversions.
                 residual_accumulator = hidden_states
+                layer_padding_mask = padding_mask
+                if cp_layout_state is not None:
+                    layer_padding_mask = cp_layout_state.get_layer_padding_mask(
+                        index, padding_mask, padding_mask_by_layout
+                    )
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -121,7 +127,7 @@ def checkpointed_forward(
                     attention_bias=attention_bias,
                     inference_context=None,
                     packed_seq_params=layer_packed_seq_params,
-                    padding_mask=padding_mask,
+                    padding_mask=layer_padding_mask,
                 )
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)

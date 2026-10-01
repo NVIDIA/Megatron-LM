@@ -881,6 +881,36 @@ def test_metadata_only_cp_batch_skips_sharding():
     assert cp_batch.get_packed_seq_params("zigzag") is not None
 
 
+def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors():
+    runtime_cp_group = MagicMock()
+    runtime_cp_group.size.return_value = 2
+    runtime_cp_group.rank.return_value = 0
+    padding_mask = torch.tensor([[False, True, False, True, False, True, False, True]])
+    batch = dict.fromkeys(pretrain_hybrid.BATCH_KEYS)
+    batch.update(
+        {
+            "padding_mask": padding_mask,
+            "cu_seqlens": torch.tensor([[0, 8]], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([[0, 8]], dtype=torch.int32),
+            "max_seqlen": torch.tensor([8], dtype=torch.int32),
+            "local_cp_size": torch.tensor([2], dtype=torch.int32),
+            "hybrid_cp_group": runtime_cp_group,
+        }
+    )
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch, boundary_layout="zigzag", is_hybrid_cp=True, cp_group=runtime_cp_group
+        )
+
+    torch.testing.assert_close(cp_batch.get_batch()["padding_mask"], padding_mask[:, [0, 1, 6, 7]])
+    assert cp_batch.get_batch()["tokens"] is None
+    assert cp_batch.get_packed_seq_params().cp_group is runtime_cp_group
+
+
 def test_get_batch_builds_required_cp_layouts():
     cp_size = 4
     seq_length = 16
