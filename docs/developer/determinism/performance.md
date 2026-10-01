@@ -417,3 +417,49 @@ The verifier checks recorded numerical evidence and captured-byte integrity; it
 does not rerun GPU numerical references or establish model/restart equality.
 Tensor blobs and logs may contain recipe data, so select their destination and
 access policy explicitly.
+
+## Run the captured-collective pipeline
+
+`collective_pipeline.py` runs the complete capture, replay, reference and timing
+pipeline for a bounded synthetic TP/SP workload on one node. It needs the
+collective capture and replay tools in `tools/determinism/` and the early
+startup API in `megatron/determinism/`, and exits with an error when they are
+missing. It runs only when invoked. In an allocated, clean source checkout:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/collective_pipeline.py \
+  --output /results/collective-performance --gpus 8
+```
+
+Use `--gpus 4` on a four-GPU node. Launch the parent outside torchrun. The
+pipeline launches its own fresh worker groups, preserves every stage log and
+requires a fresh output directory. A failed capture, replay, accuracy check,
+recipe join or timing arm stops the pipeline and retains the incomplete attempt.
+The final CPU check requires the complete matrix before marking the run complete.
+Its `capture/`, `coverage.json` and `timing/benchmark.json` outputs are the
+inputs of `baseline.py publish-collectives`.
+
+The workload covers six direct TP/SP mappings in FP32/BF16, forward and
+backward, with explicit rank-local inputs and upstream gradients, nonzero
+offsets and noncontiguous three-dimensional tensors. Pair-sized and world-sized
+groups exercise distinct priority and CTA options, producing 96 events per rank.
+The default three fresh-process policy pairs use 20 warmup and 50 measured
+samples per event; with three pairs the reported interval is bounded by the
+minimum and maximum observed ratios, so use more pairs for calibration. The
+pipeline measures current-head deterministic/default overhead; base/head
+comparisons use `benchmark_collectives.py --base-checkout`. No budgets are
+imposed, and complete results remain `not_gated`. It does not establish
+production recipe, multi-node, overlap or full-state/restart acceptance.
+
+Runtime, driver and GPU matching stays strict, so timings are joined only to
+evidence from the same configuration; heterogeneous nodes need their own
+coverage. Replay reports distinguish requested side-stream contention from
+effective contention: with `CUDA_DEVICE_MAX_CONNECTIONS=1` the serialized replay
+is evidence only for that runtime policy, not for concurrent-stream stress.
+
+CPU tests:
+
+```bash
+PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reporting \
+  tests/unit_tests/determinism_reporting
+```
