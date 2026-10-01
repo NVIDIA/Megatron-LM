@@ -247,19 +247,23 @@ functional:smoke-gb200:
   variables:
     CLUSTER: GB200
 
-# Prune weekly artifacts at least 14 days old from the configured JET roots
-# on each cluster, preserving the existing release retention. Run whenever
-# builds are enabled, regardless of pipeline source or functional test scope.
-# Functional `run_*` jobs wait for the matching cleanup job.
+# Prune artifacts older than 14 days from the JET assets/artifacts roots on
+# each cluster. Gated on release/weekly scope so it does not run on every MR
+# pipeline. Functional `run_*` jobs depend on the matching cleanup job via
+# `optional: true`, so pipelines without a cleanup job (e.g. `mr` scope) still
+# start their workloads immediately.
 .functional_cleanup_rules:
   stage: functional_tests
   rules:
     - if: $BUILD == "no"
       when: never
-    - when: on_success
+    - if: $FUNCTIONAL_TEST == "yes" && ($FUNCTIONAL_TEST_SCOPE == "release" || $FUNCTIONAL_TEST_SCOPE == "weekly")
+      when: on_success
+    - when: never
 
 .functional_cleanup:
   needs:
+    - functional:configure
     - test:build_image
   extends: [.functional_cleanup_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
