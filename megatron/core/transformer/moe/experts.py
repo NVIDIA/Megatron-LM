@@ -890,6 +890,23 @@ class TEGroupedMLP(MegatronModule):
                 if fine_grained_activation_offloading and output_buffer is None
                 else []
             )
+            post_probs = None
+            if self.config.deterministic_mode:
+                if self.linear_fc2.use_bias:
+                    raise RuntimeError(
+                        "deterministic_mode with the Transformer Engine operation-fuser grouped "
+                        "MLP requires FC2 without bias: "
+                        "routing probabilities are applied after FC2."
+                    )
+                if output_buffer is not None:
+                    raise RuntimeError(
+                        "deterministic operation-fuser grouped MLP does not support NCCL-EP "
+                        "zero-copy output buffers: probability scaling changes the output storage."
+                    )
+                # TE's fused scaled-activation dprob uses atomics. With no FC2 bias,
+                # applying the probabilities after FC2 gives an ordinary torch reduction.
+                post_probs = permuted_probs
+                permuted_probs = torch.ones_like(permuted_probs)
             with stash_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
@@ -912,6 +929,8 @@ class TEGroupedMLP(MegatronModule):
                     *fc2_extra_inputs,  # FC2 splits and, for bias, its per-token scale
                     **({"op_kwargs": op_kwargs} if op_kwargs else {}),
                 )
+                if post_probs is not None:
+                    output = (output * post_probs.unsqueeze(-1).float()).to(output.dtype)
         output = fused_group_mlp_manager.group_offload(
             output, forced_released_tensors=forced_released_tensors
         )

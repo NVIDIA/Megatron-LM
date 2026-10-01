@@ -374,10 +374,21 @@ class TestMoEModules:
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    def test_te_grouped_mlp_replays_on_uneven_experts(self):
+    @pytest.mark.parametrize(
+        "use_op_fuser", [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_op_fuser, monkeypatch):
+        if use_op_fuser:
+            if not is_te_min_version("2.14.0"):
+                pytest.skip("Grouped operation-fuser requires Transformer Engine >=2.14")
+            # TEGroupedMLP accepts the fused SwiGLU operation only when TE's CuTe DSL
+            # grouped-MLP path is enabled, as the MoE test fixtures do.
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         self._init()
         seeded()
-        config = _moe_config(hidden_size=2048, ffn_hidden_size=4096)
+        config = _moe_config(
+            hidden_size=2048, ffn_hidden_size=4096, use_transformer_engine_op_fuser=use_op_fuser
+        )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
         experts = get_submodules(spec.submodules.mlp).experts(
             num_local_experts=8,
@@ -385,6 +396,7 @@ class TestMoEModules:
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl is use_op_fuser
         experts = experts.cuda()
         tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
         rows = int(tokens_per_expert.sum())
@@ -395,7 +407,7 @@ class TestMoEModules:
             (hidden, tokens_per_expert, probs),
             replays=3,
             contention=True,
-            what="TEGroupedMLP",
+            what=f"TEGroupedMLP[operation_fuser={use_op_fuser}]",
         )
 
     @pytest.mark.skipif(
