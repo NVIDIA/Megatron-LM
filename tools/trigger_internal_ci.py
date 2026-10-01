@@ -201,7 +201,7 @@ def main():
     parser.add_argument(
         "--cluster-gb300",
         default=None,
-        help="CLUSTER_GB300 pipeline variable (opt in to GB300 workloads)",
+        help="CLUSTER_GB300 pipeline variable (override or disable the nightly GB300 cluster)",
     )
     parser.add_argument(
         "--dry-run",

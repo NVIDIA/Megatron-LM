@@ -249,11 +249,11 @@ variables:
       - "dgxgb200_oci-hsg"
     description: "Cluster for H100 workloads"
   CLUSTER_GB300:
-    value: ""
+    value: "dgxgb300_oci-jhb"
     options:
       - ""
       - "dgxgb300_oci-jhb"
-    description: "Opt-in cluster for GB300 platform workloads"
+    description: "Cluster for GB300 nightly workloads; empty disables GB300"
   PUBLISH:
     value: "no"
     options:

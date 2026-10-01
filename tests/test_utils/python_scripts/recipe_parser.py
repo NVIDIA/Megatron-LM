@@ -362,6 +362,39 @@ def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> 
     return workload_manifests
 
 
+def mirror_gb200_nightly_workloads(
+    workload_manifests: List[dotdict], config_path: pathlib.Path
+) -> List[dotdict]:
+    """Run the active GB200 dev nightly suite on GB300 without duplicating recipes."""
+    config = load_config(str(config_path))
+    workloads = filter_by_platform(workload_manifests, "dgx_gb200")
+    workloads = filter_by_scope(workloads, "nightly")
+    workloads = filter_by_cadence(workloads, "nightly")
+    workloads = filter_by_environment(workloads, "dev")
+
+    mirrored = []
+    for source in workloads:
+        workload = copy.deepcopy(source)
+        workload["launchers"] = copy.deepcopy(config["launchers"])
+        workload.spec.update(config["spec"])
+        workload.spec.update(config["test_case_overrides"].get(workload.spec["test_case"], {}))
+        # Keep source test names and model configs, but choose the reference GPU
+        # independently from the GPU recorded in newly collected metrics.
+        workload.spec["script"] = (
+            'export ACTUAL_VALUES_PATH="{assets_dir}/golden_values_{environment}_{platforms}.json"\n'
+            + "\n".join(
+                (
+                    line.replace("{platforms}", "{golden_platform}")
+                    if "GOLDEN_VALUES_PATH=" in line
+                    else line
+                )
+                for line in workload.spec["script"].splitlines()
+            )
+        )
+        mirrored.append(workload)
+    return mirrored
+
+
 def load_workloads(
     container_tag: str,
     n_repeat: int = 1,
@@ -380,13 +413,18 @@ def load_workloads(
     """Return all workloads from disk that match scope and platform."""
     recipes_dir = BASE_PATH / ".." / "recipes"
     local_dir = BASE_PATH / ".." / "local_recipes"
+    gb300_config = recipes_dir / "gb300" / "nightly.yaml"
 
     workloads: List[dotdict] = []
     build_workloads: List = []
     for file in list(recipes_dir.glob("**/*.yaml")) + list(local_dir.glob("**/*.yaml")):
+        if file == gb300_config:
+            continue
         workloads += load_and_flatten(config_path=str(file))
         if file.stem.startswith("_build"):
             build_workloads.append(load_config(config_path=str(file)))
+
+    workloads += mirror_gb200_nightly_workloads(workloads, gb300_config)
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)

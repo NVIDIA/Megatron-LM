@@ -55,7 +55,7 @@ python tools/trigger_internal_ci.py \
 | `--functional-test-cases` | `all` | `FUNCTIONAL_TEST_CASES` pipeline variable |
 | `--functional-test-name` | commit SHA | `FUNCTIONAL_TEST_NAME` pipeline variable — names the run for `pre-release`/`release` scopes (used as the run name and W&B experiment). |
 | `--functional-test-time-limit` | *(scope-dependent)* | `FUNCTIONAL_TEST_TIME_LIMIT` pipeline variable, in seconds. Defaults to `14400` (4h) for the long-running `release` and `weekly` scopes; left unset otherwise. |
-| `--cluster-gb300` | *(unset)* | `CLUSTER_GB300` pipeline variable. Set `dgxgb300_oci-jhb` to opt in to GB300 workloads, selected with platform `dgx_gb300` and the requested scope. |
+| `--cluster-gb300` | *(pipeline default)* | `CLUSTER_GB300` pipeline variable. Nightly pipelines run the GB200 nightly matrix on `dgxgb300_oci-jhb` by default. Pass an empty string to disable GB300. |
 | `--dry-run` | off | Print what would happen without pushing or triggering |
 
 > For release testing, set `--functional-test-scope release` and name the run
@@ -68,7 +68,7 @@ python tools/trigger_internal_ci.py \
 # Dry run — no push, no trigger
 python tools/trigger_internal_ci.py --gitlab-origin gitlab --dry-run
 
-# Opt in to the five GB300 nightly tests; preview the destination first
+# Run nightly, including the full GB300 matrix; preview the destination first
 python tools/trigger_internal_ci.py \
   --gitlab-origin gitlab \
   --functional-test-scope nightly \
@@ -84,6 +84,10 @@ python tools/trigger_internal_ci.py \
   --functional-test-scope release \
   --functional-test-name release-testing/mcore-v0.17.0
 ```
+
+GB300 nightly jobs have a 24-hour GitLab timeout and allow failures. Their child
+pipeline runs asynchronously, so GB300 does not delay or fail the parent nightly
+pipeline. Existing per-workload Slurm limits are retained within that timeout.
 
 ## Expected behavior
 

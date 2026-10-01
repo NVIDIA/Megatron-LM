@@ -1,0 +1,17 @@
+# recipe_parser.py mirrors every active GB200 dev nightly workload using these
+# overrides. Keep test selection, topology, and scripts in the GB200 recipes.
+launchers:
+  name:dgxgb300_oci-jhb:
+    mounts:
+      /lustre/fsw/coreai_dlalgo_mcore: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/
+      /mnt/artifacts: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci
+spec:
+  platforms: dgx_gb300
+  golden_platform: dgx_gb200
+test_case_overrides:
+  # Use measured GB300 baselines where they have already been validated.
+  deepseek_proxy_mfsdp_v1_ep2:
+    golden_platform: dgx_gb300
+  nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200:
+    golden_platform: dgx_gb300
+    time_limit_override: 10800

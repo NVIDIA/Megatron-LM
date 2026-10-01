@@ -175,13 +175,15 @@ functional:configure:
         --output-path "functional-test-job-lts-GB200.yaml" \
         ${RELEASE_ARGS[@]}
     - |
-      if [[ -n "$CLUSTER_GB300" ]]; then
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "nightly" && -n "$CLUSTER_GB300" ]]; then
         export PYTHONPATH=$(pwd)
         python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
           ${ARGS[@]} \
           --environment dev \
           --platform dgx_gb300 \
           --cluster "$CLUSTER_GB300" \
+          --job-timeout "24 hours" \
+          --allow-failure \
           --output-path "functional-test-job-dev-GB300.yaml"
       fi
   artifacts:
@@ -422,16 +424,20 @@ functional:run_dev_dgx_gb200:
     ENVIRONMENT: dev
     CLUSTER: GB200
 
-# GB300 recipes select the tests for this opt-in platform.
+# Run the GB200 nightly matrix on GB300 without delaying or failing the parent.
 functional:run_dev_dgx_gb300:
   extends: [.functional_run]
+  allow_failure: true
+  trigger:
+    # Clear the inherited waiting strategy; finish once the child is created.
+    strategy: null
   variables:
     ENVIRONMENT: dev
     CLUSTER: GB300
   rules:
     - if: $BUILD == "no"
       when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $CLUSTER_GB300 != ""
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "nightly" && $CLUSTER_GB300 != ""
       when: on_success
     - when: never
 
