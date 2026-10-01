@@ -1094,7 +1094,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         use_fa4, use_fa3 = self._resolve_flash_version()
         fa4_num_splits = 1 if self.batch_invariant_mode else 0
-        if use_fa4 and torch.cuda.get_device_capability(q.device)[0] == 9:
+        if use_fa4 and q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 9:
             # FA4's automatic heuristic can select SplitKV, which Hopper does not support.
             fa4_num_splits = 1
             if (
