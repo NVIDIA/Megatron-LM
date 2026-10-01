@@ -268,6 +268,13 @@ def classify_gtp_chains(model) -> None:
             continue
         param.chain_id = target
 
+        if _FULL_ITERATION and not param.prefetch_initialized:
+            # All producers and consumers belong to one graph. Internal events expose
+            # their ordering to graph-pool reuse; partial graphs need external handoffs.
+            param.ag_event = torch.cuda.Event()
+            param._recompute_ag_event = torch.cuda.Event()
+            param.rs_event = torch.cuda.Event()
+
         # Bwd-prefetch opt-out: embedding weight needs no bwd AG (wgrad is a
         # scatter-add on sharded rows, input has no dgrad) — saves one collective.
         if "embedding" in name:
@@ -329,10 +336,24 @@ def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
 
 
 def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
-    """Get a pool buffer or allocate fresh, tagged so _wgrad_pool_put accepts only
-    pool-owned buffers (other callers fall through to the caching allocator on release)."""
-    key = (shape, dtype)
-    pool = _wgrad_buf_pool.get(key)
+    """Allocate wgrad scratch: from the eager pool outside capture, from the graph pool inside.
+
+    The decision keys on the capture state of the current stream rather than on the chain's
+    classification, because that is what determines where the storage lives:
+
+    * Capturing (full-iteration or partial CUDA graph): ``torch.empty`` lands in the graph's
+      private pool and the captured kernels keep that address for every replay. The eager pool
+      is neither read (an eager buffer baked into a graph would later be overwritten by eager
+      reuse) nor written (the buffer is left untagged, so ``_wgrad_pool_put`` ignores it).
+    * Not capturing (eager execution, including the warmup passes before capture): pop a
+      cached buffer of this (shape, dtype) if there is one, waiting on its reuse event, else
+      allocate; tag it so ``_wgrad_pool_put`` may return it. Whether it does return is decided
+      at release by the chain: UNGRAPHED chains recycle it, GRAPHED chains drop it after
+      ``record_stream`` (see ``_release_wgrad_scratch``).
+    """
+    capturing = torch.cuda.is_current_stream_capturing()
+    # Graph region: never borrow eager storage.
+    pool = None if capturing else _wgrad_buf_pool.get((shape, dtype))
     if pool:
         buf = pool.pop()
         ready_event = getattr(buf, "_gtp_wgrad_reuse_event", None)
@@ -340,7 +361,8 @@ def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
             torch.cuda.current_stream(device=device).wait_event(ready_event)
     else:
         buf = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
-    buf._from_gtp_wgrad_pool = True
+    # Only eager allocations may be recycled; graph-pool storage never enters the eager cache.
+    buf._from_gtp_wgrad_pool = not capturing
     return buf
 
 
@@ -1998,11 +2020,12 @@ class GTPShardedParam(torch.nn.Parameter):
             # is still busy. Allocating a second raises this bucket's high-water mark for good --
             # the pool never shrinks, so every buffer in it is live at the peak. Drain our own RS
             # so the alloc below recycles that buffer, trading one overlap for the permanent
-            # bytes. Capture-guarded: the branch is host-side.
+            # bytes. Full-iteration capture needs the same drain as warmup to reuse
+            # that one buffer. Partial graphs leave this scheduling to their runner.
             if (
                 GTP_CONFIG.async_reduction
                 and self._wgrad_rs_handle is not None
-                and not torch.cuda.is_current_stream_capturing()
+                and (_FULL_ITERATION or not torch.cuda.is_current_stream_capturing())
                 and not symmetric_wgrad_pool.has_free(
                     self._unsharded_shape_padded, self.main_grad.dtype, self.group
                 )
@@ -2103,15 +2126,18 @@ class GTPShardedParam(torch.nn.Parameter):
                     for w in self._weights:
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
-        self._release_wgrad_scratch(ready_event=self.rs_event)
+        self._release_wgrad_scratch(stream=rs_stream, ready_event=self.rs_event)
         return waited
 
-    def _release_wgrad_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs"), ready_event=None):
+    def _release_wgrad_scratch(
+        self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs"), stream=None, ready_event=None
+    ):
         """Release the buffers a finished RS was reading.
 
         Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
-        so only free once the handle has been waited on). UNGRAPHED buffers go back to the pool;
-        GRAPHED just drops Python refs (addresses must stay stable for CG).
+        so only release once the handle has been waited on). Plain UNGRAPHED buffers return
+        to the manual pool, graph-pool buffers drop their Python references, and symmetric
+        buffers return to their registered pool. Reuse waits for the last reader.
         Work.wait() orders only its calling stream: pooled buffers carry the completion event
         so their next writer waits at checkout, without blocking unrelated compute here.
         """
@@ -2122,8 +2148,13 @@ class GTPShardedParam(torch.nn.Parameter):
             if not _chain_is_graphed(self.chain_id):
                 for buf in bufs:
                     _wgrad_pool_put(buf, ready_event=ready_event)
+            elif stream is not None:
+                # The FP32 sum is enqueued by handle.wait(). Keep its input alive until
+                # that side-stream read completes, including during graph capture.
+                for buf in bufs:
+                    buf.record_stream(stream)
             for buf in bufs:
-                # Return symm pool buffers (tag-gated no-op for plain and ring buffers).
+                # Tag-gated no-op for buffers outside the registered pool.
                 symmetric_wgrad_pool.free(buf, ready_event=ready_event)
             setattr(self, attr, None)
 
@@ -2771,12 +2802,14 @@ def wait_async_comms(
 
     This drains AG and recompute-AG handles and, unless ``skip_rs`` is set, wgrad RS handles.
     During CUDA graph capture, draining a handle materializes its wait in the producer graph and
-    records the corresponding external event. Because the event was constructed with
-    ``external=True``, capture emits event-record and event-wait nodes that preserve the dependency
+    records the corresponding event. Partial graphs use ``external=True`` to emit
+    event-record and event-wait nodes that preserve the dependency
     between separately captured graphs at replay. The host must launch the producer graph before
     the consumer graph so its record is the one observed by the wait. An AG handoff marker prevents
     the consumer from draining the same Work handle again; the consumer still waits on the event.
     When requested, an RS result is also accumulated into ``main_grad`` before graph completion.
+    Full-iteration graphs use internal events because the producer and consumer are in one
+    graph, exposing their dependencies to capture-time allocator reuse.
 
     Args:
         chain_id: If specified, only drain params on this chain.
