@@ -1339,7 +1339,7 @@ class LossFuncCallable:
         self,
         logprobs_dir: str,
         decode_threads: int = 1,
-        kd_loss_alpha: float = 0.5,
+        kd_loss_alpha: float = 0.9,
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
