@@ -23,12 +23,14 @@ try:
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
+        mla_rope_unapply_raw,
     )
 except Exception:
     fused_mla_rope_concat = None
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
     fused_mla_rope_out_of_place = None
+    mla_rope_unapply_raw = None
 
 
 @pytest.mark.parametrize(
@@ -609,6 +611,210 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)
 
     inverse_output.backward(torch.randn_like(inverse_output).contiguous())
     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)
+
+
+def _skip_unless_free_gpu_memory(num_bytes):
+    """Skip the calling test unless the current GPU has ``num_bytes`` of free memory."""
+    torch.cuda.empty_cache()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < num_bytes:
+        pytest.skip(
+            f"Needs {num_bytes / 2**30:.1f} GiB of free GPU memory, "
+            f"{free_bytes / 2**30:.1f} GiB available."
+        )
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("num_heads", "head_dim", "rope_first"),
+    [(64, 256, False), (32, 128, True)],
+    ids=["mla_query", "dsa_indexer_query"],
+)
+def test_mla_rope_inplace_rows_past_int32_element_offsets(num_heads, head_dim, rope_first):
+    """Rows that start at element 2**31 or later must be rotated where they are.
+
+    The MLA query (``fused_apply_mla_rope_for_q``) and the DSA indexer query
+    (``rope_first=True``) are rotated in place. With the GLM-5 shapes, 64 query heads of
+    192 + 64 channels and 32 indexer heads of 128 channels, rows 131072 and 524288 start at
+    element 2**31. A 32-bit row offset wraps there, and the forward and backward kernels read
+    and write those rows up to 4 GiB below the tensor instead.
+    """
+    assert fused_mla_rope_inplace is not None and mla_rope_unapply_raw is not None
+    emb_dim = 64
+    nope_dim = head_dim - emb_dim
+    first_wrapped_row = 2**31 // (num_heads * head_dim)
+    rows = first_wrapped_row + 16
+    # Both row sizes divide 2**31, so a wrapped row first_wrapped_row + i is addressed exactly
+    # 2**31 elements below row i. Carve the input out of a larger buffer so that an affected
+    # kernel overwrites this guard region (checked below) rather than faulting on unmapped
+    # memory.
+    guard_rows = first_wrapped_row
+    _skip_unless_free_gpu_memory((guard_rows + rows) * num_heads * head_dim * 2 + 2**30)
+
+    torch.manual_seed(1234)
+    freqs = torch.randn(rows, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+
+    def rotate(kernel, t, positions):
+        # ``t`` is one THD sequence whose positions are the given rows of the cos/sin tables.
+        return kernel(
+            t,
+            cos[positions],
+            sin[positions],
+            nope_dim,
+            emb_dim,
+            cu_seqlens_q=torch.tensor([0, t.size(0)], dtype=torch.int32, device="cuda"),
+            # The row offsets do not depend on the channel layout. remove_interleaving=True
+            # writes every rotated pair back to the slots it was read from, so the results do
+            # not depend on how a program orders its loads and stores.
+            remove_interleaving=True,
+            rope_first=rope_first,
+        )
+
+    buffer = torch.empty(
+        guard_rows + rows, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    x = buffer[guard_rows:]
+    guard = buffer[: rows - first_wrapped_row]
+    checked = slice(first_wrapped_row - 16, rows)
+    # The forward kernel, then the backward kernel, both in place.
+    for kernel in (fused_mla_rope_inplace, mla_rope_unapply_raw):
+        buffer.normal_()
+        guard_before = guard.clone()
+        # The same rows rotated as a small tensor, whose row offsets cannot overflow.
+        expected = rotate(kernel, x[checked].clone(), checked)
+        rotate(kernel, x, slice(None))
+        torch.testing.assert_close(x[checked], expected, rtol=0, atol=0)
+        torch.testing.assert_close(guard, guard_before, rtol=0, atol=0)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_mla_rope_kv_split_rows_past_int32_element_offsets():
+    """The MLA key/value split must not wrap once its input passes 2**31 elements."""
+    assert fused_mla_rope_kv_split is not None
+    num_heads, k_dim, v_dim, emb_dim = 128, 128, 128, 64
+    first_wrapped_row = 2**31 // (num_heads * (k_dim + v_dim))
+    seqlen = first_wrapped_row + 16
+    # kv, key, value, the key and value gradients and the kv gradient, in bf16.
+    _skip_unless_free_gpu_memory(
+        seqlen * num_heads * (4 * (k_dim + v_dim) + 2 * emb_dim) * 2 + 2**30
+    )
+
+    torch.manual_seed(1234)
+    freqs = torch.randn(seqlen, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    shape = (seqlen, 1, num_heads)
+    kv = torch.randn(*shape, k_dim + v_dim, dtype=torch.bfloat16, device="cuda")
+    k_pos_emb = torch.randn(seqlen, 1, 1, emb_dim, dtype=torch.bfloat16, device="cuda")
+    grad_key = torch.randn(*shape, k_dim + emb_dim, dtype=torch.bfloat16, device="cuda")
+    grad_value = torch.randn(*shape, v_dim, dtype=torch.bfloat16, device="cuda")
+
+    def run(rows):
+        kv_input = kv[rows].detach().requires_grad_(True)
+        emb_input = k_pos_emb[rows].detach().requires_grad_(True)
+        key, value = fused_mla_rope_kv_split(
+            kv_input, emb_input, cos[rows], sin[rows], emb_dim, k_dim, v_dim
+        )
+        torch.autograd.backward((key, value), (grad_key[rows], grad_value[rows]))
+        return key.detach(), value.detach(), kv_input.grad, emb_input.grad
+
+    checked = slice(first_wrapped_row - 16, seqlen)
+    # The same rows computed as a small input, whose row offsets cannot overflow.
+    expected = run(checked)
+    for actual, reference in zip(run(slice(None)), expected):
+        torch.testing.assert_close(actual[checked], reference, rtol=0, atol=0)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_mla_rope_concat_rows_past_int32_element_offsets():
+    """Fused MLA packing must not wrap once its output and inputs pass 2**31 elements."""
+    assert fused_mla_rope_concat is not None
+    num_heads, nope_dim, emb_dim = 128, 512, 64
+    # The packed output wraps first, the non-positional input (and its gradient) last.
+    first_wrapped_row = 2**31 // (num_heads * (nope_dim + emb_dim))
+    seqlen = 2**31 // (num_heads * nope_dim) + 16
+    # nope, rope, the output and its gradient, and the two input gradients, in bf16.
+    _skip_unless_free_gpu_memory(seqlen * num_heads * 4 * (nope_dim + emb_dim) * 2 + 2**30)
+
+    torch.manual_seed(1234)
+    freqs = torch.randn(seqlen, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    shape = (seqlen, 1, num_heads)
+    nope = torch.randn(*shape, nope_dim, dtype=torch.bfloat16, device="cuda")
+    rope = torch.randn(*shape, emb_dim, dtype=torch.bfloat16, device="cuda")
+    grad = torch.randn(*shape, nope_dim + emb_dim, dtype=torch.bfloat16, device="cuda")
+
+    def run(rows):
+        nope_input = nope[rows].detach().requires_grad_(True)
+        rope_input = rope[rows].detach().requires_grad_(True)
+        output = fused_mla_rope_concat(nope_input, rope_input, cos[rows], sin[rows])
+        output.backward(grad[rows])
+        return output.detach(), nope_input.grad, rope_input.grad
+
+    checked = slice(first_wrapped_row - 16, seqlen)
+    # The same rows computed as a small input, whose row offsets cannot overflow.
+    expected = run(checked)
+    for actual, reference in zip(run(slice(None)), expected):
+        torch.testing.assert_close(actual[checked], reference, rtol=0, atol=0)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("outermost", ["head", "channel"], ids=["head_major", "channel_major"])
+def test_mla_rope_concat_strided_inputs_past_int32_element_offsets(outermost):
+    """Fused MLA packing must not wrap the head or channel offsets of strided inputs.
+
+    The packing takes inputs of any strides. The absorbed-MLA query it packs is the output of
+    ``torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)``, which is head-major: head h of a
+    [t, n, d] query starts at element h * t * d. With the GLM-5 shape at TP 1, 64 heads of 512
+    channels, head 63 starts at element 2**31 or later from t = 66577 on. The inputs here are the
+    first rows of tensors whose heads (or channels) are outermost in memory and whose last heads
+    (or channels) start past 2**31, so only the head (or channel) offsets are large.
+    """
+    assert fused_mla_rope_concat is not None
+    num_heads, nope_dim, emb_dim, rows = 64, 512, 64, 16
+
+    def full_shape(dim):
+        if outermost == "head":
+            # Viewed as [t, num_heads, dim]: strides (dim, t * dim, 1), like the einsum output.
+            return (num_heads, -(-(2**31) // ((num_heads - 1) * dim)), dim)
+        # Viewed as [t, num_heads, dim]: strides (num_heads, 1, t * num_heads). The RoPE channels
+        # are read in pairs, so channel dim - 2 starts past 2**31 as well.
+        return (dim, -(-(2**31) // ((dim - 2) * num_heads)), num_heads)
+
+    shapes = (full_shape(nope_dim), full_shape(emb_dim))
+    # Two inputs of just over 2**31 elements each, in bf16.
+    _skip_unless_free_gpu_memory(sum(torch.Size(s).numel() for s in shapes) * 2 + 2**30)
+
+    torch.manual_seed(1234)
+    order = (1, 0, 2) if outermost == "head" else (1, 2, 0)
+    nope, rope = (
+        torch.randn(*shape, dtype=torch.bfloat16, device="cuda").permute(*order)[:rows]
+        for shape in shapes
+    )
+    freqs = torch.randn(rows, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    cu_seqlens = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+
+    # The same rows packed from contiguous copies, whose offsets cannot overflow.
+    expected = fused_mla_rope_concat(nope.contiguous(), rope.contiguous(), cos, sin, cu_seqlens)
+    actual = fused_mla_rope_concat(nope, rope, cos, sin, cu_seqlens)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class TestApplyRotaryPosEmbMlaFusionConflict:

@@ -147,7 +147,8 @@ def _mla_rope_fwd_inplace_kernel(
         seq_num: number of sequences for thd format, not used for sbhd format
         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
     """
-    pid_m = tl.program_id(axis=0)
+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
@@ -262,7 +263,8 @@ def _mla_rope_bwd_kernel(
     Output:
         DO_OUT: same shape and strides as DO_IN
     """
-    pid_m = tl.program_id(axis=0)
+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
@@ -748,7 +750,8 @@ def _mla_rope_concat_fwd_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """Concatenate the non-RoPE part with a rotated positional part."""
-    pid_m = tl.program_id(axis=0)
+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if IS_THD:
@@ -762,15 +765,17 @@ def _mla_rope_concat_fwd_kernel(
         nope_row = NOPE + seq_idx * stride_nope_seq + batch_idx * stride_nope_batch
         rope_row = ROPE + seq_idx * stride_rope_seq + batch_idx * stride_rope_batch
 
-    head_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
+    # The inputs may have any strides, and the absorbed MLA query (an einsum output) is
+    # head-major, so head and channel offsets can pass 2**31 too; keep these indices 64-bit.
+    head_idx = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)
     head_mask = head_idx < head_num
 
-    nope_idx = tl.arange(0, NOPE_BLOCK)
+    nope_idx = tl.arange(0, NOPE_BLOCK).to(tl.int64)
     nope_mask = head_mask[:, None] & (nope_idx[None, :] < nope_dim)
     nope_offsets = head_idx[:, None] * stride_nope_head + nope_idx[None, :] * stride_nope_dim
     nope = tl.load(nope_row + nope_offsets, mask=nope_mask)
 
-    rope_idx = tl.arange(0, ROT_BLOCK)
+    rope_idx = tl.arange(0, ROT_BLOCK).to(tl.int64)
     rope_mask = head_mask[:, None] & (rope_idx[None, :] < emb_dim // 2)
     rope_base = head_idx[:, None] * stride_rope_head
     rope_pair = rope_idx[None, :] * 2 * stride_rope_dim
@@ -839,7 +844,8 @@ def _mla_rope_concat_bwd_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """Split the output gradient and apply the inverse rotation."""
-    pid_m = tl.program_id(axis=0)
+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if IS_THD:
@@ -1084,7 +1090,8 @@ def _mla_rope_fwd_kv_split_kernel(
             or [total_seq_len, head_num, emb_dim + k_dim]
         O_VALUE: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
@@ -1199,7 +1206,8 @@ def _mla_rope_bwd_kv_split_kernel(
             or [total_seq_len, head_num, k_dim + v_dim]
         dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
