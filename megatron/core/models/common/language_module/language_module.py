@@ -51,23 +51,25 @@ class LanguageModule(MegatronModule):
             # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it.
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        groups = vars(pg_collection)
         for pg_name in ('tp', 'cp', 'pp', 'embd'):
-            assert pg_name in vars(pg_collection), (
-                f"LanguageModule pg_collection must explicitly define {pg_name}; "
-                "use None only when that group is not needed."
-            )
-            assert (
-                getattr(pg_collection, pg_name) != torch.distributed.GroupMember.NON_GROUP_MEMBER
-            ), (
-                f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
-                "use None for a nonparticipating embedding group."
-            )
+            if pg_name not in groups:
+                raise ValueError(
+                    f"LanguageModule pg_collection must explicitly define {pg_name}; "
+                    "use None only when that group is not needed."
+                )
+            if groups[pg_name] == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+                raise ValueError(
+                    f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
+                    "use None for a nonparticipating embedding group."
+                )
         if torch.distributed.is_initialized():
             for pg_name in ('tp', 'cp', 'pp'):
-                assert getattr(pg_collection, pg_name) is not None, (
-                    f"LanguageModule requires a participating {pg_name} group when distributed "
-                    "is initialized, including for singleton dimensions."
-                )
+                if groups[pg_name] is None:
+                    raise ValueError(
+                        f"LanguageModule requires a participating {pg_name} group when "
+                        "distributed is initialized, including for singleton dimensions."
+                    )
         set_attention_backend(self.config)
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
