@@ -29,6 +29,7 @@ __all__ = [
     "prepare_additive_mask",
     "prepare_sparse_mask_context",
     "scatter_topk_into_index_mask",
+    "sort_topk_by_index",
 ]
 
 
@@ -96,6 +97,37 @@ def build_valid_mask_from_starts_ends(
     return (key_positions.unsqueeze(0) >= starts.unsqueeze(-1)) & (
         key_positions.unsqueeze(0) < ends.unsqueeze(-1)
     )
+
+
+def sort_topk_by_index(
+    topk_indices: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    sk: int,
+    topk_scores: Optional[torch.Tensor] = None,
+    invalid_score: float = float("-inf"),
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Sort valid top-k slots by key index while preserving aligned scores.
+
+    Backends define validity explicitly: TileLang uses ``index >= 0`` sentinels,
+    while cuDNN consumes a compact prefix described by ``topk_length``.
+    """
+    if valid_mask.dtype != torch.bool or valid_mask.shape != topk_indices.shape:
+        raise ValueError("valid_mask must be boolean and match topk_indices")
+    if topk_scores is not None and topk_scores.shape != topk_indices.shape:
+        raise ValueError("topk_scores must match topk_indices")
+
+    sort_key = torch.where(valid_mask, topk_indices, torch.full_like(topk_indices, sk))
+    order = sort_key.argsort(dim=-1)
+    sorted_valid = torch.gather(valid_mask, dim=-1, index=order)
+    sorted_indices = torch.gather(topk_indices, dim=-1, index=order)
+    sorted_indices = sorted_indices.masked_fill(~sorted_valid, -1).contiguous()
+    if topk_scores is None:
+        return sorted_indices, None
+
+    sorted_scores = torch.gather(topk_scores, dim=-1, index=order)
+    sorted_scores = sorted_scores.masked_fill(~sorted_valid, invalid_score).contiguous()
+    return sorted_indices, sorted_scores
 
 
 def apply_starts_ends_mask_to_scores(

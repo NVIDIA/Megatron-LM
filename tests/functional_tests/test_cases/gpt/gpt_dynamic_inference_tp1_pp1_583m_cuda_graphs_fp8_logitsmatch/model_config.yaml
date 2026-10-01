@@ -30,7 +30,6 @@ MODEL_ARGS:
   --bf16: true
   --fp8-recipe: tensorwise
   --fp8-format: hybrid
-  --fp8-param-gather: true
   --first-last-layers-bf16: true
   --log-memory-to-tensorboard: true
   --log-num-zeros-in-grad: true
@@ -58,3 +57,4 @@ MODEL_ARGS:
 METRICS:
   - "generated_tokens"
   - "logprobs"
+LAUNCHER: ft_launcher

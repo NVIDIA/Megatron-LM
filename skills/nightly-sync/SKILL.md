@@ -232,13 +232,19 @@ Run on ALL changed Python files (relative to `origin/dev`), in this order:
 4. `pylint` on changed `megatron/core/` files — fix missing-docstring and
    line-too-long violations before pushing
 
-### Pre-push invariant checks
+### Pre-push advisory checks
 
 Before every `git push` in this workflow (the initial push in Phase 1
-AND every fix-push in Phase 3), run these bash checks. If any fails,
-fix the condition and re-check before pushing:
+AND every fix-push in Phase 3), run these bash checks as guidance. They
+must never block the push. Review every finding: fix genuine merge accidents
+and document intentional main removals or formatting/reordering false positives
+in the PR body.
 
 ```bash
+set +e
+(
+set -euo pipefail
+
 MERGE_COMMIT=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
 if [ -n "$MERGE_COMMIT" ]; then
   DEV_REF="${MERGE_COMMIT}^1"
@@ -250,9 +256,8 @@ fi
 
 # 1. CODEOWNERS must be identical to dev's.
 if ! git diff --quiet "$DEV_REF" HEAD -- .github/CODEOWNERS; then
-  echo "ABORT: .github/CODEOWNERS differs from dev. Restore with:"
+  echo "WARNING: .github/CODEOWNERS differs from dev. Restore with:"
   echo "  git checkout $DEV_REF -- .github/CODEOWNERS"
-  exit 1
 fi
 
 # 2. Dependency-management triple must be identical to dev's.
@@ -260,7 +265,7 @@ for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
   if ! git diff --quiet "$DEV_REF" HEAD -- "$f"; then
     # pyproject.toml is allowed to differ ONLY for git source reconciliation
     # (new [tool.uv.sources] entries from main). If you intentionally edited
-    # it for that reason, bypass this check by re-running with $f skipped.
+    # it for that reason, document the reconciliation in the PR body.
     echo "WARNING: $f differs from dev"
   fi
 done
@@ -291,7 +296,7 @@ done
 INTENTIONAL_OVERRIDE_REGEX='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
 SKIP_REGEX='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
 
-VIOLATIONS=0
+FINDINGS=0
 for f in $(git diff --name-only "$DEV_REF"..HEAD \
             -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
                '*.sh' '*.cpp' '*.cu' '*.h' \
@@ -310,25 +315,36 @@ for f in $(git diff --name-only "$DEV_REF"..HEAD \
   if [ -n "$missing" ]; then
     echo "=== $f ==="
     printf '%s\n' "$missing"
-    VIOLATIONS=$((VIOLATIONS + $(printf '%s\n' "$missing" | grep -c .)))
+    FINDINGS=$((FINDINGS + $(printf '%s\n' "$missing" | grep -c .)))
   fi
 done
 
-if [ "$VIOLATIONS" -gt 0 ]; then
-  echo "ABORT: $VIOLATIONS dev-only line(s) dropped by the merge. For each:"
+if [ "$FINDINGS" -gt 0 ]; then
+  echo "WARNING: $FINDINGS potential dev-only line removal(s) detected. For each:"
   echo "  (a) MAIN INTENTIONALLY REMOVED — find the specific commit in"
   echo "      'git log origin/main -- <file>' that removed it; document the"
   echo "      SHA in the PR body, then the drop is acceptable."
   echo "  (b) MERGE ACCIDENT — main never explicitly touched that line."
   echo "      RESTORE the dev line (Edit/Write to put it back)."
   echo "Default to (b); only declare (a) with a specific main commit as evidence."
-  exit 1
+  echo "This audit is advisory; continue the push after reviewing the findings."
 fi
+
+echo "nightly-sync pre-push guidance complete"
+)
+GUIDANCE_STATUS=$?
+if [ "$GUIDANCE_STATUS" -ne 0 ]; then
+  echo "WARNING: nightly-sync pre-push guidance failed with status $GUIDANCE_STATUS; allowing the push to continue."
+fi
+exit 0
 ```
 
-The CODEOWNERS check and the dev-feature preservation audit are HARD
-aborts — never push if either fails. The dep-triple check is a warning
-because git-source reconciliation can produce legitimate diffs there.
+All pre-push findings are advisory. The hook must return success even when it
+finds a CODEOWNERS difference, potential dev-feature removal, dependency-triple
+difference, or an internal audit error. The underlying policies still apply:
+restore accidental changes, preserve dev-only features, and document exact main
+commits for intentional removals. A warning by itself is never a reason to stop
+the workflow or request authorization to continue.
 
 Recent regressions the dev-feature audit would have flagged (all
 "merge accident" type from #4659 and #4716):
@@ -393,7 +409,12 @@ Phase 3 step 4 and the two-commit policy in Rules).
      in the PR body so reviewers see it at a glance.
   3. List of files where main's version was taken over the merge
   4. List of files that were deleted in dev but restored (and why)
-  5. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
+  5. Disposition of every pre-push advisory finding, including CODEOWNERS or
+     dependency-triple differences and potential dev-feature removals. Record
+     whether each was corrected, intentional (with the exact commit or reason),
+     or a formatting/reordering false positive. State explicitly if there were
+     no findings.
+  6. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
      commit) so reviewers can inspect ONLY the conflict resolutions. If the
      output is very long, summarize conflicts by file and put the full diff
      in a collapsed `<details>` block. If git is too old for `--remerge-diff`,

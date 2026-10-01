@@ -4,6 +4,7 @@ import os
 from datetime import timedelta
 from itertools import accumulate
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -18,15 +19,42 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from fast_hadamard_transform import hadamard_transform as _hadamard_transform
+
+    _HAVE_HADAMARD = True
+except ImportError:
+    _HAVE_HADAMARD = False
+    _hadamard_transform = None
+
+
+def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Identity-with-scale stand-in for `fast_hadamard_transform.hadamard_transform`.
+
+    Mirrors the helper in `tests/unit_tests/transformer/experimental_attention_variant/
+    test_attention_variant_dsa.py` so that DSA forward tests run in containers that
+    don't ship the upstream library.
+    """
+    return x * scale
 
 
 def test_hybrid_logging_process_groups_are_paired():
@@ -168,8 +196,245 @@ class TestHybridModel:
 
         assert self.model.max_sequence_length == 4
 
+        decoder = self.model.decoder
+        assert "layer_type_list" not in decoder.__dict__
+        assert decoder.layer_type_list == [Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP]
+        assert [type(config) for config in decoder.layer_config_list] == [
+            MambaLayerConfig,
+            AttentionLayerConfig,
+            MLPLayerConfig,
+        ]
+        assert len({id(config) for config in decoder.layer_config_list}) == 3
+        assert all(config is not self.model.config for config in decoder.layer_config_list)
+        assert all(
+            layer.config is layer_config
+            for layer, layer_config in zip(decoder.layers, decoder.layer_config_list, strict=True)
+        )
+
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
+
+    @pytest.mark.parametrize(
+        ("freeze_base", "training", "expected_grad_enabled"),
+        [(False, True, True), (True, True, False), (True, False, True)],
+    )
+    def test_frozen_base_decoder_grad_context(
+        self, monkeypatch, freeze_base, training, expected_grad_enabled
+    ):
+        decoder_input = torch.ones(4, 2, self.model.config.hidden_size, requires_grad=True)
+        grad_enabled = []
+
+        def capture_decoder(**kwargs):
+            grad_enabled.append(torch.is_grad_enabled())
+            return kwargs['hidden_states'] * 2
+
+        monkeypatch.setattr(self.model.decoder, 'forward', capture_decoder)
+        self.model.config.freeze_base_model_for_mtp = freeze_base
+        self.model.post_process = False
+        self.model.train(training)
+
+        output = self.model(
+            input_ids=None, position_ids=None, attention_mask=None, decoder_input=decoder_input
+        )
+
+        assert grad_enabled == [expected_grad_enabled]
+        assert output.requires_grad is expected_grad_enabled
+
+    def test_mtp_rejects_tp_overlap(self):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            tp_comm_overlap=True,
+        )
+        with pytest.raises(
+            ValueError, match="TP communication overlap is not supported with hybrid MTP layers"
+        ):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/M",
+            )
+
+        assert model_config.tp_comm_overlap is True
+
+    def test_mtp_requires_template(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+        )
+        with pytest.raises(
+            ValueError, match="HybridModel has mtp_num_layers set but no MTP template"
+        ):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-",
+            )
+
+    @pytest.mark.parametrize("mtp_num_layers", [0, 1, 3])
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
+    def test_mtp_rejects_pattern_depth_mismatch(
+        self, mocker, mtp_num_layers, mtp_use_repeated_layer
+    ):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
+        build = mocker.patch("megatron.core.models.hybrid.hybrid_model.build_module")
+        with pytest.raises(
+            ValueError,
+            match=f"hybrid_layer_pattern defines 2 MTP depths, but mtp_num_layers is {mtp_num_layers}",
+        ):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/-/-",
+            )
+
+        assert config.mtp_num_layers == mtp_num_layers
+        build.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("pattern", "mtp_num_layers"), [("-", None), ("-/-", None), ("-/-", 1)]
+    )
+    def test_hsm_requires_two_architecture_heads(self, pattern, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        with pytest.raises(ValueError, match="mtp_hsm=True requires at least two MTP heads"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern=pattern,
+            )
+
+        assert config.mtp_hsm is True
+
+    @pytest.mark.parametrize("mtp_num_layers", [None, 2])
+    def test_hsm_accepts_inferred_or_matching_mtp_depth(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="-/-/-",
+        )
+
+        assert config.mtp_num_layers == 2
+        assert config.mtp_hsm is True
+        assert model.mtp_process is True
+        assert len(model.mtp.layers) == 2
+
+    def test_mtp_placement_uses_model_pipeline_group(self, mocker):
+        placement = mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.mtp_on_this_rank", return_value=False
+        )
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=0.1,
+            use_cpu_initialization=True,
+        )
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-/*",
+        )
+
+        placement.assert_called_once()
+        placement_args = placement.call_args.kwargs
+        assert placement_args["pp_group"] is model.pg_collection.pp
+        assert placement_args["vp_size"] == model_config.virtual_pipeline_model_parallel_size
+
+    def test_forward_propagates_mtp_input_mask(self, mocker):
+        class CaptureMTP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp_input_mask = None
+
+            def prepare_cp_layout(self, **kwargs):
+                return SimpleNamespace(**kwargs)
+
+            def forward(self, **kwargs):
+                self.mtp_input_mask = kwargs["mtp_input_mask"]
+                hidden_states = kwargs["hidden_states"]
+                return torch.cat((hidden_states, hidden_states), dim=0)
+
+        self.model.config.mtp_num_layers = 1
+        self.model.mtp_process = True
+        self.model.mtp = CaptureMTP()
+        captured_loss_args = {}
+
+        def capture_mtp_loss(**kwargs):
+            captured_loss_args.update(kwargs)
+            return torch.chunk(kwargs["hidden_states"], 2, dim=0)[0]
+
+        mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.process_mtp_loss",
+            side_effect=capture_mtp_loss,
+        )
+
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = 2
+        self.model.cuda()
+        input_ids = torch.arange(sequence_length, device="cuda").repeat(micro_batch_size, 1)
+        position_ids = input_ids.clone()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=torch.bool, device="cuda"
+        )
+        labels = input_ids.clone()
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        mtp_input_mask = input_ids != 2
+
+        output = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        assert output.shape == labels.shape
+        assert self.model.mtp.mtp_input_mask is mtp_input_mask
+        assert captured_loss_args["mtp_input_mask"] is mtp_input_mask
+        assert captured_loss_args["metric_avg_group"] is self.model.pg_collection.dp_cp
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config
@@ -185,11 +450,45 @@ class TestHybridModel:
         assert self.model.decoder.input_tensor.shape[1] == micro_batch_size
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
-    def test_forward(self):
+    @pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
+    @pytest.mark.parametrize("convert_cp_layout", [False, True])
+    def test_forward(self, monkeypatch, recompute_method, convert_cp_layout):
         sequence_length = self.model.max_sequence_length
         micro_batch_size = 2
 
         self.model.cuda()
+        decoder = self.model.decoder
+        if recompute_method is not None:
+            decoder.config.recompute_granularity = "full"
+            decoder.config.recompute_method = recompute_method
+            decoder.config.recompute_num_layers = 2
+        if convert_cp_layout:
+            # Exercise both layout boundaries without requiring a multi-rank CP group.
+            layout_state = SimpleNamespace(
+                prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
+                finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
+            )
+            monkeypatch.setattr(
+                decoder,
+                "_cp_layout_manager",
+                SimpleNamespace(build_forward_state=lambda *args, **kwargs: layout_state),
+            )
+
+        expected_residuals = {}
+
+        def record_layer_residuals(layer, args, kwargs, output):
+            accumulator = kwargs["hidden_states"].detach().clone()
+            output = output[0] if isinstance(output, tuple) else output
+            # Keep the original forward values; backward recomputation must not be observed.
+            expected_residuals.setdefault((layer, "residual_accumulator"), accumulator)
+            expected_residuals.setdefault(
+                (layer, "residual_contribution"), output.detach() - accumulator
+            )
+
+        hooks = [
+            layer.register_forward_hook(record_layer_residuals, with_kwargs=True)
+            for layer in decoder.layers
+        ]
 
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
@@ -198,13 +497,31 @@ class TestHybridModel:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
 
-        logits = self.model.forward(
-            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
-        )
+        observed = []
+        with capture_tensor_observations(
+            lambda *args: observed.append(args),
+            frozenset({"residual_accumulator", "residual_contribution", "output_logits"}),
+        ):
+            logits = self.model.forward(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            )
+            logits.sum().backward()
+
+        for hook in hooks:
+            hook.remove()
 
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.model.vocab_size
+        kinds = [observation[2] for observation in observed]
+        assert kinds.count("residual_accumulator") == 3
+        assert kinds.count("residual_contribution") == 3
+        assert kinds.count("output_logits") == 1
+        assert observed[-1][0] is self.model.output_layer
+        assert observed[-1][4:] == (-1, 0, 1)
+        torch.testing.assert_close(observed[-1][3].transpose(0, 1), logits)
+        for owner, _, kind, tensor, *_ in observed[:-1]:
+            torch.testing.assert_close(tensor, expected_residuals[(owner, kind)])
 
     def test_forward_packed_sequence(self):
         os.environ.pop('NVTE_FUSED_ATTN', None)
@@ -329,6 +646,12 @@ class TestHybridModel:
 
 class TestHybridQKLayernorm:
 
+    # Subclasses override these to retarget the same tests at MLA's
+    # `mla_layer.kv_layernorm` or DSA's `dsa_layer.kv_layernorm`. The base class
+    # exercises the SelfAttention path with `attention_layer.k_layernorm`.
+    _attention_layer_attr = 'attention_layer'
+    _k_norm_attr = 'k_layernorm'
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -336,7 +659,9 @@ class TestHybridQKLayernorm:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _build_model(self, **config_overrides):
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
         config = TransformerConfig(
             num_layers=3,
             hidden_size=256,
@@ -346,26 +671,32 @@ class TestHybridQKLayernorm:
         )
         return HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
         )
 
     def _get_attention_layer(self, model):
-        """Return the SelfAttention submodule from the attention layer."""
+        """Return the self-attention submodule that owns a `q_layernorm`."""
         for layer in model.decoder.layers:
             if hasattr(layer, 'self_attention') and hasattr(layer.self_attention, 'q_layernorm'):
                 return layer.self_attention
         return None
 
-    def test_no_qk_norm_by_default(self):
-        """Without qk_layernorm, attention has no q/k layernorm."""
+    def _get_k_norm(self, attn):
+        return getattr(attn, self._k_norm_attr)
+
+    def test_trivial_qk_norm_by_default(self):
+        """Without qk_layernorm, attention has trivial q/k layernorm."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
         model = self._build_model()
         attn = self._get_attention_layer(model)
         assert attn is not None
-        assert attn.q_layernorm is None
-        assert attn.k_layernorm is None
+        assert attn.q_layernorm is None or isinstance(attn.q_layernorm, IdentityOp)
+        k_norm = self._get_k_norm(attn)
+        assert k_norm is None or isinstance(k_norm, IdentityOp)
 
     def test_qk_layernorm_from_config(self):
         """config.qk_layernorm=True creates q/k layernorm even with static spec."""
@@ -375,7 +706,7 @@ class TestHybridQKLayernorm:
         # TENorm is a factory (__new__ returns a TE LayerNorm/RMSNorm), so we
         # verify the norm was created rather than checking for a specific type.
         assert attn.q_layernorm is not None
-        assert attn.k_layernorm is not None
+        assert self._get_k_norm(attn) is not None
 
     def test_qk_l2_norm_from_config(self):
         """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
@@ -385,57 +716,567 @@ class TestHybridQKLayernorm:
         attn = self._get_attention_layer(model)
         assert attn is not None
         assert isinstance(attn.q_layernorm, L2Norm)
-        assert isinstance(attn.k_layernorm, L2Norm)
+        assert isinstance(self._get_k_norm(attn), L2Norm)
 
     def test_spec_provided_norm_not_overwritten(self):
         """When the spec already provides q/k layernorm, config doesn't override it."""
         import copy
 
-        from megatron.core.extensions.transformer_engine import (
-            TEDotProductAttention,
-            TELayerNormColumnParallelLinear,
-            TERowParallelLinear,
-        )
-        from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-        from megatron.core.transformer.enums import AttnMaskType
         from megatron.core.transformer.identity_op import IdentityOp
-        from megatron.core.transformer.spec_utils import ModuleSpec
-        from megatron.core.transformer.transformer_layer import (
-            TransformerLayer,
-            TransformerLayerSubmodules,
-        )
 
-        # Build a spec that explicitly sets q/k layernorm to IdentityOp
+        # Build a spec that explicitly sets q/k layernorm to IdentityOp on the
+        # attention layer that this subclass exercises.
         spec = copy.deepcopy(hybrid_stack_spec)
-        spec.submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
-            IdentityOp
-        )
-        spec.submodules.attention_layer.submodules.self_attention.submodules.k_layernorm = (
-            IdentityOp
-        )
+        attn_submodules = getattr(
+            spec.submodules, self._attention_layer_attr
+        ).submodules.self_attention.submodules
+        attn_submodules.q_layernorm = IdentityOp
+        setattr(attn_submodules, self._k_norm_attr, IdentityOp)
 
-        config = TransformerConfig(
-            num_layers=3,
-            hidden_size=256,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            qk_layernorm=True,
-        )
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=spec,
-            vocab_size=100,
-            max_sequence_length=4,
-            hybrid_layer_pattern="M*-",
-        )
+        model = self._build_model(spec=spec, qk_layernorm=True)
         attn = self._get_attention_layer(model)
         assert attn is not None
         assert isinstance(attn.q_layernorm, IdentityOp)
-        assert isinstance(attn.k_layernorm, IdentityOp)
+        assert isinstance(self._get_k_norm(attn), IdentityOp)
 
     def test_forward_with_qk_layernorm(self):
         """HybridModel forward pass works with qk_layernorm enabled."""
         model = self._build_model(qk_layernorm=True)
+        model.cuda()
+
+        sequence_length = 4
+        micro_batch_size = 2
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == 100
+
+
+class TestHybridMLAQKLayernorm(TestHybridQKLayernorm):
+    """Tests QK norm configuration of HybridModel with MLA."""
+
+    _attention_layer_attr = 'mla_layer'
+    _k_norm_attr = 'kv_layernorm'
+
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
+        config = MLATransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            **config_overrides,
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M+-",
+        )
+
+    def test_qk_l2_norm_from_config(self):
+        with pytest.raises(ValueError, match="qk_l2_norm is not supported"):
+            super().test_qk_l2_norm_from_config()
+
+
+class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
+    """Tests QK norm configuration of HybridModel with DSA."""
+
+    _attention_layer_attr = 'dsa_layer'
+    _k_norm_attr = 'kv_layernorm'
+
+    @pytest.fixture(autouse=True)
+    def _patch_hadamard_if_needed(self):
+        if not _HAVE_HADAMARD:
+            with patch(
+                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                _mock_hadamard_transform,
+            ):
+                yield
+        else:
+            yield
+
+    def test_spec_provided_norm_not_overwritten(self):
+        # DSA cannot fuse the QK norm into the up-projection, so a trivial
+        # `IdentityOp` spec is auto-promoted to `TENorm` when `qk_layernorm=True`.
+        # Finer-grained spec-respect behavior is covered by TestDSAQKNormResolution.
+        pytest.skip("DSA auto-promotes IdentityOp to TENorm; covered by TestDSAQKNormResolution.")
+
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
+        config_kwargs = dict(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            add_bias_linear=False,
+            # AbsorbedMLASelfAttention forwards `x` and `qr` to the DSA core attention; without
+            # this, the DSA core attention's forward fails on missing positional arguments.
+            experimental_attention_variant="dsa",
+            # DSA-specific settings; defaults are None and DSAIndexer requires them.
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            # The indexer-loss path runs in training mode and multiplies by this coefficient;
+            # leaving it at the default `None` raises `TypeError: ... 'Tensor' and 'NoneType'`.
+            dsa_indexer_loss_coeff=1.0,
+            # DSA's `rotate_activation` (Hadamard rotation) only supports bf16 input.
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        config_kwargs.update(config_overrides)
+        config = MLATransformerConfig(**config_kwargs)
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="MD-",
+        )
+
+    def test_qk_l2_norm_from_config(self):
+        with pytest.raises(ValueError, match="qk_l2_norm is not supported"):
+            super().test_qk_l2_norm_from_config()
+
+
+class _MLAQKNormTestBase:
+    """Common machinery for MLA/DSA QK-norm spec tests.
+
+    Subclasses override `experimental_attention_variant` and
+    `hybrid_layer_pattern` to target the MLA vs. DSA code path.
+    """
+
+    experimental_attention_variant = None
+    hybrid_layer_pattern = "M+-"
+    mla_layer_attr = "mla_layer"
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _make_spec(self, **submodule_overrides):
+        """Return a copy of `hybrid_stack_spec` with MLA/DSA submodule overrides."""
+        import copy
+
+        spec = copy.deepcopy(hybrid_stack_spec)
+        mla_submodules = getattr(
+            spec.submodules, self.mla_layer_attr
+        ).submodules.self_attention.submodules
+        for key, value in submodule_overrides.items():
+            setattr(mla_submodules, key, value)
+        return spec
+
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
+        config_kwargs = dict(
+            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        if self.experimental_attention_variant is not None:
+            config_kwargs["experimental_attention_variant"] = self.experimental_attention_variant
+            if self.experimental_attention_variant == "dsa":
+                # Must not be True for DSA.
+                config_kwargs.setdefault("add_bias_linear", False)
+                # DSAIndexer requires these; their config defaults are None.
+                config_kwargs.setdefault("dsa_indexer_n_heads", 8)
+                config_kwargs.setdefault("dsa_indexer_head_dim", 64)
+                config_kwargs.setdefault("dsa_indexer_topk", 32)
+
+        config_kwargs.update(config_overrides)
+        config = MLATransformerConfig(**config_kwargs)
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern=self.hybrid_layer_pattern,
+        )
+
+    def _get_mla_attention(self, model):
+        """Return the attention submodule for the selected MLA variant, or None."""
+        if self.experimental_attention_variant == "dsa":
+            from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+                AbsorbedMLASelfAttention,
+            )
+
+            attention_cls = AbsorbedMLASelfAttention
+        else:
+            from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+            attention_cls = MLASelfAttention
+
+        for layer in model.decoder.layers:
+            if hasattr(layer, 'self_attention') and isinstance(layer.self_attention, attention_cls):
+                return layer.self_attention
+        return None
+
+
+class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
+    """Tests QK norm spec validation in `MLASelfAttention`.
+
+    These errors guard against silently ignoring a configured norm or
+    double-applying one through a fused norm+linear.
+    """
+
+    experimental_attention_variant = None
+    hybrid_layer_pattern = "M+-"
+    mla_layer_attr = "mla_layer"
+
+    def test_q_norm_without_q_lora_rank_raises(self):
+        """When `q_lora_rank is None`, a non-trivial `q_layernorm` would
+        never be reached and must error out.
+        """
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        spec = self._make_spec(q_layernorm=TENorm)
+        with pytest.raises(ValueError, match=r"q_lora_rank is None"):
+            self._build_model(spec=spec, q_lora_rank=None)
+
+    def test_q_norm_without_q_lora_rank_hint_for_non_fused_linear(self):
+        """Error message hints at fused linear when `linear_q_proj` is non-fused."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        spec = self._make_spec(q_layernorm=TENorm)
+        with pytest.raises(ValueError, match=r"fused norm\+linear for"):
+            self._build_model(spec=spec, q_lora_rank=None)
+
+    def test_fused_linear_q_up_with_q_norm_raises(self):
+        """Non-trivial `q_layernorm` combined with a fused `linear_q_up_proj`
+        would apply the norm twice.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(q_layernorm=TENorm, linear_q_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"fused norm\+linear"):
+            self._build_model(spec=spec)
+
+    def test_fused_linear_kv_up_with_kv_norm_raises(self):
+        """Non-trivial `kv_layernorm` combined with a fused `linear_kv_up_proj`
+        would apply the norm twice.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(
+            kv_layernorm=TENorm, linear_kv_up_proj=TELayerNormColumnParallelLinear
+        )
+        with pytest.raises(ValueError, match=r"fused norm\+linear"):
+            self._build_model(spec=spec)
+
+
+class TestMLAQKNormResolution(_MLAQKNormTestBase):
+    """Tests `_resolve_qk_norm_config` for MLA.
+
+    Covers fusion auto-selection, spec overrides, and the "disabled"-path
+    guards that reject fused/explicit norms when `qk_layernorm` is off.
+    """
+
+    experimental_attention_variant = None
+    hybrid_layer_pattern = "M+-"
+    mla_layer_attr = "mla_layer"
+
+    def test_qk_layernorm_fuses_kv_up_by_default(self):
+        """With default (trivial) `kv_layernorm`, enabling `qk_layernorm`
+        auto-selects the fused `TELayerNormColumnParallelLinear` for KV up.
+        """
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        model = self._build_model(qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
+        assert isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_spec_q_norm_disables_q_up_fusion(self):
+        """A non-trivial `q_layernorm` from the spec must force a non-fused
+        `linear_q_up_proj` so the norm isn't applied on top of a fused one.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(q_layernorm=TENorm)
+        model = self._build_model(spec=spec, qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_q_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_q_up_proj, TELayerNormColumnParallelLinear)
+        # The spec's norm is actually used; it's not reset to IdentityOp.
+        assert attn.q_layernorm is not None
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        assert not isinstance(attn.q_layernorm, IdentityOp)
+
+    def test_spec_kv_norm_disables_kv_up_fusion(self):
+        """Mirror of `test_spec_q_norm_disables_q_up_fusion` for KV."""
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(kv_layernorm=TENorm)
+        model = self._build_model(spec=spec, qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_kv_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        assert not isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_disabled_qk_layernorm_rejects_fused_linear_q_up(self):
+        """When `qk_layernorm` is off, spec must not force fused linear_q_up_proj."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_q_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+    def test_disabled_qk_layernorm_rejects_fused_linear_kv_up(self):
+        """When `qk_layernorm` is off, spec must not force fused linear_kv_up_proj."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_kv_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+    def test_disabled_qk_layernorm_rejects_spec_norms(self):
+        """When `qk_layernorm` is off, spec must not carry explicit q/kv layernorms."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        for overrides in (
+            {"q_layernorm": TENorm},
+            {"kv_layernorm": TENorm},
+            {"q_layernorm": TENorm, "kv_layernorm": TENorm},
+        ):
+            spec = self._make_spec(**overrides)
+            with pytest.raises(ValueError, match=r"supposed to be disabled"):
+                self._build_model(spec=spec)
+
+
+class TestDSAQKNormResolution(_MLAQKNormTestBase):
+    """Tests `_resolve_qk_norm_config` for DSA.
+
+    DSA requires non-fused Q/KV up projections and explicit norms;
+    the fused optimization valid for MLA must be rejected here.
+    """
+
+    experimental_attention_variant = "dsa"
+    hybrid_layer_pattern = "MD-"
+    mla_layer_attr = "dsa_layer"
+
+    def test_qk_layernorm_uses_unfused_linear_and_te_norm(self):
+        """With default spec, DSA + `qk_layernorm=True` uses non-fused
+        `TEColumnParallelLinear` and `TENorm` for Q/KV.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+        )
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        model = self._build_model(qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_q_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_q_up_proj, TELayerNormColumnParallelLinear)
+        assert isinstance(attn.linear_kv_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
+        assert not isinstance(attn.q_layernorm, IdentityOp)
+        assert not isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_qk_layernorm_without_q_lora_rank_raises(self):
+        """DSA cannot apply Q norm when `q_lora_rank is None`."""
+        with pytest.raises(ValueError, match=r"q_lora_rank is None.*not supported for DSA"):
+            self._build_model(qk_layernorm=True, q_lora_rank=None)
+
+    def test_qk_layernorm_rejects_fused_linear_q_up(self):
+        """DSA does not support the fused norm+linear optimization."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_q_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"not supported for DSA"):
+            self._build_model(spec=spec, qk_layernorm=True)
+
+    def test_qk_layernorm_without_q_lora_rejects_fused_linear_q(self):
+        """DSA does not support fused `linear_q_proj` when `q_lora_rank=None`."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_q_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"not supported for DSA"):
+            self._build_model(spec=spec, qk_layernorm=True, q_lora_rank=None)
+
+    def test_disabled_qk_layernorm_rejects_fused_linear_kv_up(self):
+        """When `qk_layernorm` is off, spec must not force fused linear_kv_up_proj."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_kv_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+    def test_disabled_qk_layernorm_rejects_spec_norms(self):
+        """When `qk_layernorm` is off, spec must not carry explicit q/kv layernorms."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        for overrides in (
+            {"q_layernorm": TENorm},
+            {"kv_layernorm": TENorm},
+            {"q_layernorm": TENorm, "kv_layernorm": TENorm},
+        ):
+            spec = self._make_spec(**overrides)
+            with pytest.raises(ValueError, match=r"supposed to be disabled"):
+                self._build_model(spec=spec)
+
+
+class TestMLADownProjFusion:
+    """Tests the `config.mla_down_proj_fusion` spec selection.
+
+    The MLA layer spec with fused q/kv down-projection is pre-built at import
+    time next to the unfused one (`HybridStackSubmodules.mla_fused_down_proj_layer`
+    in `hybrid_layer_specs`); `HybridStack` selects it at construction time when
+    `config.mla_down_proj_fusion` is set.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_model(self, pattern="M+-", spec=None, **config_overrides):
+        config_kwargs = dict(
+            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        config_kwargs.update(config_overrides)
+        config = MLATransformerConfig(**config_kwargs)
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec if spec is None else spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern=pattern,
+        )
+
+    def _get_layer_with_mla(self, model):
+        """Return the layer whose self-attention is an `MLASelfAttention`
+        (which includes its `FusedMLASelfAttention` subclass).
+        """
+        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+        for layer in model.decoder.layers:
+            if hasattr(layer, 'self_attention') and isinstance(
+                layer.self_attention, MLASelfAttention
+            ):
+                return layer
+        return None
+
+    def test_enabled_sets_sharded_state_dict_keys_map(self):
+        """The keys map is written on the MLA layer submodules for checkpoint
+        compatibility with pre-fusion checkpoints.
+        """
+        mla_spec = hybrid_stack_spec.submodules.mla_fused_down_proj_layer
+        assert mla_spec is not None
+
+        keys_map = mla_spec.submodules.sharded_state_dict_keys_map
+        assert keys_map == {
+            "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+        }
+
+    def test_missing_fused_spec_raises_for_mla_layers(self):
+        """Specs without a fused variant (e.g. the gated-delta-product stack) must reject building
+        an MLA layer with the fusion enabled rather than silently degrade.
+        """
+        with pytest.raises(ValueError, match="mla_fused_down_proj_layer"):
+            self._build_model(
+                pattern="+--", spec=gated_delta_product_stack_spec, mla_down_proj_fusion=True
+            )
+
+    def test_enabled_without_mla_layers_builds_unfused_model(self):
+        """A segment without MLA layers builds fine with the fusion flag set, even if the spec
+        doesn't have the required submodule spec defined.
+        """
+        model = self._build_model(
+            pattern="---", spec=gated_delta_product_stack_spec, mla_down_proj_fusion=True
+        )
+        assert self._get_layer_with_mla(model) is None
+
+    def test_model_uses_fused_mla_when_enabled(self):
+        """Integration: a full HybridModel built with the flag uses
+        `FusedMLASelfAttention`.
+        """
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+        from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
+
+        model = self._build_model(mla_down_proj_fusion=True)
+        layer = self._get_layer_with_mla(model)
+        assert layer is not None
+        assert isinstance(layer.self_attention, FusedMLASelfAttention)
+        # The separate q/kv down projections are collapsed into a single fused
+        # down projection that also absorbs the input layernorm.
+        assert isinstance(
+            layer.self_attention.linear_qkv_down_proj, TELayerNormColumnParallelLinear
+        )
+        assert not hasattr(layer.self_attention, "linear_q_down_proj")
+        assert not hasattr(layer.self_attention, "linear_kv_down_proj")
+
+    def test_model_uses_unfused_mla_when_disabled(self):
+        """Integration: with the flag off, MLA layers use the standard
+        `MLASelfAttention` (never the fused subclass).
+        """
+        from megatron.core.transformer.multi_latent_attention import (
+            FusedMLASelfAttention,
+            MLASelfAttention,
+        )
+
+        model = self._build_model(mla_down_proj_fusion=False)
+        layer = self._get_layer_with_mla(model)
+        assert layer is not None
+        assert isinstance(layer.self_attention, MLASelfAttention)
+        assert not isinstance(layer.self_attention, FusedMLASelfAttention)
+
+    def test_enabled_replaces_input_layernorm_with_identity(self):
+        """Integration: because the fused down-proj absorbs the input
+        layernorm, the transformer layer's own `input_layernorm` must be
+        `IdentityOp`.
+        """
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        model = self._build_model(mla_down_proj_fusion=True)
+        layer = self._get_layer_with_mla(model)
+        assert layer is not None
+        assert isinstance(layer.input_layernorm, IdentityOp)
+
+    def test_forward_with_fused_mla(self):
+        """Integration: forward pass works with `mla_down_proj_fusion=True`."""
+        model = self._build_model(mla_down_proj_fusion=True)
         model.cuda()
 
         sequence_length = 4

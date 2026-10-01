@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
@@ -11,8 +12,15 @@ from torch.autograd.graph import saved_tensors_hooks
 DEBUG = False
 DEBUG_RANK = 0
 
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+logger = logging.getLogger(__name__)
 
 
 def debug_rank(message):
@@ -41,34 +49,61 @@ def _te_do_not_offload(tensor):
     )
 
 
-def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
+def print_offload_summary_table(
+    total_offload_bytes: Dict[str, int],
+    local_duplicate_summary: Optional[Dict[str, Tuple[int, int]]] = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """
-    Print an ASCII table summarizing offload bytes across all ranks.
+    Print offload bytes and warn about duplicate copies across participating ranks.
 
-    Gathers offload data from all ranks and prints a formatted table on rank 0,
-    with rows representing ranks and columns representing groups.
+    Gathers both summaries in one object collective and reports them on group rank 0.
+    The table has rows representing ranks and columns representing groups.
+
+    The reported bytes are every byte copied to CPU, so a redundant copy of an
+    already-offloaded storage is counted like any other copy.
 
     Args:
         total_offload_bytes: Dict mapping group names to offload bytes for this rank.
+        local_duplicate_summary: Dict mapping group names to redundant-copy counts
+            and bytes for this rank.
+        process_group: Ranks participating in fine-grained activation offloading.
     """
     # pylint: disable=bad-builtin
     assert torch.distributed.is_initialized()
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank(group=process_group)
+    world_size = torch.distributed.get_world_size(group=process_group)
 
-    # Gather all group names across ranks
-    local_names = list(total_offload_bytes.keys())
-    all_names_list = [None] * world_size
-    torch.distributed.all_gather_object(all_names_list, local_names)
-    all_group_names = sorted(set(name for names in all_names_list for name in names))
+    local_summary = {
+        "offload_bytes": dict(total_offload_bytes),
+        "duplicate_summary": dict(local_duplicate_summary or {}),
+    }
+    all_summaries = [None] * world_size
+    torch.distributed.all_gather_object(all_summaries, local_summary, group=process_group)
 
-    # Gather offload bytes from all ranks: each rank sends a list of bytes per group
-    local_bytes = [total_offload_bytes.get(name, 0) for name in all_group_names]
-    all_bytes_list = [None] * world_size
-    torch.distributed.all_gather_object(all_bytes_list, local_bytes)
-
-    # Print ASCII table on rank 0
     if rank == 0:
+        details = []
+        for summary_rank, summary in enumerate(all_summaries):
+            for name, (copy_count, duplicate_bytes) in sorted(summary["duplicate_summary"].items()):
+                details.append(
+                    f"rank {summary_rank}, {name}: {copy_count} redundant copies, "
+                    f"{duplicate_bytes / (1024 * 1024):.2f} MB"
+                )
+        if details:
+            logger.warning(
+                "Fine-grained activation offloading is copying the same tensor storage to CPU "
+                "more than once within an offload group, wasting host memory and PCIe bandwidth "
+                f"({', '.join(details)}). Offloading proceeds with the duplicated copies."
+            )
+
+        all_group_names = sorted(
+            {name for summary in all_summaries for name in summary["offload_bytes"]}
+        )
+        all_bytes_list = [
+            [summary["offload_bytes"].get(name, 0) for name in all_group_names]
+            for summary in all_summaries
+        ]
+
         # Calculate column widths
         col_width = max(12, max((len(name) for name in all_group_names), default=8) + 2)
         rank_col_width = max(6, len(f"Rank {world_size - 1}") + 2)
@@ -109,7 +144,7 @@ def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
         print(totals_row)
         print("=" * len(header) + "\n")
 
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=process_group)
 
 
 class OffloadTensorPool:
@@ -359,6 +394,9 @@ class OffloadTensorGroup:
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
+        # Warmup-only bookkeeping for redundant copies within this group.
+        self.duplicate_storage_tensor_count = 0
+        self.duplicate_storage_bytes = 0
         # Using memory pool is for the compatibility with cuda graph.
         # Shapes of tensors for MoE activation offload groups are not known in advance,
         # so we do not use CPU pool for them.
@@ -392,9 +430,14 @@ class OffloadTensorGroup:
         stream.wait_event(self._reload_event)
 
     def update_offload_info(self, tensor):
-        """Update the offload information."""
+        """Update the offload information with the tensor actually copied to CPU."""
         self.total_offload_bytes += tensor.numel() * tensor.element_size()
         self.total_tensor_count += 1
+
+    def set_duplicate_storage_info(self, tensor_count, duplicate_bytes):
+        """Set redundant-copy statistics calculated for this group."""
+        self.duplicate_storage_tensor_count = tensor_count
+        self.duplicate_storage_bytes = duplicate_bytes
 
 
 class PipelineOffloadManager:
@@ -505,7 +548,7 @@ class PipelineOffloadManager:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
 
-    def reset(self):
+    def reset(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset manager state for a new training iteration."""
         self._inside_context = False
         self._cur_forward_chunk = None
@@ -516,7 +559,7 @@ class PipelineOffloadManager:
 
         # Call post_warmup_callback after warmup to collect the offload information.
         if self._is_warmup and len(self._cached_chunks_forward) > 0:
-            self.post_warmup_callback()
+            self.post_warmup_callback(process_group=process_group)
         self._cached_chunks_index_backward = 0
         self._cached_chunks_index_forward = 0
 
@@ -563,7 +606,7 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_forward:
             chunk.do_offload = True
 
-    def post_warmup_callback(self):
+    def post_warmup_callback(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Callback after warmup."""
         # pylint: disable=bad-builtin
         debug_rank("post_warmup_callback")
@@ -599,10 +642,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -625,6 +666,17 @@ class PipelineOffloadManager:
                     group.offload = False
                 else:
                     break
+        # Warn about source bytes copied to CPU more than once within a single group.
+        # Once one view takes the whole-storage path, every other copy from that
+        # storage in the group is redundant. The copies are left in place -- this
+        # is only a diagnostic. This summary is gathered with the offload bytes
+        # below so post-warmup reporting needs only one object collective.
+        local_duplicate_summary = defaultdict(lambda: [0, 0])
+        for chunk in self._cached_chunks_forward:
+            for group in chunk.offload_groups:
+                if group.offload and group.duplicate_storage_tensor_count > 0:
+                    local_duplicate_summary[group._name][0] += group.duplicate_storage_tensor_count
+                    local_duplicate_summary[group._name][1] += group.duplicate_storage_bytes
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
@@ -647,7 +699,11 @@ class PipelineOffloadManager:
         # Cache summary for downstream consumers (e.g., unit tests).
         self._offload_summary_bytes = dict(total_offload_bytes)
         self._offload_summary_total_bytes = int(sum(total_offload_bytes.values()))
-        print_offload_summary_table(total_offload_bytes)
+        print_offload_summary_table(
+            total_offload_bytes,
+            {name: tuple(summary) for name, summary in local_duplicate_summary.items()},
+            process_group=process_group,
+        )
 
     def push(self, handler):
         """Add a chunk handler to the backward queue."""
@@ -828,12 +884,43 @@ class ChunkOffloadHandler:
     Manages tensor groups, coordinates asynchronous GPU-CPU transfers, and handles synchronization.
     """
 
+    # Minimum fraction of the underlying storage bytes a non-contiguous view must
+    # cover before offloading the storage instead of gathering the view: the
+    # storage path trades D2H/H2D bytes on the copy engines for skipping the
+    # gather kernel and its temporary GPU buffer, which only pays off when the
+    # view spans most of the storage.
+    BASE_OFFLOAD_MIN_COVERAGE = 0.5
+
+    @_otel_trace_fn('activation_offload', 'megatron.activation.offload')
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
-        """Offload."""
+        """Offload.
+
+        A non-contiguous view that covers most of its underlying storage is
+        offloaded as the flat storage (a plain memcpy plus the view's
+        (size, stride, storage_offset) metadata) instead of being gathered into a
+        temporary contiguous copy. The base is resolved through
+        ``untyped_storage()`` rather than ``._base`` because autograd hands the
+        saved-tensor hooks a detach()-ed alias (e.g. CheckpointWithoutOutput's
+        saved input), which drops the view metadata but not the storage.
+        """
         debug_rank("--------offload")
 
+        view_meta = None
         if not src_tensor.is_contiguous():
-            src_tensor = src_tensor.contiguous()
+            storage = src_tensor.untyped_storage()
+            element_size = src_tensor.element_size()
+            covered_bytes = src_tensor.numel() * element_size
+            if (
+                storage.nbytes() % element_size == 0
+                and covered_bytes >= self.BASE_OFFLOAD_MIN_COVERAGE * storage.nbytes()
+            ):
+                view_meta = (src_tensor.size(), src_tensor.stride(), src_tensor.storage_offset())
+                # Flat alias of the full storage; contiguous by construction.
+                src_tensor = torch.empty(0, dtype=src_tensor.dtype, device=src_tensor.device).set_(
+                    storage
+                )
+            else:
+                src_tensor = src_tensor.contiguous()
 
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
@@ -843,13 +930,14 @@ class ChunkOffloadHandler:
             )
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup, use_cpu_pool)
+        state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
 
+    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool = state
+        dev, cpu_backup, use_cpu_pool, view_meta = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
         gpu_tensor = torch.empty(
@@ -858,6 +946,9 @@ class ChunkOffloadHandler:
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
+        if view_meta is not None:
+            size, stride, storage_offset = view_meta
+            gpu_tensor = gpu_tensor.as_strided(size, stride, storage_offset)
         return gpu_tensor
 
     def __init__(
@@ -1005,15 +1096,36 @@ class ChunkOffloadHandler:
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
+            # Warmup-only accounting local to this offload group. Every tensor in
+            # the group is alive here, so device + data_ptr identifies its storage.
+            storage_records = (
+                defaultdict(
+                    lambda: {
+                        "storage_bytes": 0,
+                        "transfer_count": 0,
+                        "full_storage_count": 0,
+                        "transferred_bytes": 0,
+                    }
+                )
+                if self.is_warmup
+                else None
+            )
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
                         tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
+                    # Account the bytes actually copied to CPU (the base storage
+                    # for view offloads).
                     if self.is_warmup:
-                        group_to_offload.update_offload_info(tensor_on_device)
+                        group_to_offload.update_offload_info(state[1])
+                        self._record_offload_transfer(tensor_on_device, state, storage_records)
+                    # record_stream on the view marks the shared storage
+                    # allocation, so this also covers base-storage offloads.
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
+            if self.is_warmup:
+                self._set_duplicate_storage_info(group_to_offload, storage_records)
             group_to_offload.record_offload_event(self.d2h_stream)
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
@@ -1024,6 +1136,34 @@ class ChunkOffloadHandler:
             gname = group_to_offload._name
             self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
             self._drain_offload_pending(gname)
+
+    @staticmethod
+    def _record_offload_transfer(tensor_on_device, state, storage_records):
+        """Record one transfer for group-local duplicate-byte accounting."""
+        _, cpu_backup, _, view_meta = state
+        storage = tensor_on_device.untyped_storage()
+        storage_key = (tensor_on_device.device, storage.data_ptr(), storage.nbytes())
+        record = storage_records[storage_key]
+        record["storage_bytes"] = storage.nbytes()
+        record["transfer_count"] += 1
+        record["full_storage_count"] += int(view_meta is not None)
+        record["transferred_bytes"] += cpu_backup.numel() * cpu_backup.element_size()
+
+    @staticmethod
+    def _set_duplicate_storage_info(group, storage_records):
+        """Calculate exact redundant bytes for storages copied in full by this group."""
+        duplicate_tensor_count = 0
+        duplicate_bytes = 0
+        for record in storage_records.values():
+            # Without a full-storage copy, finding overlap between arbitrary
+            # strided logical views requires real storage-address analysis.
+            if record["full_storage_count"] == 0:
+                continue
+            storage_duplicate_bytes = record["transferred_bytes"] - record["storage_bytes"]
+            if storage_duplicate_bytes > 0:
+                duplicate_tensor_count += record["transfer_count"] - 1
+                duplicate_bytes += storage_duplicate_bytes
+        group.set_duplicate_storage_info(duplicate_tensor_count, duplicate_bytes)
 
     def get_max_deduplicated_groups(self):
         """Get the maximum number of deduplicated groups."""
@@ -1435,9 +1575,9 @@ class FineGrainedActivationOffloadingInterface:
         return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
 
     @staticmethod
-    def reset():
+    def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset the chunk handler."""
-        PipelineOffloadManager.get_instance().reset()
+        PipelineOffloadManager.get_instance().reset(process_group=process_group)
 
     @staticmethod
     def reset_instance():

@@ -7,7 +7,11 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core.enums import Fp4Recipe
-from megatron.core.fp8_utils import _get_custom_recipe
+from megatron.core.fp8_utils import (
+    _get_custom_recipe,
+    _get_grouped_quantized_recipe,
+    _unwrap_parameter_data,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -55,6 +59,14 @@ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
 
 
+def is_grouped_nvfp4tensor(tensor: torch.Tensor) -> bool:
+    """Check if a TE GroupedTensor stores NVFP4 member tensors."""
+    if not HAVE_TE_FP4_TENSOR_CLASS:
+        return False
+    recipe = _get_grouped_quantized_recipe(tensor)
+    return recipe is not None and hasattr(recipe, "nvfp4") and recipe.nvfp4()
+
+
 def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
     """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
     if len(shape) == 0:
@@ -82,6 +94,41 @@ def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: tor
     # Preserve existing values and then swap storage
     new_rowwise_data.detach().copy_(old_rowwise)
     fp4_tensor._rowwise_data = new_rowwise_data
+    del old_rowwise
+
+
+def modify_grouped_nvfp4_rowwise_storage(
+    grouped_tensor: torch.Tensor, new_rowwise_data: torch.Tensor
+) -> None:
+    """Replace grouped NVFP4 rowwise data with a new uint8 storage view.
+
+    The name intentionally mirrors `modify_nvfp4_rowwise_storage`: only the
+    packed rowwise byte buffer is remapped into the DDP buffer. The grouped
+    scale, amax, and columnwise buffers remain owned by the original tensor.
+    """
+    tensor = _unwrap_parameter_data(grouped_tensor)
+    if not is_grouped_nvfp4tensor(tensor):
+        raise ValueError("modify_grouped_nvfp4_rowwise_storage expects grouped NVFP4 storage")
+
+    old_rowwise = getattr(tensor, "rowwise_data", None)
+    if old_rowwise is None:
+        raise RuntimeError("Grouped NVFP4 tensor is missing rowwise data to replace")
+
+    new_rowwise_data = new_rowwise_data.view(-1)
+    if old_rowwise.numel() != new_rowwise_data.numel():
+        raise ValueError(
+            "Grouped NVFP4 rowwise storage size mismatch: "
+            f"old numel={old_rowwise.numel()}, new numel={new_rowwise_data.numel()}"
+        )
+    assert (
+        old_rowwise.dtype == new_rowwise_data.dtype == torch.uint8
+    ), "Grouped NVFP4 rowwise storage must be uint8"
+
+    new_rowwise_data.detach().copy_(old_rowwise.view(-1))
+    tensor.rowwise_data = new_rowwise_data
+    # Member views capture data pointers. Refresh them after swapping rowwise storage while
+    # preserving the existing scale/amax/columnwise grouped buffers.
+    tensor.quantized_tensors = tensor.split_into_quantized_tensors()
     del old_rowwise
 
 

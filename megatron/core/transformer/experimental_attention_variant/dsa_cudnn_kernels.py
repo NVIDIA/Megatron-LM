@@ -725,42 +725,15 @@ def _indexer_topk_multi_packed_cp_thd(
         raise RuntimeError("packed CP cuDNN THD indexer requires positive maximum sequence lengths")
 
     segment_divisor = 2 * cp_size
-    if sk % segment_divisor != 0:
-        raise RuntimeError(f"packed CP key length must be divisible by {segment_divisor}, got {sk}")
-
     device = q_bshd.device
-    cu_q = packed_cu_seqlens_q.to(device=device, dtype=torch.int64).contiguous()
-    cu_k = packed_cu_seqlens_k.to(device=device, dtype=torch.int64).contiguous()
-    q_lengths = cu_q[1:] - cu_q[:-1]
-    k_lengths = cu_k[1:] - cu_k[:-1]
-    q_half = q_lengths // segment_divisor
-    k_half = k_lengths // segment_divisor
-    segment_q_lengths = torch.stack((q_half, q_half), dim=1).reshape(-1)
-    segment_k_lengths = torch.stack(
-        ((cp_rank + 1) * k_half, k_lengths - cp_rank * k_half), dim=1
-    ).reshape(-1)
-
-    zero_i32 = torch.zeros(1, dtype=torch.int32, device=device)
-    segment_cu_q = torch.cat(
-        (zero_i32, segment_q_lengths.cumsum(dim=0, dtype=torch.int32))
-    ).contiguous()
-    segment_cu_k = torch.cat(
-        (zero_i32, segment_k_lengths.cumsum(dim=0, dtype=torch.int32))
-    ).contiguous()
-
-    segment_key_starts = cu_k[:-1].repeat_interleave(2)
-    total_segment_k = sk + sk // segment_divisor
-    segment_ids = torch.repeat_interleave(
-        torch.arange(segment_k_lengths.numel(), device=device),
-        segment_k_lengths,
-        output_size=total_segment_k,
+    layout = dsa_layout.build_packed_cp_indexer_layout(
+        packed_cu_seqlens_q.to(device=device),
+        packed_cu_seqlens_k.to(device=device),
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        key_size=sk,
     )
-    segment_offsets = torch.arange(total_segment_k, device=device, dtype=torch.int64)
-    segment_offsets -= torch.repeat_interleave(
-        segment_cu_k[:-1].to(dtype=torch.int64), segment_k_lengths, output_size=total_segment_k
-    )
-    source_indices = segment_key_starts.index_select(0, segment_ids) + segment_offsets
-    segmented_k = k_bshd[0].index_select(0, source_indices).contiguous()
+    segmented_k = k_bshd[0].index_select(0, layout.source_indices).contiguous()
 
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
@@ -771,8 +744,8 @@ def _indexer_topk_multi_packed_cp_thd(
         w_bsh[0],
         ratio=_INDEXER_RATIO,
         sm_scale=_INDEXER_SOFTMAX_SCALE,
-        cu_seqlens_q=segment_cu_q,
-        cu_seqlens_k=segment_cu_k,
+        cu_seqlens_q=layout.segment_cu_q.to(dtype=torch.int32),
+        cu_seqlens_k=layout.segment_cu_k.to(dtype=torch.int32),
         max_seqlen_q=max_segment_q,
         max_seqlen_k=max_segment_k,
     )["scores"]
@@ -1043,11 +1016,8 @@ def _sort_valid_topk_indices_by_index(topk_indices: Tensor, topk_length: Tensor,
     """Canonicalize consumed top-K indices while keeping ignored suffix slots invalid."""
     positions = _trailing_positions(topk_indices)
     valid = positions < topk_length.unsqueeze(-1)
-    sort_key = torch.where(valid, topk_indices, torch.full_like(topk_indices, sk))
-    order = sort_key.argsort(dim=-1)
-    sorted_indices = torch.gather(topk_indices, dim=-1, index=order)
-    sorted_valid = torch.gather(valid.expand_as(topk_indices), dim=-1, index=order)
-    return sorted_indices.masked_fill(~sorted_valid, -1).contiguous()
+    sorted_indices, _ = dsa_masking.sort_topk_by_index(topk_indices, valid, sk=sk)
+    return sorted_indices
 
 
 def _sort_valid_topk_indices_and_scores_by_index(
@@ -1056,14 +1026,15 @@ def _sort_valid_topk_indices_and_scores_by_index(
     """Sort valid top-K indices and keep the selected score payload aligned."""
     positions = _trailing_positions(topk_indices)
     valid = positions < topk_length.unsqueeze(-1)
-    sort_key = torch.where(valid, topk_indices, torch.full_like(topk_indices, sk))
-    order = sort_key.argsort(dim=-1)
-    sorted_indices = torch.gather(topk_indices, dim=-1, index=order)
-    sorted_scores = torch.gather(topk_scores, dim=-1, index=order)
-    sorted_valid = torch.gather(valid.expand_as(topk_indices), dim=-1, index=order)
-    sorted_indices = sorted_indices.masked_fill(~sorted_valid, -1)
-    sorted_scores = sorted_scores.masked_fill(~sorted_valid, torch.finfo(torch.float32).min)
-    return sorted_indices.contiguous(), sorted_scores.contiguous()
+    sorted_indices, sorted_scores = dsa_masking.sort_topk_by_index(
+        topk_indices,
+        valid,
+        sk=sk,
+        topk_scores=topk_scores,
+        invalid_score=torch.finfo(torch.float32).min,
+    )
+    assert sorted_scores is not None
+    return sorted_indices, sorted_scores
 
 
 def _prepare_attention_topk_indices(topk_indices: Tensor, sk: int) -> Tuple[Tensor, Tensor]:

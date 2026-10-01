@@ -3,9 +3,11 @@
 from unittest.mock import Mock, call, patch
 
 import pytest
+import torch
 
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,7 @@ class TestHybridModelConfigInitialization:
     def test_default_values(self):
         config = HybridModelConfig(transformer=_make_transformer())
         assert config.fp16_lm_cross_entropy is False
+        assert config.logit_dtype is None
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.hybrid_layer_pattern is None
@@ -55,6 +58,7 @@ class TestHybridModelConfigInitialization:
         config = HybridModelConfig(
             transformer=_make_transformer(),
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             hybrid_attention_ratio=0.25,
             hybrid_mlp_ratio=0.1,
@@ -63,6 +67,7 @@ class TestHybridModelConfigInitialization:
             vocab_size=50000,
         )
         assert config.fp16_lm_cross_entropy is True
+        assert config.logit_dtype == torch.float32
         assert config.parallel_output is False
         assert config.hybrid_attention_ratio == 0.25
         assert config.hybrid_mlp_ratio == 0.1
@@ -222,6 +227,17 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
+    def test_spec_none_with_wide_residual_uses_explicit_wide_spec(self, mock_model, *_):
+        self.config.transformer.wide_residual = WideResidualConfig(num_streams=2)
+        with patch("megatron.training.models.hybrid.wide_residual_hybrid_stack_spec") as mock_wide:
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
+        call_kwargs = mock_model.call_args.kwargs
+        assert call_kwargs["hybrid_stack_spec"] is mock_wide
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_none_with_inference_optimized_uses_inference_spec(self, mock_model, *_):
         self.config.transformer.transformer_impl = "inference_optimized"
         with patch("megatron.training.models.hybrid.hybrid_inference_stack_spec") as mock_inf:
@@ -244,6 +260,16 @@ class TestHybridModelBuilderBuildModel:
         mock_fn.assert_called_once_with(local_core_attention=False, remap_te_layernorm=False)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is modelopt_spec
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_wide_residual_rejects_modelopt_spec_generation(self, _mock_model, *_):
+        self.config.transformer.wide_residual = WideResidualConfig(num_streams=2)
+        self.config.restore_modelopt_state = True
+        with pytest.raises(NotImplementedError, match="ModelOpt HybridStack"):
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
@@ -329,6 +355,7 @@ class TestHybridModelBuilderBuildModel:
             seq_length=4096,
             hybrid_layer_pattern="M-A-",
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -345,6 +372,7 @@ class TestHybridModelBuilderBuildModel:
         assert kw["max_sequence_length"] == 4096
         assert kw["hybrid_layer_pattern"] == "M-A-"
         assert kw["fp16_lm_cross_entropy"] is True
+        assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
         assert kw["position_embedding_type"] == "rope"

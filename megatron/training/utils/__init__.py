@@ -16,6 +16,7 @@ from megatron.training.utils.common_utils import (
     is_last_rank,
     print_rank_last,
     is_hybrid_model,
+    is_gtp_remat_active,
     is_first_or_last_pipeline_stage,
     get_device_arch_version,
     get_blend_and_blend_per_split,

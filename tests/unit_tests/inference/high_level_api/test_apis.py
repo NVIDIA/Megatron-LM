@@ -1,18 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the high-level inference APIs (``MegatronLLM`` /
-``MegatronAsyncLLM``). Tests run without torch/megatron init by stubbing
-the engine pipeline; the worker-rank tests bypass ``__init__`` entirely
-via ``cls.__new__``."""
+"""Unit tests for the high-level inference APIs."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
 
 import megatron.core.inference.apis._llm_base as base_mod
+import megatron.core.inference.apis.async_llm as async_llm_mod
+import megatron.core.inference.apis.llm as llm_mod
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
+from megatron.core.inference.apis.serve_config import ServeConfig
 
 
 @pytest.fixture
@@ -24,6 +25,11 @@ def mock_pipeline(monkeypatch):
     monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
     monkeypatch.setattr(base_mod, "DynamicInferenceEngine", MagicMock())
+    # MegatronLLM / MegatronAsyncLLM default their inference_wrapper_cls to
+    # None and resolve to base_mod.GPTInferenceWrapper at call time, so the
+    # base_mod patch above is what steers them at construction time.
+    monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
+    monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
     # Bypass the EP-group initialization assert when no distributed setup
     # is in scope. Individual tests can override (e.g.,
     # ``test_ep_gt_1_requires_use_coordinator``).
@@ -50,8 +56,7 @@ def _make_worker_instance(cls):
     obj._loop_manager = None
     obj._coord_runtime = None
     obj._shutdown_called = False
-    if cls is MegatronAsyncLLM:
-        obj._serve_started = False
+    obj._serve_started = False
     return obj
 
 
@@ -69,10 +74,16 @@ class TestConstructorValidation:
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, **extra_kwargs)
 
     def test_megatron_llm_direct_mode_succeeds(self, mock_pipeline, fake_model_and_tokenizer):
-        model, tok = fake_model_and_tokenizer
-        llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+        model, tokenizer = fake_model_and_tokenizer
+        llm = MegatronLLM(model=model, tokenizer=tokenizer, use_coordinator=False)
         assert llm.is_primary_rank is True
         assert llm._use_coordinator is False
+
+        request = MagicMock()
+        request.finalize_text.return_value = request
+        llm._engine.generate.return_value = [request]
+        assert llm.generate("hello")[0] is request
+        request.finalize_text.assert_called_once_with(llm._controller.tokenizer)
 
     def test_async_llm_requires_use_coordinator(self, mock_pipeline, fake_model_and_tokenizer):
         """``MegatronAsyncLLM`` rejects direct mode at ``__init__`` -- the
@@ -129,6 +140,114 @@ class TestLifecycleGuards:
         llm = _make_worker_instance(MegatronAsyncLLM)
         with pytest.raises(RuntimeError, match="primary rank"):
             await llm.generate("hello")
+
+        llm._is_primary_rank = True
+        request, future = MagicMock(), asyncio.get_running_loop().create_future()
+        future.set_result(request)
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.client.add_request.return_value = future
+        assert await llm._generate_impl(["hello"], MagicMock()) == [request]
+        request.finalize_text.assert_not_called()
+
+    def test_bridge_and_serve_raise_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
+        model, tok = fake_model_and_tokenizer
+        llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+        with pytest.raises(ValueError, match="use_coordinator=True"):
+            llm.serve(ServeConfig())
+
+        async def coro():
+            return 1  # pragma: no cover
+
+        for method in (llm.run_sync, llm.submit):
+            c = coro()
+            with pytest.raises(RuntimeError, match="use_coordinator=True"):
+                method(c)
+            c.close()
+
+    def test_sync_serve_nonblocking_worker_rank_noops(self):
+        """Worker ranks skip the HTTP setup; ``blocking=False`` returns
+        immediately without touching the runtime."""
+        llm = _make_worker_instance(MegatronLLM)
+        llm.serve(ServeConfig(), blocking=False)
+        assert llm._serve_started is False
+
+    def test_sync_serve_primary_rank_starts_frontend(self, monkeypatch):
+        """Primary rank starts the HTTP frontend against the coordinator
+        address and records ``_serve_started`` for shutdown teardown."""
+        tgs = pytest.importorskip(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
+            ".text_generation_server"
+        )
+        import torch.distributed as dist
+
+        llm = _make_worker_instance(MegatronLLM)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.coord_addr = "tcp://coord:5555"
+
+        started = {}
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
+
+        sock = MagicMock()
+        llm.serve(
+            ServeConfig(
+                port=1234,
+                sock=sock,
+                default_temperature=0.7,
+                default_top_p=0.95,
+                default_top_k=20,
+                eval_mode=True,
+            ),
+            blocking=False,
+        )
+        assert llm._serve_started is True
+        assert started["coordinator_addr"] == "tcp://coord:5555"
+        assert started["server_port"] == 1234
+        assert started["sock"] is sock
+        assert started["default_temperature"] == 0.7
+        assert started["default_top_p"] == 0.95
+        assert started["default_top_k"] == 20
+        assert started["eval_mode"] is True
+
+    @pytest.mark.asyncio
+    async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
+        """Async serving forwards sampling defaults to the HTTP frontend."""
+        tgs = pytest.importorskip(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
+            ".text_generation_server"
+        )
+        import torch.distributed as dist
+
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.coord_addr = "tcp://coord:5555"
+
+        started = {}
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
+
+        sock = MagicMock()
+        await llm.serve(
+            ServeConfig(
+                port=1234,
+                sock=sock,
+                default_temperature=0.7,
+                default_top_p=0.95,
+                default_top_k=20,
+                eval_mode=True,
+            ),
+            blocking=False,
+        )
+        assert llm._serve_started is True
+        assert started["coordinator_addr"] == "tcp://coord:5555"
+        assert started["server_port"] == 1234
+        assert started["sock"] is sock
+        assert started["default_temperature"] == 0.7
+        assert started["default_top_p"] == 0.95
+        assert started["default_top_k"] == 20
+        assert started["eval_mode"] is True
 
 
 class TestNormalizePrompts:

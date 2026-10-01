@@ -8,7 +8,7 @@ import transformers
 from tqdm import tqdm
 import types
 
-from tools.checkpoint.utils import _ConverterFakeProcessGroup
+from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
 
 
 def add_arguments(parser):
@@ -164,7 +164,8 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
+        from megatron.training.global_vars import set_args, set_global_variables, set_run_config
+        from megatron.training.argument_utils import inference_cfg_container_from_args
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -234,17 +235,21 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 
 
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(margs, build_model_config=False))
     set_global_variables(margs, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
     
-    # For backward compatibility during local parallel states refactoring
-    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
-    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
-    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+    initialize_checkpoint_converter_fake_process_groups(
+        mpu,
+        margs.tensor_model_parallel_size,
+        margs.pipeline_model_parallel_size,
+        margs.expert_model_parallel_size,
+    )
 
     # Metadata.
     md = types.SimpleNamespace()
@@ -262,6 +267,7 @@ def _load_checkpoint(queue, args):
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
     md.norm_has_bias = False
+    md.qkv_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size

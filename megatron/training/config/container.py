@@ -14,7 +14,7 @@ except ImportError:
     HAVE_YAML = False
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -23,6 +23,7 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -42,8 +43,16 @@ class ConfigContainerBase:
     """
     Configuration container base class for Megatron configurations.
 
-    Provides YAML/Dict serialization and deserialization.
+    Provides sub-config validation and YAML/Dict serialization and deserialization.
     """
+
+    def validate(self) -> None:
+        """Run each sub-config's explicit validation before runtime initialization."""
+        for config_field in dataclass_fields(self):
+            config = getattr(self, config_field.name)
+            validate = getattr(config, "validate", None)
+            if callable(validate):
+                validate()
     
     @classmethod
     def from_dict(
@@ -108,22 +117,13 @@ class ConfigContainerBase:
 
         from omegaconf import OmegaConf
 
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            yaml_path_exists = msc.os.path.exists(yaml_path)
-        else:
-            yaml_path_exists = os.path.exists(yaml_path)
+        yaml_path_exists = maybe_msc.os.path.exists(yaml_path)
 
         if not yaml_path_exists:
             raise FileNotFoundError(f"YAML file not found: {yaml_path}")
 
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            with msc.open(yaml_path, "r") as f:
-                config_dict = yaml.safe_load(f)
-        else:
-            with open(yaml_path, "r") as f:
-                config_dict = yaml.safe_load(f)
+        with maybe_msc.open(yaml_path, "r") as f:
+            config_dict = yaml.safe_load(f)
 
         # Convert to OmegaConf first for better compatibility with instantiate
         conf = OmegaConf.create(config_dict)
@@ -218,13 +218,8 @@ class ConfigContainerBase:
         config_dict = self.to_dict()
 
         with safe_yaml_representers():
-            if MultiStorageClientFeature.is_enabled():
-                msc = MultiStorageClientFeature.import_package()
-                with msc.open(yaml_path, "w") as f:
-                    yaml.safe_dump(config_dict, f, default_flow_style=False)
-            else:
-                with open(yaml_path, "w") as f:
-                    yaml.safe_dump(config_dict, f, default_flow_style=False)
+            with maybe_msc.open(yaml_path, "w") as f:
+                yaml.safe_dump(config_dict, f, default_flow_style=False)
 
     def print_yaml(self) -> None:
         """
@@ -268,6 +263,7 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None

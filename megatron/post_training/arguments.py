@@ -93,6 +93,14 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
     )
+    group.add_argument(
+        "--finetune-data-files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional explicit files from an HF dataset repository used for finetuning. "
+        "Listing files avoids preparing unrelated splits of large datasets.",
+    )
 
     # MTP / base train-target selection for QAD and MTP QAT.
     group.add_argument(
