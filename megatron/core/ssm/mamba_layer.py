@@ -81,6 +81,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         """Initialize Mamba Layer.
 
@@ -88,7 +89,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config)
-        if config.wide_residual is not None and not self.supports_wide_residual_connections:
+        if (
+            config.wide_residual is not None
+            and not self.supports_wide_residual_connections
+            and not is_mtp_layer
+        ):
             raise ValueError(
                 f"{type(self).__name__} does not implement wide-residual streams. Build the "
                 "hybrid stack with WideResidualMambaLayer when wide_residual is configured."
@@ -99,6 +104,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
