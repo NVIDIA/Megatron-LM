@@ -282,13 +282,14 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(100)
-    full_hidden = torch.randn(batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16)
-    local_hidden = contiguous_slice_for_cp(full_hidden, rank, world, seq_dim=1)
+    full_ids = torch.randint(0, cfg.vocab_size, (batch, seq), device=device)
+    local_ids = contiguous_slice_for_cp(full_ids, rank, world, seq_dim=1)
 
     with torch.no_grad():
-        cp_hidden = cp_model(hidden_states=local_hidden)["hidden_states"]
-        ref_hidden = ref_model(hidden_states=full_hidden)["hidden_states"]
-    expected = contiguous_slice_for_cp(ref_hidden, rank, world, seq_dim=1)
+        cp_hidden = cp_model(input_ids=local_ids)["hidden_states"]
+        ref_hidden = ref_model(input_ids=full_ids)["hidden_states"]
+    # The model returns hidden states in sequence-major (SBH) layout.
+    expected = contiguous_slice_for_cp(ref_hidden, rank, world, seq_dim=0)
 
     torch.testing.assert_close(cp_hidden, expected, atol=1e-1, rtol=1e-1)
 
@@ -495,6 +496,8 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
         zip(native_layer_outputs, hf_layer_outputs, strict=True)
     ):
         expected = contiguous_slice_for_cp(full_expected, rank, world, seq_dim=1)
+        # Native layers return SBH hidden states; the HF decoder layers return BSH.
+        expected = expected.transpose(0, 1).contiguous()
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(
