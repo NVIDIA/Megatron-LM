@@ -369,7 +369,6 @@ def mirror_gb200_nightly_workloads(
     config = load_config(str(config_path))
     workloads = filter_by_platform(workload_manifests, "dgx_gb200")
     workloads = filter_by_scope(workloads, "nightly")
-    workloads = filter_by_cadence(workloads, "nightly")
     workloads = filter_by_environment(workloads, "dev")
 
     mirrored = []

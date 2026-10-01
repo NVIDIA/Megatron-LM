@@ -52,6 +52,34 @@ def test_gb300_platform_selects_every_gb200_nightly_case(scope, cadence):
             ).group(1)
 
 
+@pytest.mark.parametrize(("cadence", "expected_count"), [(None, 1), ("nightly", 0)])
+def test_gb300_mirror_uses_the_callers_cadence_filter(monkeypatch, cadence, expected_count):
+    test_case = "gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"
+    load_and_flatten = recipe_parser.load_and_flatten
+
+    def load_with_explicit_pr_cadence(config_path):
+        workloads = load_and_flatten(config_path)
+        for workload in workloads:
+            if workload.spec["test_case"] == test_case:
+                workload.spec["cadence"] = ["pr"]
+        return workloads
+
+    monkeypatch.setattr(recipe_parser, "load_and_flatten", load_with_explicit_pr_cadence)
+    for platform in ("dgx_gb200", "dgx_gb300"):
+        workloads = recipe_parser.load_workloads(
+            container_tag="validation",
+            scope="nightly",
+            cadence=cadence,
+            environment="dev",
+            platform=platform,
+            test_case=test_case,
+        )
+        specs = [workload["spec"] for workload in workloads if workload["type"] == "basic"]
+        assert len(specs) == expected_count
+        for spec in specs:
+            assert spec["cadence"] == ["pr"]
+
+
 @pytest.mark.parametrize(
     ("scope", "environment"),
     [
