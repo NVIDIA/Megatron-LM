@@ -59,8 +59,8 @@ These checks run only when invoked; no CI job runs them. Run them on one node
 with every GPU (`--world-size 8` on an eight-GPU node, `--world-size 4` on a
 four-GPU node). A typical validation set is the per-step protocol for both GPU
 adapters plus the stop-point comparisons below (steps 3 and 5 of a five-step
-schedule) for both GPU adapters and TP=2/PP=2 training with one or two virtual
-chunks.
+schedule) for both GPU adapters, TP=2/PP=2 training with one or two virtual
+chunks, the precision-aware optimizer recipe and the hybrid CPU/GPU Adam recipe.
 
 ## Compare selected stop points
 
@@ -193,9 +193,80 @@ load and checks the returned iteration. Comparison rechecks the real files;
 changed, missing or additional shards invalidate the evidence. Checkpoint
 hashes identify the loaded files; state comparisons still use raw bytes.
 
-FP8/FP4, precision-aware/offloaded optimizers, other communication overlap policies,
+FP8/FP4, other precision-aware/offloaded optimizer configurations, other communication overlap policies,
 broader PP/VPP/CP/EP/FSDP layouts, real datasets and production recipe stop-point validation
 remain separate work. Unsupported state formats fail visibly.
+
+### Precision-aware Adam storage
+
+Select `--optimizer-mode precision_aware_fp16` for a separate BF16 TP=2/PP=1
+recipe with FP32 main gradients, scaled FP16 first/second moments, and the
+native BF16-plus-`int16` master-parameter remainder representation:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --optimizer-mode precision_aware_fp16 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-precision-aware-stop-points
+```
+
+TE's checkpoint `state_dict()` converts low-precision moments and does not
+include the separate scaling map. This adapter reads the raw optimizer state
+through the base PyTorch serializer, retaining FP16 moment bytes, both FP32
+scales, `int16` remainder bytes, group/step state, optimizer policy, dtype-range
+tensors and overflow state. It neither casts these states to FP32 nor changes
+the native checkpoint save/load implementation.
+
+Every local optimizer shard is bound to its actual model chunk, parameter name
+and byte-sharing element range. Missing moments, scales or remainders, wrong
+dtypes, copied or misidentified shards, unsupported hooks and unknown state
+keys cannot pass. CPU controls independently perturb the second moment,
+master remainder and scale bytes and require the unchanged state comparator
+to detect each difference.
+
+This named optimizer recipe does not enable other moment/master dtypes,
+offloading, quantized model parameters, capturable optimizers or combinations
+with PP/VPP. Those require their own complete storage and boundary adapters.
+
+### Hybrid CPU/GPU Adam storage
+
+The `hybrid_precision_aware_fp32` mode uses the actual
+Megatron distributed optimizer with 50% CPU offload, Torch AdamW on CPU,
+TE FusedAdam on GPU, pinned CPU copies and native D2H/H2D overlap. It uses
+FP32 moments and masters and routes BF16 model shards through the
+precision-aware distributed interface, as required by Megatron's CPU offload
+CLI.
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --optimizer-mode hybrid_precision_aware_fp32 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-hybrid-stop-points
+```
+
+Capture includes every CPU/GPU child and outer state, both moments, CPU
+per-parameter and GPU group counters, parameters and gradients, live master
+and CPU copies, pinned gradient buffers, defaults, dispatch/storage policy,
+native hook code/ownership and storage aliases. The model mapping uses actual
+tensor storage and named shard ranges: hybrid parameter order can differ from
+the distributed wrapper's earlier group positions. Copied or unowned shards,
+stale parameter/gradient copies, unknown state and changed hooks are unverified.
+Native D2H events must be drained and both distinct transfer streams complete
+before the existing capture barrier; the adapter does not drain an incomplete
+transfer to make a snapshot pass.
+
+Two schema decisions are explicit in provenance. The outer optimizer's missing
+`differentiable` option and the False value inserted by PyTorch restore both
+mean False; True and non-boolean values are rejected. Child defaults remain
+exact. Constructor-only CPU/GPU group containers retain validated parameter
+membership; their stale option dictionaries are not live optimizer state.
+The active child groups, all outer options and child defaults are captured in
+full. No tensor or scalar numerical tolerance is introduced.
+
+This named TP=2/PP=1 recipe requires actual partial CPU/GPU ownership on every
+rank. Full offload, other backends, unpinned copies, low-precision moments,
+quantized parameters, additional overlap and PP/VPP combinations remain
+unverified until their own complete adapters and GPU protocols pass.
 
 ## Capture contract
 

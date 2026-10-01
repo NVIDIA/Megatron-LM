@@ -60,6 +60,20 @@ def _run_worker(command: list[str], env: dict, log, *, timeout: float = 600) -> 
             raise
 
 
+def _validate_optimizer_mode(
+    backend: str, pipeline_size: int, virtual_pipeline_size: int, optimizer_mode: str
+) -> None:
+    if optimizer_mode not in (
+        "standard",
+        "precision_aware_fp16",
+        "hybrid_precision_aware_fp32",
+    ) or (
+        optimizer_mode != "standard"
+        and (backend != "megatron_gpt" or pipeline_size != 1 or virtual_pipeline_size != 1)
+    ):
+        raise ValueError("Precision-aware or hybrid optimizers require the Megatron PP=1 recipe")
+
+
 def _verify_stop_point(directory: Path, world_size: int, capture: dict) -> None:
     """Require only the target snapshot, not a subset of per-step instrumentation."""
     expected = {
@@ -80,7 +94,11 @@ def _verify_stop_point(directory: Path, world_size: int, capture: dict) -> None:
 
 
 def _verify_megatron_layout(
-    directory: Path, world_size: int, pipeline_size: int, virtual_pipeline_size: int = 1
+    directory: Path,
+    world_size: int,
+    pipeline_size: int,
+    virtual_pipeline_size: int = 1,
+    optimizer_mode: str = "standard",
 ) -> None:
     """Require every physical coordinate, virtual chunk and actual loader owner."""
     data_size = world_size // (2 * pipeline_size)
@@ -88,6 +106,11 @@ def _verify_megatron_layout(
     observed = set()
     for rank in range(world_size):
         completion = json.loads((directory / f"complete-rank-{rank:06d}.json").read_text())
+        if (
+            completion["provenance"].get("recipe", {}).get("optimizer_mode", "standard")
+            != optimizer_mode
+        ):
+            raise UnverifiedState(f"Unexpected Megatron optimizer mode: {directory}, rank {rank}")
         layout = completion["provenance"]["rank_layout"]
         if (
             layout["global_rank"] != rank
@@ -135,6 +158,7 @@ def run_protocol(
     stop_step: int | None = None,
     pipeline_size: int = 1,
     virtual_pipeline_size: int = 1,
+    optimizer_mode: str = "standard",
     phase_timeout: float = 600,
 ) -> dict:
     """Run two independent trainings, a resume, and a deliberately broken resume.
@@ -152,6 +176,7 @@ def run_protocol(
     if backend == "megatron_gpt" and (world_size not in (4, 8) or control != "rng"):
         raise ValueError("Megatron training uses four/eight ranks and an omitted-RNG control")
     _validate_pipeline_size(backend, pipeline_size, virtual_pipeline_size)
+    _validate_optimizer_mode(backend, pipeline_size, virtual_pipeline_size, optimizer_mode)
     if not 0 < checkpoint_step < steps or control not in (
         "rng",
         "optimizer",
@@ -168,6 +193,7 @@ def run_protocol(
         "world_size": world_size,
         "pipeline_size": pipeline_size,
         "virtual_pipeline_size": virtual_pipeline_size,
+        "optimizer_mode": optimizer_mode,
         "steps": steps,
         "checkpoint_step": checkpoint_step,
         "control_injection": f"omit_restore_{control}",
@@ -225,6 +251,7 @@ def run_protocol(
             if backend == "megatron_gpt":
                 command += ["--pipeline-size", str(pipeline_size)]
                 command += ["--virtual-pipeline-size", str(virtual_pipeline_size)]
+                command += ["--optimizer-mode", optimizer_mode]
             if name in ("resume", "control"):
                 command += ["--resume", str(output / "reference")]
             if name == "control":
@@ -241,7 +268,7 @@ def run_protocol(
         if backend == "megatron_gpt":
             for name in ("reference", "repeat", "resume", "control"):
                 _verify_megatron_layout(
-                    output / name, world_size, pipeline_size, virtual_pipeline_size
+                    output / name, world_size, pipeline_size, virtual_pipeline_size, optimizer_mode
                 )
         result["fresh"] = compare_runs(
             output / "reference",
@@ -311,12 +338,14 @@ def run_stop_points(
     stop_steps: list[int],
     pipeline_size: int = 1,
     virtual_pipeline_size: int = 1,
+    optimizer_mode: str = "standard",
     phase_timeout: float = 600,
 ) -> dict:
     """Run a separate four-launch protocol for every selected target step."""
     if not math.isfinite(phase_timeout) or phase_timeout <= 0:
         raise ValueError("Phase timeout must be finite and positive")
     _validate_pipeline_size(backend, pipeline_size, virtual_pipeline_size)
+    _validate_optimizer_mode(backend, pipeline_size, virtual_pipeline_size, optimizer_mode)
     if not stop_steps or len(set(stop_steps)) != len(stop_steps):
         raise ValueError("Require a nonempty list of unique stop steps")
     for step in stop_steps:
@@ -330,6 +359,7 @@ def run_stop_points(
         "world_size": world_size,
         "pipeline_size": pipeline_size,
         "virtual_pipeline_size": virtual_pipeline_size,
+        "optimizer_mode": optimizer_mode,
         "steps": steps,
         "checkpoint_step": checkpoint_step,
         "stop_steps": sorted(stop_steps),
@@ -349,6 +379,7 @@ def run_stop_points(
                 stop_step=step,
                 pipeline_size=pipeline_size,
                 virtual_pipeline_size=virtual_pipeline_size,
+                optimizer_mode=optimizer_mode,
                 phase_timeout=phase_timeout,
             )
             result["targets"].append(target)
@@ -374,6 +405,11 @@ def main() -> int:
     )
     parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--optimizer-mode",
+        choices=("standard", "precision_aware_fp16", "hybrid_precision_aware_fp32"),
+        default="standard",
+    )
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
     parser.add_argument(
@@ -391,6 +427,7 @@ def main() -> int:
             world_size=args.world_size,
             pipeline_size=args.pipeline_size,
             virtual_pipeline_size=args.virtual_pipeline_size,
+            optimizer_mode=args.optimizer_mode,
             phase_timeout=args.phase_timeout,
             steps=args.steps,
             checkpoint_step=args.checkpoint_step,
