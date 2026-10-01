@@ -507,6 +507,11 @@ class FsdpModule:
         # hook fires once after both uses contribute, so our post_backward() has not
         # reset BACKWARD when depth 1 enters. Its weights are already gathered.
         # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
+        # In shared MTP, post_backward would run twice (once per depth), resetting
+        # the phase after each invocation. Depth 1 could then enter from RESTING
+        # and gather its weights normally, without this guard. grads_ready would
+        # run once, after both depths' local gradient contributions have accumulated,
+        # and perform the reduction.
         # This likely requires addressing static prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is FsdpModule.Phase.BACKWARD:
