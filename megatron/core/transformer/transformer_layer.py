@@ -358,7 +358,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.is_moe_layer = getattr(self, "is_moe_layer", False)
         super().__init__(config=config, vp_stage=vp_stage)
 
-        if config.wide_residual is not None and not self.supports_wide_residual_connections:
+        if (
+            config.wide_residual is not None
+            and not self.supports_wide_residual_connections
+            and not is_mtp_layer
+        ):
             raise ValueError(
                 f"{type(self).__name__} does not implement wide-residual streams. Build the "
                 "decoder with WideResidualTransformerLayer when wide_residual is configured."
