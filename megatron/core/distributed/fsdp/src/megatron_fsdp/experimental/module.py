@@ -505,7 +505,7 @@ class FsdpModule:
         # In ordinary autograd, backward enters depth 2 then depth 1, invoking this
         # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
         # hook fires once after both uses contribute, so our post_backward() has not
-        # reset BACKWARD when depth 1 enters. Its weights are already gathered.
+        # reset BACKWARD when depth 1 enters.
         # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
         # In shared MTP, post_backward would run twice (once per depth), resetting
         # the phase after each invocation. Depth 1 could then enter from RESTING
