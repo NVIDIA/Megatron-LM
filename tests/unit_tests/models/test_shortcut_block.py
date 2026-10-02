@@ -375,6 +375,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.route_scale = torch.nn.Parameter(torch.tensor(13.0))
             self.prob_scale = torch.nn.Parameter(torch.tensor(17.0))
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
+            self.pre_mlp_layernorm = torch.nn.Identity()
             self.mlp = FakeMLP()
 
         def shortcut_route_preprocess(

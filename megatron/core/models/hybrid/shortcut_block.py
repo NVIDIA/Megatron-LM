@@ -157,8 +157,6 @@ class ShortcutMoEBlock(MegatronModule):
         self.is_first_layer = getattr(attn_layer, "is_first_layer", False)
         self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
         self.tp_group = moe_layer.mlp.tp_group
-        self.attn_layer = attn_layer
-        self.moe_layer = moe_layer
         self.recompute_shortcut_pre_mlp_layernorm = (
             self.config.recompute_granularity == "selective"
             and "shortcut_pre_mlp_layernorm" in (self.config.recompute_modules or [])
@@ -178,6 +176,15 @@ class ShortcutMoEBlock(MegatronModule):
             eps=self.config.layernorm_epsilon,
             has_residual=False,
         )
+        # Register the shortcut norm first: routing precedes the paired attention layer.
+        self.attn_layer = attn_layer
+        self.moe_layer = moe_layer
+        # Routed experts run before this norm, which feeds only the shared experts.
+        # Re-register it after the MLP subtree so static FSDP prefetch visits the
+        # expert unit before the norm unit. Parameter names and ownership stay the same.
+        pre_mlp_layernorm = moe_layer.pre_mlp_layernorm
+        del moe_layer.pre_mlp_layernorm
+        moe_layer.pre_mlp_layernorm = pre_mlp_layernorm
         self.shortcut_post_norm = (
             build_module(
                 shortcut_norm_spec,
