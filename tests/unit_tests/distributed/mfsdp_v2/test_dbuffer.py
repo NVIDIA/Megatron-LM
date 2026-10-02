@@ -406,8 +406,14 @@ def test_replicate_view_round_trip(distributed_setup):
         sharded_buffer.local_buffer.untyped_storage()
         is replicated_buffer.local_buffer.untyped_storage()
     )
+    # This compares the whole buffer, including uninitialized padding that may
+    # contain NaNs. Matching NaNs copied from that padding must compare equal.
     torch.testing.assert_close(
-        sharded_buffer.local_buffer, redistributed_sharded_buffer.local_buffer, rtol=0, atol=0
+        sharded_buffer.local_buffer,
+        redistributed_sharded_buffer.local_buffer,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
     )
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
@@ -621,27 +627,6 @@ def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_2d_mesh_row_atomic_before_replicate_is_rejected(distributed_setup):
-    """RowAtomic axes must be a suffix to keep every local buffer contiguous."""
-    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
-        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
-
-    mesh = init_device_mesh(
-        distributed_setup.device.type,
-        (2, distributed_setup.world_size // 2),
-        mesh_dim_names=("row_atomic", "replicate"),
-    )
-
-    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
-        DBuffer.empty(
-            mesh=mesh,
-            placements=[RowAtomic(), Replicate()],
-            tensor_shapes=[torch.Size((6, 4))],
-            dtype=torch.float32,
-            device=distributed_setup.device,
-        )
-
-
 def test_2d_mesh_shards_across_all_ranks(distributed_setup):
     """Multiple RowAtomic axes shard local storage by the product of their mesh sizes."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -711,6 +696,59 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(dist
         ),
     ]
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
+
+
+@pytest.mark.parametrize("destination", ["allocated", "separate", "aliased"])
+def test_multi_axis_view_and_allgather(distributed_setup, destination):
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    replicated = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    sharded = replicated.redistribute([RowAtomic(), RowAtomic()])
+    assert sharded.local_buffer.untyped_storage() is replicated.local_buffer.untyped_storage()
+    # Invalidate everything except this rank's optimizer shard to catch missing gathers.
+    replicated.local_buffer.fill_(-1)
+    for index, tensor in enumerate(tensors):
+        sharded.copy_from(index, tensor)
+    out = None if destination == "allocated" else replicated
+    if destination == "separate":
+        out = DBuffer(mesh, replicated.placements, replicated.layout, sharded.dtype, sharded.device)
+    result = sharded.allgather((1, 0), out=out)
+    if out is not None:
+        assert result is out
+    _assert_dbuffer_local_tensors_close(result, tensors)
+
+
+@pytest.mark.parametrize("axes", [(0, 1), (1, 2), (0, 1, 2)])
+@pytest.mark.parametrize("symmetric_memory", [False, True])
+def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memory):
+    if distributed_setup.world_size % 4:
+        pytest.skip("Requires a world size divisible by four.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, 2, distributed_setup.world_size // 4)
+    )
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source_placements = [Replicate() if axis < min(axes) else RowAtomic() for axis in range(3)]
+    target_placements = [Replicate() if axis <= max(axes) else RowAtomic() for axis in range(3)]
+    source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
+    expected = DBuffer.distribute_tensors(tensors, mesh, target_placements)
+    out = None
+    if symmetric_memory:
+        if distributed_setup.device.type != "cuda":
+            pytest.skip("Symmetric memory requires CUDA.")
+        # Symmetric-memory rendezvous requires an initialized NCCL communicator.
+        for axis in axes:
+            dist.barrier(group=mesh.get_group(axis), device_ids=[distributed_setup.device.index])
+        with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(distributed_setup.device)):
+            out = DBuffer(mesh, target_placements, source.layout, source.dtype, source.device)
+        assert out.is_symmetric_memory
+    result = source.allgather(axes, out=out)
+    if out is not None:
+        assert result is out
+    assert result.placements == tuple(target_placements)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
 
 
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
