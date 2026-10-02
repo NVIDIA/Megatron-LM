@@ -57,6 +57,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_merge,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.utils import is_using_quantization_scales
 
 
@@ -286,6 +289,12 @@ class SSMDynamicInferenceMixin:
             f"({y.shape[0]}) than the input projection contained ({zxBCdt.shape[0]})."
         )
         if padding_token_count > 0:
+            # Graph bucket alignment reads the process-global kernel switch;
+            # Mamba's SSM batch-invariant path can also require token padding.
+            assert context.batch_invariant_mode or is_batch_invariant_mode_enabled(), (
+                "Token-only SSM padding requires batch-invariant SSM execution "
+                "or the global batch-invariant kernel mode."
+            )
             y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
 
         # Zero padding positions to avoid corrupting quantization amax calculations.

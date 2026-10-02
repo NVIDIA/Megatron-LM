@@ -221,21 +221,41 @@ class _FakeSSM(SSMDynamicInferenceMixin):
 
 
 @pytest.mark.parametrize(
-    ("batch_invariant_mode", "num_requests", "tokens_per_request", "padded_token_count"),
+    (
+        "global_batch_invariant_mode",
+        "batch_invariant_mode",
+        "num_requests",
+        "tokens_per_request",
+        "padded_token_count",
+        "expect_padding_error",
+    ),
     [
-        (False, 40, 1, 40),
-        (False, 40, 1, 64),
-        (True, 40, 1, 40),
-        (True, 40, 1, 64),
-        (False, 20, 3, 60),
-        (False, 20, 3, 64),
-        (True, 20, 3, 64),
+        (False, False, 40, 1, 40, False),
+        (True, False, 40, 1, 64, False),
+        (False, True, 40, 1, 40, False),
+        (False, True, 40, 1, 64, False),
+        (False, False, 20, 3, 60, False),
+        (True, False, 20, 3, 64, False),
+        (False, True, 20, 3, 64, False),
+        (True, True, 20, 3, 64, False),
+        (False, False, 40, 1, 64, True),
+        (False, False, 20, 3, 64, True),
     ],
 )
 def test_decode_ssm_preserves_batch_invariant_token_padding(
-    batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
+    monkeypatch,
+    global_batch_invariant_mode,
+    batch_invariant_mode,
+    num_requests,
+    tokens_per_request,
+    padded_token_count,
+    expect_padding_error,
 ):
-    """Token-only graph padding bypasses SSM decode even with the context flag off."""
+    """Token-only padding requires either the SSM or global batch-invariant switch."""
+    monkeypatch.setattr(
+        "megatron.core.ssm.ssm_inference.is_batch_invariant_mode_enabled",
+        lambda: global_batch_invariant_mode,
+    )
     metadata_token_count = num_requests * tokens_per_request
     projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
         padded_token_count, 1, 4
@@ -255,6 +275,11 @@ def test_decode_ssm_preserves_batch_invariant_token_padding(
         mamba_metadata=types.SimpleNamespace(batch_indices_decode=batch_indices),
         padding_slice=slice(metadata_token_count, padded_token_count),
     )
+
+    if expect_padding_error:
+        with pytest.raises(AssertionError, match="Token-only SSM padding requires"):
+            mixer.ssm_dynamic_inference(torch.empty(0), context)
+        return
 
     output, bias = mixer.ssm_dynamic_inference(torch.empty(0), context)
 
