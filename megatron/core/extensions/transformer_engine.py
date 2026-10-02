@@ -26,12 +26,14 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
+    TeardownStage,
     get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
+    register_model_parallel_teardown,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
@@ -88,6 +90,38 @@ except ImportError:
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _te_autocast_depth() -> int:
+    """Return the nesting depth of Transformer Engine autocast contexts."""
+    if is_te_min_version("2.15.0"):
+        return FP8GlobalStateManager.quantization_state.autocast_depth
+    if is_te_min_version("2.9.0"):
+        return FP8GlobalStateManager.AUTOCAST_DEPTH
+    return FP8GlobalStateManager.FP8_AUTOCAST_DEPTH
+
+
+def _check_te_autocast_exited() -> None:
+    """Refuse model-parallel teardown inside a Transformer Engine autocast context.
+
+    On exit, an open context can reduce FP8 scaling statistics over its process group,
+    which teardown destroys, and it reads the global state that teardown resets. A
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
+    """
+    if _te_autocast_depth() > 0:
+        raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
+
+
+def _reset_te_global_state() -> None:
+    """Drop TE's FP8 reduction groups and per-model tensor caches."""
+    FP8GlobalStateManager.reset()
+
+
+if HAVE_TE:
+    register_model_parallel_teardown(TeardownStage.VALIDATE, _check_te_autocast_exited)
+    register_model_parallel_teardown(TeardownStage.RESET_STATE, _reset_te_global_state)
 
 
 def _set_expert_parameter_attributes(

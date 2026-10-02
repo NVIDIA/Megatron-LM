@@ -14,6 +14,7 @@ from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -1793,6 +1794,13 @@ class _NCCLEPManager(_DispatchManager):
         return hidden_states
 
 
+def _release_nccl_ep_symm_buffers() -> None:
+    """Drop the shared zero-copy symm buffers, which NCCL EP allocated on its communicator."""
+    _NCCLEPManager._zc_fwd_token_buf = None
+    _NCCLEPManager._zc_bwd_token_buf = None
+    _NCCLEPManager._zc_recv_topk_weights_buf = None
+
+
 def nccl_ep_release_context() -> None:
     """Release the process-wide NCCL EP context and the shared zero-copy symm buffers.
 
@@ -1800,10 +1808,13 @@ def nccl_ep_release_context() -> None:
     ``_ensure_bootstrap`` rebuilds both lazily, so the symm-buffer rendezvous lands outside
     CUDA-graph capture.
     """
-    _NCCLEPManager._zc_fwd_token_buf = None
-    _NCCLEPManager._zc_bwd_token_buf = None
-    _NCCLEPManager._zc_recv_topk_weights_buf = None
+    _release_nccl_ep_symm_buffers()
     nccl_ep_finalize()
+
+
+# This module imports fused_a2a, which registered nccl_ep_finalize first, so teardown
+# drops the symm buffers before NCCL EP finalizes, as nccl_ep_release_context() does.
+register_model_parallel_teardown(TeardownStage.RELEASE_COMMUNICATION, _release_nccl_ep_symm_buffers)
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):

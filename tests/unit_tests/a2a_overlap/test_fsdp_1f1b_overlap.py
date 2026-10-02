@@ -24,7 +24,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     overlap_train_step,
     reset_model,
 )
-from tests.unit_tests.test_utilities import Utils
 
 SEQ_LEN = 32
 VOCAB_SIZE = 128
@@ -40,16 +39,14 @@ class TestFSDP1F1BOverlap:
     weights against standard FSDP forward/backward.
     """
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(
+    @pytest.fixture(autouse=True)
+    def model_parallel(self, shared_model_parallel):
+        shared_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=4,
         )
         set_streams()
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
