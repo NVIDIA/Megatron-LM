@@ -403,7 +403,12 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunked):
+@pytest.mark.parametrize("real_topk", [False, True])
+def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunked, real_topk):
+    if real_topk:
+        _skip_if_fused_dsa_unavailable(require_flash_mla=False)
+    device = "cuda" if real_topk else "cpu"
+
     class FakeDSA:
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
@@ -417,24 +422,29 @@ def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunke
             )
             return {"indices": indices.to(torch.int32), "values": None}
 
-    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    if not real_topk:
+        monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+        monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
     if chunked:
         monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 32)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
-        torch.zeros((1, 3, 1, 1)),
-        torch.zeros((1, 4, 1)),
-        torch.zeros((1, 3, 1)),
+        torch.zeros((1, 3, 1, 1), device=device),
+        torch.zeros((1, 4, 1), device=device),
+        torch.zeros((1, 3, 1), device=device),
         topk=2,
-        varlen_starts=torch.zeros(3, dtype=torch.int64),
-        varlen_ends=torch.full((3,), 4, dtype=torch.int64),
+        varlen_starts=torch.zeros(3, dtype=torch.int64, device=device),
+        varlen_ends=torch.full((3,), 4, dtype=torch.int64, device=device),
         return_scores=False,
         use_local_indexer_varlen=True,
     )
 
-    torch.testing.assert_close(topk_indices, torch.tensor([[[2, 3]] * 3], dtype=torch.int32))
-    torch.testing.assert_close(topk_length, torch.tensor([[2, 2, 2]], dtype=torch.int32))
+    torch.testing.assert_close(
+        topk_indices, torch.tensor([[[2, 3]] * 3], dtype=torch.int32, device=device)
+    )
+    torch.testing.assert_close(
+        topk_length, torch.tensor([[2, 2, 2]], dtype=torch.int32, device=device)
+    )
 
 
 def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkeypatch):
@@ -1756,10 +1766,14 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
     "scores, expected_indices",
     [([0.0, 0.0, 0.0, 0.0], [2, 3]), ([0.0, 3.0e-13, 1.0e-13, 0.0], [1, 2])],
 )
+@pytest.mark.parametrize("real_topk", [False, True])
 def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
-    monkeypatch, scores, expected_indices
+    monkeypatch, scores, expected_indices, real_topk
 ):
-    original_scores = torch.tensor(scores, dtype=torch.float32).view(1, 4)
+    if real_topk:
+        _skip_if_fused_dsa_unavailable(require_flash_mla=False)
+    device = "cuda" if real_topk else "cpu"
+    original_scores = torch.tensor(scores, dtype=torch.float32, device=device).view(1, 4)
 
     class FakeDSA:
         @staticmethod
@@ -1774,25 +1788,27 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
             )
             return {"indices": indices.to(torch.int32), "values": scores_flat.gather(-1, indices)}
 
-    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    if not real_topk:
+        monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+        monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
-        torch.ones((1, 1, 1, 1)),
+        torch.ones((1, 1, 1, 1), device=device),
         original_scores.view(1, 4, 1),
-        torch.ones((1, 1, 1)),
+        torch.ones((1, 1, 1), device=device),
         topk=2,
-        varlen_starts=torch.tensor([0], dtype=torch.int64),
-        varlen_ends=torch.tensor([4], dtype=torch.int64),
+        varlen_starts=torch.tensor([0], dtype=torch.int64, device=device),
+        varlen_ends=torch.tensor([4], dtype=torch.int64, device=device),
         return_scores=False,
         return_topk_scores=True,
         use_local_indexer_varlen=True,
     )
 
     torch.testing.assert_close(
-        topk_indices.sort(dim=-1).values, torch.tensor([[expected_indices]], dtype=torch.int32)
+        topk_indices.sort(dim=-1).values,
+        torch.tensor([[expected_indices]], dtype=torch.int32, device=device),
     )
-    torch.testing.assert_close(topk_length, torch.tensor([[2]], dtype=torch.int32))
+    torch.testing.assert_close(topk_length, torch.tensor([[2]], dtype=torch.int32, device=device))
     torch.testing.assert_close(
         topk_scores,
         original_scores.gather(-1, topk_indices.long().view(1, 2)).view(1, 1, 2),
