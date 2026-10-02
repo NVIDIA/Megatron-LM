@@ -189,6 +189,15 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
 
+        if config.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "MoonEP is not yet integrated with Megatron-FSDP v1. Supporting it requires "
+                "binding gathered expert weights, acquiring FSDP-managed full-gradient "
+                "buffers through get_main_grad, and completing replica-gradient accumulation "
+                "before FSDP reduces or releases those buffers. "
+                "Use regular DDP or the distributed optimizer for now."
+            )
+
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -739,6 +748,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If a required process group is missing or the model,
                 topology, or data-parallel configuration uses an unsupported feature.
         """
+        if config.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "MoonEP is not yet integrated with Megatron-FSDP v2. Supporting it requires "
+                "rebinding gathered expert weights after unshard, providing FSDP-managed "
+                "full-gradient buffers for native and replica contributions, and completing "
+                "replica-gradient accumulation before FSDP packs/reduce-scatters gradients "
+                "or releases their buffers."
+            )
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):

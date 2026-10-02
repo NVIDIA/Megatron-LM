@@ -29,6 +29,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
+    uses_compact_routes,
     z_loss_func,
 )
 from megatron.core.transformer.moe.router_diagnostics import build_router_diagnostics
@@ -387,8 +388,8 @@ class TopKRouter(Router):
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Sparse routing probs and boolean
-            routing map, each shaped ``[num_tokens, num_experts]``.
+            Tuple[torch.Tensor, torch.Tensor]: Compact probabilities and expert ids when
+            requested by the dispatcher, otherwise dense probabilities and a boolean map.
         """
         assert (
             not self.config.moe_router_fusion
@@ -449,6 +450,7 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=self.config.moe_router_fusion,
             precomputed_indices=indices,
+            dense_output=uses_compact_routes(self.config),
         )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
@@ -903,6 +905,10 @@ class TopKRouter(Router):
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
+
+            With virtual-expert load balancing the dispatcher plans from the router's compact
+            routes instead: ``probs`` is ``[num_tokens, topk]`` and ``routing_map`` holds the
+            ``[num_tokens, topk]`` expert ids. The dense map is never built.
         """
         seq_length, bsz = logits.shape[:2]
         observe_router_diagnostics = is_observing_tensor("router_diagnostics")
@@ -929,6 +935,10 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        # HybridEP and virtual-expert planning consume the compact [num_tokens, topk] ids and
+        # probabilities directly (see uses_compact_routes); the dispatcher expects the same format.
+        compact_routes = uses_compact_routes(self.config)
 
         # Calculate probs and routing_map for token dispatching
         if self.config.moe_num_hash_layers > 0:
@@ -961,6 +971,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                dense_output=compact_routes,
             )
 
         # Apply token dropping to probs and routing_map.

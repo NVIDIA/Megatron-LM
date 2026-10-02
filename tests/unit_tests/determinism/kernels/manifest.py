@@ -300,6 +300,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- MoE
     KernelEntry(
+        name="virtual_expert_planner",
+        sources=("megatron/core/transformer/moe/virtual_expert_triton.py",),
+        tests=(K + "test_moe_kernels.py",),
+        kind="triton",
+        notes="Alignment-specialized route planning replays bit-exactly in eager and CUDA graphs.",
+    ),
+    KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(K + "test_moe_kernels.py",),
