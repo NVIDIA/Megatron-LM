@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -206,6 +207,37 @@ def get_loaded_iteration():
     """Get the iteration that was loaded from checkpoint, or None if no checkpoint was loaded."""
     global _LOADED_ITERATION
     return _LOADED_ITERATION
+
+
+def _validate_cyclic_dataloader_resume(args, checkpoint_args, release):
+    """Reject cyclic resumes whose sampler layout cannot be remapped safely."""
+    if release or getattr(args, 'finetune', False):
+        return
+    if getattr(args, 'dataloader_type', None) != 'cyclic':
+        return
+    run_sharding = getattr(args, 'data_sharding', False)
+    checkpoint_sharding = getattr(checkpoint_args, 'dataloader_data_sharding', None)
+    if checkpoint_sharding is None:
+        checkpoint_sharding = getattr(checkpoint_args, 'data_sharding', None)
+    if checkpoint_sharding is not None and checkpoint_sharding != run_sharding:
+        raise RuntimeError(
+            'Cannot resume a cyclic dataloader when the data-sharding mode changes '
+            f'(checkpoint={checkpoint_sharding}, run={run_sharding}).'
+        )
+    if not run_sharding:
+        return
+
+    checkpoint_dp = getattr(checkpoint_args, 'dataloader_data_parallel_size', None)
+    if checkpoint_dp is None:
+        checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0) * getattr(
+            checkpoint_args, 'gtp_weight_remat_size', 1
+        )
+    run_dp = getattr(args, 'data_parallel_size', 0) * getattr(args, 'gtp_weight_remat_size', 1)
+    if checkpoint_dp > 0 and run_dp > 0 and checkpoint_dp != run_dp:
+        raise RuntimeError(
+            'Cannot resume a sharded cyclic dataloader with a different '
+            f'data-parallel size ({checkpoint_dp} from the checkpoint vs. {run_dp} for this run).'
+        )
 
 
 def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
@@ -1157,7 +1189,9 @@ def save_checkpoint(
                     return_base_dir=True,
                 )
                 if iteration > 0:
-                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                    from megatron.training.utils.checkpoint_utils import (
+                        get_checkpoint_run_config_filename,
+                    )
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -1285,9 +1319,9 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from megatron.training.distillation import get_logits_saver
-
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
+        from megatron.training.distillation import get_logits_saver
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
@@ -1700,7 +1734,13 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict['args'] = args
+    checkpoint_args = copy.copy(args)
+    if hasattr(args, 'data_parallel_size'):
+        checkpoint_args.dataloader_data_parallel_size = args.data_parallel_size * getattr(
+            args, 'gtp_weight_remat_size', 1
+        )
+        checkpoint_args.dataloader_data_sharding = getattr(args, 'data_sharding', False)
+    state_dict['args'] = checkpoint_args
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -3057,6 +3097,7 @@ def load_checkpoint(
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
         # architecture-preserving load. Keep every other resume-time argument
