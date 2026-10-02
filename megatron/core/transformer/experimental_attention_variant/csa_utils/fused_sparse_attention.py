@@ -1681,10 +1681,10 @@ def _deterministic_sparse_indexer_grads_wk(
     Same math as ``cudnn.DSA.indexer_backward_wrapper`` (KL backward normalised by ``B * S_q``;
     ``topk_indices`` are local to each batch element, negatives are padding). Packed THD
     callers use a single synthetic batch, so their flat key ids are already batch-local.
-    The per-key reduction
-    over the (query, slot) contributions uses torch's deterministic ``index_add_`` when
-    ``torch.use_deterministic_algorithms(True)`` is active (sort-based, fixed order) and otherwise a
-    stable sort + prefix sum with gathers at fixed boundaries; both give a fixed summation order.
+    The per-key reduction over the (query, slot) contributions uses torch's deterministic
+    ``index_add_`` when ``torch.use_deterministic_algorithms(True)`` is active (sort-based,
+    fixed order) and otherwise a stable sort + prefix sum with gathers at fixed boundaries;
+    both give a fixed summation order.
     Padding slots are spread over distinct dummy rows: the deterministic ``index_add_`` processes
     duplicates of one id serially, and causal Top-K leaves a large fraction of the slots padded.
     """
