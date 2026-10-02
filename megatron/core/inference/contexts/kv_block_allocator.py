@@ -50,7 +50,6 @@ class KVBlockAllocator:
             assert pc_state.pool_size == pool_size, "pc_state must span the whole block pool"
         self.pc_state = pc_state
         self.registry = prefix_cache_registry
-        self.on_blocks_deregistered: Optional[Callable] = None
         self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
         # Handoff blocks remain pinned until decode finishes pulling them.
@@ -257,8 +256,6 @@ class KVBlockAllocator:
         keys_to_delete = set(hashes) - {-1}
         self.registry.evict_kv(keys_to_delete)
         block_ids_list = block_ids.tolist()
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids_list, keys_to_delete)
         for observer in tuple(self._blocks_deregistered_observers):
             observer(block_ids_list, keys_to_delete)
 

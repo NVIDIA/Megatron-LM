@@ -1093,7 +1093,6 @@ class PrefixCachedMambaMetadata(MambaMetadata):
             self._intermediate_real_count_buffer.fill_(0)
             self.intermediate_real_count = self._intermediate_real_count_buffer
 
-
     # -------------------------------------------------------------------------
     # Intermediate state tracking
     # -------------------------------------------------------------------------

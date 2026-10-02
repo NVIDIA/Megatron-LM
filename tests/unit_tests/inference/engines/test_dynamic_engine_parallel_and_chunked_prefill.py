@@ -679,9 +679,10 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         original = meta.write_token_maps
         written = set()
         shared = []
-        # `block_ref_counts` exists only under prefix caching; without it no block is ever
-        # shared, so the shared-write check is vacuous rather than skipped.
-        ref_counts = getattr(alloc, "block_ref_counts", None)
+        # Per-block ref counts live on the allocator's prefix-cache state, which exists only
+        # under prefix caching; without it no block is ever shared, so the shared-write check
+        # is vacuous rather than skipped.
+        ref_counts = alloc.pc_state.block_ref_counts if alloc.pc_state is not None else None
 
         def recording(gpu_view, rows, positions, block_table, padded_token_count, **kwargs):
             # Observe the OUTPUT, not the inputs: `write_token_maps` decides the final
@@ -1119,7 +1120,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         def step_and_sample():
             nonlocal max_ref_seen
             env.engine.step_modern()
-            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.pc_state.block_ref_counts.max()))
+            max_ref_seen = max(
+                max_ref_seen, int(context.kv_block_allocator.pc_state.block_ref_counts.max())
+            )
 
         with self._record_mtp_kv_writes(context) as (_written, shared_writes):
             add_request(0)

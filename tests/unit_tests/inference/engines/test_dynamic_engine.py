@@ -4801,12 +4801,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # the speculative block reserve nor the draft-slot back-off applies.
         ctx.num_speculative_tokens = 0
         ctx.enable_mtp_kv_cache = False
-        ctx.kv_block_allocator = types.SimpleNamespace(
-            kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
-        )
-        ctx.mamba_slot_allocator = types.SimpleNamespace(
-            hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
-        )
+        from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
+
+        ctx.prefix_cache_registry = PrefixCacheRegistry()
+        ctx.prefix_cache_registry.register_kv([7, 8], block_hashes)
+        ctx.prefix_cache_registry.register_mamba([7, 8], block_hashes)
+        ctx.mamba_slot_allocator = types.SimpleNamespace()
 
         _m = DynamicInferenceContext._compute_prefix_match(
             ctx, req, prefill_chunk_length=211, record_mamba_match=True

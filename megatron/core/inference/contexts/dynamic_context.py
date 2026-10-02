@@ -18,10 +18,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import (
-    InferenceConfig,
-    KVCacheManagementMode,
-)
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
@@ -3189,18 +3186,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if start_block >= end_block:
             return 0
 
-        mamba_map = self.prefix_cache_registry.mamba_hash_to_block_id
         hashes = req.precomputed_block_hashes[start_block:end_block]
-
-        # Mark the blocks in range whose hash the allocator still holds state
-        # for; the farthest such block is the match count. Intersecting against
-        # the range's hashes first keeps this bounded by the range rather than
-        # the size of the whole cache.
-        block_hashes = torch.tensor(hashes, dtype=torch.int64)
-        cached = mamba_map.keys() & set(hashes)
-        cached_hashes = torch.tensor(list(cached), dtype=torch.int64)
-        is_cached = torch.isin(block_hashes, cached_hashes)
-        return int(is_cached.nonzero()[-1].item()) + 1 if is_cached.any() else 0
+        return self.prefix_cache_registry.match_mamba_farthest(hashes)
 
     def _compute_prefix_match(
         self,
@@ -3276,8 +3263,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
-                    backed_off_blocks = self._find_mamba_match_count(
-                        req=req, start_block=0, end_block=num_mamba_matched - 1
+                    backed_off_blocks = self.prefix_cache_registry.find_mamba_backoff(
+                        req.precomputed_block_hashes, num_mamba_matched - 1
                     )
                     prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
                 else:
@@ -3318,8 +3305,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 and finished == 0
                 and prefix_skip_tokens > 0
             ):
-                usable = self._find_mamba_match_count(
-                    req=req, start_block=0, end_block=prefix_skip_tokens // self.block_size_tokens
+                usable = self.prefix_cache_registry.find_mamba_backoff(
+                    req.precomputed_block_hashes, prefix_skip_tokens // self.block_size_tokens
                 )
                 prefix_skip_tokens = usable * self.block_size_tokens
 
