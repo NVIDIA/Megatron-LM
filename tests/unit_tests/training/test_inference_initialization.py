@@ -9,17 +9,28 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.inference import initialize as inference_initialize
 from megatron.training import arguments, global_vars, initialize
 
 
 @pytest.mark.parametrize("build_tokenizer", [False, True])
-def test_inference_services_without_training_arguments(monkeypatch, build_tokenizer):
-    args = Namespace(enable_experimental=False, disable_jit_fuser=False)
+@pytest.mark.parametrize("enable_runtime_flags", [False, True])
+def test_inference_services_without_training_arguments(
+    monkeypatch, build_tokenizer, enable_runtime_flags
+):
+    args = Namespace(
+        enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
+    )
+    experimental = Mock()
+    jit = Mock()
+    monkeypatch.setattr(inference_initialize, "set_experimental_flag", experimental)
+    monkeypatch.setattr(inference_initialize, "disable_jit_fuser", jit)
     services = {}
     for name in ("_build_tokenizer", "_set_wandb_writer", "_set_telemetry"):
         services[name] = Mock()
         monkeypatch.setattr(global_vars, name, services[name])
     for name in (
+        "initialize_runtime_services",
         "init_num_microbatches_calculator",
         "_set_tensorboard_writer",
         "_set_timers",
@@ -31,12 +42,23 @@ def test_inference_services_without_training_arguments(monkeypatch, build_tokeni
     ):
         monkeypatch.setattr(global_vars, name, Mock(side_effect=AssertionError(name)))
 
-    global_vars.initialize_runtime_services(args, build_tokenizer=build_tokenizer, inference=True)
+    inference_initialize.initialize_runtime_services_for_inference(
+        args, build_tokenizer=build_tokenizer
+    )
 
     assert services["_build_tokenizer"].call_count == int(build_tokenizer)
     services["_set_wandb_writer"].assert_called_once_with(args)
     services["_set_telemetry"].assert_called_once_with(args, include_training=False)
-    assert vars(args) == {"enable_experimental": False, "disable_jit_fuser": False}
+    if enable_runtime_flags:
+        experimental.assert_called_once_with(True)
+        jit.assert_called_once_with()
+    else:
+        experimental.assert_not_called()
+        jit.assert_not_called()
+    assert vars(args) == {
+        "enable_experimental": enable_runtime_flags,
+        "disable_jit_fuser": enable_runtime_flags,
+    }
 
 
 def test_inference_telemetry_does_not_read_training_fields(monkeypatch):

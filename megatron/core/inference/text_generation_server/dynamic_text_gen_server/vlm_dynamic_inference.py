@@ -20,10 +20,11 @@ import json
 from functools import partial
 
 from megatron.core.transformer.module import MegatronModule
+from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint_for_inference
+from megatron.training.checkpointing import load_args_from_checkpoint
 
 # NOTE: ``get_model`` below does a ``from model import model_provider`` for the
 # ``examples/multimodal/model.py`` file, whose siblings use bare imports like

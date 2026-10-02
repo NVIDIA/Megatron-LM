@@ -23,6 +23,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -32,7 +33,6 @@ from megatron.training.checkpointing import (
     get_checkpoint_version,
     load_args_from_checkpoint,
     load_checkpoint,
-    load_checkpoint_for_inference,
     maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,

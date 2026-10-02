@@ -2616,21 +2616,6 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
-def load_checkpoint_for_inference(
-    model: list[torch.nn.Module], *, strict: bool = True, load_arg: str = 'load'
-) -> tuple[int, float]:
-    """Load model weights without resuming a training run.
-
-    Checkpoint format handling and model compatibility checks are shared with
-    training. RNG restoration retains the existing ``no_load_rng``/``finetune``
-    policy; optimizer, scheduler, rerun and consumed-sample state are not restored.
-    The returned iteration/FLOP count are checkpoint metadata only.
-    """
-    return load_checkpoint(
-        model, None, None, load_arg=load_arg, strict=strict, restore_training_state=False
-    )
-
-
 def load_checkpoint(
     ddp_model,
     optimizer,
