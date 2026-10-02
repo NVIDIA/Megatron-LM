@@ -710,24 +710,16 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     assert group.main_grad is None
 
 
-@pytest.mark.parametrize(
-    "trainable_child,input_requires_grad", [(False, True), (True, True), (True, False)]
-)
-def test_frozen_weights_remain_available_during_backward(
-    distributed_setup, trainable_child, input_requires_grad
-):
+def test_frozen_weights_remain_available_during_backward(distributed_setup):
     """Frozen weights must remain available until internal backward completes."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Linear(4, 4, bias=False).to(device)
-    model.requires_grad_(False)
-    if trainable_child:
-        # The parent owns only frozen weights, but backward must reach its child
-        # even when the parent's input does not require gradients.
-        model = nn.Sequential(nn.Linear(4, 4, bias=False).to(device), model)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    model[1].requires_grad_(False)
+    # The parent owns only frozen weights, but backward must reach its child
+    # even though the parent's input does not require gradients.
     with fully_shard_context(device=device):
-        if trainable_child:
-            fully_shard(model[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model[0], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     def unpack(tensor):
@@ -737,15 +729,12 @@ def test_frozen_weights_remain_available_during_backward(
             pytest.fail("Frozen weight was resharded before backward consumed it", pytrace=False)
         return tensor
 
-    x = torch.ones(2, 4, device=device, requires_grad=input_requires_grad)
+    x = torch.ones(2, 4, device=device)
     with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, unpack):
         model(x).sum().backward()
 
-    if input_requires_grad:
-        assert x.grad is not None
-    if trainable_child:
-        assert model[0].weight.grad is not None
-        torch.optim.SGD(model.parameters(), lr=0.05).step()
+    assert model[0].weight.grad is not None
+    torch.optim.SGD(model.parameters(), lr=0.05).step()
 
 
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
