@@ -299,6 +299,32 @@ class FsdpModule:
         )
         self.register_post_backward_hook(FsdpModule.post_backward)
 
+        # A shared checkpoint-recompute hook can call an earlier unit's child
+        # (e.g. unit.norm) before that unit's backward-pre hook gathers its weights.
+        # Gather the owning unit before the child runs; only the child is replayed.
+        # The owner still controls gradient reduction and parameter release.
+        module_ref = ref(self)
+
+        def prepare_recomputed_child(_module: nn.Module, _args: tuple[object, ...]) -> None:
+            """Gather parent-owned weights before replay calls this child."""
+            owner = module_ref()
+            if (
+                owner is not None
+                and _is_in_backward()
+                and owner.phase is not FsdpModule.Phase.FORWARD
+            ):
+                owner.pre_backward()
+
+        parameter_owners: set[nn.Module] = set()
+        for group in self._parameter_groups:
+            for parameter in group.fsdp_parameters:
+                for fqn in parameter.fqns:
+                    parameter_owner, _ = get_parameter_owner(module, fqn)
+                    if parameter_owner is not module:
+                        parameter_owners.add(parameter_owner)
+        for parameter_owner in parameter_owners:
+            parameter_owner.register_forward_pre_hook(prepare_recomputed_child)
+
     def register_post_backward_hook(
         self, post_backward_hook: Callable[["FsdpModule"], None]
     ) -> None:
