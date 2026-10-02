@@ -7,6 +7,7 @@ import pytest
 import torch
 import transformer_engine as te
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
@@ -135,7 +136,7 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert grouped[2] is trailing_layer
     shortcut = grouped[1]
     assert isinstance(shortcut, ShortcutMoEBlock)
-    assert shortcut.attn_layer is compute
+    assert shortcut.compute_layer is compute
     assert shortcut.moe_layer is paired_moe
     assert shortcut.attn_layer_idx == compute.layer_number - 1
     assert shortcut.moe_layer_idx == paired_moe.layer_number - 1
@@ -317,6 +318,81 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         "postprocess_packed": "packed-5",
     }
     torch.testing.assert_close(output, hidden_states + 14)
+
+
+def test_inference_runs_paired_layer_atomically(monkeypatch):
+    """Inference routes on the pair input and runs the paired layer's ordinary forward.
+
+    The two-stage training path never updates KV-cache or recurrent state, so inference must
+    not use it; it must also select the MoE layer's inference token dispatcher first.
+    """
+    config = _shortcut_config()
+    compute_layer = _FakeCompute(config)
+    moe_layer = _FakeMoE(config)
+    block = ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=False)
+    inference_context = object()
+    observed = {}
+
+    def compute_forward(hidden_states, **kwargs):
+        observed["compute_context"] = kwargs["inference_context"]
+        return hidden_states + 1, None
+
+    def two_stage(*_args, **_kwargs):
+        raise AssertionError("inference must not use the two-stage training path")
+
+    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+        observed["route_input"] = shortcut_hidden
+        return shortcut_hidden, shortcut_hidden
+
+    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
+        observed["shared_input"] = hidden_states
+        return torch.zeros_like(hidden_states), None, hidden_states, ()
+
+    def postprocess(residual, combined_output, shared_expert_output, **_kwargs):
+        return residual + combined_output
+
+    @contextmanager
+    def quant_context_factory(*_args):
+        yield
+
+    monkeypatch.setattr(compute_layer, "forward", compute_forward)
+    monkeypatch.setattr(compute_layer, "forward_pre_attn_and_core_attn", two_stage)
+    monkeypatch.setattr(
+        moe_layer.mlp,
+        "select_token_dispatcher",
+        lambda: observed.setdefault("dispatcher_selected", True),
+        raising=False,
+    )
+    monkeypatch.setattr(block, "_moe_router_preprocess", route)
+    monkeypatch.setattr(block, "_launch_dispatch", lambda hidden, probs, **_: (hidden, probs))
+    monkeypatch.setattr(
+        moe_layer.mlp, "routed_experts_compute", lambda hidden, probs: (hidden, None), raising=False
+    )
+    monkeypatch.setattr(block, "_launch_combine", lambda output, **_: output)
+    monkeypatch.setattr(block, "_moe_shared_experts", shared)
+    monkeypatch.setattr(block, "_postprocess", postprocess)
+
+    hidden_states = torch.zeros(2, 1, config.hidden_size)
+    InferenceMode.set_active()
+    try:
+        output = block(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            inference_context=inference_context,
+            rotary_pos_emb=None,
+            sequence_len_offset=None,
+            packed_seq_params=None,
+            padding_mask=None,
+            quant_context_factory=quant_context_factory,
+        )
+    finally:
+        InferenceMode.unset_active()
+
+    assert observed["dispatcher_selected"]
+    assert observed["compute_context"] is inference_context
+    torch.testing.assert_close(observed["route_input"], hidden_states)
+    torch.testing.assert_close(observed["shared_input"], hidden_states + 1)
+    torch.testing.assert_close(output, hidden_states + 1 + hidden_states)
 
 
 def test_parallel_stream_is_initialized_once(monkeypatch):

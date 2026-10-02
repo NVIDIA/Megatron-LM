@@ -264,9 +264,11 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         model = SimpleNamespace(
             config=SimpleNamespace(batch_invariant_mode=True, params_dtype=torch.bfloat16)
         )
+        layers = [SimpleNamespace(mixer=SimpleNamespace(chunk_size=self.chunk_size))]
         decoder = SimpleNamespace(
             layer_type_list=[Symbols.MAMBA],
-            layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=self.chunk_size))],
+            layers=layers,
+            physical_layers=lambda: tuple(layers),
             mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
         )
         with patch("megatron.core.inference.config.get_attr_wrapped_model", return_value=decoder):

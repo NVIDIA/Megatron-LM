@@ -18,7 +18,7 @@ from enum import Enum, auto
 from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -1994,6 +1994,7 @@ def _load_non_persistent_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
@@ -2014,6 +2015,7 @@ def _load_non_persistent_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif args.non_persistent_ckpt_type == 'local':
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -2035,6 +2037,15 @@ def _load_non_persistent_base_checkpoint(
         )
 
 
+def _gtp_pad_for_alignment_from_args(args):
+    """GTP dim-0 alignment implied by the precision recipe recorded in args."""
+    return resolve_gtp_pad_for_alignment(
+        fp4=getattr(args, 'fp4', None) is not None,
+        fp8_recipe=getattr(args, 'fp8_recipe', None),
+        fp8=getattr(args, 'fp8', None) is not None,
+    )
+
+
 def _load_global_dist_base_checkpoint(
     load_dir,
     args,
@@ -2045,6 +2056,7 @@ def _load_global_dist_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
@@ -2095,11 +2107,8 @@ def _load_global_dist_base_checkpoint(
 
     # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
     # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
-    gtp_pad_for_alignment = resolve_gtp_pad_for_alignment(
-        fp4=getattr(args, 'fp4', None) is not None,
-        fp8_recipe=getattr(args, 'fp8_recipe', None),
-        fp8=getattr(args, 'fp8', None) is not None,
-    )
+    if gtp_pad_for_alignment is None:
+        gtp_pad_for_alignment = _gtp_pad_for_alignment_from_args(args)
     grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
@@ -2142,6 +2151,7 @@ def _load_base_checkpoint(
     dp_cp_group=None,
     expt_dp_group=None,
     gpt_compat_layer_maps=None,
+    gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from the given directory
 
@@ -2182,6 +2192,7 @@ def _load_base_checkpoint(
                 checkpointing_context,
                 dp_cp_group=dp_cp_group,
                 expt_dp_group=expt_dp_group,
+                gtp_pad_for_alignment=gtp_pad_for_alignment,
             )
         else:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
@@ -2234,6 +2245,7 @@ def _load_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif ckpt_format == 'torch':
         ckpt_type = CheckpointType.LEGACY
@@ -2628,11 +2640,15 @@ def load_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
+    model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
         parameters and buffers in model.
+    model_sharded_state_dict_modifier: optional callback applied in place to each model
+        sharded state dict before loading (torch_dist only), e.g. to remap keys to a
+        checkpoint's naming.
     skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
         for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
@@ -2697,6 +2713,11 @@ def load_checkpoint(
         else:
             raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
+    if model_sharded_state_dict_modifier is not None and ckpt_format != 'torch_dist':
+        raise NotImplementedError(
+            f'model_sharded_state_dict_modifier requires a torch_dist checkpoint, got {ckpt_format}'
+        )
+
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
@@ -2707,6 +2728,14 @@ def load_checkpoint(
         and 'args' in state_dict
     ):
         ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+
+    # GTP padding was sized by the precision recipe of the run that saved the checkpoint, which
+    # can differ from this run's (e.g. an MXFP8-trained checkpoint loaded for BF16 inference).
+    gtp_pad_for_alignment = (
+        _gtp_pad_for_alignment_from_args(ckpt_args)
+        if any(hasattr(ckpt_args, name) for name in ('fp4', 'fp8', 'fp8_recipe'))
+        else None
+    )
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
@@ -2920,6 +2949,11 @@ def load_checkpoint(
                 )
                 if is_model or is_optim:
                     retarget_sharded_state_dict_to_gpt_checkpoint(sub_sd, gpt_compat_layer_maps)
+
+        if model_sharded_state_dict_modifier is not None:
+            for model_key in ('model', *(f'model{i}' for i in range(len(model)))):
+                if model_key in load_kwargs['sharded_state_dict']:
+                    model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
     elif args.ckpt_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -3020,6 +3054,7 @@ def load_checkpoint(
         dp_cp_group=dp_cp_group,
         expt_dp_group=expt_dp_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
+        gtp_pad_for_alignment=gtp_pad_for_alignment,
         **load_kwargs,
     )
 
