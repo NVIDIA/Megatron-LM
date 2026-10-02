@@ -50,21 +50,12 @@ For NVIDIA GPU Cloud (NGC) container setup and all installation options, review 
 
 # Latest News
 
+- **[2026/09]** **[Scaling Bitwise-Deterministic Pretraining for a Trillion-Parameter Nemotron Model](https://github.com/NVIDIA/Megatron-LM/discussions/7497)** - A guide to reproducing training runs, validating checkpoint resume, and reducing determinism overhead at scale with Megatron Core.
 - **[2026/08]** **[Megatron Core 0.19](https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.19.0)** - Introduces HybridModel, quantile-based MoE router balancing, packed-sequence MoE dispatch, and CUDA Graph-compatible activation offloading.
 - **[2026/08]** **[Megatron Bridge performance summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html)** - August NeMo container benchmarks cover DeepSeek, Qwen3, GPT-OSS, and Nemotron on GB200 and GB300, with configurations and performance recipes.
 - **[2026/07]** **[DeepSeek-V3 pretraining on GB300 NVL72](https://developer.nvidia.com/blog/setting-a-world-record-for-moe-pre-training-on-nvidia-gb300-nvl72/)** - Megatron Core achieves 1,648 TFLOPs/s per GPU for DeepSeek-V3 671B on 256 GPUs.
 - **[2026/05]** **[DeepSeek-V4 initial support](https://github.com/NVIDIA/Megatron-LM/issues/4468)** - Megatron Core's `dev` branch includes the initial DeepSeek-V4 implementation; Megatron Bridge provides [conversion, inference, and pretraining recipes](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/deepseek_v4).
 - **[2026/04]** **[Advancing Emerging Optimizers for Accelerated LLM Training with NVIDIA Megatron](https://developer.nvidia.com/blog/advancing-emerging-optimizers-for-accelerated-llm-training-with-nvidia-megatron/)** - Muon and other emerging optimizers are now supported in Megatron Core via the new **[Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers)** library.
-- **[2026/03]** **[Scalable Training of Mixture-of-Experts Models with Megatron Core](https://arxiv.org/abs/2603.07685)** - Technical report on scaling MoE training with integrated optimizations for memory, communication, and computation.
-- **[2026/03]** **[Implementing Falcon-H1 Hybrid Architecture in Megatron Core](https://developer.nvidia.com/blog/implementing-falcon-h1-hybrid-architecture-in-nvidia-megatron-core/)** - Technology Innovation Institute (TII) contributes Falcon-H1 hybrid transformer-Mamba architecture and BitNet ternary quantization support to Megatron Core.
-- **[2026/03]** **[Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4003)** - Roadmap for upcoming Megatron Core features and improvements.
-- **[2026/01]** **[Dynamic Context Parallelism](https://developer.nvidia.com/blog/speeding-up-variable-length-training-with-dynamic-context-parallelism-and-nvidia-megatron-core/)** - Up to 1.48x speedup for variable-length sequence training with adaptive CP sizing.
-- **[2025/12]** **Megatron Core development has moved to GitHub.** All development and CI now happen in the open, and community contributions are welcome.
-- **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - Early access branch with experimental features.
-- **[2025/10]** **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
-- **[2025/08]** **[Mixture of Experts (MoE) Q3–Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
-- **[2025/08]** **[GPT-OSS Model](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Megatron Core integrates advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions.
-- **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
 
 [Previous News](docs/discussions/README.md#previous-news)
 
