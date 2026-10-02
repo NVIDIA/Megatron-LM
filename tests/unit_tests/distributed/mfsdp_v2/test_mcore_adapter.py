@@ -22,7 +22,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_stack_spec,
+    wide_residual_hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
@@ -30,9 +33,10 @@ from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapp
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -668,17 +672,18 @@ class TestMcoreAdapterExpertParallel:
     def teardown_method(self):
         _destroy_model_parallel()
 
-    def test_build_train_step_and_clip(self):
+    @pytest.mark.parametrize("residual_replay", [False, True], ids=["standard", "residual-replay"])
+    def test_build_train_step_and_clip(self, residual_replay):
         """Shard experts over expert-DP and clip their combined gradients."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
         config = TransformerConfig(
-            num_layers=2,
+            num_layers=4 if residual_replay else 2,
             hidden_size=64,
             num_attention_heads=4,
             num_moe_experts=4,
             expert_model_parallel_size=2,
-            moe_layer_freq=[0, 1],
+            moe_layer_freq=[0, 1, 0, 1] if residual_replay else [0, 1],
             moe_token_dispatcher_type="alltoall",
             moe_router_topk=2,
             moe_grouped_gemm=True,
@@ -690,31 +695,43 @@ class TestMcoreAdapterExpertParallel:
             hidden_dropout=0.0,
             gradient_accumulation_fusion=False,
             attention_backend=AttnBackend.unfused,
+            wide_residual=(
+                WideResidualConfig(num_streams=3, learned_retention=True)
+                if residual_replay
+                else None
+            ),
+            recompute_granularity="selective" if residual_replay else None,
+            recompute_modules=["residual_stream"] if residual_replay else None,
+            residual_stream_recompute_num_layers=4 if residual_replay else None,
         )
         # Pair CPU initialization with an explicit common seed for the reference and EP model.
         torch.manual_seed(123)
         reference_config = replace(config, expert_model_parallel_size=1)
         reference_model = HybridModel(
             config=reference_config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=(
+                wide_residual_hybrid_stack_spec if residual_replay else hybrid_stack_spec
+            ),
             vocab_size=128,
             max_sequence_length=8,
-            hybrid_layer_pattern="*E",
+            hybrid_layer_pattern="*E*E" if residual_replay else "*E",
             pg_collection=self.reference_pg_collection,
         ).cuda()
         model = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=(
+                wide_residual_hybrid_stack_spec if residual_replay else hybrid_stack_spec
+            ),
             vocab_size=128,
             max_sequence_length=8,
-            hybrid_layer_pattern="*E",
+            hybrid_layer_pattern="*E*E" if residual_replay else "*E",
             pg_collection=self.pg_collection,
         ).cuda()
         model.load_state_dict(reference_model.state_dict(), strict=False)
         for model_layer, reference_layer in zip(
             model.decoder.layers, reference_model.decoder.layers
         ):
-            if not isinstance(model_layer, MoETransformerLayer):
+            if not isinstance(model_layer.mlp, MoELayer):
                 continue
             for fc in ("linear_fc1", "linear_fc2"):
                 model_fc = getattr(model_layer.mlp.experts, fc)
