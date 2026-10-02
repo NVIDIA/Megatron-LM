@@ -75,7 +75,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_experimental_args(parser)
-    parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
     parser = _add_rerun_machine_args(parser)
@@ -2723,35 +2722,6 @@ def _add_inprocess_restart_args(parser):
                        help='Release all unoccupied cached GPU memory on every in-process restart.')
     return parser
 
-def _add_one_logger_args(parser):
-    group = parser.add_argument_group(title='one logger')
-    group.add_argument('--no-one-logger', action='store_false',
-                       help='If set, disable using one_logger to track E2E metrics'
-                       'Note that one_logger is an internal tool and not '
-                       'available externally. For installation, please go to '
-                       'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
-                       'for more details',
-                       dest='enable_one_logger')
-    group.add_argument('--one-logger-project', type=str, default='megatron-lm',
-                       help='The one-logger project name. Will ignore if '
-                       '--no-one-logger is set')
-    group.add_argument('--one-logger-run-name', type=str, default=None,
-                       help='The one-logger run name displayed. Will ignore if '
-                       '--no-one-logger is set')
-    group.add_argument('--one-logger-async', action='store_true',
-                       help='If set, forces one_logger to use async mode.')
-    group.add_argument('--app-tag-run-name', type=str, default=None,
-                       help='Jobs belonging to same training run, suppose to '
-                       'have the same name. It will be used to track progress of '
-                       'a training done over multiple different jobs')
-    group.add_argument('--app-tag-run-version', type=str, default='0.0.0',
-                       help='The version of the training of which current job is '
-                       'part of. It will be used to track the changes in the '
-                       'application side which might change the performance '
-                       'baseline')
-    return parser
-
-
 def _add_ft_package_args(parser):
     group = parser.add_argument_group(title='ft_package')
     group.add_argument('--enable-ft-package', action='store_true',
@@ -2771,35 +2741,8 @@ def _add_ft_package_args(parser):
 def _add_logging_args(parser):
     from megatron.training.config import LoggerConfig
 
-    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath", "enable_one_logger", "one_logger_project", "one_logger_run_name", "one_logger_async", "app_tag_run_name", "app_tag_run_version", "otel_enabled", "otel_service_name", "otel_span_groups", "run_workload_inspector_server"])
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath", "run_workload_inspector_server"])
     group = log_factory.build_group(parser, title="logging")
-
-    otel_group = parser.add_argument_group(title='opentelemetry')
-    otel_group.add_argument(
-        '--otel-enabled',
-        action='store_true',
-        default=False,
-        help='Enable OpenTelemetry telemetry (traces and metrics). '
-        'See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.',
-    )
-    otel_group.add_argument(
-        '--otel-service-name',
-        type=str,
-        default=None,
-        help='Override OTEL_SERVICE_NAME for this training run.',
-    )
-    otel_group.add_argument(
-        '--otel-span-groups',
-        type=str,
-        default=None,
-        help='Comma-separated span-group spec controlling which OTel '
-        'instrumentation boundaries are active.  Accepts preset keywords '
-        '("default", "per_step", "full", "all") or individual group names '
-        '("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", '
-        '"step", "forward_backward", "optimizer", "microbatch"), or a mix.  '
-        'Defaults to "default" (coarse job/checkpoint/evaluate spans only).  '
-        'Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.',
-    )
 
     return parser
 
