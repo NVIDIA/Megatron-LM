@@ -45,6 +45,7 @@ from megatron.core.inference.apis import MegatronAsyncLLM, MegatronLLM
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
+from megatron.inference.initialize import initialize_runtime_services_for_inference
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -52,7 +53,6 @@ from megatron.inference.utils import (
 )
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -268,8 +268,8 @@ def main():
         extra_args_provider=add_offline_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    initialize_runtime_services_for_inference(args)
+    initialize_megatron(inference=True)
     _validate_high_level_api_args(args)
 
     if os.environ.get("NSIGHT_PREFIX"):

@@ -13,6 +13,8 @@ import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -21,6 +23,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -892,6 +895,98 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             expected_loaded_metadata,
             second_job_mock_metadata,
         ]
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
+@pytest.mark.parametrize("no_load_rng", [False, True])
+def test_inference_checkpoint_without_training_state(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, no_load_rng
+):
+    """Load real weights and preserve RNG policy without a training calculator."""
+    args = create_ckpt_load_args
+    args.ckpt_format = ckpt_format
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = ckpt_format != "torch"
+    args.world_size = torch.distributed.get_world_size()
+    args.data_parallel_size = args.world_size
+    args.global_batch_size = args.world_size
+    args.micro_batch_size = 1
+    args.fp16 = False
+    args.bf16 = False
+    args.hidden_size = 32
+    args.num_attention_heads = 4
+    args.consumed_train_samples = 123 * args.global_batch_size
+    with TempNamedDir(tmp_path_dist_ckpt / "inference_checkpoint", sync=True) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        args.save_tokenizer_assets = False
+        set_args(args)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=32, num_attention_heads=4, use_cpu_initialization=True
+        )
+
+        def build_model():
+            return (
+                GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_layer_local_spec(),
+                    vocab_size=32,
+                    max_sequence_length=16,
+                )
+                .cuda()
+                .eval()
+            )
+
+        model = build_model()
+        save_checkpoint(123, [model], None, None, 456)
+        saved_rng = torch.get_rng_state().clone()
+        saved_cuda_rng = torch.cuda.get_rng_state().clone()
+
+        restored = build_model()
+        with torch.no_grad():
+            for parameter in restored.parameters():
+                parameter.zero_()
+        torch.manual_seed(987)
+        before_load_rng = torch.get_rng_state().clone()
+        before_load_cuda_rng = torch.cuda.get_rng_state().clone()
+        args.no_load_rng = no_load_rng
+        # These training options must not influence an inference load.
+        args.override_ckpt_iteration = 7
+        args.phase_transition_iterations = [100]
+        for name in (
+            "global_batch_size",
+            "micro_batch_size",
+            "consumed_train_samples",
+            "skipped_train_samples",
+            "consumed_valid_samples",
+        ):
+            delattr(args, name)
+        unset_num_microbatches_calculator()
+        with (
+            mock.patch(
+                "megatron.training.checkpointing.update_num_microbatches",
+                side_effect=AssertionError("Inference must not update training microbatches"),
+            ),
+            mock.patch(
+                "megatron.training.checkpointing.get_rerun_state_machine",
+                side_effect=AssertionError("Inference must not restore training rerun state"),
+            ),
+        ):
+            metadata = load_checkpoint_for_inference([restored])
+
+        assert metadata == (123, 456)
+        assert not hasattr(args, "consumed_train_samples")
+        assert not hasattr(args, "skipped_train_samples")
+        assert not hasattr(args, "consumed_valid_samples")
+        for expected, actual in zip(model.parameters(), restored.parameters()):
+            assert torch.equal(expected, actual)
+        assert torch.equal(torch.get_rng_state(), before_load_rng if no_load_rng else saved_rng)
+        assert torch.equal(
+            torch.cuda.get_rng_state(), before_load_cuda_rng if no_load_rng else saved_cuda_rng
+        )
+        tokens = torch.arange(8, device="cuda").unsqueeze(0)
+        with torch.inference_mode():
+            assert torch.equal(model(tokens, tokens, None), restored(tokens, tokens, None))
 
 
 @pytest.mark.parametrize(

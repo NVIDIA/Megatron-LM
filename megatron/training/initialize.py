@@ -61,6 +61,8 @@ def initialize_megatron(
     seed_etp_group=None,
     skip_random_seed=False,
     skip_dependency_compilation=False,
+    *,
+    inference: bool = False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -69,6 +71,8 @@ def initialize_megatron(
     what you are doing.
     `skip_dependency_compilation` should only be set by workloads that do not
     use the C++ dataset helpers.
+    `inference` initializes distributed execution and RNG without training rerun,
+    checkpoint workers, autoresume or dataset compilation.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -78,10 +82,17 @@ def initialize_megatron(
 
     args = get_args()
 
+    if inference and args.tp_comm_overlap:
+        raise ValueError(
+            "--tp-comm-overlap uses fixed training user buffers and is not supported by "
+            "inference initialization. Disable it until inference has a validated buffer-sizing "
+            "contract. Inference-specific communication optimizations are unaffected."
+        )
+
     # set logging level
     setup_logging()
 
-    if args.async_save and args.use_persistent_ckpt_worker:
+    if not inference and args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
@@ -93,16 +104,17 @@ def initialize_megatron(
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
-    initialize_rerun_state_machine(
-        state_save_func=state_save_func,
-        state_restore_func=state_restore_func,
-        mode=RerunMode(args.rerun_mode),
-        error_injector=RerunErrorInjector(
-            error_injection_rate=args.error_injection_rate,
-            error_injection_type=RerunDiagnostic(args.error_injection_type),
-        ),
-        result_rejected_tracker_filename=args.result_rejected_tracker_filename,
-    )
+    if not inference:
+        initialize_rerun_state_machine(
+            state_save_func=state_save_func,
+            state_restore_func=state_restore_func,
+            mode=RerunMode(args.rerun_mode),
+            error_injector=RerunErrorInjector(
+                error_injection_rate=args.error_injection_rate,
+                error_injection_type=RerunDiagnostic(args.error_injection_type),
+            ),
+            result_rejected_tracker_filename=args.result_rejected_tracker_filename,
+        )
 
     if args.batch_invariant_mode:
         backend = args.batch_invariant_backend
@@ -173,10 +185,11 @@ def initialize_megatron(
         finish_mpu_init()
 
         # Autoresume.
-        _init_autoresume()
+        if not inference:
+            _init_autoresume()
 
         # Compile dependencies.
-        if not skip_dependency_compilation:
+        if not inference and not skip_dependency_compilation:
             _compile_dependencies()
 
         if args.tp_comm_overlap:
