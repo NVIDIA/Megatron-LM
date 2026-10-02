@@ -6,7 +6,6 @@ import ipaddress
 import json
 import logging
 import socket
-import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -25,29 +24,28 @@ from megatron.core.inference.inference_request import (
     PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     prepare_multimodal_data,
-    unwrap_serialized_tensors,
 )
-from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
-from megatron.core.inference.utils import model_eos_token_ids
+from megatron.core.inference.utils import detokenize_tokens, model_eos_token_ids
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import (
     StreamingChatParser,
+    finish_reason,
     json_safe_logprobs,
     json_safe_top_n_logprobs,
     openai_stream,
 )
 from .common import (
-    abort_requests,
-    attach_stage_metadata,
-    collect_stage_metadata,
-    generation_config_sampling_defaults,
-    log_sampling_defaults_once,
-    resolve_sampling_default,
+    add_moe_routing_to_choice,
+    build_response,
+    build_usage,
+    failed_requests_response,
+    parse_sampling_params,
+    reply_prompt_length,
+    run_inference,
+    submit_requests,
+    unwrap_batch,
     validate_offload_params,
 )
 
@@ -113,12 +111,6 @@ def _get_field(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
-
-def _get_non_none(obj, key, default):
-    """Returns the value from the object or default if the key is missing or None."""
-    val = obj.get(key)
-    return default if val is None else val
 
 
 def _try_parse_jsonish(value):
@@ -821,6 +813,182 @@ def _tokenize_with_media_slots_sync(
     return prompt_tokens
 
 
+def apply_parsers(
+    message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None, finished=True
+):
+    """Runs CPU-intensive text parsing."""
+    for parser in parsers_list:
+        if parser not in PARSER_MAPPING:
+            raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
+
+    implicit_reasoning_end_markers = (
+        tuple(
+            marker
+            for parser_name in parsers_list
+            for marker in getattr(PARSER_MAPPING[parser_name], "implicit_reasoning_end_markers", ())
+        )
+        if tools_requested
+        else ()
+    )
+
+    meta = {}
+    for parser in parsers_list:
+        prev_text = message_text
+        parsed_text, new_info = PARSER_MAPPING[parser].parse(
+            message_text,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            implicit_reasoning_end_markers=implicit_reasoning_end_markers,
+            finished=finished,
+        )
+        if "tool_calls" in new_info:
+            new_info["tool_calls"] = _normalize_tool_calls(
+                new_info.get("tool_calls", []), tools=tools
+            )
+            if not tools_requested:
+                # Ignore incidental tool-call syntax in plain chat mode.
+                parsed_text = prev_text
+                new_info.pop("tool_calls", None)
+        message_text = parsed_text
+
+        assert not (meta.keys() & new_info.keys()), "Multiple parsers found the same information."
+        meta.update(new_info)
+
+    return message_text, meta
+
+
+def _logprob_token(token, logprob, top_logprobs=None):
+    """One OpenAI chat-logprobs entry; ``top_logprobs`` is attached only for the sampled token."""
+    entry = {"token": token, "logprob": logprob, "bytes": list(token.encode("utf-8"))}
+    if top_logprobs is not None:
+        entry["top_logprobs"] = top_logprobs
+    return entry
+
+
+def _chat_logprobs_content(result, tokenizer):
+    """The ``logprobs.content`` list for one choice; non-finite logprobs are clamped for JSON."""
+    token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
+    tokens = [tokenizer.detokenize([tok]) for tok in result["generated_tokens"]]
+    generated_top_n_logprobs = json_safe_top_n_logprobs(
+        result.get("generated_top_n_logprobs") or []
+    )
+    content = []
+    for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
+        top_logprobs = (
+            [
+                _logprob_token(token_str, logprob)
+                for token_str, logprob in generated_top_n_logprobs[i].items()
+            ]
+            if i < len(generated_top_n_logprobs)
+            else []
+        )
+        content.append(_logprob_token(tok, lp, top_logprobs=top_logprobs))
+    return content
+
+
+def format_chat_response(
+    batch_results,
+    sampling_params,
+    tokenizer,
+    *,
+    parsers,
+    tools,
+    tools_requested,
+    tool_choice,
+    parallel_tool_calls,
+    chat_template_kwargs,
+    return_tokenized_data,
+    return_raw_text,
+    verbose,
+):
+    """Build the OpenAI chat-completion body from the finished replies.
+
+    ``finish_reason`` follows vLLM: "length" at the token limit, "tool_calls" when tools were
+    called under auto/required tool choice, otherwise "stop" (a named tool choice also reports
+    "stop" and empties ``content``).
+    """
+    results, response_uid, response_metadata = unwrap_batch(batch_results)
+    is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
+    choices = []
+    total_completion_tokens = 0
+    prompt_tokens_counts = []
+    cached_tokens_counts = []
+    for request_idx, result in enumerate(results):
+        text_output = detokenize_tokens(
+            tokenizer,
+            result["generated_tokens"],
+            remove_EOD=not sampling_params.detokenize_stop_sequence,
+        )
+        prompt_len = reply_prompt_length(result)
+        prompt_tokens_counts.append(prompt_len)
+        cached_tokens_counts.append(result.get("num_cached_tokens", 0))
+        # Under payload offload the engine dropped the per-token log probs from the reply.
+        payload_offloaded = bool(result.get("payload_offloaded"))
+        logprobs_content = None
+        if sampling_params.return_log_probs and not payload_offloaded:
+            logprobs_content = _chat_logprobs_content(result, tokenizer)
+
+        message_text = text_output
+        metadata = {}
+        if parsers:
+            message_text, metadata = apply_parsers(
+                message_text,
+                tools,
+                parsers,
+                tools_requested,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        normalized_tool_calls = _maybe_filter_parallel_tool_calls(
+            metadata.get("tool_calls", []), parallel_tool_calls
+        )
+        if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
+            content = ""
+        else:
+            content = message_text if message_text is not None else ""
+
+        message = {"role": "assistant", "content": content}
+        if normalized_tool_calls:
+            message["tool_calls"] = normalized_tool_calls
+        if "reasoning" in metadata:
+            message["reasoning_content"] = metadata["reasoning"]
+        if return_tokenized_data and not payload_offloaded:
+            # Wire contract matches vLLM: prompt_token_ids are model-input tokens
+            # (post vision/video expansion).
+            message["prompt_token_ids"] = result["prompt_tokens"]
+            message["generation_token_ids"] = result["generated_tokens"]
+        if return_raw_text and not payload_offloaded:
+            message["raw_text"] = tokenizer.detokenize(result["prompt_tokens"]) + text_output
+        if not payload_offloaded:
+            # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
+            message["generation_log_probs"] = result.get("generated_log_probs", [])
+
+        reason = finish_reason(result)
+        if reason == "stop" and normalized_tool_calls and not is_named_tool_choice:
+            reason = "tool_calls"
+
+        choice_data = {
+            "index": request_idx,
+            "message": message,
+            # 'logprobs' in chat API is an object containing 'content'
+            "logprobs": {"content": logprobs_content} if logprobs_content is not None else None,
+            "finish_reason": reason,
+        }
+        add_moe_routing_to_choice(choice_data, result, prompt_len)
+        choices.append(choice_data)
+
+        if verbose:
+            logger.info(_redact_token_id_lists_for_logging(result))
+        if not payload_offloaded and result.get("generated_log_probs") is None:
+            logger.warning(
+                "Generation log probs is None for request:\n%s",
+                json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
+            )
+        total_completion_tokens += len(result["generated_tokens"])
+
+    usage = build_usage(prompt_tokens_counts, total_completion_tokens, cached_tokens_counts)
+    return build_response(response_uid, "chat.completion", choices, usage, response_metadata)
+
+
 try:
     import orjson
 
@@ -833,53 +1001,6 @@ try:
     from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('chat_completions_api', __name__)
-
-    def apply_parsers(
-        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None, finished=True
-    ):
-        """Runs CPU-intensive text parsing."""
-        for parser in parsers_list:
-            if parser not in PARSER_MAPPING:
-                raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
-
-        implicit_reasoning_end_markers = (
-            tuple(
-                marker
-                for parser_name in parsers_list
-                for marker in getattr(
-                    PARSER_MAPPING[parser_name], "implicit_reasoning_end_markers", ()
-                )
-            )
-            if tools_requested
-            else ()
-        )
-
-        meta = {}
-        for parser in parsers_list:
-            prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(
-                message_text,
-                tools=tools,
-                chat_template_kwargs=chat_template_kwargs,
-                implicit_reasoning_end_markers=implicit_reasoning_end_markers,
-                finished=finished,
-            )
-            if "tool_calls" in new_info:
-                new_info["tool_calls"] = _normalize_tool_calls(
-                    new_info.get("tool_calls", []), tools=tools
-                )
-                if not tools_requested:
-                    # Ignore incidental tool-call syntax in plain chat mode.
-                    parsed_text = prev_text
-                    new_info.pop("tool_calls", None)
-            message_text = parsed_text
-
-            assert not (
-                meta.keys() & new_info.keys()
-            ), "Multiple parsers found the same information."
-            meta.update(new_info)
-
-        return message_text, meta
 
     @bp.route('/chat/completions', methods=['POST'])
     @bp.route('/v1/chat/completions', methods=['POST'])
@@ -1136,72 +1257,6 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            # For a field the request omits: an explicitly configured server default
-            # wins, then the model's generation_config.json, then the previous
-            # hardcoded fallback.
-            gen_defaults = generation_config_sampling_defaults(tokenizer)
-            cfg = current_app.config
-            temperature = float(
-                _get_non_none(
-                    req,
-                    "temperature",
-                    resolve_sampling_default(
-                        cfg, gen_defaults, "temperature", 'default_temperature', 1.0
-                    ),
-                )
-            )
-            top_p = float(
-                _get_non_none(
-                    req,
-                    "top_p",
-                    resolve_sampling_default(cfg, gen_defaults, "top_p", 'default_top_p', 1.0),
-                )
-            )
-            top_k = int(
-                _get_non_none(
-                    req,
-                    "top_k",
-                    resolve_sampling_default(cfg, gen_defaults, "top_k", 'default_top_k', 0),
-                )
-            )
-            log_sampling_defaults_once(
-                tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
-            )
-            n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
-
-            if temperature == 0.0:
-                top_k = 1
-                top_p = 0.0
-
-            # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(_get_non_none(req, "logprobs", False))
-            top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(_get_non_none(req, "skip_prompt_log_probs", True))
-            add_BOS = bool(_get_non_none(req, "add_BOS", False))
-
-            # The engine only handles add_BOS for string prompts, not pre-tokenized
-            # input. Since we pre-tokenize via apply_chat_template, we must handle
-            # BOS ourselves, matching the logic in tokenize_prompt().
-            if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
-                prompt_length = len(prompt_tokens)
-                start_idx = 0
-                while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
-                    start_idx += 1
-                if start_idx > 0:
-                    prompt_tokens = prompt_tokens[start_idx:]
-
-                if add_BOS:
-                    prompt_tokens = [tokenizer.bos] + prompt_tokens
-
-                if offload_params and PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params:
-                    # BOS changes happen inside the expanded prefix.
-                    offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] += (
-                        len(prompt_tokens) - prompt_length
-                    )
-
-            max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
-            ignore_eos = bool(req.get("ignore_eos", False))
-
             # Does the client want the prompt tokens echoed back? Only then does the
             # engine need to keep the prompt_tokens tensor on the response payload.
             # return_tokenized_data (implied by prevent_retokenization) needs the ids;
@@ -1210,31 +1265,35 @@ try:
                 req.get("return_tokenized_data", False) or prevent_retokenization
             )
             return_raw_text = req.get("return_raw_text", False)
-            return_prompt_tokens = return_tokenized_data or return_raw_text
-
-            # OpenAI-style "stop" may be a string or list of strings; normalize.
-            stop = req.get("stop", None)
-            if isinstance(stop, str):
-                stop = [stop]
-
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                return_log_probs=return_log_probs,
-                top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
-                stop_words=stop,
-                skip_prompt_log_probs=skip_prompt_log_probs,
-                add_BOS=add_BOS,
-                termination_id=-1 if ignore_eos else None,
-                return_prompt_tokens=return_prompt_tokens,
-                streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
-                # This frontend detokenizes its own output below. Keeping it off the
-                # coordinator matters because that is one process shared by all DP ranks.
-                detokenize_generations=False,
+            sampling_params, extras = parse_sampling_params(
+                req,
+                current_app.config,
+                tokenizer,
+                completions_mode=False,
+                return_prompt_tokens=return_tokenized_data or return_raw_text,
             )
-        except ValueError as e:
+            n = extras["n"]  # Number of choices to generate
+
+            # The engine only handles add_BOS for string prompts, not pre-tokenized
+            # input. Since we pre-tokenize via apply_chat_template, we must handle
+            # BOS ourselves, matching the logic in tokenize_prompt().
+            if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
+                length_before_bos = len(prompt_tokens)
+                start_idx = 0
+                while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
+                    start_idx += 1
+                if start_idx > 0:
+                    prompt_tokens = prompt_tokens[start_idx:]
+
+                if sampling_params.add_BOS:
+                    prompt_tokens = [tokenizer.bos] + prompt_tokens
+
+                if offload_params and PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params:
+                    # BOS changes happen inside the expanded prefix.
+                    offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] += (
+                        len(prompt_tokens) - length_before_bos
+                    )
+        except (ValueError, TypeError) as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
@@ -1305,7 +1364,7 @@ try:
                     tokenizer,
                     incremental_detokenizers,
                     chat=True,
-                    return_log_probs=return_log_probs,
+                    return_log_probs=sampling_params.return_log_probs,
                     include_usage=include_usage,
                     chat_parsers=chat_parsers,
                 ),
@@ -1317,264 +1376,46 @@ try:
         # add_request_with_id, not add_request: a non-streaming response writes
         # nothing to the socket while generating, so a disconnect is never
         # discovered as a broken pipe. Aborting needs the request ids.
-        #
-        # Submitted one at a time rather than in a comprehension so a failure on
-        # admission k -- a zmq send error, or multimodal serialization on a
-        # malformed payload -- can abort the k-1 already in flight. Left to
-        # escape they would generate to their token limit holding batch slots,
-        # the same leak the abort below the gather closes.
-        request_ids = []
-        tasks = []
         try:
-            for _ in range(n):
-                request_id, future = client.add_request_with_id(
-                    prompt_tokens,
-                    sampling_params,
-                    multi_modal_data=prepared_multimodal_data,
-                    offload_params=offload_params,
-                )
-                request_ids.append(request_id)
-                tasks.append(future)
+            request_ids, tasks = submit_requests(
+                client,
+                ((prompt_tokens, sampling_params) for _ in range(n)),
+                multi_modal_data=prepared_multimodal_data,
+                offload_params=offload_params,
+            )
         except Exception as e:
-            abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
             return Response(f"Error submitting request: {e}", status=500)
 
-        if current_app.config['verbose']:
-            start_time = time.perf_counter()
-
         try:
-            batch_results = await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            # Quart cancels this handler when the peer goes away (its ASGI
-            # connection races handle_messages against handle_request and
-            # cancels the loser). Without this the engine would keep generating
-            # for a client that is gone, holding a slot until it hit the token
-            # limit -- orphans then accumulate faster than they retire and the
-            # batch saturates.
-            abort_requests(client, request_ids, "client disconnected")
-            raise
+            batch_results = await run_inference(
+                client, request_ids, tasks, current_app.config['verbose'], log_label=f"(n={n})"
+            )
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
 
-        if current_app.config['verbose']:
-            logging.info(
-                f"Batch of {len(tasks)} requests (n={n}) processed in "
-                f"{time.perf_counter() - start_time:.2f}s"
-            )
-
         # --- 4. Check for failed requests ---
-        failed_errors = []
-        has_nontransient_error = False
-        for i, record in enumerate(batch_results):
-            if record.get("status") == "FAILED":
-                events = record.get("events", [])
-                error_events = [
-                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
-                ]
-                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
-                    has_nontransient_error = True
-                error_msg = (
-                    str(error_events[-1].get("payload", "Unknown error"))
-                    if error_events
-                    else "Unknown error"
-                )
-                failed_errors.append(f"Request {i}: {error_msg}")
-
-        if failed_errors:
-            error_detail = "; ".join(failed_errors)
-            status = 400 if has_nontransient_error else 500
-            logger.error(f"Inference request(s) failed: {error_detail}")
-
-            # NOTE: This exact string is required for compatibility with Nemo-RL, DO NOT MODIFY.
-            if "MaxSequenceLengthOverflowError" in error_detail:
-                error_msg = (
-                    f"This model's maximum context length was exceeded. "
-                    f"Your messages resulted in {len(prompt_tokens)} tokens. "
-                    f"Please reduce the length of the messages. {error_detail}"
-                )
-                return Response(error_msg, status=400)
-
-            return Response(f"Inference request(s) failed: {error_detail}", status=status)
+        failure = failed_requests_response(batch_results, len(prompt_tokens))
+        if failure is not None:
+            body, status = failure
+            return Response(body, status=status)
 
         # --- 5. Format OpenAI Response ---
-        choices = []
-        total_completion_tokens = 0
-        prompt_tokens_counts = []
-        cached_tokens_counts = []
-
-        # return_tokenized_data / return_raw_text / return_prompt_tokens were computed
-        # at submit time (above) and drive both the response shape here and whether the
-        # engine kept the prompt_tokens tensor on the payload.
-        request_idx = 0
-        response_uid = None
-        response_metadata = {}
-        for result_item in batch_results:
-            result = unwrap_serialized_tensors(result_item)
-            if response_uid is None:
-                response_uid = result["uid"]
-            collect_stage_metadata(response_metadata, result)
-
-            text_output = TextGenerationController.detokenize(
-                tokenizer,
-                result["generated_tokens"],
-                remove_EOD=not sampling_params.detokenize_stop_sequence,
-            )
-            # The engine always reports prompt_length (for usage), but drops the
-            # prompt_tokens tensor unless return_prompt_tokens was set.
-            prompt_tokens_count = result.get("prompt_length")
-            if prompt_tokens_count is None:
-                prompt_tokens_out = result["prompt_tokens"]
-                prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
-            prompt_tokens_counts.append(prompt_tokens_count)
-            cached_tokens_counts.append(result.get("num_cached_tokens", 0))
-
-            # Under payload offload the engine dropped the per-token log probs from the reply
-            # so the OpenAI logprobs block is absent.
-            payload_offloaded = bool(result.get("payload_offloaded"))
-            logprobs_content = None
-            if sampling_params.return_log_probs and not payload_offloaded:
-                token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
-
-                tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
-                tokens = list(map(tokenizer.detokenize, tokens_to_decode))
-
-                # Get top_n_logprobs if available
-                generated_top_n_logprobs = json_safe_top_n_logprobs(
-                    result.get('generated_top_n_logprobs') or []
-                )
-
-                logprobs_content = []
-                for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
-                    # Build top_logprobs list for this token position
-                    top_logprobs_list = []
-                    if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
-                        top_n_dict = generated_top_n_logprobs[i]
-                        for token_str, logprob in top_n_dict.items():
-                            top_logprobs_list.append(
-                                {
-                                    "token": token_str,
-                                    "logprob": logprob,
-                                    "bytes": list(token_str.encode("utf-8")),
-                                }
-                            )
-
-                    logprobs_content.append(
-                        {
-                            "token": tok,
-                            "logprob": lp,
-                            "bytes": list(tok.encode("utf-8")),
-                            "top_logprobs": top_logprobs_list,
-                        }
-                    )
-
-            metadata = {}
-            message_text = text_output
-
-            if parsers:
-                message_text, metadata = apply_parsers(
-                    message_text,
-                    tools,
-                    parsers,
-                    tools_requested,
-                    chat_template_kwargs=chat_template_kwargs,
-                )
-
-            normalized_tool_calls = metadata.get("tool_calls", [])
-
-            # Apply parallel_tool_calls filtering (matches vLLM behavior)
-            normalized_tool_calls = _maybe_filter_parallel_tool_calls(
-                normalized_tool_calls, parallel_tool_calls
-            )
-
-            # Determine content based on tool_choice (matches vLLM behavior):
-            # - Named tool choice or "required": content is empty string
-            # - Otherwise: content is the parsed message text
-            is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
-            if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
-                content = ""
-            else:
-                content = message_text if message_text is not None else ""
-
-            message = {"role": "assistant", "content": content}
-            if normalized_tool_calls:
-                message["tool_calls"] = normalized_tool_calls
-            if "reasoning" in metadata:
-                message["reasoning_content"] = metadata["reasoning"]
-
-            if return_tokenized_data and not payload_offloaded:
-                # Wire contract matches vLLM: prompt_token_ids are model-input tokens
-                # (post vision/video expansion).
-                message["prompt_token_ids"] = result["prompt_tokens"]
-                message["generation_token_ids"] = result["generated_tokens"]
-            if return_raw_text and not payload_offloaded:
-                prompt_str = tokenizer.detokenize(result["prompt_tokens"])
-                message["raw_text"] = prompt_str + text_output
-            if not payload_offloaded:
-                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
-                message["generation_log_probs"] = result.get("generated_log_probs", [])
-            return_log_probs = sampling_params.return_log_probs
-
-            # Determine finish_reason following vLLM conventions:
-            # - "tool_calls" for auto or required tool choice when tools are called
-            # - "stop" for named tool choice (even when tools are called)
-            # - "length" when max tokens is reached
-            if (
-                len(result["generated_tokens"])
-                >= result["sampling_params"]["num_tokens_to_generate"]
-            ):
-                finish_reason = "length"
-            elif normalized_tool_calls and not is_named_tool_choice:
-                finish_reason = "tool_calls"
-            else:
-                finish_reason = "stop"
-
-            # Choice-level prompt/generation_token_ids, generation_log_probs and
-            # raw_text were duplicates of message-level data (or reconstructable);
-            # dropped to match vLLM's response shape and cut payload size.
-            choice_data = {
-                "index": request_idx,
-                "message": message,
-                # 'logprobs' in chat API is an object containing 'content'
-                "logprobs": {"content": logprobs_content} if logprobs_content is not None else None,
-                "finish_reason": finish_reason,
-            }
-            if current_app.config['verbose']:
-                logging.info(_redact_token_id_lists_for_logging(result))
-
-            if result["routing_indices"] is not None:
-                choice_data["moe_topk_indices"] = result["routing_indices"]
-                if prompt_tokens_count:
-                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
-                        :prompt_tokens_count
-                    ]
-
-            choices.append(choice_data)
-            if not payload_offloaded and result.get("generated_log_probs") is None:
-                logger.warning(
-                    "Generation log probs is None for request:\n%s",
-                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
-                )
-            total_completion_tokens += len(result["generated_tokens"])
-            request_idx += 1
-
-        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-        cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
-        response = {
-            "id": response_uid,
-            "created": int(time.time()),
-            "model": "EMPTY",
-            "object": "chat.completion",
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_token_count,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": prompt_token_count + total_completion_tokens,
-                "prompt_tokens_details": {"cached_tokens": cached_token_count},
-            },
-        }
-        attach_stage_metadata(response, response_metadata)
+        response = format_chat_response(
+            batch_results,
+            sampling_params,
+            tokenizer,
+            parsers=parsers,
+            tools=tools,
+            tools_requested=tools_requested,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            chat_template_kwargs=chat_template_kwargs,
+            return_tokenized_data=return_tokenized_data,
+            return_raw_text=return_raw_text,
+            verbose=current_app.config['verbose'],
+        )
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

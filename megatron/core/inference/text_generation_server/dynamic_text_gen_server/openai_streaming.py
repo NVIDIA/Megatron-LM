@@ -114,7 +114,8 @@ def _prompt_logprobs(tokenizer, token_ids, log_probs, top_log_probs):
     }
 
 
-def _finish_reason(result):
+def finish_reason(result):
+    """OpenAI finish reason for a finished reply: "length" at the token limit, else "stop"."""
     requested = (result.get("sampling_params") or {}).get("num_tokens_to_generate")
     generated = len(result.get("generated_tokens") or [])
     return "length" if requested is not None and generated >= requested else "stop"
@@ -237,7 +238,7 @@ class StreamingChatParser:
         """Return the OpenAI finish reason for this parsed choice."""
         if self.tools_streamed and not self._named_tool_choice:
             return "tool_calls"
-        return _finish_reason(result)
+        return finish_reason(result)
 
 
 def _status_name(record):
@@ -451,7 +452,7 @@ async def openai_stream(
                 "index": index,
                 "logprobs": None,
                 "finish_reason": (
-                    parser.finish_reason(result) if parser is not None else _finish_reason(result)
+                    parser.finish_reason(result) if parser is not None else finish_reason(result)
                 ),
                 "generation_token_ids": list(state["tokens"]),
                 "generation_log_probs": json_safe_logprobs(state["log_probs"]),

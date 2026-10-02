@@ -106,6 +106,10 @@ BODIES = {CHAT_PATH: CHAT_BODY, COMPLETIONS_PATH: COMPLETIONS_BODY}
 FAN_OUT_BODIES = {CHAT_PATH: {**CHAT_BODY, "n": 3}, COMPLETIONS_PATH: {"prompt": ["a", "b", "c"]}}
 PATHS = pytest.mark.parametrize("path", [CHAT_PATH, COMPLETIONS_PATH], ids=["chat", "completions"])
 NOT_A_NUMBER_ERROR = "Invalid sampling parameter: could not convert string to float: 'hot'"
+NOT_AN_INT_ERROR = (
+    "Invalid sampling parameter: int() argument must be a string, a bytes-like object or a real "
+    "number, not 'list'"
+)
 _ENDPOINT_MODULES = {CHAT_PATH: "chat_completions", COMPLETIONS_PATH: "completions"}
 _ENDPOINTS_PACKAGE = (
     "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints"
@@ -293,7 +297,17 @@ _COMPLETIONS_DEFAULTS = {
         ),
         pytest.param(
             COMPLETIONS_PATH,
-            {"logprobs": None, "echo": None, "stop": None, "ignore_eos": None},
+            {
+                "temperature": None,
+                "top_p": None,
+                "top_k": None,
+                "logprobs": None,
+                "echo": None,
+                "max_tokens": None,
+                "stop": None,
+                "ignore_eos": None,
+                "streaming_interval": None,
+            },
             {},
             _COMPLETIONS_DEFAULTS,
             id="completions-null-fields-mean-default",
@@ -333,13 +347,13 @@ _COMPLETIONS_DEFAULTS = {
             {"return_log_probs": True, "top_n_logprobs": 3, "skip_prompt_log_probs": True},
             id="completions-logprobs-int-without-echo",
         ),
-        # /v1/completions derives skip_prompt_log_probs from echo; the engine knob is not read.
+        # An explicit engine knob overrides the echo-derived default.
         pytest.param(
             COMPLETIONS_PATH,
             {"logprobs": 5, "skip_prompt_log_probs": False},
             {},
-            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": True},
-            id="completions-explicit-skip-prompt-log-probs-is-ignored",
+            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": False},
+            id="completions-explicit-skip-prompt-log-probs-wins-over-echo",
         ),
         pytest.param(
             CHAT_PATH,
@@ -572,7 +586,6 @@ _NEMO_RL_OVERFLOW_BODY = (
     "This model's maximum context length was exceeded. Your messages resulted in 2 tokens. "
     f"Please reduce the length of the messages. Request 0: {_OVERFLOW}"
 )
-_PLAIN_OVERFLOW_BODY = f"Inference request(s) failed: Request 0: {_OVERFLOW}"
 
 
 def _on_both_endpoints(expected):
@@ -622,19 +635,15 @@ def _on_both_endpoints(expected):
             ),
             id="no-error-events",
         ),
-        # /v1/completions reports a context overflow like any other failure, while
-        # /v1/chat/completions reports the prompt length in the body Nemo-RL matches on, whatever
-        # the event type.
+        # Both endpoints report a context overflow in the body Nemo-RL matches on, as a 400,
+        # whatever the event type.
         pytest.param(
             [
                 failed_reply({"type": "ERROR_NONTRANSIENT", "payload": _OVERFLOW}),
                 _COMPLETED,
                 _COMPLETED,
             ],
-            {
-                CHAT_PATH: (_NEMO_RL_OVERFLOW_BODY, 400),
-                COMPLETIONS_PATH: (_PLAIN_OVERFLOW_BODY, 400),
-            },
+            _on_both_endpoints((_NEMO_RL_OVERFLOW_BODY, 400)),
             id="overflow-nontransient",
         ),
         pytest.param(
@@ -643,10 +652,7 @@ def _on_both_endpoints(expected):
                 _COMPLETED,
                 _COMPLETED,
             ],
-            {
-                CHAT_PATH: (_NEMO_RL_OVERFLOW_BODY, 400),
-                COMPLETIONS_PATH: (_PLAIN_OVERFLOW_BODY, 500),
-            },
+            _on_both_endpoints((_NEMO_RL_OVERFLOW_BODY, 400)),
             id="overflow-transient",
         ),
     ],
