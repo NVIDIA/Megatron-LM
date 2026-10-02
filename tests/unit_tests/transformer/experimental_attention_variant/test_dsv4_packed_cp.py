@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """DSv4 backend, packed-layout and CP parity; run on at least 4 GPUs."""
 
+import inspect
 import json
 from copy import copy
 from dataclasses import replace
@@ -334,7 +335,10 @@ def test_packed_cp2_full_width_deterministic_replay(ratio):
     if Utils.world_size < 2:
         pytest.skip("requires at least two ranks")
     pytest.importorskip("flash_mla")
-    pytest.importorskip("cudnn.deepseek_sparse_attention")
+    dsa = pytest.importorskip("cudnn.deepseek_sparse_attention")
+    backward_parameters = inspect.signature(dsa.DSA.sparse_attention_backward_wrapper).parameters
+    if "deterministic" not in backward_parameters:
+        pytest.skip("deterministic sparse-attention backward needs nvidia-cudnn-frontend >= 1.29")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("deterministic cuDNN sparse attention requires SM10x")
     prior = torch.are_deterministic_algorithms_enabled()
