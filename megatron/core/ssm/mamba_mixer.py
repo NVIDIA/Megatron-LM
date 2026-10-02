@@ -1321,6 +1321,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """
         return self.chunk_size
 
+    def backward_dw(self):
+        """Compute weight gradients for the linear layers wrapped by this mixer.
+
+        Mirrors ``GatedDeltaNet.backward_dw``. The selective-scan kernel is a
+        single autograd function whose wgrad runs in the regular backward pass,
+        so only the input/output projections need delayed wgrad here.
+        """
+        self.in_proj.backward_dw()
+        self.out_proj.backward_dw()
+
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
 

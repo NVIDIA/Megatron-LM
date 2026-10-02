@@ -1,0 +1,132 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Schedule-plan classes for HybridStack-based decoders.
+
+These extend the GPT-side ``TransformerLayerSchedulePlan`` /
+``TransformerModelChunkSchedulePlan`` with the per-layer ``layer_type`` symbol
+that HybridStack assigns to each entry of its ``layer_type_list`` (including
+bracketed groups like ``[*-]``). The base classes remain GPT-only; this module
+adds the hybrid-specific dispatch into ``build_hybrid_stack_callables`` and
+uses ``HybridStackNode`` so the schedule node's free-input policy can diverge
+from the GPT default. The pre/post-process nodes from
+``core.models.common.utils`` are reused as-is — they already call
+``model._preprocess`` / ``model._postprocess`` which work on a HybridModel.
+"""
+
+from contextlib import nullcontext
+
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    TransformerLayerSchedulePlan,
+    TransformerModelChunkSchedulePlan,
+)
+from megatron.core.models.hybrid.fine_grained_callables import (
+    HybridStackNode,
+    build_hybrid_stack_callables,
+)
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.pipeline_parallel.utils import NoopScheduleNode
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer
+
+
+class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
+    """Per-layer schedule plan for HybridStack decoders.
+
+    Adds the ``layer_type`` extra-arg propagation; routes through
+    ``build_hybrid_stack_callables`` when ``layer_type`` is set (i.e. the layer
+    is a HybridStack entry, possibly a bracketed group); falls back to the GPT
+    path for plain TransformerLayer / MTP layers when ``layer_type`` is None.
+    """
+
+    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args=None):
+        if extra_args is None:
+            extra_args = {}
+        self.layer_type = extra_args.get("layer_type", None)
+        super().__init__(layer, event, chunk_state, comp_stream, comm_stream, extra_args)
+
+    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
+        if self.layer_type is None:
+            return super()._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
+
+        fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
+            build_hybrid_stack_callables(self.layer, layer_type=self.layer_type)
+        )
+
+        extra_args["config"] = self.layer.config
+        extra_args["is_moe"] = is_moe
+        extra_args["num_local_experts"] = num_local_experts
+        extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
+        extra_args["is_mtp"] = False
+
+        def create_node(stream, module, name):
+            bwd_dw_callables = bwd_dw_callable_map.get(name, None)
+            node_extra_args = dict(extra_args)
+            if bwd_dw_callables is None:
+                node_extra_args["delay_wgrad_compute"] = False
+            return HybridStackNode(
+                stream,
+                event,
+                self.layer_state,
+                self.chunk_state,
+                module,
+                name=name,
+                bwd_dw_callables=bwd_dw_callables,
+                extra_args=node_extra_args,
+            )
+
+        (
+            pre_dispatch_module,
+            moe_dispatch_module,
+            mlp_module,
+            moe_combine_module,
+            mtp_post_process_module,
+        ) = fwd_callables
+
+        self.pre_dispatch_computation = create_node(
+            comp_stream, pre_dispatch_module, "pre_dispatch_computation"
+        )
+        self.mlp = create_node(comp_stream, mlp_module, "mlp")
+        if is_moe:
+            self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
+            self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+        else:
+            self.moe_dispatch = NoopScheduleNode()
+            self.moe_combine = NoopScheduleNode()
+
+        # HybridStack groups never carry an MTP terminal, so mtp_post_process is
+        # always a no-op here.
+        self.mtp_post_process = NoopScheduleNode()
+
+    def get_low_precision_context(self):
+        """Return the layer-level quantization context for GPT-path layers.
+
+        Hybrid callables enter the quantization context of each physical layer
+        themselves, so hybrid layer plans use a null context here.
+        """
+        if self.layer_type is None and isinstance(
+            self.layer, (TransformerLayer, MultiTokenPredictionLayer)
+        ):
+            return super().get_low_precision_context()
+        return nullcontext()
+
+
+class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
+    """Model-chunk schedule plan that builds ``HybridStackSchedulePlan`` layer plans.
+
+    Threads HybridStack's ``layer_type_list[layer_idx]`` symbol into each
+    layer plan's ``extra_args`` so the per-layer plan can dispatch grouped
+    layers correctly. Layers of other modules (e.g. MTP layers) get
+    ``layer_type=None`` and follow the GPT path. The pre/post
+    process nodes inherit from the GPT base class — they already dispatch
+    on ``model._preprocess`` / ``model._postprocess`` which a HybridModel
+    implements.
+    """
+
+    LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
+
+    def _extra_args_for_layer(self, module, layer_idx, num_layers):
+        extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)
+        extra_args["layer_type"] = (
+            module.layer_type_list[layer_idx] if isinstance(module, HybridStack) else None
+        )
+        return extra_args
