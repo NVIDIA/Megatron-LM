@@ -321,14 +321,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
-        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available.",
+        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; the inference-kernel value pass (moe_inference_training_forward) with recompute backward.",
     ),
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; the MXFP8 training-stack quantization of the inference-kernel value pass.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
