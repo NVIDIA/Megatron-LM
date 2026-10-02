@@ -227,7 +227,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
                 )
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
-    # Experts additionally need grad_divisor=ep_size; see fully_shard.
+    # Experts additionally need grad_scale=1 / ep_size; see fully_shard.
     with fully_shard_context(device=device):
         for decoder_layer in model.decoder.layers:
             if isinstance(decoder_layer, MoETransformerLayer):
@@ -235,7 +235,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
                     decoder_layer.mlp.experts,
                     mesh=moe_mesh["edp"],
                     placements=moe_placements,
-                    grad_divisor=ep_size,
+                    grad_scale=1.0 / ep_size,
                 )
         fully_shard(model, mesh=world_mesh, placements=dense_placements)
 
