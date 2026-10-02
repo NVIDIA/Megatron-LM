@@ -96,6 +96,36 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert assigned[:pool_size] == assigned[pool_size:]
 
 
+@pytest.mark.parametrize("during_warmup", [False, True])
+def test_failed_capture_restores_global_state(monkeypatch, during_warmup):
+    """Capture errors must not silence later eager DDP gradient hooks."""
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_CAPTURING", False)
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_WARMUP", False)
+    monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+    te_capture_ended = []
+    monkeypatch.setattr(
+        cuda_graphs_module, "te_set_capture_end", lambda: te_capture_ended.append(True)
+    )
+    original_save = torch.autograd.function.FunctionCtx.save_for_backward
+
+    def fail_capture(cls):
+        cls._enable_saved_tensors_observer()
+        cuda_graphs_module._set_capture_start()
+        if during_warmup:
+            cuda_graphs_module._set_warmup_start()
+        raise RuntimeError("injected capture failure")
+
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_create_cudagraphs", classmethod(fail_capture))
+    with pytest.raises(RuntimeError, match="injected capture failure"):
+        create_cudagraphs()
+
+    assert not cuda_graphs_module.is_graph_capturing()
+    assert not cuda_graphs_module.is_graph_warmup()
+    assert te_capture_ended == [True]
+    assert _CudagraphGlobalRecord._saved_tensors_observer is None
+    assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
 

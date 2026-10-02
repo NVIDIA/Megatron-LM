@@ -290,7 +290,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
-        "replayed through packed SelfAttention in test_runtime_cp_attention.py.",
+        "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
+        "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),
     KernelEntry(
         name="kitchen_extension",
@@ -305,7 +306,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
-        "router gating GEMM, TE fused permutation/router kernels.",
+        "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
+        "histogram accumulation and bias updates.",
     ),
     KernelEntry(
         name="moe_router",

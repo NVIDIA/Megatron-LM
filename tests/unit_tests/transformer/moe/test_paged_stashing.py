@@ -33,6 +33,55 @@ from tests.unit_tests.test_utilities import (
 pytestmark = pytest.mark.launch_on_gb200
 
 
+@pytest.mark.parametrize("eager", [False, True])
+def test_nccl_ep_dispatch_ignores_stale_zero_copy_buffers(monkeypatch, eager):
+    """A prior zero-copy dispatcher must not lend its receive buffer to ordinary dispatch."""
+    from megatron.core.transformer.moe import token_dispatcher
+
+    manager = token_dispatcher._NCCLEPManager.__new__(token_dispatcher._NCCLEPManager)
+    manager.router_topk = 2
+    manager._max_tokens_per_rank = 64
+    manager._recv_capacity = None if eager else 32
+    manager.hidden_dim = 8
+    manager.num_local_experts = 2
+    manager.alignment = 0
+    manager.dispatch_fwd_quant_recipe = None
+    manager.combine_bwd_quant_recipe = None
+    manager._zc_quant = False
+    manager.eager = eager
+    manager.token_indices = torch.zeros(4, 2, dtype=torch.int64)
+    manager.token_probs = torch.full((4, 2), 0.5)
+    manager.over_budget = torch.tensor(False)
+    manager.required_recv = torch.tensor(0, dtype=torch.int64)
+    monkeypatch.setattr(manager, "_ensure_bootstrap", lambda: None)
+
+    # Deliberately use a different capacity, as when switching models or dispatch modes.
+    stale_weights = torch.ones(128)
+    monkeypatch.setattr(token_dispatcher._NCCLEPManager, "_zc_recv_topk_weights_buf", stale_weights)
+
+    class Buffer:
+        total_recv_tokens = torch.tensor(4, dtype=torch.int64)
+
+    monkeypatch.setattr(token_dispatcher, "new_nccl_ep_buffer", lambda **kwargs: Buffer())
+
+    def dispatch(buffer, tokens, indices, weights, *, recv_tokens, recv_topk_weights):
+        if eager:
+            assert recv_tokens is None and recv_topk_weights is None
+        rows = 4 if eager else manager._recv_capacity
+        output = torch.zeros(rows, manager.hidden_dim)
+        probs = torch.zeros(rows) if recv_topk_weights is None else recv_topk_weights
+        # TE enforces one receive weight for each received-token slot.
+        assert probs.numel() == output.shape[0]
+        return output, torch.tensor([2, 2]), probs
+
+    monkeypatch.setattr(token_dispatcher, "nccl_ep_dispatch", dispatch)
+    output = manager.dispatch(torch.zeros(4, manager.hidden_dim))
+
+    assert manager.dispatched_probs.shape == (output.shape[0],)
+    assert token_dispatcher._NCCLEPManager._zc_recv_topk_weights_buf is stale_weights
+    assert torch.equal(stale_weights, torch.ones(128))
+
+
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
     """Per-expert token counts from a local routing map, summed across the default process group.
 

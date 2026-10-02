@@ -626,6 +626,14 @@ class _CudagraphGlobalRecord:
         try:
             return cls._create_cudagraphs()
         finally:
+            # A failed capture must not leave DDP hooks disabled for subsequent backwards.
+            if is_graph_capturing():
+                _set_warmup_end()
+                _set_capture_end()
+                if HAVE_TE_GRAPHS:
+                    te_set_capture_end()
+                if FREEZE_GC:
+                    gc.unfreeze()
             cls._disable_saved_tensors_observer()
 
     @classmethod
@@ -680,6 +688,12 @@ class _CudagraphGlobalRecord:
             # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
             GTP_CONFIG.check_param_states = False
             initialize_graph_wgrad_rings()
+
+        # Recording/warmup can keep AccumulateGrad nodes alive on the default stream.
+        # Match full-iteration capture: let autograd redirect those stale references to
+        # the capturing stream rather than introduce an illegal default-stream dependency.
+        if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
+            torch.autograd.graph.set_override_stale_capture_stream(True)
 
         _set_capture_start()
         if has_te_modules:
