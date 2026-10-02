@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -54,6 +54,37 @@ except ImportError:
     HAVE_FLA = False
 
 logger = logging.getLogger(__name__)
+
+
+class _TorchL2Norm(torch.autograd.Function):
+    """Match FLA's saved-output gradient without its timing-based autotuning."""
+
+    @staticmethod
+    def forward(ctx, x, eps):
+        """Normalize in FP32 and save the rounded output used by FLA's backward."""
+        x_float = x.float()
+        rstd = 1.0 / torch.sqrt((x_float * x_float).sum(dim=-1, keepdim=True) + eps)
+        y = (x_float * rstd).to(x.dtype)
+        ctx.save_for_backward(y, rstd)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        """Apply the saved-output gradient formula in FP32."""
+        y, rstd = ctx.saved_tensors
+        y_float, dy_float = y.float(), dy.float()
+        dx = dy_float * rstd - (dy_float * y_float).sum(dim=-1, keepdim=True) * y_float * rstd
+        return dx.to(y.dtype), None
+
+
+def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize the last dimension with FLA-compatible epsilon and dtype semantics.
+
+    Both passes compute in FP32. Backward uses the normalized output rounded to
+    the input dtype, matching FLA rather than differentiating an unrounded norm.
+    This path avoids timing-selected reduction layouts in deterministic training.
+    """
+    return _TorchL2Norm.apply(x, eps)
 
 
 @dataclass
@@ -444,7 +475,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            normalize = torch_l2norm if self.config.deterministic_mode else l2norm
+            query_key = normalize(query_key.contiguous())
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size

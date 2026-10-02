@@ -25,6 +25,35 @@ def test_wrapper_rejects_shortcut_moe_models():
         GPTInferenceWrapper(model, inference_context=None)
 
 
+@pytest.mark.parametrize("enable_mhc,pp_size", [(True, 2), (True, 1), (False, 2)])
+def test_wrapper_rejects_mhc_pipeline_inference(monkeypatch, enable_mhc, pp_size):
+    """Use the inference PP group, which can differ from the training configuration."""
+    pg_collection = SimpleNamespace(tp=object(), pp=object())
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_mhc_connections=enable_mhc,
+            pipeline_model_parallel_size=3 - pp_size,
+            fp32_residual_connection=False,
+            params_dtype=torch.float32,
+            sequence_parallel=False,
+            fp8=None,
+        )
+    )
+    context = SimpleNamespace(config=SimpleNamespace(pg_collection=pg_collection))
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_world_size",
+        lambda group: pp_size if group is pg_collection.pp else 1,
+    )
+
+    if enable_mhc and pp_size > 1:
+        with pytest.raises(NotImplementedError, match="mHC inference with pipeline parallelism"):
+            GPTInferenceWrapper(model, context)
+    else:
+        wrapper = GPTInferenceWrapper(model, context)
+        assert wrapper.pp_group is pg_collection.pp
+
+
 def test_validate_input_modalities_accepts_declared_capabilities_and_rejects_others():
     wrapper = _wrapper()
     wrapper.supports_image = True
