@@ -711,7 +711,7 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
 
 
 def test_frozen_weights_remain_available_during_backward(distributed_setup):
-    """Frozen weights must remain available until internal backward completes."""
+    """A frozen FSDP unit with no input gradients must wait for internal backward."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
@@ -722,6 +722,8 @@ def test_frozen_weights_remain_available_during_backward(distributed_setup):
         fully_shard(model[0], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
+    assert all(not group.requires_grad for group in model.parameter_groups)
+
     def unpack(tensor):
         # Fail before a CUDA kernel reads freed storage. Suppress traceback tensor
         # formatting, which would also try to read that storage.
@@ -729,9 +731,11 @@ def test_frozen_weights_remain_available_during_backward(distributed_setup):
             pytest.fail("Frozen weight was resharded before backward consumed it", pytrace=False)
         return tensor
 
-    x = torch.ones(2, 4, device=device)
+    x = torch.ones(2, 4, device=device, requires_grad=False)
     with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, unpack):
-        model(x).sum().backward()
+        output = model(x)
+        assert output.requires_grad  # The separately sharded child still needs backward.
+        output.sum().backward()
 
     assert model[0].weight.grad is not None
     torch.optim.SGD(model.parameters(), lr=0.05).step()
