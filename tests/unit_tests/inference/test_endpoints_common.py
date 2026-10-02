@@ -135,6 +135,10 @@ BODIES = {CHAT_PATH: CHAT_BODY, COMPLETIONS_PATH: COMPLETIONS_BODY}
 FAN_OUT_BODIES = {CHAT_PATH: {**CHAT_BODY, "n": 3}, COMPLETIONS_PATH: {"prompt": ["a", "b", "c"]}}
 PATHS = pytest.mark.parametrize("path", [CHAT_PATH, COMPLETIONS_PATH], ids=["chat", "completions"])
 NOT_A_NUMBER_ERROR = "Invalid sampling parameter: could not convert string to float: 'hot'"
+NOT_AN_INT_ERROR = (
+    "Invalid sampling parameter: int() argument must be a string, a bytes-like object or a real "
+    "number, not 'list'"
+)
 _ENDPOINT_MODULES = {CHAT_PATH: "chat_completions", COMPLETIONS_PATH: "completions"}
 _ENDPOINTS_PACKAGE = (
     "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints"
@@ -304,7 +308,17 @@ _COMPLETIONS_DEFAULTS = {
         ),
         pytest.param(
             COMPLETIONS_PATH,
-            {"logprobs": None, "echo": None, "stop": None, "ignore_eos": None},
+            {
+                "temperature": None,
+                "top_p": None,
+                "top_k": None,
+                "logprobs": None,
+                "echo": None,
+                "max_tokens": None,
+                "stop": None,
+                "ignore_eos": None,
+                "streaming_interval": None,
+            },
             {},
             _COMPLETIONS_DEFAULTS,
             id="completions-null-fields-mean-default",
@@ -337,13 +351,13 @@ _COMPLETIONS_DEFAULTS = {
             {"return_log_probs": True, "top_n_logprobs": 3, "skip_prompt_log_probs": True},
             id="completions-logprobs-int-without-echo",
         ),
-        # /v1/completions derives skip_prompt_log_probs from echo; the engine knob is not read.
+        # An explicit engine knob overrides the echo-derived default.
         pytest.param(
             COMPLETIONS_PATH,
             {"logprobs": 5, "skip_prompt_log_probs": False},
             {},
-            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": True},
-            id="completions-explicit-skip-prompt-log-probs-is-ignored",
+            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": False},
+            id="completions-explicit-skip-prompt-log-probs-wins-over-echo",
         ),
         pytest.param(
             CHAT_PATH,
@@ -617,40 +631,21 @@ _NEMO_RL_OVERFLOW_BODY = (
     "This model's maximum context length was exceeded. Your messages resulted in 2 tokens. "
     f"Please reduce the length of the messages. Request 0: {_OVERFLOW}"
 )
-_PLAIN_OVERFLOW_BODY = f"Inference request(s) failed: Request 0: {_OVERFLOW}"
 
 
 @pytest.mark.asyncio
+@PATHS
 @pytest.mark.parametrize(
-    ("path", "event_type", "expected"),
-    [
-        # /v1/chat/completions reports the prompt length in the body Nemo-RL matches on,
-        # whatever the event type ...
-        pytest.param(
-            CHAT_PATH, "ERROR_NONTRANSIENT", (_NEMO_RL_OVERFLOW_BODY, 400), id="chat-nontransient"
-        ),
-        pytest.param(
-            CHAT_PATH, "ERROR_TRANSIENT", (_NEMO_RL_OVERFLOW_BODY, 400), id="chat-transient"
-        ),
-        # ... while /v1/completions reports an overflow like any other failure.
-        pytest.param(
-            COMPLETIONS_PATH,
-            "ERROR_NONTRANSIENT",
-            (_PLAIN_OVERFLOW_BODY, 400),
-            id="completions-nontransient",
-        ),
-        pytest.param(
-            COMPLETIONS_PATH,
-            "ERROR_TRANSIENT",
-            (_PLAIN_OVERFLOW_BODY, 500),
-            id="completions-transient",
-        ),
-    ],
+    "event_type", ["ERROR_NONTRANSIENT", "ERROR_TRANSIENT"], ids=["nontransient", "transient"]
 )
-async def test_context_overflow_failure_report(path, event_type, expected):
+async def test_context_overflow_failure_report(path, event_type):
+    """Both endpoints report the prompt length in the body Nemo-RL matches on, as a 400."""
     client = ReplyingClient([failed_reply({"type": event_type, "payload": _OVERFLOW})])
     app = build_app(path, client)
 
     response = await app.test_client().post(path, json=BODIES[path])
 
-    assert (await response.get_data(as_text=True), response.status_code) == expected
+    assert (await response.get_data(as_text=True), response.status_code) == (
+        _NEMO_RL_OVERFLOW_BODY,
+        400,
+    )

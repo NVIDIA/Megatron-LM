@@ -40,6 +40,7 @@ from tests.unit_tests.inference.test_endpoints_common import (
     CHAT_BODY,
     CHAT_PATH,
     NOT_A_NUMBER_ERROR,
+    NOT_AN_INT_ERROR,
     ReplyingClient,
     build_app,
     completed_reply,
@@ -1279,15 +1280,15 @@ async def test_n_choices_prepare_and_serialize_shared_media_once():
         pytest.param(
             {"messages": "hi"}, 400, "'messages' must be a list", id="messages-not-a-list"
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # A sampling field of the wrong type is a client error, whether the conversion raises
+        # ValueError or TypeError.
         pytest.param(
             {**CHAT_BODY, "temperature": "hot"},
             400,
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({**CHAT_BODY, "top_k": [1]}, 500, None, id="top-k-list"),
+        pytest.param({**CHAT_BODY, "top_k": [1]}, 400, NOT_AN_INT_ERROR, id="top-k-list"),
     ],
 )
 async def test_malformed_requests_are_rejected_before_submission(body, status, expected_error):

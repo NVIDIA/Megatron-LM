@@ -12,8 +12,8 @@ import pytest
 pytest.importorskip("quart")
 
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
-    attach_stage_metadata,
-    collect_stage_metadata,
+    build_response,
+    unwrap_batch,
     validate_offload_params,
 )
 from tests.unit_tests.inference.test_endpoints_common import (
@@ -22,6 +22,7 @@ from tests.unit_tests.inference.test_endpoints_common import (
     COMPLETIONS_BODY,
     COMPLETIONS_PATH,
     NOT_A_NUMBER_ERROR,
+    NOT_AN_INT_ERROR,
     PATHS,
     ReplyingClient,
     Tokenizer,
@@ -105,7 +106,7 @@ async def test_completions_batch_rejects_conflicting_stage_metadata():
     app = build_app(COMPLETIONS_PATH, client)
 
     # Quart's test client turns the handler's ValueError into a 500; the message
-    # itself is pinned by test_collect_stage_metadata_rejects_conflicting_values.
+    # itself is pinned by test_unwrap_batch_merges_stage_metadata.
     response = await app.test_client().post(COMPLETIONS_PATH, json={"prompt": ["a", "b"]})
 
     assert response.status_code == 500
@@ -123,23 +124,41 @@ async def test_completions_without_stager_has_no_extra_top_level_keys():
     assert set(payload) == {"id", "object", "created", "model", "choices", "usage"}
 
 
-def test_collect_stage_metadata_tolerates_missing_and_none():
-    response_metadata = {}
-    collect_stage_metadata(response_metadata, {})
-    collect_stage_metadata(response_metadata, {"payload_stage_metadata": None})
-    assert response_metadata == {}
+@pytest.mark.parametrize(
+    ("stage_metadata", "expected"),
+    [
+        pytest.param([{}, {"payload_stage_metadata": None}], {}, id="missing-and-none-tolerated"),
+        pytest.param(
+            [{"payload_stage_metadata": {"store_key": "abc"}}] * 2,
+            {"store_key": "abc"},
+            id="identical-values-merge-once",
+        ),
+        pytest.param(
+            [
+                {"payload_stage_metadata": {"store_key": "abc"}},
+                {"payload_stage_metadata": {"store_key": "xyz"}},
+            ],
+            "conflicting response metadata for 'store_key'",
+            id="conflicting-values-rejected",
+        ),
+    ],
+)
+def test_unwrap_batch_merges_stage_metadata(stage_metadata, expected):
+    batch = [
+        completed_reply(f"req-{i}", [10], [11], **extra) for i, extra in enumerate(stage_metadata)
+    ]
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            unwrap_batch(batch)
+    else:
+        results, response_uid, response_metadata = unwrap_batch(batch)
+        assert [result["uid"] for result in results] == ["req-0", "req-1"]
+        assert (response_uid, response_metadata) == ("req-0", expected)
 
 
-def test_collect_stage_metadata_rejects_conflicting_values():
-    response_metadata = {}
-    collect_stage_metadata(response_metadata, {"payload_stage_metadata": {"store_key": "abc"}})
-    with pytest.raises(ValueError, match="conflicting response metadata for 'store_key'"):
-        collect_stage_metadata(response_metadata, {"payload_stage_metadata": {"store_key": "xyz"}})
-
-
-def test_attach_stage_metadata_refuses_to_overwrite_reserved_fields():
+def test_build_response_refuses_to_overwrite_reserved_fields():
     with pytest.raises(ValueError, match=r"reserved fields: \['choices', 'id'\]"):
-        attach_stage_metadata({"id": "x", "choices": []}, {"id": "y", "choices": [], "k": 1})
+        build_response("x", "text_completion", [], {}, {"id": "y", "choices": [], "k": 1})
 
 
 # --- offload_params validation ---------------------------------------------
@@ -244,16 +263,16 @@ _INVALID_PROMPT_FORMAT = (
         ),
         pytest.param({"prompt": [1.5]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-floats"),
         pytest.param({"prompt": ["a", 1]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-mixed-list"),
-        # A tokenizer error is reported as an internal failure.
+        # A tokenizer ValueError is a client error: the prompt could not be tokenized.
         pytest.param(
             {"prompt": "hello"},
             {"tokenizer": _RaisingTokenizer()},
-            500,
-            "Error tokenizing prompt: cannot tokenize 'hello'",
+            400,
+            "cannot tokenize 'hello'",
             id="tokenizer-error",
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # A sampling field of the wrong type is a client error, whether the conversion raises
+        # ValueError or TypeError.
         pytest.param(
             {"prompt": "hello", "temperature": "hot"},
             {},
@@ -261,23 +280,7 @@ _INVALID_PROMPT_FORMAT = (
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({"prompt": "hello", "top_k": [1]}, {}, 500, None, id="top-k-list"),
-        # Sampling fields are read with a plain .get(), so an explicit null reaches the
-        # float()/int() conversion and escapes as a 500 (chat treats null as "use the default").
-        pytest.param(
-            {
-                "prompt": "hello",
-                "temperature": None,
-                "top_p": None,
-                "top_k": None,
-                "max_tokens": None,
-                "streaming_interval": None,
-            },
-            {},
-            500,
-            None,
-            id="null-sampling-fields",
-        ),
+        pytest.param({"prompt": "hello", "top_k": [1]}, {}, 400, NOT_AN_INT_ERROR, id="top-k-list"),
     ],
 )
 async def test_malformed_requests_are_rejected_before_submission(
@@ -336,19 +339,34 @@ _LOGPROBS_WITH_ECHO = {
     "top_logprobs": [None, {"<11>": -1.0}, {"<12>": -0.5}, {"<13>": -9999.0}],
     "text_offset": [0, 4, 8, 12],
 }
+# With the prompt scores skipped, the prompt positions are padded so the lists stay aligned.
+_LOGPROBS_WITH_ECHO_UNSCORED_PROMPT = {
+    **_LOGPROBS_WITH_ECHO,
+    "token_logprobs": [None, None, -0.5, -9999.0],
+    "top_logprobs": [None, None, {"<12>": -0.5}, {"<13>": -9999.0}],
+}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("echo", "logprobs", "expected_logprobs"),
+    ("echo", "logprobs", "skip_prompt_log_probs", "expected_logprobs"),
     [
-        pytest.param(False, None, None, id="plain"),
+        pytest.param(False, None, False, None, id="plain"),
         # Non-finite values are clamped for JSON; the leading None is the OpenAI first-token slot.
-        pytest.param(False, 1, _LOGPROBS_WITHOUT_ECHO, id="logprobs"),
-        pytest.param(True, 1, _LOGPROBS_WITH_ECHO, id="echo-with-logprobs"),
+        pytest.param(False, 1, False, _LOGPROBS_WITHOUT_ECHO, id="logprobs"),
+        pytest.param(True, 1, False, _LOGPROBS_WITH_ECHO, id="echo-with-logprobs"),
+        pytest.param(
+            True,
+            1,
+            True,
+            _LOGPROBS_WITH_ECHO_UNSCORED_PROMPT,
+            id="echo-with-logprobs-skipping-prompt-scores",
+        ),
     ],
 )
-async def test_completions_response_format(echo, logprobs, expected_logprobs, recwarn):
+async def test_completions_response_format(
+    echo, logprobs, skip_prompt_log_probs, expected_logprobs, recwarn
+):
     first = completed_reply(
         "req-0",
         [10, 11],
@@ -365,9 +383,17 @@ async def test_completions_response_format(echo, logprobs, expected_logprobs, re
         "req-1", [10, 11, 12], [14, 15], sampling_params={"num_tokens_to_generate": 2}
     )
     del second["prompt_length"]
+    if skip_prompt_log_probs:
+        # The engine honored the knob and returned no prompt scores.
+        del first["prompt_log_probs"], first["prompt_top_n_logprobs"]
     client = ReplyingClient([first, second])
     app = build_app(COMPLETIONS_PATH, client)
-    body = {"prompt": ["p0", "p1"], "echo": echo, **({"logprobs": logprobs} if logprobs else {})}
+    body = {
+        "prompt": ["p0", "p1"],
+        "echo": echo,
+        **({"logprobs": logprobs} if logprobs else {}),
+        **({"skip_prompt_log_probs": True} if skip_prompt_log_probs else {}),
+    }
 
     response = await app.test_client().post(COMPLETIONS_PATH, json=body)
 
@@ -377,7 +403,12 @@ async def test_completions_response_format(echo, logprobs, expected_logprobs, re
     assert payload["object"] == "text_completion"
     assert payload["model"] == "EMPTY"
     assert isinstance(payload["created"], int)
-    assert payload["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    assert payload["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+        "prompt_tokens_details": {"cached_tokens": 2},
+    }
     choice_0, choice_1 = payload["choices"]
     assert (choice_0["index"], choice_1["index"]) == (0, 1)
     assert (choice_0["text"], choice_1["text"]) == (
