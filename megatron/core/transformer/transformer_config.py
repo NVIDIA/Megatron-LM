@@ -350,6 +350,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_tie_break: Optional[Literal["none", "small", "large"]] = None
+    """Tie policy for the ordinary cuDNN DSA indexer. ``none`` allows arbitrary ties;
+    ``small`` and ``large`` prefer smaller and larger logical key indices, respectively. Unset
+    preserves the existing policy: smaller indices on CPU when K < Sk, arbitrary on CUDA.
+    This controls selection among equal scores, not the output order."""
+
     dsa_indexer_topk_freq: int = 1
     """Frequency of DSA indexer top-k computation across layers.
     A value greater than 1 enables cross-layer top-k sharing."""
@@ -1850,6 +1856,27 @@ class TransformerConfig(ModelParallelConfig):
                     f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
                 )
                 self.dsa_kernel_backend = legacy_backend
+
+        if self.dsa_indexer_topk_tie_break not in (None, "none", "small", "large"):
+            raise ValueError(
+                "dsa_indexer_topk_tie_break must be None, 'none', 'small', or 'large', got "
+                f"{self.dsa_indexer_topk_tie_break!r}."
+            )
+        if self.dsa_indexer_topk_tie_break is not None and (
+            self.experimental_attention_variant != "dsa"
+            or self.dsa_kernel_backend != "cudnn"
+            or self.attention_backend in (AttnBackend.unfused, "unfused")
+        ):
+            raise ValueError(
+                "dsa_indexer_topk_tie_break requires experimental_attention_variant='dsa', "
+                "dsa_kernel_backend='cudnn', and attention_backend != unfused."
+            )
+        self._dsa_indexer_topk_tie_break: Optional[int] = {
+            None: None,
+            "none": 0,
+            "small": 1,
+            "large": 2,
+        }[self.dsa_indexer_topk_tie_break]
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
             raise ValueError(

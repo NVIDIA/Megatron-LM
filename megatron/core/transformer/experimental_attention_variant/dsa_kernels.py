@@ -158,6 +158,14 @@ def run_fused_qk_topk(
         use_local_indexer_varlen=use_local_indexer_varlen,
         single_packed_thd_sequence=single_packed_thd_sequence,
     )
+    backend_kwargs = _packed_layout_hook_kwargs(
+        fn,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        packed_thd_causal_identity_layout=use_local_indexer_varlen,
+        packed_thd_single_sequence=single_packed_thd_sequence,
+    )
+    if config.dsa_kernel_backend == "cudnn":
+        backend_kwargs["topk_tie_break"] = config._dsa_indexer_topk_tie_break
     result = fn(
         q=q,
         k=k,
@@ -174,12 +182,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **_packed_layout_hook_kwargs(
-            fn,
-            varlen_is_plain_causal=varlen_is_plain_causal,
-            packed_thd_causal_identity_layout=use_local_indexer_varlen,
-            packed_thd_single_sequence=single_packed_thd_sequence,
-        ),
+        **backend_kwargs,
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
