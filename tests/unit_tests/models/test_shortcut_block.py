@@ -13,9 +13,13 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import TwoStageAttentionLayer
+from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -24,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _shortcut_config(*, parallel: bool = False):
+def _shortcut_config(*, parallel: bool = False, wide_residual: WideResidualConfig | None = None):
     return TransformerConfig(
         num_layers=1,
         hidden_size=8,
@@ -39,6 +43,7 @@ def _shortcut_config(*, parallel: bool = False):
         moe_shortcut_post_norm=True,
         moe_shortcut_parallel=parallel,
         add_bias_linear=False,
+        wide_residual=wide_residual,
     )
 
 
@@ -98,6 +103,9 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
+    def _get_mlp_residual_connection(self):
+        return getattr(self, "residual_connection_mlp", None)
+
 
 @pytest.mark.parametrize(
     ("compute_symbol", "parallel"),
@@ -145,7 +153,69 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert "1.shortcut_post_norm.weight" in state_keys
 
 
-def test_shortcut_owns_cp_layout_transitions(monkeypatch):
+def test_wide_shortcut_owns_independent_registered_read():
+    """The routed shortcut reads wide X_l through its own ordinary-width controller."""
+
+    config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
+    pg_collection = ProcessGroupCollection()
+    compute = _FakeCompute(config)
+    compute.residual_stream_hidden_size = config.wide_residual.num_streams * config.hidden_size
+    moe = _FakeMoE(config)
+    moe.residual_connection_mlp = StreamwiseSigmoidWideResidualConnection(
+        config=config, layer_number=moe.layer_number, branch_name="mlp", pg_collection=pg_collection
+    )
+    block = ShortcutMoEBlock(compute, moe, overlap_a2a=False).cuda()
+
+    state_keys = set(block.state_dict())
+    assert "shortcut_residual_read.read_map.logit" in state_keys
+    assert "moe_layer.residual_connection_mlp.read_map.logit" in state_keys
+    assert (
+        block.shortcut_residual_read.read_map.logit
+        is not block.moe_layer.residual_connection_mlp.read_map.logit
+    )
+
+    wide_hidden = torch.randn(
+        5, 3 * config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+    )
+    shortcut_hidden = block._read_shortcut_hidden(wide_hidden, recompute_context=None)
+
+    assert shortcut_hidden.shape == (5, config.hidden_size)
+    shortcut_hidden.square().mean().backward()
+    gradient = block.shortcut_residual_read.read_map.logit.grad
+    assert gradient is not None
+    assert torch.count_nonzero(gradient[: config.wide_residual.num_streams]) > 0
+    assert wide_hidden.grad is not None
+
+
+def test_wide_shortcut_mtp_pair_stays_ordinary_width():
+    """MTP auxiliary stacks do not inherit the decoder's wide residual stream."""
+
+    config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
+    compute = _FakeCompute(config)
+    compute.is_mtp_layer = True
+    moe = _FakeMoE(config)
+    moe.is_mtp_layer = True
+
+    block = ShortcutMoEBlock(compute, moe, overlap_a2a=False)
+    ordinary_hidden = torch.randn(3, config.hidden_size)
+
+    assert block.is_mtp_layer
+    assert block.shortcut_residual_read is None
+    assert block._read_shortcut_hidden(ordinary_hidden, recompute_context=None) is ordinary_hidden
+    assert not any("shortcut_residual_read" in key for key in block.state_dict())
+
+
+def test_shortcut_pair_rejects_mixed_mtp_ownership():
+    config = _shortcut_config()
+    compute = _FakeCompute(config)
+    compute.is_mtp_layer = True
+
+    with pytest.raises(ValueError, match="agree.*MTP"):
+        ShortcutMoEBlock(compute, _FakeMoE(config), overlap_a2a=False)
+
+
+@pytest.mark.parametrize("residual_replay", [False, True], ids=["eager", "replay"])
+def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     config = _shortcut_config()
     attn_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
@@ -154,6 +224,12 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
     )
     calls = []
     observed = {}
+    attn_context, moe_context = (
+        build_residual_stream_recompute_plan(2, 2) if residual_replay else (None, None)
+    )
+    expected_layer_kwargs = (
+        {"residual_stream_recompute_context": attn_context} if residual_replay else {}
+    )
 
     class RecordingCPLayoutState:
         def prepare_layer(self, layer_idx, hidden_states):
@@ -167,13 +243,24 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
         observed["cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
+        assert {
+            key: value
+            for key, value in kwargs.items()
+            if key == "residual_stream_recompute_context"
+        } == expected_layer_kwargs
         return (hidden_states,)
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None):
+    def attn_post(hidden_states, **kwargs):
+        assert kwargs == expected_layer_kwargs
+        return hidden_states
+
+    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+        assert recompute_context is attn_context
         observed["route_packed"] = packed_seq_params
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask=None, packed_seq_params=None):
+    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
+        assert recompute_context is moe_context
         observed["shared_packed"] = packed_seq_params
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
@@ -184,7 +271,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
         packed_seq_params=None,
         moe_unflatten_mbs=None,
         mlp_state=(),
+        recompute_context=None,
     ):
+        assert recompute_context is moe_context
         observed["postprocess_packed"] = packed_seq_params
         return residual
 
@@ -193,7 +282,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
         yield
 
     monkeypatch.setattr(attn_layer, "forward_pre_attn_and_core_attn", attn_forward)
-    monkeypatch.setattr(attn_layer, "forward_post_core_attn", lambda hidden_states: hidden_states)
+    monkeypatch.setattr(attn_layer, "forward_post_core_attn", attn_post)
     monkeypatch.setattr(block, "_moe_router_preprocess", route)
     monkeypatch.setattr(block, "_launch_dispatch", lambda hidden, probs, **_: (hidden, probs))
     monkeypatch.setattr(
@@ -216,6 +305,8 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
         quant_context_factory=quant_context_factory,
         cp_layout_state=RecordingCPLayoutState(),
         packed_sequence_cp_metadata=cp_metadata,
+        attn_recompute_context=attn_context,
+        moe_recompute_context=moe_context,
     )
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
@@ -454,12 +545,16 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.mlp = FakeMLP()
 
         def shortcut_route_preprocess(
-            self, shortcut_hidden, padding_mask=None, packed_seq_params=None
+            self, shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None
         ):
+            assert recompute_context is None
             assert_quant_layer(1)
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
 
-        def shortcut_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
+        def shortcut_shared_experts(
+            self, hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None
+        ):
+            assert recompute_context is None
             assert_quant_layer(1)
             return hidden_states * self.shared_scale, None, hidden_states, ()
 
