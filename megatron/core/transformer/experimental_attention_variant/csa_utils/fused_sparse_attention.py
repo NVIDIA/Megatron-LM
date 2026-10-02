@@ -23,6 +23,7 @@ Public API:
 from __future__ import annotations
 
 import inspect
+import math
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -212,6 +213,9 @@ def _deterministic_sparse_bwd_kwargs(q_flat: Tensor, requested: bool) -> dict:
 # mode the contributions are recomputed here without atomics: stable-sort by key id, prefix-sum
 # in the original row-major order and gather at fixed boundaries, then a dense fixed-order add.
 _DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
+# cuDNN's sparse-indexer backward differentiates KL with log-probabilities clipped at -100:
+# targets are raised to exp(-100) and slots whose predicted probability is below it are dropped.
+_CUDNN_INDEXER_CLIP_PROB_MIN = math.exp(-100.0)
 
 
 def _requires_native_deterministic_indexer_grad_w(q_idx_bshd: Tensor) -> bool:
@@ -247,9 +251,12 @@ def _deterministic_sparse_indexer_grads_wk(
 ) -> Tuple[Optional[Tensor], Tensor]:
     """Recompute the sparse-indexer dK (and optionally dW) without floating-point atomics.
 
-    Same math as ``cudnn.DSA.indexer_backward_wrapper`` (KL backward normalised by ``B * S_q``;
-    ``topk_indices`` are local to each batch element, negatives are padding). Packed THD
-    callers use a single synthetic batch, so their flat key ids are already batch-local.
+    Same math as ``cudnn.DSA.indexer_backward_wrapper``: the clipped-log KL backward, with
+    per-slot score gradient ``predict * sum(kept_target) - kept_target`` normalised by
+    ``B * S_q``, where ``kept_target`` keeps the clipped target of valid slots whose predicted
+    probability is at least ``exp(-100)``. ``topk_indices`` are local to each batch element and
+    negatives are padding. Packed THD callers use a single synthetic batch, so their flat key
+    ids are already batch-local.
     The per-key reduction
     over the (query, slot) contributions uses torch's deterministic ``index_add_`` when
     ``torch.use_deterministic_algorithms(True)`` is active (sort-based, fixed order) and otherwise a
@@ -309,7 +316,12 @@ def _deterministic_sparse_indexer_grads_wk(
         gather_idx = indices_chunk.masked_fill(~valid, 0).reshape(-1)
         selected_k = k_flat.index_select(0, gather_idx).reshape(n_rows, topk, indexer_dim).float()
         dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))  # (rows, heads, topk)
-        score_grad = (index_flat[row_start:row_end] - attn_flat[row_start:row_end]).float()
+        predict = index_flat[row_start:row_end].float()
+        kept = valid & (predict >= _CUDNN_INDEXER_CLIP_PROB_MIN)
+        kept_target = torch.where(
+            kept, attn_flat[row_start:row_end].float().clamp_min(_CUDNN_INDEXER_CLIP_PROB_MIN), 0.0
+        )
+        score_grad = predict * kept_target.sum(dim=-1, keepdim=True) - kept_target
         score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
         head_coeff = (dot > 0).to(dtype=torch.float32)
         if grad_w_flat is not None:
