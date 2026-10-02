@@ -308,8 +308,6 @@ class FsdpModule:
         this module's parameters and reduce their gradients. It is invoked once
         all of this module's trainable parameters have accumulated gradients, or
         via a full-backward hook when the module owns no trainable parameters.
-        Units owning frozen parameters reject backward if that hook receives no
-        input gradients, since it may fire before internal backward consumes weights.
 
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
@@ -318,7 +316,7 @@ class FsdpModule:
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
 
-            def frozen_backward_hook(hooked_module, grad_input, _grad_output):
+            def module_backward_hook(hooked_module, grad_input, _grad_output):
                 module = cast(FsdpModule, hooked_module)
                 # With no grad-requiring inputs, PyTorch fires this hook at
                 # output gradients, before internal backward can read weights.
@@ -331,7 +329,7 @@ class FsdpModule:
                     )
                 post_backward_hook(module)
 
-            module.register_full_backward_hook(frozen_backward_hook)
+            module.register_full_backward_hook(module_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
