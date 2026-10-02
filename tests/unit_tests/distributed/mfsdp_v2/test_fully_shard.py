@@ -715,6 +715,9 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    # A frozen linear alone with non-grad-requiring inputs has no backward graph.
+    # The trainable layer creates a gradient path through the frozen layer while
+    # the root module's input still does not require gradients.
     trainable_linear = nn.Linear(4, 4, bias=False)
     frozen_linear = nn.Linear(4, 4, bias=False)
     frozen_linear.requires_grad_(False)
@@ -735,14 +738,15 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
         return tensor
 
     x = torch.ones(2, 4, device=device, requires_grad=False)
-    # Linear backward saves its weight to compute the input gradient, whether
-    # the weight is frozen or trainable. Keep saved tensors without copying so
-    # unpack can detect freed storage before CUDA reads it if the rejection regresses.
+    # The first argument (pack_hook) runs when forward saves a tensor for backward.
+    # The identity lambda preserves its storage so a copy cannot hide early resharding.
+    # The second (unpack_hook) runs when backward retrieves it; unpack checks that
+    # its storage still exists before a CUDA kernel can read it if rejection regresses.
     with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, unpack):
         output = model(x)
         assert not x.requires_grad
         assert output.requires_grad
-        with pytest.raises(RuntimeError, match="MFSDP cannot safely reshard frozen weights"):
+        with pytest.raises(NotImplementedError, match="MFSDP cannot safely reshard frozen weights"):
             output.sum().backward()
 
     frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
