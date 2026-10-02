@@ -32,6 +32,51 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 
 
+def test_hybrid_cp_scheduler_repacks_non_power_of_two_domain():
+    """A non-power-of-two DPxCP domain must not overrun during empty-rank filling."""
+
+    class FakeGroup:
+        def size(self):
+            return 10
+
+    scheduler = hybrid_cp_schedule.BalancedCPScheduler(
+        max_seq_len_per_rank=100, dp_cp_group=FakeGroup()
+    )
+
+    groups, sample_id_groups = scheduler.get_groups_and_subsamples([(0, 50), (1, 50)], None)
+
+    assert len(groups) == 1
+    assert [len(sample_ids) for sample_ids in sample_id_groups[0]] == [1] * 10
+    assert sorted({sample_id for sample_ids in sample_id_groups[0] for sample_id in sample_ids}) == [
+        0,
+        1,
+    ]
+
+
+def test_hybrid_cp_scheduler_uses_precreated_aligned_groups():
+    """Every sub-sample must map to one fixed communicator block."""
+
+    class FakeGroup:
+        def size(self):
+            return 8
+
+    lengths = [127, 275, 251, 173, 177, 310, 260, 105, 257, 112, 223, 155, 56, 316, 134]
+    scheduler = hybrid_cp_schedule.BalancedCPScheduler(
+        max_seq_len_per_rank=100, dp_cp_group=FakeGroup()
+    )
+    _, sample_id_groups = scheduler.get_groups_and_subsamples(
+        list(enumerate(lengths)), None
+    )
+
+    for group in sample_id_groups:
+        for sample_id in {sample_id for rank_ids in group for sample_id in rank_ids}:
+            ranks = [rank for rank, rank_ids in enumerate(group) if sample_id in rank_ids]
+            group_size = len(ranks)
+            if group_size < 8:
+                group_start = (ranks[0] // group_size) * group_size
+                assert ranks == list(range(group_start, group_start + group_size))
+
+
 def test_reset_activation_offload_uses_language_model_group(mocker):
     reset = mocker.patch.object(schedule.off_interface, "reset")
     language_group = object()
