@@ -76,8 +76,7 @@ Megatron-LM/
 │   │   ├── inference/           # Inference engines and server
 │   │   └── export/              # Model export (example: TensorRT-LLM)
 │   ├── training/                # Training scripts
-│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
-│   └── rl/                      # Reinforcement learning (including RLHF)
+│   └── post_training/           # Post-training (quantization, distillation, pruning, etc.)
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
 ├── tests/                       # Comprehensive test suite
