@@ -54,6 +54,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_tools_for_template,
     _serialize_eos_token_ids,
     _suffix_tokens_after_prefix,
+    _TemplateRenderer,
     _tokenize_with_media_slots_sync,
 )
 from tests.unit_tests.inference.test_endpoints_common import (
@@ -924,8 +925,12 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     executor in one hop, on the thread that owns the private tokenizer copy.
     """
     assert not inspect.iscoroutinefunction(_tokenize_with_media_slots_sync)
-    # And the endpoint must not have kept a direct call that skips the executor.
-    src = inspect.getsource(chat_completions_module.chat_completions)
+    # Executor dispatch is owned by the renderer; the endpoint must not call the sync function
+    # directly, and the renderer must hand it to the executor rather than await it.
+    assert "_tokenize_with_media_slots_sync" not in inspect.getsource(
+        chat_completions_module.chat_completions
+    )
+    src = inspect.getsource(_TemplateRenderer.tokenize)
     assert "_tokenize_with_media_slots_sync" in src
     for line in src.splitlines():
         if "_tokenize_with_media_slots_sync" in line:
