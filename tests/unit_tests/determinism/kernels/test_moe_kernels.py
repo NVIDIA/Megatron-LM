@@ -377,17 +377,28 @@ class TestMoEModules:
     @pytest.mark.parametrize(
         "use_op_fuser", [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)]
     )
-    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_op_fuser, monkeypatch):
+    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_op_fuser):
+        activation_overrides = {}
         if use_op_fuser:
             if not is_te_min_version("2.14.0"):
                 pytest.skip("Grouped operation-fuser requires Transformer Engine >=2.14")
-            # TEGroupedMLP accepts the fused SwiGLU operation only when TE's CuTe DSL
-            # grouped-MLP path is enabled, as the MoE test fixtures do.
-            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+            # The weighted squared-ReLU activation selects the operation-fuser path without
+            # TE's CuTe DSL kernel selector. In BF16, TE runs the grouped operations unfused, so
+            # this replays the deterministic routing-probability placement end to end; the
+            # placement itself is checked against a reference in test_grouped_mlp.py.
+            activation_overrides = dict(
+                activation_func=squared_relu,
+                gated_linear_unit=False,
+                use_fused_weighted_squared_relu=True,
+                bias_activation_fusion=False,
+            )
         self._init()
         seeded()
         config = _moe_config(
-            hidden_size=2048, ffn_hidden_size=4096, use_transformer_engine_op_fuser=use_op_fuser
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            use_transformer_engine_op_fuser=use_op_fuser,
+            **activation_overrides,
         )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
         experts = get_submodules(spec.submodules.mlp).experts(
