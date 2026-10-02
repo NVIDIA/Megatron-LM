@@ -174,9 +174,7 @@ class PrefixCacheBlockState:
     # Eviction / deregistration
     # =========================================================================
 
-    def try_lru_evict_for_pool(
-        self, num_blocks_needed: int
-    ) -> Optional[Tuple[Tensor, List[int]]]:
+    def try_lru_evict_for_pool(self, num_blocks_needed: int) -> Optional[Tuple[Tensor, List[int]]]:
         """Pick + reset the LRU-oldest victims; return them plus their hashes.
 
         Returns:

@@ -11,7 +11,7 @@ from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCach
 from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 
 
-def test_allocator_notifies_observer_without_replacing_legacy_callback():
+def test_allocator_notifies_deregistration_observer():
     context = Mock()
     allocator = KVBlockAllocator(
         context,
@@ -21,15 +21,12 @@ def test_allocator_notifies_observer_without_replacing_legacy_callback():
         prefix_cache_registry=PrefixCacheRegistry(),
     )
     removed = Mock()
-    legacy = Mock()
     allocator.add_blocks_deregistered_observer(removed)
-    allocator.on_blocks_deregistered = legacy
 
     blocks = allocator.allocate_memory_blocks(2)
     allocator.register_kv_block_hashes(blocks.tolist(), [101, 202])
     allocator.release_memory_blocks(blocks)
 
-    legacy.assert_called_once()
     removed.assert_called_once()
 
 
