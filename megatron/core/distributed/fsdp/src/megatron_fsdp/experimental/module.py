@@ -323,7 +323,7 @@ class FsdpModule:
                 # With no grad-requiring inputs, PyTorch fires this hook at
                 # output gradients, before internal backward can read weights.
                 # Parameterless containers have no owned storage to release.
-                if module._parameter_groups and all(grad is None for grad in grad_input):
+                if module.parameter_groups and all(grad is None for grad in grad_input):
                     raise RuntimeError(
                         "MFSDP cannot safely reshard frozen weights when its full backward "
                         "hook receives no input gradients. See "
