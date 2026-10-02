@@ -713,17 +713,16 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
 def test_frozen_weights_without_input_gradients_reject_backward(distributed_setup):
     """Reject the unsafe full-backward-hook path before releasing frozen weights."""
 
-    class FrozenLinear(nn.Linear):
-        """Create an internal gradient path without changing the caller's input."""
-
-        def forward(self, x):
-            """Require activation gradients so backward still needs the frozen weight."""
-            return super().forward(x.detach().requires_grad_())
-
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = FrozenLinear(4, 4, bias=False).to(device).requires_grad_(False)
+    trainable_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear.requires_grad_(False)
+    model = nn.Sequential(trainable_linear, frozen_linear).to(device)
+    # Shard the trainable layer separately so the root FSDP unit owns only the
+    # frozen weight. Backward still needs that weight to reach the trainable layer.
     with fully_shard_context(device=device):
+        fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     assert all(not group.requires_grad for group in model.parameter_groups)
