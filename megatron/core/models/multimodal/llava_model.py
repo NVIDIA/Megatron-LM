@@ -316,6 +316,7 @@ class LLaVAModel(MegatronModule):
         class_token_len = 1
         self.vision_model = None
         self.vision_projection = None
+        self._vision_reads_host_imgs_sizes = False
         self._vision_projection_input_size = None
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
@@ -443,6 +444,8 @@ class LLaVAModel(MegatronModule):
                 class_token_len = 0
                 vmt = vision_transformer_config.vision_model_type
                 if vmt in ("pixtral-vit", "pixtral-vit-large"):
+                    # ViTModel reads the per-image patch grid on the host.
+                    self._vision_reads_host_imgs_sizes = True
                     self.vision_model = ViTModel(
                         transformer_config=vision_transformer_config,
                         transformer_layer_spec=vision_transformer_layer_spec,
@@ -1475,7 +1478,11 @@ class LLaVAModel(MegatronModule):
                 if vision_packed_seq_params is not None:
                     vision_kwargs["packed_seq_params"] = vision_packed_seq_params
                 if imgs_sizes is not None:
-                    vision_kwargs["imgs_sizes"] = imgs_sizes
+                    vision_kwargs["imgs_sizes"] = (
+                        imgs_sizes.cpu()
+                        if self._vision_reads_host_imgs_sizes and torch.is_tensor(imgs_sizes)
+                        else imgs_sizes
+                    )
                 image_embeddings = self.vision_model(
                     vision_images, **vision_kwargs
                 )  # [num_tiles, img_seq_len, h_vision]

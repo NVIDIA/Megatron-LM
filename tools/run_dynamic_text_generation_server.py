@@ -23,6 +23,8 @@ import torch  # noqa: E402
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
 from megatron.core.inference.config import (  # noqa: E402
     ImageProcessingConfig,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
     VideoProcessingConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
@@ -248,7 +250,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         dynamic_resolution=getattr(args, 'dynamic_resolution', False),
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
-        spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
+        # A native 2x2 merger needs even patch grids, like pixel shuffle.
+        spatial_merge_size=2 if getattr(args, 'conv_merging', False) else 1,
         dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
         dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),
@@ -271,6 +274,16 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             )
         ),
     )
+    if getattr(args, 'mimo_checkpoint_prefix_map', None) is not None:
+        # MIMO training data marks image positions with a tokenizer special token (e.g. <img>);
+        # write that token into chat prompts instead of the default <image>.
+        image_token = tokenizer.detokenize([args.image_token_id], skip_special_tokens=False)
+        image_prompt_spec = MediaPromptSpec(model_token=image_token)
+        inference_config.multimodal_prompt_config = MultimodalPromptConfig(
+            image_spec=image_prompt_spec, video_spec=image_prompt_spec
+        )
+        if torch.distributed.get_rank() == 0:
+            print(f"MIMO image prompt token: {image_token!r} (id {args.image_token_id})")
 
     context = DynamicInferenceContext(model.config, inference_config)
     wrapped_model = VLMInferenceWrapper(model, context)
