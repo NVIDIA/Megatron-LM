@@ -64,17 +64,18 @@ For NVIDIA GPU Cloud (NGC) container setup and all installation options, review 
 Megatron-LM/
 ├── megatron/
 │   ├── core/                    # Megatron Core (kernels, parallelism, building blocks)
-│   │   ├── models/              # Transformer models
+│   │   ├── models/              # Transformer, hybrid, and multimodal models
 │   │   ├── transformer/         # Transformer building blocks
 │   │   ├── tensor_parallel/     # Tensor parallelism
 │   │   ├── pipeline_parallel/   # Pipeline parallelism
-│   │   ├── distributed/         # Distributed training (FSDP, DDP)
+│   │   ├── context_parallel/    # Context parallelism
+│   │   ├── distributed/         # Distributed training (Megatron FSDP, DDP)
+│   │   ├── dist_checkpointing/  # Distributed checkpoint saving, loading, and resharding
 │   │   ├── optimizer/           # Optimizers
 │   │   ├── datasets/            # Dataset loaders
 │   │   ├── inference/           # Inference engines and server
 │   │   └── export/              # Model export (example: TensorRT-LLM)
 │   ├── training/                # Training scripts
-│   ├── legacy/                  # Legacy components
 │   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
 │   └── rl/                      # Reinforcement learning (including RLHF)
 ├── examples/                    # Ready-to-use training examples
