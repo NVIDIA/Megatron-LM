@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,7 @@ from .param_and_grad_buffer import (
     PrefetchOrder,
     _check_nan_in_grad,
     override_sharded_param_methods_with_safety_checks,
+    resolve_fsdp_unit_filter,
     to_local_if_dtensor,
 )
 from .utils import (
@@ -149,6 +150,11 @@ class MegatronFSDP(torch.nn.Module):
             should be treated as an FSDP Unit, i.e. the minimum releasable model unit.
             It affects the granularity of the communication parameter grouping and
             triggers aggregate collective communication in FP8 mixed precision training.
+            Shorthand for an fsdp_unit_filter that matches instances of these classes.
+        fsdp_unit_filter (Optional[Callable]): Predicate that returns True for modules that
+            should be treated as an FSDP Unit, for both communication buckets and parameter
+            lifecycle hooks. More general than fsdp_unit_modules, e.g. it can select some
+            instances of a class but not others. Pass at most one of the two.
         device (torch.device): Target device for the sharded model. Used to migrate
             all model parameters to an expected device. If init_model_with_meta_device=True,
             this argument is ignored.
@@ -231,6 +237,7 @@ class MegatronFSDP(torch.nn.Module):
         enable_fine_grained_param_gather_backward_hook: bool = False,
         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
+        fsdp_unit_filter: Optional[Callable[[torch.nn.Module], bool]] = None,
     ):
         super().__init__()
         # If device is not specified, use the current device.
@@ -334,6 +341,9 @@ class MegatronFSDP(torch.nn.Module):
             if fsdp_unit_modules is not None
             else []
         )
+        # Every FSDP unit check goes through this one predicate; fsdp_unit_modules is
+        # shorthand for a class-based one.
+        self.fsdp_unit_filter = resolve_fsdp_unit_filter(self.fsdp_unit_modules, fsdp_unit_filter)
 
         # Determine if we should delay the gradient reduction. Only if no parameter class
         # shards gradients, since a sharded class reduces on every backward pass.
@@ -429,7 +439,7 @@ class MegatronFSDP(torch.nn.Module):
             self.module,
             bucketing_policy=BucketingPolicy(
                 suggested_bucket_size=self.bucket_size,
-                fsdp_unit_modules=self.fsdp_unit_modules,
+                fsdp_unit_filter=self.fsdp_unit_filter,
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
                 expert_data_parallel_sharding_strategy=(
                     self.ddp_config.expert_data_parallel_sharding_strategy
@@ -466,7 +476,7 @@ class MegatronFSDP(torch.nn.Module):
                 total_param_elements = 0
                 total_fsdp_module = 0
                 for module in self.module.modules():
-                    if isinstance(module, tuple(self.fsdp_unit_modules)):
+                    if self._is_fsdp_unit_module(module):
                         total_fsdp_module += 1
                         total_param_elements += sum(p.numel() for p in module.parameters())
                 # The suggested size is twice the number of elements in the FSDP modules.
@@ -504,6 +514,10 @@ class MegatronFSDP(torch.nn.Module):
         module = importlib.import_module(module_path)
         cls = getattr(module, class_name)
         return cls
+
+    def _is_fsdp_unit_module(self, module: nn.Module) -> bool:
+        """Whether ``module`` should be treated as an FSDP unit."""
+        return self.fsdp_unit_filter is not None and self.fsdp_unit_filter(module)
 
     def all_gather_and_wait_parameters_ready(
         self,
@@ -605,7 +619,6 @@ class MegatronFSDP(torch.nn.Module):
         `optim` and `optim_grads` do not require FSDP units because they do not
         shard model parameters.
         """
-        fsdp_unit_modules = self.fsdp_unit_modules
 
         def _param_list_for_submodule_unshard(
             module: nn.Module, pass_direction: Literal["forward", "backward"]
@@ -642,7 +655,7 @@ class MegatronFSDP(torch.nn.Module):
                     # recomputation on individual submodules.
                     return list(module.parameters(recurse=False))
             else:
-                if isinstance(module, tuple(fsdp_unit_modules)):
+                if self._is_fsdp_unit_module(module):
                     # FSDP unit modules should be unsharded and communicated together.
                     return list(module.parameters())
                 else:
@@ -748,7 +761,7 @@ class MegatronFSDP(torch.nn.Module):
             - Releases the module's parameters for the backward phase to free memory.
             - Marks the module as IDLE in the training state machine.
             """
-            assert isinstance(module, tuple(fsdp_unit_modules))
+            assert self._is_fsdp_unit_module(module)
             assert any_sharding_strategy_in(self.ddp_config, ["optim_grads_params"])
 
             # Release parameters for this module after backward.
@@ -1051,8 +1064,8 @@ class MegatronFSDP(torch.nn.Module):
                 lazy_release = False
                 module._training_state = TrainingState.IDLE
 
-            assert isinstance(
-                module, tuple(fsdp_unit_modules)
+            assert self._is_fsdp_unit_module(
+                module
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
             # Release the module parameters after the forward pass to save memory.
@@ -1147,7 +1160,7 @@ class MegatronFSDP(torch.nn.Module):
             if not self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
+            if self._is_fsdp_unit_module(module):
                 fsdp_modules.append(module)
 
                 if any_sharding_strategy_in(self.ddp_config, ["optim_grads_params"]):
@@ -1174,7 +1187,7 @@ class MegatronFSDP(torch.nn.Module):
 
             # Register the post-backward hook to deallocate model parameters
             # and reduce-scatter gradients after the backward pass.
-            if isinstance(module, tuple(fsdp_unit_modules)):
+            if self._is_fsdp_unit_module(module):
                 if any_sharding_strategy_in(self.ddp_config, ["optim_grads_params"]):
                     self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
                         module.register_forward_pre_hook(
