@@ -50,7 +50,13 @@ class CudnnDsaInterface(Protocol):
     """
 
     def indexer_top_k_wrapper(
-        self, scores: Tensor, seq_lens: Tensor, top_k: int, next_n: int, return_val: bool
+        self,
+        scores: Tensor,
+        seq_lens: Tensor,
+        top_k: int,
+        next_n: int,
+        return_val: bool,
+        tie_break: int,
     ) -> dict:
         """Select the top-``top_k`` key indices (and optional scores) per query row."""
 
@@ -142,7 +148,6 @@ class CudnnDsaInterface(Protocol):
 
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
-_TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
 _TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
@@ -519,55 +524,15 @@ def _normalize_plain_causal_bounds(
     return starts, ends
 
 
-def _topk_tie_break_bias(positions: Tensor, key_count: int, dtype: torch.dtype) -> Tensor:
-    """Per-position tie-break bias; lower key indices get a larger bias.
-
-    Shared by :func:`_add_indexer_topk_tie_break` and
-    :func:`_remove_indexer_topk_tie_break` so the add and remove sides stay exact inverses.
-    """
-    step = _TOPK_TIE_BREAK_EPS / float(key_count - 1)
-    return ((key_count - 1 - positions) * step).to(dtype=dtype)
-
-
-def _add_indexer_topk_tie_break(scores: Tensor, *, inplace: bool = False) -> Tensor:
-    """Prefer lower key indices for exact top-k score ties."""
-    sk = scores.size(-1)
-    if sk <= 1:
-        return scores
-    positions = torch.arange(sk, device=scores.device, dtype=torch.float32)
-    bias = _topk_tie_break_bias(positions, sk, scores.dtype).view(*((1,) * (scores.ndim - 1)), sk)
-    if inplace:
-        return scores.add_(bias)
-    return scores + bias
-
-
-def _use_dense_indexer_topk_tie_break(scores: Tensor, topk_k: int) -> bool:
-    """Return whether to bias the full score matrix before cuDNN top-k.
-
-    The dense bias is useful for deterministic small-shape parity tests, but on
-    long-context CUDA runs it is a full score-matrix elementwise pass before
-    every top-k and dominates runtime. Real indexer scores are not expected to
-    rely on exact finite ties for correctness, so keep the expensive full-matrix
-    tie-break off the CUDA training path.
-    """
-    return topk_k < scores.size(-1) and not scores.is_cuda
-
-
-def _remove_indexer_topk_tie_break(
-    topk_scores: Tensor, topk_indices: Tensor, key_count: int
-) -> Tensor:
-    """Remove the deterministic top-k tie-break from selected score values."""
-    if key_count <= 1:
-        return topk_scores
-    positions = topk_indices.clamp(min=0, max=key_count - 1).to(dtype=torch.float32)
-    bias = _topk_tie_break_bias(positions, key_count, topk_scores.dtype)
-    return torch.where(topk_indices >= 0, topk_scores - bias, topk_scores)
-
-
 def _indexer_top_k_wrapper_chunked(
     scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
 ) -> dict:
-    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation."""
+    """Run cuDNN top-k in row chunks, preferring larger key indices on exact ties.
+
+    Score columns preserve logical key order after CP reordering and prefix cropping;
+    packed sequence offsets are restored after selection. No score perturbation is needed.
+    Requires cuDNN Frontend's native tie-break API (NVIDIA/cudnn-frontend#1332).
+    """
     n_rows, sk = scores_flat.shape
     scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
     scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
@@ -577,7 +542,12 @@ def _indexer_top_k_wrapper_chunked(
 
     if chunk_rows >= n_rows:
         return _cudnn_dsa.indexer_top_k_wrapper(
-            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
+            scores_flat,
+            seq_lens,
+            top_k=topk_k,
+            next_n=1,
+            return_val=return_topk_scores,
+            tie_break=2,
         )
 
     indices_chunks = []
@@ -590,6 +560,7 @@ def _indexer_top_k_wrapper_chunked(
             top_k=topk_k,
             next_n=1,
             return_val=return_topk_scores,
+            tie_break=2,
         )
         indices_chunks.append(tk_result["indices"])
         if return_topk_scores:
@@ -745,16 +716,9 @@ def _indexer_topk_from_score_chunks(
                 scores_chunk, starts[row_start:row_end], ends[row_start:row_end], key_positions_i64
             )
         scores_flat = scores_chunk.reshape(b * (row_end - row_start), score_sk).contiguous()
-        use_tie_break = _use_dense_indexer_topk_tie_break(scores_flat, chunk_topk_k)
-        scores_for_topk = (
-            _add_indexer_topk_tie_break(scores_flat, inplace=True) if use_tie_break else scores_flat
-        )
         chunk_seq_lens = seq_lens_b[:, row_start:row_end].reshape(-1).contiguous()
         tk_result = _indexer_top_k_wrapper_chunked(
-            scores_for_topk,
-            chunk_seq_lens,
-            topk_k=chunk_topk_k,
-            return_topk_scores=return_topk_scores,
+            scores_flat, chunk_seq_lens, topk_k=chunk_topk_k, return_topk_scores=return_topk_scores
         )
         topk_indices = tk_result["indices"].view(b, row_end - row_start, chunk_topk_k)
         topk_values = None
@@ -763,13 +727,11 @@ def _indexer_topk_from_score_chunks(
             if topk_values is None:
                 raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
             topk_values = topk_values.view(b, row_end - row_start, chunk_topk_k)
-            if use_tie_break:
-                topk_values = _remove_indexer_topk_tie_break(topk_values, topk_indices, score_sk)
         topk_indices, topk_values = _pad_topk_result(topk_indices, topk_values, topk_k)
         indices_chunks.append(topk_indices)
         if return_topk_scores:
             values_chunks.append(topk_values)
-        del scores_for_topk, scores_flat, scores_chunk
+        del scores_flat, scores_chunk
 
     return (
         torch.cat(indices_chunks, dim=1),
@@ -982,10 +944,8 @@ def _indexer_topk_packed_thd(
         return _pad_topk_result(topk_indices, topk_scores, topk_k)
 
     local_seq_lens = (ends - starts).clamp(max=max_score_k).to(torch.int32).contiguous()
-    use_tie_break = _use_dense_indexer_topk_tie_break(scores, score_topk)
-    scores_for_topk = _add_indexer_topk_tie_break(scores, inplace=True) if use_tie_break else scores
     tk_result = _indexer_top_k_wrapper_chunked(
-        scores_for_topk, local_seq_lens, topk_k=score_topk, return_topk_scores=return_topk_scores
+        scores, local_seq_lens, topk_k=score_topk, return_topk_scores=return_topk_scores
     )
     topk_indices = tk_result["indices"].view(1, sq, score_topk)
     topk_scores = None
@@ -994,8 +954,6 @@ def _indexer_topk_packed_thd(
         if topk_scores is None:
             raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
         topk_scores = topk_scores.view(1, sq, score_topk)
-        if use_tie_break:
-            topk_scores = _remove_indexer_topk_tie_break(topk_scores, topk_indices, max_score_k)
 
     valid = topk_indices >= 0
     topk_indices = torch.where(
@@ -1589,17 +1547,10 @@ def _indexer_topk_bshd(
     if topk_indices is None:
         n_rows = b * sq
         scores_flat = scores.reshape(n_rows, sk).contiguous()
-        use_tie_break = _use_dense_indexer_topk_tie_break(scores_flat, topk_k)
-        scores_for_topk = (
-            _add_indexer_topk_tie_break(scores_flat, inplace=not return_scores)
-            if use_tie_break
-            else scores_flat
-        )
-
         tk_result = _indexer_top_k_wrapper_chunked(
-            scores_for_topk, seq_lens, topk_k=topk_k, return_topk_scores=return_topk_scores
+            scores_flat, seq_lens, topk_k=topk_k, return_topk_scores=return_topk_scores
         )
-        del scores_for_topk, scores_flat
+        del scores_flat
         if not return_scores:
             del scores
         topk_indices = tk_result["indices"].view(b, sq, topk_k)
@@ -1608,8 +1559,6 @@ def _indexer_topk_bshd(
             if topk_scores is None:
                 raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
             topk_scores = topk_scores.view(b, sq, topk_k)
-            if use_tie_break:
-                topk_scores = _remove_indexer_topk_tie_break(topk_scores, topk_indices, sk)
 
     if return_topk_scores:
         topk_scores = topk_scores.to(dtype=torch.float32)
