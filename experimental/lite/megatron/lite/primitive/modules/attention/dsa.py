@@ -1099,6 +1099,7 @@ class DynamicSparseAttention(nn.Module):
                 query_pos,
                 torch.arange(kv.shape[0], device=x.device),
             )
+        # ``mask`` is None here for shared layers.
         out = self._run_cp_sparse_segment(
             query,
             kv,
