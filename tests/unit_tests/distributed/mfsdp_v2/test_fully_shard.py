@@ -732,6 +732,9 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
         return tensor
 
     x = torch.ones(2, 4, device=device, requires_grad=False)
+    # Linear backward saves its weight to compute the input gradient, whether
+    # the weight is frozen or trainable. Keep saved tensors without copying so
+    # unpack can detect freed storage before CUDA reads it if the rejection regresses.
     with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, unpack):
         output = model(x)
         assert output.requires_grad  # The separately sharded child still needs backward.
