@@ -33,6 +33,19 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
 
+_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q = "_mamba_packed_seq_cg_cu_seqlens_q"
+_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV = "_mamba_packed_seq_cg_cu_seqlens_kv"
+_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q_PADDED = "_mamba_packed_seq_cg_cu_seqlens_q_padded"
+_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV_PADDED = "_mamba_packed_seq_cg_cu_seqlens_kv_padded"
+_MAMBA_PACKED_SEQ_CG_SEQ_IDX = "_mamba_packed_seq_cg_seq_idx"
+_MAMBA_PACKED_SEQ_CG_INPUT_NAMES = (
+    _MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q,
+    _MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV,
+    _MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q_PADDED,
+    _MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV_PADDED,
+    _MAMBA_PACKED_SEQ_CG_SEQ_IDX,
+)
+
 
 @dataclass
 class MambaLayerSubmodules:
@@ -342,17 +355,205 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
 
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Prepare static inputs for CUDA graph capture.
+
+        When packed sequences are in use (SFT), also sets up shared CUDA graph
+        buffer tensors and a dummy PackedSeqParams so the graph captures the
+        packed-sequence code path (Mamba with seq_idx).
+        """
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+
+        if getattr(self.config, 'cuda_graph_max_packed_seqs', None) is not None:
+            self._cuda_graph_seq_length = seq_length
+            max_seqs = self.config.cuda_graph_max_packed_seqs
+            # Compute total_tokens as seen by Mamba SSM after CP all_to_all.
+            mamba_cp_size = self.mixer.cp.cp_size
+            total_tokens = (seq_length // self.config.context_parallel_size) * mamba_cp_size
+            device = static_inputs["hidden_states"].device
+            self._cuda_graph_mamba_total_tokens = total_tokens
+            self._use_pp_packed_mamba_cg_inputs = (
+                self.config.cuda_graph_impl == "transformer_engine"
+                and self.config.pipeline_model_parallel_size > 1
+            )
+
+            if self._use_pp_packed_mamba_cg_inputs:
+                # TE owns these ordinary Tensor kwargs per graph slot. This is
+                # required for 1F1B schedules where a later forward must not
+                # overwrite sequence boundaries used by an earlier backward.
+                _, buffers = PackedSeqParams.create_dummy_for_cuda_graph(
+                    seq_length, max_seqs=max_seqs, device=device
+                )
+                seq_idx_buf = torch.zeros(1, total_tokens, dtype=torch.int32, device=device)
+                self._cuda_graph_packed_seq_target_len = buffers['cu_seqlens_q'].shape[0]
+            else:
+                # With PP=1, forward/backward microbatch lifetimes do not
+                # overlap, so layers can share one set of staging tensors.
+                buffers = PackedSeqParams.get_or_create_shared_cg_buffers(
+                    seq_length, max_seqs, device, tag='mamba'
+                )
+                seq_idx_buf = PackedSeqParams.get_or_create_shared_seq_idx_buffer(
+                    total_tokens, device
+                )
+                buffers['seq_idx'] = seq_idx_buf
+                self._cuda_graph_psp_buffers = buffers
+
+            self._cuda_graph_mamba_seq_idx_spec = (
+                seq_idx_buf.shape,
+                seq_idx_buf.dtype,
+                seq_idx_buf.device,
+            )
+
+            # Correct cu_seqlens for Mamba's CP all_to_all sequence gathering.
+            # pre_conv_ssm gathers: [seq_length/cp, b, d] -> [seq_length, b, d/cp]
+            if mamba_cp_size > 1:
+                for k in (
+                    'cu_seqlens_q',
+                    'cu_seqlens_kv',
+                    'cu_seqlens_q_padded',
+                    'cu_seqlens_kv_padded',
+                ):
+                    buffers[k][1:] = total_tokens
+
+            if self._use_pp_packed_mamba_cg_inputs:
+                static_inputs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q] = buffers['cu_seqlens_q']
+                static_inputs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV] = buffers['cu_seqlens_kv']
+                static_inputs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q_PADDED] = buffers[
+                    'cu_seqlens_q_padded'
+                ]
+                static_inputs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV_PADDED] = buffers[
+                    'cu_seqlens_kv_padded'
+                ]
+                static_inputs[_MAMBA_PACKED_SEQ_CG_SEQ_IDX] = seq_idx_buf
+            else:
+                self._cuda_graph_psp = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=buffers['cu_seqlens_q'],
+                    cu_seqlens_kv=buffers['cu_seqlens_kv'],
+                    cu_seqlens_q_padded=buffers['cu_seqlens_q_padded'],
+                    cu_seqlens_kv_padded=buffers['cu_seqlens_kv_padded'],
+                    max_seqlen_q=total_tokens,
+                    max_seqlen_kv=total_tokens,
+                    total_tokens=total_tokens,
+                    seq_idx=seq_idx_buf,
+                )
+
+        return static_inputs
+
+    @staticmethod
+    def _decompose_packed_seq_params_to_cg_kwargs(kwargs, target_len):
+        """Replace Mamba's PackedSeqParams with graph-slot-owned Tensor inputs."""
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        if packed_seq_params is None:
+            return
+
+        packed_seq_params.ensure_cg_padded(target_len)
+        if packed_seq_params.seq_idx is None:
+            raise ValueError("Packed Mamba CUDA graph replay requires a precomputed seq_idx.")
+        kwargs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q] = packed_seq_params._cg_padded_q
+        kwargs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV] = packed_seq_params._cg_padded_kv
+        kwargs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q_PADDED] = packed_seq_params._cg_padded_qp
+        kwargs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_KV_PADDED] = packed_seq_params._cg_padded_kvp
+        kwargs[_MAMBA_PACKED_SEQ_CG_SEQ_IDX] = packed_seq_params.seq_idx
+
+    def _reconstruct_packed_seq_params_from_cg_kwargs(self, kwargs):
+        """Rebuild Mamba's PackedSeqParams from graph-slot-owned Tensor inputs."""
+        graph_inputs = [kwargs.pop(name, None) for name in _MAMBA_PACKED_SEQ_CG_INPUT_NAMES]
+        if all(value is None for value in graph_inputs):
+            return
+        if not all(value is not None for value in graph_inputs):
+            raise ValueError("Packed Mamba CUDA graphs require all sequence metadata inputs.")
+
+        total_tokens = self._cuda_graph_mamba_total_tokens
+        kwargs['packed_seq_params'] = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=graph_inputs[0],
+            cu_seqlens_kv=graph_inputs[1],
+            cu_seqlens_q_padded=graph_inputs[2],
+            cu_seqlens_kv_padded=graph_inputs[3],
+            max_seqlen_q=total_tokens,
+            max_seqlen_kv=total_tokens,
+            total_tokens=total_tokens,
+            seq_idx=graph_inputs[4],
+        )
+
+    def _seq_idx_matches_cuda_graph(self, seq_idx):
+        """Return whether ``seq_idx`` matches the tensor signature captured by the graph."""
+        if seq_idx is None:
+            return False
+        shape, dtype, device = self._cuda_graph_mamba_seq_idx_spec
+        return seq_idx.shape == shape and seq_idx.dtype == dtype and seq_idx.device == device
+
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        """Inject dummy PSP for CUDA graph capture so Mamba captures the packed-seq code path."""
+        if any(name in kwargs for name in _MAMBA_PACKED_SEQ_CG_INPUT_NAMES):
+            kwargs = dict(kwargs)
+            self._reconstruct_packed_seq_params_from_cg_kwargs(kwargs)
+        elif hasattr(self, '_cuda_graph_psp') and kwargs.get('packed_seq_params') is None:
+            kwargs = dict(kwargs)
+            kwargs['packed_seq_params'] = self._cuda_graph_psp
+        return self.forward(*args, **kwargs)
+
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """
-        CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
-        interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
-        However, CUDA graph accepts only Tensor inputs.
-        Hence, `inference_context` is excluded from input list.
+        CUDA graph replay for Mamba layer using TE interface.
+
+        Uses graph-slot-owned metadata for PP schedules, or copies metadata into
+        shared staging buffers for PP=1. Falls back to eager execution when the
+        runtime metadata does not fit the captured graph signature.
         """
         assert kwargs.get('inference_context') is None, (
             "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
+        psp = kwargs.get('packed_seq_params')
+        if psp is not None and hasattr(self, '_cuda_graph_mamba_seq_idx_spec'):
+            if psp.seq_idx is None:
+                raise ValueError("Packed Mamba CUDA graph replay requires a precomputed seq_idx.")
+            if not self._seq_idx_matches_cuda_graph(psp.seq_idx):
+                # Graph inputs have a fixed shape, dtype, and device. This also
+                # prevents PP=1 copy_ from broadcasting a one-token seq_idx
+                # across the entire captured buffer.
+                return self.forward(*args, **kwargs)
+        if psp is not None and getattr(self, '_use_pp_packed_mamba_cg_inputs', False):
+            if psp.cu_seqlens_q.shape[0] > self._cuda_graph_packed_seq_target_len:
+                return self.forward(*args, **kwargs)
+            kwargs = dict(kwargs)
+            self._decompose_packed_seq_params_to_cg_kwargs(
+                kwargs, self._cuda_graph_packed_seq_target_len
+            )
+        elif psp is not None and hasattr(self, '_cuda_graph_psp_buffers'):
+            bucket_max = self._cuda_graph_psp_buffers['cu_seqlens_q'].shape[0]  # max_seqs + 1
+            if psp.cu_seqlens_q.shape[0] > bucket_max:
+                # Actual N_docs exceeds bucket -> fall back to non-CG forward.
+                return self.forward(*args, **kwargs)
+
+            bufs = self._cuda_graph_psp_buffers
+            target_len = bufs['cu_seqlens_q'].shape[0]
+
+            # PSP-identity gate: shared buffers need only be updated ONCE per
+            # micro-batch. Use 'is' to avoid false-positive cache hits from
+            # CPython id() recycling.
+            if bufs.get('_last_updated_psp') is not psp:
+                psp.ensure_cg_padded(target_len)
+                bufs['cu_seqlens_q'].copy_(psp._cg_padded_q)
+                bufs['cu_seqlens_kv'].copy_(psp._cg_padded_kv)
+                bufs['cu_seqlens_q_padded'].copy_(
+                    psp._cg_padded_qp if psp._cg_padded_qp is not None else psp._cg_padded_q
+                )
+                bufs['cu_seqlens_kv_padded'].copy_(
+                    psp._cg_padded_kvp if psp._cg_padded_kvp is not None else psp._cg_padded_kv
+                )
+                # Copy seq_idx into shared buffer (computed by __post_init__).
+                if 'seq_idx' in bufs and psp.seq_idx is not None:
+                    bufs['seq_idx'].copy_(psp.seq_idx)
+                bufs['_last_updated_psp'] = psp
+
+            # The dummy PSP was injected inside capture and is not part of TE's callable
+            # signature. Its tensor fields already alias the staging buffers updated above.
+            kwargs = dict(kwargs)
+            kwargs.pop('packed_seq_params')
+
         return super()._te_cuda_graph_replay(*args, **kwargs)
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

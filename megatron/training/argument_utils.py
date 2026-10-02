@@ -329,6 +329,7 @@ def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
+    from megatron.core.packed_seq_params import CUDA_GRAPH_MAX_PACKED_SEQS
     from megatron.core.quantization.utils import (
         kitchen_quantization_recipe_config,
         load_quantization_recipe,
@@ -353,6 +354,24 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+
+    # Packed CUDA graph capture is a Core configuration contract. Do not make
+    # Core layers consult the training global-args singleton while preparing
+    # graph inputs. The training entry point translates its packed-data modes
+    # into an explicit metadata capacity here.
+    requested_packed_capacity = getattr(args, 'cuda_graph_max_packed_seqs', None)
+    uses_packed_sequences = requested_packed_capacity is not None or any(
+        bool(getattr(args, name, False))
+        for name in ('sft', 'dataloader_inter_document_masking', 'rl_use_sequence_packing')
+    )
+    if getattr(args, 'cuda_graph_impl', 'none') != 'none' and uses_packed_sequences:
+        kw_args['cuda_graph_max_packed_seqs'] = (
+            requested_packed_capacity
+            if requested_packed_capacity is not None
+            else CUDA_GRAPH_MAX_PACKED_SEQS
+        )
+    else:
+        kw_args['cuda_graph_max_packed_seqs'] = None
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
