@@ -1076,9 +1076,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
-            state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
-            )
+            restored_group = {
+                **param_groups_map[needed_groups],
+                "params": inner_param_group['params'],
+            }
+            if (
+                (USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER)
+                and isinstance(self.optimizer, Adam)
+                and not inner_param_group['params']
+            ):
+                # Checkpoints align step across groups for resharding. FusedAdam does
+                # not advance empty local groups, so retain their live step metadata
+                # instead of introducing the checkpoint's global step on this rank.
+                if "step" in inner_param_group:
+                    restored_group["step"] = inner_param_group["step"]
+                else:
+                    restored_group.pop("step", None)
+            state_dict_param_groups.append(restored_group)
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
