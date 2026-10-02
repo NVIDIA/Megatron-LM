@@ -185,7 +185,9 @@ class PrefixCachingTestBase:
         msa = ctx.mamba_slot_allocator
         alloc = ctx.kv_block_allocator
         slots = msa.allocate_slots_batch(bids)
-        bid_tensor = torch.tensor(bids, dtype=torch.int64, device=alloc.pc_state.block_hashes.device)
+        bid_tensor = torch.tensor(
+            bids, dtype=torch.int64, device=alloc.pc_state.block_hashes.device
+        )
         hashes = alloc.pc_state.block_hashes[bid_tensor].tolist()
         msa.register_block_hashes_batch(bids, hashes)
         return slots
@@ -286,7 +288,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         h0, h1 = req.precomputed_block_hashes
         assert alloc.registry.kv_hash_to_block_id.get(h0) == b0
         assert alloc.registry.kv_hash_to_block_id.get(h1) == b1
-        assert alloc.pc_state.block_hashes[b0].item() == h0 and alloc.pc_state.block_hashes[b1].item() == h1
+        assert (
+            alloc.pc_state.block_hashes[b0].item() == h0
+            and alloc.pc_state.block_hashes[b1].item() == h1
+        )
 
         # partial block not registered
         ctx2 = self._ctx()
@@ -301,7 +306,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         alloc3 = ctx3.kv_block_allocator
         ctx3.add_request(self._req(ctx3, self._prompt(bs + (bs - 1))))
         db0, db1 = self._block_ids(ctx3, 0, 2)
-        assert alloc3.pc_state.block_hashes[db0].item() != -1 and alloc3.pc_state.block_hashes[db1].item() == -1
+        assert (
+            alloc3.pc_state.block_hashes[db0].item() != -1
+            and alloc3.pc_state.block_hashes[db1].item() == -1
+        )
         active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
         ctx3.update_requests(active_mask, new_tokens)
@@ -462,9 +470,15 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         b0_hash = alloc.pc_state.block_hashes[b0].item()
         assert alloc.pc_state.block_ref_counts[b0].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.pc_state.block_ref_counts[b0].item() == 1 and b0_hash in alloc.registry.kv_hash_to_block_id
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 1
+            and b0_hash in alloc.registry.kv_hash_to_block_id
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.pc_state.block_ref_counts[b0].item() == 0 and b0_hash in alloc.registry.kv_hash_to_block_id
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 0
+            and b0_hash in alloc.registry.kv_hash_to_block_id
+        )
 
         # cached blocks reused by new request
         ctx2 = self._ctx()
@@ -738,10 +752,19 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         b0_hash = alloc.pc_state.block_hashes[b0].item()
         avail_before = alloc.pool_avail
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.pc_state.block_ref_counts[b0].item() == 1 and b0_hash in alloc.registry.kv_hash_to_block_id
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 1
+            and b0_hash in alloc.registry.kv_hash_to_block_id
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.pc_state.block_ref_counts[b0].item() == 0 and b0_hash not in alloc.registry.kv_hash_to_block_id
-        assert alloc.pc_state.block_hashes[b0].item() == -1 and alloc.pc_state.block_hashes[b1].item() == -1
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 0
+            and b0_hash not in alloc.registry.kv_hash_to_block_id
+        )
+        assert (
+            alloc.pc_state.block_hashes[b0].item() == -1
+            and alloc.pc_state.block_hashes[b1].item() == -1
+        )
         assert alloc.pool_avail == avail_before + 2
 
         # released blocks not discoverable
@@ -979,9 +1002,15 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p5 = self._prompt(bs * 3)
         ctx5.add_request(self._req(ctx5, p5.clone()))
         msa5 = ctx5.mamba_slot_allocator
-        assert len(alloc5.registry.kv_hash_to_block_id) == 3 and len(msa5.registry.mamba_hash_to_block_id) == 0
+        assert (
+            len(alloc5.registry.kv_hash_to_block_id) == 3
+            and len(msa5.registry.mamba_hash_to_block_id) == 0
+        )
         self._mamba_allocate_and_register(ctx5, self._block_ids(ctx5, 0, 3)[:2])
-        assert len(alloc5.registry.kv_hash_to_block_id) == 3 and len(msa5.registry.mamba_hash_to_block_id) == 2
+        assert (
+            len(alloc5.registry.kv_hash_to_block_id) == 3
+            and len(msa5.registry.mamba_hash_to_block_id) == 2
+        )
 
         # find_mamba_match_count
         ctx6 = self._mctx()
@@ -1887,8 +1916,12 @@ def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
     allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=6, max_slots=4)
     allocator.allocate_slots_batch([0, 1, 2, 3])
     allocator.context.kv_block_allocator.pc_state.block_ref_counts[:4] = 0
-    allocator.context.kv_block_allocator.pc_state.block_timestamps[:4] = torch.tensor([40, 10, 30, 20])
-    allocator.context.kv_block_allocator.pc_state.block_hashes[:4] = torch.tensor([100, 101, 102, 103])
+    allocator.context.kv_block_allocator.pc_state.block_timestamps[:4] = torch.tensor(
+        [40, 10, 30, 20]
+    )
+    allocator.context.kv_block_allocator.pc_state.block_hashes[:4] = torch.tensor(
+        [100, 101, 102, 103]
+    )
     allocator.register_block_hashes_batch([0, 1, 2, 3], [100, 101, 102, 103])
 
     allocator.allocate_slots_batch([4, 5])
@@ -2402,7 +2435,9 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         ctx.reset(preserve_prefix_cache=True)
         assert ctx.kv_block_allocator.registry.kv_hash_to_block_id == cached  # preserved
-        torch.testing.assert_close(ctx.kv_block_allocator.pc_state.block_mtp_next_token, next_tokens)
+        torch.testing.assert_close(
+            ctx.kv_block_allocator.pc_state.block_mtp_next_token, next_tokens
+        )
 
         ctx.reset()  # default: full reset
         assert len(ctx.kv_block_allocator.registry.kv_hash_to_block_id) == 0  # cleared
@@ -2600,7 +2635,9 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             assert filler is not None and alloc.pool_avail == 0
         else:
             assert not alloc.registry.kv_hash_to_block_id
-            assert all(alloc.pc_state.block_hashes[block_id].item() == -1 for block_id in producer_blocks)
+            assert all(
+                alloc.pc_state.block_hashes[block_id].item() == -1 for block_id in producer_blocks
+            )
             filler = alloc.allocate_memory_blocks(alloc.pool_avail)
             assert filler is not None and alloc.pool_avail == 0
             producer_tensor = torch.tensor(producer_blocks, dtype=torch.int32)
@@ -3384,7 +3421,11 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         `kv_hash_to_block_id` by HASH without checking which block it lands on, so two live
         blocks holding one hash means releasing either silently evicts the other's entry.
         """
-        live = [b for b in range(alloc.pc_state.block_hashes.numel()) if alloc.pc_state.block_hashes[b].item() != -1]
+        live = [
+            b
+            for b in range(alloc.pc_state.block_hashes.numel())
+            if alloc.pc_state.block_hashes[b].item() != -1
+        ]
         hashes = [alloc.pc_state.block_hashes[b].item() for b in live]
         assert len(hashes) == len(set(hashes)), f"duplicate hash across live blocks: {hashes}"
         for b in live:
@@ -3414,7 +3455,9 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert alloc.pc_state.block_ref_counts[p_blocks[2]].item() == 1  # producer only
         assert alloc.pc_state.block_ref_counts[s_blocks[2]].item() == 1  # sibling only
         # The producer keeps the canonical hash; the recomputed copy stays private.
-        assert alloc.registry.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        assert (
+            alloc.registry.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        )
         assert alloc.pc_state.block_hashes[s_blocks[2]].item() == -1
         self._assert_hash_registry_is_injective(alloc)
 
@@ -3441,7 +3484,9 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         # Each sibling's recomputed block is its own, and the hash never moved.
         assert len(set(private_blocks)) == len(private_blocks)
         assert p_blocks[2] not in private_blocks
-        assert alloc.registry.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        assert (
+            alloc.registry.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        )
         assert alloc.pc_state.block_ref_counts[p_blocks[0]].item() == 5
         self._assert_hash_registry_is_injective(alloc)
 

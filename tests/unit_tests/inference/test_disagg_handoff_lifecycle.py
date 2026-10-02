@@ -974,7 +974,9 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(2)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.registry.kv_hash_to_block_id.update(zip(hashes[:2], cached.tolist()))
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id.update(
+        zip(hashes[:2], cached.tolist())
+    )
 
     kv_meta = {"request_id": 5, "resume_tokens": [99]}
     engine.add_request_with_kv_handoff(

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
 from .prefix_cache_registry import PrefixCacheRegistry
@@ -61,6 +60,7 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
         self.registry = prefix_cache_registry
+        self.registry.clear_mamba()
         self.registry.set_mamba_evict_callback(self._on_mamba_evicted)
 
         # PrefixCachedMambaMetadata.compute_and_store_offsets() records extraction
@@ -215,7 +215,7 @@ class MambaSlotAllocator:
         assert candidate_ids.numel() >= num_needed
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
-        if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+        if pc_state.is_lru:
             timestamps = pc_state.block_timestamps[candidate_ids]
             _, oldest_indices = torch.topk(timestamps, k=num_needed, largest=False, sorted=False)
             evict_ids = candidate_ids[oldest_indices]
