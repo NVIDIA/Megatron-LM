@@ -190,6 +190,9 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
+        # The shared embedding weights need to be materialized before they are all-reduced.
+        self._materialize_shared_embedding_weight()
+
         if (
             is_vp_first_stage(self.vp_stage, self.vp_size)
             and is_pp_first_stage(self.pp_group)
@@ -231,7 +234,7 @@ class LanguageModule(MegatronModule):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if torch.distributed.is_initialized():
-            if self._is_in_embd_group() and not self.config.init_model_with_meta_device:
+            if self._is_in_embd_group():
                 weight = self.shared_embedding_or_output_weight()
                 weight.data = weight.data.cuda()
                 torch.distributed.all_reduce(weight.data, group=self.embd_group)
@@ -245,6 +248,35 @@ class LanguageModule(MegatronModule):
                 "something is definitely wrong."
             )
             LanguageModule.embedding_warning_printed = True
+
+    def _materialize_shared_embedding_weight(self) -> None:
+        """Give a shared embedding copy that was built on the meta device storage and values."""
+        if not torch.distributed.is_initialized() or not self._is_in_embd_group():
+            return
+        weight = self.shared_embedding_or_output_weight()
+        if weight is None or not weight.is_meta:
+            return
+        owner = next(
+            module
+            for module in self.modules()
+            if any(param is weight for param in module.parameters(recurse=False))
+        )
+        old_params = dict(owner.named_parameters(recurse=False))
+        device = torch.cuda.current_device()
+        owner._apply(
+            lambda t: torch.empty_like(t, device=device) if t.is_meta else t, recurse=False
+        )
+        if hasattr(owner, "reset_parameters"):
+            owner.reset_parameters()
+        # reset_parameters may replace the Parameter objects (TE does); keep their attributes.
+        for name, old_param in old_params.items():
+            new_param = owner.get_parameter(name)
+            if new_param is old_param:
+                continue
+            new_param.requires_grad_(old_param.requires_grad)
+            for attr, value in vars(old_param).items():
+                if not attr.startswith("_") and not hasattr(new_param, attr):
+                    setattr(new_param, attr, value)
 
     def _scale_logits(self, logits: Tensor) -> Tensor:
         """Apply MuP output scaling to logits.
