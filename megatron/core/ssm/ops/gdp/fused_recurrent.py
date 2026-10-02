@@ -26,7 +26,7 @@ per draft token and no re-read of the running state.
 
 import torch
 
-from .common import HAVE_TRITON, exp, tl, triton
+from .common import HAVE_TRITON, exp, softplus, tl, triton
 
 
 @triton.heuristics(
@@ -37,6 +37,8 @@ from .common import HAVE_TRITON, exp, tl, triton
         'HAS_STATE_INDICES': lambda args: args['state_indices'] is not None,
         'STORE_INTERMEDIATE': lambda args: args['intermediate_states'] is not None,
         'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+        'USE_GATE_IN_KERNEL': lambda args: args['A_log'] is not None,
+        'HAS_DT_BIAS': lambda args: args['dt_bias'] is not None,
     }
 )
 @triton.jit(do_not_specialize=['T'])
@@ -46,6 +48,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     v,
     g,
     beta,
+    A_log,
+    dt_bias,
     o,
     h0,
     ht,
@@ -74,6 +78,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     HAS_STATE_INDICES: tl.constexpr,
     STORE_INTERMEDIATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_GATE_IN_KERNEL: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    APPLY_BETA_SIGMOID: tl.constexpr,
 ):
     """Walk one sequence token by token, carrying the `[K, V]` state."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -87,8 +94,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     else:
         bos, eos = i_n * T, i_n * T + T
     # Dynamic batching addresses a persistent per-request cache by slot; a
-    # padding request carries -1, reads no state and writes none. Static
-    # batching keeps the dense layout, where request i owns row i.
+    # padding request carries -1 (see the early exit below). Static batching
+    # keeps the dense layout, where request i owns row i.
     if HAS_STATE_INDICES:
         i_s = tl.load(state_indices + i_n).to(tl.int64)
         state_offset = i_s * state_slot_stride + i_hv * state_head_stride
@@ -121,8 +128,22 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    # A padding request writes a zero output and returns before reading its
+    # inputs or touching the state cache.
+    if HAS_STATE_INDICES:
+        if i_s < 0:
+            for _ in tl.range(0, T):
+                tl.store(p_o, tl.zeros([BV], dtype=p_o.dtype.element_ty), mask=mask_v)
+                p_o += HV * V
+            return
+
+    if USE_GATE_IN_KERNEL:
+        b_A = tl.load(A_log + i_hv).to(tl.float32)
+        if HAS_DT_BIAS:
+            b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE and i_s >= 0:
+    if USE_INITIAL_STATE:
         p_h0 = h0 + state_offset + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -138,9 +159,16 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_beta = tl.load(p_beta).to(tl.float32)
         else:
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+        if APPLY_BETA_SIGMOID:
+            b_beta = tl.sigmoid(b_beta)
 
         if USE_G:
             b_g = tl.load(p_g).to(tl.float32)
+            if USE_GATE_IN_KERNEL:
+                # `g` is the raw gate input; GDN's decay is formed here.
+                if HAS_DT_BIAS:
+                    b_g = b_g + b_dt_bias
+                b_g = -exp(b_A) * softplus(b_g)
             b_h *= exp(b_g)
 
         b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
@@ -151,9 +179,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         # Snapshot the state once per draft token, on the step that closes that
         # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
         # snapshot is the state a rollback to "this token accepted" must restore.
-        # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
-        # state cache untouched below.
-        if STORE_INTERMEDIATE and i_s >= 0:
+        if STORE_INTERMEDIATE:
             if (i_t + 1) % STEPS_PER_TOKEN == 0:
                 p_int = (
                     intermediate_states
@@ -172,7 +198,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta += HV * (1 if IS_BETA_HEADWISE else V)
         p_o += HV * V
 
-    if STORE_FINAL_STATE and i_s >= 0:
+    if STORE_FINAL_STATE:
         p_ht = ht + state_offset + o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
@@ -192,6 +218,9 @@ def fused_recurrent_gated_delta_rule_update(
     state_indices: torch.Tensor | None = None,
     intermediate_states: torch.Tensor | None = None,
     steps_per_token: int = 1,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    use_beta_sigmoid_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the recurrent Gated Delta Rule forward pass.
 
@@ -220,11 +249,17 @@ def fused_recurrent_gated_delta_rule_update(
         steps_per_token: Recurrence steps that make up one draft token, i.e. the
             Householder count `M` folded into the sequence dimension. Only
             meaningful together with `intermediate_states`.
+        A_log: `[HV]` log decay rates. When given, `g` is the raw gate input and
+            the kernel forms the decay `-exp(A_log) * softplus(g + dt_bias)`.
+        dt_bias: `[HV]` gate bias, used only together with `A_log`.
+        use_beta_sigmoid_in_kernel: Whether `beta` is a logit to be passed
+            through a sigmoid in-kernel.
 
     Returns `(o, final_state)` with `o` shaped like `v`. When `state` is given,
     `final_state` is that same cache tensor, updated in place.
     """
     assert HAVE_TRITON, "fused_recurrent_gated_delta_rule_update requires Triton"
+    assert dt_bias is None or A_log is not None, "dt_bias requires A_log"
     # The kernel indexes with raw pointer arithmetic and would read garbage from
     # a strided input, so force every tensor argument contiguous.
     q, k, v, beta = q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous()
@@ -294,6 +329,8 @@ def fused_recurrent_gated_delta_rule_update(
         v=v,
         g=g,
         beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
         o=o,
         h0=initial_state,
         ht=final_state,
@@ -316,13 +353,8 @@ def fused_recurrent_gated_delta_rule_update(
         BV=BV,
         IS_BETA_HEADWISE=beta.ndim != v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         num_warps=1,
         num_stages=3,
     )
-    if state_indices is not None:
-        # A padding row's recurrence ran over whatever the padded input buffer
-        # held, so its output is overwritten rather than merely left unwritten:
-        # the contract is zero, and a stale inf/NaN would survive a mask.
-        assert cu_seqlens is None, "state_indices with cu_seqlens is not supported yet"
-        o.masked_fill_((state_indices < 0).view(-1, *([1] * (o.ndim - 1))), 0)
     return o, final_state

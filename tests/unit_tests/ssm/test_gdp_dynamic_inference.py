@@ -1218,12 +1218,21 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
         torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
 
     @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
-    def test_matches_upstream_fla(self):
-        """Fork parity with the pip FLA kernel the training path still uses."""
+    @pytest.mark.parametrize("gate_in_kernel", [False, True])
+    def test_matches_upstream_fla(self, gate_in_kernel):
+        """Fork parity with the pip FLA kernel; the in-kernel gate is GDN's decode form."""
         from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
         q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
         indices = torch.tensor([7, 0, 3, 10, 1, 5], device="cuda", dtype=torch.int32)
+        gate_kwargs = {}
+        if gate_in_kernel:
+            HV = self.SHAPE["HV"]
+            gate_kwargs = dict(
+                A_log=torch.randn(HV, device="cuda"),
+                dt_bias=torch.randn(HV, device="cuda"),
+                use_beta_sigmoid_in_kernel=True,
+            )
 
         state_fork = state.clone()
         out_fork, _ = fused_recurrent_gated_delta_rule_update(
@@ -1235,6 +1244,7 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
             beta=beta,
             state_indices=indices,
             use_qk_l2norm_in_kernel=True,
+            **gate_kwargs,
         )
 
         # Upstream needs the initial states gathered in, and returns the final
@@ -1248,6 +1258,8 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
             initial_state=state[indices.long()],
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=gate_in_kernel,
+            **gate_kwargs,
         )
         state_fla = state.clone()
         state_fla[indices.long()] = final_state.to(state.dtype)
