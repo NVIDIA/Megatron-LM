@@ -3,7 +3,6 @@
 import gc
 import os
 import sys
-from dataclasses import dataclass
 
 import pytest
 import torch
@@ -421,40 +420,6 @@ class TestCudaGraphConfigAndArguments:
 
 
 class TestCudaGraphReplay:
-    def test_inference_fast_match_keeps_mismatch_validation(self):
-        @dataclass
-        class Packed:
-            tensor: torch.Tensor
-            count: int
-
-        captured = Packed(torch.empty(2, 3), 2)
-        runner = object.__new__(_CudaGraphRunner)
-        runner.fwd_graph_input_arg_metas = [cuda_graphs_module.ArgMetadata(torch.empty(2, 3))]
-        runner.fwd_graph_input_kwarg_metas = {
-            "packed": cuda_graphs_module.ArgMetadata(captured),
-            "flag": cuda_graphs_module.ArgMetadata(True),
-        }
-
-        valid_args = (torch.empty(2, 3),)
-        valid_kwargs = {"packed": Packed(torch.empty(2, 3), 2), "flag": True}
-        cases = [
-            (valid_args, valid_kwargs),
-            ((torch.empty(3, 2),), valid_kwargs),
-            ((torch.empty(2, 3, dtype=torch.float16),), valid_kwargs),
-            (valid_args, {"packed": Packed(torch.empty(2, 4), 2), "flag": True}),
-            (valid_args, {"packed": Packed(torch.empty(2, 3), 3), "flag": True}),
-            (valid_args, {"packed": valid_kwargs["packed"]}),
-        ]
-        for args, kwargs in cases:
-            assert runner._inference_replay_args_match(args, kwargs) == (
-                not runner.get_mismatch_errors(args, kwargs)
-            )
-
-        # Captured dataclass fields are read live by the original validator.
-        captured.count = 4
-        assert runner._inference_replay_args_match(valid_args, {"packed": captured, "flag": True})
-        assert not runner.get_mismatch_errors(valid_args, {"packed": captured, "flag": True})
-
     def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
         calls = []
         first = object()

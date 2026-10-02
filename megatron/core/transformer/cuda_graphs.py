@@ -12,7 +12,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
-from functools import lru_cache, partial
+from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
@@ -405,26 +405,6 @@ def _check_supported_type(meta):
     assert meta.type in _SUPPORTED_TYPES or is_dataclass(
         meta.value
     ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
-
-
-@lru_cache(maxsize=1)
-def _inference_replay_supported_types():
-    """Types accepted by the replay validator, cached after inference imports settle."""
-    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-    from megatron.core.inference.contexts.static_context import StaticInferenceContext
-
-    return {
-        torch.Tensor,
-        torch.distributed.ProcessGroup,
-        type(None),
-        bool,
-        int,
-        str,
-        float,
-        StaticInferenceContext,
-        DynamicInferenceContext,
-        ArgMetadata,
-    }
 
 
 def annotate_first_last_layer(layers):
@@ -1759,68 +1739,13 @@ class _CudaGraphRunner(torch.nn.Module):
             return out[0]
         return tuple(out)
 
-    def _inference_replay_args_match(self, args, kwargs):
-        """Check cached inference inputs without constructing replay-time ArgMetadata.
-
-        A failed quick check falls through to get_mismatch_errors, which keeps its
-        detailed diagnostics and remains the validator for every other replay.
-        Dataclass fields are read from the captured object on each call, matching
-        get_mismatch_errors' treatment of mutable inference contexts.
-        """
-        if len(args) != len(self.fwd_graph_input_arg_metas):
-            return False
-        if len(kwargs) != len(self.fwd_graph_input_kwarg_metas) or any(
-            key not in self.fwd_graph_input_kwarg_metas for key in kwargs
-        ):
-            return False
-
-        supported = _inference_replay_supported_types()
-
-        def matches(value, reference, metadata=None):
-            expected_type = metadata.type if metadata is not None else type(reference)
-            reference_is_dataclass = is_dataclass(reference)
-            if type(value) is not expected_type and not (
-                is_dataclass(value) and reference_is_dataclass
-            ):
-                return False
-            # A mutable captured dataclass can acquire an unsupported field.
-            # In that case use the original validator and its assertion.
-            if expected_type not in supported and not reference_is_dataclass:
-                return False
-
-            if expected_type is torch.Tensor or issubclass(expected_type, torch.Tensor):
-                expected = metadata if metadata is not None else reference
-                return (
-                    value.shape == expected.shape
-                    and value.dtype == expected.dtype
-                    and value.device == expected.device
-                )
-            if reference_is_dataclass:
-                return all(
-                    matches(getattr(value, field.name), getattr(reference, field.name))
-                    for field in dataclasses.fields(reference)
-                )
-            return value == reference
-
-        return all(
-            matches(value, metadata.value, metadata)
-            for value, metadata in zip(args, self.fwd_graph_input_arg_metas)
-        ) and all(
-            matches(kwargs[key], metadata.value, metadata)
-            for key, metadata in self.fwd_graph_input_kwarg_metas.items()
-        )
-
-    def replay_graph_capture(self, is_first_microbatch, args, kwargs, fast_inference_check=False):
+    def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
 
         # Arguments passed to a cudagraph for replay must match the args in the captured graph.
         #  Tensor arguments need to have the same shape, dtype, and device location.
         #  All other arguments must have the exact same memory addresses for graph safety.
-        mismatch_errors = (
-            []
-            if fast_inference_check and self._inference_replay_args_match(args, kwargs)
-            else self.get_mismatch_errors(args, kwargs)
-        )
+        mismatch_errors = self.get_mismatch_errors(args, kwargs)
         if mismatch_errors:
             error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
             raise AssertionError(error_msg)
@@ -2164,12 +2089,7 @@ class CudaGraphManager(torch.nn.Module):
             runner = self.get_cudagraph_runner(
                 megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
             )
-            out = runner.replay_graph_capture(
-                self.is_first_microbatch,
-                args,
-                kwargs,
-                fast_inference_check=bool(is_inference_mode and cache_key is not None),
-            )
+            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode or self._inline_capture:
                 # Inference generation mode creates graphs immediately
@@ -2218,12 +2138,7 @@ class CudaGraphManager(torch.nn.Module):
                     )
 
                 # Now replay the graph
-                out = runner.replay_graph_capture(
-                    self.is_first_microbatch,
-                    args,
-                    kwargs,
-                    fast_inference_check=bool(is_inference_mode and cache_key is not None),
-                )
+                out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(
                     megatron_module, args, kwargs, self.reuse_cudagraphs
