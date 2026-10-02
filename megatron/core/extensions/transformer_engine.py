@@ -3680,7 +3680,6 @@ try:
         num_layers,
         model_layers,
         activation_offloading,
-        weight_offloading,
         double_buffering,
         retain_pinned_cpu_buffers,
     ):
@@ -3691,9 +3690,8 @@ try:
                 enabled,
                 num_layers,
                 model_layers,
-                activation_offloading,
-                weight_offloading,
-                double_buffering,
+                offload_activations=activation_offloading,
+                double_buffering=double_buffering,
                 retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
             )
         elif is_te_min_version("2.5.0"):
@@ -3702,17 +3700,16 @@ try:
                 enabled,
                 num_layers,
                 model_layers,
-                activation_offloading,
-                weight_offloading,
-                double_buffering,
+                offload_activations=activation_offloading,
+                double_buffering=double_buffering,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
-                enabled, num_layers, model_layers, activation_offloading, weight_offloading
+                enabled, num_layers, model_layers, activation_offloading
             )
         else:
             context, sync_func = _get_cpu_offload_context(
-                enabled, num_layers, activation_offloading, weight_offloading
+                enabled, num_layers, activation_offloading
             )
 
         return context, sync_func
