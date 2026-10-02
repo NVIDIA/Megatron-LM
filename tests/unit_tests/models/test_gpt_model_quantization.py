@@ -2,11 +2,15 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -575,6 +579,186 @@ class TestGPTModelTEQuantizationConfig:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize(
+        "experts_path",
+        ("decoder.layers.0.mlp.experts", "mtp.layers.0.mtp_model_layer.mlp.experts"),
+        ids=("decoder", "mtp"),
+    )
+    @pytest.mark.parametrize("late_override", (False, True), ids=("constructor", "late"))
+    def test_bf16_override_executes_basic_ops_under_mxfp8(
+        self, monkeypatch, record_property, experts_path, late_override
+    ) -> None:
+        """Full GPT construction must apply exact-path overrides to real expert ops."""
+        import inspect
+
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.pytorch import fp8_autocast
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear
+            from transformer_engine.pytorch.ops.basic.grouped_linear import (
+                is_op_fuser_grouped_tensor_path_supported,
+            )
+        except ImportError:
+            pytest.skip("TE grouped-tensor operation fuser support is required")
+        if "single_grouped_weight" not in inspect.signature(GroupedLinear.__init__).parameters:
+            pytest.skip("TE operation fuser requires single_grouped_weight support")
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+        if not is_op_fuser_grouped_tensor_path_supported(None, torch.bfloat16):
+            pytest.skip("Native BF16 grouped GEMM requires a supported GPU and cuBLASLt version")
+
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        linear_paths = [f"{experts_path}.linear_fc{idx}" for idx in (1, 2)]
+        precision_recipe = RecipeConfig.from_config_dict(
+            {
+                "matchers": {
+                    path: {"type": "glob", "enabled": True, "pattern": path, "config": "bf16"}
+                    for path in linear_paths
+                },
+                "configs": {
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    }
+                },
+            }
+        )
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            moe_ffn_hidden_size=128,
+            num_moe_experts=2,
+            mtp_num_layers=1,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            gradient_accumulation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=False,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=None if late_override else precision_recipe,
+        )
+        decoder_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=decoder_spec,
+            mtp_block_spec=get_gpt_mtp_block_spec(
+                config, decoder_spec, use_transformer_engine=True
+            ),
+            vocab_size=512,
+            max_sequence_length=64,
+        ).cuda()
+        modules = dict(model.named_modules())
+        experts = modules[experts_path]
+        if late_override:
+            from megatron.core.quantization.utils import get_quant_config_or_none
+
+            # Exercise the post-construction finish_init contract independently of
+            # GPTModel's current constructor-name propagation.
+            for path in linear_paths:
+                assert modules[path].te_quant_params is None
+                modules[path].finish_init(get_quant_config_or_none(path, precision_recipe))
+        for path in linear_paths:
+            assert modules[path].te_quant_params is not None
+            assert not modules[path].will_execute_quantized(True)
+        assert experts._with_fused_impl, "BF16 must remain on the TE ops path"
+        original_params = dict(experts.named_parameters())
+        # Default GPT initialization yields tiny outputs for which a fixed absolute
+        # tolerance can hide accidental FP8 computation. Keep GEMM scales near one.
+        torch.manual_seed(456)
+        with torch.no_grad():
+            for weight in original_params.values():
+                weight.normal_(std=weight.shape[-1] ** -0.5)
+
+        # Spy on real basic-op execution. A fused quantized kernel bypasses these calls,
+        # while a lost override makes the recorded context True even without joint fusion.
+        basic_op_contexts = []
+        real_fuser_forward = GroupedLinear.fuser_forward
+
+        def record_basic_op_context(op, *args, **kwargs):
+            basic_op_contexts.append(FP8GlobalStateManager.is_fp8_enabled())
+            return real_fuser_forward(op, *args, **kwargs)
+
+        monkeypatch.setattr(GroupedLinear, "fuser_forward", record_basic_op_context)
+        split_sizes = (256, 512)
+        tokens_per_expert = torch.tensor(split_sizes, dtype=torch.int64, device="cuda")
+        num_tokens = sum(split_sizes)
+        inputs = torch.randn(
+            num_tokens, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        probs = torch.rand(num_tokens, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_()
+        reference_probs = probs.detach().clone().requires_grad_()
+        reference_weights = {
+            name: weight.detach().clone().requires_grad_()
+            for name, weight in original_params.items()
+        }
+
+        # Independent BF16 reference with the same per-expert weights and router scales.
+        reference_outputs = []
+        offset = 0
+        for expert_idx, count in enumerate(split_sizes):
+            rows = slice(offset, offset + count)
+            offset += count
+            projected = F.linear(
+                reference_inputs[rows], reference_weights[f"linear_fc1.weight{expert_idx}"]
+            )
+            gate, value = projected.float().chunk(2, dim=-1)
+            activated = (F.silu(gate) * value * reference_probs[rows, None].float()).to(
+                torch.bfloat16
+            )
+            reference_outputs.append(
+                F.linear(activated, reference_weights[f"linear_fc2.weight{expert_idx}"])
+            )
+        reference_output = torch.cat(reference_outputs)
+
+        with fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+            output, bias = experts(inputs, tokens_per_expert, probs)
+            assert FP8GlobalStateManager.is_fp8_enabled(), "The override leaked into its caller"
+        assert bias is None
+
+        def assert_bf16_close(actual, expected, label):
+            actual, expected = actual.detach(), expected.detach()
+            assert torch.isfinite(actual).all()
+            reference_rms = expected.float().square().mean().sqrt().clamp_min(1e-12)
+            relative_rms = (
+                actual.float() - expected.float()
+            ).square().mean().sqrt() / reference_rms
+            record_property(f"{label}_relative_rms", relative_rms.item())
+            assert (
+                relative_rms < 1e-2
+            ), f"{label}: BF16 relative RMS error {relative_rms.item():.6f}"
+            torch.testing.assert_close(
+                actual, expected, rtol=2e-2, atol=5e-3 * reference_rms.item()
+            )
+
+        assert_bf16_close(output, reference_output, "output")
+
+        # Run backward outside autocast so its precision must come from the saved forward.
+        grad_output = torch.randn_like(output)
+        output.backward(grad_output)
+        reference_output.backward(grad_output)
+        assert_bf16_close(inputs.grad, reference_inputs.grad, "input_gradient")
+        assert_bf16_close(probs.grad, reference_probs.grad, "probability_gradient")
+        for name, weight in experts.named_parameters():
+            assert weight is original_params[name]
+            assert weight.grad is not None
+            assert_bf16_close(weight.grad, reference_weights[name].grad, name)
+        # Keep this after numerical checks: a lost override must fail numerically too.
+        assert basic_op_contexts == [False, False]
 
     @pytest.mark.parametrize(
         ("transformer_impl", "recipe_storage"),
