@@ -4643,8 +4643,12 @@ class TestThdWrapperDispatchAndValidation:
         }
         dk._DSA = fake_dsa
 
+        # Quantization and the compact kernel are mocked, so the dispatch must
+        # not depend on Transformer Engine or Triton actually being installed.
         with (
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(dk, "HAVE_TE_MXFP8", True),
+            patch.object(dk, "HAVE_TRITON", True),
             patch.object(
                 dk, "quantize_indexer_mxfp8", side_effect=[(q_fp8, q_scale), (k_fp8, k_scale)]
             ) as quantize,

@@ -1385,19 +1385,31 @@ def _compact_flat_topk_idxs(global_idxs: Tensor) -> Tuple[Tensor, Tensor]:
     cuDNN DSA backward. Invalid suffix entries remain ``-1`` until forward has
     consumed them; callers may then replace the ignored suffix with a safe
     non-negative placeholder before backward.
+
+    CUDA tensors use cuDNN ``compactify_wrapper`` when that wrapper can be
+    imported. CPU tensors, and CUDA tensors without the wrapper, use the same
+    stable PyTorch pack.
     """
     if global_idxs.ndim != 2:
         raise ValueError(f"global_idxs must be 2-D (rows, topk), got {tuple(global_idxs.shape)}")
 
+    wrapper = None
     if global_idxs.is_cuda:
-        _ensure_dsa_namespace()
-        res = _DSA.compactify_wrapper(global_idxs)
-        compact_idxs, topk_length = res["indices"], res["topk_length"]
-    else:
+        try:
+            _ensure_dsa_namespace()
+        except ImportError:
+            wrapper = None
+        else:
+            candidate = getattr(_DSA, "compactify_wrapper", None)
+            wrapper = candidate if callable(candidate) else None
+    if wrapper is None:
         valid_mask = global_idxs >= 0
         sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
         compact_idxs = global_idxs.gather(-1, sorted_indices)
         topk_length = valid_mask.sum(dim=-1).int()
+    else:
+        res = wrapper(global_idxs)
+        compact_idxs, topk_length = res["indices"], res["topk_length"]
 
     return compact_idxs.int().contiguous(), topk_length.int().contiguous()
 
@@ -1450,8 +1462,8 @@ def build_flat_topk_idxs(
 
     topk_length_flat = None
     if compact:
-        # The CUDA path is a single warp-per-row CuTe DSL kernel; the helper
-        # retains a stable PyTorch fallback for CPU-only unit tests.
+        # The CUDA path is a single warp-per-row CuTe DSL kernel when cuDNN
+        # Frontend is installed. Otherwise the helper uses a stable PyTorch pack.
         global_idxs, topk_length_flat = _compact_flat_topk_idxs(global_idxs)
 
     return global_idxs, topk_length_flat
