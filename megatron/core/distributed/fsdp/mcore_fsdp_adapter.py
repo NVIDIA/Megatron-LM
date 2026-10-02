@@ -675,7 +675,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         construction_context = (
             nullcontext(active_context)
             if active_context is not None
-            else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
+            else fully_shard_context(
+                device=device,
+                use_symmetric_memory=ddp_config.nccl_ub,
+                overlap_dp_outer_communication=ddp_config.overlap_dp_outer_communication,
+            )
         )
         with construction_context:
             if expert_dp_mesh is not None:

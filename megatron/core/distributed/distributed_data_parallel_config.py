@@ -97,6 +97,10 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    overlap_dp_outer_communication: bool = False
+    """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
+    reductions on a separate CUDA stream."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -327,6 +331,11 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.overlap_dp_outer_communication:
+            if not self.use_megatron_fsdp:
+                raise ValueError("overlap_dp_outer_communication requires Megatron-FSDP.")
+            if self.megatron_fsdp_version != 2:
+                raise ValueError("overlap_dp_outer_communication requires Megatron-FSDP v2.")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
