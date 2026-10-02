@@ -393,9 +393,11 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
     """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
-    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
-    backend. The final index scores remain FP32 independently of this option. This option does
-    not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+    path. With BF16 inputs and parameters, FP32 produces FP32 head weights without changing
+    parameter storage. cuDNN forward scoring and KL loss preserve these FP32 weights/scores;
+    its native indexer backward uses BF16-rounded weights and BF16 gradients, approximating
+    the FP32-weight forward. Final index scores are FP32 with either option. This does not
+    affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
     dsa_cp_balance_indexer: bool = False
     """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
@@ -1864,15 +1866,6 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_indexer_weights_proj_output_dtype='fp32' requires "
                 "dsa_indexer_weights_proj_use_quantization=False because quantized "
                 "TELinear does not guarantee a true-FP32 output for this projection."
-            )
-        if (
-            self.dsa_indexer_weights_proj_output_dtype == "fp32"
-            and self.dsa_kernel_backend == "cudnn"
-        ):
-            raise ValueError(
-                "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
-                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
-                "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
         if self.dsa_cp_balance_indexer:
