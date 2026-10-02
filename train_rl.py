@@ -25,7 +25,7 @@ from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import get_run_config, initialize_runtime_services
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -197,7 +197,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         model (GPTModel): The GPT Model
     """
     runtime_state = get_rl_runtime_state()
-    args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
@@ -206,7 +206,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    if args.rl_use_sequence_packing:
+    if cfg.rl.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
 
@@ -222,7 +222,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_lengths,
             seq_indices,
             packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
+        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, cfg.rl.rl_inference_logprobs_is_correction)
 
         runtime_state.increment_sequences(len(seq_indices))
     else:
@@ -249,7 +249,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         # advantages already on GPU from prepare_data_for_update
         loss_mask = loss_mask[:, 1:].contiguous().cuda()
         inference_logprobs = (
-            inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
+            inference_logprobs.cuda() if cfg.rl.rl_inference_logprobs_is_correction else None
         )
 
         runtime_state.increment_sequences(tokens.shape[0])
@@ -258,10 +258,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     model_to_use = model[0] if isinstance(model, list) else model
 
     if packed_seq_params is None:
-        if args.rl_use_sequence_packing:
+        if cfg.rl.rl_use_sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
                 seq_length=tokens.shape[1],
-                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                max_sequences_per_bin=cfg.rl.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
         else:
@@ -312,12 +312,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     old_logprobs=old_logprobs,
                     ref_logprobs=ref_logprobs,
                     advantages=advantages,
-                    clamp_eps_lower=args.grpo_clamp_eps_lower,
-                    clamp_eps_upper=args.grpo_clamp_eps_upper,
-                    kl_beta=args.grpo_kl_beta,
-                    entropy_weight=args.grpo_entropy_term_weight,
+                    clamp_eps_lower=cfg.rl.grpo_clamp_eps_lower,
+                    clamp_eps_upper=cfg.rl.grpo_clamp_eps_upper,
+                    kl_beta=cfg.rl.grpo_kl_beta,
+                    entropy_weight=cfg.rl.grpo_entropy_term_weight,
                     inference_logprobs=inference_logprobs,
-                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                    is_truncation_coef=cfg.rl.rl_importance_sampling_truncation_coef,
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
                 )

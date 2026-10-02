@@ -21,7 +21,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
@@ -350,13 +349,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
             )
 
     setup_cfg = inference_cfg_from_args(args)
-    return setup_cfg.to_inference_config(
-        model,
-        kv_cache_management_mode=args.rl_kv_cache_management_mode,
-        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
-        enable_cuda_graphs=(args.inference_cuda_graph_scope != InferenceCudaGraphScope.none),
-        metrics_writer=metrics_writer,
-    )
+    return setup_cfg.to_inference_config(model, metrics_writer=metrics_writer)
 
 
 def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
