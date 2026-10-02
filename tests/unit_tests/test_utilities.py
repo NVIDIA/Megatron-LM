@@ -13,7 +13,6 @@ from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel import random as tp_random
 from megatron.core.transformer import cuda_graphs, multi_token_prediction
-from megatron.core.transformer.experimental_attention_variant import dsa
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
@@ -76,10 +75,6 @@ def reset_cuda_graph_global_state():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         cuda_graphs.delete_cuda_graphs()
-    # Only a completed capture restores the stream;
-    # TestParallelTransformerBlockCudagraphs records without capturing.
-    if torch.cuda.is_available():
-        torch.cuda.set_stream(torch.cuda.default_stream())
 
 
 def _snapshot_torch_settings():
@@ -156,7 +151,6 @@ def reset_transient_process_state():
     reset_cuda_graph_global_state()
     # Sized at the first num_layers seen; TestMTPLossLoggingHelper reads it back.
     multi_token_prediction.MTPLossLoggingHelper.tracker.clear()
-    dsa.DSAIndexerLossLoggingHelper.tracker.clear()
     # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False

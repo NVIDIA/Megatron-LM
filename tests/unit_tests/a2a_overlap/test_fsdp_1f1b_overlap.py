@@ -11,7 +11,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_s
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer import TransformerLayer
-from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     apply_flex_backend_kwargs,
@@ -52,7 +51,6 @@ class TestFSDP1F1BOverlap:
 
     def teardown_method(self, method):
         PipelineOffloadManager.reset_instance()
-        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")

@@ -2,7 +2,6 @@
 
 import os
 import sys
-import unittest
 from pathlib import Path
 
 import pytest
@@ -190,13 +189,8 @@ def restore_class_process_state():
 
 
 @pytest.fixture(autouse=True)
-def reset_process_state(request):
+def reset_process_state():
     snapshot = snapshot_process_state()
     yield
-    # pytest keeps every class-based test instance alive for the whole session,
-    # so anything a test stored on self stays allocated until it is dropped here.
-    instance = request.instance
-    if instance is not None and not isinstance(instance, unittest.TestCase):
-        instance.__dict__.clear()
     reset_transient_process_state()
     restore_process_state(snapshot)
