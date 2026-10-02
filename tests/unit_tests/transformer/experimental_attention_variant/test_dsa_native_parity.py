@@ -324,7 +324,7 @@ def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
             return {"scores": scores}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -368,7 +368,7 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
             return {"scores": scores * sm_scale}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -403,34 +403,39 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
     )
 
 
-def test_cudnn_indexer_topk_tie_break_prefers_lower_indices(monkeypatch):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunked):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
-            return {"scores": torch.zeros((1, 1, 4), dtype=torch.float32)}
-
-        @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
+            assert tie_break == 2
             assert return_val is False
-            values, indices = scores_flat.topk(top_k, dim=-1)
-            return {"indices": indices.to(torch.int32), "values": values if return_val else None}
+            torch.testing.assert_close(scores_flat, torch.zeros_like(scores_flat), rtol=0, atol=0)
+            indices = (
+                scores_flat.size(-1)
+                - 1
+                - scores_flat.flip(-1).argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+            )
+            return {"indices": indices.to(torch.int32), "values": None}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    if chunked:
+        monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 32)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
-        torch.zeros((1, 1, 1, 1)),
+        torch.zeros((1, 3, 1, 1)),
         torch.zeros((1, 4, 1)),
-        torch.zeros((1, 1, 1)),
+        torch.zeros((1, 3, 1)),
         topk=2,
-        varlen_starts=torch.tensor([0], dtype=torch.int64),
-        varlen_ends=torch.tensor([4], dtype=torch.int64),
+        varlen_starts=torch.zeros(3, dtype=torch.int64),
+        varlen_ends=torch.full((3,), 4, dtype=torch.int64),
         return_scores=False,
         use_local_indexer_varlen=True,
     )
 
-    torch.testing.assert_close(topk_indices, torch.tensor([[[0, 1]]], dtype=torch.int32))
-    torch.testing.assert_close(topk_length, torch.tensor([[2]], dtype=torch.int32))
+    torch.testing.assert_close(topk_indices, torch.tensor([[[2, 3]] * 3], dtype=torch.int32))
+    torch.testing.assert_close(topk_length, torch.tensor([[2, 2, 2]], dtype=torch.int32))
 
 
 def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkeypatch):
@@ -440,7 +445,7 @@ def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkey
             raise AssertionError("repeated varlen ends must not scatter through one score row")
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -478,7 +483,7 @@ def test_cudnn_indexer_topk_nonlocal_varlen_ends_avoid_global_score_rows(monkeyp
             raise AssertionError("non-local varlen ends must not allocate global score rows")
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -514,7 +519,7 @@ def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
             raise AssertionError("local varlen must score with logical ends before masking")
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -546,7 +551,8 @@ def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
     )
 
 
-def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
+@pytest.mark.parametrize("equal_scores", [False, True])
+def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equal_scores):
     seen = {}
 
     class FakeDSA:
@@ -581,16 +587,24 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
                 q_length = q_end - q_start
                 for row in range(q_length):
                     valid_k = k_length - q_length + row + 1
-                    scores[q_start + row, :valid_k] = torch.arange(valid_k, dtype=torch.float32)
+                    scores[q_start + row, :valid_k] = (
+                        0 if equal_scores else torch.arange(valid_k, dtype=torch.float32)
+                    )
             return {"scores": scores}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val, tie_break):
             del next_n
+            assert tie_break == 2
             masked_scores = scores.clone()
             key_ids = torch.arange(scores.size(1)).view(1, -1)
             masked_scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
-            values, indices = masked_scores.topk(top_k, dim=-1)
+            indices = (
+                scores.size(-1)
+                - 1
+                - masked_scores.flip(-1).argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+            )
+            values = masked_scores.gather(-1, indices)
             return {"indices": indices.to(torch.int32), "values": values if return_val else None}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
@@ -633,7 +647,7 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
         valid_count = position - start + 1
         row = list(range(position, max(start - 1, position - 3), -1))
         expected_indices.append(row + [-1] * (3 - len(row)))
-        local_scores = [value - start for value in row]
+        local_scores = [0 if equal_scores else value - start for value in row]
         expected_scores.append(
             local_scores + [torch.finfo(torch.float32).min] * (3 - len(local_scores))
         )
@@ -1464,7 +1478,7 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
             }
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             seen["topk_seq_lens"].append(seq_lens.detach().clone())
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
@@ -1520,7 +1534,7 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
             }
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -1555,8 +1569,11 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
 # kernel/build root cause is resolved.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
-def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_alignment(monkeypatch):
-    _skip_if_fused_dsa_unavailable()
+@pytest.mark.parametrize("equal_scores", [False, True])
+def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_alignment(
+    monkeypatch, equal_scores
+):
+    _skip_if_fused_dsa_unavailable(require_flash_mla=False)
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda *_args: 1)
 
     query = torch.zeros((1, 4, 32, 128), device="cuda", dtype=torch.bfloat16)
@@ -1564,7 +1581,7 @@ def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_align
     key = torch.zeros((1, 16, 128), device="cuda", dtype=torch.bfloat16)
     key[..., 0] = torch.arange(16, device="cuda", dtype=torch.bfloat16)
     weights = torch.zeros((1, 4, 32), device="cuda", dtype=torch.bfloat16)
-    weights[..., 0] = 1
+    weights[..., 0] = 0 if equal_scores else 1
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         query,
         key,
@@ -1595,7 +1612,11 @@ def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_align
     )
     torch.testing.assert_close(
         sorted_scores.cpu(),
-        torch.tensor([[[1.0, 2.0], [2.0, 3.0], [11.0, 12.0], [12.0, 13.0]]]),
+        (
+            torch.zeros((1, 4, 2))
+            if equal_scores
+            else torch.tensor([[[1.0, 2.0], [2.0, 3.0], [11.0, 12.0], [12.0, 13.0]]])
+        ),
         rtol=0,
         atol=0,
     )
@@ -1614,7 +1635,7 @@ def test_cudnn_indexer_topk_indices_only_filters_masked_varlen_scores(monkeypatc
             return {"scores": scores}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             assert return_val is False
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
@@ -1659,7 +1680,7 @@ def test_cudnn_indexer_topk_indices_only_compacts_invalid_prefix_entries(monkeyp
             return {"scores": scores}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             assert return_val is False
             indices = torch.tensor([[4, 6, 3, 5]], dtype=torch.int32)
             return {"indices": indices.to(device=scores_flat.device)}
@@ -1693,7 +1714,7 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
             return {"scores": torch.tensor([[[0.5, float("-inf"), 2.0, 1.0]]], dtype=torch.float32)}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             seen["return_val"] = return_val
             values, indices = scores_flat.topk(top_k, dim=-1)
             if return_val:
@@ -1732,28 +1753,35 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
     )
 
 
-def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(monkeypatch):
-    seen = {}
+@pytest.mark.parametrize(
+    "scores, expected_indices",
+    [([0.0, 0.0, 0.0, 0.0], [2, 3]), ([0.0, 3.0e-13, 1.0e-13, 0.0], [1, 2])],
+)
+def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
+    monkeypatch, scores, expected_indices
+):
+    original_scores = torch.tensor(scores, dtype=torch.float32).view(1, 4)
 
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q, k, w, ratio, sm_scale):
-            return {"scores": torch.zeros((1, 1, 4), dtype=torch.float32)}
-
-        @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
-            seen["scores_flat"] = scores_flat.detach().clone()
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
+            assert tie_break == 2
             assert return_val is True
-            values, indices = scores_flat.topk(top_k, dim=-1)
-            return {"indices": indices.to(torch.int32), "values": values if return_val else None}
+            torch.testing.assert_close(scores_flat, original_scores, rtol=0, atol=0)
+            indices = (
+                scores_flat.size(-1)
+                - 1
+                - scores_flat.flip(-1).argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+            )
+            return {"indices": indices.to(torch.int32), "values": scores_flat.gather(-1, indices)}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
-        torch.zeros((1, 1, 1, 1)),
-        torch.zeros((1, 4, 1)),
-        torch.zeros((1, 1, 1)),
+        torch.ones((1, 1, 1, 1)),
+        original_scores.view(1, 4, 1),
+        torch.ones((1, 1, 1)),
         topk=2,
         varlen_starts=torch.tensor([0], dtype=torch.int64),
         varlen_ends=torch.tensor([4], dtype=torch.int64),
@@ -1762,10 +1790,16 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(monkeypatch)
         use_local_indexer_varlen=True,
     )
 
-    assert seen["scores_flat"][0, 0] > seen["scores_flat"][0, 1]
-    torch.testing.assert_close(topk_indices, torch.tensor([[[0, 1]]], dtype=torch.int32))
+    torch.testing.assert_close(
+        topk_indices.sort(dim=-1).values, torch.tensor([[expected_indices]], dtype=torch.int32)
+    )
     torch.testing.assert_close(topk_length, torch.tensor([[2]], dtype=torch.int32))
-    torch.testing.assert_close(topk_scores, torch.zeros((1, 1, 2), dtype=torch.float32))
+    torch.testing.assert_close(
+        topk_scores,
+        original_scores.gather(-1, topk_indices.long().view(1, 2)).view(1, 1, 2),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_cudnn_indexer_topk_scores_reapply_varlen_bounds(monkeypatch):
@@ -1775,7 +1809,7 @@ def test_cudnn_indexer_topk_scores_reapply_varlen_bounds(monkeypatch):
             return {"scores": torch.zeros((1, 1, 8), dtype=torch.float32)}
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             assert return_val is True
             indices = torch.tensor([[5, 3, 4, 1]], dtype=torch.int32)
             return {
@@ -2182,7 +2216,7 @@ def test_cudnn_indexer_topk_scores_local_varlen_keeps_compact_query_rows(monkeyp
             raise AssertionError("local varlen must score with logical ends before masking")
 
         @staticmethod
-        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
+        def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
             values, indices = scores_flat.topk(top_k, dim=-1)
             if return_val:
                 return {"indices": indices.to(torch.int32), "values": values}
