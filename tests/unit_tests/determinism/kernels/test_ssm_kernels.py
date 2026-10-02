@@ -374,6 +374,54 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     )
 
 
+def test_fused_recurrent_gated_delta_rule_update_padding_replays():
+    """Single-token decode whose ``-1`` padding rows hold NaN/Inf inputs.
+
+    The kernel zeroes padding rows in its output store, so they must come out as ``+0.0``
+    bytes on every replay while real rows and the slot-indexed state cache replay exactly.
+    """
+    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+
+    seeded()
+    B, H, K, V = 128, 16, 128, 128
+    slots = B + 8
+    q = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, 1, H, V, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(B, 1, H, device="cuda") * 0.1
+    beta = torch.rand(B, 1, H, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(slots, H, K, V, device="cuda")
+    state_indices = torch.randperm(slots, device="cuda")[:B].to(torch.int32)
+    state_indices[::16] = -1
+    padding = state_indices < 0
+    q[padding] = float("nan")
+    v[padding] = float("inf")
+
+    def fn(q, k, v, g, beta, state, state_indices):
+        return fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            state=state,
+            state_indices=state_indices,
+        )
+
+    ref_out, _ = assert_replays_bit_exact(
+        fn,
+        (q, k, v, g, beta, state, state_indices),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="fused_recurrent_gated_delta_rule_update (padding rows)",
+    )
+    padded_out = ref_out["out[0]"][padding]
+    assert torch.equal(padded_out, torch.zeros_like(padded_out))
+    assert not torch.signbit(padded_out).any()
+
+
 @pytest.mark.parametrize("S", [1, 4])
 def test_gdp_decode_prepare_replays(S):
     """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
