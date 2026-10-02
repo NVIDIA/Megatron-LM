@@ -358,7 +358,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.is_moe_layer = getattr(self, "is_moe_layer", False)
         super().__init__(config=config, vp_stage=vp_stage)
 
-        if config.wide_residual is not None and not self.supports_wide_residual_connections:
+        if (
+            config.wide_residual is not None
+            and not self.supports_wide_residual_connections
+            and not is_mtp_layer
+        ):
             raise ValueError(
                 f"{type(self).__name__} does not implement wide-residual streams. Build the "
                 "decoder with WideResidualTransformerLayer when wide_residual is configured."
@@ -854,13 +858,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         rotary_pos_emb: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         packed_sequence_cp_metadata=None,
     ):
         """Run the training path through pre-attention and core attention."""
         assert self.supports_two_stage_attention()
 
-        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(
+            hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+        )
 
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
@@ -883,6 +890,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         context: Optional[Tensor] = None,
         attn_state=(),
         context_mask: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Run the training path after core attention."""
         assert self.supports_two_stage_attention()
@@ -896,6 +904,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             context=context,
             context_mask=context_mask,
             attn_state=attn_state,
+            residual_stream_recompute_context=residual_stream_recompute_context,
         )
 
     def _get_self_attention_residual_connection(self):

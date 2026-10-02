@@ -1637,12 +1637,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
-            if self.moe_shortcut_connection:
-                raise NotImplementedError(
-                    "wide_residual does not yet support moe_shortcut_connection. "
-                    "ShortcutMoE groups and executes paired hybrid layers outside the ordinary "
-                    "wide-residual branch-connection path."
-                )
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
                 raise NotImplementedError(
                     "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
@@ -1651,10 +1645,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise NotImplementedError(
                     "wide_residual does not yet support pipeline_model_parallel_size > 1. "
                     "Inter-stage communication buffers are still sized from hidden_size."
-                )
-            if self.mtp_num_layers is not None:
-                raise NotImplementedError(
-                    "wide_residual does not yet support Multi-Token Prediction (MTP)."
                 )
             if self.inference_fuse_tp_communication:
                 raise NotImplementedError(
