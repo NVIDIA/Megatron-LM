@@ -249,9 +249,6 @@ def test_overlaps_communication_and_compute(
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_groups)}."
     )
 
-    # Release the dedicated communicator so it does not leak into the shared session.
-    dist.destroy_process_group(dp_group)
-
 
 def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     """Zero per-module prefetch budgets should launch all-gathers before compute."""
