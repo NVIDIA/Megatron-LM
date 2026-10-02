@@ -316,7 +316,7 @@ class FsdpModule:
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
 
-            def input_grad_checked_backward_hook(hooked_module, grad_input, _grad_output):
+            def grad_checking_post_backward_hook(hooked_module, grad_input, _grad_output):
                 module = cast(FsdpModule, hooked_module)
                 # With no grad-requiring inputs, PyTorch fires this hook at
                 # output gradients, before internal backward can read weights.
@@ -329,7 +329,7 @@ class FsdpModule:
                     )
                 post_backward_hook(module)
 
-            module.register_full_backward_hook(input_grad_checked_backward_hook)
+            module.register_full_backward_hook(grad_checking_post_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
