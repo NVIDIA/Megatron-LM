@@ -58,11 +58,13 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 @dataclass(frozen=True)
 class SparseAttentionVisibility:
-    """Compact per-token extension of a causal sliding-attention window.
+    """Compact per-query distances to the edges of a bidirectional span.
 
-    ``left`` and ``right`` contain the additional visible-token counts around each query.
-    A zero pair preserves ordinary causal sliding-window attention. This representation avoids
-    materializing an ``[B, S, S]`` mask and is used by DeepSeek-V4-Vision image spans.
+    ``left`` and ``right`` count tokens from the query back to the span start and forward
+    to the span end. A zero pair preserves ordinary causal sliding-window attention. The
+    causal window already covers ``window_size - 1`` tokens to the left, so only a larger
+    ``left`` reaches further back. This avoids materializing an ``[B, S, S]`` mask and is
+    used by DeepSeek-V4-Vision image spans.
     """
 
     left: torch.Tensor

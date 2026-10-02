@@ -95,8 +95,10 @@ def test_visible_window_extends_bidirectionally_inside_image_span():
     indices = get_window_topk_idxs_visible(3, 8, visibility, torch.device("cpu"))
 
     assert indices.shape == (1, 8, 7)
+    # Image occupies positions 2..5. Query 2 also keeps its causal window back to 0.
     assert torch.equal(indices[0, 2, :6], torch.arange(6, dtype=torch.int32))
-    assert torch.equal(indices[0, 5, :5], torch.arange(1, 6, dtype=torch.int32))
+    # Query 5 is the image end (left=3), so the span starts at 2, not one token earlier.
+    assert torch.equal(indices[0, 5, :5], torch.tensor([2, 3, 4, 5, -1], dtype=torch.int32))
     assert torch.equal(indices[0, 6, :3], torch.arange(4, 7, dtype=torch.int32))
     assert torch.all(indices[0, 6, 3:] == -1)
 
