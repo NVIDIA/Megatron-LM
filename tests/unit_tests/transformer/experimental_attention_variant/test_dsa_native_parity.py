@@ -402,27 +402,37 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
     )
 
 
+def _torch_topk_indices(scores, topk, tie_break):
+    if tie_break == 0:
+        return scores.topk(topk, dim=-1).indices
+    if tie_break == 2:
+        return (
+            scores.size(-1)
+            - 1
+            - scores.flip(-1).argsort(dim=-1, descending=True, stable=True)[..., :topk]
+        )
+    return scores.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+
+
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("real_topk", [False, True])
 @pytest.mark.parametrize("topk", [2, 8])
 def test_cudnn_indexer_topk_tie_break_preserves_device_policy(
-    monkeypatch, chunked, real_topk, topk
+    monkeypatch, chunked, real_topk, topk, topk_tie_break
 ):
     if real_topk:
         _skip_if_fused_dsa_unavailable(require_flash_mla=False)
     device = "cuda" if real_topk else "cpu"
+    expected_policy = int(topk < 8 and not real_topk) if topk_tie_break is None else topk_tie_break
 
     class FakeDSA:
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
-            assert tie_break == int(top_k < 8)
+            assert tie_break == expected_policy
             assert return_val is False
             torch.testing.assert_close(scores_flat, torch.zeros_like(scores_flat), rtol=0, atol=0)
-            indices = (
-                scores_flat.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
-                if tie_break
-                else scores_flat.topk(top_k, dim=-1).indices
-            )
+            indices = _torch_topk_indices(scores_flat, top_k, tie_break)
             return {"indices": indices.to(torch.int32), "values": None}
 
     if real_topk:
@@ -430,7 +440,7 @@ def test_cudnn_indexer_topk_tie_break_preserves_device_policy(
         native_topk = dsa_cudnn_kernels._cudnn_dsa.indexer_top_k_wrapper
 
         def checked_native_topk(*args, **kwargs):
-            assert kwargs["tie_break"] == 0
+            assert kwargs["tie_break"] == expected_policy
             return native_topk(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -451,11 +461,16 @@ def test_cudnn_indexer_topk_tie_break_preserves_device_policy(
         varlen_ends=torch.full((3,), 8, dtype=torch.int64, device=device),
         return_scores=False,
         use_local_indexer_varlen=True,
+        topk_tie_break=topk_tie_break,
     )
 
-    if not real_topk:
+    if expected_policy:
+        start = 8 - topk if expected_policy == 2 else 0
         torch.testing.assert_close(
-            topk_indices, torch.arange(topk, dtype=torch.int32).view(1, 1, topk).expand(1, 3, -1)
+            topk_indices,
+            torch.arange(start, start + topk, dtype=torch.int32, device=device)
+            .view(1, 1, topk)
+            .expand(1, 3, -1),
         )
     assert ((topk_indices >= 0) & (topk_indices < 8)).all()
     assert (topk_indices[..., 1:] > topk_indices[..., :-1]).all()
@@ -578,8 +593,12 @@ def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
 
 
 @pytest.mark.parametrize("equal_scores", [False, True])
-def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equal_scores):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(
+    monkeypatch, equal_scores, topk_tie_break
+):
     seen = {}
+    expected_policy = 1 if topk_tie_break is None else topk_tie_break
 
     class FakeDSA:
         @staticmethod
@@ -621,11 +640,11 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equa
         @staticmethod
         def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val, tie_break):
             del next_n
-            assert tie_break == 1
+            assert tie_break == expected_policy
             masked_scores = scores.clone()
             key_ids = torch.arange(scores.size(1)).view(1, -1)
             masked_scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
-            indices = masked_scores.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+            indices = _torch_topk_indices(masked_scores, top_k, tie_break)
             values = masked_scores.gather(-1, indices)
             return {"indices": indices.to(torch.int32), "values": values if return_val else None}
 
@@ -651,6 +670,7 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equa
         packed_max_seqlen_k=16,
         packed_cp_size=2,
         local_packed_cp_rank=0,
+        topk_tie_break=topk_tie_break,
     )
 
     assert seen["q_shape"] == torch.Size([12, 1, 1])
@@ -665,13 +685,16 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equa
     expected_indices = []
     expected_scores = []
     expected_lengths = []
-    for position, start in zip(query_positions.tolist(), starts.tolist()):
+    for row_idx, (position, start) in enumerate(zip(query_positions.tolist(), starts.tolist())):
         valid_count = position - start + 1
-        row = (
-            list(range(start, min(position + 1, start + 3)))
-            if equal_scores
-            else list(range(position, max(start - 1, position - 3), -1))
-        )
+        if equal_scores and expected_policy == 0:
+            row = topk_indices[0, row_idx, : min(valid_count, 3)].tolist()
+            assert len(set(row)) == len(row)
+            assert all(start <= value <= position for value in row)
+        elif equal_scores and expected_policy == 1:
+            row = list(range(start, min(position + 1, start + 3)))
+        else:
+            row = list(range(position, max(start - 1, position - 3), -1))
         expected_indices.append(row + [-1] * (3 - len(row)))
         local_scores = [0 if equal_scores else value - start for value in row]
         expected_scores.append(
@@ -688,7 +711,8 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equa
     )
 
 
-def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch, topk_tie_break):
     """CP1 multi-sequence packs use one THD call without splitting Q or duplicating K."""
     seen = {"calls": 0}
 
@@ -717,10 +741,12 @@ def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
         @staticmethod
         def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val, tie_break):
             del next_n
+            assert tie_break == (1 if topk_tie_break is None else topk_tie_break)
             masked_scores = scores.clone()
             key_ids = torch.arange(scores.size(1)).view(1, -1)
             masked_scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
-            values, indices = masked_scores.topk(top_k, dim=-1)
+            indices = _torch_topk_indices(masked_scores, top_k, tie_break)
+            values = masked_scores.gather(-1, indices)
             return {"indices": indices.to(torch.int32), "values": values if return_val else None}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
@@ -751,6 +777,7 @@ def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
         packed_max_seqlen_k=5,
         packed_cp_size=1,
         local_packed_cp_rank=0,
+        topk_tie_break=topk_tie_break,
     )
 
     assert seen["calls"] == 1
@@ -1471,7 +1498,7 @@ def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
         softmax_scale=1.0,
         loss_coeff=0.001,
         pg_collection=SimpleNamespace(tp=None),
-        config=SimpleNamespace(kv_lora_rank=512),
+        config=SimpleNamespace(kv_lora_rank=512, _dsa_indexer_topk_tie_break=None),
         use_local_indexer_varlen=True,
         packed_seq_params=packed_seq_params,
         cp_size=2,
@@ -1490,7 +1517,8 @@ def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
     assert loss_on[20:23] == (16, 16, 2)
 
 
-def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch, topk_tie_break):
     seen = {"forward_shapes": [], "topk_seq_lens": []}
 
     class FakeDSA:
@@ -1505,11 +1533,13 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
+            assert tie_break == (1 if topk_tie_break is None else topk_tie_break)
             seen["topk_seq_lens"].append(seq_lens.detach().clone())
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
-            values, indices = scores.topk(top_k, dim=-1)
+            indices = _torch_topk_indices(scores, top_k, tie_break)
+            values = scores.gather(-1, indices)
             if return_val:
                 return {"indices": indices.to(torch.int32), "values": values}
             return {"indices": indices.to(torch.int32), "values": None}
@@ -1531,6 +1561,7 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
         single_packed_thd_sequence=True,
         packed_cp_size=2,
         local_packed_cp_rank=1,
+        topk_tie_break=topk_tie_break,
     )
 
     assert seen["forward_shapes"] == [(2, 4), (2, 6)]
@@ -1777,21 +1808,23 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
     [([0.0, 0.0, 0.0, 0.0], [0, 1]), ([0.0, 3.0e-13, 1.0e-13, 0.0], [1, 2])],
 )
 @pytest.mark.parametrize("real_topk", [False, True])
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
 def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
-    monkeypatch, scores, expected_indices, real_topk
+    monkeypatch, scores, expected_indices, real_topk, topk_tie_break
 ):
     if real_topk:
         _skip_if_fused_dsa_unavailable(require_flash_mla=False)
     device = "cuda" if real_topk else "cpu"
     original_scores = torch.tensor(scores, dtype=torch.float32, device=device).view(1, 4)
+    expected_policy = int(not real_topk) if topk_tie_break is None else topk_tie_break
 
     class FakeDSA:
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
-            assert tie_break == 1
+            assert tie_break == expected_policy
             assert return_val is True
             torch.testing.assert_close(scores_flat, original_scores, rtol=0, atol=0)
-            indices = scores_flat.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+            indices = _torch_topk_indices(scores_flat, top_k, tie_break)
             return {"indices": indices.to(torch.int32), "values": scores_flat.gather(-1, indices)}
 
     if not real_topk:
@@ -1808,12 +1841,15 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
         return_scores=False,
         return_topk_scores=True,
         use_local_indexer_varlen=True,
+        topk_tie_break=topk_tie_break,
     )
 
     sorted_indices = topk_indices.sort(dim=-1).values
     assert ((sorted_indices >= 0) & (sorted_indices < 4)).all()
     assert (sorted_indices[..., 1:] > sorted_indices[..., :-1]).all()
-    if not real_topk or any(scores):
+    if expected_policy or any(scores):
+        if not any(scores) and expected_policy == 2:
+            expected_indices = [2, 3]
         torch.testing.assert_close(
             sorted_indices, torch.tensor([[expected_indices]], dtype=torch.int32, device=device)
         )
@@ -1878,7 +1914,8 @@ def test_cudnn_attention_topk_preparation_preserves_valid_prefix():
     torch.testing.assert_close(topk_length, torch.tensor([[3, 2]], dtype=torch.int32))
 
 
-def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch, topk_tie_break):
     seen = {}
 
     def fake_indexer_topk(
@@ -1902,6 +1939,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         packed_max_seqlen_k=None,
         packed_cp_size=1,
         varlen_is_plain_causal=False,
+        topk_tie_break=None,
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -1918,6 +1956,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         seen["local_packed_cp_query_start"] = local_packed_cp_query_start
         seen["local_packed_cp_query_len"] = local_packed_cp_query_len
         seen["varlen_is_plain_causal"] = varlen_is_plain_causal
+        seen["topk_tie_break"] = topk_tie_break
         return (
             torch.tensor([[[1, 0, -1], [2, 1, 0]]], dtype=torch.int32),
             torch.tensor([[2, 3]], dtype=torch.int32),
@@ -1940,6 +1979,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         use_local_indexer_varlen=True,
         single_packed_thd_sequence=True,
         local_packed_cp_rank=7,
+        topk_tie_break=topk_tie_break,
     )
 
     torch.testing.assert_close(
@@ -1958,6 +1998,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
     assert seen["use_local_indexer_varlen"] is True
     assert seen["single_packed_thd_sequence"] is True
     assert seen["local_packed_cp_rank"] == 7
+    assert seen["topk_tie_break"] == topk_tie_break
 
 
 @pytest.mark.parametrize("hook", ["split_topk", "split_topk_loss", "full_fusion"])
@@ -2024,9 +2065,11 @@ def test_cudnn_fused_hooks_reject_non_relu_scoring(hook):
             )
 
 
-def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatch):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatch, topk_tie_break):
     class Config:
         kv_lora_rank = 512
+        _dsa_indexer_topk_tie_break = topk_tie_break
 
     seen = {}
 
@@ -2051,6 +2094,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_max_seqlen_k=None,
         packed_cp_size=1,
         varlen_is_plain_causal=False,
+        topk_tie_break=None,
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -2062,6 +2106,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         seen["local_packed_cp_query_start"] = local_packed_cp_query_start
         seen["local_packed_cp_query_len"] = local_packed_cp_query_len
         seen["varlen_is_plain_causal"] = varlen_is_plain_causal
+        seen["topk_tie_break"] = topk_tie_break
         return (
             torch.tensor([[[1, 0], [2, -1]]], dtype=torch.int32),
             torch.tensor([[2, 1]], dtype=torch.int32),
@@ -2127,6 +2172,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
     assert seen["single_packed_thd_sequence"] is False
     assert seen["local_packed_cp_rank"] == 0
     assert seen["varlen_is_plain_causal"] is True
+    assert seen["topk_tie_break"] == topk_tie_break
     assert seen["tp_group"] is pg_collection.tp
     assert seen["d_v"] == Config.kv_lora_rank
     torch.testing.assert_close(
@@ -2416,6 +2462,7 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_max_seqlen_k=None,
         packed_cp_size=1,
         varlen_is_plain_causal=False,
+        topk_tie_break=None,
     ):
         del (
             single_packed_thd_sequence,
@@ -2779,7 +2826,10 @@ def test_cudnn_attention_backward_sanitizes_ignored_topk_slots(monkeypatch, sour
         torch.testing.assert_close(key.grad, torch.zeros_like(key.grad))
 
 
-def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen(monkeypatch):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen(
+    monkeypatch, topk_tie_break
+):
     seen = {}
 
     class FakeDSA:
@@ -2798,6 +2848,7 @@ def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen
 
     def fake_indexer_topk(*args, **kwargs):
         assert kwargs["use_local_indexer_varlen"] is True
+        assert kwargs["topk_tie_break"] == topk_tie_break
         return (
             torch.tensor([[[0, -1, -1], [0, 1, -1]]], dtype=torch.int32),
             torch.tensor([[1, 2]], dtype=torch.int32),
@@ -2828,6 +2879,7 @@ def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen
         varlen_starts=torch.tensor([0, 0], dtype=torch.int64),
         varlen_ends=torch.tensor([1, 2], dtype=torch.int64),
         use_local_indexer_varlen=True,
+        topk_tie_break=topk_tie_break,
     )
 
     output.float().sum().backward()
@@ -3379,8 +3431,10 @@ def test_cudnn_full_fusion_declines_unsupported_flashmla_value_dim(monkeypatch):
     )
 
 
-def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch):
+@pytest.mark.parametrize("topk_tie_break", [None, 0, 1, 2])
+def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch, topk_tie_break):
     class Config:
+        _dsa_indexer_topk_tie_break = topk_tie_break
         dsa_kernel_backend = "cudnn"
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
@@ -3410,11 +3464,13 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_tie_break=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
         seen["varlen_starts"] = varlen_starts
         seen["use_local_indexer_varlen"] = use_local_indexer_varlen
+        seen["topk_tie_break"] = topk_tie_break
         return torch.zeros(
             (query.size(0), query.size(1), query.size(2) * d_v),
             dtype=query.dtype,
@@ -3466,11 +3522,13 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
     assert seen["sparse_loss"] is False
     assert seen["loss_coeff"] == 0.0
     assert seen["use_local_indexer_varlen"] is True
+    assert seen["topk_tie_break"] == topk_tie_break
     torch.testing.assert_close(seen["varlen_starts"], torch.tensor([0, 2], dtype=torch.int64))
 
 
 def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeypatch):
     class Config:
+        _dsa_indexer_topk_tie_break = None
         dsa_kernel_backend = "cudnn"
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
@@ -3500,6 +3558,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_tie_break=None,
     ):
         seen["loss_coeff"] = loss_coeff
         seen["sparse_loss"] = sparse_loss
@@ -3558,6 +3617,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
 
 def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypatch):
     class Config:
+        _dsa_indexer_topk_tie_break = None
         dsa_kernel_backend = "cudnn"
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
@@ -3587,6 +3647,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_tie_break=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -3709,6 +3770,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
     """
 
     class Config:
+        _dsa_indexer_topk_tie_break = None
         dsa_kernel_backend = "cudnn"
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
@@ -3738,6 +3800,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_tie_break=None,
     ):
         seen["called"] = True
         seen["varlen_starts"] = varlen_starts

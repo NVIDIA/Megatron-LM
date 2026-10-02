@@ -4,6 +4,8 @@ import copy
 import logging
 import math
 import warnings
+from argparse import ArgumentParser
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -61,6 +63,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     scatter_topk_into_index_mask,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.training.argument_utils import ArgumentGroupFactory
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -670,10 +673,15 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
     assert "backend returned None" in caplog.text
 
 
-def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
+@pytest.mark.parametrize(
+    ("backend", "tie_break"),
+    [("tilelang", None), ("cudnn", None), ("cudnn", 0), ("cudnn", 1), ("cudnn", 2)],
+)
+def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch, backend, tie_break):
     class Config:
         attention_backend = "auto"
-        dsa_kernel_backend = "tilelang"
+        dsa_kernel_backend = backend
+        _dsa_indexer_topk_tie_break = tie_break
 
     q = torch.zeros((1, 1, 1, 1))
     k = torch.ones((1, 1, 1, 1))
@@ -733,6 +741,10 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     assert seen["topk_kwargs"]["packed_thd_causal_identity_layout"] is False
     assert seen["topk_kwargs"]["packed_thd_single_sequence"] is True
     assert seen["topk_kwargs"]["local_packed_cp_rank"] == 3
+    if backend == "cudnn":
+        assert seen["topk_kwargs"]["topk_tie_break"] == tie_break
+    else:
+        assert "topk_tie_break" not in seen["topk_kwargs"]
     assert (
         dsa_kernels.run_fused_qk_topk_with_loss(
             Config,
@@ -4247,6 +4259,58 @@ class TestDSAModuleSpecDispatch:
         """DSA can use the absorbed-MLA fused path with standard RoPE."""
         config = self._make_dsa_config(experimental_attention_variant="dsa", apply_rope_fusion=True)
         assert config.apply_rope_fusion
+
+    @pytest.mark.parametrize(
+        ("tie_break", "overrides", "expected", "error"),
+        [
+            (None, {}, None, None),
+            ("none", {}, 0, None),
+            ("small", {}, 1, None),
+            ("large", {}, 2, None),
+            (None, {"dsa_kernel_backend": "none"}, None, None),
+            ("invalid", {}, None, "must be None"),
+            ("small", {"experimental_attention_variant": None}, None, "requires"),
+            ("small", {"experimental_attention_variant": "dsv4_hybrid"}, None, "requires"),
+            ("small", {"dsa_kernel_backend": "none"}, None, "requires"),
+            ("small", {"dsa_kernel_backend": "tilelang"}, None, "requires"),
+            ("small", {"attention_backend": "unfused"}, None, "requires"),
+        ],
+    )
+    def test_dsa_indexer_topk_tie_break_config_and_cli(
+        self, monkeypatch, tie_break, overrides, expected, error
+    ):
+        field_name = "dsa_indexer_topk_tie_break"
+        config_fields = {field.name for field in fields(MLATransformerConfig)}
+        assert "_dsa_indexer_topk_tie_break" not in config_fields
+        parser = ArgumentParser()
+        ArgumentGroupFactory(
+            MLATransformerConfig, exclude=sorted(config_fields - {field_name})
+        ).build_group(parser)
+        cli_args = [] if tie_break is None else ["--dsa-indexer-topk-tie-break", tie_break]
+        if tie_break == "invalid":
+            with pytest.raises(SystemExit):
+                parser.parse_args(cli_args)
+        else:
+            assert getattr(parser.parse_args(cli_args), field_name) == tie_break
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config."
+            "_validate_dsa_kernel_backend_dependencies",
+            lambda _backend: None,
+        )
+        kwargs = {
+            "experimental_attention_variant": "dsa",
+            "dsa_kernel_backend": "cudnn",
+            field_name: tie_break,
+            **overrides,
+        }
+        if error is not None:
+            with pytest.raises(ValueError, match=f"dsa_indexer_topk_tie_break {error}"):
+                self._make_dsa_config(**kwargs)
+        else:
+            config = self._make_dsa_config(**kwargs)
+            assert config.dsa_indexer_topk_tie_break == tie_break
+            assert config._dsa_indexer_topk_tie_break == expected
 
     def test_dsa_cp_requires_allgather_cp_comm_type(self):
         """DSA context parallelism should fail early for unsupported CP communication."""
