@@ -60,6 +60,7 @@ from tests.unit_tests.inference.test_endpoints_common import (
     CHAT_BODY,
     CHAT_PATH,
     NOT_A_NUMBER_ERROR,
+    NOT_AN_INT_ERROR,
     ReplyingClient,
     Tokenizer,
     build_app,
@@ -1607,8 +1608,8 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
         pytest.param(
             {"messages": "hi"}, {}, 400, "'messages' must be a list", id="messages-not-a-list"
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # A sampling field of the wrong type is a client error, whether the conversion raises
+        # ValueError or TypeError.
         pytest.param(
             {**CHAT_BODY, "temperature": "hot"},
             {},
@@ -1616,7 +1617,7 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 500, None, id="top-k-list"),
+        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 400, NOT_AN_INT_ERROR, id="top-k-list"),
         pytest.param(
             {"messages": [{"role": "user", "content": [_FTP_IMAGE]}]},
             {},
