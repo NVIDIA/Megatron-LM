@@ -430,17 +430,17 @@ def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunke
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 3, 1, 1), device=device),
-        torch.zeros((1, 4, 1), device=device),
+        torch.zeros((1, 8, 1), device=device),
         torch.zeros((1, 3, 1), device=device),
         topk=2,
         varlen_starts=torch.zeros(3, dtype=torch.int64, device=device),
-        varlen_ends=torch.full((3,), 4, dtype=torch.int64, device=device),
+        varlen_ends=torch.full((3,), 8, dtype=torch.int64, device=device),
         return_scores=False,
         use_local_indexer_varlen=True,
     )
 
     torch.testing.assert_close(
-        topk_indices, torch.tensor([[[2, 3]] * 3], dtype=torch.int32, device=device)
+        topk_indices, torch.tensor([[[6, 7]] * 3], dtype=torch.int32, device=device)
     )
     torch.testing.assert_close(
         topk_length, torch.tensor([[2, 2, 2]], dtype=torch.int32, device=device)
