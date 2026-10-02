@@ -19,7 +19,11 @@ from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Placements, fully_shard
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
     FsdpMuon,
     FsdpOrthogonalizedOptimizer,
@@ -164,8 +168,9 @@ def _make_fsdp_model(device: torch.device, mesh, seed: int = 1234) -> TinyModel:
     """Build the sharded `TinyModel` with deterministic initial weights."""
     torch.manual_seed(seed)
     model = TinyModel().to(device)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     return model
 
 
@@ -272,7 +277,8 @@ def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setu
 
     torch.manual_seed(1234)
     model = BoundaryModel(rows, in_features).to(device)
-    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
 
     # Assert the single parameter is a boundary parameter on this rank.
     fsdp_group = get_containing_parameter_group(cast(nn.Parameter, model.fc.weight))
@@ -311,8 +317,9 @@ def test_step_mixed_params_with_separate_optimizer(distributed_setup):
 
     torch.manual_seed(1234)
     model = MixedModel().to(device)
-    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
 
     torch.manual_seed(1234)
     baseline = MixedModel().to(device)
@@ -360,13 +367,15 @@ def test_contraction_matches_2d(distributed_setup):
 
     torch.manual_seed(1234)
     model_2d = ContractionModel(SHAPES_2D).to(device)
-    fully_shard(model_2d.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model_2d.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model_2d.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model_2d.fc2, mesh=mesh, placements=_flat_placements())
 
     torch.manual_seed(1234)
     model_nd = ContractionModel(SHAPES_ND).to(device)
-    fully_shard(model_nd.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model_nd.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model_nd.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model_nd.fc2, mesh=mesh, placements=_flat_placements())
 
     opt_2d = FsdpMuon(
         model_2d.parameters(), inner_optimizer=_make_muon(model_2d.parameters()), dp_mesh=mesh
@@ -408,7 +417,8 @@ def test_base_class_1d_params_error_at_kernel(distributed_setup):
 
     torch.manual_seed(1234)
     model = NonMatrixModel().to(device)
-    fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
 
     base_opt = FsdpOrthogonalizedOptimizer(
         model.parameters(), inner_optimizer=_make_muon(model.parameters()), dp_mesh=mesh
