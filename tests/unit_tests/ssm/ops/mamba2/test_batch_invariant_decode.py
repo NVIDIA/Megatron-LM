@@ -54,6 +54,14 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
         _pin_mamba_autotuners()
 
+    @classmethod
+    def tearDownClass(cls):
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            _unpin_mamba_autotuners,
+        )
+
+        _unpin_mamba_autotuners()
+
     def setUp(self):
         torch.manual_seed(0)
         # No global flags: batch_invariant_decode_buffered_scan is a pure tensor-ops function

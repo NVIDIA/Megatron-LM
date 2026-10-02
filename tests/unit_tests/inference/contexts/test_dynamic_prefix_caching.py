@@ -39,6 +39,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
+    reset_rounder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -55,6 +56,9 @@ class PrefixCachingTestBase:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        reset_rounder()
 
     @staticmethod
     def _mamba_config(mamba_chunk_size=128):
@@ -3330,9 +3334,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         try:
             self._run_engine_case(case)
         finally:
-            DynamicInferenceContext.ROUNDER = 64
-            DynamicInferenceContext.TOKEN_ROUNDER = 64
-            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            reset_rounder()
             Utils.destroy_model_parallel()
 
 
