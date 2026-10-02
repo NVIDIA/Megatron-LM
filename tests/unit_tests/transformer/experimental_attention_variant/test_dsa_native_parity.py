@@ -404,7 +404,10 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
 
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("real_topk", [False, True])
-def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunked, real_topk):
+@pytest.mark.parametrize("topk", [2, 8])
+def test_cudnn_indexer_topk_tie_break_preserves_device_policy(
+    monkeypatch, chunked, real_topk, topk
+):
     if real_topk:
         _skip_if_fused_dsa_unavailable(require_flash_mla=False)
     device = "cuda" if real_topk else "cpu"
@@ -412,17 +415,28 @@ def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunke
     class FakeDSA:
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
-            assert tie_break == 2
+            assert tie_break == int(top_k < 8)
             assert return_val is False
             torch.testing.assert_close(scores_flat, torch.zeros_like(scores_flat), rtol=0, atol=0)
             indices = (
-                scores_flat.size(-1)
-                - 1
-                - scores_flat.flip(-1).argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+                scores_flat.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
+                if tie_break
+                else scores_flat.topk(top_k, dim=-1).indices
             )
             return {"indices": indices.to(torch.int32), "values": None}
 
-    if not real_topk:
+    if real_topk:
+        dsa_cudnn_kernels._ensure_dsa_namespace()
+        native_topk = dsa_cudnn_kernels._cudnn_dsa.indexer_top_k_wrapper
+
+        def checked_native_topk(*args, **kwargs):
+            assert kwargs["tie_break"] == 0
+            return native_topk(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dsa_cudnn_kernels._cudnn_dsa, "indexer_top_k_wrapper", checked_native_topk
+        )
+    else:
         monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
         monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
     if chunked:
@@ -432,18 +446,21 @@ def test_cudnn_indexer_topk_tie_break_prefers_larger_indices(monkeypatch, chunke
         torch.zeros((1, 3, 1, 1), device=device),
         torch.zeros((1, 8, 1), device=device),
         torch.zeros((1, 3, 1), device=device),
-        topk=2,
+        topk=topk,
         varlen_starts=torch.zeros(3, dtype=torch.int64, device=device),
         varlen_ends=torch.full((3,), 8, dtype=torch.int64, device=device),
         return_scores=False,
         use_local_indexer_varlen=True,
     )
 
+    if not real_topk:
+        torch.testing.assert_close(
+            topk_indices, torch.arange(topk, dtype=torch.int32).view(1, 1, topk).expand(1, 3, -1)
+        )
+    assert ((topk_indices >= 0) & (topk_indices < 8)).all()
+    assert (topk_indices[..., 1:] > topk_indices[..., :-1]).all()
     torch.testing.assert_close(
-        topk_indices, torch.tensor([[[6, 7]] * 3], dtype=torch.int32, device=device)
-    )
-    torch.testing.assert_close(
-        topk_length, torch.tensor([[2, 2, 2]], dtype=torch.int32, device=device)
+        topk_length, torch.full((1, 3), topk, dtype=torch.int32, device=device)
     )
 
 
@@ -604,15 +621,11 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equa
         @staticmethod
         def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val, tie_break):
             del next_n
-            assert tie_break == 2
+            assert tie_break == 1
             masked_scores = scores.clone()
             key_ids = torch.arange(scores.size(1)).view(1, -1)
             masked_scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
-            indices = (
-                scores.size(-1)
-                - 1
-                - masked_scores.flip(-1).argsort(dim=-1, descending=True, stable=True)[:, :top_k]
-            )
+            indices = masked_scores.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
             values = masked_scores.gather(-1, indices)
             return {"indices": indices.to(torch.int32), "values": values if return_val else None}
 
@@ -654,7 +667,11 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch, equa
     expected_lengths = []
     for position, start in zip(query_positions.tolist(), starts.tolist()):
         valid_count = position - start + 1
-        row = list(range(position, max(start - 1, position - 3), -1))
+        row = (
+            list(range(start, min(position + 1, start + 3)))
+            if equal_scores
+            else list(range(position, max(start - 1, position - 3), -1))
+        )
         expected_indices.append(row + [-1] * (3 - len(row)))
         local_scores = [0 if equal_scores else value - start for value in row]
         expected_scores.append(
@@ -1578,11 +1595,8 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
 # kernel/build root cause is resolved.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
-@pytest.mark.parametrize("equal_scores", [False, True])
-def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_alignment(
-    monkeypatch, equal_scores
-):
-    _skip_if_fused_dsa_unavailable(require_flash_mla=False)
+def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_alignment(monkeypatch):
+    _skip_if_fused_dsa_unavailable()
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda *_args: 1)
 
     query = torch.zeros((1, 4, 32, 128), device="cuda", dtype=torch.bfloat16)
@@ -1590,7 +1604,7 @@ def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_align
     key = torch.zeros((1, 16, 128), device="cuda", dtype=torch.bfloat16)
     key[..., 0] = torch.arange(16, device="cuda", dtype=torch.bfloat16)
     weights = torch.zeros((1, 4, 32), device="cuda", dtype=torch.bfloat16)
-    weights[..., 0] = 0 if equal_scores else 1
+    weights[..., 0] = 1
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         query,
         key,
@@ -1621,11 +1635,7 @@ def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_align
     )
     torch.testing.assert_close(
         sorted_scores.cpu(),
-        (
-            torch.zeros((1, 4, 2))
-            if equal_scores
-            else torch.tensor([[[1.0, 2.0], [2.0, 3.0], [11.0, 12.0], [12.0, 13.0]]])
-        ),
+        torch.tensor([[[1.0, 2.0], [2.0, 3.0], [11.0, 12.0], [12.0, 13.0]]]),
         rtol=0,
         atol=0,
     )
@@ -1764,7 +1774,7 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
 
 @pytest.mark.parametrize(
     "scores, expected_indices",
-    [([0.0, 0.0, 0.0, 0.0], [2, 3]), ([0.0, 3.0e-13, 1.0e-13, 0.0], [1, 2])],
+    [([0.0, 0.0, 0.0, 0.0], [0, 1]), ([0.0, 3.0e-13, 1.0e-13, 0.0], [1, 2])],
 )
 @pytest.mark.parametrize("real_topk", [False, True])
 def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
@@ -1778,14 +1788,10 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
     class FakeDSA:
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val, tie_break):
-            assert tie_break == 2
+            assert tie_break == 1
             assert return_val is True
             torch.testing.assert_close(scores_flat, original_scores, rtol=0, atol=0)
-            indices = (
-                scores_flat.size(-1)
-                - 1
-                - scores_flat.flip(-1).argsort(dim=-1, descending=True, stable=True)[:, :top_k]
-            )
+            indices = scores_flat.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
             return {"indices": indices.to(torch.int32), "values": scores_flat.gather(-1, indices)}
 
     if not real_topk:
@@ -1804,10 +1810,13 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(
         use_local_indexer_varlen=True,
     )
 
-    torch.testing.assert_close(
-        topk_indices.sort(dim=-1).values,
-        torch.tensor([[expected_indices]], dtype=torch.int32, device=device),
-    )
+    sorted_indices = topk_indices.sort(dim=-1).values
+    assert ((sorted_indices >= 0) & (sorted_indices < 4)).all()
+    assert (sorted_indices[..., 1:] > sorted_indices[..., :-1]).all()
+    if not real_topk or any(scores):
+        torch.testing.assert_close(
+            sorted_indices, torch.tensor([[expected_indices]], dtype=torch.int32, device=device)
+        )
     torch.testing.assert_close(topk_length, torch.tensor([[2]], dtype=torch.int32, device=device))
     torch.testing.assert_close(
         topk_scores,

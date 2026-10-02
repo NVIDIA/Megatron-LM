@@ -527,13 +527,13 @@ def _normalize_plain_causal_bounds(
 def _indexer_top_k_wrapper_chunked(
     scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
 ) -> dict:
-    """Run cuDNN top-k in row chunks, preferring larger key indices on exact ties.
+    """Run cuDNN top-k in row chunks with the existing device-specific tie policy.
 
-    Score columns preserve logical key order after CP reordering and prefix cropping;
-    packed sequence offsets are restored after selection. No score perturbation is needed.
-    Requires cuDNN Frontend's native tie-break API (NVIDIA/cudnn-frontend#1332).
+    Preserve smaller-index ties for CPU parity and arbitrary ties on CUDA, using
+    cuDNN Frontend's native API (NVIDIA/cudnn-frontend#1332) without score perturbation.
     """
     n_rows, sk = scores_flat.shape
+    tie_break = 1 if topk_k < sk and not scores_flat.is_cuda else 0
     scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
     scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
     chunk_rows = _bytes_to_chunk_rows(
@@ -547,7 +547,7 @@ def _indexer_top_k_wrapper_chunked(
             top_k=topk_k,
             next_n=1,
             return_val=return_topk_scores,
-            tie_break=2,
+            tie_break=tie_break,
         )
 
     indices_chunks = []
@@ -560,7 +560,7 @@ def _indexer_top_k_wrapper_chunked(
             top_k=topk_k,
             next_n=1,
             return_val=return_topk_scores,
-            tie_break=2,
+            tie_break=tie_break,
         )
         indices_chunks.append(tk_result["indices"])
         if return_topk_scores:
