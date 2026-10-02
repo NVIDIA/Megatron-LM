@@ -1505,11 +1505,11 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
 
 
 def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
-    """Whether DeepEP fused permutation pads input for TE grouped-tensor GEMM."""
+    """Whether DeepEP v1/v2 fused permutation pads input for TE grouped-tensor GEMM."""
     return (
         config.moe_use_grouped_tensor
         and config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
         and config.moe_permute_fusion
         and fused_permute_and_pad_with_probs is not None
     )
