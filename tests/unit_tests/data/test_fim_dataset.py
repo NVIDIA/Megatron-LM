@@ -10,6 +10,9 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from tests.unit_tests.test_utilities import Utils
 
 
+# Skipped in dev: fails when /opt/data is mounted read-only, because the dataset writes its
+# index cache next to /opt/data/datasets/fim (OSError: [Errno 30] Read-only file system).
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("spm_rate", [0.0, 1.0])
 @pytest.mark.parametrize("split_sample", [None, "python"])
 @pytest.mark.usefixtures("ensure_test_data")

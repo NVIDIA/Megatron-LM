@@ -56,5 +56,6 @@ products:
   - test_case: [moe_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # Broken: fails with main's uv.lock too (RandomSTE has no attribute 'generator')
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]

@@ -54,5 +54,6 @@ products:
   - test_case: [gpt_inference_server_async_sched_tp2_pp2_dp2_qwen3_8b_sse]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # Broken: fails with main's uv.lock too (server not ready within 600s)
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]

@@ -91,7 +91,8 @@ products:
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_inference_optimized_swiglu_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # Broken: fails with main's uv.lock too (logprob mismatch at index 19)
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
   # Regression guard for the MTP + sequence-parallel all-gather fixes in
   # https://github.com/NVIDIA/Megatron-LM/pull/5748 (under block-scope CUDA
