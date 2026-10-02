@@ -792,6 +792,12 @@ def _get_megatron_emerging_optimizer(
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
+    if eopt_name == 'muon' and config.use_distributed_optimizer and not use_layer_wise:
+        raise ValueError(
+            "Muon with use_distributed_optimizer=True requires "
+            "use_layer_wise_distributed_optimizer=True."
+        )
+
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
