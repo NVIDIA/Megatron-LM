@@ -714,12 +714,14 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
     """Reject the unsafe full-backward-hook path before releasing frozen weights."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
-    model[1].requires_grad_(False)
+    trainable_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear.requires_grad_(False)
+    model = nn.Sequential(trainable_linear, frozen_linear).to(device)
     # The parent owns only frozen weights, but backward must reach its child
     # even though the parent's input does not require gradients.
     with fully_shard_context(device=device):
-        fully_shard(model[0], mesh=mesh, placements=_default_placements())
+        fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     assert all(not group.requires_grad for group in model.parameter_groups)
