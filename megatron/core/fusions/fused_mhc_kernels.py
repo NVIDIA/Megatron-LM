@@ -18,6 +18,10 @@ Determinism:
   The native, Triton, and cuTile backends are currently tagged ``unknown``.
   Numerical and gradient parity are covered, but bit-exact repeatability has
   not been certified. The accelerated backends use timing-based autotuning.
+  When torch deterministic algorithms are enabled, the Triton Sinkhorn kernels
+  and the H_post BDA weight-gradient reduction bypass their autotuners and
+  launch with fixed configurations, because the selected configuration changes
+  their floating-point reduction order. The cuTile kernels keep autotuning.
 """
 
 import logging
