@@ -23,7 +23,6 @@ Public API:
 from __future__ import annotations
 
 import inspect
-from collections import OrderedDict
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -173,111 +172,19 @@ def _ensure_dsa_namespace():
 
 # Query-head counts supported by cuDNN's deterministic sparse-attention backward.
 _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
-# Retain only the largest scratch buffer per device. Warm up all graph shapes (including the
-# largest workspace) before capture, and do not grow the workspace after capturing a graph.
-_DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict = {}
-# Shape metadata contains no tensor references; bound it for variable-length workloads too.
-_DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES: OrderedDict = OrderedDict()
-_DETERMINISTIC_SPARSE_BWD_WORKSPACE_CACHE_SIZE = 128
 
 
-def _deterministic_requested(flag: bool = False) -> bool:
-    """Select the opt-in MCore path only for the explicit ``deterministic_mode`` flag.
-
-    PyTorch's global switch alone does not opt into replacement external kernels or their
-    stricter hardware/feature requirements.
-    """
-    return bool(flag)
-
-
-def _get_deterministic_sparse_attention_workspace(
-    q_flat: Tensor,
-    kv_flat: Tensor,
-    out_flat: Tensor,
-    lse: Tensor,
-    attn_sink: Tensor,
-    topk_idxs: Tensor,
-    topk_length: Optional[Tensor],
-    softmax_scale: float,
-) -> Tensor:
-    """Reuse a grow-only per-device buffer and cache cuDNN's shape-dependent size queries.
-
-    Calls on a device must be serialized. Before CUDA graph capture, eagerly run the complete
-    backward for every capture shape and the maximum workspace to warm cuDNN's kernels too.
-    Cache misses and buffer growth during capture are rejected before querying/allocating.
-    """
-    device = q_flat.device
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    samples = (q_flat, kv_flat, out_flat, lse, attn_sink, topk_idxs, topk_length)
-    key = (
-        _DSA.SparseAttentionBackward,
-        device,
-        softmax_scale,
-        tuple(
-            (tuple(t.shape), tuple(t.stride()), t.dtype, t.device) if t is not None else None
-            for t in samples
-        ),
-    )
-    capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-    sizes = _DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES
-    if key not in sizes:
-        if capturing:
-            raise RuntimeError(
-                "Warm up deterministic sparse-attention shapes before CUDA graph capture."
-            )
-        backward_api = _DSA.SparseAttentionBackward(
-            sample_q=q_flat,
-            sample_kv=kv_flat,
-            sample_out=out_flat,
-            sample_dout=out_flat,
-            sample_lse=lse,
-            sample_attn_sink=attn_sink,
-            sample_topk_idxs=topk_idxs,
-            sample_topk_length=topk_length,
-            softmax_scale=softmax_scale,
-            deterministic=True,
-        )
-        if not backward_api.check_support():
-            raise RuntimeError(
-                "deterministic mode: cuDNN rejected the deterministic DSA "
-                "sparse-attention backward "
-                "for this problem shape."
-            )
-        sizes[key] = int(backward_api.scratch_workspace_bytes())
-        if len(sizes) > _DETERMINISTIC_SPARSE_BWD_WORKSPACE_CACHE_SIZE:
-            sizes.popitem(last=False)
-    sizes.move_to_end(key)
-    required_bytes = sizes[key]
-    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(device)
-    if workspace is None or workspace.numel() < required_bytes:
-        if capturing:
-            raise RuntimeError(
-                "Warm up the maximum deterministic sparse-attention workspace before capture."
-            )
-        workspace = torch.empty(required_bytes, dtype=torch.uint8, device=device)
-        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[device] = workspace
-    return workspace
-
-
-def _deterministic_sparse_bwd_kwargs(
-    q_flat: Tensor,
-    kv_flat: Tensor,
-    out_flat: Tensor,
-    lse: Tensor,
-    attn_sink: Tensor,
-    topk_idxs: Tensor,
-    topk_length: Optional[Tensor],
-    softmax_scale: float,
-    requested: bool = False,
-) -> dict:
+def _deterministic_sparse_bwd_kwargs(q_flat: Tensor, requested: bool) -> dict:
     """Extra kwargs that switch ``sparse_attention_backward_wrapper`` to its deterministic kernel.
 
-    Returns ``{}`` unless deterministic execution was requested. When it was requested but the
-    installed cuDNN frontend / GPU / head count cannot provide the kernel, raise instead of
-    silently running the atomic version, so a deterministic run never degrades unnoticed.
+    Returns ``{}`` unless deterministic execution was requested. Only the ``deterministic``
+    argument selects this kernel; ``torch.use_deterministic_algorithms`` alone keeps the default
+    one. When it was requested but the installed cuDNN frontend, GPU or head count cannot provide
+    the kernel, raise instead of silently running the atomic version. The wrapper allocates the
+    kernel's scratch workspace for each call from PyTorch's caching allocator, so the scratch
+    follows the current stream and CUDA graph memory pools like any other temporary tensor.
     """
-    if not _deterministic_requested(requested):
+    if not requested:
         return {}
     _ensure_dsa_namespace()
     wrapper = getattr(_DSA, "sparse_attention_backward_wrapper", None)
@@ -285,14 +192,10 @@ def _deterministic_sparse_bwd_kwargs(
         parameters = inspect.signature(wrapper).parameters if wrapper is not None else {}
     except (TypeError, ValueError):
         parameters = {}
-    if (
-        "deterministic" not in parameters
-        or "workspace" not in parameters
-        or getattr(_DSA, "SparseAttentionBackward", None) is None
-    ):
+    if "deterministic" not in parameters:
         raise RuntimeError(
             "deterministic mode: the installed cudnn-frontend has no deterministic DSA "
-            "sparse-attention backward (needs nvidia-cudnn-frontend >= 1.28)."
+            "sparse-attention backward (needs nvidia-cudnn-frontend >= 1.29)."
         )
     num_heads = q_flat.shape[-2]
     capability = torch.cuda.get_device_capability(q_flat.device)[0] if q_flat.is_cuda else None
@@ -302,12 +205,7 @@ def _deterministic_sparse_bwd_kwargs(
             f"SM100 GPU and a query-head count in {sorted(_DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS)}; "
             f"got sm{capability}0 with {num_heads} heads."
         )
-    return {
-        "deterministic": True,
-        "workspace": _get_deterministic_sparse_attention_workspace(
-            q_flat, kv_flat, out_flat, lse, attn_sink, topk_idxs, topk_length, softmax_scale
-        ),
-    }
+    return {"deterministic": True}
 
 
 # cuDNN's sparse-indexer backward accumulates dK with atomics (and dW on SM90). In deterministic
@@ -500,17 +398,7 @@ def _csa_sparse_attention_backward(
         topk_idxs,
         softmax_scale=softmax_scale,
         topk_length=topk_length,
-        **_deterministic_sparse_bwd_kwargs(
-            q,
-            kv,
-            out,
-            lse,
-            attn_sink,
-            topk_idxs,
-            topk_length,
-            softmax_scale,
-            requested=deterministic,
-        ),
+        **_deterministic_sparse_bwd_kwargs(q, requested=deterministic),
     )
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
     if padded_num_heads != actual_num_heads:
@@ -806,7 +694,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
-        ctx.deterministic = _deterministic_requested(deterministic)
+        ctx.deterministic = deterministic
         return out, lse, lse_indexer
 
     @staticmethod
@@ -851,7 +739,8 @@ def csa_sparse_attn(
             ``None`` when ``indexer_topk > 0`` (FlashMLA constraint).
         indexer_topk: int; ``0`` for Paths A/C, positive for Path B to enable
             FlashMLA's ``lse_indexer`` output.
-        deterministic: request deterministic cuDNN backward, also enabled by torch's global flag.
+        deterministic: use cuDNN's deterministic sparse-attention backward (SM100 only).
+            ``torch.use_deterministic_algorithms`` alone does not select it.
 
     Returns:
         ``(sq, b, np * d_v)`` bf16 output.
@@ -987,7 +876,7 @@ def _indexer_topk_bshd(
     seq_lens = valid_per_q.repeat(b)  # (b*sq,), row-major over (b, sq)
 
     topk_k = min(topk, sk)
-    if _deterministic_requested(deterministic):
+    if deterministic:
         topk_indices = _stable_topk_indices(scores_flat, seq_lens, topk_k)
     else:
         tk_result = _DSA.indexer_top_k_wrapper(
@@ -1055,7 +944,8 @@ def indexer_topk(
             the weights-scaling trick (``relu(c·x) = c·relu(x)`` for
             ``c > 0``) so the caller passes raw weights. Default ``1.0``
             means weights are treated as already-scaled.
-        deterministic: request fixed Top-K selection and ordering, also enabled by torch globally.
+        deterministic: select Top-K with a stable sort, resolving score ties toward the
+            smallest key id. ``torch.use_deterministic_algorithms`` alone does not select it.
 
     Returns:
         topk_indices: ``(b, sq, topk)`` int32 — local per-batch indices into
@@ -1331,7 +1221,6 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
 
-        deterministic = _deterministic_requested(deterministic)
         if deterministic and loss_coeff > 0 and not sparse_loss:
             raise RuntimeError(
                 "deterministic CSA indexer backward requires dsa_indexer_use_sparse_loss=True; "
@@ -1658,8 +1547,9 @@ def fused_csa_indexer_sparse_attn(
         kv_offset:    start of compressed region within ``kv_full``.
         calculate_per_token_loss: if True, report raw local KL sum and
             compensate the cuDNN backward wrappers' local averaging.
-        deterministic: use stable Top-K and deterministic sparse backward kernels. Requires
-            sparse loss when indexer loss is enabled; also follows torch's global flag.
+        deterministic: use stable Top-K, cuDNN's deterministic sparse-attention backward and
+            fixed-order sparse indexer dK/dW. Requires sparse loss when indexer loss is
+            enabled. ``torch.use_deterministic_algorithms`` alone does not select these.
 
     Returns:
         ``(output, indexer_loss)`` where ``output`` is ``(sq, b, np * d_v)``

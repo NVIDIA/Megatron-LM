@@ -3,7 +3,6 @@
 """Numerical and replay coverage for deterministic CSA indexer gradients."""
 
 import os
-from collections import OrderedDict
 from types import SimpleNamespace
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -147,23 +146,32 @@ def test_stable_topk_ties_causal_padding_and_short_keys(monkeypatch, global_mode
 
 
 def test_deterministic_backward_rejects_missing_cudnn_api(monkeypatch):
-    from types import SimpleNamespace
-
     monkeypatch.setattr(dk, "_DSA", SimpleNamespace(sparse_attention_backward_wrapper=lambda: None))
     q = torch.zeros(1, 16, 8)
-    with pytest.raises(RuntimeError, match="no deterministic DSA"):
-        dk._deterministic_sparse_bwd_kwargs(q, q, q, q, q, q, None, 1.0, requested=True)
+    with pytest.raises(RuntimeError, match="no deterministic DSA.*>= 1.29"):
+        dk._deterministic_sparse_bwd_kwargs(q, requested=True)
 
 
-def test_central_sparse_backward_forwards_deterministic_workspace(monkeypatch):
-    from types import SimpleNamespace
+def test_deterministic_backward_requires_sm100_and_supported_heads(monkeypatch):
+    def backward(q, kv, out, dout, lse, sink, indices, *, deterministic=False):
+        raise AssertionError("the support checks must not launch the kernel")
 
-    workspace = torch.empty(8, dtype=torch.uint8)
+    monkeypatch.setattr(dk, "_DSA", SimpleNamespace(sparse_attention_backward_wrapper=backward))
+    with pytest.raises(RuntimeError, match="needs an SM100 GPU"):
+        dk._deterministic_sparse_bwd_kwargs(torch.zeros(1, 16, 8), requested=True)
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10:
+        q = torch.zeros(1, 16, 8, device="cuda")
+        assert dk._deterministic_sparse_bwd_kwargs(q, requested=True) == {"deterministic": True}
+        with pytest.raises(RuntimeError, match="query-head count"):
+            dk._deterministic_sparse_bwd_kwargs(q[:, :8], requested=True)
+
+
+def test_central_sparse_backward_forwards_deterministic_flag(monkeypatch):
     seen = {}
 
-    def deterministic_kwargs(*args, requested):
+    def deterministic_kwargs(q, requested):
         assert requested is True
-        return {"deterministic": True, "workspace": workspace}
+        return {"deterministic": True}
 
     def backward(q, kv, out, dout, lse, sink, indices, **kwargs):
         seen.update(kwargs)
@@ -184,7 +192,8 @@ def test_central_sparse_backward_forwards_deterministic_workspace(monkeypatch):
         None,
         deterministic=True,
     )
-    assert seen["deterministic"] is True and seen["workspace"] is workspace
+    # cuDNN's wrapper allocates its scratch workspace per call when none is passed.
+    assert seen["deterministic"] is True and "workspace" not in seen
     assert torch.equal(dq, torch.ones_like(q))
     assert dkv.shape == kv.shape and dsink.shape == sink.shape
 
@@ -228,109 +237,7 @@ def test_torch_flag_alone_preserves_external_kernel_dispatch(monkeypatch):
         torch.use_deterministic_algorithms(True)
         q = torch.zeros(1, 4, 1, 2)
         dk._indexer_topk_bshd(q, torch.zeros(1, 2, 2), torch.ones(1, 4, 1), 1, 2)
-        assert dk._deterministic_sparse_bwd_kwargs(q, q, q, q, q, q, None, 1.0) == {}
-        assert not dk._deterministic_requested()
+        assert dk._deterministic_sparse_bwd_kwargs(q, requested=False) == {}
     finally:
         torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
     assert len(seen) == 1
-
-
-def test_workspace_reuses_largest_allocation_and_bounds_shape_cache(monkeypatch):
-    calls = []
-
-    class Backward:
-        def __init__(self, **kwargs):
-            self.rows = kwargs["sample_q"].shape[0]
-            calls.append(kwargs)
-
-        def check_support(self):
-            return True
-
-        def scratch_workspace_bytes(self):
-            return self.rows * 8
-
-    monkeypatch.setattr(dk, "_DSA", SimpleNamespace(SparseAttentionBackward=Backward))
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES", OrderedDict())
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACE_CACHE_SIZE", 2)
-
-    def workspace(rows, dtype=torch.float32):
-        q = torch.zeros(rows, 16, 8, dtype=dtype)
-        return dk._get_deterministic_sparse_attention_workspace(q, q, q, q, q, q, None, 1.0)
-
-    largest = workspace(4)
-    assert workspace(2) is largest
-    assert workspace(4) is largest and len(calls) == 2
-    grown = workspace(8)
-    assert grown.numel() == 64 and grown is not largest
-    assert len(dk._DETERMINISTIC_SPARSE_BWD_WORKSPACES) == 1
-    assert len(dk._DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES) == 2
-    assert workspace(4) is grown and len(calls) == 3
-    assert workspace(2) is grown and len(calls) == 4  # Evicted metadata is safely rebuilt.
-    assert workspace(2, torch.bfloat16) is grown and len(calls) == 5
-
-
-def test_workspace_shape_key_distinguishes_strides_and_optional_lengths(monkeypatch):
-    calls = []
-
-    class Backward:
-        def __init__(self, **kwargs):
-            calls.append(kwargs)
-
-        def check_support(self):
-            return True
-
-        def scratch_workspace_bytes(self):
-            return 8
-
-    monkeypatch.setattr(dk, "_DSA", SimpleNamespace(SparseAttentionBackward=Backward))
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES", OrderedDict())
-    q = torch.zeros(2, 2, 2)
-    for sample, lengths, scale in (
-        (q, None, 1.0),
-        (q.clone(), None, 1.0),
-        (q.transpose(0, 1), None, 1.0),
-        (q, torch.ones(2, dtype=torch.int32), 1.0),
-        (q, None, 0.5),
-    ):
-        dk._get_deterministic_sparse_attention_workspace(sample, q, q, q, q, q, lengths, scale)
-    assert len(calls) == 4
-
-
-def test_workspace_requires_eager_warmup_before_capture(monkeypatch):
-    calls = []
-
-    class Backward:
-        def __init__(self, **kwargs):
-            calls.append(kwargs)
-
-        def check_support(self):
-            return True
-
-        def scratch_workspace_bytes(self):
-            return 8
-
-    monkeypatch.setattr(dk, "_DSA", SimpleNamespace(SparseAttentionBackward=Backward))
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACE_SIZES", OrderedDict())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    q = SimpleNamespace(
-        device=torch.device("cuda", 0),
-        shape=(2, 16, 8),
-        dtype=torch.float32,
-        stride=lambda: (128, 8, 1),
-    )
-    with pytest.raises(RuntimeError, match="Warm up.*shapes"):
-        dk._get_deterministic_sparse_attention_workspace(q, q, q, q, q, q, None, 1.0)
-    assert not calls  # No cuDNN support-query construction inside a capture.
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    empty = torch.empty
-    monkeypatch.setattr(torch, "empty", lambda size, **kwargs: empty(size, dtype=torch.uint8))
-    warmed = dk._get_deterministic_sparse_attention_workspace(q, q, q, q, q, q, None, 1.0)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert dk._get_deterministic_sparse_attention_workspace(q, q, q, q, q, q, None, 1.0) is warmed
-    assert len(calls) == 1
-    dk._DETERMINISTIC_SPARSE_BWD_WORKSPACES.clear()
-    with pytest.raises(RuntimeError, match="Warm up the maximum"):
-        dk._get_deterministic_sparse_attention_workspace(q, q, q, q, q, q, None, 1.0)

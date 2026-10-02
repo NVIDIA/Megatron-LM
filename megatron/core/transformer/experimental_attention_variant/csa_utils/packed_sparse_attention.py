@@ -158,7 +158,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
-        ctx.deterministic = sbhd._deterministic_requested(deterministic)
+        ctx.deterministic = deterministic
         return out, lse, lse_indexer
 
     @staticmethod
@@ -313,7 +313,6 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         """Run packed attention with positive indexer loss and deferred CP reductions."""
         if loss_coeff <= 0:
             raise ValueError("Use csa_sparse_attn when indexer loss is disabled.")
-        deterministic = sbhd._deterministic_requested(deterministic)
         if deterministic and not sparse_loss:
             raise RuntimeError(
                 "deterministic packed CSA indexer backward requires "
@@ -761,7 +760,7 @@ def indexer_topk(
     lengths = packed_layout.build_seq_lens(
         cu_seqlens_q, cu_seqlens_kv, q.shape[0], ratio, q_causal_offsets
     )
-    if sbhd._deterministic_requested(deterministic):
+    if deterministic:
         candidates = sbhd._stable_topk_indices(scores, lengths, min(topk, max_seqlen_kv))
     else:
         candidates = _DSA.indexer_top_k_wrapper(
