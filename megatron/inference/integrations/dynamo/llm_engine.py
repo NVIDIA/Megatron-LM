@@ -44,6 +44,8 @@ from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
 logger = logging.getLogger(__name__)
+_HEALTH_CHECK_TIMEOUT = 5.0
+_RELEASE_TIMEOUT = 5.0
 
 
 def build_sampling_params(request: GenerateRequest) -> SamplingParams:
@@ -65,6 +67,9 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
         params.top_k = max(0, int(sampling["top_k"]))
     if stop.get("max_tokens") is not None:
         params.num_tokens_to_generate = int(stop["max_tokens"])
+    if stop.get("min_tokens", 0):
+        raise ValueError("Megatron Dynamo backend does not support nonzero min_tokens")
+    params.detokenize_stop_sequence = bool(sampling.get("include_stop_str_in_output", False))
     if stop.get("stop"):
         params.stop_words = list(stop["stop"])
     stop_token_ids = list(stop.get("stop_token_ids") or [])
@@ -115,7 +120,10 @@ class MegatronLLMEngine(LLMEngine):
         self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_context: zmq.asyncio.Context | None = None
         self._release_sockets: dict[str, zmq.asyncio.Socket] = {}
-        self._release_lock = asyncio.Lock()
+        self._release_locks: dict[str, asyncio.Lock] = {}
+        self._cleanup_tasks: set[asyncio.Task] = set()
+        self._prefill_waiters: dict[str, asyncio.Future] = {}
+        self._engine_progress = 0
         self._request_ids: dict[str, int] = {}
         self.worker_id: Optional[int] = None
 
@@ -299,7 +307,7 @@ class MegatronLLMEngine(LLMEngine):
     async def generate(
         self, request: GenerateRequest, context: Context
     ) -> AsyncGenerator[GenerateChunk, None]:
-        if self.client is None:
+        if self.client is None or self._shutting_down:
             raise RuntimeError("Megatron engine is not initialized")
         token_ids = list(request.get("token_ids") or [])
         if not token_ids:
@@ -312,6 +320,12 @@ class MegatronLLMEngine(LLMEngine):
 
         probe = is_probe(request)
         if probe and self.config.role == "decode":
+            # Dedicated decode engines reject prompt-only requests. Require a
+            # fresh scheduling-loop heartbeat instead, including in external mode.
+            progress = self._engine_progress
+            async with asyncio.timeout(_HEALTH_CHECK_TIMEOUT):
+                while self._engine_progress == progress:
+                    await asyncio.sleep(0.05)
             yield {
                 "token_ids": [],
                 "index": 0,
@@ -331,14 +345,17 @@ class MegatronLLMEngine(LLMEngine):
             params.num_tokens_to_generate = 0
             stream = self.client.add_request_streaming(token_ids, params)
             self._request_ids[context_id] = stream.request_id
-            final = None
+            # A cancelled client must not discard the final handoff metadata. Let
+            # prefill finish and retain an owner that can release its KV/SSM state.
+            result_task = asyncio.create_task(self._collect_prefill_result(stream))
+            waiter = asyncio.shield(result_task)
+            self._prefill_waiters[context_id] = waiter
+            delivered = False
             try:
-                async for item in stream:
-                    if "final" in item:
-                        final = item["final"]
-                        break
-                if final is None:
-                    raise RuntimeError("Megatron prefill stream ended without a result")
+                final = await waiter
+                if self._prefill_waiters.get(context_id) is not waiter or self._shutting_down:
+                    raise asyncio.CancelledError
+                self._validate_final_result(final)
                 disagg = dict(final.get("disaggregated_params") or {})
                 disagg["release"] = {
                     "coordinator_addr": endpoint.coordinator_address,
@@ -346,6 +363,9 @@ class MegatronLLMEngine(LLMEngine):
                         disagg.get("request_id", final.get("request_id", stream.request_id))
                     ),
                 }
+                delivered = True
+                self._prefill_waiters.pop(context_id, None)
+                self._request_ids.pop(context_id, None)
                 yield {
                     "token_ids": [],
                     "index": 0,
@@ -358,8 +378,9 @@ class MegatronLLMEngine(LLMEngine):
                     "disaggregated_params": disagg,
                 }
             finally:
-                if final is None:
-                    await stream.aclose()
+                self._prefill_waiters.pop(context_id, None)
+                if not delivered:
+                    self._schedule_cleanup(self._release_cancelled_prefill(result_task))
                 self._request_ids.pop(context_id, None)
             return
 
@@ -380,9 +401,10 @@ class MegatronLLMEngine(LLMEngine):
         try:
             async for chunk in self._stream_chunks(stream, token_ids, params):
                 source_safe = True
-                yield chunk
                 if not released and self.config.role == "decode":
-                    released = await self._release_handoff_from_meta_async(release)
+                    self._schedule_cleanup(self._release_handoff_from_meta_async(release))
+                    released = True
+                yield chunk
         except InferenceRequestError as error:
             source_safe = error.source_safe
             raise
@@ -396,7 +418,7 @@ class MegatronLLMEngine(LLMEngine):
                             timeout=self.config.drain_timeout,
                         )
                     if source_safe:
-                        await self._release_handoff_from_meta_async(release)
+                        self._schedule_cleanup(self._release_handoff_from_meta_async(release))
                 except Exception:
                     logger.exception("Failed to finish cancelled Megatron handoff")
 
@@ -423,6 +445,7 @@ class MegatronLLMEngine(LLMEngine):
                 if final is None:
                     continue
                 final = unwrap_serialized_tensors(final)
+                self._validate_final_result(final)
                 all_tokens = list(final.get("generated_tokens") or [])
                 all_log_probs = list(final.get("generated_log_probs") or [])
                 tokens = all_tokens[completion_tokens:]
@@ -467,8 +490,45 @@ class MegatronLLMEngine(LLMEngine):
                 f"{len(token_ids)} generated tokens"
             )
 
+    @staticmethod
+    def _validate_final_result(final: dict[str, Any]) -> None:
+        """Reject admission failures delivered through the normal reply channel."""
+        if final.get("status") == "FAILED":
+            errors = [
+                str(event.get("payload"))
+                for event in final.get("events", [])
+                if event.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+            ]
+            reason = "; ".join(errors) or "unknown engine error"
+            raise InferenceRequestError(f"Megatron request failed: {reason}", source_safe=True)
+
+    @staticmethod
+    async def _collect_prefill_result(stream) -> dict[str, Any]:
+        async for item in stream:
+            if "final" in item:
+                return item["final"]
+        raise RuntimeError("Megatron prefill stream ended without a result")
+
+    async def _release_cancelled_prefill(self, result_task: asyncio.Task) -> None:
+        final = await result_task
+        disagg = final.get("disaggregated_params") or {}
+        if disagg:
+            # This is the engine's request ID, not the client's local stream ID.
+            self.client.release_handoff(int(disagg["request_id"]))
+
+    def _schedule_cleanup(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_finished)
+
+    def _cleanup_finished(self, task: asyncio.Task) -> None:
+        self._cleanup_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Megatron handoff cleanup failed", exc_info=error)
+
     async def _release_remote_handoff(self, address: str, request_id: int) -> None:
-        async with self._release_lock:
+        lock = self._release_locks.setdefault(address, asyncio.Lock())
+        async with asyncio.timeout(_RELEASE_TIMEOUT), lock:
             socket = self._release_sockets.get(address)
             if socket is None:
                 if self._release_context is None:
@@ -477,17 +537,14 @@ class MegatronLLMEngine(LLMEngine):
                 socket.setsockopt(zmq.SNDHWM, 0)
                 socket.setsockopt(zmq.RCVHWM, 0)
                 socket.connect(address)
-                await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
                 try:
-                    reply = await asyncio.wait_for(
-                        socket.recv(), timeout=min(30.0, self.config.engine_start_timeout)
-                    )
-                except Exception:
+                    await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+                    reply = await socket.recv()
+                    if Headers(msgpack.unpackb(reply, raw=False)[0]) != Headers.CONNECT_ACK:
+                        raise RuntimeError("Unexpected handoff release coordinator reply")
+                except BaseException:
                     socket.close(linger=0)
                     raise
-                if Headers(msgpack.unpackb(reply, raw=False)[0]) != Headers.CONNECT_ACK:
-                    socket.close(linger=0)
-                    raise RuntimeError("Unexpected handoff release coordinator reply")
                 self._release_sockets[address] = socket
             await socket.send(
                 msgpack.packb([Headers.RELEASE_KV.value, int(request_id)], use_bin_type=True)
@@ -504,6 +561,12 @@ class MegatronLLMEngine(LLMEngine):
         return True
 
     async def abort(self, context: Context) -> None:
+        waiter = self._prefill_waiters.pop(str(context.id()), None)
+        if waiter is not None:
+            # Cancel only the consumer; the protected result task still owns
+            # the prefill until its retained state can be released.
+            waiter.cancel()
+            return
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
             await asyncio.wait_for(
@@ -512,7 +575,7 @@ class MegatronLLMEngine(LLMEngine):
 
     async def drain(self) -> None:
         deadline = asyncio.get_running_loop().time() + self.config.drain_timeout
-        while self._request_ids:
+        while self._request_ids or self._cleanup_tasks:
             if asyncio.get_running_loop().time() >= deadline:
                 logger.warning("Timed out draining Megatron requests")
                 return
@@ -520,9 +583,17 @@ class MegatronLLMEngine(LLMEngine):
 
     async def cleanup(self) -> None:
         self._shutting_down = True
+        for waiter in self._prefill_waiters.values():
+            waiter.cancel()
+        await self.drain()
+        tasks = list(self._cleanup_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for socket in self._release_sockets.values():
             socket.close(linger=0)
         self._release_sockets.clear()
+        self._release_locks.clear()
         if self._release_context is not None:
             self._release_context.term()
             self._release_context = None
@@ -595,6 +666,9 @@ class MegatronLLMEngine(LLMEngine):
         return [PushSource(on_ready=self._set_publisher, dp_rank=0)]
 
     def _on_engine_event(self, kind: str, payload: dict) -> None:
+        if kind == "progress":
+            self._engine_progress += 1
+            return
         if kind == "ready":
             try:
                 self._ready_messages.put_nowait(payload)
@@ -602,6 +676,8 @@ class MegatronLLMEngine(LLMEngine):
                 logger.warning("Ignoring duplicate Megatron readiness message")
             return
         if kind in ("stored", "removed", "cleared"):
+            if self.config.role == "decode":
+                return
             with self._publisher_lock:
                 if self._publisher is None:
                     self._kv_queue.put((kind, payload))

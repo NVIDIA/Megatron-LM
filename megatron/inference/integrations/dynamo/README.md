@@ -42,7 +42,10 @@ python -m megatron.inference.integrations.dynamo \
 ```
 
 Disaggregated serving requires separate prefill and decode workers. Each worker
-starts its own private coordinator and rank group:
+starts its own private coordinator and rank group. KV/SSM handoff requires
+`--disagg-kv-transport-backend nixl` (the default). NCCL handoff is rejected
+because these workers have independent process groups; this restriction does
+not affect NCCL model-parallel collectives or RL weight transfers:
 
 ```bash
 python -m megatron.inference.integrations.dynamo \
@@ -125,12 +128,21 @@ pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
   metadata in `disaggregated_params`.
 - The frontend forwards the prefill result to the selected decode worker.
 - Decode imports the blocks before generation and releases the source handoff
-  after the first post-import output.
+  in the background after the first post-import output. Source connection and
+  release attempts time out after five seconds and log failures without
+  interrupting decode output; connections to different sources proceed independently.
 - Rank zero queues prefix block events after successful forwards; a dedicated
   thread sends them directly to the Dynamo parent without crossing the request
   coordinator or stalling the forward path.
-- Cancellation targets the exact Megatron request; shutdown unregisters the
-  endpoint, drains active requests, and then stops all ranks.
+- Cancelled prefills retain ownership of their engine result until prefill
+  finishes, then release the retained KV/SSM state. Shutdown drains active
+  requests and pending cleanup before stopping all ranks.
+- Decode health probes wait up to five seconds for fresh progress from the
+  engine's scheduling loop, without scheduling prompt prefill on a decode engine.
+- Engine failures are returned as errors, including failures received through
+  the normal final-result channel. Selected-token logprobs and
+  `sampling_options.include_stop_str_in_output` are supported; nonzero
+  `stop_conditions.min_tokens` is rejected.
 
 The default local mode supports one node per engine. External mode lets a
 scheduler or orchestrator place an engine across multiple nodes. Scale

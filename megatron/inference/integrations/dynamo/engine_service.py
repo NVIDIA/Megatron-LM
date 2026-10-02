@@ -33,6 +33,11 @@ async def _serve() -> None:
     args.return_log_probs = True
     args.skip_prompt_log_probs = True
     disaggregated = args.role in ("prefill", "decode")
+    if disaggregated and args.disagg_kv_transport_backend != "nixl":
+        raise ValueError(
+            "Dynamo prefill/decode workers require --disagg-kv-transport-backend nixl; "
+            "NCCL handoff across independent worker process groups is not supported"
+        )
     engine_class = DynamoDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
     engine = get_dynamic_inference_engine(engine_class=engine_class)
 
@@ -54,6 +59,8 @@ async def _serve() -> None:
         engine.setup_kv_transfer(role=args.role)
 
     reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
+    if disaggregated:
+        engine.set_progress_callback(lambda: reporter.observe("progress", {}))
     reporter.start()
 
     try:

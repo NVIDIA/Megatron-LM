@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 pytest.importorskip("dynamo")
 
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.inference.integrations.dynamo import engine_service
 from megatron.inference.integrations.dynamo.args import parse_args
+from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
 from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
 from megatron.inference.integrations.dynamo.main import main
 
@@ -122,8 +125,25 @@ def test_owned_engine_command_targets_megatron_only_service():
 
 
 @pytest.mark.asyncio
-async def test_engine_service_skips_prompt_log_probs_before_engine_construction(monkeypatch):
-    args = SimpleNamespace(return_log_probs=False, skip_prompt_log_probs=False, role="aggregated")
+@pytest.mark.parametrize(
+    "role,backend",
+    [
+        ("aggregated", "nccl"),
+        ("prefill", "nccl"),
+        ("decode", "nccl"),
+        ("prefill", "nixl"),
+        ("decode", "nixl"),
+    ],
+)
+async def test_engine_service_validates_handoff_and_log_probs_before_construction(
+    monkeypatch, role, backend
+):
+    args = SimpleNamespace(
+        return_log_probs=False,
+        skip_prompt_log_probs=False,
+        role=role,
+        disagg_kv_transport_backend=backend,
+    )
 
     def build_engine(*, engine_class):
         assert engine_class is not None
@@ -134,8 +154,12 @@ async def test_engine_service_skips_prompt_log_probs_before_engine_construction(
     monkeypatch.setattr(engine_service, "get_args", lambda: args)
     monkeypatch.setattr(engine_service, "get_dynamic_inference_engine", build_engine)
 
-    with pytest.raises(RuntimeError, match="configuration observed"):
-        await engine_service._serve()
+    if role != "aggregated" and backend == "nccl":
+        with pytest.raises(ValueError, match="require --disagg-kv-transport-backend nixl"):
+            await engine_service._serve()
+    else:
+        with pytest.raises(RuntimeError, match="configuration observed"):
+            await engine_service._serve()
 
 
 @pytest.mark.asyncio
@@ -199,3 +223,25 @@ async def test_external_readiness_does_not_require_child_process():
     task = asyncio.create_task(report_ready())
     assert await engine._wait_for_readiness() == expected
     await task
+
+
+def test_progress_requires_successful_running_engine_scheduling():
+    engine = object.__new__(DynamoDynamicInferenceEngine)
+    engine.rank = 0
+    engine.state = EngineState.RUNNING
+    engine._last_progress_time = 0.0
+    report = MagicMock()
+    engine.set_progress_callback(report)
+    with patch.object(StateHandoffDynamicInferenceEngine, "schedule_requests", return_value=3):
+        assert engine.schedule_requests() == 3
+        report.assert_called_once()
+        engine.state = EngineState.PAUSED
+        engine.schedule_requests()
+        report.assert_called_once()
+    engine.state = EngineState.RUNNING
+    with patch.object(
+        StateHandoffDynamicInferenceEngine, "schedule_requests", side_effect=RuntimeError("stalled")
+    ):
+        with pytest.raises(RuntimeError, match="stalled"):
+            engine.schedule_requests()
+    report.assert_called_once()

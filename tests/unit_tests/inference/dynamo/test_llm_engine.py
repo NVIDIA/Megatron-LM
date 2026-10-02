@@ -11,8 +11,10 @@ import pytest
 
 pytest.importorskip("dynamo")
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_client import InferenceRequestError
 from megatron.inference.integrations.dynamo.args import Config
 from megatron.inference.integrations.dynamo.llm_engine import (
     MegatronLLMEngine,
@@ -63,13 +65,22 @@ def test_sampling_params_maps_greedy_and_limits():
     params = build_sampling_params(
         {
             "token_ids": [1],
-            "sampling_options": {"temperature": 0.0, "top_p": 0.9},
-            "stop_conditions": {"max_tokens": 7},
+            "sampling_options": {
+                "temperature": 0.0,
+                "top_p": 0.9,
+                "include_stop_str_in_output": True,
+            },
+            "stop_conditions": {"max_tokens": 7, "min_tokens": 0, "stop": ["END"]},
         }
     )
     assert params.top_k == 1
     assert params.top_p == 0.0
     assert params.num_tokens_to_generate == 7
+    assert params.detokenize_stop_sequence
+    assert params.stop_words == ["END"]
+    assert not build_sampling_params({}).detokenize_stop_sequence
+    with pytest.raises(ValueError, match="nonzero min_tokens"):
+        build_sampling_params({"stop_conditions": {"min_tokens": 2}})
 
     selected_logprobs = build_sampling_params({"token_ids": [1], "output_options": {"logprobs": 0}})
     assert selected_logprobs.return_log_probs
@@ -225,20 +236,13 @@ class _Context:
 
 
 @pytest.mark.asyncio
-async def test_decode_health_probe_bypasses_kv_handoff():
-    handoff_called = False
-
-    def add_request_with_kv_handoff(*_args, **_kwargs):
-        nonlocal handoff_called
-        handoff_called = True
-        raise AssertionError("health probe must not import KV")
-
+@pytest.mark.parametrize("responsive", [True, False])
+async def test_decode_health_probe_checks_engine_without_handoff(responsive):
     engine = MegatronLLMEngine(_config("decode"))
+    engine.config.engine_launch_mode = "external"
     engine.client = SimpleNamespace(
-        add_request_streaming=lambda *_args, **_kwargs: pytest.fail(
-            "decode health probe must not enter the model engine"
-        ),
-        add_request_with_kv_handoff=add_request_with_kv_handoff,
+        add_request_streaming=MagicMock(side_effect=AssertionError),
+        add_request_with_kv_handoff_streaming=MagicMock(side_effect=AssertionError),
     )
     request = {
         "token_ids": [1],
@@ -247,11 +251,21 @@ async def test_decode_health_probe_bypasses_kv_handoff():
         "stop_conditions": {"max_tokens": 1},
     }
 
-    chunks = [chunk async for chunk in engine.generate(request, _Context())]
-
-    assert chunks[-1]["token_ids"] == []
-    assert chunks[-1]["finish_reason"] == "stop"
-    assert not handoff_called
+    # A heartbeat from before the probe is not sufficient.
+    engine._on_engine_event("progress", {})
+    with patch("megatron.inference.integrations.dynamo.llm_engine._HEALTH_CHECK_TIMEOUT", 0.15):
+        generation = engine.generate(request, _Context())
+        probe = asyncio.create_task(anext(generation))
+        await asyncio.sleep(0)
+        if responsive:
+            engine._on_engine_event("progress", {})
+            assert (await probe)["finish_reason"] == "stop"
+        else:
+            with pytest.raises(TimeoutError):
+                await probe
+        await generation.aclose()
+    engine.client.add_request_streaming.assert_not_called()
+    engine.client.add_request_with_kv_handoff_streaming.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -452,3 +466,184 @@ async def test_release_handoff_reuses_async_socket():
     context.socket.assert_called_once()
     assert socket.send.await_count == 3
     socket.close.assert_called_once_with(linger=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancellation", ["consumer", "abort", "completed_abort"])
+async def test_cancelled_prefill_releases_state_after_final_reply(cancellation):
+    cancel = MagicMock()
+    stream = AsyncStream(36, cancel)
+    engine = MegatronLLMEngine(_config("prefill"))
+    engine._engine_endpoint = _endpoint()
+    engine.client = SimpleNamespace(
+        add_request_streaming=MagicMock(return_value=stream), release_handoff=MagicMock()
+    )
+    generation = engine.generate({"token_ids": [1]}, _Context())
+    consumer = asyncio.create_task(anext(generation))
+    await asyncio.sleep(0)
+    if cancellation == "completed_abort":
+        # The shield can already have a result while its consumer has not yet
+        # resumed. Cancelling a done future alone does not cancel that consumer.
+        engine._prefill_waiters["dynamo-request"].set_result(
+            {"status": "COMPLETED", "disaggregated_params": {"request_id": 900}}
+        )
+    if cancellation != "consumer":
+        await engine.abort(_Context())
+    else:
+        consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    cancel.assert_not_called()
+    engine.client.release_handoff.assert_not_called()
+    # Engine request IDs differ from client stream IDs. The late final result
+    # carries the identity needed to release both KV blocks and the SSM slot.
+    stream.put({"final": {"status": "COMPLETED", "disaggregated_params": {"request_id": 900}}})
+    stream.finish()
+    await asyncio.wait_for(asyncio.gather(*engine._cleanup_tasks), timeout=1)
+    engine.client.release_handoff.assert_called_once_with(900)
+    assert not engine._prefill_waiters
+    assert not engine._request_ids
+    assert not engine._cleanup_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+async def test_failed_final_reply_propagates_engine_error(role):
+    stream = AsyncStream(1, MagicMock())
+    stream.put(
+        {
+            "final": {
+                "status": "FAILED",
+                "events": [
+                    {
+                        "type": "ERROR_NONTRANSIENT",
+                        "payload": {
+                            "type": "TokenOverflowError",
+                            "message": "token budget exceeded",
+                        },
+                    }
+                ],
+            }
+        }
+    )
+    stream.finish()
+    engine = MegatronLLMEngine(_config(role))
+    engine._engine_endpoint = _endpoint()
+    engine.client = SimpleNamespace(
+        add_request_streaming=MagicMock(return_value=stream),
+        add_request_with_kv_handoff_streaming=MagicMock(return_value=stream),
+        release_handoff=MagicMock(),
+    )
+    with patch(
+        "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result", return_value={}
+    ):
+        with pytest.raises(InferenceRequestError, match="token budget exceeded"):
+            _ = [chunk async for chunk in engine.generate({"token_ids": [1]}, _Context())]
+    await asyncio.gather(*engine._cleanup_tasks)
+    engine.client.release_handoff.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+def test_kv_startup_buffer_only_keeps_events_for_publishing_roles(role):
+    engine = MegatronLLMEngine(_config(role))
+    engine._on_engine_event("ready", _endpoint().to_dict())
+    engine._on_engine_event("removed", {"block_hashes": [1]})
+    assert engine._ready_messages.get_nowait() == _endpoint().to_dict()
+    if role == "decode":
+        assert engine._kv_queue.empty()
+    else:
+        publisher = MagicMock()
+        engine._set_publisher(publisher)
+        publisher.publish_removed.assert_called_once_with(block_hashes=[1])
+        assert engine._kv_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_source_release_failure_does_not_block_or_fail_decode(caplog):
+    stream = AsyncStream(1, MagicMock())
+    stream.put({"partial": {"new_tokens": [2]}})
+    stream.put({"final": {"status": "COMPLETED", "generated_tokens": [2, 3]}})
+    stream.finish()
+    engine = MegatronLLMEngine(_config("decode"))
+    engine.client = SimpleNamespace(add_request_with_kv_handoff_streaming=lambda *args: stream)
+    release_started = asyncio.Event()
+    release_failed = asyncio.Event()
+
+    async def release(*args):
+        release_started.set()
+        await release_failed.wait()
+        raise TimeoutError("source unavailable")
+
+    engine._release_remote_handoff = release
+    prefill = {
+        "disaggregated_params": {
+            "release": {"coordinator_addr": "tcp://prefill:5000", "request_id": 9}
+        }
+    }
+    with patch(
+        "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result",
+        return_value=prefill,
+    ):
+        generation = engine.generate({"token_ids": [1]}, _Context())
+        assert (await anext(generation))["token_ids"] == [2]
+        await asyncio.wait_for(release_started.wait(), timeout=1)
+        assert (await asyncio.wait_for(anext(generation), timeout=1))["token_ids"] == [3]
+        with pytest.raises(StopAsyncIteration):
+            await anext(generation)
+    release_failed.set()
+    await asyncio.gather(*engine._cleanup_tasks, return_exceptions=True)
+    assert "Megatron handoff cleanup failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unreachable_release_source_does_not_block_other_sources():
+    engine = MegatronLLMEngine(_config("decode"))
+    connecting = asyncio.Event()
+
+    async def stalled_recv():
+        connecting.set()
+        await asyncio.Future()
+
+    stalled = MagicMock(send=AsyncMock(), recv=stalled_recv)
+    healthy = MagicMock(
+        send=AsyncMock(), recv=AsyncMock(return_value=msgpack.packb([Headers.CONNECT_ACK.value]))
+    )
+    engine._release_context = MagicMock(socket=MagicMock(side_effect=[stalled, healthy]))
+    with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.1):
+        pending = asyncio.create_task(engine._release_remote_handoff("tcp://stalled:1", 1))
+        await asyncio.wait_for(connecting.wait(), timeout=1)
+        await engine._release_remote_handoff("tcp://healthy:2", 2)
+        assert not pending.done()
+        with pytest.raises(TimeoutError):
+            await pending
+    stalled.close.assert_called_once_with(linger=0)
+    assert list(engine._release_sockets) == ["tcp://healthy:2"]
+    await engine.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_cancelled_prefill_before_stopping_engine():
+    stream = AsyncStream(1, MagicMock())
+    engine = MegatronLLMEngine(_config("prefill"))
+    engine._engine_endpoint = _endpoint()
+    client = MagicMock(add_request_streaming=MagicMock(return_value=stream))
+    engine.client = client
+    generation = engine.generate({"token_ids": [1]}, _Context())
+    consumer = asyncio.create_task(anext(generation))
+    await asyncio.sleep(0)
+
+    async def finish_prefill():
+        await asyncio.sleep(0.01)
+        stream.put({"final": {"disaggregated_params": {"request_id": 99}}})
+        stream.finish()
+
+    completion = asyncio.create_task(finish_prefill())
+    await engine.cleanup()
+    await completion
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    names = [call[0] for call in client.mock_calls]
+    assert names.index("release_handoff") < names.index("stop_engines")
+    client.release_handoff.assert_called_once_with(99)
+    assert not engine._cleanup_tasks
