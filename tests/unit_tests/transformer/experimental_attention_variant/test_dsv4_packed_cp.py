@@ -37,14 +37,15 @@ def fresh_packed_compile_cache():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires compiled CUDA metadata")
 @pytest.mark.parametrize('cu_values', [(0, 128, 256), (0, 0, 128, 128, 256), (0, 96, 256)])
 @pytest.mark.parametrize('ratio', [4, 128])
-def test_compiled_packed_metadata_matches_document_positions(cu_values, ratio):
+@pytest.mark.parametrize('torch_deterministic', [False, True])
+def test_compiled_packed_metadata_matches_document_positions(cu_values, ratio, torch_deterministic):
     """Compiled metadata must preserve real document positions, including empty segments."""
     cu = torch.tensor(cu_values, dtype=torch.int32, device='cuda')
     capacity = 40 if ratio == 4 else 2
     halo = 8 if ratio == 4 else ratio
     prior = torch.are_deterministic_algorithms_enabled()
     prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(torch_deterministic)
     try:
         for start in (0, 128):
             hidden = torch.arange(start, start + 128, device='cuda').float().view(128, 1, 1)
