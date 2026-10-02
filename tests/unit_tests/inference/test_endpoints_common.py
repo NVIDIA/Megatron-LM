@@ -1,7 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Tests for endpoints/common.py and for what /v1/completions and /v1/chat/completions share.
+
+The shared behavior is pinned over HTTP: both handlers run under Quart's test client against the
+fake inference client defined below, which test_completions.py and test_chat_completions.py reuse.
+"""
+
+import asyncio
+import importlib
+import logging
+from dataclasses import fields
+
 import pytest
 
+from megatron.core.inference.config import MultimodalPromptConfig
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
     apply_optional_sampling_default,
     generation_config_sampling_defaults,
@@ -109,3 +122,535 @@ def test_generation_config_sampling_defaults_omits_non_numeric_fields():
         generation_config = {"temperature": "warm", "top_p": 0.9}
 
     assert generation_config_sampling_defaults(_Tokenizer()) == {"top_p": 0.9}
+
+
+# --- HTTP harness, shared with test_completions.py and test_chat_completions.py ---------------
+
+CHAT_PATH = "/v1/chat/completions"
+COMPLETIONS_PATH = "/v1/completions"
+CHAT_BODY = {"messages": [{"role": "user", "content": "hello"}]}
+COMPLETIONS_BODY = {"prompt": "hello"}
+BODIES = {CHAT_PATH: CHAT_BODY, COMPLETIONS_PATH: COMPLETIONS_BODY}
+# Three submissions per request: n=3 choices for chat, a batch of three prompts for completions.
+FAN_OUT_BODIES = {CHAT_PATH: {**CHAT_BODY, "n": 3}, COMPLETIONS_PATH: {"prompt": ["a", "b", "c"]}}
+PATHS = pytest.mark.parametrize("path", [CHAT_PATH, COMPLETIONS_PATH], ids=["chat", "completions"])
+NOT_A_NUMBER_ERROR = "Invalid sampling parameter: could not convert string to float: 'hot'"
+_ENDPOINT_MODULES = {CHAT_PATH: "chat_completions", COMPLETIONS_PATH: "completions"}
+_ENDPOINTS_PACKAGE = (
+    "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints"
+)
+_GENERATION_CONFIG_DEFAULTS = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+
+
+class Tokenizer:
+    """Fixed tokenization; each id detokenizes to "<id>" so expected strings stay readable."""
+
+    chat_template = "test-template"
+    bos = None
+    eos_id = 2
+    eod = 2
+
+    def apply_chat_template(self, messages, **kwargs):
+        del messages, kwargs
+        return [10, 11]
+
+    def tokenize(self, prompt):
+        del prompt
+        return [10, 11]
+
+    def detokenize(self, token_ids, **kwargs):
+        return "".join(f"<{tok}>" for tok in token_ids)
+
+
+class GenerationConfigTokenizer(Tokenizer):
+    """Carries the model's generation_config.json sampling defaults."""
+
+    generation_config = _GENERATION_CONFIG_DEFAULTS
+
+
+def completed_reply(uid, prompt_tokens, generated_tokens, **extra):
+    """A completed, non-serialized reply dict of the shape the coordinator forwards."""
+    reply = {
+        "uid": uid,
+        "status": "COMPLETED",
+        "events": [],
+        "prompt_tokens": list(prompt_tokens),
+        "prompt_length": len(prompt_tokens),
+        "generated_tokens": list(generated_tokens),
+        "generated_log_probs": None,
+        "routing_indices": None,
+        "num_cached_tokens": 0,
+        "sampling_params": {"num_tokens_to_generate": 16},
+    }
+    reply.update(extra)
+    return reply
+
+
+def failed_reply(*events):
+    """A failed reply carrying the given engine events."""
+    return {"uid": "req-failed", "status": "FAILED", "events": list(events)}
+
+
+class ReplyingClient:
+    """Records each submission and answers it with the next canned reply.
+
+    A reply that is an exception fails that request's future; ``fail_admission_at`` is the
+    zero-based submission that raises instead of being admitted. Without ``replies`` every
+    submission gets a completed reply built from its own prompt tokens.
+    """
+
+    def __init__(self, replies=None, *, fail_admission_at=None):
+        self.replies = None if replies is None else list(replies)
+        self.fail_admission_at = fail_admission_at
+        self.prompt_tokens = []
+        self.sampling_params = []
+        self.offload_params = []
+        self.aborted = []
+
+    def add_request_with_id(
+        self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
+        del multi_modal_data
+        if len(self.prompt_tokens) == self.fail_admission_at:
+            raise RuntimeError("zmq send failed")
+        self.prompt_tokens.append(list(prompt_tokens))
+        self.sampling_params.append(sampling_params)
+        self.offload_params.append(offload_params)
+        request_id = len(self.prompt_tokens)
+        reply = (
+            completed_reply(f"req-{request_id}", prompt_tokens, [12, 13])
+            if self.replies is None
+            else self.replies.pop(0)
+        )
+        future = asyncio.get_running_loop().create_future()
+        if isinstance(reply, Exception):
+            future.set_exception(reply)
+        else:
+            future.set_result(reply)
+        return request_id, future
+
+    def abort_request(self, request_id):
+        self.aborted.append(request_id)
+
+
+def build_app(path, client, **config):
+    """A Quart app serving the endpoint at ``path`` with the test defaults; ``config`` overrides."""
+    quart = pytest.importorskip("quart")
+    blueprint = importlib.import_module(f"{_ENDPOINTS_PACKAGE}.{_ENDPOINT_MODULES[path]}").bp
+    app = quart.Quart(__name__)
+    app.config.update(
+        client=client,
+        tokenizer=Tokenizer(),
+        parsers=[],
+        verbose=False,
+        multimodal_prompt_config=MultimodalPromptConfig(),
+        eval_mode=True,
+    )
+    app.config.update(config)
+    app.register_blueprint(blueprint)
+    return app
+
+
+# --- sampling parameters ----------------------------------------------------
+
+# Request-controlled SamplingParams fields at their defaults, as both endpoints submit them. The
+# temperature/top_p/top_k tiers and the greedy normalization are pinned end to end in
+# test_dynamic_text_generation_server_config.py.
+_DEFAULT_FIELDS = {
+    "temperature": 1.0,
+    "top_p": 0.0,  # SamplingParams normalizes the no-op 1.0 to the disabled sentinel.
+    "top_k": 0,
+    "return_log_probs": False,
+    "top_n_logprobs": 0,
+    "skip_prompt_log_probs": True,
+    "num_tokens_to_generate": None,
+    "stop_words": None,
+    "add_BOS": False,
+    "termination_id": None,
+    "streaming_interval": 1,
+    "detokenize_generations": False,
+}
+_CHAT_DEFAULTS = {**_DEFAULT_FIELDS, "return_prompt_tokens": False}  # eval_mode=True in build_app
+_COMPLETIONS_DEFAULTS = {
+    **_DEFAULT_FIELDS,
+    "num_tokens_to_generate": 16,
+    "return_prompt_tokens": True,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body", "app_config", "expected_fields"),
+    [
+        pytest.param(CHAT_PATH, {}, {}, _CHAT_DEFAULTS, id="chat-defaults"),
+        pytest.param(COMPLETIONS_PATH, {}, {}, _COMPLETIONS_DEFAULTS, id="completions-defaults"),
+        pytest.param(
+            CHAT_PATH,
+            {
+                "logprobs": None,
+                "top_logprobs": None,
+                "skip_prompt_log_probs": None,
+                "max_tokens": None,
+                "max_completion_tokens": None,
+                "n": None,
+                "stop": None,
+                "add_BOS": None,
+                "ignore_eos": None,
+                "streaming_interval": None,
+            },
+            {},
+            _CHAT_DEFAULTS,
+            id="chat-null-fields-mean-default",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"logprobs": None, "echo": None, "stop": None, "ignore_eos": None},
+            {},
+            _COMPLETIONS_DEFAULTS,
+            id="completions-null-fields-mean-default",
+        ),
+        pytest.param(
+            CHAT_PATH,
+            {},
+            {"tokenizer": GenerationConfigTokenizer()},
+            _GENERATION_CONFIG_DEFAULTS,
+            id="chat-model-generation-config",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {},
+            {"tokenizer": GenerationConfigTokenizer()},
+            _GENERATION_CONFIG_DEFAULTS,
+            id="completions-model-generation-config",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"logprobs": 5, "echo": True},
+            {},
+            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": False},
+            id="completions-logprobs-int-with-echo-scores-the-prompt",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"logprobs": 3},
+            {},
+            {"return_log_probs": True, "top_n_logprobs": 3, "skip_prompt_log_probs": True},
+            id="completions-logprobs-int-without-echo",
+        ),
+        # /v1/completions derives skip_prompt_log_probs from echo; the engine knob is not read.
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"logprobs": 5, "skip_prompt_log_probs": False},
+            {},
+            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": True},
+            id="completions-explicit-skip-prompt-log-probs-is-ignored",
+        ),
+        pytest.param(
+            CHAT_PATH,
+            {"logprobs": True, "top_logprobs": 10, "skip_prompt_log_probs": False},
+            {},
+            {"return_log_probs": True, "top_n_logprobs": 10, "skip_prompt_log_probs": False},
+            id="chat-logprobs-bool-with-top-logprobs",
+        ),
+        pytest.param(
+            CHAT_PATH,
+            {"logprobs": False, "top_logprobs": 5},
+            {},
+            {"return_log_probs": False, "top_n_logprobs": 0},
+            id="chat-logprobs-false-ignores-top-logprobs",
+        ),
+        pytest.param(
+            CHAT_PATH,
+            {"max_completion_tokens": 256, "max_tokens": 128},
+            {},
+            {"num_tokens_to_generate": 256},
+            id="chat-max-completion-tokens-wins",
+        ),
+        pytest.param(
+            CHAT_PATH,
+            {"max_tokens": 128, "stop": ["A", "B"], "ignore_eos": True, "add_BOS": True},
+            {},
+            {
+                "num_tokens_to_generate": 128,
+                "stop_words": ["A", "B"],
+                "termination_id": -1,
+                "add_BOS": True,
+            },
+            id="chat-max-tokens-stop-ignore-eos-add-bos",
+        ),
+        pytest.param(
+            CHAT_PATH,
+            {"n": 4, "streaming_interval": 3},
+            {},
+            {"streaming_interval": 3},
+            id="chat-n-fans-out-with-streaming-interval",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"max_tokens": 32, "stop": "END", "ignore_eos": True, "streaming_interval": 2},
+            {},
+            {
+                "num_tokens_to_generate": 32,
+                "stop_words": ["END"],
+                "termination_id": -1,
+                "streaming_interval": 2,
+            },
+            id="completions-max-tokens-stop-string-ignore-eos",
+        ),
+        # Only a streaming request reads stream_options; junk there is ignored otherwise.
+        pytest.param(
+            CHAT_PATH,
+            {"stream_options": ["include_usage"]},
+            {},
+            _CHAT_DEFAULTS,
+            id="chat-non-dict-stream-options-ignored",
+        ),
+    ],
+)
+async def test_sampling_params_are_parsed_from_the_request(path, body, app_config, expected_fields):
+    client = ReplyingClient()
+    app = build_app(path, client, **app_config)
+
+    response = await app.test_client().post(path, json={**BODIES[path], **body})
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert len(client.sampling_params) == (body.get("n") or 1)
+    for sampling_params in client.sampling_params:
+        assert {name: getattr(sampling_params, name) for name in expected_fields} == expected_fields
+
+
+# Fields the HTTP layer sets from the request body (chat also reads add_BOS) ...
+_REQUEST_CONTROLLED_FIELDS = {
+    "temperature",
+    "top_k",
+    "top_p",
+    "return_log_probs",
+    "top_n_logprobs",
+    "skip_prompt_log_probs",
+    "num_tokens_to_generate",
+    "stop_words",
+    "termination_id",
+    "streaming_interval",
+}
+# ... the fields each endpoint decides itself and never reads from the request ...
+_FRONTEND_OWNED_FIELDS = {
+    CHAT_PATH: {"return_prompt_tokens": False, "detokenize_generations": False},
+    COMPLETIONS_PATH: {
+        "return_prompt_tokens": True,
+        "detokenize_generations": False,
+        "add_BOS": False,
+    },
+}
+# ... and the fields no HTTP client may set: engine-internal, derived, or forced by the client.
+_ENGINE_OWNED_FIELDS = {
+    "return_prompt_top_n_logprobs",
+    "return_segments",
+    "num_tokens_total",
+    "detokenize_stop_sequence",
+    "streaming",
+    "do_kv_handoff",
+}
+_EVERY_FIELD_REQUEST = {
+    "temperature": 0.5,
+    "top_p": 0.9,
+    "top_k": 40,
+    "logprobs": 5,  # an int for /v1/completions, truthy for chat
+    "top_logprobs": 5,
+    # Differs from the dataclass default and keeps the derived return_prompt_top_n_logprobs at its
+    # own default.
+    "skip_prompt_log_probs": True,
+    "max_tokens": 200,
+    "stop": ["END"],
+    "add_BOS": True,
+    "ignore_eos": True,
+    "streaming_interval": 3,
+    # Named by the client, but not the client's to set.
+    **{name: True for name in _ENGINE_OWNED_FIELDS},
+}
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_every_sampling_params_field_is_classified(path):
+    """A new SamplingParams field must be placed in one of the three groups above."""
+    request_controlled = _REQUEST_CONTROLLED_FIELDS | ({"add_BOS"} if path == CHAT_PATH else set())
+    frontend_owned = _FRONTEND_OWNED_FIELDS[path]
+    assert {field.name for field in fields(SamplingParams)} == (
+        request_controlled | set(frontend_owned) | _ENGINE_OWNED_FIELDS
+    )
+    client = ReplyingClient()
+    app = build_app(path, client)
+
+    response = await app.test_client().post(path, json={**BODIES[path], **_EVERY_FIELD_REQUEST})
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    (sampling_params,) = client.sampling_params
+    defaults = SamplingParams()
+    for name in request_controlled:
+        assert getattr(sampling_params, name) != getattr(defaults, name), name
+    for name in _ENGINE_OWNED_FIELDS:
+        assert getattr(sampling_params, name) == getattr(defaults, name), name
+    assert {name: getattr(sampling_params, name) for name in frontend_owned} == frontend_owned
+
+
+# --- failures before a response is formatted ---------------------------------
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize(
+    ("make_client", "expected_error", "expected_aborted"),
+    [
+        # A failure on admission k aborts the k-1 requests already in flight.
+        pytest.param(
+            lambda: ReplyingClient(fail_admission_at=2),
+            "Error submitting request: zmq send failed",
+            [1, 2],
+            id="third-admission-fails",
+        ),
+        pytest.param(
+            lambda: ReplyingClient(
+                [
+                    completed_reply("req-0", [10, 11], [12]),
+                    ValueError("boom"),
+                    completed_reply("req-2", [10, 11], [12]),
+                ]
+            ),
+            "Error during inference: boom",
+            [],
+            id="engine-error",
+        ),
+    ],
+)
+async def test_failures_before_formatting_are_a_500(
+    path, make_client, expected_error, expected_aborted
+):
+    client = make_client()
+    app = build_app(path, client)
+
+    response = await app.test_client().post(path, json=FAN_OUT_BODIES[path])
+
+    assert response.status_code == 500
+    assert await response.get_data(as_text=True) == expected_error
+    assert client.aborted == expected_aborted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "expected_log"),
+    [
+        (CHAT_PATH, "Batch of 3 requests (n=3) processed in"),
+        (COMPLETIONS_PATH, "Batch of 3 requests processed in"),
+    ],
+    ids=["chat", "completions"],
+)
+async def test_verbose_logs_the_batch_timing(path, expected_log, caplog):
+    client = ReplyingClient()
+    app = build_app(path, client, verbose=True)
+
+    with caplog.at_level(logging.INFO):
+        response = await app.test_client().post(path, json=FAN_OUT_BODIES[path])
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert expected_log in caplog.text
+
+
+# --- failed requests ----------------------------------------------------------
+
+_COMPLETED = completed_reply("req-ok", [10, 11], [12])
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize(
+    ("replies", "expected"),
+    [
+        pytest.param(
+            [
+                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "bad"}),
+                _COMPLETED,
+                _COMPLETED,
+            ],
+            ("Inference request(s) failed: Request 0: bad", 400),
+            id="nontransient-is-400",
+        ),
+        pytest.param(
+            [
+                _COMPLETED,
+                failed_reply({"type": "ERROR_TRANSIENT", "payload": "timeout"}),
+                _COMPLETED,
+            ],
+            ("Inference request(s) failed: Request 1: timeout", 500),
+            id="transient-is-500",
+        ),
+        pytest.param(
+            [
+                failed_reply({"type": "ERROR_TRANSIENT", "payload": "t"}),
+                _COMPLETED,
+                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "nt"}),
+            ],
+            ("Inference request(s) failed: Request 0: t; Request 2: nt", 400),
+            id="mixed-nontransient-wins",
+        ),
+        pytest.param(
+            [failed_reply(), _COMPLETED, {"uid": "req-failed", "status": "FAILED"}],
+            (
+                "Inference request(s) failed: Request 0: Unknown error; Request 2: Unknown error",
+                500,
+            ),
+            id="no-error-events",
+        ),
+    ],
+)
+async def test_failed_requests_are_reported(path, replies, expected):
+    client = ReplyingClient(replies)
+    app = build_app(path, client)
+
+    response = await app.test_client().post(path, json=FAN_OUT_BODIES[path])
+
+    assert (await response.get_data(as_text=True), response.status_code) == expected
+
+
+_OVERFLOW = "MaxSequenceLengthOverflowError: prompt exceeds max_sequence_length"
+# Nemo-RL matches on this exact message.
+_NEMO_RL_OVERFLOW_BODY = (
+    "This model's maximum context length was exceeded. Your messages resulted in 2 tokens. "
+    f"Please reduce the length of the messages. Request 0: {_OVERFLOW}"
+)
+_PLAIN_OVERFLOW_BODY = f"Inference request(s) failed: Request 0: {_OVERFLOW}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "event_type", "expected"),
+    [
+        # /v1/chat/completions reports the prompt length in the body Nemo-RL matches on,
+        # whatever the event type ...
+        pytest.param(
+            CHAT_PATH, "ERROR_NONTRANSIENT", (_NEMO_RL_OVERFLOW_BODY, 400), id="chat-nontransient"
+        ),
+        pytest.param(
+            CHAT_PATH, "ERROR_TRANSIENT", (_NEMO_RL_OVERFLOW_BODY, 400), id="chat-transient"
+        ),
+        # ... while /v1/completions reports an overflow like any other failure.
+        pytest.param(
+            COMPLETIONS_PATH,
+            "ERROR_NONTRANSIENT",
+            (_PLAIN_OVERFLOW_BODY, 400),
+            id="completions-nontransient",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            "ERROR_TRANSIENT",
+            (_PLAIN_OVERFLOW_BODY, 500),
+            id="completions-transient",
+        ),
+    ],
+)
+async def test_context_overflow_failure_report(path, event_type, expected):
+    client = ReplyingClient([failed_reply({"type": event_type, "payload": _OVERFLOW})])
+    app = build_app(path, client)
+
+    response = await app.test_client().post(path, json=BODIES[path])
+
+    assert (await response.get_data(as_text=True), response.status_code) == expected

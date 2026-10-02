@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import copy
 import re
 import sys
 from dataclasses import replace
@@ -34,6 +35,14 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_messages_for_template,
     _suffix_tokens_after_prefix,
     _tokenize_with_media_slots_sync,
+)
+from tests.unit_tests.inference.test_endpoints_common import (
+    CHAT_BODY,
+    CHAT_PATH,
+    NOT_A_NUMBER_ERROR,
+    ReplyingClient,
+    build_app,
+    completed_reply,
 )
 
 
@@ -1257,3 +1266,231 @@ async def test_n_choices_prepare_and_serialize_shared_media_once():
     assert all(wire == client.serialized_media[0] for wire in client.serialized_media)
     assert all(wire is not client.serialized_media[0] for wire in client.serialized_media[1:])
     assert compute_key.call_count == 1
+
+
+# --- HTTP: request validation and response formatting -------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "status", "expected_error"),
+    [
+        pytest.param({}, 400, "Missing 'messages' field", id="missing-messages"),
+        pytest.param(
+            {"messages": "hi"}, 400, "'messages' must be a list", id="messages-not-a-list"
+        ),
+        # A sampling field of the wrong type is a client error when the conversion raises
+        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        pytest.param(
+            {**CHAT_BODY, "temperature": "hot"},
+            400,
+            NOT_A_NUMBER_ERROR,
+            id="temperature-not-a-number",
+        ),
+        pytest.param({**CHAT_BODY, "top_k": [1]}, 500, None, id="top-k-list"),
+    ],
+)
+async def test_malformed_requests_are_rejected_before_submission(body, status, expected_error):
+    client = ReplyingClient([])
+    app = build_app(CHAT_PATH, client)
+
+    response = await app.test_client().post(CHAT_PATH, json=body)
+
+    assert response.status_code == status
+    if expected_error is not None:
+        assert await response.get_data(as_text=True) == expected_error
+    assert client.prompt_tokens == []  # nothing reached the engine
+
+
+_TOOLS = [
+    {"type": "function", "function": {"name": "f1"}},
+    {"type": "function", "function": {"name": "f2"}},
+]
+_TOOL_CALLS = [
+    {"id": "c1", "function": {"name": "f1", "arguments": '{"x": 1}'}},
+    {"id": "c2", "function": {"name": "f2", "arguments": {"y": 2}}},
+]
+_NORMALIZED_TOOL_CALLS = [
+    {"id": "c1", "type": "function", "function": {"name": "f1", "arguments": '{"x": 1}'}},
+    {"id": "c2", "type": "function", "function": {"name": "f2", "arguments": '{"y": 2}'}},
+]
+_TOOL_PARSE_RESULT = ("parsed", {"tool_calls": _TOOL_CALLS, "reasoning": "thinking"})
+_TOOL_MESSAGE = {
+    "content": "parsed",
+    "tool_calls": _NORMALIZED_TOOL_CALLS,
+    "reasoning_content": "thinking",
+}
+_NAMED_TOOL_CHOICE = {"type": "function", "function": {"name": "f1"}}
+_CHAT_LOGPROBS = {
+    "content": [
+        {
+            "token": "<30>",
+            "logprob": -0.5,
+            "bytes": [60, 51, 48, 62],
+            "top_logprobs": [
+                {"token": "30", "logprob": -0.5, "bytes": [51, 48]},
+                {"token": "7", "logprob": -9999.0, "bytes": [55]},
+            ],
+        },
+        {"token": "<31>", "logprob": -0.25, "bytes": [60, 51, 49, 62], "top_logprobs": []},
+    ]
+}
+
+
+def _parser(parse_result):
+    parser = mock.MagicMock()
+    parser.implicit_reasoning_end_markers = ()
+    # A fresh copy per call: the endpoint normalizes, and may drop, the tool calls in place.
+    parser.parse.side_effect = lambda *args, **kwargs: copy.deepcopy(parse_result)
+    return parser
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "body",
+        "app_config",
+        "parse_result",
+        "expected_message",
+        "expected_finish_reason",
+        "expected_logprobs",
+    ),
+    [
+        pytest.param({}, {}, None, {"content": "<30><31>"}, "stop", None, id="compact-message"),
+        pytest.param(
+            {"return_tokenized_data": True, "return_raw_text": True},
+            {},
+            None,
+            {
+                "content": "<30><31>",
+                "prompt_token_ids": [10, 2],
+                "generation_token_ids": [30, 31],
+                "raw_text": "<10><2><30><31>",
+            },
+            "stop",
+            None,
+            id="token-ids-and-raw-text",
+        ),
+        # Outside eval mode prevent_retokenization is on by default, which echoes the token ids.
+        pytest.param(
+            {},
+            {"eval_mode": False},
+            None,
+            {"content": "<30><31>", "prompt_token_ids": [10, 2], "generation_token_ids": [30, 31]},
+            "stop",
+            None,
+            id="rl-default-echoes-token-ids",
+        ),
+        # Only the OpenAI block is clamped for JSON; the message-level list is raw engine output.
+        pytest.param(
+            {"logprobs": True},
+            {},
+            None,
+            {"content": "<30><31>"},
+            "stop",
+            _CHAT_LOGPROBS,
+            id="logprobs",
+        ),
+        # finish_reason follows vLLM: "tool_calls" under auto/required, "stop" for a named tool.
+        pytest.param(
+            {"tools": _TOOLS},
+            {},
+            _TOOL_PARSE_RESULT,
+            _TOOL_MESSAGE,
+            "tool_calls",
+            None,
+            id="tool-calls-auto",
+        ),
+        pytest.param(
+            {"tools": _TOOLS, "tool_choice": "required"},
+            {},
+            _TOOL_PARSE_RESULT,
+            {**_TOOL_MESSAGE, "content": ""},
+            "tool_calls",
+            None,
+            id="tool-choice-required-empties-content",
+        ),
+        pytest.param(
+            {"tools": _TOOLS, "tool_choice": _NAMED_TOOL_CHOICE},
+            {},
+            _TOOL_PARSE_RESULT,
+            {**_TOOL_MESSAGE, "content": ""},
+            "stop",
+            None,
+            id="named-tool-choice-reports-stop",
+        ),
+        pytest.param(
+            {"tools": _TOOLS, "parallel_tool_calls": False},
+            {},
+            _TOOL_PARSE_RESULT,
+            {**_TOOL_MESSAGE, "tool_calls": _NORMALIZED_TOOL_CALLS[:1]},
+            "tool_calls",
+            None,
+            id="parallel-tool-calls-disabled-keeps-first",
+        ),
+        # Incidental tool-call syntax is ignored when the client opted out of tools.
+        pytest.param(
+            {"tools": _TOOLS, "tool_choice": "none"},
+            {},
+            _TOOL_PARSE_RESULT,
+            {"content": "<30><31>", "reasoning_content": "thinking"},
+            "stop",
+            None,
+            id="tool-choice-none-drops-tool-calls",
+        ),
+    ],
+)
+async def test_chat_response_format(
+    body, app_config, parse_result, expected_message, expected_finish_reason, expected_logprobs
+):
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    replies = [
+        completed_reply(
+            "chat-0",
+            [10, 2],
+            [30, 31],
+            num_cached_tokens=2,
+            routing_indices=[5, 6, 7, 8],
+            generated_log_probs=[-0.5, -0.25],
+            # Only the first position reports a top-N distribution.
+            generated_top_n_logprobs=[{"30": -0.5, "7": float("-inf")}],
+        ),
+        # n=2 fan-out: the second choice hit its token limit.
+        completed_reply("chat-1", [10, 2], [40], sampling_params={"num_tokens_to_generate": 1}),
+    ]
+    client = ReplyingClient(replies)
+    parsers = ["p"] if parse_result is not None else []
+    app = build_app(CHAT_PATH, client, parsers=parsers, **app_config)
+
+    with mock.patch.object(chat_completions, "PARSER_MAPPING", {"p": _parser(parse_result)}):
+        response = await app.test_client().post(CHAT_PATH, json={**CHAT_BODY, "n": 2, **body})
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    payload = await response.get_json()
+    assert payload["id"] == "chat-0"
+    assert payload["object"] == "chat.completion"
+    assert payload["model"] == "EMPTY"
+    assert payload["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 2},
+    }
+    choice_0, choice_1 = payload["choices"]
+    assert (choice_0["index"], choice_1["index"]) == (0, 1)
+    assert choice_0["message"] == {
+        "role": "assistant",
+        "generation_log_probs": [-0.5, -0.25],
+        **expected_message,
+    }
+    assert choice_0["finish_reason"] == expected_finish_reason
+    assert choice_0["logprobs"] == expected_logprobs
+    assert (choice_0["moe_topk_indices"], choice_0["prompt_moe_topk_indices"]) == (
+        [5, 6, 7, 8],
+        [5, 6],
+    )
+    assert choice_1["finish_reason"] == "length"
+    assert "moe_topk_indices" not in choice_1
