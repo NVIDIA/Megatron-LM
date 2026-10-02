@@ -736,29 +736,50 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
-def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
+@pytest.mark.parametrize(
+    "parameter_placements",
+    [
+        pytest.param([Replicate(), Shard(0)], id="hfsdp"),  # ZeRO-1 / ZeRO-3
+        pytest.param([Replicate(), Replicate()], id="hybrid_zero2"),  # ZeRO-1 / ZeRO-2
+        pytest.param([Shard(0), Shard(0)], id="fsdp"),  # ZeRO-3 / ZeRO-3
+    ],
+)
+@pytest.mark.parametrize("inner_dp_size", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_next_forward_uses_optimizer_updated_weights(
+    distributed_setup, parameter_placements, inner_dp_size, dtype
+):
     """The next forward should observe weights updated by the previous optimizer step."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
+    if world_size < 2 or world_size % inner_dp_size:
+        pytest.skip("Requires at least two ranks and a world size divisible by inner_dp_size.")
 
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(1, world_size, bias=False, dtype=torch.bfloat16).to(device)
-    nn.init.constant_(model.weight, 1.0)
+    mesh = init_device_mesh(device.type, (world_size // inner_dp_size, inner_dp_size))
+    placements = Placements(
+        dp_axes=[0, 1],
+        parameter=parameter_placements,
+        # Reduce gradients inner-then-outer into the optimizer's two-axis shards.
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Shard(0), Shard(0)],
+    )
+    # Uneven rows and a bias exercise padding in both gather stages.
+    model = nn.Linear(5, 7, device=device, dtype=dtype)
+    nn.init.ones_(model.weight)
+    nn.init.zeros_(model.bias)
 
     with fully_shard_context(device=device):
         fully_shard(
             model,
             mesh=mesh,
-            placements=_default_placements(),
+            placements=placements,
             mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
         )
     # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
     # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
     fully_shard_optimizer(optimizer)
-    x = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
+    x = torch.ones(1, 5, device=device, dtype=dtype)
 
     def train_iteration() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
@@ -767,11 +788,9 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         optimizer.step()
         return loss.detach().float()
 
-    first_loss = train_iteration()
-    second_loss = train_iteration()
-
-    with pytest.raises(AssertionError):
-        torch.testing.assert_close(second_loss, first_loss)
+    # Each step subtracts 0.25 from all five weights and the bias of each row.
+    for expected in (35.0, 24.5, 14.0):
+        torch.testing.assert_close(train_iteration(), torch.tensor(expected, device=device))
 
 
 def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):
