@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from math import ceil
 from typing import Optional, Protocol, Tuple
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -1186,13 +1186,67 @@ class TEGroupedMLP(MegatronModule):
                         )
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
                         if k in sub_sd:
+                            layout_kwargs = {}
+                            if not getattr(module, 'single_grouped_weight', False) and not getattr(
+                                sub_sd[k], 'is_torch_fsdp2_param', False
+                            ):
+                                param = getattr(module, k.split('.')[-1], sub_sd[k].data)
+                                group = getattr(param, 'group', None)
+                                local_rows = sub_sd[k].local_shape[0]
+                                logical_rows = (
+                                    2 * self.config.moe_ffn_hidden_size // self.tp_group.size()
+                                )
+                                if group is not None:
+                                    assert (
+                                        local_rows * group.size() - param.pad_length == logical_rows
+                                    )
+                                else:
+                                    assert local_rows == logical_rows
+                                layout_kwargs = dict(
+                                    glu_interleave_size=self.config.moe_mlp_glu_interleave_size,
+                                    tp_local_rows=logical_rows,
+                                    local_row_offset=(
+                                        group.rank() * local_rows if group is not None else 0
+                                    ),
+                                )
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k],
                                 new_sharded_offsets,
                                 singleton_local_shards,
                                 tp_group=self.tp_group,
                                 dp_group=metadata['dp_cp_group'],
+                                **layout_kwargs,
                             )
+            elif name == 'linear_fc2' and self.config.gated_linear_unit:
+                for key, shard in sub_sd.items():
+                    source_param = getattr(getattr(shard, 'data', None), '_gtp_dequant_src', None)
+                    if source_param is None:
+                        continue
+
+                    def build_fp8(key, tensor, replica_id, flattened_range, template=shard):
+                        from megatron.core.fp8_utils import is_float8tensor
+                        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8
+
+                        assert flattened_range is None
+                        data = (
+                            dequantize_gtp_native_fp8(tensor) if is_float8tensor(tensor) else tensor
+                        )
+                        return [
+                            replace(
+                                template,
+                                key=key,
+                                data=data,
+                                dtype=data.dtype,
+                                replica_id=replica_id,
+                            )
+                        ]
+
+                    # No FC2 row permutation: retain the Parameter identity while
+                    # deferring native-FP8 dequantization to serialization, so the
+                    # existing per-parameter optimizer path can find this weight.
+                    sub_sd[key] = ShardedTensorFactory(
+                        shard.key, source_param, build_fp8, lambda parts: parts[0], shard.replica_id
+                    )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:
