@@ -35,6 +35,7 @@ COMPATIBILITY_FILES = (
     "tests/unit_tests/find_test_cases.py",
     "tests/unit_tests/testmon_selector.py",
     "tests/unit_tests/testmon_cache.py",
+    "tests/unit_tests/testmon_mandatory.py",
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",

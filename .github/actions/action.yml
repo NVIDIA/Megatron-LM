@@ -200,7 +200,20 @@ runs:
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
-              EFFECTIVE_MODE=enforce
+              # Mandatory-test mappings (tests/unit_tests/testmon_mandatory_tests.yaml)
+              # compare the tested commit with the baseline commit, the same
+              # reference point Testmon uses for its own selection.
+              BASELINE_SHA=$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["source_sha"])' assets_dir/testmon/manifest.json) || BASELINE_SHA=""
+              if [[ -n "$BASELINE_SHA" ]] \
+                && git fetch --no-tags --depth=1 origin "$BASELINE_SHA" \
+                && git diff --name-only "$BASELINE_SHA" HEAD > assets_dir/testmon/changed-files; then
+                EFFECTIVE_MODE=enforce
+                CHANGED_FILES=$(wc -l < assets_dir/testmon/changed-files | tr -d ' ')
+              else
+                EFFECTIVE_MODE=full
+                FALLBACK_REASON="unable to diff against baseline $BASELINE_SHA; running the full bucket without recording or saving"
+                echo "::notice::Testmon baseline diff unavailable; running the full unit-test bucket."
+              fi
             else
               EFFECTIVE_MODE=full
               FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
@@ -222,6 +235,9 @@ runs:
           echo "- Effective mode: $EFFECTIVE_MODE"
           if [[ "$REQUESTED_MODE" == "enforce" ]]; then
             echo "- Restored cache key: ${MATCHED_KEY:-none}"
+          fi
+          if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
+            echo "- Changed files vs. baseline: ${CHANGED_FILES}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
             echo "- Fallback: $FALLBACK_REASON"

@@ -340,12 +340,27 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "error",
         "invalid",
         "identity-error",
+        "diff-error",
     ],
 )
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     generation, source_tree, tmp_path, restore
 ):
     directory, identity = generation
+    # The resolver diffs the tested commit against the baseline source commit;
+    # replace git so the step can run outside a repository.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'echo "git $*" >> "$GIT_LOG"\n'
+        '[ "$GIT_FAIL" = "true" ] && exit 128\n'
+        '[ "$1" = "diff" ] && printf "megatron/core/a.py\\ntests/unit_tests/test_b.py\\n"\n'
+        "exit 0\n"
+    )
+    fake_git.chmod(0o755)
+    git_log = tmp_path / "git.log"
     if restore == "different-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", "sha256:" + "c" * 64)
     elif restore == "missing-image":
@@ -372,7 +387,11 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         cwd=tmp_path,
         env={
             **os.environ,
-            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            "PATH": os.pathsep.join(
+                (str(fake_bin), str(Path(sys.executable).parent), os.environ["PATH"])
+            ),
+            "GIT_LOG": str(git_log),
+            "GIT_FAIL": "true" if restore == "diff-error" else "false",
             "REQUESTED_MODE": "enforce",
             "IDENTITY_OUTCOME": "failure" if restore == "identity-error" else "success",
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
@@ -391,11 +410,24 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
+    changed_files = after.pop("changed-files", None)
     assert after == before
     if valid:
         assert "b" * 40 in summary.read_text()
+        assert "Changed files vs. baseline: 2" in summary.read_text()
+        assert changed_files is not None
+        assert changed_files[0].decode().splitlines() == [
+            "megatron/core/a.py",
+            "tests/unit_tests/test_b.py",
+        ]
+        assert f"git fetch --no-tags --depth=1 origin {'b' * 40}" in git_log.read_text()
+        assert f"git diff --name-only {'b' * 40} HEAD" in git_log.read_text()
     else:
         assert "without recording or saving" in summary.read_text()
+        if restore == "diff-error":
+            assert "unable to diff against baseline" in summary.read_text()
+        else:
+            assert not git_log.exists()
 
 
 @pytest.mark.parametrize(

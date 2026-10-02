@@ -1,0 +1,16 @@
+# Unit tests that must always run when a source directory changes, regardless of
+# what Testmon selects. This file is only consulted in the selective (`enforce`)
+# unit-test mode; full and baseline runs already execute every test.
+#
+# A mapping fires when any file changed between the restored Testmon baseline
+# commit and the tested commit lives under one of its `source_dirs` (prefix
+# match; glob patterns are also accepted). Its `test_buckets` are keyed by the
+# recipe platform (`dgx_h100`, `dgx_gb200`) and list test paths or globs; only
+# the files that belong to the bucket currently being executed are added to that
+# bucket's selection. Naming a whole bucket runs that bucket exhaustively.
+mappings:
+  - source_dirs:
+      - megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/distributed/mfsdp_v2/**/*.py
