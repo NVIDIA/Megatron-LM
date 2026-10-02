@@ -277,7 +277,6 @@ class TestBertModelAttentionDimensions:
             "Linear.__init__() got an unexpected keyword argument 'rng_tracker_name'"
         )
         assert exc_info.value.__notes__ == [
-            "when instantiating TERowParallelLinear",
             "when instantiating SelfAttention",
             "when instantiating TransformerLayer",
         ]
