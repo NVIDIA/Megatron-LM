@@ -201,6 +201,35 @@ class TestComputeLocalTokensPerExpert:
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         assert result.sum().item() == local_mask.sum().item()
 
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_counts_into_caller_zeroed_buffer(self, persistent):
+        """A caller-zeroed counter buffer is filled in place and returned."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        routing_map = torch.randint(0, 32, (64, 6), device="cuda")
+        counts = torch.zeros(8, dtype=torch.int32, device="cuda")
+        result = compute_local_tokens_per_expert(
+            routing_map, 8, 8, _vt(64), persistent=persistent, zeroed_tokens_per_expert=counts
+        )
+        assert result is counts
+        expected = _ref_tokens_per_expert(routing_map, 8, 8)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
+    def test_rejects_invalid_counter_buffer(self, invalid):
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        counts = {
+            "shape": torch.zeros(7, dtype=torch.int32, device="cuda"),
+            "dtype": torch.zeros(8, dtype=torch.int64, device="cuda"),
+            "stride": torch.zeros(16, dtype=torch.int32, device="cuda")[::2],
+        }[invalid]
+        routing_map = torch.zeros(4, 2, dtype=torch.int64, device="cuda")
+        with pytest.raises(AssertionError):
+            compute_local_tokens_per_expert(
+                routing_map, 0, 8, _vt(4), zeroed_tokens_per_expert=counts
+            )
+
 
 @pytest.mark.internal
 class TestComputeExpertOffsets:

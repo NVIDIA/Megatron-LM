@@ -74,7 +74,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     HAS_STATE_INDICES: tl.constexpr,
     STORE_INTERMEDIATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    FUSE_PADDING_MASK: tl.constexpr,
 ):
     """Walk one sequence token by token, carrying the `[K, V]` state."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -147,7 +146,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
         b_h += b_k[:, None] * b_v
         b_o = tl.sum(b_h * b_q[:, None], 0)
-        if FUSE_PADDING_MASK and HAS_STATE_INDICES:
+        if HAS_STATE_INDICES:
+            # Zero padding rows in this store, so o needs no masked_fill_ after the launch.
+            # A padding row's recurrence ran over whatever the padded input buffer
+            # held, so its output is overwritten rather than merely left unwritten:
+            # the contract is zero, and a stale inf/NaN would survive a mask.
             # Select, rather than multiply: padded inputs may contain NaN/Inf.
             b_o = tl.where(i_s >= 0, b_o, 0.0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
@@ -196,7 +199,6 @@ def fused_recurrent_gated_delta_rule_update(
     state_indices: torch.Tensor | None = None,
     intermediate_states: torch.Tensor | None = None,
     steps_per_token: int = 1,
-    fuse_padding_mask: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the recurrent Gated Delta Rule forward pass.
 
@@ -225,8 +227,6 @@ def fused_recurrent_gated_delta_rule_update(
         steps_per_token: Recurrence steps that make up one draft token, i.e. the
             Householder count `M` folded into the sequence dimension. Only
             meaningful together with `intermediate_states`.
-        fuse_padding_mask: Zero padding in the recurrent store instead of a separate mask.
-            Set False to retain the unfused reference path for exactness checks.
 
     Returns `(o, final_state)` with `o` shaped like `v`. When `state` is given,
     `final_state` is that same cache tensor, updated in place.
@@ -256,9 +256,6 @@ def fused_recurrent_gated_delta_rule_update(
     assert (
         state_indices is None or state is not None
     ), "state_indices requires the state cache it indexes into"
-
-    if state_indices is not None:
-        assert cu_seqlens is None, "state_indices with cu_seqlens is not supported yet"
 
     o = torch.empty_like(v)
     if state is not None:
@@ -326,13 +323,9 @@ def fused_recurrent_gated_delta_rule_update(
         BV=BV,
         IS_BETA_HEADWISE=beta.ndim != v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        FUSE_PADDING_MASK=fuse_padding_mask,
         num_warps=1,
         num_stages=3,
     )
-    if state_indices is not None and not fuse_padding_mask:
-        # A padding row's recurrence ran over whatever the padded input buffer
-        # held, so its output is overwritten rather than merely left unwritten:
-        # the contract is zero, and a stale inf/NaN would survive a mask.
-        o.masked_fill_((state_indices < 0).view(-1, *([1] * (o.ndim - 1))), 0)
+    if state_indices is not None:
+        assert cu_seqlens is None, "state_indices with cu_seqlens is not supported yet"
     return o, final_state
