@@ -21,6 +21,7 @@ from .common import (
     generation_config_sampling_defaults,
     log_sampling_defaults_once,
     resolve_sampling_default,
+    sampling_params_for_choice,
     validate_offload_params,
 )
 
@@ -179,6 +180,7 @@ try:
                 multi_modal_data = {modality: media_bytes}
 
             sampling_params = SamplingParams(
+                seed=req.get("seed"),
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -224,7 +226,7 @@ try:
             # Hash and serialize shared media once before fanning it out across
             # the prompts in this batch, the same way chat completions does.
             prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
-            for prompt_tokens in prompts_as_tokens:
+            for index, prompt_tokens in enumerate(prompts_as_tokens):
                 per_req_params = SamplingParams(
                     temperature=sampling_params.temperature,
                     top_k=sampling_params.top_k,
@@ -243,6 +245,7 @@ try:
                     # Keep that work off the coordinator so it can forward the reply body unchanged.
                     detokenize_generations=False,
                 )
+                per_req_params.seed = sampling_params_for_choice(sampling_params, index).seed
                 if stream_requested:
                     tasks.append(
                         client.add_request_streaming(

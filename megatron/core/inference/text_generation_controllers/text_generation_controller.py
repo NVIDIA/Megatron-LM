@@ -1142,7 +1142,7 @@ class TextGenerationController(MTPControllerMixin):
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
-    def _dynamic_step_sample_logits(self):
+    def _dynamic_step_sample_logits(self, sequence_lengths: Optional[Tensor] = None):
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
@@ -1169,6 +1169,7 @@ class TextGenerationController(MTPControllerMixin):
             no_top_k=no_top_k,
             no_top_p=no_top_p,
             output=self._sampled_tokens_cuda[:n],
+            sequence_lengths=sequence_lengths,
         )
 
     def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
@@ -2087,7 +2088,9 @@ class TextGenerationController(MTPControllerMixin):
 
         return active_request_ids, finished_request_ids, active_request_mask
 
-    def _run_async_sched_sample(self) -> _AsyncScheduleSampleResult:
+    def _run_async_sched_sample(
+        self, sequence_lengths: Optional[Tensor] = None
+    ) -> _AsyncScheduleSampleResult:
         """Sample active requests and start transferring their tokens to CPU.
 
         Returns:
@@ -2097,7 +2100,7 @@ class TextGenerationController(MTPControllerMixin):
         active_request_count = context.total_request_count - context.paused_request_count
 
         range_push("sampling")
-        self._dynamic_step_sample_logits()
+        self._dynamic_step_sample_logits(sequence_lengths=sequence_lengths)
         self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
@@ -2849,8 +2852,11 @@ class TextGenerationController(MTPControllerMixin):
             # -------------------------------------------------------------------------
             # Sample
             # -------------------------------------------------------------------------
-            # Enqueue sampling behind the current logits-producing work.
-            sample_result = self._run_async_sched_sample()
+            # Prepare has advanced the live lengths; sample using the positions
+            # of the pending logits, not those of the successor forward.
+            sample_result = self._run_async_sched_sample(
+                sequence_lengths=resolved_sequence_lengths - 1
+            )
 
             # Populate the next forward's input-ID view directly from GPU samples.
             context.copy_async_sched_sample_to_forward(sample_result.sampled_tokens_gpu)
@@ -3299,6 +3305,9 @@ class TextGenerationController(MTPControllerMixin):
         )
         max_prompt_length_in_batch = max(prompt_lengths_in_batch)
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
+
+        if any(req.sampling_params.seed is not None for req in active_requests.values()):
+            raise ValueError("Request-local seeds require dynamic inference")
 
         # For batch inference the sampling params are the same for all request
         sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params

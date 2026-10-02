@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import hashlib
+import struct
 from collections import defaultdict
 from typing import Any, List, Optional, Tuple
 
@@ -12,6 +14,12 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
+
+
+def request_token_seed(seed: int, position: int) -> int:
+    """Derive a draw from logical request seed and absolute next-token position."""
+    digest = hashlib.sha256(struct.pack("<QQ", seed, position)).digest()
+    return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
 
 class TorchSampling(Sampling):
@@ -83,6 +91,7 @@ class TorchSampling(Sampling):
         *,
         generator: torch.Generator,
         vocab_size: Optional[int] = None,
+        row_seeds: Optional[List[Optional[int]]] = None,
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
 
@@ -93,7 +102,9 @@ class TorchSampling(Sampling):
             temperature: Temperature scaling factor.
             top_k: Top-k filtering value (0 = disabled).
             top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled).
-            generator: RNG used by `torch.multinomial`.
+            generator: Shared RNG for requests without an explicit seed.
+            row_seeds: Optional per-row draw seeds. None entries use the shared RNG.
+                Explicit seeds do not advance that RNG.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
 
@@ -121,7 +132,22 @@ class TorchSampling(Sampling):
         # which keeps the two engines' sampling paths aligned; vLLM also uses it to
         # avoid the CPU-GPU sync that `torch.multinomial` incurs.
         q = torch.empty_like(probabilities)
-        q.exponential_(generator=generator)
+        if row_seeds is None:
+            q.exponential_(generator=generator)
+        else:
+            if len(row_seeds) != q.shape[0]:
+                raise ValueError("row_seeds must contain one entry per logits row")
+            unseeded = [i for i, seed in enumerate(row_seeds) if seed is None]
+            if unseeded:
+                indices = torch.tensor(unseeded, device=q.device, dtype=torch.long)
+                noise = torch.empty((len(unseeded), q.shape[1]), device=q.device, dtype=q.dtype)
+                noise.exponential_(generator=generator)
+                q.index_copy_(0, indices, noise)
+            local_rng = torch.Generator(device=q.device)
+            for row, seed in enumerate(row_seeds):
+                if seed is not None:
+                    local_rng.manual_seed(seed)
+                    q[row].exponential_(generator=local_rng)
         sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
         if vocab_size:
@@ -189,6 +215,7 @@ class TorchSampling(Sampling):
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
         output: Optional[Tensor] = None,
+        sequence_lengths: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
@@ -216,7 +243,26 @@ class TorchSampling(Sampling):
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
         md = context.active_request_metadata
-        device = torch.cuda.current_device()
+        device = logits.device
+        seed_metadata = md.get("seed")
+        seeds = (
+            [-1] * active_request_count
+            if seed_metadata is None
+            else seed_metadata[:active_request_count].tolist()
+        )
+        row_seeds = None
+        if any(seed >= 0 for seed in seeds):
+            if token_to_request_index is not None or context.config.num_speculative_tokens:
+                raise ValueError("Request-local seeds do not yet support speculative decoding")
+            positions = (
+                context.get_active_sequence_lengths()
+                if sequence_lengths is None
+                else sequence_lengths
+            ).tolist()
+            row_seeds = [
+                request_token_seed(seed, position) if seed >= 0 else None
+                for seed, position in zip(seeds, positions)
+            ]
 
         bucket_map: dict = defaultdict(list)
         temp = md["temperature"][:active_request_count].tolist()
@@ -237,7 +283,7 @@ class TorchSampling(Sampling):
             output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
-        for idx_tensor, (_, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):
+        for idx_tensor, (indices, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):
             if token_to_request_index is None:
                 row_indices = idx_tensor
             else:
@@ -250,6 +296,7 @@ class TorchSampling(Sampling):
                     top_p,
                     generator=self._rng,
                     vocab_size=self._vocab_size,
+                    row_seeds=None if row_seeds is None else [row_seeds[i] for i in indices],
                 )
             )
             indices_list.append(row_indices)
