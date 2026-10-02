@@ -55,11 +55,14 @@ def _reference_indexer_grads(q, w, k, indices, target, loss_coeff, grad_loss, sm
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("compute_grad_w", [False, True])
 @pytest.mark.parametrize("chunk_rows", [None, 3])
+@pytest.mark.parametrize("torch_deterministic", [True, False])
 def test_deterministic_indexer_grads_match_reference_and_replay(
-    batch, dtype, compute_grad_w, chunk_rows, monkeypatch
+    batch, dtype, compute_grad_w, chunk_rows, torch_deterministic, monkeypatch
 ):
     # B=1 is also the synthetic-batch contract used by packed THD and CP callers.
     # Three query rows per chunk forces the B=2 case to cross a sample boundary.
+    # The torch flag selects index_add_ accumulation; without it the helper sorts key ids
+    # and gathers prefix sums. Both orders use the same batch-offset key ids.
     # Tiny test heads otherwise allocate a large unused padding-id array under the 1 GiB budget.
     monkeypatch.setattr(dk, "_DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES", 4096)
     if chunk_rows is not None:
@@ -73,7 +76,7 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
     prior_deterministic = torch.are_deterministic_algorithms_enabled()
     prior_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
-        torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(torch_deterministic)
         results = [
             dk._deterministic_sparse_indexer_grads_wk(
                 q.clone(),
