@@ -311,8 +311,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         """Orthogonalize the group's gathered inputs into full updates.
 
         Each >=2D input is contracted to a 2D matrix `(shape[0], rest)` per Muon's matrix
-        view of weights; `<2D` inputs are passed through uncontracted and error in
-        `orthogonalize`, like in the upstream `OrthogonalizedOptimizer`. This method is
+        view of weights. `<2D` inputs are rejected rank-uniformly in `step` before any
+        communication, so the kernel-level check below is unreachable in practice; it
+        remains as a guard. This method is
         the seam for future batching: parameters of the same shape could be stacked
         into one batched kernel instead of the per-parameter loop.
         """
@@ -400,6 +401,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     layouts={i: owner_layout.layouts[i] for i in active_indices},
                     owners={i: owner_layout.owners[i] for i in active_indices},
                 )
+                # The `orthogonalize` kernel rejects <2D inputs, but only the owner
+                # calls it: a per-rank raise there would leave the other ranks
+                # deadlocked in the gather/scatter P2P. Validate rank-uniformly from
+                # the rank-identical layouts before posting any communication.
+                for i, layout in active.layouts.items():
+                    if len(layout.full_shape) < 2:
+                        raise ValueError(
+                            f"Only 2D or higher-dimensional parameters can be "
+                            f"orthogonalized; parameter {i} of {fsdp_group!r} has "
+                            f"shape {tuple(layout.full_shape)}."
+                        )
                 if active.layouts:
                     temporaries.extend(self._step_active(fsdp_group, active, torch_group, lr))
 
