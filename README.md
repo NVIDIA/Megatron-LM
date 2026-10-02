@@ -77,10 +77,7 @@ Megatron-LM/
 │   │   └── export/              # Model export (example: TensorRT-LLM)
 │   ├── training/                # Training scripts
 │   └── post_training/           # Post-training (quantization, distillation, pruning, etc.)
-├── examples/                    # Ready-to-use training examples
-├── tools/                       # Utility tools
-├── tests/                       # Comprehensive test suite
-└── docs/                        # Documentation
+└── examples/                    # Ready-to-use training examples
 ```
 
 # Performance Benchmarking
