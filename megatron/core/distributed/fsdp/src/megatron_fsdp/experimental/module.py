@@ -308,6 +308,8 @@ class FsdpModule:
         this module's parameters and reduce their gradients. It is invoked once
         all of this module's trainable parameters have accumulated gradients, or
         via a full-backward hook when the module owns no trainable parameters.
+        Units owning frozen parameters reject backward if that hook receives no
+        input gradients, since it may fire before internal backward consumes weights.
 
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
@@ -315,11 +317,21 @@ class FsdpModule:
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
-            module.register_full_backward_hook(
-                lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
-                    cast(FsdpModule, hooked_module)
-                )
-            )
+
+            def frozen_backward_hook(hooked_module, grad_input, _grad_output):
+                module = cast(FsdpModule, hooked_module)
+                # With no grad-requiring inputs, PyTorch fires this hook at
+                # output gradients, before internal backward can read weights.
+                # Parameterless containers have no owned storage to release.
+                if module._parameter_groups and all(grad is None for grad in grad_input):
+                    raise RuntimeError(
+                        "MFSDP cannot safely reshard frozen weights when its full backward "
+                        "hook receives no input gradients. See "
+                        "https://github.com/NVIDIA/Megatron-LM/issues/7823."
+                    )
+                post_backward_hook(module)
+
+            module.register_full_backward_hook(frozen_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion

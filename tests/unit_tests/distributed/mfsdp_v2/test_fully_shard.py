@@ -710,8 +710,8 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     assert group.main_grad is None
 
 
-def test_frozen_weights_remain_available_during_backward(distributed_setup):
-    """A frozen FSDP unit with no input gradients must wait for internal backward."""
+def test_frozen_weights_without_input_gradients_reject_backward(distributed_setup):
+    """Reject the unsafe full-backward-hook path before releasing frozen weights."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
@@ -735,10 +735,11 @@ def test_frozen_weights_remain_available_during_backward(distributed_setup):
     with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, unpack):
         output = model(x)
         assert output.requires_grad  # The separately sharded child still needs backward.
-        output.sum().backward()
+        with pytest.raises(RuntimeError, match="MFSDP cannot safely reshard frozen weights"):
+            output.sum().backward()
 
-    assert model[0].weight.grad is not None
-    torch.optim.SGD(model.parameters(), lr=0.05).step()
+    frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
+    assert frozen_weight.untyped_storage().nbytes() > 0
 
 
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
