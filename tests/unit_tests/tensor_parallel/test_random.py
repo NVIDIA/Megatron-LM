@@ -9,6 +9,7 @@ from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
+    cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -376,3 +377,42 @@ def test_checkpoint_without_output_retain_input_tensors(use_manager):
         assert torch.allclose(ref_input_grad, input2.grad)
     finally:
         Utils.destroy_model_parallel()
+
+
+def _capture_rng_op_on_forked_state(register_state):
+    """Capture `torch.rand` while the default generator runs on a cloned (forked) state."""
+    default_generator = torch.cuda.default_generators[torch.cuda.current_device()]
+    original_state = default_generator.graphsafe_get_state()
+    forked_state = default_generator.clone_state()
+    forked_state.manual_seed(1234)
+    graph = torch.cuda.CUDAGraph()
+    if register_state:
+        graph.register_generator_state(forked_state)
+    try:
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            default_generator.graphsafe_set_state(forked_state)
+            output = torch.rand(8, device="cuda")
+            default_generator.graphsafe_set_state(original_state)
+    finally:
+        default_generator.graphsafe_set_state(original_state)
+    graph.replay()
+    torch.cuda.synchronize()
+    return output
+
+
+def test_cudagraph_needs_generator_registration_is_cached():
+    cudagraph_needs_generator_registration.cache_clear()
+    first = cudagraph_needs_generator_registration()
+    assert isinstance(first, bool)
+    assert cudagraph_needs_generator_registration() is first
+    assert cudagraph_needs_generator_registration.cache_info().hits == 1
+
+
+def test_cudagraph_generator_registration_matches_torch_behavior():
+    """The probe answer must be the registration that a capture with a forked state needs."""
+    needs_registration = cudagraph_needs_generator_registration()
+    output = _capture_rng_op_on_forked_state(register_state=needs_registration)
+    assert output.shape == (8,)
+    if needs_registration:
+        with pytest.raises(RuntimeError):
+            _capture_rng_op_on_forked_state(register_state=False)

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 from collections.abc import Callable
 from typing import Any, Optional, TypeVar, Union
@@ -27,11 +28,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.tensor_observation import suspend_tensor_observations
-from megatron.core.utils import (
-    is_te_min_version,
-    is_torch_min_version,
-    safely_set_viewless_tensor_data,
-)
+from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
@@ -448,16 +445,40 @@ def get_all_rng_states():
         return {}
 
 
-def cudagraph_needs_generator_registration() -> bool:
-    """Whether generators must be registered with a `torch.cuda.CUDAGraph` before capture.
+def _probe_cudagraph_generator_registration() -> bool:
+    """Capture one RNG op on an unregistered generator and report whether PyTorch rejects it."""
+    generator = torch.Generator(device="cuda")
+    buffer = torch.empty(4, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    needs_registration = False
+    with torch.cuda.stream(stream):
+        graph.capture_begin(capture_error_mode="thread_local")
+        try:
+            buffer.zero_()  # keeps the probe graph non-empty, so capture_end() does not warn
+            buffer.uniform_(generator=generator)
+        except RuntimeError:
+            needs_registration = True
+        finally:
+            graph.capture_end()
+    torch.cuda.current_stream().wait_stream(stream)
+    return needs_registration
 
-    PyTorch >= 2.14 (pytorch/pytorch#176753) lazily registers every generator whose Philox
-    state is consumed during capture, and `CUDAGraph.register_generator_state()` became a
-    deprecated no-op that prints a warning on *every* call. Skip the explicit registration
-    there: it does nothing, and with one call per layer, per graph and per generator it floods
-    stderr (tens of thousands of lines per rank for dynamic inference with CUDA graphs).
+
+@functools.lru_cache(maxsize=None)
+def cudagraph_needs_generator_registration() -> bool:
+    """Whether a `torch.cuda.CUDAGraph` needs explicit generator registration before capture.
+
+    PyTorch with pytorch/pytorch#176753 registers generators lazily during capture, and
+    `CUDAGraph.register_generator_state()` is a deprecated no-op that warns on *every* call.
+    PyTorch without #176753 rejects RNG ops on generator states that no one registered with
+    the graph. The version does not tell them apart: NVIDIA PyTorch 26.09 and 26.10 report
+    2.14.0a0 with #176753 reverted. So probe the behavior once and cache the answer.
     """
-    return not is_torch_min_version("2.14.0a0")
+    if not hasattr(torch.cuda.CUDAGraph, "register_generator_state"):
+        return False
+    return _probe_cudagraph_generator_registration()
 
 
 def model_parallel_cuda_manual_seed(
