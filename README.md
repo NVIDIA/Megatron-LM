@@ -23,7 +23,7 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Getting Started
 
-**Compatibility:** Python **3.12+** and PyTorch **2.6.0+** are required, as declared in [pyproject.toml](pyproject.toml). Python 3.10 and 3.11 are no longer supported. GPU training also requires a compatible CUDA, NCCL, and Transformer Engine stack; use a container environment to keep these dependencies aligned. For source development, the tested NGC PyTorch base images are pinned in [docker/.ngc_version.dev](docker/.ngc_version.dev) and [docker/.ngc_version.lts](docker/.ngc_version.lts).
+**Compatibility:** Python **3.12+** and PyTorch **2.6.0+** recommended. For source development, the tested NGC PyTorch base images are pinned in [docker/.ngc_version.dev](https://github.com/sbhavani/Megatron-LM/blob/codex/readme-refresh/docker/.ngc_version.dev) and [docker/.ngc_version.lts](https://github.com/sbhavani/Megatron-LM/blob/codex/readme-refresh/docker/.ngc_version.lts).
 
 **Install from PyPI:**
 
