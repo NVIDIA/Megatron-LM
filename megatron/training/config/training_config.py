@@ -378,14 +378,21 @@ class LoggerConfig:
     moe_routing_trace_dump_weights: bool = False
     """Save router weight tensors to a .pt sidecar file."""
 
-    enable_one_logger: bool = True
-    """Enable one-logger end-to-end metrics."""
+    enable_one_logger: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-one-logger"]}},
+    )
+    """Enable/disable using one_logger to track E2E metrics.
+    Note that one_logger is an internal tool and not available externally.
+    For installation, please go to
+    https://confluence.nvidia.com/display/MLWFO/Package+Repositories for more details.
+    """
 
     one_logger_project: str = "megatron-lm"
-    """Project for one-logger metrics."""
+    """The one-logger project name. Ignored if --no-one-logger is set."""
 
     one_logger_run_name: str | None = None
-    """Run name displayed by one-logger."""
+    """The one-logger run name displayed. Ignored if --no-one-logger is set."""
 
     one_logger_async: bool = False
     """Run one-logger asynchronously."""
@@ -397,13 +404,21 @@ class LoggerConfig:
     """Application version associated with performance metrics."""
 
     otel_enabled: bool = False
-    """Enable OpenTelemetry in addition to its environment configuration."""
+    """Enable OpenTelemetry telemetry (traces and metrics).
+    See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.
+    """
 
     otel_service_name: str | None = None
-    """Override the OpenTelemetry service name."""
+    """Override OTEL_SERVICE_NAME for this training run."""
 
     otel_span_groups: str | None = None
-    """Override the OpenTelemetry span-group selection."""
+    """Comma-separated span-group spec controlling which OTel instrumentation boundaries are active.
+    Accepts preset keywords ("default", "per_step", "full", "all") or individual group names
+    ("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", "step",
+    "forward_backward", "optimizer", "microbatch"), or a mix.
+    Defaults to "default" (coarse job/checkpoint/evaluate spans only).
+    Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.
+    """
 
     def validate(self) -> None:
         """Check logging requirements shared by CLI and native configurations."""
