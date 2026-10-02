@@ -1423,7 +1423,7 @@ def _indexer_topk_bshd(
     Args:
         q_bshd: ``(b, sq, idx_nh, idx_hd)`` bf16, C-contiguous.
         k_bsd:  ``(b, sk, idx_hd)`` bf16, C-contiguous.
-        w_bsh:  ``(b, sq, idx_nh)`` bf16, C-contiguous raw weights.
+        w_bsh:  ``(b, sq, idx_nh)`` bf16 or fp32, C-contiguous raw weights.
         topk:   number of top-K indices to return per query.
 
     Returns:
@@ -1856,15 +1856,21 @@ def _all_reduce_tp_target(target: Tensor, tp_group) -> Tensor:
 
 
 def _pad_indexer_heads_for_backward(q_bshd: Tensor, w_bsh: Tensor) -> Tuple[Tensor, Tensor, int]:
-    """Pad indexer heads for cuDNN backward kernels that require at least 64 heads."""
+    """Prepare BF16 weights and pad heads for cuDNN indexer backward.
+
+    Forward scoring retains FP32 weights (cudnn-frontend#1311). Backward still
+    requires BF16 weights, so its gradients approximate the FP32-weight forward.
+    """
     actual_heads = q_bshd.size(2)
     if actual_heads >= 64:
+        if w_bsh.dtype == torch.float32:
+            w_bsh = w_bsh.to(torch.bfloat16)
         return q_bshd, w_bsh, actual_heads
 
     q_padded = q_bshd.new_zeros((q_bshd.size(0), q_bshd.size(1), 64, q_bshd.size(3)))
     q_padded[:, :, :actual_heads, :] = q_bshd
 
-    w_padded = w_bsh.new_zeros((w_bsh.size(0), w_bsh.size(1), 64))
+    w_padded = w_bsh.new_zeros((w_bsh.size(0), w_bsh.size(1), 64), dtype=torch.bfloat16)
     w_padded[:, :, :actual_heads] = w_bsh
     return q_padded.contiguous(), w_padded.contiguous(), actual_heads
 
@@ -3050,7 +3056,7 @@ def fused_indexer_sparse_attn(
         kv_full: ``(skv, b, d)`` bf16 SBD compressed KV.
         q_indexer: ``(sq, b, idx_nh, idx_hd)`` bf16 indexer query.
         k_indexer: ``(skv, b, idx_hd)`` bf16 indexer key.
-        weights: ``(sq, b, idx_nh)`` bf16 indexer weights.
+        weights: ``(sq, b, idx_nh)`` bf16 or fp32 indexer weights.
         indexer_topk: number of top-K compressed positions to select.
         softmax_scale: attention ``Q @ K^T`` scale.
         loss_coeff: coefficient scaling the KL divergence loss.

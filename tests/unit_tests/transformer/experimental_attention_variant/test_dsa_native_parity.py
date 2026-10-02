@@ -346,10 +346,19 @@ def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
     )
 
 
-def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypatch):
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("chunk_rows", [2, 4])
+def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(
+    monkeypatch, weights_dtype, chunk_rows
+):
+    weights = torch.full((1, 4, 1), 1.0 + 2**-10, dtype=weights_dtype)
+
     class FakeDSA:
         @staticmethod
         def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+            assert q_bshd.dtype == k_bshd.dtype == torch.bfloat16
+            assert w_bsh.dtype == weights_dtype
+            torch.testing.assert_close(w_bsh, weights[:, : w_bsh.size(1)], rtol=0, atol=0)
             b, sq, idx_nh, _ = q_bshd.shape
             sk = k_bshd.size(1)
             scores = torch.zeros((b, sq, sk), dtype=torch.float32)
@@ -376,27 +385,35 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda b, sq, sk: 2)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda b, sq, sk: chunk_rows
+    )
 
-    topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
-        torch.ones((1, 4, 1, 1)),
-        torch.arange(1, 5, dtype=torch.float32).view(1, 4, 1),
-        torch.ones((1, 4, 1)),
+    topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
+        torch.ones((1, 4, 1, 1), dtype=torch.bfloat16),
+        torch.arange(1, 5, dtype=torch.bfloat16).view(1, 4, 1),
+        weights,
         topk=4,
         return_scores=False,
+        return_topk_scores=True,
     )
 
     torch.testing.assert_close(
-        topk_indices,
+        topk_indices.sort(dim=-1).values,
         torch.tensor(
             [[[0, -1, -1, -1], [0, 1, -1, -1], [0, 1, 2, -1], [0, 1, 2, 3]]], dtype=torch.int32
-        ),
+        )
+        .sort(dim=-1)
+        .values,
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
         topk_length, torch.tensor([[1, 2, 3, 4]], dtype=torch.int32), rtol=0, atol=0
     )
+    expected_scores = (topk_indices.float() + 1) * weights.float()
+    expected_scores.masked_fill_(topk_indices < 0, torch.finfo(torch.float32).min)
+    torch.testing.assert_close(topk_scores, expected_scores, rtol=0, atol=0)
 
 
 def test_cudnn_indexer_topk_tie_break_prefers_lower_indices(monkeypatch):
@@ -644,7 +661,8 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
     )
 
 
-def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch, weights_dtype):
     """CP1 multi-sequence packs use one THD call without splitting Q or duplicating K."""
     seen = {"calls": 0}
 
@@ -682,9 +700,9 @@ def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
 
-    q = torch.ones((1, 8, 1, 1))
-    k = torch.ones((1, 8, 1))
-    weights = torch.ones((1, 8, 1))
+    q = torch.ones((1, 8, 1, 1), dtype=torch.bfloat16)
+    k = torch.ones((1, 8, 1), dtype=torch.bfloat16)
+    weights = torch.full((1, 8, 1), 1.0 + 2**-10, dtype=weights_dtype)
     cu_q = torch.tensor([0, 3, 8], dtype=torch.int32)
     # Match the production dynamic-scheduler contract: self-attention Q/K
     # boundaries alias, so equality is proven without a CUDA synchronization.
@@ -716,6 +734,7 @@ def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
     assert seen["q"].data_ptr() == q.data_ptr()
     assert seen["k"].data_ptr() == k.data_ptr()
     assert seen["weights"].data_ptr() == weights.data_ptr()
+    torch.testing.assert_close(seen["weights"], weights.view(8, 1), rtol=0, atol=0)
     assert seen["cu_q"] is cu_q
     assert seen["cu_k"] is cu_k
     assert (seen["max_q"], seen["max_k"]) == (5, 5)
@@ -1962,7 +1981,8 @@ def test_cudnn_fused_hooks_reject_non_relu_scoring(hook):
             )
 
 
-def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatch):
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatch, weights_dtype):
     class Config:
         kv_lora_rank = 512
 
@@ -1990,6 +2010,8 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_cp_size=1,
         varlen_is_plain_causal=False,
     ):
+        assert w_bsh.dtype == weights_dtype
+        torch.testing.assert_close(w_bsh, weights.permute(1, 0, 2), rtol=0, atol=0)
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
         seen["varlen_starts"] = varlen_starts
@@ -2013,11 +2035,16 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         return torch.zeros((2, 1, d_v), dtype=q.dtype), torch.zeros((2, 1), dtype=torch.float32)
 
     def fake_sparse_loss_and_grads(**kwargs):
+        assert kwargs["w_bsh"].dtype == weights_dtype
         seen["loss_topk"] = kwargs["topk_indices_cmp"].detach().clone()
         seen["tp_group"] = kwargs["tp_group"]
         q_grad = torch.ones_like(kwargs["q_idx_bshd"]).permute(1, 0, 2, 3).contiguous()
         k_grad = torch.full_like(kwargs["k_idx_bsd"], 2.0).permute(1, 0, 2).contiguous()
-        w_grad = torch.full_like(kwargs["w_bsh"], 3.0).permute(1, 0, 2).contiguous()
+        w_grad = (
+            torch.full_like(kwargs["w_bsh"], 3.0, dtype=torch.bfloat16)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
         return torch.tensor(4.0, dtype=torch.float32), q_grad, k_grad, w_grad
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
@@ -2029,7 +2056,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
 
     q = torch.zeros((2, 1, 1, 1), dtype=torch.bfloat16, requires_grad=True)
     k = torch.zeros((3, 1, 1), dtype=torch.bfloat16, requires_grad=True)
-    weights = torch.zeros((2, 1, 1), dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.full((2, 1, 1), 1.0 + 2**-10, dtype=weights_dtype, requires_grad=True)
 
     class FakeProcessGroupCollection:
         tp = object()
@@ -2302,8 +2329,11 @@ def test_cudnn_sparse_attn_target_pads_small_local_head_count(monkeypatch):
     assert seen["topk_indices_global"] is False
 
 
-def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch, weights_dtype):
     seen = {}
+    weights = torch.full((1, 1, 1), 1.0 + 2**-10, dtype=weights_dtype, requires_grad=True)
+    selected_scores = torch.tensor([3.0, 2.0, 0.0]) * weights.detach().float().view(())
 
     class FakeDSA:
         @staticmethod
@@ -2324,10 +2354,14 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
             block_I,
         ):
             seen["index_score"] = index_score
+            assert weights.dtype == torch.bfloat16
+            torch.testing.assert_close(
+                weights[:, :, :1], torch.ones((1, 1, 1), dtype=torch.bfloat16)
+            )
             return {
                 "d_index_q": torch.zeros_like(q_indexer),
                 "d_index_k": torch.zeros_like(k_indexer),
-                "d_weights": torch.zeros_like(weights),
+                "d_weights": torch.ones_like(weights),
             }
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
@@ -2368,10 +2402,13 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         )
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
+        torch.testing.assert_close(w_bsh, weights.permute(1, 0, 2), rtol=0, atol=0)
         return (
             torch.tensor([[[3, 1, 2, -1]]], dtype=torch.int32),
             torch.tensor([[3]], dtype=torch.int32),
-            torch.tensor([[[3.0, 2.0, 0.0, torch.finfo(torch.float32).min]]]),
+            torch.cat((selected_scores, torch.tensor([torch.finfo(torch.float32).min]))).view(
+                1, 1, 4
+            ),
         )
 
     def fake_flash_mla(q, kv, topk_idxs, softmax_scale, d_v, attn_sink, topk_length):
@@ -2386,13 +2423,16 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_bshd", fake_indexer_topk)
     monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_flash_mla)
     monkeypatch.setattr(dsa_cudnn_kernels, "_compute_attn_target", fake_attn_target)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_run_sparse_attention_backward", lambda **kwargs: (None, None)
+    )
 
-    dsa_cudnn_kernels.fused_indexer_sparse_attn(
+    _, indexer_loss = dsa_cudnn_kernels.fused_indexer_sparse_attn(
         torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16),
         torch.zeros((4, 1, 1), dtype=torch.bfloat16),
         torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16),
         torch.zeros((4, 1, 1), dtype=torch.bfloat16),
-        torch.zeros((1, 1, 1), dtype=torch.bfloat16),
+        weights,
         indexer_topk=4,
         softmax_scale=1.0,
         loss_coeff=0.01,
@@ -2408,9 +2448,12 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
     torch.testing.assert_close(
         seen["loss_topk"], torch.tensor([[[3, 1, 2, -1]]], dtype=torch.int32)
     )
-    expected = torch.softmax(torch.tensor([3.0, 2.0, 0.0]), dim=0)
-    torch.testing.assert_close(seen["index_score"][0, 0, :3], expected)
+    expected = torch.softmax(selected_scores, dim=0)
+    torch.testing.assert_close(seen["index_score"][0, 0, :3], expected, rtol=1e-6, atol=0)
     torch.testing.assert_close(seen["index_score"][0, 0, 3:], torch.zeros(125))
+    torch.testing.assert_close(indexer_loss, -0.01 * selected_scores.log_softmax(dim=0)[0])
+    indexer_loss.backward()
+    torch.testing.assert_close(weights.grad, torch.ones_like(weights), rtol=0, atol=0)
 
 
 def test_cudnn_sparse_loss_masks_invalid_query_rows_for_backward(monkeypatch):
@@ -2953,25 +2996,37 @@ def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
     assert grad_kv.shape == (skv, batch_size, attn_dim)
 
 
-def test_cudnn_indexer_backward_head_padding_slices_to_actual_heads():
-    q = torch.randn(1, 2, 32, 4)
-    w = torch.randn(1, 2, 32)
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_cudnn_indexer_backward_head_padding_slices_to_actual_heads(weights_dtype, num_heads):
+    q = torch.randn(1, 2, num_heads, 4, dtype=torch.bfloat16)
+    w = torch.full((1, 2, num_heads), 1.0 + 2**-10, dtype=weights_dtype)
+    original_w = w.clone()
 
     padded_q, padded_w, actual_heads = dsa_cudnn_kernels._pad_indexer_heads_for_backward(q, w)
 
-    assert actual_heads == 32
+    assert actual_heads == num_heads
     assert padded_q.shape == (1, 2, 64, 4)
     assert padded_w.shape == (1, 2, 64)
-    torch.testing.assert_close(padded_q[:, :, :32], q)
-    torch.testing.assert_close(padded_w[:, :, :32], w)
-    torch.testing.assert_close(padded_q[:, :, 32:], torch.zeros(1, 2, 32, 4))
-    torch.testing.assert_close(padded_w[:, :, 32:], torch.zeros(1, 2, 32))
+    torch.testing.assert_close(padded_q[:, :, :num_heads], q, rtol=0, atol=0)
+    torch.testing.assert_close(padded_w[:, :, :num_heads], w.bfloat16(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        padded_q[:, :, num_heads:], torch.zeros_like(padded_q[:, :, num_heads:])
+    )
+    torch.testing.assert_close(
+        padded_w[:, :, num_heads:], torch.zeros_like(padded_w[:, :, num_heads:])
+    )
+    torch.testing.assert_close(w, original_w, rtol=0, atol=0)
+    if num_heads == 64:
+        assert padded_q is q
+        if weights_dtype == torch.bfloat16:
+            assert padded_w is w
 
     grad_q, grad_w = dsa_cudnn_kernels._slice_indexer_backward_head_grads(
         padded_q, padded_w, actual_heads
     )
     torch.testing.assert_close(grad_q, q)
-    torch.testing.assert_close(grad_w, w)
+    torch.testing.assert_close(grad_w, w.bfloat16(), rtol=0, atol=0)
 
 
 def test_cudnn_sparse_indexer_backward_chunks_sequence_and_preserves_scaling(monkeypatch):
@@ -3125,10 +3180,16 @@ def test_cudnn_dense_attn_lse_uses_full_causal_kv():
     torch.testing.assert_close(lse, expected)
 
 
-def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch):
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch, weights_dtype):
     seen = {}
     dense_lse = torch.tensor([[[0.25, 0.5], [0.75, 1.0]]], dtype=torch.float32)
     sparse_lse = torch.full((2, 2), 99.0, dtype=torch.float32)
+    weights = torch.full((2, 1, 1), 1.0 + 2**-10, dtype=weights_dtype, requires_grad=True)
+    index_scores = torch.tensor(
+        [[[0.0, float("-inf"), float("-inf")], [0.0, 1.0, float("-inf")]]], dtype=torch.float32
+    )
+    index_scores[0, 1, 1] = weights.detach()[1, 0, 0].float()
 
     class FakeDSA:
         @staticmethod
@@ -3157,25 +3218,27 @@ def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch):
             ratio,
             block_I,
         ):
-            del attn_score, attn_l1norm, index_score, index_lse
+            del attn_score, attn_l1norm, index_lse
             del sm_scale, loss_coeff, grad_loss, ratio, block_I
+            assert weights.dtype == torch.bfloat16
+            torch.testing.assert_close(
+                weights[:, :, :1], torch.ones((1, 2, 1), dtype=torch.bfloat16)
+            )
+            torch.testing.assert_close(index_score, index_scores, rtol=0, atol=0)
             return {
                 "d_index_q": torch.zeros_like(q_indexer),
                 "d_index_k": torch.zeros_like(k_indexer),
-                "d_weights": torch.zeros_like(weights),
+                "d_weights": torch.ones_like(weights),
             }
 
     def fake_indexer_topk(*args, **kwargs):
-        del args
+        torch.testing.assert_close(args[2], weights.permute(1, 0, 2), rtol=0, atol=0)
         seen["return_scores"] = kwargs["return_scores"]
         seen["return_topk_scores"] = kwargs["return_topk_scores"]
         return (
             torch.tensor([[[0], [1]]], dtype=torch.int32),
             torch.tensor([[1, 1]], dtype=torch.int32),
-            torch.tensor(
-                [[[0.0, float("-inf"), float("-inf")], [0.0, 1.0, float("-inf")]]],
-                dtype=torch.float32,
-            ),
+            index_scores.clone(),
         )
 
     def fake_flash_mla(q, kv, topk_idxs, softmax_scale, d_v, attn_sink, topk_length):
@@ -3195,13 +3258,16 @@ def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch):
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_bshd", fake_indexer_topk)
     monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_flash_mla)
     monkeypatch.setattr(dsa_cudnn_kernels, "_compute_dense_attn_lse", fake_dense_lse)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_run_sparse_attention_backward", lambda **kwargs: (None, None)
+    )
 
-    dsa_cudnn_kernels.fused_indexer_sparse_attn(
+    _, indexer_loss = dsa_cudnn_kernels.fused_indexer_sparse_attn(
         torch.zeros((2, 1, 2, 1), dtype=torch.bfloat16),
         torch.zeros((3, 1, 1), dtype=torch.bfloat16),
         torch.zeros((2, 1, 1, 1), dtype=torch.bfloat16),
         torch.zeros((3, 1, 1), dtype=torch.bfloat16),
-        torch.zeros((2, 1, 1), dtype=torch.bfloat16),
+        weights,
         indexer_topk=1,
         softmax_scale=1.0,
         loss_coeff=1.0,
@@ -3215,6 +3281,11 @@ def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch):
     assert seen["dense_lse_helper_called"] is True
     torch.testing.assert_close(seen["dense_lse"], dense_lse)
     assert not torch.allclose(seen["dense_lse"], sparse_lse.reshape(1, 2, 2))
+    target = torch.tensor([0.25, 0.75])
+    expected_loss = (target * (target.log() - index_scores[0, 1, :2].log_softmax(dim=0))).sum() / 2
+    torch.testing.assert_close(indexer_loss, expected_loss, rtol=1e-5, atol=1e-8)
+    indexer_loss.backward()
+    torch.testing.assert_close(weights.grad, torch.ones_like(weights), rtol=0, atol=0)
 
 
 def test_cudnn_full_fusion_declines_absorbed_mla_without_up_v_weight(monkeypatch):
