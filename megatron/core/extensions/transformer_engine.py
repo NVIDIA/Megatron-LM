@@ -2151,6 +2151,11 @@ class TERowParallelLinear(TELinear):
 _te_dpa_supports_softcap = (
     "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
 )
+_te_dpa_supports_no_load_balance = (
+    hasattr(getattr(te.pytorch, "CPLoadBalancingStrategy", None), "NO_LOAD_BALANCE")
+    and "load_balancing_strategy"
+    in inspect.signature(te.pytorch.DotProductAttention.set_context_parallel_group).parameters
+)
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -2364,6 +2369,32 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        if self.config.attention_cp_layout == "contiguous":
+            if not _te_dpa_supports_no_load_balance:
+                raise RuntimeError(
+                    "Contiguous attention CP requires a Transformer Engine build with "
+                    "CPLoadBalancingStrategy.NO_LOAD_BALANCE support."
+                )
+            if attention_type != "self":
+                raise ValueError("Contiguous attention CP only supports self-attention.")
+            # TE defaults to p2p when CP is disabled at construction. Preserve the
+            # requested mode for callers that later install a runtime CP group.
+            self.set_context_parallel_group(
+                self.cp_group,
+                self.cp_global_ranks,
+                self.cp_stream,
+                cp_comm_type or self.cp_comm_type,
+            )
+
+    def set_context_parallel_group(self, cp_group, cp_global_ranks, cp_stream, cp_comm_type="p2p"):
+        """Keep TE's partition strategy consistent when a caller rebinds the CP group."""
+        kwargs = {}
+        if self.config.attention_cp_layout == "contiguous":
+            kwargs["load_balancing_strategy"] = te.pytorch.CPLoadBalancingStrategy.NO_LOAD_BALANCE
+        super().set_context_parallel_group(
+            cp_group, cp_global_ranks, cp_stream, cp_comm_type, **kwargs
+        )
+
     @contextmanager
     def _temporary_runtime_context_parallel_group(
         self, packed_seq_params: Optional[PackedSeqParams]
@@ -2382,11 +2413,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if runtime_cp_group.size() == 1:
                 # Dynamic CP metadata retains the singleton group, while TE
                 # must see CP disabled for this microbatch.
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             else:
                 if TEDotProductAttention.cp_stream is None:
                     TEDotProductAttention.cp_stream = torch.cuda.Stream()
-                super().set_context_parallel_group(
+                self.set_context_parallel_group(
                     runtime_cp_group,
                     torch.distributed.get_process_group_ranks(runtime_cp_group),
                     TEDotProductAttention.cp_stream,
@@ -2395,9 +2426,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             yield
         finally:
             if original_cp_group is None or original_cp_group.size() == 1:
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             else:
-                super().set_context_parallel_group(
+                self.set_context_parallel_group(
                     original_cp_group,
                     original_cp_global_ranks,
                     TEDotProductAttention.cp_stream,
@@ -2461,6 +2492,47 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             else {}
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+
+        if self.config.attention_cp_layout == "contiguous" and get_pg_size(self.cp_group) > 1:
+            if attention_bias is not None:
+                raise ValueError("Contiguous attention CP does not support attention bias.")
+            if qkv_format == "sbhd":
+                if attn_mask_type != AttnMaskType.causal:
+                    raise ValueError(
+                        "Padded contiguous attention CP requires THD sequence metadata."
+                    )
+                # Adapt dense inputs to the THD format required by TE's no-load-balance CP.
+                # TODO: Reduce the conversion overhead.
+                seq_length = query.size(0) * self.cp_group.size()
+                cu_seqlens = torch.arange(
+                    0, 2 * seq_length, seq_length, dtype=torch.int32, device=query.device
+                )
+                sample_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    cu_seqlens_q_padded=cu_seqlens,
+                    cu_seqlens_kv_padded=cu_seqlens,
+                    max_seqlen_q=seq_length,
+                    max_seqlen_kv=seq_length,
+                    pad_between_seqs=False,
+                )
+                outputs = [
+                    self._forward(
+                        q.contiguous(),
+                        k.contiguous(),
+                        v.contiguous(),
+                        None,
+                        attn_mask_type,
+                        packed_seq_params=sample_params,
+                        num_splits=num_splits,
+                        bf16_backward=bf16_backward,
+                    )
+                    for q, k, v in zip(query.unbind(1), key.unbind(1), value.unbind(1))
+                ]
+                return outputs[0].unsqueeze(1) if len(outputs) == 1 else torch.stack(outputs, dim=1)
+            if qkv_format != "thd":
+                raise ValueError("Contiguous attention CP requires SBHD or THD input.")
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
