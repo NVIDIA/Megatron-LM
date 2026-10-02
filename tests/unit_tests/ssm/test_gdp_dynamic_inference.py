@@ -235,7 +235,7 @@ class _FakeSSM(SSMDynamicInferenceMixin):
 def test_decode_ssm_preserves_batch_invariant_token_padding(
     batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
 ):
-    """Global GEMM padding bypasses SSM decode even with the context flag off."""
+    """Token-only graph padding bypasses SSM decode even with the context flag off."""
     metadata_token_count = num_requests * tokens_per_request
     projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
         padded_token_count, 1, 4

@@ -223,9 +223,9 @@ class SSMDynamicInferenceMixin:
         if decode_req_count > 0:
             seq_len = 1 + context.num_speculative_tokens
             decode_token_count = decode_req_count * seq_len
-            # Global batch-invariant GEMM may add token-only rows even when the
-            # context's SSM batch-invariant flag is disabled. They do not
-            # represent requests and must stay out of the recurrent kernels.
+            # Global batch-invariant graph buckets may pad tokens without adding
+            # requests, even when the context's SSM batch-invariant flag is off.
+            # These token-only rows must stay out of the recurrent kernels.
             assert decode_token_count <= zxBCdt.shape[0], (
                 "SSM metadata describes more decode tokens "
                 f"({decode_token_count}) than the input projection contains "
@@ -277,8 +277,9 @@ class SSMDynamicInferenceMixin:
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
 
-        # Restore the projection's token-only padding before the output projection.
-        # Its row count can be TP-local, unlike the context's global token count.
+        # Restore token-only padding before the output projection regardless of
+        # the context's SSM batch-invariant flag. Use the projection's actual row
+        # count, which can be TP-local rather than the context's global count.
         padding_token_count = zxBCdt.shape[0] - y.shape[0]
         assert padding_token_count >= 0, (
             "SSM produced more token rows "
