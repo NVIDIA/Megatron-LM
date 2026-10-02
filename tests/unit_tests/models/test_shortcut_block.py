@@ -340,11 +340,11 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None):
+    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         observed["route_input"] = shortcut_hidden
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask=None, packed_seq_params=None):
+    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
         observed["shared_input"] = hidden_states
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
