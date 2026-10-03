@@ -567,7 +567,7 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         out = q + kv.mean(dim=0) + attn_sink.view(1, -1, 1)
         return out, q.new_zeros(q.shape[:2]), None
 
-    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args):
+    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args, **_kwargs):
         d_kv = d_out.sum(dim=(0, 1)).unsqueeze(0).expand_as(kv) / kv.shape[0]
         return d_out.clone(), d_kv, d_out.sum(dim=(0, 2))
 
@@ -649,6 +649,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
+        deterministic_mode=False,
         num_layers=1,
         mtp_num_layers=0,
     )

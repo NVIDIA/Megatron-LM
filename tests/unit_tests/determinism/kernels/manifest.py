@@ -268,7 +268,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_mappings",
         sources=("megatron/core/tensor_parallel/mappings.py",),
-        tests=(C + "test_transformer_layer.py", C + "test_gpt_model.py"),
+        tests=(
+            C + "test_transformer_layer.py",
+            C + "test_gpt_model.py",
+            K + "test_csa_packed_kernels.py",
+        ),
         kind="external-lib",
         notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
     ),
@@ -737,6 +741,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "deterministic cuDNN attention backward is also exercised by packed CP2 strict replay.",
+    ),
+    KernelEntry(
         name="csa_teacher_lse",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
@@ -744,6 +762,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
+    ),
+    KernelEntry(
+        name="csa_packed_layout_and_loss",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_indexer_loss_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
+        ),
+        tests=(
+            K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+        ),
+        kind="triton",
+        notes="Tensor-based packed layout, index sanitation and compiled KL. "
+        "test_dsv4_packed_cp.py adds strict BF16 full-width attention/indexer replay for "
+        "ratios 0/4/128, plus numerical CP parity; this is not full-model CP qualification.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

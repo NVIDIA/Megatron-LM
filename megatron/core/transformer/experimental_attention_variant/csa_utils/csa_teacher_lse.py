@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Memory-efficient Triton kernels for the dense SBHD CSA teacher denominator."""
+"""Memory-efficient Triton kernels for the dense CSA teacher denominator."""
 
 from __future__ import annotations
 
@@ -41,7 +41,10 @@ if _TRITON_AVAILABLE:
         softmax_scale,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
-        total_kv: tl.constexpr,
+        # ``total_kv`` is only an out-of-range bound. It is the packed KV row
+        # count, which varies per microbatch under THD, so keep it a runtime
+        # scalar rather than part of the JIT key.
+        total_kv,
         window_width: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -130,7 +133,7 @@ if _TRITON_AVAILABLE:
         BLOCK_D: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        """Add every causal compressed-key contribution for an SBHD input."""
+        """Add the causal compressed-key mass for fixed-shape SBHD input."""
         query_blocks = tl.cdiv(seqlen_q, BLOCK_Q)
         batch = tl.program_id(0) // query_blocks
         query_block = tl.program_id(0) % query_blocks
@@ -195,6 +198,113 @@ if _TRITON_AVAILABLE:
         )
         tl.store(output + output_offsets, lse, mask=row_mask)
 
+    @triton.jit
+    def _csa_compressed_lse_thd_kernel(
+        query,
+        compressed_kv,
+        non_compressed_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        q_causal_offsets,
+        output,
+        stride_q_row: tl.constexpr,
+        stride_q_head: tl.constexpr,
+        stride_q_dim: tl.constexpr,
+        stride_k_row: tl.constexpr,
+        stride_k_dim: tl.constexpr,
+        stride_noncomp_row: tl.constexpr,
+        stride_noncomp_head: tl.constexpr,
+        stride_out_row: tl.constexpr,
+        stride_out_head: tl.constexpr,
+        softmax_scale,
+        # Packed-THD geometry is data-dependent: the segment count and both
+        # maxima change with every microbatch. They only size a grid division
+        # and a loop bound, so keep them runtime scalars — as ``tl.constexpr``
+        # they put a full Triton JIT compile on the critical path of every step.
+        num_sequences,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        ratio: tl.constexpr,
+        HAS_Q_CAUSAL_OFFSETS: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Add the causal compressed-key mass for packed THD input."""
+        query_blocks = tl.cdiv(max_seqlen_q, BLOCK_Q)
+        sequence = tl.program_id(0) // query_blocks
+        query_block = tl.program_id(0) % query_blocks
+        head_block = tl.program_id(1)
+
+        query_start = tl.load(cu_seqlens_q + sequence)
+        query_end = tl.load(cu_seqlens_q + sequence + 1)
+        key_start_offset = tl.load(cu_seqlens_k + sequence)
+        key_end_offset = tl.load(cu_seqlens_k + sequence + 1)
+        query_length = query_end - query_start
+        key_length = key_end_offset - key_start_offset
+        causal_offset = 0
+        if HAS_Q_CAUSAL_OFFSETS:
+            causal_offset = tl.load(q_causal_offsets + sequence)
+
+        row_offsets = tl.arange(0, BLOCK_Q * BLOCK_H)
+        local_queries = query_block * BLOCK_Q + row_offsets // BLOCK_H
+        query_rows = query_start + local_queries
+        head_offsets = head_block * BLOCK_H + row_offsets % BLOCK_H
+        row_mask = (local_queries < query_length) & (head_offsets < num_heads)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        dim_mask = dim_offsets < head_dim
+
+        q_offsets = (
+            query_rows[:, None] * stride_q_row
+            + head_offsets[:, None] * stride_q_head
+            + dim_offsets[None, :] * stride_q_dim
+        )
+        q = tl.load(query + q_offsets, mask=row_mask[:, None] & dim_mask[None, :], other=0.0)
+
+        running_max = tl.load(
+            non_compressed_lse
+            + query_rows * stride_noncomp_row
+            + head_offsets * stride_noncomp_head,
+            mask=row_mask,
+            other=-float("inf"),
+        ).to(tl.float32)
+        running_sum = tl.where(row_mask & (running_max > -float("inf")), 1.0, 0.0)
+        visible_keys = tl.minimum((local_queries + causal_offset + 1) // ratio, key_length)
+
+        for key_start in range(0, max_seqlen_k, BLOCK_K):
+            local_keys = key_start + tl.arange(0, BLOCK_K)
+            key_mask = local_keys < key_length
+            k_offsets = (key_start_offset + local_keys[None, :]) * stride_k_row + dim_offsets[
+                :, None
+            ] * stride_k_dim
+            k = tl.load(
+                compressed_kv + k_offsets, mask=dim_mask[:, None] & key_mask[None, :], other=0.0
+            )
+            logits = tl.dot(q, k, out_dtype=tl.float32) * softmax_scale
+            score_mask = (
+                row_mask[:, None]
+                & key_mask[None, :]
+                & (local_keys[None, :] < visible_keys[:, None])
+            )
+            logits = tl.where(score_mask, logits, -float("inf"))
+
+            tile_max = tl.max(logits, axis=1)
+            new_max = tl.maximum(running_max, tile_max)
+            old_scale = tl.where(running_max > -float("inf"), tl.exp(running_max - new_max), 0.0)
+            tile_sum = tl.sum(tl.where(score_mask, tl.exp(logits - new_max[:, None]), 0.0), axis=1)
+            running_sum = running_sum * old_scale + tile_sum
+            running_max = new_max
+
+        lse = tl.where(running_sum > 0.0, running_max + tl.log(running_sum), -float("inf"))
+        tl.store(
+            output + query_rows * stride_out_row + head_offsets * stride_out_head,
+            lse,
+            mask=row_mask,
+        )
+
 
 def csa_teacher_lse_unsupported_reason(
     query: Tensor, full_kv: Tensor, compressed_kv: Tensor, attn_sink: Tensor, window_indices: Tensor
@@ -211,10 +321,10 @@ def csa_teacher_lse_unsupported_reason(
         return f"query dtype must be bfloat16 or float16, got {query.dtype}"
     if full_kv.dtype != query.dtype or compressed_kv.dtype != query.dtype:
         return "query, full_kv, and compressed_kv must have the same dtype"
-    if query.ndim != 3 or full_kv.ndim != 2 or compressed_kv.ndim != 3:
+    if query.ndim != 3 or full_kv.ndim != 2 or compressed_kv.ndim not in (2, 3):
         return (
             "expected flat query [total_q, heads, dim], flat full_kv [total_kv, dim], "
-            "and SBHD compressed_kv [batch, seqlen_k, dim]"
+            "and compressed_kv [total_k, dim] or [batch, seqlen_k, dim]"
         )
     if query.shape[-1] != full_kv.shape[-1] or query.shape[-1] != compressed_kv.shape[-1]:
         return "query, full_kv, and compressed_kv head dimensions must match"
@@ -234,10 +344,8 @@ def csa_teacher_lse_unsupported_reason(
     return None
 
 
-def can_use_fused_csa_teacher_lse(
-    query: Tensor, full_kv: Tensor, compressed_kv: Tensor, attn_sink: Tensor, window_indices: Tensor
-) -> bool:
-    """Return whether the Triton SBHD teacher-LSE kernels support these tensors."""
+def can_use_fused_csa_teacher_lse(query, full_kv, compressed_kv, attn_sink, window_indices):
+    """Return whether packed or SBHD teacher inputs have supported shapes and dtypes."""
     return (
         csa_teacher_lse_unsupported_reason(query, full_kv, compressed_kv, attn_sink, window_indices)
         is None
@@ -254,29 +362,26 @@ def fused_csa_teacher_lse(
     softmax_scale: float,
     ratio: int,
     *,
-    batch_size: int,
-    seqlen_q: int,
+    batch_size: Optional[int] = None,
+    seqlen_q: Optional[int] = None,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
 ) -> Tensor:
-    """Compute the full SBHD CSA teacher LSE without a score-matrix temporary.
+    """Compute the full dense CSA teacher LSE without a score-matrix temporary.
 
     ``query`` and ``full_kv`` use FlashMLA's flat-global layout. Sliding-window
-    indices address ``full_kv`` directly. ``compressed_kv`` has B/K/D layout.
-    The result has B/S/H layout.
+    indices address ``full_kv`` directly. ``compressed_kv`` is B/K/D for SBHD
+    or packed K/D for THD. The result is B/S/H for SBHD and T/H for THD.
     """
     if ratio <= 0:
         raise ValueError(f"ratio must be positive, got {ratio}")
-    unsupported_reason = csa_teacher_lse_unsupported_reason(
-        query, full_kv, compressed_kv, attn_sink, window_indices
-    )
-    if unsupported_reason is not None:
-        raise RuntimeError(f"fused SBHD CSA teacher LSE is unavailable: {unsupported_reason}")
+    if not can_use_fused_csa_teacher_lse(query, full_kv, compressed_kv, attn_sink, window_indices):
+        raise ValueError("unsupported tensor layout or dtype for fused CSA teacher LSE")
 
     total_q, num_heads, head_dim = query.shape
-    if compressed_kv.shape[0] != batch_size:
-        raise ValueError("SBHD compressed_kv must have shape [batch, seqlen_k, dim]")
-    if total_q != batch_size * seqlen_q:
-        raise ValueError("flat query length must equal batch_size * seqlen_q")
-
     block_d = max(16, triton.next_power_of_2(head_dim))
     window_block_h = min(128, max(16, triton.next_power_of_2(num_heads)))
     window_block_k = min(64, max(16, triton.next_power_of_2(max(1, window_indices.shape[1]))))
@@ -287,14 +392,6 @@ def fused_csa_teacher_lse(
 
     non_compressed_lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
     window_grid = (total_q, triton.cdiv(num_heads, window_block_h))
-    output = torch.empty(
-        (batch_size, seqlen_q, num_heads), device=query.device, dtype=torch.float32
-    )
-    compressed_grid = (
-        batch_size * triton.cdiv(seqlen_q, compressed_block_q),
-        triton.cdiv(num_heads, compressed_block_h),
-    )
-
     with torch.cuda.device(query.device):
         _csa_window_lse_kernel[window_grid](
             query,
@@ -323,29 +420,93 @@ def fused_csa_teacher_lse(
             num_warps=8,
             num_stages=window_num_stages,
         )
-        _csa_compressed_lse_sbhd_kernel[compressed_grid](
+
+        if cu_seqlens_q is None:
+            if batch_size is None or seqlen_q is None:
+                raise ValueError("SBHD fused CSA teacher LSE requires batch_size and seqlen_q")
+            if compressed_kv.ndim != 3 or compressed_kv.shape[0] != batch_size:
+                raise ValueError("SBHD compressed_kv must have shape [batch, seqlen_k, dim]")
+            if total_q != batch_size * seqlen_q:
+                raise ValueError("flat query length must equal batch_size * seqlen_q")
+
+            output = torch.empty(
+                (batch_size, seqlen_q, num_heads), device=query.device, dtype=torch.float32
+            )
+            compressed_grid = (
+                batch_size * triton.cdiv(seqlen_q, compressed_block_q),
+                triton.cdiv(num_heads, compressed_block_h),
+            )
+            _csa_compressed_lse_sbhd_kernel[compressed_grid](
+                query,
+                compressed_kv,
+                non_compressed_lse,
+                output,
+                query.stride(0),
+                query.stride(1),
+                query.stride(2),
+                compressed_kv.stride(0),
+                compressed_kv.stride(1),
+                compressed_kv.stride(2),
+                non_compressed_lse.stride(0),
+                non_compressed_lse.stride(1),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                softmax_scale,
+                batch_size,
+                seqlen_q,
+                compressed_kv.shape[1],
+                num_heads,
+                head_dim,
+                ratio,
+                BLOCK_Q=compressed_block_q,
+                BLOCK_H=compressed_block_h,
+                BLOCK_D=block_d,
+                BLOCK_K=compressed_block_k,
+                num_warps=8,
+                num_stages=2,
+            )
+            return output
+
+        if any(value is None for value in (cu_seqlens_k, max_seqlen_q, max_seqlen_k)):
+            raise ValueError("THD fused CSA teacher LSE requires packed-sequence metadata")
+        if compressed_kv.ndim != 2:
+            raise ValueError("THD compressed_kv must have shape [total_k, dim]")
+        if cu_seqlens_q.shape != cu_seqlens_k.shape:
+            raise ValueError("THD query and compressed-KV cumulative lengths must match")
+
+        output = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
+        num_sequences = cu_seqlens_q.numel() - 1
+        compressed_grid = (
+            num_sequences * triton.cdiv(max_seqlen_q, compressed_block_q),
+            triton.cdiv(num_heads, compressed_block_h),
+        )
+        q_offsets_arg = q_causal_offsets if q_causal_offsets is not None else cu_seqlens_q
+        _csa_compressed_lse_thd_kernel[compressed_grid](
             query,
             compressed_kv,
             non_compressed_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            q_offsets_arg,
             output,
             query.stride(0),
             query.stride(1),
             query.stride(2),
             compressed_kv.stride(0),
             compressed_kv.stride(1),
-            compressed_kv.stride(2),
             non_compressed_lse.stride(0),
             non_compressed_lse.stride(1),
             output.stride(0),
             output.stride(1),
-            output.stride(2),
             softmax_scale,
-            batch_size,
-            seqlen_q,
-            compressed_kv.shape[1],
+            num_sequences,
+            max_seqlen_q,
+            max_seqlen_k,
             num_heads,
             head_dim,
             ratio,
+            HAS_Q_CAUSAL_OFFSETS=q_causal_offsets is not None,
             BLOCK_Q=compressed_block_q,
             BLOCK_H=compressed_block_h,
             BLOCK_D=block_d,
@@ -353,7 +514,7 @@ def fused_csa_teacher_lse(
             num_warps=8,
             num_stages=2,
         )
-    return output
+        return output
 
 
 __all__ = [
