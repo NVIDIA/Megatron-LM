@@ -2,9 +2,12 @@
 
 from copy import deepcopy
 from typing import Any, Dict
+from unittest.mock import Mock, patch
 
 import pytest
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions import transformer_engine as te_ext
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TEQuantizationParams,
@@ -150,6 +153,68 @@ def test_te_inference_storage_defaults(model_overrides, recipe_overrides, inheri
 def test_te_recipe_rejects_non_boolean_fp8_param(value) -> None:
     with pytest.raises(ValueError, match="fp8_param must be a bool"):
         TEQuantizationRecipe.parse_from_config({"fp8_param": value})
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+@pytest.mark.parametrize(("tp_only_amax_red", "group_name"), [(False, "tp_dp_cp"), (True, "tp_cp")])
+def test_te_quantization_override_uses_explicit_amax_group(tp_only_amax_red, group_name) -> None:
+    """Per-module TE overrides must not read global process groups when explicit ones exist."""
+    groups = Mock()
+    groups.tp_dp_cp = Mock()
+    groups.tp_cp = Mock()
+    recipe = TEQuantizationRecipe(
+        fp8_quantization_recipe=Fp8Recipe.tensorwise,
+        override_nonquantized_autocast=True,
+        tp_only_amax_red=tp_only_amax_red,
+    )
+    quant_recipe = Mock()
+    context = Mock()
+
+    with (
+        patch.object(te_ext.FP8GlobalStateManager, "is_fp8_enabled", return_value=False),
+        patch.object(te_ext.te.common.recipe, "Float8CurrentScaling", return_value=quant_recipe),
+        patch.object(te_ext, "fp8_autocast", return_value=context) as fp8_autocast,
+        patch.object(
+            te_ext,
+            "model_parallel_is_initialized",
+            side_effect=AssertionError("global process groups must not be read"),
+        ),
+        patch.object(
+            te_ext,
+            "get_amax_reduction_group",
+            side_effect=AssertionError("global process groups must not be read"),
+        ),
+    ):
+        result = te_ext._get_fp8_autocast_for_quant_recipe(recipe, groups)
+
+    assert result is context
+    fp8_autocast.assert_called_once_with(
+        enabled=True, fp8_recipe=quant_recipe, fp8_group=getattr(groups, group_name)
+    )
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+def test_te_quantization_override_keeps_legacy_amax_group_fallback() -> None:
+    """Callers without an explicit collection retain the MPU compatibility path."""
+    recipe = TEQuantizationRecipe(
+        fp8_quantization_recipe=Fp8Recipe.tensorwise, override_nonquantized_autocast=True
+    )
+    quant_recipe = Mock()
+    amax_group = Mock()
+
+    with (
+        patch.object(te_ext.FP8GlobalStateManager, "is_fp8_enabled", return_value=False),
+        patch.object(te_ext.te.common.recipe, "Float8CurrentScaling", return_value=quant_recipe),
+        patch.object(te_ext, "fp8_autocast") as fp8_autocast,
+        patch.object(te_ext, "model_parallel_is_initialized", return_value=True),
+        patch.object(te_ext, "get_amax_reduction_group", return_value=amax_group) as get_group,
+    ):
+        te_ext._get_fp8_autocast_for_quant_recipe(recipe)
+
+    get_group.assert_called_once_with(with_context_parallel=True, tp_only_amax_red=False)
+    fp8_autocast.assert_called_once_with(
+        enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group
+    )
 
 
 @pytest.mark.skipif(not HAVE_KITCHEN, reason="Kitchen required for using kitchen backend.")
