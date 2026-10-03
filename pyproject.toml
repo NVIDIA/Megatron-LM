@@ -104,7 +104,7 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.29.0",
+    "nvidia-cudnn-frontend[cutedsl]>=1.29.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -208,7 +208,7 @@ no-build-isolation-package = [
 ]
 link-mode = "copy"
 # The Mamba revision retained from main pins an older TileLang/TVM FFI family.
-# Override those transitive constraints for cuDNN Frontend 1.28 compatibility.
+# Override those transitive constraints for cuDNN Frontend 1.29 compatibility.
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
