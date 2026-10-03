@@ -60,6 +60,21 @@ with a record-and-replay mechanism.
 3. Different input sizes may require different runtime orders for efficiency. We could
    capture or compute multiple orders for the runtime to choose from.
 
+## Fused Weight Gradients
+
+Transformer Engine modules built with `fuse_wgrad_accumulation=True` write their weight
+gradients into `weight.main_grad` during backward instead of returning them to autograd. For
+parameter groups with such weights, the reduce-scatter input is allocated and zeroed on the
+compute stream when the module's own backward starts (not while a checkpointed region is
+recomputed), and its views are exposed as `main_grad`. Post-backward adds any autograd
+gradients, removes `main_grad`, and hands the buffer to the reduce-scatter stream as before.
+Because the buffer was allocated on the compute stream, it is released only after the compute
+stream's next wait on the reduce-scatter stream (the next module's reduction or the end of
+backward), so allocation and deallocation stay on one stream without `record_stream`. Up to
+two such buffers are alive at once: one being reduced and one being filled. With delayed
+weight-gradient computation (`delay_wgrad_compute=True`), a module's buffer instead lives
+until its `backward_dw()` has run and the next reduction after that has waited for it.
+
 # Alternatives considered
 
 ## FSDP1
