@@ -6,14 +6,14 @@ This module hosts private helpers shared by ``MegatronLLM`` and
 ``MegatronAsyncLLM``: ``_EventLoopManager``, ``_CoordinatorRuntime``, and
 ``_MegatronLLMBase``. The public sync/async wrappers live on the subclasses;
 this base only exposes shared engine state, runtime spawn, validation
-helpers, the public sync bridge (``submit``/``run_sync``), and the private
-``_<method>_impl`` coroutines.
+helpers, the public sync bridge (``submit``/``run_sync``), the sync teardown
+(``close``), and the private ``_<method>_impl`` coroutines.
 """
 
 import asyncio
 import concurrent.futures
 import threading
-from typing import Any, Coroutine, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Coroutine, List, Optional, Tuple, Type, Union
 
 import torch.distributed as dist
 
@@ -38,16 +38,23 @@ class _EventLoopManager:
 
     Bridges sync and async user-thread callers to coroutines that run on the
     background loop via ``asyncio.run_coroutine_threadsafe``.
+    ``loop_factory`` is used to build the loop.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, loop_factory: Optional[Callable[[], asyncio.AbstractEventLoop]] = None
+    ) -> None:
+        self._loop_factory = loop_factory or asyncio.new_event_loop
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._started: bool = False
         self._stopped: bool = False
 
     def start(self) -> None:
-        """Spawn the daemon thread and start the event loop. Idempotent."""
+        """Spawn the daemon thread and start the event loop. Idempotent.
+
+        Re-raises in the caller's thread if ``loop_factory`` fails to build the loop.
+        """
         if self._started:
             return
 
@@ -62,22 +69,37 @@ class _EventLoopManager:
         parent_device = torch.cuda.current_device() if torch.cuda.is_available() else None
 
         loop_ready = threading.Event()
+        # Surfaced to the caller's thread: a factory that raises must not leave
+        # start() waiting forever on a loop that never comes up.
+        startup_failure: List[BaseException] = []
 
         def _run_loop() -> None:
-            if parent_device is not None:
-                torch.cuda.set_device(parent_device)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            self._loop = loop
-            # Fires once run_forever() starts dispatching callbacks, so
-            # callers blocked on loop_ready.wait() resume only after the
-            # loop is actually running.
-            loop.call_soon(loop_ready.set)
-            loop.run_forever()
+            try:
+                if parent_device is not None:
+                    torch.cuda.set_device(parent_device)
+                loop = self._loop_factory()
+                asyncio.set_event_loop(loop)
+                self._loop = loop
+                # Fires once run_forever() starts dispatching callbacks, so
+                # callers blocked on loop_ready.wait() resume only after the
+                # loop is actually running.
+                loop.call_soon(loop_ready.set)
+            except BaseException as exc:
+                startup_failure.append(exc)
+                loop_ready.set()
+                return
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
 
         self._thread = threading.Thread(target=_run_loop, daemon=True)
         self._thread.start()
         loop_ready.wait()
+        if startup_failure:
+            self._thread.join()
+            self._thread = None
+            raise startup_failure[0]
         self._started = True
 
     @property
@@ -98,25 +120,32 @@ class _EventLoopManager:
             raise RuntimeError("_EventLoopManager.start() must be called before submit().")
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-    def run_sync(self, coro: Coroutine):
-        """Schedule ``coro`` on the background loop and block on its result.
+    def assert_not_on_loop(self) -> None:
+        """Raise if called from a coroutine running on the background loop itself.
 
-        Must not be called from a coroutine running on ``self._loop`` itself
-        -- that would deadlock, since the only loop that could dispatch
-        ``coro`` would be the one already blocked waiting for the caller.
-        Calling from a different loop (e.g., the user's main-thread asyncio
-        loop) is allowed: ``coro`` runs on the background loop while the
-        caller's loop is stalled until ``.result()`` returns.
+        Blocking on the loop from there would deadlock: the only loop that could
+        dispatch the work is the one already blocked waiting for it.
         """
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
-            running = None  # no loop on this thread, safe
+            return  # no loop on this thread, safe
         if running is self._loop:
             raise RuntimeError(
-                "run_sync called from a coroutine running on the background "
-                "loop -- would deadlock waiting for the same loop."
+                "Called from a coroutine running on the background loop -- "
+                "would deadlock waiting for the same loop."
             )
+
+    def run_sync(self, coro: Coroutine):
+        """Schedule ``coro`` on the background loop and block on its result.
+
+        Must not be called from a coroutine running on ``self._loop`` itself
+        (see :meth:`assert_not_on_loop`). Calling from a different loop (e.g.,
+        the user's main-thread asyncio loop) is allowed: ``coro`` runs on the
+        background loop while the caller's loop is stalled until ``.result()``
+        returns.
+        """
+        self.assert_not_on_loop()
         return self.submit(coro).result()
 
     async def run_async(self, coro: Coroutine):
@@ -265,9 +294,14 @@ class _MegatronLLMBase:
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
+        loop_factory: Optional[Callable[[], asyncio.AbstractEventLoop]] = None,
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
+        if loop_factory is not None and not use_coordinator:
+            raise ValueError(
+                "loop_factory requires use_coordinator=True (direct mode has no runtime loop)"
+            )
 
         if not use_coordinator:
             from megatron.core import parallel_state
@@ -304,7 +338,7 @@ class _MegatronLLMBase:
         self._serve_started: bool = False
 
         if use_coordinator:
-            loop_manager = _EventLoopManager()
+            loop_manager = _EventLoopManager(loop_factory)
             loop_manager.start()
             coord_runtime: "Optional[_CoordinatorRuntime]" = None
             try:
@@ -384,13 +418,35 @@ class _MegatronLLMBase:
         assert self._loop_manager is not None
         return self._loop_manager.run_sync(coro)
 
+    # ---- sync teardown (public) ----
+
+    def close(self) -> None:
+        """Tear down the frontend, engine and runtime from a sync caller. Idempotent.
+
+        Callable from any thread except the runtime loop itself.
+        """
+        if self._shutdown_called:
+            return
+        if self._use_coordinator:
+            assert self._loop_manager is not None
+            # Reject the runtime-loop caller before any state changes,
+            # so the object stays fully closable afterwards.
+            self._loop_manager.assert_not_on_loop()
+        self._shutdown_called = True
+        self._stop_frontend_if_started()
+        if not self._use_coordinator:
+            return
+        assert self._loop_manager is not None
+        self._loop_manager.run_sync(self._shutdown_impl())
+        self._loop_manager.stop()
+
     # ---- internal helpers ----
 
     def _stop_frontend_if_started(self) -> None:
         """Stop the HTTP frontend if ``serve()`` started one on this rank.
 
-        Called first by both facades' ``shutdown()`` so no new requests
-        arrive while the coordinator is torn down. Invariant:
+        Called first by ``close()`` and the async ``shutdown()`` so no new
+        requests arrive while the coordinator is torn down. Invariant:
         ``_serve_started`` can only be True when ``use_coordinator=True``
         because ``serve()`` raises otherwise.
         """
