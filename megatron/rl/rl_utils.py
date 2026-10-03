@@ -62,6 +62,7 @@ from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -1143,7 +1144,41 @@ def _scatter_for_context_parallel(
     )
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def _vocab_parallel_logprob_processor(
+    *,
+    hidden_states,
+    output_layer,
+    output_weight,
+    context,
+    scale_logits,
+    **_,
+):
+    """Compute selected-token logprobs without gathering vocabulary logits."""
+    labels = context["labels"]
+    tp_group = context["tp_group"]
+
+    vocab_parallel_logits, _ = output_layer(
+        hidden_states,
+        weight=output_weight,
+        runtime_gather_output=False,
+    )
+    vocab_parallel_logits = scale_logits(vocab_parallel_logits)
+
+    token_nll = vocab_parallel_cross_entropy(
+        vocab_parallel_logits,
+        labels.transpose(0, 1).contiguous(),
+        tp_group=tp_group,
+    )
+    return -token_nll.transpose(0, 1).contiguous()
+
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    no_grad=False,
+    sequence_packing=False,
+    packed_seq_params=None,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -1174,11 +1209,13 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 device=tokens.device,
             )
         else:
-            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            cu_seqlens = torch.tensor(
+                [0, tokens.shape[1]], dtype=torch.int32, device=tokens.device
+            )
             # Make sure to omit `total_tokens` to prevent `seq_idx` from being auto-computed.
             # That would cause a sequence packing kernel to be incorrectly used.
             packed_seq_params = PackedSeqParams(
-                qkv_format='thd',
+                qkv_format="thd",
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
                 max_seqlen_q=tokens.shape[1],
@@ -1204,8 +1241,14 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
-                tokens_in, position_ids_in, packed_seq_params_in, local_labels, cp_scatter = (
-                    _scatter_for_context_parallel(tokens, position_ids, packed_seq_params, cp_group)
+                (
+                    tokens_in,
+                    position_ids_in,
+                    packed_seq_params_in,
+                    local_labels,
+                    cp_scatter,
+                ) = _scatter_for_context_parallel(
+                    tokens, position_ids, packed_seq_params, cp_group
                 )
             else:
                 tokens_in, position_ids_in, packed_seq_params_in = (
@@ -1214,14 +1257,32 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     packed_seq_params,
                 )
 
+            if cp_size > 1:
+                logprob_labels = local_labels
+            else:
+                # The final position has no next-token target. Give the output
+                # processor a shape-compatible label and discard that position
+                # below, matching the existing get_logprobs contract.
+                logprob_labels = torch.cat(
+                    (tokens[:, 1:], tokens[:, -1:]),
+                    dim=1,
+                )
+
+            logprob_context = {
+                "labels": logprob_labels,
+                "tp_group": pg_collection.tp,
+            }
+
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
                     tokens_in,
                     position_ids_in,
                     attention_mask_for_forward,
                     packed_seq_params=packed_seq_params_in,
-                    runtime_gather_output=True,
+                    runtime_gather_output=False,
                     fp32_output=fp32_output,
+                    output_processor=_vocab_parallel_logprob_processor,
+                    output_processor_context=logprob_context,
                 )
 
             set_model_config_attribute(model, "flash_decode", flash_decode)
@@ -1231,21 +1292,23 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         if not is_pp_last_stage(pp_group):
             return logits_or_hidden_states
 
-        logits = logits_or_hidden_states
+        local_logprobs = logits_or_hidden_states
         with nvtx_range("rl/log-softmax", time=True):
             if cp_size > 1:
-                local_logprobs = selective_log_softmax(logits, local_labels)
-                # Differentiable all-gather so training pass can backprop through the reassembly.
-                # With no-grad, this acts as a plain all_gather.
+                # Differentiable all-gather so training can backprop through
+                # context-parallel reassembly.
                 gathered = torch.distributed.nn.functional.all_gather(
                     local_logprobs.contiguous(), group=cp_scatter.cp_group
                 )
-                full = torch.cat(gathered, dim=1).index_select(1, cp_scatter.inverse_gather_perm)
+                full = torch.cat(gathered, dim=1).index_select(
+                    1, cp_scatter.inverse_gather_perm
+                )
                 # Drop the dummy boundary position appended by the label shift.
                 logprobs = full[:, :-1]
             else:
-                # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                # The processor returns one value for every input position;
+                # the final position has no next-token target.
+                logprobs = local_logprobs[:, :-1]
         return logprobs
 
 
