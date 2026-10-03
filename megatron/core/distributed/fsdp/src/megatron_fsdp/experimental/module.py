@@ -547,14 +547,6 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        # Packing clears unsharded gradients after each reduction, so missing
-        # gradients here belong to parameters unused by this backward.
-        for group in self._parameter_groups:
-            if not group.requires_grad:
-                continue
-            for parameter in group.fsdp_parameters:
-                if parameter.unsharded.grad is None:
-                    parameter.unsharded.grad = torch.zeros_like(parameter.unsharded)
         self.reshard()
         self._reduce_gradient_groups()
         if not self.context._post_backward_hook_registered:
