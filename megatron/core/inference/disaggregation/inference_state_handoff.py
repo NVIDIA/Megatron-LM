@@ -868,7 +868,7 @@ class InferenceStateHandoffMixin:
         allocator = self.context.kv_block_allocator
         cached_blocks = []
         for block_hash in hashes[:num_blocks]:
-            block_id = allocator.kv_hash_to_block_id.get(block_hash)
+            block_id = self.context.prefix_cache_registry.kv_hash_to_block_id.get(block_hash)
             if block_id is None:
                 break
             cached_blocks.append(int(block_id))
@@ -884,7 +884,9 @@ class InferenceStateHandoffMixin:
         potential_matched_count = 0
         if cached_blocks:
             block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
-            potential_matched_count = int((allocator.block_ref_counts[block_tensor] == 0).sum())
+            potential_matched_count = int(
+                (allocator.pc_state.block_ref_counts[block_tensor] == 0).sum()
+            )
         # Model-parallel ranks process the same request and allocator operations
         # in lockstep, so capacity must remain mirrored without a per-request collective.
         return allocator.is_memory_available(

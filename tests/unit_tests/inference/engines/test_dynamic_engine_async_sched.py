@@ -1239,14 +1239,17 @@ def _instrument_scenario_runtime(env, scenario, runtime):
 
     controller._compact_async_sched_logits = traced_compact
 
-    allocator = context.kv_block_allocator
-    original_deregister = allocator._deregister_blocks
+    # Deregistration lives on the allocator's per-block prefix-cache state, which only
+    # exists when prefix caching is on.
+    pc_state = context.kv_block_allocator.pc_state
+    if pc_state is not None:
+        original_deregister = pc_state.deregister_blocks
 
-    def traced_deregister(block_ids):
-        runtime["prefix-blocks-deregistered"] += block_ids.numel()
-        return original_deregister(block_ids)
+        def traced_deregister(block_ids):
+            runtime["prefix-blocks-deregistered"] += block_ids.numel()
+            return original_deregister(block_ids)
 
-    allocator._deregister_blocks = traced_deregister
+        pc_state.deregister_blocks = traced_deregister
 
     if "fused-rope" in scenario.signals:
         original_fused_rope = context.apply_fused_qk_rotary_emb

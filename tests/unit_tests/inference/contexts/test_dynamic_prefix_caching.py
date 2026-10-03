@@ -11,6 +11,9 @@ import pytest
 import torch
 
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    PrefixCachedMambaMetadata,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -19,6 +22,7 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
 )
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
@@ -165,7 +169,7 @@ class PrefixCachingTestBase:
 
         cached_block_id = drained_block_ids[0].item()
         cached_hash = 1
-        while cached_hash in alloc.kv_hash_to_block_id:
+        while cached_hash in alloc.registry.kv_hash_to_block_id:
             cached_hash += 1
         alloc.register_kv_block_hashes([cached_block_id], [cached_hash], parent_hashes=[0])
         alloc.release_memory_blocks(drained_block_ids[:1])
@@ -181,8 +185,10 @@ class PrefixCachingTestBase:
         msa = ctx.mamba_slot_allocator
         alloc = ctx.kv_block_allocator
         slots = msa.allocate_slots_batch(bids)
-        bid_tensor = torch.tensor(bids, dtype=torch.int64, device=alloc.block_hashes.device)
-        hashes = alloc.block_hashes[bid_tensor].tolist()
+        bid_tensor = torch.tensor(
+            bids, dtype=torch.int64, device=alloc.pc_state.block_hashes.device
+        )
+        hashes = alloc.pc_state.block_hashes[bid_tensor].tolist()
         msa.register_block_hashes_batch(bids, hashes)
         return slots
 
@@ -280,28 +286,34 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
         h0, h1 = req.precomputed_block_hashes
-        assert alloc.kv_hash_to_block_id.get(h0) == b0
-        assert alloc.kv_hash_to_block_id.get(h1) == b1
-        assert alloc.block_hashes[b0].item() == h0 and alloc.block_hashes[b1].item() == h1
+        assert alloc.registry.kv_hash_to_block_id.get(h0) == b0
+        assert alloc.registry.kv_hash_to_block_id.get(h1) == b1
+        assert (
+            alloc.pc_state.block_hashes[b0].item() == h0
+            and alloc.pc_state.block_hashes[b1].item() == h1
+        )
 
         # partial block not registered
         ctx2 = self._ctx()
         alloc2 = ctx2.kv_block_allocator
         ctx2.add_request(self._req(ctx2, self._prompt(bs + bs // 2)))
         pb0, pb1 = self._block_ids(ctx2, 0, 2)
-        assert alloc2.block_hashes[pb0].item() != -1
-        assert alloc2.block_hashes[pb1].item() == -1
+        assert alloc2.pc_state.block_hashes[pb0].item() != -1
+        assert alloc2.pc_state.block_hashes[pb1].item() == -1
 
         # decode does not register completed blocks
         ctx3 = self._ctx()
         alloc3 = ctx3.kv_block_allocator
         ctx3.add_request(self._req(ctx3, self._prompt(bs + (bs - 1))))
         db0, db1 = self._block_ids(ctx3, 0, 2)
-        assert alloc3.block_hashes[db0].item() != -1 and alloc3.block_hashes[db1].item() == -1
+        assert (
+            alloc3.pc_state.block_hashes[db0].item() != -1
+            and alloc3.pc_state.block_hashes[db1].item() == -1
+        )
         active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
         ctx3.update_requests(active_mask, new_tokens)
-        assert alloc3.block_hashes[db1].item() == -1
+        assert alloc3.pc_state.block_hashes[db1].item() == -1
 
         # second request finds registered blocks
         ctx4 = self._ctx()
@@ -310,7 +322,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx4.add_request(self._req(ctx4, p4.clone()))
         req2 = self._req(ctx4, p4.clone(), request_id=2)
         for h in req2.precomputed_block_hashes:
-            assert h in alloc4.kv_hash_to_block_id
+            assert h in alloc4.registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     def test_block_sharing_patterns(self):
@@ -329,7 +341,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         for req_idx in range(1, 10):
             assert self._block_ids(ctx, req_idx, 3) == first_blocks
         for bid in first_blocks:
-            assert alloc.block_ref_counts[bid].item() == 10
+            assert alloc.pc_state.block_ref_counts[bid].item() == 10
 
         # divergent suffix shares common prefix
         ctx2 = self._ctx()
@@ -342,8 +354,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2, request_id=2))
         r2 = self._block_ids(ctx2, 1, 3)
         assert r2[0] == r1[0] and r2[1] == r1[1] and r2[2] != r1[2]
-        assert alloc2.block_ref_counts[r1[0]].item() == 2
-        assert alloc2.block_ref_counts[r1[2]].item() == 1
+        assert alloc2.pc_state.block_ref_counts[r1[0]].item() == 2
+        assert alloc2.pc_state.block_ref_counts[r1[2]].item() == 1
 
         # broken chain stops sharing: [X,W,Z] vs [X,Y,Z]
         ctx3 = self._ctx()
@@ -356,7 +368,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx3.add_request(self._req(ctx3, p3b, request_id=2))
         r3b = self._block_ids(ctx3, 1, 3)
         assert r3b[0] == r3a[0] and r3b[1] != r3a[1] and r3b[2] != r3a[2]
-        assert alloc3.block_ref_counts[r3a[0]].item() == 2
+        assert alloc3.pc_state.block_ref_counts[r3a[0]].item() == 2
 
     @pytest.mark.internal
     def test_prefill_token_savings(self):
@@ -401,7 +413,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
             assert ctx3.request_query_lengths[i + 1].item() == tail
         assert ctx3.active_token_count - tokens_after == 5 * tail
         for bid in first_blocks:
-            assert alloc3.block_ref_counts[bid].item() == 6
+            assert alloc3.pc_state.block_ref_counts[bid].item() == 6
         assert ctx3.lifetime_prefill_token_count == (bs * 3 + tail) + 5 * tail
 
         # no match: full prompt added
@@ -455,12 +467,18 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.block_hashes[b0].item()
-        assert alloc.block_ref_counts[b0].item() == 2
+        b0_hash = alloc.pc_state.block_hashes[b0].item()
+        assert alloc.pc_state.block_ref_counts[b0].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 1
+            and b0_hash in alloc.registry.kv_hash_to_block_id
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0 and b0_hash in alloc.kv_hash_to_block_id
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 0
+            and b0_hash in alloc.registry.kv_hash_to_block_id
+        )
 
         # cached blocks reused by new request
         ctx2 = self._ctx()
@@ -470,10 +488,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         cb0, cb1 = self._block_ids(ctx2, 0, 2)
         ctx2.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx2.total_request_count = 0
-        assert alloc2.block_ref_counts[cb0].item() == 0
+        assert alloc2.pc_state.block_ref_counts[cb0].item() == 0
         ctx2.add_request(self._req(ctx2, p2.clone(), request_id=2))
         assert self._block_ids(ctx2, 0, 2) == [cb0, cb1]
-        assert alloc2.block_ref_counts[cb0].item() == 1
+        assert alloc2.pc_state.block_ref_counts[cb0].item() == 1
 
         # eviction frees oldest cached first
         ctx3 = self._ctx(buffer_size_gb=0.01, rounder=1)
@@ -493,7 +511,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
             except Exception:
                 break
         for bid in active_blocks:
-            assert alloc3.block_ref_counts[bid.item()].item() == 1
+            assert alloc3.pc_state.block_ref_counts[bid.item()].item() == 1
 
     @pytest.mark.internal
     def test_add_request_full_cache_partial_hit_pins_matched_blocks(self):
@@ -530,9 +548,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert len({s0, s1, sx}) == 3
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0, 1]))
         ctx.total_request_count = 0
-        assert alloc.block_ref_counts[s0].item() == 0
-        assert alloc.block_ref_counts[s1].item() == 0
-        assert alloc.block_ref_counts[sx].item() == 0
+        assert alloc.pc_state.block_ref_counts[s0].item() == 0
+        assert alloc.pc_state.block_ref_counts[s1].item() == 0
+        assert alloc.pc_state.block_ref_counts[sx].item() == 0
 
         # Force a full pool: the new block for H2 can only come from eviction.
         alloc.pool_avail = 0
@@ -551,18 +569,18 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         # All three block IDs are distinct — no duplicate from a reclaimed match.
         assert len(set(block_table)) == 3
         # Matched blocks stay pinned for the new request.
-        assert alloc.block_ref_counts[s0].item() == 1
-        assert alloc.block_ref_counts[s1].item() == 1
-        assert alloc.block_ref_counts[sx].item() == 1
+        assert alloc.pc_state.block_ref_counts[s0].item() == 1
+        assert alloc.pc_state.block_ref_counts[s1].item() == 1
+        assert alloc.pc_state.block_ref_counts[sx].item() == 1
         # Contiguous H0 -> H1 -> H2 hash chain over [S0, S1, SX].
-        assert alloc.block_hashes[s0].item() == h0
-        assert alloc.block_hashes[s1].item() == h1
-        assert alloc.block_hashes[sx].item() == h2
+        assert alloc.pc_state.block_hashes[s0].item() == h0
+        assert alloc.pc_state.block_hashes[s1].item() == h1
+        assert alloc.pc_state.block_hashes[sx].item() == h2
         # Parent bookkeeping is stored as resolved block ids: S1's parent is S0
         # and SX's parent is S1 along the H0 -> H1 -> H2 chain.
-        assert alloc.block_parent_id[s1].item() == s0
-        assert alloc.block_parent_id[sx].item() == s1
-        assert alloc.kv_hash_to_block_id[h1] == s1
+        assert alloc.pc_state.block_parent_id[s1].item() == s0
+        assert alloc.pc_state.block_parent_id[sx].item() == s1
+        assert alloc.registry.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
     def test_failed_partial_hit_admission_rolls_back_and_retries(self):
@@ -595,9 +613,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert follower.num_cached_tokens == 0
         assert ctx.prefix_cache_hits == hits_before
         assert ctx.prefix_cache_blocks_matched == blocks_before
-        assert [alloc.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
+        assert [alloc.pc_state.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
         assert all(
-            alloc.kv_hash_to_block_id[hash_] == block
+            alloc.registry.kv_hash_to_block_id[hash_] == block
             for hash_, block in zip(matched_hashes, matched_blocks)
         )
 
@@ -624,14 +642,14 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         # Request A stays active, pinning the shared prefix H0/S0 -> H1/S1.
         ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
         s0, s1 = self._block_ids(ctx, 0, 2)
-        assert alloc.block_ref_counts[s0].item() == 1
-        assert alloc.block_ref_counts[s1].item() == 1
+        assert alloc.pc_state.block_ref_counts[s0].item() == 1
+        assert alloc.pc_state.block_ref_counts[s1].item() == 1
 
         # One unrelated block is cached and evictable (ref_count == 0).
         ctx.add_request(self._req(ctx, self._prompt(bs, offset=9000), request_id=2))
         (sx,) = self._block_ids(ctx, 1, 1)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[sx].item() == 0
+        assert alloc.pc_state.block_ref_counts[sx].item() == 0
         assert int(alloc.get_evictable_block_count()) == 1
 
         # Free pool exhausted: the one new block B needs (H2) can only come from
@@ -661,7 +679,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, self._prompt(bs)))
         original_block_id = self._block_ids(ctx, 0, 1)[0]
         assert ctx.request_last_kv_block_offset[0].item() == bs - 1
-        assert alloc.block_ref_counts[original_block_id].item() == 1
+        assert alloc.pc_state.block_ref_counts[original_block_id].item() == 1
 
         cached_block_id, cached_hash = self._fill_pool_with_one_evictable_block(ctx)
 
@@ -678,10 +696,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert ctx.request_kv_block_counts[0].item() == 2
         assert new_block_id == cached_block_id
         assert new_block_id != original_block_id
-        assert cached_hash not in alloc.kv_hash_to_block_id
-        assert alloc.block_hashes[new_block_id].item() == -1
-        assert alloc.block_ref_counts[original_block_id].item() == 1
-        assert alloc.block_ref_counts[new_block_id].item() == 1
+        assert cached_hash not in alloc.registry.kv_hash_to_block_id
+        assert alloc.pc_state.block_hashes[new_block_id].item() == -1
+        assert alloc.pc_state.block_ref_counts[original_block_id].item() == 1
+        assert alloc.pc_state.block_ref_counts[new_block_id].item() == 1
         assert alloc.pool_avail == 0
         assert alloc.get_allocatable_count() == 0
         assert int(alloc.get_evictable_block_count()) == 0
@@ -714,8 +732,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert ctx.request_last_kv_block_id[0].item() == original_last_block_ids[0].item()
         assert ctx.request_last_kv_block_id[1].item() == cached_block_id
         assert ctx.request_last_kv_block_id[2].item() == original_last_block_ids[2].item()
-        assert cached_hash not in alloc.kv_hash_to_block_id
-        assert alloc.block_ref_counts[cached_block_id].item() == 1
+        assert cached_hash not in alloc.registry.kv_hash_to_block_id
+        assert alloc.pc_state.block_ref_counts[cached_block_id].item() == 1
         assert alloc.pool_avail == 0
         assert alloc.get_allocatable_count() == 0
         assert int(alloc.get_evictable_block_count()) == 0
@@ -731,13 +749,22 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.block_hashes[b0].item()
+        b0_hash = alloc.pc_state.block_hashes[b0].item()
         avail_before = alloc.pool_avail
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 1
+            and b0_hash in alloc.registry.kv_hash_to_block_id
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0 and b0_hash not in alloc.kv_hash_to_block_id
-        assert alloc.block_hashes[b0].item() == -1 and alloc.block_hashes[b1].item() == -1
+        assert (
+            alloc.pc_state.block_ref_counts[b0].item() == 0
+            and b0_hash not in alloc.registry.kv_hash_to_block_id
+        )
+        assert (
+            alloc.pc_state.block_hashes[b0].item() == -1
+            and alloc.pc_state.block_hashes[b1].item() == -1
+        )
         assert alloc.pool_avail == avail_before + 2
 
         # released blocks not discoverable
@@ -749,7 +776,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx2.total_request_count = 0
         ctx2.add_request(self._req(ctx2, p2.clone(), request_id=2))
         new_blocks = self._block_ids(ctx2, 0, 2)
-        assert alloc2.block_ref_counts[new_blocks[0]].item() == 1
+        assert alloc2.pc_state.block_ref_counts[new_blocks[0]].item() == 1
 
 
 class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
@@ -901,7 +928,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # blocks reused (pool unchanged), ref counts incremented
         assert alloc.pool_avail == avail
         for bid in first_blocks:
-            assert alloc.block_ref_counts[bid].item() == 2
+            assert alloc.pc_state.block_ref_counts[bid].item() == 2
         # all tokens processed (none skipped)
         assert req2.num_cached_tokens == 0
         assert ctx.prefix_cache_hits == 1
@@ -975,9 +1002,15 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p5 = self._prompt(bs * 3)
         ctx5.add_request(self._req(ctx5, p5.clone()))
         msa5 = ctx5.mamba_slot_allocator
-        assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 0
+        assert (
+            len(alloc5.registry.kv_hash_to_block_id) == 3
+            and len(msa5.registry.mamba_hash_to_block_id) == 0
+        )
         self._mamba_allocate_and_register(ctx5, self._block_ids(ctx5, 0, 3)[:2])
-        assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 2
+        assert (
+            len(alloc5.registry.kv_hash_to_block_id) == 3
+            and len(msa5.registry.mamba_hash_to_block_id) == 2
+        )
 
         # find_mamba_match_count
         ctx6 = self._mctx()
@@ -1140,11 +1173,11 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p5 = self._prompt(bs * 2)
         ctx5.add_request(self._req(ctx5, p5.clone()))
         bid5 = ctx5.request_to_kv_block_ids[0][0].item()
-        bh5 = alloc5.block_hashes[bid5].item()
+        bh5 = alloc5.pc_state.block_hashes[bid5].item()
         self._mamba_allocate_and_register(ctx5, [bid5])
-        assert msa5.has_state(bid5) and bh5 in msa5.hash_to_block_id
+        assert msa5.has_state(bid5) and bh5 in msa5.registry.mamba_hash_to_block_id
         ctx5.release_memory_blocks_from_request_indexes([0])
-        assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
+        assert not msa5.has_state(bid5) and bh5 not in msa5.registry.mamba_hash_to_block_id
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_clamp_lands_on_cached_block(self):
@@ -1231,7 +1264,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx = self._mctx(block_size_tokens=bs)
         prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
-        msa = ctx.mamba_slot_allocator
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
@@ -1241,7 +1273,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         prefix_skip = _m.prefix_skip_tokens
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
-        msa.compute_and_store_offsets(
+        md = ctx.mamba_metadata
+        md.compute_and_store_offsets(
+            ctx,
             req2,
             1,
             prefix_skip,
@@ -1251,29 +1285,29 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             overall,
         )
         # Penultimate block offset (block 2 boundary) is a valid intermediate
-        count = msa._intermediate_counts_cpu[1].item()
+        count = md._intermediate_counts_cpu[1].item()
         if count > 0:
-            offsets = msa._intermediate_offsets_cpu[1, :count].tolist()
+            offsets = md._intermediate_offsets_cpu[1, :count].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa._eos_cache_block_id_cpu[1].item() >= 0
+        assert md._eos_cache_block_id_cpu[1].item() >= 0
 
         # non-aligned prompt produces last_aligned intermediate offset
         ctx2 = self._mctx(block_size_tokens=bs)
         prompt_len = bs * 3 + bs // 2
         p2 = self._prompt(prompt_len)
         ctx2.add_request(self._req(ctx2, p2.clone()))
-        msa2 = ctx2.mamba_slot_allocator
         self._mamba_allocate_and_register(ctx2, self._block_ids(ctx2, 0, 3)[:2])
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 2
         ctx2.add_request(req2b)
-        count2 = msa2._intermediate_counts_cpu[1].item()
+        md2 = ctx2.mamba_metadata
+        count2 = md2._intermediate_counts_cpu[1].item()
         if count2 > 0:
-            offsets = msa2._intermediate_offsets_cpu[1, :count2].tolist()
+            offsets = md2._intermediate_offsets_cpu[1, :count2].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa2._eos_cache_block_id_cpu[1].item() < 0
+        assert md2._eos_cache_block_id_cpu[1].item() < 0
 
         # block-aligned prompts set EOS cache block ID
         ctx3 = self._mctx(block_size_tokens=bs)
@@ -1285,14 +1319,15 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # Deferred Mamba ops execute during transfer.
         ctx3.initialize_attention_state()
         ctx3.transfer_bookkeeping_to_gpu()
-        assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
+        assert ctx3.mamba_metadata._eos_cache_block_id_cpu[1].item() >= 0
 
-        # intermediate output buffers are pre-allocated
+        # intermediate output buffers are pre-allocated on the prefix-cached metadata
         ctx4 = self._mctx()
-        msa4 = ctx4.mamba_slot_allocator
-        assert msa4.intermediate_ssm_out.shape[0] == ctx4.num_mamba_layers
-        assert msa4.intermediate_conv_out.shape[0] == ctx4.num_mamba_layers
-        assert msa4.intermediate_ssm_out.shape[1] == msa4.max_intermediate_count
+        md4 = ctx4.mamba_metadata
+        assert isinstance(md4, PrefixCachedMambaMetadata)
+        assert md4.intermediate_ssm_out.shape[0] == ctx4.num_mamba_layers
+        assert md4.intermediate_conv_out.shape[0] == ctx4.num_mamba_layers
+        assert md4.intermediate_ssm_out.shape[1] == md4.max_intermediate_count
 
         # store_from_live copies all layers
         ctx5 = self._mctx()
@@ -1319,7 +1354,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         #   request-based: MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests
         import math
 
-        from megatron.core.inference.contexts.mamba_slot_allocator import (
+        from megatron.core.inference.contexts.attention_context.mamba_metadata import (
             MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
         )
 
@@ -1336,9 +1371,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert expected == token_based(ctx)  # token bound wins here
         assert ctx.max_mamba_intermediate_states_per_step == expected
         # The single value is shared everywhere it's consumed.
-        assert ctx.mamba_slot_allocator.max_intermediate_count == expected
+        assert isinstance(ctx.mamba_metadata, PrefixCachedMambaMetadata)
         assert ctx.mamba_metadata.max_intermediate_count == expected
-        assert ctx.mamba_slot_allocator.intermediate_ssm_out.shape[1] == expected
+        assert ctx.mamba_metadata.intermediate_ssm_out.shape[1] == expected
 
         # Request-limited regime: few requests but a large token budget, so
         # 3 * max_requests is the tighter bound. This is the case the token-only
@@ -1349,9 +1384,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert expected2 == request_based(ctx2)  # request bound wins here
         assert expected2 < token_based(ctx2)  # ...and it is strictly tighter
         assert ctx2.max_mamba_intermediate_states_per_step == expected2
-        assert ctx2.mamba_slot_allocator.max_intermediate_count == expected2
+        assert isinstance(ctx2.mamba_metadata, PrefixCachedMambaMetadata)
         assert ctx2.mamba_metadata.max_intermediate_count == expected2
-        assert ctx2.mamba_slot_allocator.intermediate_ssm_out.shape[1] == expected2
+        assert ctx2.mamba_metadata.intermediate_ssm_out.shape[1] == expected2
 
     @pytest.mark.internal
     def test_intermediate_count_bounded_by_token_budget(self):
@@ -1450,16 +1485,16 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             max_sequence_length=512,
         )
         assert ctx.mamba_chunk_size == 64
-        msa = ctx.mamba_slot_allocator
+        md = ctx.mamba_metadata
 
         # Fresh 65-token prompt: crosses exactly the block boundary at token 64.
         ctx.add_request(self._req(ctx, self._prompt(bs + 1)))
 
-        count = msa._intermediate_counts_cpu[0].item()
+        count = md._intermediate_counts_cpu[0].item()
         # The boundary at token 64 was recorded -- would be 0 under the old
         # hardcoded-128 filter, since 64 % 128 != 0.
         assert count == 1
-        offsets = msa._intermediate_offsets_cpu[0, :count].tolist()
+        offsets = md._intermediate_offsets_cpu[0, :count].tolist()
         assert offsets == [bs]
 
 
@@ -1495,7 +1530,7 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         if model_type == "hybrid":
             block_ids_0 = self._block_ids(ctx, 0, 2)
             for bid in block_ids_0:
-                bh = ctx.kv_block_allocator.block_hashes[bid].item()
+                bh = ctx.kv_block_allocator.pc_state.block_hashes[bid].item()
                 ctx.mamba_slot_allocator.register_block_hashes_batch([bid], [bh])
 
         ctx.request_kv_length_offsets[0] += prompt_len
@@ -1748,7 +1783,7 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         assert self._write_targets(ctx, start2, end2) == [dummy] * chunk2_length
         # Every block this request holds is shared with the first request.
         for block_id in self._block_ids(ctx, 1, 4):
-            assert ctx.kv_block_allocator.block_ref_counts[block_id].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[block_id].item() == 2
 
 
 @pytest.mark.internal
@@ -1830,9 +1865,11 @@ def _make_cpu_mamba_slot_allocator(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     kv_allocator = SimpleNamespace(
         pool_size=total_blocks,
-        block_ref_counts=torch.ones(total_blocks, dtype=torch.int32),
-        block_timestamps=torch.zeros(total_blocks, dtype=torch.int64),
-        block_hashes=torch.full((total_blocks,), -1, dtype=torch.int64),
+        pc_state=SimpleNamespace(
+            block_ref_counts=torch.ones(total_blocks, dtype=torch.int32),
+            block_timestamps=torch.zeros(total_blocks, dtype=torch.int64),
+            block_hashes=torch.full((total_blocks,), -1, dtype=torch.int64),
+        ),
     )
     context = SimpleNamespace(
         max_requests=1,
@@ -1856,6 +1893,7 @@ def _make_cpu_mamba_slot_allocator(
         ssm_states_shape=(1,),
         conv_states_dtype=torch.float32,
         ssm_states_dtype=torch.float32,
+        prefix_cache_registry=PrefixCacheRegistry(),
     )
 
 
@@ -1877,9 +1915,13 @@ def test_mamba_slot_allocation_failure_is_atomic(monkeypatch):
 def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
     allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=6, max_slots=4)
     allocator.allocate_slots_batch([0, 1, 2, 3])
-    allocator.context.kv_block_allocator.block_ref_counts[:4] = 0
-    allocator.context.kv_block_allocator.block_timestamps[:4] = torch.tensor([40, 10, 30, 20])
-    allocator.context.kv_block_allocator.block_hashes[:4] = torch.tensor([100, 101, 102, 103])
+    allocator.context.kv_block_allocator.pc_state.block_ref_counts[:4] = 0
+    allocator.context.kv_block_allocator.pc_state.block_timestamps[:4] = torch.tensor(
+        [40, 10, 30, 20]
+    )
+    allocator.context.kv_block_allocator.pc_state.block_hashes[:4] = torch.tensor(
+        [100, 101, 102, 103]
+    )
     allocator.register_block_hashes_batch([0, 1, 2, 3], [100, 101, 102, 103])
 
     allocator.allocate_slots_batch([4, 5])
@@ -1987,7 +2029,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
             assert msa4.free_count == 0
             # Set ref counts to 0 so blocks are evictable
             for bid in fill_bids:
-                ctx4.kv_block_allocator.block_ref_counts[bid] = 0
+                ctx4.kv_block_allocator.pc_state.block_ref_counts[bid] = 0
             # Invalidate old slots, then reallocate to test eviction path
             for bid in fill_bids:
                 msa4.invalidate_block(bid)
@@ -2017,15 +2059,15 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Write known patterns to intermediate output buffers
         for layer in range(ctx.num_mamba_layers):
-            msa.intermediate_ssm_out[layer, 0] = layer + 1.0
-            msa.intermediate_conv_out[layer, 0] = layer + 100.0
+            metadata.intermediate_ssm_out[layer, 0] = layer + 1.0
+            metadata.intermediate_conv_out[layer, 0] = layer + 100.0
 
         # Set up intermediate offsets: 1 intermediate at src_offset=0
         bid0 = ctx.request_to_kv_block_ids[ctx_idx][0].item()
-        msa._intermediate_block_ids_cpu[ctx_idx, 0] = bid0
-        msa._intermediate_offsets_cpu[ctx_idx, 0] = 128
-        msa._intermediate_counts_cpu[ctx_idx] = 1
-        msa._has_intermediates = True
+        metadata._intermediate_block_ids_cpu[ctx_idx, 0] = bid0
+        metadata._intermediate_offsets_cpu[ctx_idx, 0] = 128
+        metadata._intermediate_counts_cpu[ctx_idx] = 1
+        metadata._has_intermediates = True
 
         # Set metadata fields that would normally be set by _update_intermediate_offsets
         metadata.intermediate_count = 1
@@ -2033,7 +2075,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Set up EOS block (block-aligned prompt)
         eos_bid = ctx.request_to_kv_block_ids[ctx_idx][2].item()
-        msa._eos_cache_block_id_cpu[ctx_idx] = eos_bid
+        metadata._eos_cache_block_id_cpu[ctx_idx] = eos_bid
 
         # Write known patterns to live mamba state for EOS copy
         mamba_idx = metadata.request_to_mamba_state_idx[ctx_idx].item()
@@ -2071,15 +2113,15 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
             )
 
         # Verify hash_to_block_id updated for valid hashes
-        bid0_hash = alloc.block_hashes[bid0].item()
-        eos_hash = alloc.block_hashes[eos_bid].item()
+        bid0_hash = alloc.pc_state.block_hashes[bid0].item()
+        eos_hash = alloc.pc_state.block_hashes[eos_bid].item()
         if bid0_hash > 0:
-            assert msa.hash_to_block_id.get(bid0_hash) == bid0
+            assert msa.registry.mamba_hash_to_block_id.get(bid0_hash) == bid0
         if eos_hash > 0:
-            assert msa.hash_to_block_id.get(eos_hash) == eos_bid
+            assert msa.registry.mamba_hash_to_block_id.get(eos_hash) == eos_bid
 
         # Verify _has_intermediates cleared
-        assert not msa._has_intermediates
+        assert not metadata._has_intermediates
 
 
 class TestPerBlockRouting(PrefixCachingTestBase):
@@ -2385,19 +2427,21 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         )
         bs = ctx.block_size_tokens
         ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
-        cached = dict(ctx.kv_block_allocator.kv_hash_to_block_id)
+        cached = dict(ctx.kv_block_allocator.registry.kv_hash_to_block_id)
         assert len(cached) == 2
-        next_tokens = ctx.kv_block_allocator.block_mtp_next_token.clone()
+        next_tokens = ctx.kv_block_allocator.pc_state.block_mtp_next_token.clone()
         if enable_mtp:
             assert (next_tokens >= 0).any()
 
         ctx.reset(preserve_prefix_cache=True)
-        assert ctx.kv_block_allocator.kv_hash_to_block_id == cached  # preserved
-        torch.testing.assert_close(ctx.kv_block_allocator.block_mtp_next_token, next_tokens)
+        assert ctx.kv_block_allocator.registry.kv_hash_to_block_id == cached  # preserved
+        torch.testing.assert_close(
+            ctx.kv_block_allocator.pc_state.block_mtp_next_token, next_tokens
+        )
 
         ctx.reset()  # default: full reset
-        assert len(ctx.kv_block_allocator.kv_hash_to_block_id) == 0  # cleared
-        assert (ctx.kv_block_allocator.block_mtp_next_token == -1).all()
+        assert len(ctx.kv_block_allocator.registry.kv_hash_to_block_id) == 0  # cleared
+        assert (ctx.kv_block_allocator.pc_state.block_mtp_next_token == -1).all()
 
     @pytest.mark.internal
     @pytest.mark.parametrize("enable_prefix_caching", [False, True])
@@ -2466,7 +2510,6 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         )  # mamba prefix caching enabled
         bs = ctx.block_size_tokens
         assert bs == 256
-        msa = ctx.mamba_slot_allocator
 
         prompt_len = bs * 3 + 64  # 3 complete blocks + a 64-token remainder
         req = self._req(ctx, self._prompt(prompt_len))
@@ -2478,7 +2521,8 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         # finished=2*bs, no prefix skip, the rest of the prompt as the chunk.
         req.finished_chunk_token_count = 2 * bs
         cont_chunk = prompt_len - 2 * bs
-        msa.compute_and_store_offsets(
+        ctx.mamba_metadata.compute_and_store_offsets(
+            ctx,
             req,
             current_id=0,
             skip_tokens=0,
@@ -2491,14 +2535,14 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         # last complete block boundary = 3*bs (768); chunk-relative offset = 768-512=256.
         last_aligned_abs = (prompt_len // bs) * bs
         expected_offset = last_aligned_abs - 2 * bs
-        count = msa._intermediate_counts_cpu[0].item()
+        count = ctx.mamba_metadata._intermediate_counts_cpu[0].item()
         assert count >= 1
-        recorded = msa._intermediate_offsets_cpu[0, :count].tolist()
+        recorded = ctx.mamba_metadata._intermediate_offsets_cpu[0, :count].tolist()
         assert expected_offset in recorded
         # the recorded boundary maps to the last complete block (index 2)
         idx = recorded.index(expected_offset)
         assert (
-            msa._intermediate_block_ids_cpu[0, idx].item()
+            ctx.mamba_metadata._intermediate_block_ids_cpu[0, idx].item()
             == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
         )
 
@@ -2520,7 +2564,8 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         msa = ctx.mamba_slot_allocator
 
         seed.finished_chunk_token_count = bs
-        msa.compute_and_store_offsets(
+        ctx.mamba_metadata.compute_and_store_offsets(
+            ctx,
             seed,
             current_id=0,
             skip_tokens=0,
@@ -2532,8 +2577,8 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         seed.finished_chunk_token_count = 0
 
         endpoint_block = ctx.request_to_kv_block_ids[0][1].item()
-        assert msa._intermediate_counts_cpu[0].item() == 0
-        assert msa._eos_cache_block_id_cpu[0].item() == endpoint_block
+        assert ctx.mamba_metadata._intermediate_counts_cpu[0].item() == 0
+        assert ctx.mamba_metadata._eos_cache_block_id_cpu[0].item() == endpoint_block
 
         ctx.initialize_attention_state()
         seed_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
@@ -2543,7 +2588,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         endpoint_hash = seed.precomputed_block_hashes[1]
         endpoint_slot = msa.block_to_slot[endpoint_block].item()
-        assert msa.hash_to_block_id[endpoint_hash] == endpoint_block
+        assert msa.registry.mamba_hash_to_block_id[endpoint_hash] == endpoint_block
         assert torch.all(msa.conv_states[:, endpoint_slot] == 17)
         assert torch.all(msa.ssm_states[:, endpoint_slot] == 23)
 
@@ -2580,17 +2625,19 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
     def _apply_local_churn(self, ctx, producer, producer_blocks):
         """Exhaust the pool and make a new request recycle or evict producer blocks."""
         alloc = ctx.kv_block_allocator
-        policy = alloc.prefix_caching_eviction_policy
+        policy = alloc.pc_state.eviction_policy
         ctx.release_memory_blocks_from_request_indexes(torch.arange(ctx.total_request_count))
 
         if policy == PrefixCachingEvictionPolicy.LRU:
-            cached_before = dict(alloc.kv_hash_to_block_id)
+            cached_before = dict(alloc.registry.kv_hash_to_block_id)
             assert cached_before
             filler = alloc.allocate_memory_blocks(alloc.pool_avail)
             assert filler is not None and alloc.pool_avail == 0
         else:
-            assert not alloc.kv_hash_to_block_id
-            assert all(alloc.block_hashes[block_id].item() == -1 for block_id in producer_blocks)
+            assert not alloc.registry.kv_hash_to_block_id
+            assert all(
+                alloc.pc_state.block_hashes[block_id].item() == -1 for block_id in producer_blocks
+            )
             filler = alloc.allocate_memory_blocks(alloc.pool_avail)
             assert filler is not None and alloc.pool_avail == 0
             producer_tensor = torch.tensor(producer_blocks, dtype=torch.int32)
@@ -2609,13 +2656,13 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             evicted_ids = {
                 block_id
                 for block_hash, block_id in cached_before.items()
-                if block_hash not in alloc.kv_hash_to_block_id
+                if block_hash not in alloc.registry.kv_hash_to_block_id
             }
             assert pressure_blocks == evicted_ids
         else:
             assert pressure_blocks == set(producer_blocks)
             assert not any(
-                block_hash in alloc.kv_hash_to_block_id
+                block_hash in alloc.registry.kv_hash_to_block_id
                 for block_hash in producer.precomputed_block_hashes
             )
 
@@ -2668,13 +2715,13 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
                 ctx.add_request(self._req(ctx, prompt.clone(), request_id=request_id))
             expected_refs = 3 + int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
             assert all(
-                alloc.block_ref_counts[block_id].item() == expected_refs
+                alloc.pc_state.block_ref_counts[block_id].item() == expected_refs
                 for block_id in producer_blocks
             )
             ctx.release_memory_blocks_from_request_indexes(torch.tensor([1, 2, 3]))
             remaining_refs = int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
             assert all(
-                alloc.block_ref_counts[block_id].item() == remaining_refs
+                alloc.pc_state.block_ref_counts[block_id].item() == remaining_refs
                 for block_id in producer_blocks
             )
 
@@ -3119,9 +3166,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             if enable_prefix_caching:
                 assert engine._prefix_cache_hits > hits_before
                 if case["policy"] == PrefixCachingEvictionPolicy.REF_ZERO:
-                    assert not allocator.kv_hash_to_block_id
+                    assert not allocator.registry.kv_hash_to_block_id
                     assert all(
-                        allocator.block_ref_counts[block_id].item() == 0
+                        allocator.pc_state.block_ref_counts[block_id].item() == 0
                         for block_id in blocks_this_wave
                     )
 
@@ -3132,7 +3179,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert engine._prefix_cache_blocks_matched >= 6
             assert engine._prefix_coordination_waits >= 3
             if case["policy"] == PrefixCachingEvictionPolicy.LRU:
-                assert all_hashes - allocator.kv_hash_to_block_id.keys()
+                assert all_hashes - allocator.registry.kv_hash_to_block_id.keys()
             else:
                 assert all(
                     len(previous & current) >= 2
@@ -3370,18 +3417,22 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
     def _assert_hash_registry_is_injective(alloc):
         """No two live blocks may carry the same hash.
 
-        This is the invariant the back-off could have broken. `_deregister_blocks` pops
+        This is the invariant the back-off could have broken. Deregistration pops
         `kv_hash_to_block_id` by HASH without checking which block it lands on, so two live
         blocks holding one hash means releasing either silently evicts the other's entry.
         """
-        live = [b for b in range(alloc.block_hashes.numel()) if alloc.block_hashes[b].item() != -1]
-        hashes = [alloc.block_hashes[b].item() for b in live]
+        live = [
+            b
+            for b in range(alloc.pc_state.block_hashes.numel())
+            if alloc.pc_state.block_hashes[b].item() != -1
+        ]
+        hashes = [alloc.pc_state.block_hashes[b].item() for b in live]
         assert len(hashes) == len(set(hashes)), f"duplicate hash across live blocks: {hashes}"
         for b in live:
-            h = alloc.block_hashes[b].item()
-            assert alloc.kv_hash_to_block_id[h] == b, (
+            h = alloc.pc_state.block_hashes[b].item()
+            assert alloc.registry.kv_hash_to_block_id[h] == b, (
                 f"block {b} carries hash {h} but the map points at "
-                f"{alloc.kv_hash_to_block_id.get(h)}"
+                f"{alloc.registry.kv_hash_to_block_id.get(h)}"
             )
 
     @pytest.mark.internal
@@ -3399,13 +3450,15 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         # Blocks 0-1 inherited; block 2 was matched but given up, so it is recomputed privately.
         assert s_blocks[:2] == p_blocks[:2]
         assert s_blocks[2] != p_blocks[2]
-        assert alloc.block_ref_counts[p_blocks[0]].item() == 2
-        assert alloc.block_ref_counts[p_blocks[1]].item() == 2
-        assert alloc.block_ref_counts[p_blocks[2]].item() == 1  # producer only
-        assert alloc.block_ref_counts[s_blocks[2]].item() == 1  # sibling only
+        assert alloc.pc_state.block_ref_counts[p_blocks[0]].item() == 2
+        assert alloc.pc_state.block_ref_counts[p_blocks[1]].item() == 2
+        assert alloc.pc_state.block_ref_counts[p_blocks[2]].item() == 1  # producer only
+        assert alloc.pc_state.block_ref_counts[s_blocks[2]].item() == 1  # sibling only
         # The producer keeps the canonical hash; the recomputed copy stays private.
-        assert alloc.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
-        assert alloc.block_hashes[s_blocks[2]].item() == -1
+        assert (
+            alloc.registry.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        )
+        assert alloc.pc_state.block_hashes[s_blocks[2]].item() == -1
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
@@ -3431,8 +3484,10 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         # Each sibling's recomputed block is its own, and the hash never moved.
         assert len(set(private_blocks)) == len(private_blocks)
         assert p_blocks[2] not in private_blocks
-        assert alloc.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
-        assert alloc.block_ref_counts[p_blocks[0]].item() == 5
+        assert (
+            alloc.registry.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        )
+        assert alloc.pc_state.block_ref_counts[p_blocks[0]].item() == 5
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
@@ -3450,7 +3505,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
 
         # All three matched blocks inherited, including the last.
         assert s_blocks[:3] == p_blocks[:3]
-        assert alloc.block_ref_counts[p_blocks[2]].item() == 2
+        assert alloc.pc_state.block_ref_counts[p_blocks[2]].item() == 2
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
@@ -3530,9 +3585,9 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
     def _assert_chained_ancestry(alloc, *requests):
         for req in requests:
             for index, block_hash in enumerate(req.precomputed_block_hashes):
-                if block_hash in alloc.kv_hash_to_block_id:
+                if block_hash in alloc.registry.kv_hash_to_block_id:
                     assert all(
-                        ancestor in alloc.kv_hash_to_block_id
+                        ancestor in alloc.registry.kv_hash_to_block_id
                         for ancestor in req.precomputed_block_hashes[:index]
                     ), "registered descendant has an orphaned ancestor"
 
@@ -3556,8 +3611,8 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert all(ctx.check_availability(sibling))
         ctx.add_request(sibling)
         assert sibling.mtp_private_suffix_start == 0
-        assert not alloc.kv_hash_to_block_id
-        assert all(alloc.block_hashes[b].item() == -1 for b in self._block_ids(ctx, 1, 3))
+        assert not alloc.registry.kv_hash_to_block_id
+        assert all(alloc.pc_state.block_hashes[b].item() == -1 for b in self._block_ids(ctx, 1, 3))
         self._assert_chained_ancestry(alloc, producer, sibling)
         alloc.release_memory_blocks(held)
 
@@ -3573,11 +3628,11 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         ctx.add_request(sibling)
         sibling_blocks = self._block_ids(ctx, 1, 5)
         assert sibling.mtp_private_suffix_start == 2
-        assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
+        assert all(alloc.pc_state.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
 
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.int32))
-        assert all(alloc.block_ref_counts[b].item() == 1 for b in sibling_blocks)
-        assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
+        assert all(alloc.pc_state.block_ref_counts[b].item() == 1 for b in sibling_blocks)
+        assert all(alloc.pc_state.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
         self._assert_hash_registry_is_injective(alloc)
         self._assert_chained_ancestry(alloc, producer, sibling)
         # Lookup must never discover a descendant above a missing canonical parent.
@@ -3594,7 +3649,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
             alloc.release_memory_blocks(reclaimed)
         self._assert_chained_ancestry(alloc, producer, sibling)
         assert ctx._find_kv_match_count(sibling, 0, 5)[0] == sibling_blocks[:2]
-        assert all(alloc.block_ref_counts[b].item() == 1 for b in sibling_blocks)
+        assert all(alloc.pc_state.block_ref_counts[b].item() == 1 for b in sibling_blocks)
         alloc.release_memory_blocks(held)
 
     @pytest.mark.internal
@@ -3616,7 +3671,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         ctx.add_request(sibling, prefill_chunk_length=first_chunk_length)
         assert sibling.mtp_private_suffix_start == first_chunk_blocks
         private_block = self._block_ids(ctx, 1, first_chunk_blocks + 1)[-1]
-        assert alloc.block_hashes[private_block].item() == -1
+        assert alloc.pc_state.block_hashes[private_block].item() == -1
 
         sibling.finished_chunk_token_count = first_chunk_length
         sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[first_chunk_length:]
@@ -3627,7 +3682,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
 
         blocks = self._block_ids(ctx, 1, len(s_prompt) // bs)
         assert blocks[first_chunk_blocks] == private_block
-        assert all(alloc.block_hashes[b].item() == -1 for b in blocks[first_chunk_blocks:])
+        assert all(alloc.pc_state.block_hashes[b].item() == -1 for b in blocks[first_chunk_blocks:])
         self._assert_hash_registry_is_injective(alloc)
         self._assert_chained_ancestry(alloc, producer, sibling)
 
@@ -3641,11 +3696,11 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         ctx.add_request(producer)
         producer_blocks = self._block_ids(ctx, 0, 5)
         # Model a block whose boundary slot has not been filled by its producer yet.
-        alloc.block_mtp_next_token[producer_blocks[1]] = -1
+        alloc.pc_state.block_mtp_next_token[producer_blocks[1]] = -1
         sibling = self._req(ctx, prompt.clone(), request_id=2)
         ctx.add_request(sibling, prefill_chunk_length=2 * bs)
         assert sibling.mtp_private_suffix_start == 1
-        alloc.block_mtp_next_token[producer_blocks[1]] = int(prompt[2 * bs])
+        alloc.pc_state.block_mtp_next_token[producer_blocks[1]] = int(prompt[2 * bs])
         sibling.finished_chunk_token_count = 2 * bs
         sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[2 * bs :]
         ctx.total_request_count -= 1
@@ -3660,7 +3715,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         sibling_blocks = self._block_ids(ctx, 1, 5)
         assert sibling_blocks[0] == producer_blocks[0]
         assert set(sibling_blocks[1:]).isdisjoint(producer_blocks)
-        assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[1:])
+        assert all(alloc.pc_state.block_hashes[b].item() == -1 for b in sibling_blocks[1:])
         self._assert_hash_registry_is_injective(alloc)
         self._assert_chained_ancestry(alloc, producer, sibling)
 
@@ -3682,7 +3737,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         ctx.add_request(sibling, prefill_chunk_length=first_chunk_length)
         assert self._block_ids(ctx, 1, 2) == producer_blocks[:2]
         expected_next_token = int(prompt[2 * bs])
-        assert alloc.block_mtp_next_token[producer_blocks[1]].item() == expected_next_token
+        assert alloc.pc_state.block_mtp_next_token[producer_blocks[1]].item() == expected_next_token
 
         sibling.finished_chunk_token_count = first_chunk_length
         sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[first_chunk_length:]
@@ -3693,8 +3748,8 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
 
         # The completion chunk may end before the successor. It must not mark the
         # producer's already-written boundary slot unknown or change its ancestry.
-        assert alloc.block_mtp_next_token[producer_blocks[1]].item() == expected_next_token
-        assert alloc.block_ref_counts[producer_blocks[1]].item() == 2
+        assert alloc.pc_state.block_mtp_next_token[producer_blocks[1]].item() == expected_next_token
+        assert alloc.pc_state.block_ref_counts[producer_blocks[1]].item() == 2
         self._assert_hash_registry_is_injective(alloc)
         self._assert_chained_ancestry(alloc, producer, sibling)
         consumer = self._req(ctx, prompt.clone(), request_id=3)
@@ -3714,19 +3769,19 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
         # Registration paths that do not record a successor token must fail closed.
-        assert (alloc.block_mtp_next_token == -1).all()
+        assert (alloc.pc_state.block_mtp_next_token == -1).all()
 
         ctx.add_request(self._req(ctx, self._prompt(bs * 3)))
         blocks = self._block_ids(ctx, 0, 3)
         # Block 0's successor is inside the prompt, so its slot was written and recorded.
-        assert alloc.block_mtp_next_token[blocks[0]].item() >= 0
+        assert alloc.pc_state.block_mtp_next_token[blocks[0]].item() >= 0
         # The last block's successor is past the prompt: nothing paired it, so it stays -1.
-        assert alloc.block_mtp_next_token[blocks[2]].item() == -1
+        assert alloc.pc_state.block_mtp_next_token[blocks[2]].item() == -1
 
-        alloc._deregister_blocks(torch.tensor(blocks, dtype=torch.int32))
+        alloc.pc_state.deregister_blocks(torch.tensor(blocks, dtype=torch.int32))
 
         for b in blocks:
-            assert alloc.block_mtp_next_token[b].item() == -1, (
+            assert alloc.pc_state.block_mtp_next_token[b].item() == -1, (
                 f"block {b} kept its lookahead token through deregistration; a request that "
                 f"later allocates it could inherit a draft slot computed by its old owner."
             )
@@ -3748,7 +3803,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         r = self._req(ctx, prompt.clone(), request_id=1)
         ctx.add_request(r, prefill_chunk_length=bs)
         block0 = self._block_ids(ctx, 0, 1)[0]
-        assert alloc.block_mtp_next_token[block0].item() == -1, (
+        assert alloc.pc_state.block_mtp_next_token[block0].item() == -1, (
             "block 0 completed at the chunk boundary, so its final draft slot is unwritten "
             "until the next chunk pairs it; advertising a token now would be a lie."
         )
@@ -3762,7 +3817,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         ctx.total_request_count -= 1
         ctx.add_request(r, prefill_chunk_length=bs)
 
-        assert alloc.block_mtp_next_token[block0].item() == int(prompt[bs]), (
+        assert alloc.pc_state.block_mtp_next_token[block0].item() == int(prompt[bs]), (
             "after the chunk that pairs it, block 0's slot is real and must advertise the "
             "token it was computed against."
         )

@@ -12,6 +12,8 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
+from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
@@ -56,15 +58,19 @@ class _TransferAgent:
 
 
 class _KvAllocator:
+    """Fake of the KV allocator's handoff surface over the extracted state objects."""
+
     enable_prefix_caching = True
 
-    def __init__(self):
+    def __init__(self, registry):
         self.next_block = 10
         self.capacity_available = True
         self.releases = []
         self.registered_parent_hashes = []
-        self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
-        self.kv_hash_to_block_id = {}
+        # Production reads ref counts through `pc_state` and cached hashes through the
+        # context's shared registry; keep the fake's views on those same objects.
+        self.pc_state = SimpleNamespace(block_ref_counts=torch.zeros(256, dtype=torch.int32))
+        self.registry = registry
 
     def is_memory_available(self, _count, potential_matched_count=0):
         assert potential_matched_count >= 0
@@ -73,20 +79,20 @@ class _KvAllocator:
     def allocate_memory_blocks(self, count):
         blocks = torch.arange(self.next_block, self.next_block + count, dtype=torch.int32)
         self.next_block += count
-        self.block_ref_counts[blocks] = 1
+        self.pc_state.block_ref_counts[blocks] = 1
         return blocks
 
     def release_memory_blocks(self, blocks):
-        assert torch.all(self.block_ref_counts[blocks] > 0)
-        self.block_ref_counts[blocks] -= 1
+        assert torch.all(self.pc_state.block_ref_counts[blocks] > 0)
+        self.pc_state.block_ref_counts[blocks] -= 1
         self.releases.append(blocks.tolist())
 
     def retain_memory_blocks(self, block_ids):
         if block_ids:
-            self.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
+            self.pc_state.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
 
     def register_kv_block_hashes(self, block_ids, block_hashes, parent_hashes=None):
-        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        self.registry.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
         self.registered_parent_hashes.extend(parent_hashes or [])
 
     def update_timestamps(self, block_ids):
@@ -118,7 +124,7 @@ class _SchedulerHarness:
             return
         request_id = self.waiting_request_ids[0]
         block_ids = torch.tensor(self.blocks_to_bind[request_id], dtype=torch.int32)
-        self.context.kv_block_allocator.block_ref_counts[block_ids] += 1
+        self.context.kv_block_allocator.pc_state.block_ref_counts[block_ids] += 1
         if request_id in self.partial_admissions:
             self.get_request(request_id).finished_chunk_token_count += 4
         else:
@@ -132,6 +138,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         # generation_config `[2, 11]`. Empty is the single-eos case.
         self._extra_eos_token_id_set = frozenset(extra_eos_token_id_set)
         self._initialize_disaggregation_state()
+        registry = PrefixCacheRegistry()
         self.context = SimpleNamespace(
             block_size_tokens=4,
             num_speculative_tokens=0,
@@ -142,7 +149,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             active_token_count=0,
             max_tokens=8,
             is_hybrid_model=hybrid,
-            kv_block_allocator=_KvAllocator(),
+            kv_block_allocator=_KvAllocator(registry),
+            prefix_cache_registry=registry,
             mamba_slot_allocator=None,
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
             memory_buffer=torch.empty(1),
@@ -590,8 +598,8 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
         engine.context,
         pool_size=7,
         paused_limit=0,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        pc_state=PrefixCacheBlockState(7, PrefixCachingEvictionPolicy.LRU),
+        prefix_cache_registry=engine.context.prefix_cache_registry,
     )
     engine.context.kv_block_allocator = allocator
     baseline_capacity = allocator.get_allocatable_count()
@@ -608,7 +616,7 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
         allocator.release_memory_blocks(torch.tensor(request_blocks, dtype=torch.int32))
         engine._pinned_handoff_blocks[request_id] = request_blocks
 
-    assert allocator.block_ref_counts[blocks].tolist() == [1, 1, 1, 1]
+    assert allocator.pc_state.block_ref_counts[blocks].tolist() == [1, 1, 1, 1]
     assert int(allocator.get_evictable_block_count()) == 0
     assert allocator.get_allocatable_count() == baseline_capacity - 4
     assert allocator.evict_lru_blocks(1) is False
@@ -616,8 +624,8 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
 
     engine.release_handoff_blocks(11)
     assert allocator.get_allocatable_count() == baseline_capacity - 2
-    assert allocator.block_ref_counts[first_handoff].tolist() == [0, 0]
-    assert allocator.block_hashes[first_handoff[0]].item() == 101
+    assert allocator.pc_state.block_ref_counts[first_handoff].tolist() == [0, 0]
+    assert allocator.pc_state.block_hashes[first_handoff[0]].item() == 101
     assert first_handoff[1] in allocator.block_bag[: allocator.pool_avail].tolist()
 
     engine.release_handoff_blocks(11)
@@ -626,8 +634,8 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
 
     engine.release_handoff_blocks(12)
     assert allocator.get_allocatable_count() == baseline_capacity
-    assert allocator.block_ref_counts[blocks].tolist() == [0, 0, 0, 0]
-    assert allocator.block_hashes[registered_blocks].tolist() == [101, 201]
+    assert allocator.pc_state.block_ref_counts[blocks].tolist() == [0, 0, 0, 0]
+    assert allocator.pc_state.block_hashes[registered_blocks].tolist() == [101, 201]
     free_blocks = allocator.block_bag[: allocator.pool_avail].tolist()
     assert all(block in free_blocks for block in partial_tail_blocks)
 
@@ -772,7 +780,7 @@ def test_handoff_finishes_without_an_extra_decode_step(
     admit.assert_not_called()
     complete.assert_called_once_with(7)
     assert request.generated_tokens == expected_tokens
-    assert engine.context.kv_block_allocator.block_ref_counts[blocks].tolist() == [0, 0]
+    assert engine.context.kv_block_allocator.pc_state.block_ref_counts[blocks].tolist() == [0, 0]
     assert pending.local_blocks == []
     assert pending.continuation_blocks == []
 
@@ -966,7 +974,9 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(2)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes[:2], cached.tolist()))
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id.update(
+        zip(hashes[:2], cached.tolist())
+    )
 
     kv_meta = {"request_id": 5, "resume_tokens": [99]}
     engine.add_request_with_kv_handoff(
@@ -1056,7 +1066,7 @@ def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = int(cached[0])
     kv_meta = {
         "resume_tokens": [99],
         "pp_metas": [
@@ -1082,7 +1092,7 @@ def test_nixl_handoff_trims_per_rank_block_lists(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = int(cached[0])
     kv_meta = {
         "resume_tokens": [99],
         "tp_metas": [{"rank": 0, "block_ids": [100, 101]}, {"rank": 1, "block_ids": [200, 201]}],
@@ -1104,7 +1114,7 @@ def test_nccl_handoff_does_not_filter_source_push(handoff_loop):
     engine._kv_transfer_agent.is_push = True
     prompt = [3] * 8
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = 4
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = 4
 
     kv_meta = {"request_id": 9, "resume_tokens": [99]}
     engine.add_request_with_kv_handoff(

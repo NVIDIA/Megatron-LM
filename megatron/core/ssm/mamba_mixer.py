@@ -804,14 +804,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         Returns:
             Output tensor of shape (l, b, d). Intermediate states (if any) are written
-            directly into the slot-allocator buffers held by `context`.
+            directly into the scratch buffers of `context.mamba_metadata`.
         """
         assert (
             self.cp.cp_size == 1
         ), "Context parallel is not supported for MambaMixer dynamic inference prefill"
 
         metadata = context.mamba_metadata
-        slot_allocator = context.mamba_slot_allocator
 
         seq_idx = metadata.seq_idx
         cu_seqlens = metadata.cu_seqlens
@@ -825,14 +824,15 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         conv_seq_idx = metadata.conv_seq_idx
         conv_seq_start = metadata.conv_seq_start
 
-        # Wire the per-layer intermediate extraction buffers (prefix caching) when a
-        # slot allocator is present; otherwise extraction is disabled below.
+        # Wire the per-layer intermediate extraction buffers (prefix caching). They live
+        # on the metadata and are non-None only for `PrefixCachedMambaMetadata`;
+        # otherwise extraction is disabled below.
         intermediate_ssm_out = None
         intermediate_conv_out = None
-        if slot_allocator is not None:
+        if metadata.intermediate_ssm_out is not None:
             mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
-            intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
+            intermediate_ssm_out = metadata.intermediate_ssm_out[mamba_layer_idx]
+            intermediate_conv_out = metadata.intermediate_conv_out[mamba_layer_idx]
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
