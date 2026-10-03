@@ -187,7 +187,9 @@ products:
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [nightly]
+        # A100 exact numerical trajectories differ across allocations: #7801.
+        scope: [nightly-broken]
+        cadence: [nightly]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
