@@ -554,10 +554,57 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
+
+    def prepare_fused_grad_buffer(self) -> None:
+        """Allocate this backward's reduce-scatter input and expose fused views as ``main_grad``.
+
+        Runs on the current (compute) stream before the owning module's backward. Transformer
+        Engine accumulates into ``main_grad``, so the buffer is zeroed. Later calls in the same
+        backward are no-ops.
+        """
+        if not self.has_fused_wgrad or self._fused_grad_buffer is not None:
+            return
+        with self._symmetric_memory_context():
+            buffer = DBuffer(
+                mesh=self.mesh,
+                placements=[Partial("avg")] * self.mesh.ndim,
+                layout=self.main_weight.layout,
+                dtype=self.dtype,
+                device=self.main_weight.device,
+            )
+        buffer.local_buffer.zero_()
+        for index, (fsdp_parameter, fused) in enumerate(
+            zip(self.fsdp_parameters, self.fused_wgrad_mask)
+        ):
+            if fused:
+                fsdp_parameter.unsharded.main_grad = buffer.get_tensor_view(index)
+        self._fused_grad_buffer = buffer
+
+    def take_fused_grad_buffer(self) -> DBuffer:
+        """Finish this backward's fused buffer and return it for the reduce-scatter.
+
+        Adds autograd gradients, for parameters Transformer Engine does not write, into their
+        views and removes ``main_grad`` from fused parameters so it exists only during backward.
+        """
+        buffer = self._fused_grad_buffer
+        if buffer is None:
+            raise RuntimeError("The fused gradient buffer was not prepared before backward.")
+        self._fused_grad_buffer = None
+        for index, (fsdp_parameter, fused) in enumerate(
+            zip(self.fsdp_parameters, self.fused_wgrad_mask)
+        ):
+            parameter = fsdp_parameter.unsharded
+            if fused:
+                del parameter.main_grad
+            if parameter.grad is not None:
+                buffer.get_tensor_view(index).add_(parameter.grad)
+                parameter.grad = None
+            elif not fused:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+        return buffer
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False
