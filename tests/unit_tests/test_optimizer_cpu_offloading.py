@@ -315,7 +315,7 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
 
 
-def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
+def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param(monkeypatch):
     """Test that DistributedOptimizer works with HybridDeviceOptimizer (CPU offloading)
     when the model has mark_keep_in_fp32 parameters without raising non-leaf Tensor ValueError.
     """
@@ -352,7 +352,19 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
             optimizer_offload_fraction=1.0,
         )
 
+        init_count = 0
+        original_init_sub_optimizers = HybridDeviceOptimizer._init_sub_optimizers
+
+        def counted_init_sub_optimizers(optimizer):
+            nonlocal init_count
+            init_count += 1
+            return original_init_sub_optimizers(optimizer)
+
+        monkeypatch.setattr(
+            HybridDeviceOptimizer, '_init_sub_optimizers', counted_init_sub_optimizers
+        )
         optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+        assert init_count == 1
 
         inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
         output = ddp_model(inputs)
