@@ -27,7 +27,10 @@ from megatron.core.models.common.embeddings import (
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -571,6 +574,7 @@ class MLASelfAttention(MultiLatentAttention):
         name: str | None = None,
     ):
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         super().__init__(
@@ -1385,6 +1389,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         name: str | None = None,
     ):
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         MultiLatentAttention.__init__(

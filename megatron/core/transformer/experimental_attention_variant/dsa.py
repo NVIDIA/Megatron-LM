@@ -13,7 +13,10 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
@@ -1274,6 +1277,7 @@ class DSAIndexer(MegatronModule):
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
