@@ -1850,6 +1850,13 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
+        if request.sampling_params.seed is not None:
+            if self.context.config.sampling_backend != "torch":
+                raise ValueError("Request-local seeds require sampling_backend='torch'")
+            if self.context.config.num_speculative_tokens:
+                raise ValueError("Request-local seeds do not yet support speculative decoding")
+            if "seed" not in self.context.request_metadata:
+                raise ValueError("Request-local seeds require seed in request metadata")
 
         if is_resume:
             if request_id not in self.requests or self.get_request(request_id) is not request:

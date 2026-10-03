@@ -671,6 +671,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "flashinfer on Blackwell and are not replayed in CI.",
     ),
     KernelEntry(
+        name="inference_request_seed_sampling",
+        sources=("megatron/core/inference/sampling/torch_sampling.py",),
+        tests=(K + "test_request_seed_sampling.py",),
+        kind="dispatch",
+        training_path=False,
+        notes="Request-local exponential draws replay across changing batch layouts.",
+    ),
+    KernelEntry(
         name="inference_flashinfer_sampling",
         sources=("megatron/core/inference/sampling/flashinfer_sampling.py",),
         kind="dispatch",
