@@ -211,11 +211,32 @@ class TorchSampling(Sampling):
         Returns:
             Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
-        del eager, cache_key, no_top_k, no_top_p
+        del eager, cache_key
 
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
         md = context.active_request_metadata
+
+        # With top-k=1 for every request, every row uses argmax regardless of
+        # temperature or its request mapping. Avoid building GPU bucket indices,
+        # torch.isin masks, and the scatter that otherwise serialize this eager
+        # sampling path once for the base logits and once per MTP depth.
+        if (
+            active_request_count > 0
+            and not no_top_k
+            and no_top_p
+            and bool((md["top_k"][:active_request_count] == 1).all())
+            and bool((md["top_p"][:active_request_count] == 0.0).all())
+        ):
+            selected_logits = (
+                logits[gather_indices[:n], :] if gather_indices is not None else logits[:n, :]
+            )
+            sampled = torch.argmax(selected_logits, dim=-1)
+            if output is None:
+                return sampled
+            output.copy_(sampled)
+            return output
+
         device = torch.cuda.current_device()
 
         bucket_map: dict = defaultdict(list)
