@@ -194,6 +194,13 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
     """Build a Megatron-style LR scheduler for Megatron Lite's optimizer."""
     total_steps = opt.total_training_steps
     if total_steps <= 0:
+        # Without a scheduler, still apply wd_mult once: Megatron Core builds
+        # every group with the base weight decay and relies on the scheduler.
+        for param_group in optimizer.param_groups:
+            if param_group.get("weight_decay", None) is not None:
+                param_group["weight_decay"] = opt.weight_decay * param_group.get(
+                    "wd_mult", 1.0
+                )
         return None
 
     warmup_steps = opt.lr_warmup_steps if opt.lr_warmup_steps is not None else -1

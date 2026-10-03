@@ -247,3 +247,9 @@ def test_local_lr_scheduler_keeps_no_decay_groups_undecayed() -> None:
     scheduler.step(1)
 
     assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0, 0.1]
+
+    for group in optimizer.param_groups:
+        group["weight_decay"] = 0.1
+    opt.total_training_steps = 0
+    assert _build_lr_scheduler(optimizer, opt) is None
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0, 0.1]
