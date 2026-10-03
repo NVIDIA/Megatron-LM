@@ -8,6 +8,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
 )
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -106,6 +107,45 @@ class TestRotaryEmbedding:
         assert cos.device.type == sin.device.type == 'cuda'
         assert torch.allclose(cos, expected_cos, atol=1e-5)
         assert torch.allclose(sin, expected_sin, atol=1e-5)
+
+
+class TestYarnRotaryEmbedding:
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.kv_channels = 64
+        self.seq_len = 16
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("rotary_percent", [1.0, 0.5, 0.25])
+    def test_rotary_percent_matches_rope(self, rotary_percent):
+        """With scaling_factor=1.0 YaRN reduces to plain RoPE, so both embeddings must rotate
+        the same int(kv_channels * rotary_percent) channels."""
+        rope = RotaryEmbedding(self.kv_channels, rotary_percent)
+        yarn = YarnRotaryEmbedding(
+            self.kv_channels,
+            rotary_percent=rotary_percent,
+            scaling_factor=1.0,
+            mscale=1.0,
+            mscale_all_dim=0.0,
+        )
+        rot_dim = int(self.kv_channels * rotary_percent)
+
+        expected = rope(self.seq_len)
+        emb, mscale = yarn(self.seq_len)
+        assert expected.shape[-1] == rot_dim
+        assert emb.shape[-1] == rot_dim
+        assert mscale == 1.0
+        assert torch.allclose(emb, expected)
+
+        cos, sin = yarn.get_cached_cos_sin(self.seq_len)
+        assert cos.shape[-1] == rot_dim
+        assert sin.shape[-1] == rot_dim
+        assert torch.allclose(cos, expected.cos())
+        assert torch.allclose(sin, expected.sin())
 
 
 class TestQKVRotaryEmbedding:
