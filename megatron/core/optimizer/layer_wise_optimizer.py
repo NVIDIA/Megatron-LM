@@ -11,8 +11,9 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
@@ -662,9 +663,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         'LayerWiseDistributedOptimizer expects base torch optimizers, '
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                optimizers[i] = Float16OptimizerWithFloat16Params(
+                mixed_precision_optimizer = Float16OptimizerWithFloat16Params(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
+                if (
+                    model_chunks
+                    and getattr(get_model_config(model_chunks[0]), "cuda_graph_impl", "none")
+                    == "full_iteration"
+                    and not config.optimizer_cuda_graph
+                    and not config.optimizer_cpu_offload
+                ):
+                    mixed_precision_optimizer._full_iteration_grad_copy = FullIterationGradCopy()
+                optimizers[i] = mixed_precision_optimizer
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
