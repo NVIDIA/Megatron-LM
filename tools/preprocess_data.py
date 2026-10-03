@@ -2,17 +2,21 @@
 
 """Processing large data for pretraining."""
 import argparse
-import math
 import json
+import math
 import os
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
-import time
-import gzip
 import glob
+import gzip
 import multiprocessing
+import queue
+import time
+
 import numpy as np
+
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
@@ -21,9 +25,9 @@ except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
+from megatron.core.datasets import indexed_dataset
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
-from megatron.core.datasets import indexed_dataset
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
@@ -411,6 +415,12 @@ def main():
 
             for p in processes:
                 p.join()
+            for p in processes:
+                if p.exitcode != 0:
+                    raise RuntimeError(
+                        f"Preprocessing worker {p.name} exited with exit code {p.exitcode} "
+                        "while splitting sentences."
+                    )
 
             if args.partitions == 1:
                 continue
@@ -429,13 +439,30 @@ def main():
             p.start()
             processes.append(p)
 
-        for _ in processes:
-            worker_performance = q.get()
-            if args.find_optimal_num_workers:
-                performance[num_workers] = worker_performance
-
-        for p in processes:
-            p.join()
+        try:
+            for _ in processes:
+                while True:
+                    try:
+                        worker_performance = q.get(timeout=1)
+                        break
+                    except queue.Empty:
+                        for p in processes:
+                            if p.exitcode is not None and p.exitcode != 0:
+                                raise RuntimeError(
+                                    f"Preprocessing worker {p.name} exited with exit code {p.exitcode}."
+                                )
+                if args.find_optimal_num_workers:
+                    performance[num_workers] = worker_performance
+        except BaseException:
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+            raise
+        finally:
+            for p in processes:
+                p.join()
+            q.close()
+            q.join_thread()
 
         if args.partitions == 1:
             continue
