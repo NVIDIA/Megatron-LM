@@ -1,4 +1,6 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,11 +22,45 @@ class _FakeGroupedQuantizedTensor:
         return self._members
 
 
+class _ParameterWithHighPrecisionInit:
+    def __init__(self, value):
+        self.value = value
+        self.clear_count = 0
+
+    def get_high_precision_init_val(self):
+        return self.value
+
+    def clear_high_precision_init_val(self):
+        self.value = None
+        self.clear_count += 1
+
+
 @pytest.fixture(autouse=True)
 def _use_fake_grouped_tensor_class(monkeypatch):
     """Make the CPU test double satisfy the production TE GroupedTensor type contract."""
     monkeypatch.setattr(fp8_utils, "GroupedTensor", _FakeGroupedQuantizedTensor)
     monkeypatch.setattr(fp8_utils, "HAVE_TE_GROUPED_TENSOR_CLASS", True)
+
+
+@pytest.mark.parametrize("precision_aware", [False, True], ids=["standard", "precision-aware"])
+def test_finalize_high_precision_init_values(precision_aware):
+    first_value = object()
+    second_value = object()
+    first = _ParameterWithHighPrecisionInit(first_value)
+    second = _ParameterWithHighPrecisionInit(second_value)
+    already_clear = _ParameterWithHighPrecisionInit(None)
+    model_params = [first, second, already_clear, object()]
+    config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=precision_aware)
+
+    cleared = DistributedOptimizer._finalize_high_precision_init_values(model_params, config)
+
+    expected_clear_count = int(not precision_aware)
+    assert cleared == 2 * expected_clear_count
+    assert first.clear_count == expected_clear_count
+    assert second.clear_count == expected_clear_count
+    assert first.value is (first_value if precision_aware else None)
+    assert second.value is (second_value if precision_aware else None)
+    assert already_clear.clear_count == 0
 
 
 def test_expand_quantized_param_shard_for_cast_splits_grouped_wrapper():

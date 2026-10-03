@@ -351,6 +351,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return local_param_group_map, group_ranges
 
+    @staticmethod
+    def _finalize_high_precision_init_values(
+        model_params: List[torch.nn.Parameter], config: OptimizerConfig
+    ) -> int:
+        """Clear initialization values after main-parameter initialization.
+
+        Quantized parameters retain a high-precision CPU initialization value
+        until the distributed optimizer creates its FP32 main-parameter shard.
+        """
+        if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return 0
+
+        cleared = 0
+        for model_param in model_params:
+            getter = getattr(model_param, 'get_high_precision_init_val', None)
+            if getter is None or getter() is None:
+                continue
+            model_param.clear_high_precision_init_val()
+            cleared += 1
+
+        return cleared
+
     @classmethod
     def _build_model_and_main_param_groups(
         cls,
@@ -443,7 +465,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     .to(model_param.device)
                                     .float()
                                 )
-                                model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
@@ -777,6 +798,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
         )
 
+        # Preserve model-parameter references before main-parameter initialization replaces each
+        # optimizer group's parameter list with its local shards.
+        original_model_params = [
+            model_param
+            for group_range in self.opt_group_ranges
+            for model_param in group_range["orig_group"]["params"]
+        ]
+
         # Allocate main param shards.
         (
             self.model_float16_groups,
@@ -786,6 +815,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+        )
+        self._high_precision_init_value_count = self._finalize_high_precision_init_values(
+            original_model_params, config
         )
 
         # _build_model_and_main_param_groups() installs each group's params as
