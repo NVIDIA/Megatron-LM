@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -706,6 +707,7 @@ def save_checkpoint(
     """
     start_ckpt = time()
     args = get_args()
+    is_conversion = getattr(args, 'ckpt_convert_format', None) is not None
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -1157,7 +1159,9 @@ def save_checkpoint(
                     return_base_dir=True,
                 )
                 if iteration > 0:
-                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                    from megatron.training.utils.checkpoint_utils import (
+                        get_checkpoint_run_config_filename,
+                    )
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -1171,6 +1175,14 @@ def save_checkpoint(
                             raise
                         warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
                     else:
+                        if is_conversion:
+                            # Conversion updates legacy args, not the active config.
+                            run_config = copy.copy(run_config)
+                            run_config.checkpoint = copy.copy(run_config.checkpoint)
+                            run_config.checkpoint.ckpt_format = ckpt_format
+                            run_config.checkpoint.save = save_dir
+                            if ckpt_format != 'torch_dist':
+                                run_config.checkpoint.verify_integrity = False
                         run_config.to_yaml(run_config_filename)
 
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
@@ -1285,9 +1297,9 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from megatron.training.distillation import get_logits_saver
-
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
+        from megatron.training.distillation import get_logits_saver
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
