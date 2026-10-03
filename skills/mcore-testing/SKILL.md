@@ -187,6 +187,12 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
    this; the `determinism-exempt` label overrides it for non-numeric edits.
    See `docs/developer/determinism/testing.md`.
 
+Prefer assertions on observable behavior and public interfaces over private
+methods, class selection, or incidental internal state. A behavior-preserving
+refactor should not require changing a test. Test implementation details only
+when the detail is itself an intentional requirement, such as a performance or
+cache contract. See [Google Testing Blog: Test Behavior, Not Implementation](https://testing.googleblog.com/2013/08/testing-on-toilet-test-behavior-not.html).
+
 ---
 
 ## Adding a Functional / Integration Test
