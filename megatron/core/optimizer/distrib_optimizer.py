@@ -1279,6 +1279,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         continue
                     if k == "param":
                         k = "master_param"
+                        sharded_model_param.copy_(v)
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
