@@ -8,11 +8,13 @@ fake inference client defined below, which test_completions.py and test_chat_com
 
 import asyncio
 import importlib
+import json
 import logging
 from dataclasses import fields
 
 import pytest
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
@@ -206,6 +208,7 @@ class ReplyingClient:
         self.sampling_params = []
         self.offload_params = []
         self.aborted = []
+        self.streamed = []
 
     def add_request_with_id(
         self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
@@ -228,6 +231,22 @@ class ReplyingClient:
         else:
             future.set_result(reply)
         return request_id, future
+
+    def add_request_streaming(
+        self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
+        """Answers with a stream that carries the canned reply as its only, final frame."""
+        request_id, future = self.add_request_with_id(
+            prompt_tokens,
+            sampling_params,
+            multi_modal_data=multi_modal_data,
+            offload_params=offload_params,
+        )
+        self.streamed.append(request_id)
+        stream = AsyncStream(request_id=request_id, cancel=lambda: self.aborted.append(request_id))
+        stream.put({"final": future.result()})
+        stream.finish()
+        return stream
 
     def abort_request(self, request_id):
         self.aborted.append(request_id)
@@ -384,6 +403,39 @@ _COMPLETIONS_DEFAULTS = {
             {},
             {"streaming_interval": 3},
             id="chat-n-fans-out-with-streaming-interval",
+        ),
+        pytest.param(
+            CHAT_PATH, {"stop": "END"}, {}, {"stop_words": ["END"]}, id="chat-stop-string"
+        ),
+        # A temperature of zero means greedy decoding, whatever top_k/top_p say.
+        pytest.param(
+            CHAT_PATH,
+            {"temperature": 0, "top_k": 50, "top_p": 0.9},
+            {},
+            {"temperature": 0.0, "top_k": 1, "top_p": 0.0},
+            id="chat-zero-temperature-is-greedy",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"temperature": 0, "top_k": 50, "top_p": 0.9},
+            {},
+            {"temperature": 0.0, "top_k": 1, "top_p": 0.0},
+            id="completions-zero-temperature-is-greedy",
+        ),
+        # An operator default outranks the model's generation_config.
+        pytest.param(
+            COMPLETIONS_PATH,
+            {},
+            {"tokenizer": GenerationConfigTokenizer(), "default_top_p": 0.5},
+            {"temperature": 0.6, "top_p": 0.5, "top_k": 20},
+            id="completions-server-default-beats-generation-config",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"temperature": 0.3},
+            {"tokenizer": GenerationConfigTokenizer()},
+            {"temperature": 0.3},
+            id="completions-request-beats-generation-config",
         ),
         pytest.param(
             COMPLETIONS_PATH,
@@ -654,3 +706,112 @@ async def test_context_overflow_failure_report(path, event_type, expected):
     response = await app.test_client().post(path, json=BODIES[path])
 
     assert (await response.get_data(as_text=True), response.status_code) == expected
+
+
+# --- streaming ----------------------------------------------------------------
+
+
+class TextDetokenizer:
+    """Stands in for the incremental detokenizer, which only accepts HF fast tokenizers."""
+
+    def __init__(self, tokenizer, prompt_tokens):
+        del prompt_tokens
+        self._tokenizer = tokenizer
+        self.text = ""
+
+    def update(self, tokens):
+        delta = self._tokenizer.detokenize(tokens)
+        self.text += delta
+        return delta
+
+    @property
+    def text_length(self):
+        return len(self.text)
+
+
+def build_streaming_app(path, client, monkeypatch, **config):
+    """`build_app` with the endpoint's incremental detokenizer replaced by `TextDetokenizer`."""
+    app = build_app(path, client, **config)
+    module = importlib.import_module(f"{_ENDPOINTS_PACKAGE}.{_ENDPOINT_MODULES[path]}")
+    monkeypatch.setattr(module, "HuggingFaceFastIncrementalDetokenizer", TextDetokenizer)
+    return app
+
+
+async def sse_payloads(response):
+    """The JSON payloads of an SSE response, and whether it ended with `[DONE]`."""
+    records = [r for r in (await response.get_data(as_text=True)).split("\n\n") if r]
+    done = records[-1] == "data: [DONE]"
+    payloads = [
+        json.loads(record.removeprefix("data: ")) for record in records[: -1 if done else None]
+    ]
+    return payloads, done
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_streaming_requires_a_fast_tokenizer(path):
+    pytest.importorskip("transformers")
+    client = ReplyingClient()
+    app = build_app(path, client)
+
+    response = await app.test_client().post(path, json={**BODIES[path], "stream": True})
+
+    assert response.status_code == 400
+    assert "Hugging Face fast tokenizers" in await response.get_data(as_text=True)
+    assert client.prompt_tokens == []
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize("include_usage", [False, True])
+async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usage, monkeypatch):
+    offload_params = {"store": "x"}
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+    body = {
+        **FAN_OUT_BODIES[path],
+        "stream": True,
+        "stream_options": {"include_usage": include_usage},
+        "offload_params": offload_params,
+    }
+
+    response = await app.test_client().post(path, json=body)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert response.mimetype == "text/event-stream"
+    assert client.streamed == [1, 2, 3]
+    assert client.offload_params == [offload_params] * 3
+    payloads, done = await sse_payloads(response)
+    assert done
+    finals = [
+        p["choices"][0] for p in payloads if p["choices"] and "generated_text" in p["choices"][0]
+    ]
+    assert sorted(choice["index"] for choice in finals) == [0, 1, 2]
+    assert all(choice["generated_text"] == "<12><13>" for choice in finals)
+    usage = [p["usage"] for p in payloads if "usage" in p]
+    assert usage == (
+        [
+            {
+                "prompt_tokens": 2,
+                "completion_tokens": 6,
+                "total_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            }
+        ]
+        if include_usage
+        else []
+    )
+    assert client.aborted == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_streaming_reports_an_engine_failure_in_band(path, monkeypatch):
+    client = ReplyingClient([failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "bad"})])
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(path, json={**BODIES[path], "stream": True})
+
+    assert response.status_code == 200
+    # Headers are already sent, so the failure arrives as an error event without `[DONE]`.
+    assert await sse_payloads(response) == ([{"error": {"message": "bad"}}], False)
