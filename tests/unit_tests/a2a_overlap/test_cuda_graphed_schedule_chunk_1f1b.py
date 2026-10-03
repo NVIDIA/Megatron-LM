@@ -14,6 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.utils import set_streams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
@@ -107,6 +108,7 @@ class TestPartialCudaGraphedA2AOverlap:
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
             mtp_block_spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def create_test_args(

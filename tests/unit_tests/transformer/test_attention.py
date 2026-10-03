@@ -65,6 +65,9 @@ class TestParallelAttention:
             self.transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
     def teardown_method(self):
@@ -79,6 +82,18 @@ class TestParallelAttention:
             assert num_weights == 82816
         else:
             assert num_weights == 66304
+
+    @pytest.mark.parametrize('missing_group', ['tp', 'cp'])
+    def test_constructor_rejects_omitted_process_group(self, missing_group):
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        delattr(pg_collection, missing_group)
+        with pytest.raises(ValueError, match=f'must have {missing_group} process group'):
+            SelfAttention(
+                self.transformer_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -159,6 +174,9 @@ class TestParallelAttention:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         config = checkpointed_parallel_attention.config
 
@@ -209,6 +227,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
@@ -229,6 +250,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
         with pytest.raises(ValueError, match="current_max_attn_logits is None"):
@@ -249,6 +273,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -283,6 +310,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -318,6 +348,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -352,6 +385,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -757,7 +793,14 @@ def test_qk_layernorm_from_config_fallback():
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
-        attn = SelfAttention(config, submodules, layer_number=1)
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
+        )
         assert isinstance(attn.q_layernorm, te_pytorch.LayerNorm)
         assert isinstance(attn.k_layernorm, te_pytorch.LayerNorm)
     finally:
@@ -783,7 +826,14 @@ def test_qk_l2_norm_from_config_fallback():
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
-        attn = SelfAttention(config, submodules, layer_number=1)
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
+        )
         assert isinstance(attn.q_layernorm, L2Norm)
         assert isinstance(attn.k_layernorm, L2Norm)
     finally:
@@ -806,7 +856,14 @@ def test_qk_layernorm_spec_config_mismatch_raises():
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=L2Norm, k_layernorm=L2Norm)
         with pytest.raises(ValueError, match="qk_layernorm"):
-            SelfAttention(config, submodules, layer_number=1)
+            SelfAttention(
+                config,
+                submodules,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp', 'dp']
+                ),
+            )
     finally:
         Utils.destroy_model_parallel()
 

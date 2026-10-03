@@ -34,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -110,6 +111,7 @@ class TestPrefixCachingCudaGraphs:
                 parallel_output=True,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
             mamba_config = None
         else:  # hybrid
@@ -137,6 +139,7 @@ class TestPrefixCachingCudaGraphs:
                 hybrid_layer_pattern="M*-",
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
             mamba_config = ssm_state_config(model)
 
@@ -372,6 +375,7 @@ class TestHybridChunkedPrefillIntermediateState:
             hybrid_layer_pattern="M*-",
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)

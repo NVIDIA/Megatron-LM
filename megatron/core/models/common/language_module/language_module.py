@@ -17,17 +17,16 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
-from megatron.core.utils import (
-    get_pg_rank,
-    get_tensor_model_parallel_group_if_none,
-    make_tp_sharded_tensor_for_checkpoint,
-)
+from megatron.core.utils import get_pg_rank, make_tp_sharded_tensor_for_checkpoint
 
 
 class LanguageModule(MegatronModule):
@@ -35,27 +34,47 @@ class LanguageModule(MegatronModule):
 
     Args:
         config (TransformerConfig): Input transformer config for the model
-        pg_collection (ProcessGroupCollection): Model communication process groups
+        pg_collection (ProcessGroupCollection): Explicit model communication groups with
+            ``tp``, ``cp``, ``pp``, and ``embd`` fields. Once distributed is initialized,
+            ``tp``, ``cp``, and ``pp`` must be participating groups, including singleton
+            dimensions. Use ``embd=None`` on nonparticipating embedding stages; PyTorch's
+            NON_GROUP_MEMBER sentinel is not a usable group. Explicit None fields are
+            permitted for offline model construction.
     """
 
     def __init__(
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
-        set_attention_backend(self.config)
         if pg_collection is None:
+            # The global grid is only a compatibility default: a model built on independent grids
+            # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it.
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        groups = vars(pg_collection)
+        for pg_name in ('tp', 'cp', 'pp', 'embd'):
+            if pg_name not in groups:
+                raise ValueError(
+                    f"LanguageModule pg_collection must explicitly define {pg_name}; "
+                    "use None only when that group is not needed."
+                )
+            if groups[pg_name] == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+                raise ValueError(
+                    f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
+                    "use None for a nonparticipating embedding group."
+                )
+        if torch.distributed.is_initialized():
+            for pg_name in ('tp', 'cp', 'pp'):
+                if groups[pg_name] is None:
+                    raise ValueError(
+                        f"LanguageModule requires a participating {pg_name} group when "
+                        "distributed is initialized, including for singleton dimensions."
+                    )
+        set_attention_backend(self.config)
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
-        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
+        self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
-        assert hasattr(self.pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it used default "
-            "`parallel_state.default_embedding_ranks` to create the process group."
-            "If you are using the default process group, please use"
-            "`parallel_state.get_embedding_group()` "
-            "If you don't need embd_group, you need to explicitly set it to None."
-        )
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
