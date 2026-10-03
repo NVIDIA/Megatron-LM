@@ -291,9 +291,10 @@ class FsdpModule:
             lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
         )
         module.register_forward_hook(
-            lambda hooked_module, _args, output: cast(FsdpModule, hooked_module).post_forward(
-                output
-            )
+            lambda hooked_module, args, kwargs, output: cast(
+                FsdpModule, hooked_module
+            ).post_forward(output, inputs=(args, kwargs)),
+            with_kwargs=True,
         )
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
@@ -471,7 +472,7 @@ class FsdpModule:
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
-    def post_forward(self, output: object = None) -> None:
+    def post_forward(self, output: object = None, *, inputs: object = ()) -> None:
         """Return parameters to their sharded resting state after forward compute."""
         if (
             output is not None
@@ -487,6 +488,7 @@ class FsdpModule:
                         if group.requires_grad
                         for parameter in group.fsdp_parameters
                     ),
+                    inputs,
                 )
             )
         # Recomputed parameters are consumed immediately by this module's

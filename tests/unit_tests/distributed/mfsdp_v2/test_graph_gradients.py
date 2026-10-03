@@ -202,6 +202,31 @@ def test_reentrant_recompute_counts_visible_parameters(distributed_setup):
         )
 
 
+def test_parameter_count_stops_at_keyword_input(distributed_setup):
+    """An upstream checkpoint must not make this unit fall back to its owned count."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
+    upstream = nn.Linear(8, 8).to(device)
+    model = ConditionalUnit().to(device)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh, placements)
+
+    x = torch.randn(4, 8, device=device, requires_grad=True)
+    hidden = checkpoint(upstream, x, use_reentrant=True)
+    # Keyword tensors are boundaries too. Walking past hidden would encounter
+    # the checkpoint and incorrectly count the unused image weight and bias.
+    output = model(hidden=hidden)
+    assert model._trainable_parameter_countdown.initial_value == 2
+    output.square().mean().backward()
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert x.grad is not None
+    for parameter in model.image.parameters():
+        assert torch.count_nonzero(parameter.grad.to_local()).item() == 0
+
+
 class SharedModel(nn.Module):
     """Reuse the same conditional layer at successive prediction depths."""
 
