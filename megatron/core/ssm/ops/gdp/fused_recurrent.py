@@ -146,6 +146,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
         b_h += b_k[:, None] * b_v
         b_o = tl.sum(b_h * b_q[:, None], 0)
+        if HAS_STATE_INDICES:
+            # Zero padding rows in this store, so o needs no masked_fill_ after the launch.
+            # A padding row's recurrence ran over whatever the padded input buffer
+            # held, so its output is overwritten rather than merely left unwritten:
+            # the contract is zero, and a stale inf/NaN would survive a mask.
+            # Select, rather than multiply: padded inputs may contain NaN/Inf.
+            b_o = tl.where(i_s >= 0, b_o, 0.0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # Snapshot the state once per draft token, on the step that closes that
@@ -320,9 +327,5 @@ def fused_recurrent_gated_delta_rule_update(
         num_stages=3,
     )
     if state_indices is not None:
-        # A padding row's recurrence ran over whatever the padded input buffer
-        # held, so its output is overwritten rather than merely left unwritten:
-        # the contract is zero, and a stale inf/NaN would survive a mask.
         assert cu_seqlens is None, "state_indices with cu_seqlens is not supported yet"
-        o.masked_fill_((state_indices < 0).view(-1, *([1] * (o.ndim - 1))), 0)
     return o, final_state
