@@ -408,6 +408,7 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
 @pytest.mark.parametrize(
     ("prompt", "multi_modal_data", "status", "error"),
     [
+        (_PROMPT_TOKENS, "not-a-dict", 400, "multi_modal_data must be a dictionary"),
         (_PROMPT_TOKENS, {"audio": "payload"}, 400, "Unsupported multimodal modalities"),
         (
             _PROMPT_TOKENS,
