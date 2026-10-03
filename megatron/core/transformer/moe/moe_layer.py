@@ -470,6 +470,17 @@ class MoELayer(BaseMoELayer):
         # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
         self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
+    def select_token_dispatcher(self) -> None:
+        """Select the inference token dispatcher if active, otherwise use training dispatcher."""
+        if not hasattr(self, "_inference_token_dispatcher"):
+            return
+        if InferenceMode.is_active():
+            self.token_dispatcher = self._inference_token_dispatcher
+            self.shared_expert_overlap = self._inference_token_dispatcher.shared_experts is not None
+        else:
+            self.token_dispatcher = self._training_token_dispatcher
+            self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
         weight gradient computation with dispatch backward.
@@ -692,18 +703,7 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
-        # Select the active token dispatcher based on whether the inference engine
-        # is currently using the model. Only applies when the inference dispatcher
-        # was set up (config.transformer_impl == "inference_optimized").
-        if hasattr(self, "_inference_token_dispatcher"):
-            if InferenceMode.is_active():
-                self.token_dispatcher = self._inference_token_dispatcher
-                self.shared_expert_overlap = (
-                    self._inference_token_dispatcher.shared_experts is not None
-                )
-            else:
-                self.token_dispatcher = self._training_token_dispatcher
-                self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+        self.select_token_dispatcher()
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):

@@ -99,6 +99,7 @@ class LLaVAModel(MegatronModule):
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
         language_rope_scaling_factor (float): RoPE scaling factor. Defaults to 8.
+        logit_dtype (torch.dtype, optional): Dtype of the language model's output-layer GEMM.
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         conv_merging (bool): Account for a native 2x2 vision-token merger.
@@ -137,6 +138,7 @@ class LLaVAModel(MegatronModule):
         language_rope_scaling_factor: float = 8.0,
         hybrid_layer_pattern: str = None,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         conv_merging: bool = False,
@@ -177,7 +179,7 @@ class LLaVAModel(MegatronModule):
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        language_model_type = getattr(language_transformer_config, "language_model_type", "")
+        is_hybrid_language_model = language_transformer_config.is_hybrid_model
 
         # Constructor configuration and initial module state.
         self.pre_process = pre_process
@@ -219,11 +221,7 @@ class LLaVAModel(MegatronModule):
         self._balance_vision_context_parallel_by_tokens = balance_vision_context_parallel_by_tokens
         self._profile_vision_context_parallel_partition = profile_vision_context_parallel_partition
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
-            if not (
-                language_model_type.startswith('nemotron5-hybrid')
-                or language_model_type == 'nemotron6-moe'
-                or language_model_type == 'nemotron6-super'
-            ):  # pylint: disable=line-too-long
+            if not is_hybrid_language_model:
                 assert isinstance(
                     language_transformer_layer_spec.submodules, TransformerLayerSubmodules
                 )
@@ -258,9 +256,7 @@ class LLaVAModel(MegatronModule):
                 self.language_model = build_hf_model(
                     language_transformer_config, language_transformer_config.language_model_type
                 )
-            elif language_model_type.startswith(
-                ('nemotron5-hybrid', 'nemotron6-moe', 'nemotron6-super')
-            ):
+            elif is_hybrid_language_model:
                 self.language_model = HybridModel(
                     config=language_transformer_config,
                     hybrid_stack_spec=language_transformer_layer_spec,
@@ -274,9 +270,11 @@ class LLaVAModel(MegatronModule):
                     rotary_percent=language_rotary_percent,
                     rotary_base=language_rotary_base,
                     fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+                    logit_dtype=logit_dtype,
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
                 )
             else:
                 self.language_model = GPTModel(
@@ -292,6 +290,7 @@ class LLaVAModel(MegatronModule):
                     rotary_base=language_rotary_base,
                     rope_scaling=language_rope_scaling,
                     rope_scaling_factor=language_rope_scaling_factor,
+                    logit_dtype=logit_dtype,
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
