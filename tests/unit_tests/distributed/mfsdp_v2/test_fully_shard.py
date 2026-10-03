@@ -330,6 +330,38 @@ def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
 
+def test_fused_wgrad_mask_marks_only_te_fused_gemm_weights(distributed_setup):
+    """Only 2-D weights of TE modules built with fuse_wgrad_accumulation=True are fused."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(
+        te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True),
+        te.Linear(32, 16, bias=True, device=device, fuse_wgrad_accumulation=False),
+    )
+    frozen = te.Linear(16, 16, bias=True, device=device, fuse_wgrad_accumulation=True)
+    frozen.requires_grad_(False)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+        fully_shard(frozen, mesh=mesh, placements=_default_placements())
+
+    fused_by_fqn = {
+        fqn: fused
+        for group in model.parameter_groups
+        for fsdp_parameter, fused in zip(group.fsdp_parameters, group.fused_wgrad_mask)
+        for fqn in fsdp_parameter.fqns
+    }
+    assert fused_by_fqn == {
+        "0.layer_norm_weight": False,
+        "0.layer_norm_bias": False,
+        "0.weight": True,
+        "0.bias": False,
+        "1.weight": False,
+        "1.bias": False,
+    }
+    assert [group.has_fused_wgrad for group in model.parameter_groups] == [True]
+    assert [group.has_fused_wgrad for group in frozen.parameter_groups] == [False]
+
+
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.
