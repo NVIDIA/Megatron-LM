@@ -18,13 +18,17 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe import test_moe_single_grouped_weight_numerics as numerics
 
-pytestmark = numerics.pytestmark
+# The GB200 CI selector scans this file's text before pytest resolves inherited marks.
+pytestmark = [pytest.mark.launch_on_gb200, *numerics.pytestmark]
 
 
 @pytest.fixture
 def moe_case(monkeypatch):
     # Reuse the existing DDP/DistOpt model and batch setup, without inheriting its tests.
     monkeypatch.setattr(sys, "argv", list(sys.argv))
+    # Set this before setup_method snapshots the environment, so monkeypatch restores
+    # the caller's value after teardown_method finishes.
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     case = numerics.TestMoESingleGroupedWeightNumerics()
     case.setup_method(None)
     try:
@@ -32,6 +36,28 @@ def moe_case(monkeypatch):
         yield case
     finally:
         case.teardown_method(None)
+
+
+def _enable_native_glu_fusion(monkeypatch):
+    """Enable native TE fusion locally even if conftest imported TE before this fixture."""
+    from transformer_engine.pytorch.ops.fused import grouped_mlp
+    from transformer_engine.pytorch.ops.fuser import OperationFuser
+
+    fused_cls = grouped_mlp.GroupedMLP_CuTeGEMMGLU
+    # Older TE caches False and omits registration when the import-time env is unset.
+    # Re-run the original capability checks without changing that shared cache.
+    uncached_check = getattr(fused_cls.is_supported, "__wrapped__", None)
+    if uncached_check is not None:
+        monkeypatch.setattr(fused_cls, "is_supported", classmethod(uncached_check))
+    native_fusion = getattr(grouped_mlp, "fuse_glu_ops", None)
+    if native_fusion is None:
+        native_fusion = grouped_mlp.fuse_ops
+    callbacks = OperationFuser.forward_backward_fusion_functions
+    if native_fusion not in callbacks:
+        # Replace rather than mutate the shared list; pytest restores it after this case.
+        monkeypatch.setattr(
+            OperationFuser, "forward_backward_fusion_functions", [native_fusion, *callbacks]
+        )
 
 
 def _setup_model(
@@ -164,6 +190,79 @@ def _forward(case, model, experts):
         hook.remove()
 
 
+def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
+    """Keep the unfused MXFP8 reference's intermediates at the fused kernel's precision.
+
+    This is forward-only: parameters and MXFP8 quantizers are unchanged, while FC1,
+    SwiGLU and FC2 keep FP32 intermediates until the final BF16 output. Casting an
+    already rounded BF16 result to FP32 would not recover the lost precision.
+    """
+    from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
+
+    original_linear = GroupedLinear._fuser_forward_grouped_tensor
+    original_activation = ScaledSwiGLU._scaled_glu_forward
+    calls = []
+
+    def reference_ops():
+        # TEGroupedMLP builds these lazily on the first forward.
+        return tuple(experts._fused_ops[0].children()) if experts._fused_ops else ()
+
+    def linear_fp32(op, **kwargs):
+        ops = reference_ops()
+        if not any(op is reference_op for reference_op in ops):
+            return original_linear(op, **kwargs)
+        assert not torch.is_grad_enabled() and not torch.is_autocast_enabled()
+        assert kwargs["dtype"] == torch.bfloat16
+        assert kwargs["with_quantized_compute"] and kwargs["out_buffer"] is None
+        is_fc2 = op is ops[2]
+        assert kwargs["input_"].dtype == (torch.float32 if is_fc2 else torch.bfloat16)
+        # Override after TE checks grouped-path eligibility using the BF16 parameters.
+        # FC2 must also keep FP32, or it would round the activation before quantizing it.
+        kwargs["dtype"] = torch.float32
+        output, saved = original_linear(op, **kwargs)
+        assert output.dtype == torch.float32
+        calls.append("fc2" if is_fc2 else "fc1")
+        return (output.bfloat16() if is_fc2 else output), saved
+
+    def activation_fp32(op, input_, scales):
+        ops = reference_ops()
+        if not any(op is reference_op for reference_op in ops):
+            return original_activation(op, input_, scales)
+        assert not torch.is_grad_enabled() and not torch.is_autocast_enabled()
+        assert input_.dtype == torch.float32
+        # The fused MXFP8 activation rounds router probabilities to BF16 too.
+        output = original_activation(op, input_, scales.bfloat16().float())
+        assert output.dtype == torch.float32
+        calls.append("activation")
+        return output
+
+    with monkeypatch.context() as reference:
+        reference.setattr(GroupedLinear, "_fuser_forward_grouped_tensor", linear_fp32)
+        reference.setattr(ScaledSwiGLU, "_scaled_glu_forward", activation_fp32)
+        output, losses = _forward(case, model, experts)
+    assert calls == ["fc1", "activation", "fc2"]
+    return output, losses
+
+
+def _assert_execution_plan(experts, *, fused):
+    """An op-fuser configuration flag alone does not prove the fused kernel ran."""
+    (sequence,) = experts._fused_ops
+    selected = [
+        (type(op).__name__, tuple(indices))
+        for group in sequence._module_groups
+        for op, indices in group._forward_ops
+    ]
+    expected = (
+        [("GroupedMLP_CuTeGEMMGLU", (0, 1, 2))]
+        if fused
+        else [("GroupedLinear", (0,)), ("ScaledSwiGLU", (1,)), ("GroupedLinear", (2,))]
+    )
+    assert selected == expected, (
+        f"Expected {expected}, got {selected}. Fused MXFP8 requires a GB200 container "
+        "with native TE/cuDNN grouped-MLP fusion support."
+    )
+
+
 @pytest.mark.parametrize("single_weight", [False, True], ids=["indexed-weight", "single-weight"])
 @pytest.mark.parametrize("single_bias", [False, True], ids=["indexed-bias", "single-bias"])
 @pytest.mark.parametrize("use_op_fuser", [False, True], ids=["module", "op-fuser"])
@@ -175,10 +274,13 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
 
     Both execution layouts load the same independently checked canonical checkpoint.
     Nonzero FC1/FC2 biases participate in all four weight/bias storage combinations.
+    MXFP8 op-fuser cases require actual joint fusion and an FP32-intermediate reference.
     The negative control bypasses only the load conversion and must break expert output.
     Optimizer moments are deliberately not restored when changing the execution layout.
     """
     numerics._skip_if_unsupported(precision)
+    if precision == "mxfp8" and use_op_fuser:
+        _enable_native_glu_fusion(monkeypatch)
     canonical = _canonical_parameters()
     with TempNamedDir(tmp_path_dist_ckpt / "canonical_glu_checkpoint", sync=True) as directory:
         model, optimizer, scheduler, experts = _setup_model(
@@ -224,7 +326,14 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
             load=True,
         )
         _assert_parameters(experts, canonical)
-        reference_output, reference_losses = _forward(moe_case, model, experts)
+        if precision == "mxfp8" and use_op_fuser:
+            reference_output, reference_losses = _forward_with_fp32_intermediates(
+                moe_case, model, experts, monkeypatch
+            )
+        else:
+            reference_output, reference_losses = _forward(moe_case, model, experts)
+        if use_op_fuser:
+            _assert_execution_plan(experts, fused=False)
         del experts, model, optimizer, scheduler
 
         model, optimizer, scheduler, experts = _setup_model(
@@ -240,6 +349,8 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         expected_runtime = _expected_runtime(canonical, 32)
         _assert_parameters(experts, expected_runtime)
         actual_output, actual_losses = _forward(moe_case, model, experts)
+        if use_op_fuser:
+            _assert_execution_plan(experts, fused=precision == "mxfp8")
         tolerance = 5e-3 if precision == "bf16" else 5e-2
         torch.testing.assert_close(actual_output, reference_output, rtol=tolerance, atol=tolerance)
         torch.testing.assert_close(actual_losses, reference_losses, rtol=tolerance, atol=tolerance)

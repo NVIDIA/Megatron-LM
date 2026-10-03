@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
-from megatron.training.glu_checkpointing import (
+from megatron.training.ckpt.glu_checkpointing import (
     prepare_glu_checkpoint_for_load,
     prepare_glu_checkpoint_for_save,
     validate_glu_checkpoint_backend,
