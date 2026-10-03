@@ -7,6 +7,7 @@ import logging
 
 import torch
 
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
     get_all_rng_states,
@@ -144,6 +145,7 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
+    validation_calls: dict[str, list[dict]] = {'training': [], 'validation': []}
 
     def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
@@ -227,15 +229,20 @@ class FullCudaGraphWrapper:
                     FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
+            rerun_state_machine = get_rerun_state_machine()
+            with (
+                torch.cuda.graph(
+                    FullCudaGraphWrapper.cuda_graph[training_str],
+                    stream=capture_stream,
+                    pool=get_graph_pool(self.use_single_mempool),
+                    capture_error_mode="thread_local",
+                ),
+                rerun_state_machine.capture_validation_calls() as validation_calls,
             ):
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
+            FullCudaGraphWrapper.validation_calls[training_str] = validation_calls
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
@@ -244,6 +251,12 @@ class FullCudaGraphWrapper:
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
+        # Validate before returning to the training loop's rerun/update decision.
+        # A later replay must not overwrite a failed result retained for attribution.
+        for validation in FullCudaGraphWrapper.validation_calls[training_str]:
+            get_rerun_state_machine().validate_result(
+                **{**validation, 'result': validation['result'].clone()}
+            )
         return FullCudaGraphWrapper.result[training_str]
 
     def curr_iter(self, stage):
@@ -262,10 +275,12 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            FullCudaGraphWrapper.validation_calls['training'] = []
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['validation']
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+            FullCudaGraphWrapper.validation_calls['validation'] = []
         gc.collect()
