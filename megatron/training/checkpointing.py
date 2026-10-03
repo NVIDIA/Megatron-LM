@@ -65,13 +65,13 @@ from megatron.training.global_vars import get_run_config, get_tokenizer
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
-from .global_vars import get_args
-from .glu_checkpointing import (
+from .ckpt.glu_checkpointing import (
     prepare_glu_checkpoint_for_load,
     prepare_glu_checkpoint_for_save,
     validate_glu_checkpoint_backend,
     validate_glu_optimizer_layout,
 )
+from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
@@ -1157,7 +1157,9 @@ def save_checkpoint(
                     return_base_dir=True,
                 )
                 if iteration > 0:
-                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                    from megatron.training.utils.checkpoint_utils import (
+                        get_checkpoint_run_config_filename,
+                    )
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -1285,9 +1287,9 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from megatron.training.distillation import get_logits_saver
-
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
+        from megatron.training.distillation import get_logits_saver
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
