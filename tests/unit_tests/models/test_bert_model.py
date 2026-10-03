@@ -274,10 +274,12 @@ class TestBertModelAttentionDimensions:
                 max_sequence_length=4,
             )
         assert str(exc_info.value) == (
-            "Linear.__init__() got an unexpected keyword argument 'rng_tracker_name' when "
-            "instantiating TERowParallelLinear when instantiating SelfAttention when "
-            "instantiating TransformerLayer"
+            "Linear.__init__() got an unexpected keyword argument 'rng_tracker_name'"
         )
+        assert exc_info.value.__notes__ == [
+            "when instantiating SelfAttention",
+            "when instantiating TransformerLayer",
+        ]
 
     @pytest.mark.internal
     def test_transformer_engine_version_1_7_to_1_10_unfused_attention(self, mocker):
