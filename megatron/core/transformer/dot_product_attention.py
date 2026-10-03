@@ -144,6 +144,11 @@ class DotProductAttention(MegatronModule):
             )
             if config.perform_initialization:
                 self.softmax_offset = config.init_method(self.softmax_offset)
+            # Head-sharded across TP (matches sharded_state_dict partition dim 0). Mark
+            # so clip-norm keeps every rank's sink grads (same family as #5916).
+            tensor_parallel.set_tensor_model_parallel_attributes(
+                self.softmax_offset, True, 0, 1
+            )
         else:
             raise ValueError("Softmax type not supported")
 

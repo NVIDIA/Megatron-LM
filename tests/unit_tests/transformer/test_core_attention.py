@@ -132,3 +132,49 @@ class TestDotProductAttentionSoftcap:
         assert (without - wrong).abs().max() > 1e-3, "inputs do not separate the two caps"
 
         torch.testing.assert_close(with_scaling, without, rtol=1e-2, atol=1e-2)
+
+
+class TestLearnableSoftmaxOffsetTPAttributes:
+    """Learnable attention-sink offsets are head-sharded across TP.
+
+    Without tensor_model_parallel=True, clip-norm keeps sink grads only on TP
+    rank 0 and undercounts the global L2 norm (Finding 8 of #7452).
+    """
+
+    def test_softmax_offset_marked_tensor_parallel(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        fake_tp = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+        fake_cp = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4,
+            num_attention_heads=2,
+            kv_channels=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            softmax_type="learnable",
+            perform_initialization=False,
+            params_dtype=torch.float32,
+            use_cpu_initialization=True,
+        )
+        with (
+            patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")),
+            patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            attention = DotProductAttention(
+                config,
+                1,
+                AttnMaskType.causal,
+                "self",
+                pg_collection=ProcessGroupCollection(tp=fake_tp, cp=fake_cp),
+            )
+        param = attention.softmax_offset
+        assert param is not None
+        assert param.numel() == 1
+        assert param.tensor_model_parallel is True
+        assert param.partition_dim == 0
+        assert param.partition_stride == 1
