@@ -362,6 +362,65 @@ def test_fused_wgrad_mask_marks_only_te_fused_gemm_weights(distributed_setup):
     assert [group.has_fused_wgrad for group in frozen.parameter_groups] == [False]
 
 
+def _fused_layer_norm_linear_group(distributed_setup):
+    """Fully shard one fused te.LayerNormLinear; return it, its group, and unsharded params."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    [group] = model.parameter_groups
+    unsharded = {
+        fsdp_parameter.fqns[0]: fsdp_parameter.unsharded for fsdp_parameter in group.fsdp_parameters
+    }
+    # Return the model too: the group holds only a weak reference to it.
+    return model, group, unsharded
+
+
+def test_fused_grad_buffer_prepare_and_take(distributed_setup):
+    """prepare exposes zeroed fused views; take packs autograd gradients and drops main_grad."""
+    _model, group, unsharded = _fused_layer_norm_linear_group(distributed_setup)
+    unfused_names = ("layer_norm_weight", "layer_norm_bias", "bias")
+
+    group.prepare_fused_grad_buffer()
+    main_grad = unsharded["weight"].main_grad
+    assert main_grad.shape == unsharded["weight"].shape
+    assert main_grad.dtype == group.dtype
+    assert torch.count_nonzero(main_grad) == 0
+    assert not any(hasattr(unsharded[name], "main_grad") for name in unfused_names)
+
+    # A second prepare in the same backward, e.g. from another unshard(), keeps the buffer.
+    group.prepare_fused_grad_buffer()
+    assert unsharded["weight"].main_grad is main_grad
+
+    main_grad.fill_(1.0)  # Stands in for TE's fused wgrad GEMM.
+    for name in unfused_names:
+        unsharded[name].grad = torch.full_like(unsharded[name], 2.0)
+    buffer = group.take_fused_grad_buffer()
+
+    assert not any(hasattr(parameter, "main_grad") for parameter in unsharded.values())
+    assert all(parameter.grad is None for parameter in unsharded.values())
+    views = {
+        fsdp_parameter.fqns[0]: buffer.get_tensor_view(index)
+        for index, fsdp_parameter in enumerate(group.fsdp_parameters)
+    }
+    torch.testing.assert_close(views["weight"], torch.ones_like(views["weight"]))
+    for name in unfused_names:
+        torch.testing.assert_close(views[name], torch.full_like(views[name], 2.0))
+    with pytest.raises(RuntimeError, match="not prepared"):
+        group.take_fused_grad_buffer()
+
+
+def test_fused_grad_buffer_requires_unfused_gradients(distributed_setup):
+    """An unfused parameter without a gradient is an error, as on the copy path."""
+    _model, group, unsharded = _fused_layer_norm_linear_group(distributed_setup)
+    group.prepare_fused_grad_buffer()
+    unsharded["layer_norm_weight"].grad = torch.ones_like(unsharded["layer_norm_weight"])
+    unsharded["layer_norm_bias"].grad = torch.ones_like(unsharded["layer_norm_bias"])
+    with pytest.raises(RuntimeError, match="Missing gradient"):
+        group.take_fused_grad_buffer()
+
+
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.
