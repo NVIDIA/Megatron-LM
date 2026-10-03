@@ -126,6 +126,23 @@ class EmergingOptimizerEntry:
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
     """Instantiate an emerging optimizer and return it with its init_state_fn."""
     entry = _EMERGING_OPTIMIZERS[eopt_name]
+    if eopt_name == 'muon' and _muon_modes_are_hybrid(config):
+        # Hybrid dense/expert modes: get_megatron_optimizer keeps the primary Muon
+        # optimizer's dense and expert buckets separate and calls this once per bucket.
+        # Both land in LayerWiseDistributedOptimizer's base list; its NS-home wiring
+        # only touches LayerShardedMuon instances.
+        is_expert = bool(param_groups) and bool(param_groups[0].get('is_expert_parallel', False))
+        mode = (
+            _muon_expert_tp_mode(config)
+            if is_expert
+            else getattr(config, 'muon_tp_mode', 'duplicated')
+        )
+        eopt_kwargs = _muon_registry_config_to_kwargs(
+            config, model_chunks, pg_collection, tp_mode=mode, is_expert=is_expert
+        )
+        optimizer_cls = _muon_config_to_cls(config, mode)
+        return optimizer_cls(param_groups, **eopt_kwargs), entry.init_state_fn
+
     if entry.config_to_kwargs is not None:
         eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
     else:
@@ -753,13 +770,31 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
     return kwargs
 
 
-def _muon_config_to_cls(config) -> type:
+def _muon_expert_tp_mode(config) -> str:
+    """Effective NS mode for expert-parallel weights: ``muon_expert_tp_mode`` when set,
+    otherwise following ``muon_tp_mode``."""
+    return getattr(config, 'muon_expert_tp_mode', None) or getattr(
+        config, 'muon_tp_mode', 'duplicated'
+    )
+
+
+def _muon_modes_are_hybrid(config) -> bool:
+    """Whether dense and expert weights run DIFFERENT NS modes, so the ``muon`` entry builds
+    one base optimizer per (dense, expert) bucket (see :func:`_create_emerging_optimizer`)."""
+    return _muon_expert_tp_mode(config) != getattr(config, 'muon_tp_mode', 'duplicated')
+
+
+def _muon_config_to_cls(config, tp_mode: str | None = None) -> type:
     """The ``muon`` registry entry's class.
 
-    ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'`` (a registry-level class
+    ``LayerShardedMuon`` when the mode is ``'layer_sharded'`` (a registry-level class
     selector, not a TensorParallelMuon runtime mode), ``TensorParallelMuon`` otherwise.
+    ``tp_mode`` overrides ``config.muon_tp_mode`` for one bucket of a hybrid dense/expert
+    configuration (:func:`_muon_modes_are_hybrid`); the registry calls this without it.
     """
-    if getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded':
+    if tp_mode is None:
+        tp_mode = getattr(config, 'muon_tp_mode', 'duplicated')
+    if tp_mode == 'layer_sharded':
         from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 
         return LayerShardedMuon
@@ -780,25 +815,41 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     return kwargs
 
 
-def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+def _muon_registry_config_to_kwargs(
+    config, model_chunks, pg_collection, *, tp_mode: str | None = None, is_expert: bool = False
+) -> Dict[str, Any]:
     """``config_to_kwargs`` for the ``muon`` registry entry.
 
     TensorParallelMuon kwargs, plus LayerShardedMuon's own when
     :func:`_muon_config_to_cls` selects it (the same helper the entry's
     ``config_to_cls`` uses, so class and kwargs cannot disagree).
+
+    ``tp_mode`` and ``is_expert`` describe one bucket of a hybrid dense/expert
+    configuration (:func:`_create_emerging_optimizer`): the mode overrides
+    ``config.muon_tp_mode``, and an expert bucket gets the expert (expt_gtp_remat, expt_tp)
+    axes. The registry itself calls this with the defaults.
     """
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
-    cls = _muon_config_to_cls(config)
+    cls = _muon_config_to_cls(config, tp_mode)
     if cls is TensorParallelMuon:
+        if tp_mode is not None:
+            # The reflective builder read config.muon_tp_mode; this bucket runs its own.
+            kwargs["tp_mode"] = tp_mode
         return kwargs
-    # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
     kwargs.update(_kwargs_from_config(cls, "muon", config))
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
     # delegated (empty-homes fallback) path runs the bitwise reference mode instead.
     kwargs["tp_mode"] = "duplicated"
-    # No config attr for these: the (gtp_remat, tp) axes come from the collection.
-    kwargs["gtp_remat_group"] = getattr(pg_collection, "gtp_remat", None)
-    kwargs["tp_group"] = getattr(pg_collection, "tp", None)
+    # No config attr for these: the axes come from the collection. An expert bucket defaults
+    # to the expert axes; per-group NS-home wiring (_wire_layer_sharding_ns_homes) assigns
+    # domains group by group regardless, this keeps the fallback consistent.
+    if is_expert:
+        kwargs["gtp_remat_group"] = getattr(pg_collection, "expt_gtp_remat", None)
+        kwargs["tp_group"] = getattr(pg_collection, "expt_tp", None)
+        kwargs["split_qkv"] = False
+    else:
+        kwargs["gtp_remat_group"] = getattr(pg_collection, "gtp_remat", None)
+        kwargs["tp_group"] = getattr(pg_collection, "tp", None)
     return kwargs
 
 
