@@ -98,6 +98,7 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
     """GDP-owned parameters, conv1d, and child modules use the owning topology."""
     tp_group = object()
     dp_cp_group = object()
+    sharded_offsets = ((0, 1, 2),)
     in_proj_dim = 8
     conv_dim = 4
 
@@ -142,6 +143,10 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
             side_effect=child_wrap,
         ),
         patch(
+            "megatron.core.ssm.gated_delta_product._split_in_proj_factory",
+            side_effect=lambda tensor, *args, **kwargs: tensor,
+        ) as in_proj_split,
+        patch(
             "megatron.core.ssm.gated_delta_product._split_tensor_factory",
             side_effect=lambda tensor, *args, **kwargs: tensor,
         ),
@@ -151,19 +156,30 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
         ),
     ):
         GatedDeltaProductMixer.sharded_state_dict(
-            mixer, prefix="mixer.", metadata={"dp_cp_group": dp_cp_group}
+            mixer,
+            prefix="mixer.",
+            sharded_offsets=sharded_offsets,
+            metadata={"dp_cp_group": dp_cp_group},
         )
 
     assert checkpoint_wrap_calls == [
         {
             "tensor_parallel_layers_axis_map": {"A_log": 0, "dt_bias": 0, "D": 0},
-            "sharded_offsets": (),
+            "sharded_offsets": sharded_offsets,
             "tp_group": tp_group,
             "dp_cp_group": dp_cp_group,
         },
         {"tp_group": tp_group, "dp_cp_group": dp_cp_group},
     ]
     assert child_wrap_calls == [{"tp_group": tp_group}]
+    in_proj_split.assert_called_once()
+    assert in_proj_split.call_args.args[0].data is in_proj.weight
+    assert in_proj_split.call_args.kwargs == {
+        "weight": in_proj.weight,
+        "tp_group": tp_group,
+        "dp_cp_group": dp_cp_group,
+        "sharded_offsets": sharded_offsets,
+    }
 
 
 def test_householder_components_reshard_tp2_to_tp1_in_semantic_order():
