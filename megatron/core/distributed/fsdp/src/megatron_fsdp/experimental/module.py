@@ -25,12 +25,11 @@ from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
-from torch.utils._pytree import tree_leaves
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
-from .module_utils import get_parameter_owner
+from .module_utils import count_used_parameters, get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
@@ -472,36 +471,6 @@ class FsdpModule:
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
-    def _count_used_parameters(self, output: object) -> int:
-        """Count unique owned leaves reachable from this forward's outputs."""
-        owned_count = sum(
-            len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
-        )
-        pending = [
-            torch.autograd.graph.get_gradient_edge(tensor).node
-            for tensor in tree_leaves(output)
-            if isinstance(tensor, torch.Tensor) and tensor.requires_grad
-        ]
-        visited = set()
-        used_parameters = set()
-        while pending:
-            node = pending.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            # This node exposes checkpoint inputs, but hides internal parameter
-            # leaves. Fall back to the owned count only for such an opaque graph.
-            if node.name() == "CheckpointFunctionBackward":
-                return owned_count
-            parameter = getattr(node, "variable", None)
-            if (
-                parameter is not None
-                and get_containing_parameter_group(parameter) in self._parameter_groups
-            ):
-                used_parameters.add(parameter)
-            pending.extend(parent for parent, _ in node.next_functions if parent is not None)
-        return len(used_parameters)
-
     def post_forward(self, output: object = None) -> None:
         """Return parameters to their sharded resting state after forward compute."""
         if (
@@ -509,7 +478,17 @@ class FsdpModule:
             and torch.is_grad_enabled()
             and self.phase is not FsdpModule.Phase.BACKWARD
         ):
-            self._trainable_parameter_countdown = Countdown(self._count_used_parameters(output))
+            self._trainable_parameter_countdown = Countdown(
+                count_used_parameters(
+                    output,
+                    (
+                        parameter.unsharded
+                        for group in self._parameter_groups
+                        if group.requires_grad
+                        for parameter in group.fsdp_parameters
+                    ),
+                )
+            )
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.

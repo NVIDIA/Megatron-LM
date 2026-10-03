@@ -14,7 +14,11 @@
 
 """Utilities for parameter ownership and metadata in FSDP modules."""
 
+from collections.abc import Iterable
+
+import torch
 from torch import nn
+from torch.utils._pytree import tree_leaves
 
 
 def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.Module, str]:
@@ -44,3 +48,29 @@ def copy_parameter_attributes(from_: nn.Parameter, to_: nn.Parameter) -> None:
     for name in _PARAMETER_ATTRIBUTES_TO_PRESERVE:
         if hasattr(from_, name):
             setattr(to_, name, getattr(from_, name))
+
+
+def count_used_parameters(output: object, parameters: Iterable[nn.Parameter]) -> int:
+    """Count unique owned leaves reachable from this forward's outputs."""
+    parameters = set(parameters)
+    pending = [
+        torch.autograd.graph.get_gradient_edge(tensor).node
+        for tensor in tree_leaves(output)
+        if isinstance(tensor, torch.Tensor) and tensor.requires_grad
+    ]
+    visited = set()
+    used_parameters = set()
+    while pending:
+        node = pending.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        # This node exposes checkpoint inputs, but hides internal parameter
+        # leaves. Fall back to the owned count only for such an opaque graph.
+        if node.name() == "CheckpointFunctionBackward":
+            return len(parameters)
+        parameter = getattr(node, "variable", None)
+        if parameter in parameters:
+            used_parameters.add(parameter)
+        pending.extend(parent for parent, _ in node.next_functions if parent is not None)
+    return len(used_parameters)
