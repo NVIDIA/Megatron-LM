@@ -607,7 +607,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ):
             assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
                 "Static KV memory pointers require UVM or torch_memory_saver when not persisted. "
-                "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+                "Use --inference-kv-cache-management-mode=persist, "
+                "UVM, or install torch_memory_saver."
             )
 
         # When not using `torch_memory_saver`, we manually offload/restore tensors.
