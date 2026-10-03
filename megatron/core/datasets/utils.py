@@ -12,17 +12,26 @@ logger = logging.getLogger(__name__)
 
 
 class Split(Enum):
+    """Identifiers for the training, validation, and test dataset splits."""
+
     train = 0
     valid = 1
     test = 2
 
 
 def compile_helpers():
-    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
+    """Load wheel helpers or compile from source; invoke this on a single process."""
+    import importlib
     import os
     import subprocess
 
-    command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]
+    directory = os.path.abspath(os.path.dirname(__file__))
+    if not os.path.isfile(os.path.join(directory, "Makefile")):
+        # Wheels contain the extension built by setup.py, without build sources.
+        # Import it to check availability/ABI; a missing or broken extension fails.
+        importlib.import_module(f"{__package__}.helpers_cpp")
+        return
+    command = ["make", "-C", directory]
     if subprocess.run(command).returncode != 0:
         import sys
 

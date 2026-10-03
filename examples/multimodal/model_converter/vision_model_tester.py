@@ -11,6 +11,13 @@ sys.path.append(
 )
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import torch
 from transformers import AutoModel
 
