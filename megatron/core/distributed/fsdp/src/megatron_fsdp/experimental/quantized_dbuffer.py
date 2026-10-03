@@ -291,9 +291,12 @@ class QuantizedDBuffer:
         return out
 
     def allgather(
-        self, mesh_axis: int, *, out: "QuantizedDBuffer | None" = None
+        self, mesh_axis: int | Iterable[int], *, out: "QuantizedDBuffer | None" = None
     ) -> "QuantizedDBuffer":
-        """All-gather every plane, returning ``out`` when supplied or a new wrapper."""
+        """Gather one or more axes in every plane, reusing ``out`` when supplied."""
+        # Materialize generators once so every plane gathers the same axes.
+        if not isinstance(mesh_axis, int):
+            mesh_axis = tuple(mesh_axis)
         if out is None:
             return self._from_planes(*(plane.allgather(mesh_axis) for plane in self.planes))
         for plane, out_plane in zip(self.planes, out.planes):
