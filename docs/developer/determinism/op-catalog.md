@@ -33,9 +33,9 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 
 | Operation | Where | Deterministic Path | Default Path |
 | --- | --- | --- | --- |
-| MoE token unpermute (combine) | `megatron/core/transformer/moe/moe_utils.py` | `index_add_` — deterministic under torch deterministic algorithms and CUDA-graph safe | `scatter_add_` (atomic accumulation) |
+| MoE token unpermute (combine) | `megatron/core/transformer/moe/moe_utils.py` | `scatter_add_` under torch deterministic algorithms on torch >= 2.9, using sort-based accumulation without materialising the expanded index; `index_add_` fallback on older torch | `scatter_add_` (atomic accumulation) |
 | MoE routing map and probabilities | `megatron/core/transformer/moe/moe_utils.py` | `index_put_(accumulate=False)` row-wise writes | out-of-place `scatter` |
-| Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | direct indexing `weight[idx]` (deterministic backward) | `F.embedding` (non-deterministic atomic backward) |
+| Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | `F.embedding` with deterministic backward under `torch.use_deterministic_algorithms(True)`; setting only `config.deterministic_mode` warns once | `F.embedding` (may use atomic backward depending on torch version and shape) |
 | Gated-delta-net kernel | `megatron/core/ssm/gated_delta_net.py` | torch `chunk_gated_delta_rule` | FLA fused kernel |
 | Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net/` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
 | Mamba/SSM Triton ops | `megatron/core/ssm/ops/common/determinism.py` | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
