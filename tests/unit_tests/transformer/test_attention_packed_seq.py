@@ -3,10 +3,12 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -483,3 +485,163 @@ class TestAttentionDynamicContextParallel:
 
         assert captured[0][0] is runtime_group
         assert captured[-1] == (None, None, None)
+
+
+def _contiguous_causal_reference(query, key, value):
+    """Use PyTorch's FP32 math backend as the full-sequence reference."""
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        output = torch.nn.functional.scaled_dot_product_attention(
+            query.float().transpose(0, 1),
+            key.float().transpose(0, 1),
+            value.float().transpose(0, 1),
+            is_causal=True,
+            enable_gqa=True,
+        )
+    return output.transpose(0, 1).flatten(1)
+
+
+@pytest.fixture
+def contiguous_cp_groups(cp_size, backend, layout, monkeypatch):
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.core.extensions.transformer_engine import _te_dpa_supports_no_load_balance
+
+    if not _te_dpa_supports_no_load_balance:
+        pytest.skip("requires TE NO_LOAD_BALANCE support")
+    if Utils.world_size < cp_size or Utils.world_size % cp_size:
+        pytest.skip(f"requires a world size divisible by CP{cp_size}")
+    if layout == "padded" and backend == "flash":
+        pytest.skip("TE no-load-balance FlashAttention requires unpadded sequences")
+    if backend == "fused" and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("FusedAttention THD requires SM90+")
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    Utils.initialize_model_parallel(context_parallel_size=cp_size)
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    monkeypatch.setattr(
+        te_dpa, "_attention_backends", {**te_dpa._attention_backends, "attention_params": None}
+    )
+    yield (
+        parallel_state.get_context_parallel_group(),
+        parallel_state.get_tensor_model_parallel_group(),
+    )
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("backend", ["flash", "fused"])
+@pytest.mark.parametrize("layout", ["dense1", "dense2", "packed", "padded"])
+def test_contiguous_cp_forward_backward(cp_size, backend, layout, contiguous_cp_groups):
+    """Compare contiguous CP outputs and Q/K/V gradients with full-sequence attention."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+    cp_group, tp_group = contiguous_cp_groups
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=64,
+        context_parallel_size=cp_size,
+        cp_comm_type="all_gather",
+        linear_cp_layout="contiguous",
+        attention_cp_layout="contiguous",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+    )
+    module = TEDotProductAttention(
+        config,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        cp_comm_type="all_gather",
+        pg_collection=ProcessGroupCollection(tp=tp_group, cp=cp_group),
+    ).cuda()
+    # External rebindings must retain the strategy selected by the config.
+    module.set_context_parallel_group(
+        cp_group,
+        torch.distributed.get_process_group_ranks(cp_group),
+        module.cp_stream,
+        "all_gather",
+    )
+    assert module.load_balancing_strategy is te.CPLoadBalancingStrategy.NO_LOAD_BALANCE
+
+    length = 1024
+    batch = 2 if layout == "dense2" else 1
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    global_inputs = [
+        torch.randn(
+            length, batch, heads, 64, device="cuda", dtype=torch.bfloat16, generator=generator
+        ).requires_grad_()
+        for heads in (4, 1, 1)
+    ]
+    params = None
+    if layout.startswith("dense"):
+        reference = torch.stack(
+            [
+                _contiguous_causal_reference(*(x[:, sample] for x in global_inputs))
+                for sample in range(batch)
+            ],
+            dim=1,
+        )
+    else:
+        physical = [0, 197, 621, length]
+        lengths = [193, 415, 399] if layout == "padded" else [197, 424, 403]
+        pieces = []
+        for start, end, valid in zip(physical[:-1], physical[1:], lengths):
+            result = _contiguous_causal_reference(
+                *(x[start : start + valid, 0] for x in global_inputs)
+            )
+            pieces.extend((result, result.new_zeros(end - start - valid, 256)))
+        reference = torch.cat(pieces).unsqueeze(1)
+        cu = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+        )
+        padded = (
+            torch.tensor(physical, device="cuda", dtype=torch.int32) if layout == "padded" else cu
+        )
+        params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=padded,
+            cu_seqlens_kv_padded=padded,
+            max_seqlen_q=max(lengths),
+            max_seqlen_kv=max(lengths),
+            pad_between_seqs=layout == "padded",
+            cp_group=cp_group,
+            local_cp_size=cp_size,
+        )
+
+    dout = torch.randn(reference.shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    reference.backward(dout.float())
+    rank = cp_group.rank()
+    expected_output = reference.detach().chunk(cp_size)[rank]
+    expected_grads = [x.grad.chunk(cp_size)[rank] for x in global_inputs]
+    local = [x.detach().chunk(cp_size)[rank].clone().requires_grad_() for x in global_inputs]
+    output = module(
+        *(x.squeeze(1) if params is not None else x for x in local),
+        None,
+        AttnMaskType.causal,
+        packed_seq_params=params,
+    )
+    assert te_dpa._attention_backends[f"use_{backend}_attention"]
+    if params is not None:
+        output = output.unsqueeze(1)
+    output.backward(dout.chunk(cp_size)[rank].contiguous())
+    assert module.cp_group is cp_group
+    assert module.load_balancing_strategy is te.CPLoadBalancingStrategy.NO_LOAD_BALANCE
+    observed = [output.detach(), *(x.grad for x in local)]
+    for actual, expected in zip(observed, [expected_output, *expected_grads]):
+        torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
