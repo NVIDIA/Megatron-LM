@@ -190,8 +190,8 @@ def test_attn_logit_softcapping_rejects_invalid_values(softcap):
         pytest.param(
             {"num_moe_experts": 2, "moe_shortcut_connection": True, "cuda_graph_impl": "local"},
             AssertionError,
-            "CUDA graphs are not supported",
-            id="cuda-graphs",
+            "supports CUDA graphs only",
+            id="cuda-graphs-layer-scope",
         ),
     ],
 )
@@ -205,6 +205,22 @@ def test_shortcut_rejects_incompatible_configurations(overrides, error, message)
             moe_router_pre_softmax=True,
             **overrides,
         )
+
+
+def test_shortcut_accepts_local_block_cuda_graphs():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        cuda_graph_impl="local",
+        inference_cuda_graph_scope="block",
+    )
+    assert config.cuda_graph_impl == "local"
+    assert config.inference_cuda_graph_scope.name == "block"
 
 
 def _make_shortcut_memory_config(**overrides):

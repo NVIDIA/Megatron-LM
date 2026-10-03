@@ -718,8 +718,12 @@ class TestWideResidualStaticConstruction:
         ids=("local", "transformer_engine", "full_iteration", "legacy_local", "legacy_te"),
     )
     def test_wide_residual_rejects_cuda_graphs(self, config_overrides):
-        with pytest.raises(NotImplementedError, match="does not yet support CUDA graphs"):
+        with pytest.raises(NotImplementedError, match="supports CUDA graphs only"):
             _wide_config(**config_overrides)
+
+    def test_wide_residual_accepts_local_block_cuda_graphs(self):
+        config = _wide_config(cuda_graph_impl="local", inference_cuda_graph_scope="block")
+        assert config.inference_cuda_graph_scope.name == "block"
 
 
 class TestWideResidualLayerIntegration:
