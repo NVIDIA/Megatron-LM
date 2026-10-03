@@ -31,6 +31,19 @@ This documentation covers **Megatron-specific** usage: CLI flags, environment va
 
 For general concepts — span groups, instrumentation primitives, configuration model, custom exporters, resource detection — see the [lens documentation](https://github.com/NVIDIA-NeMo/Lens). This section links to lens docs when relevant rather than duplicating content.
 
+## Installation
+
+The `dev` extra installs the lightweight Lens API used by instrumentation sites.
+To create providers and export telemetry, also install the `otel` extra, which
+includes the Lens SDK dependencies. In a source-checkout development container:
+
+```bash
+uv sync --locked --extra dev --extra otel --all-groups
+```
+
+For an installed package, use `megatron-core[otel]` alongside the extras needed
+for the workload.
+
 ## Quick start
 
 ```bash
@@ -63,7 +76,7 @@ Each span is tagged with a **span group** that controls whether it's emitted at 
 - **Metrics**: Prometheus via the OTel Collector, or direct OTLP to Grafana Mimir / Datadog / etc.
 - **Logs** (optional): via the OTel log bridge when `MEGATRON_OTEL_LOGS_ENABLED=1` — correlates `logging` records with the active span's trace ID.
 
-By default, only **one rank** exports (the last rank). For multi-rank telemetry, see [Configuration — Rank strategy](configuration.md#rank-strategy).
+By default, only **one rank** exports (the last rank). For multi-rank telemetry, see [Configuration — Export strategy](configuration.md#export-strategy).
 
 ## Related
 
