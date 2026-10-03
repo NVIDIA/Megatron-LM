@@ -8,23 +8,19 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 from torch import nn
 from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    checkpoint,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
     load_checkpoint,
     save_checkpoint,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
-    attach_uneven_dtensor_metadata,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
@@ -108,9 +104,14 @@ def test_post_wrap_assign_true_load_raises(distributed_setup):
 
 
 def _build_sharded(
-    mesh: DeviceMesh, device: torch.device, *, param_dtype: torch.dtype, zero_init: bool
+    model: nn.Module,
+    mesh: DeviceMesh,
+    device: torch.device,
+    *,
+    param_dtype: torch.dtype,
+    zero_init: bool,
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
-    model = _TinyModel().to(device=device, dtype=param_dtype)
+    model = model.to(device=device, dtype=param_dtype)
     if zero_init:
         # Zero the destination weights so they are obviously different from the saved (trained)
         # source; a correct load must overwrite them.
@@ -127,10 +128,10 @@ def _build_sharded(
 
 
 def _build_packed_sharded(
-    mesh: DeviceMesh, device: torch.device
+    model: nn.Module, mesh: DeviceMesh, device: torch.device
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
     """Shard a :class:`_PackedModel`, whose packing no canonical ``Shard(0)`` split describes."""
-    model = _PackedModel().to(device=device)
+    model = model.to(device=device)
     with fully_shard_context(device=device):
         fully_shard(model.block, mesh=mesh, placements=_default_placements())
         fully_shard(model.linear, mesh=mesh, placements=_default_placements())
@@ -176,17 +177,10 @@ def _train_one_step(
     optimizer.step()
 
 
-def _save_through_stable_path(
-    model: nn.Module, optimizer: torch.optim.Optimizer, checkpoint_dir: Path
-) -> None:
-    """Save the same state through Megatron-FSDP's stable, gather-based uneven-DTensor helper."""
-    model_state_dict = get_model_state_dict(model)
-    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
+def _attach_stable_metadata(model, model_state_dict, optimizer_state_dict) -> None:
+    """Use the gather-based metadata builder as a reference for the native save path."""
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
     preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
-    dcp.save(
-        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
-    )
 
 
 def _saved_chunks(checkpoint_dir: Path) -> dict[str, list[tuple[tuple[int, ...], ...]]]:
@@ -206,31 +200,16 @@ def _even_shard_rows(rows: int, world_size: int) -> list[int]:
 
 
 def _assert_tensors_identical(expected: torch.Tensor, actual: torch.Tensor, what: str) -> None:
-    """Assert two tensors are bit-identical, checking DTensor global metadata when applicable.
-
-    A checkpoint roundtrip must reproduce the values exactly, so tolerances are zero. For DTensors
-    it must also reproduce the *global* view: an entry whose global shape or placement changed would
-    be silently wrong even if this rank's local shard happens to match.
-    """
-    assert type(expected) is type(actual), f"{what}: {type(expected)} became {type(actual)}"
-    if isinstance(expected, DTensor):
-        assert (
-            expected.shape == actual.shape
-        ), f"{what}: global shape {expected.shape} != {actual.shape}"
-        assert expected.placements == actual.placements, f"{what}: placements changed"
-        assert expected.device_mesh == actual.device_mesh, f"{what}: device mesh changed"
-        expected, actual = expected.to_local(), actual.to_local()
+    """Assert a checkpoint restores local tensor values, shapes, and dtypes exactly."""
+    assert not isinstance(expected, DTensor), f"{what}: snapshot should be local"
+    assert not isinstance(actual, DTensor), f"{what}: checkpoint wrapper leaked into runtime state"
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{what}: value mismatch")
 
 
 def _snapshot_state(
     model: nn.Module, optimizer: torch.optim.Optimizer
 ) -> tuple[dict[str, torch.Tensor], dict[int, dict]]:
-    """Clone the model weights and optimizer state, keyed as their state dicts are.
-
-    DTensor entries are cloned as DTensors so the comparison can check the global shape and
-    placements, not just this rank's local shard.
-    """
+    """Clone local model weights and optimizer state for comparison after saving or loading."""
     model_snapshot = {key: value.clone() for key, value in model.state_dict().items()}
     optimizer_snapshot: dict[int, dict] = {}
     for index, state in optimizer.state_dict()["state"].items():
@@ -257,9 +236,8 @@ def _assert_model_matches_snapshot(
     # cross-rank "at least one rank compared something" check.
     local_nonempty = False
     for key, expected in model_snapshot.items():
-        assert isinstance(current[key], DTensor), f"{key} should rest as a DTensor"
         _assert_tensors_identical(expected, current[key], f"model[{key}]")
-        local_nonempty = local_nonempty or expected.to_local().numel() > 0
+        local_nonempty = local_nonempty or expected.numel() > 0
     return local_nonempty
 
 
@@ -270,6 +248,7 @@ def _assert_optimizer_matches_snapshot(
     current = optimizer.state_dict()["state"]
     assert optimizer_snapshot.keys() == current.keys()
     for index, expected_state in optimizer_snapshot.items():
+        assert expected_state.keys() == current[index].keys()
         for key, expected in expected_state.items():
             actual = current[index][key]
             if torch.is_tensor(expected):
@@ -278,7 +257,14 @@ def _assert_optimizer_matches_snapshot(
                 assert expected == actual, f"optim[{index}][{key}] scalar mismatch"
 
 
-def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Module) -> None:
+def _global_shapes(model: nn.Module) -> dict[str, torch.Size]:
+    """Capture expected checkpoint shapes before sharding the model."""
+    return {key: value.shape for key, value in model.state_dict().items()}
+
+
+def _assert_checkpoint_records_global_shapes(
+    checkpoint_dir: Path, expected_shapes: dict[str, torch.Size]
+) -> None:
     """Assert the saved checkpoint describes every parameter by its full global shape.
 
     A checkpoint of a sharded model must describe the assembled tensor, not this rank's fragment,
@@ -292,9 +278,9 @@ def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Mod
     what actually guards it.
     """
     metadata = FileSystemReader(checkpoint_dir).read_metadata()
-    for key, value in model.state_dict().items():
+    for key, shape in expected_shapes.items():
         entry = metadata.state_dict_metadata[f"model.{key}"]
-        assert tuple(entry.size) == tuple(value.shape), f"model.{key}: saved {entry.size}"
+        assert tuple(entry.size) == tuple(shape), f"model.{key}: saved {entry.size}"
 
 
 @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
@@ -314,16 +300,22 @@ def test_checkpoint_roundtrip_default_placements(
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
     # Source: train one step so weights and optimizer state are non-trivial, then save.
-    model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=False)
+    model = _TinyModel()
+    expected_shapes = _global_shapes(model)
+    model, optimizer = _build_sharded(model, mesh, device, param_dtype=param_dtype, zero_init=False)
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
     model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
 
     with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{param_dtype}", sync=True) as checkpoint_dir:
         save_checkpoint(model, optimizer, checkpoint_dir)
-        _assert_checkpoint_records_global_shapes(checkpoint_dir, model)
+        _assert_checkpoint_records_global_shapes(checkpoint_dir, expected_shapes)
+        _assert_model_matches_snapshot(model, model_snapshot)
+        _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
 
         # Destination: zero-initialized, so a correct load is non-trivial.
-        model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=True)
+        model, optimizer = _build_sharded(
+            _TinyModel(), mesh, device, param_dtype=param_dtype, zero_init=True
+        )
         load_checkpoint(model, optimizer, checkpoint_dir)
 
     local_nonempty = _assert_model_matches_snapshot(model, model_snapshot)
@@ -335,7 +327,9 @@ def test_checkpoint_roundtrip_default_placements(
     assert any(nonempty_flags), "All ranks had empty local shards."
 
 
-def test_saved_chunks_match_the_stable_path(distributed_setup, tmp_path_dist_ckpt: Path) -> None:
+def test_saved_chunks_match_the_stable_path(
+    distributed_setup, tmp_path_dist_ckpt: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The checkpoint describes the same chunks Megatron-FSDP's stable helper would describe.
 
     The stable helper recovers each shard's offset with one ``all_gather_object`` per DTensor.
@@ -347,7 +341,9 @@ def test_saved_chunks_match_the_stable_path(distributed_setup, tmp_path_dist_ckp
     world_size = distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
 
-    model, optimizer = _build_packed_sharded(mesh, device)
+    model = _PackedModel()
+    expected_shapes = _global_shapes(model)
+    model, optimizer = _build_packed_sharded(model, mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -356,7 +352,9 @@ def test_saved_chunks_match_the_stable_path(distributed_setup, tmp_path_dist_ckp
         save_checkpoint(model, optimizer, analytic_dir)
         analytic_chunks = _saved_chunks(analytic_dir)
     with TempNamedDir(tmp_path_dist_ckpt / "stable", sync=True) as stable_dir:
-        _save_through_stable_path(model, optimizer, stable_dir)
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoint, "attach_uneven_dtensor_metadata", _attach_stable_metadata)
+            save_checkpoint(model, optimizer, stable_dir)
         stable_chunks = _saved_chunks(stable_dir)
 
     assert analytic_chunks.keys() == stable_chunks.keys()
@@ -368,12 +366,10 @@ def test_saved_chunks_match_the_stable_path(distributed_setup, tmp_path_dist_ckp
     # On a single rank nothing can be misplaced: the one shard is the whole tensor.
     if world_size > 1:
         uneven = False
-        for key, parameter in model.state_dict().items():
+        for key, shape in expected_shapes.items():
             saved_rows = sorted(sizes[0] for _, sizes in analytic_chunks[f"model.{key}"])
             # An empty shard writes nothing, so it has no chunk on either side to compare.
-            even_rows = sorted(
-                rows for rows in _even_shard_rows(parameter.shape[0], world_size) if rows > 0
-            )
+            even_rows = sorted(rows for rows in _even_shard_rows(shape[0], world_size) if rows > 0)
             uneven = uneven or saved_rows != even_rows
         assert uneven, "No parameter sharded unevenly, so the metadata was not exercised."
 
@@ -387,7 +383,9 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer = _build_packed_sharded(mesh, device)
+    model = _PackedModel()
+    expected_shapes = _global_shapes(model)
+    model, optimizer = _build_packed_sharded(model, mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -396,16 +394,16 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
         save_checkpoint(model, optimizer, checkpoint_dir)
         saved_chunks = _saved_chunks(checkpoint_dir)
 
-    for key, parameter in model.state_dict().items():
+    for key, shape in expected_shapes.items():
         chunks = saved_chunks[f"model.{key}"]
         covered = 0
         for offsets, sizes in chunks:
             if sizes[0] == 0:
                 continue
             assert offsets[0] == covered, f"{key} chunks are not contiguous: {chunks}"
-            assert tuple(sizes[1:]) == tuple(parameter.shape[1:]), f"{key} chunk shape"
+            assert tuple(sizes[1:]) == tuple(shape[1:]), f"{key} chunk shape"
             covered += sizes[0]
-        assert covered == parameter.shape[0], f"{key} chunks do not cover the global tensor"
+        assert covered == shape[0], f"{key} chunks do not cover the global tensor"
 
 
 def test_checkpoint_roundtrip_tied_parameter(distributed_setup, tmp_path_dist_ckpt: Path) -> None:
@@ -448,12 +446,12 @@ def test_metadata_attach_issues_no_collectives(
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer = _build_packed_sharded(mesh, device)
+    model = _PackedModel()
+    expected_shapes = _global_shapes(model)
+    model, optimizer = _build_packed_sharded(model, mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
-    model_state_dict = get_model_state_dict(model)
-    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
 
     def _fail(*args, **kwargs):
         raise AssertionError("Attaching chunk metadata must not issue a collective.")
@@ -462,6 +460,6 @@ def test_metadata_attach_issues_no_collectives(
     # shard's offset with one all_gather_object per DTensor; this path derives it from the layout.
     for name in ("all_gather", "all_gather_object", "all_gather_into_tensor", "all_reduce"):
         monkeypatch.setattr(dist, name, _fail)
-    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
+    state = checkpoint._CheckpointState(model, optimizer).state_dict()
 
-    assert model_state_dict.keys() == dict(model.named_parameters()).keys()
+    assert state["model"].keys() == expected_shapes.keys()
