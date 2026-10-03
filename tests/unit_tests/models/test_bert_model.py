@@ -358,9 +358,10 @@ class TestBertModel:
             max_sequence_length=4,
             return_embeddings=True,
         )
-        # The packed buffer holds eight tokens while the last padded sequence ends at seven,
-        # so a trailing padding region has to be handled without rejecting the input.
-        input_ids = torch.arange(8, dtype=torch.int64).unsqueeze(0)
+        # The packed buffer holds fourteen tokens while the last padded sequence ends at seven.
+        # The trailing padding region is longer than max_sequence_length, so its positions have
+        # to be clamped to stay inside the learned position embedding table.
+        input_ids = torch.arange(14, dtype=torch.int64).unsqueeze(0)
         cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
         cu_seqlens_padded = torch.tensor([0, 4, 7], dtype=torch.int32)
         packed_seq_params = PackedSeqParams(
@@ -373,7 +374,7 @@ class TestBertModel:
             max_seqlen_kv=4,
         )
         hidden_states = (
-            torch.arange(8, dtype=torch.float32).view(8, 1, 1).expand(-1, 1, config.hidden_size)
+            torch.arange(14, dtype=torch.float32).view(14, 1, 1).expand(-1, 1, config.hidden_size)
         )
 
         embedding_forward = mocker.patch.object(
@@ -390,7 +391,7 @@ class TestBertModel:
 
         assert torch.equal(
             embedding_forward.call_args.kwargs['position_ids'],
-            torch.tensor([[0, 1, 2, 3, 0, 1, 2, 0]], dtype=torch.int64),
+            torch.tensor([[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 3, 3, 3]], dtype=torch.int64),
         )
         assert torch.equal(pooler_forward.call_args.args[1], torch.tensor([0, 4], dtype=torch.long))
         expected = torch.tensor([[1.0], [5.0]]).expand(-1, config.hidden_size)

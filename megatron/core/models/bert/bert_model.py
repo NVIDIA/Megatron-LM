@@ -287,7 +287,12 @@ class BertModel(LanguageModule):
                 physical_cu_seqlens, segment_lengths, output_size=total_tokens
             )
             token_positions = torch.arange(total_tokens, dtype=torch.long, device=token_ids.device)
-            return (token_positions - seq_starts).unsqueeze(0)
+            position_ids = token_positions - seq_starts
+            # Trailing buffer padding (and alignment padding) can extend past a segment's real
+            # length; those tokens are masked out, but their positions must stay inside the
+            # learned position embedding table.
+            position_ids = position_ids.clamp(max=self.max_sequence_length - 1)
+            return position_ids.unsqueeze(0)
 
         # Create position ids
         seq_length = token_ids.size(1)
