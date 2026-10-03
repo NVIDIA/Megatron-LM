@@ -1269,7 +1269,11 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
 
         if verbose:
             logger.info(_redact_token_id_lists_for_logging(result))
-        if not payload_offloaded and result.get("generated_log_probs") is None:
+        if (
+            sampling_params.return_log_probs
+            and not payload_offloaded
+            and result.get("generated_log_probs") is None
+        ):
             logger.warning(
                 "Generation log probs is None for request:\n%s",
                 json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
