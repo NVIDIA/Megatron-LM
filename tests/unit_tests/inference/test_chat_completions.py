@@ -1949,20 +1949,24 @@ async def test_chat_response_format(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reply_fields", "warns"),
+    ("logprobs", "reply_fields", "warns"),
     [
-        ({}, True),
-        ({"generated_log_probs": [-0.5, -0.25]}, False),
-        ({"payload_offloaded": True}, False),
+        (True, {}, True),
+        (False, {}, False),
+        (True, {"generated_log_probs": [-0.5, -0.25]}, False),
+        (True, {"payload_offloaded": True}, False),
     ],
-    ids=["missing", "present", "offloaded"],
+    ids=["missing", "not-requested", "present", "offloaded"],
 )
-async def test_chat_warns_when_generation_log_probs_are_missing(reply_fields, warns, caplog):
+async def test_chat_warns_when_generation_log_probs_are_missing(
+    logprobs, reply_fields, warns, caplog
+):
     client = ReplyingClient([completed_reply("chat-0", [10, 2], [30, 31], **reply_fields)])
     app = build_app(CHAT_PATH, client)
+    body = {**CHAT_BODY, "logprobs": logprobs}
 
     with caplog.at_level(logging.WARNING):
-        response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+        response = await app.test_client().post(CHAT_PATH, json=body)
 
     assert response.status_code == 200, await response.get_data(as_text=True)
     assert ("Generation log probs is None" in caplog.text) is warns
