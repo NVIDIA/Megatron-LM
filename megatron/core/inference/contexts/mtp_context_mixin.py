@@ -486,7 +486,19 @@ class MTPContextMixin:
 
         # Read the bound back off `seq_lengths` rather than off `append_counts`: either branch
         # above may have introduced a run longer than any single `append_counts` entry.
-        max_seqlen = int(seq_lengths.max().item()) if p > 0 else 1
+        #
+        # Never advertise max_seqlen_q == 1. FlashAttention-2 reads that as "one query token
+        # per sequence" and, under GQA, takes its `seqlenq_ngroups_swapped` path, reshaping q
+        # to [num_seqs, num_heads_k, ngroups, head_size]. That assumes total_q == num_seqs,
+        # which this pass violates: a request contributing zero rows (a decode request that
+        # accepted no drafts, or a prefill chunk of length 1) still occupies a cu_seqlens
+        # entry, so total_q < num_seqs and the reshape raises. Worst at num_query_groups == 1,
+        # where ngroups is maximal. `forward_mode = COMMIT` below keeps Megatron's own router
+        # on the varlen path, but it cannot reach inside the kernel -- FA2 re-derives
+        # decode-ness from this bound alone. max_seqlen_q is only an upper bound for kernel
+        # sizing, so raising it is safe; it declines an optimization in a pass whose hidden
+        # output is discarded.
+        max_seqlen = max(2, int(seq_lengths.max().item())) if p > 0 else 2
         self._mtp_activate_attn_metadata(
             graphed=False,
             padded_request_count=padded_p,
