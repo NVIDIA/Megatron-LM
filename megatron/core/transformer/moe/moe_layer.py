@@ -513,12 +513,18 @@ class MoELayer(BaseMoELayer):
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
-        dispatcher.
+        dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
+        passed through untouched and the dispatcher decides whether its backend excludes padded
+        rows.
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -548,9 +554,15 @@ class MoELayer(BaseMoELayer):
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
+        if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
+            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs, padding_mask=padding_mask
+            )
+        else:
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs
+            )
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -711,7 +723,9 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    hidden_states, probs = self.preprocess(
+                        hidden_states, probs, routing_map, padding_mask
+                    )
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
