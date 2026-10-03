@@ -504,6 +504,24 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+        # Shared-layer MTP (mtp_use_repeated_layer=True) reuses the same FSDP block:
+        #   h1 = block(fuse(h0, shifted_embeddings_1))
+        #   h2 = block(fuse(h1, shifted_embeddings_2))
+        #   (loss1(h1) + loss2(h2)).backward()
+        # In ordinary autograd, backward enters depth 2 then depth 1, invoking this
+        # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
+        # hook fires once after both uses contribute, so our post_backward() has not
+        # reset BACKWARD when depth 1 enters.
+        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
+        # In shared MTP, post_backward would run twice (once per depth), resetting
+        # the phase after each invocation. Depth 1 could then enter from RESTING
+        # and gather its weights normally, without this guard. grads_ready would
+        # run once, after both depths' local gradient contributions have accumulated,
+        # and perform the reduction.
+        # This likely requires addressing static prefetch order for repeated invocations first:
+        # https://github.com/NVIDIA/Megatron-LM/issues/7764
+        if self.phase is FsdpModule.Phase.BACKWARD:
+            return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
