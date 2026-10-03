@@ -671,6 +671,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "flashinfer on Blackwell and are not replayed in CI.",
     ),
     KernelEntry(
+        name="inference_torch_sampling",
+        sources=("megatron/core/inference/sampling/torch_sampling.py",),
+        tests=(K + "test_torch_sampling_support.py",),
+        kind="dispatch",
+        training_path=False,
+        notes="Top-p tail-cutoff parity and exact replay on tied logits.",
+    ),
+    KernelEntry(
         name="inference_flashinfer_sampling",
         sources=("megatron/core/inference/sampling/flashinfer_sampling.py",),
         kind="dispatch",
