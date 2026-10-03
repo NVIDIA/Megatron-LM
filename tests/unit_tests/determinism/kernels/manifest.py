@@ -766,6 +766,28 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
     ),
+    # ---------------------------------------------------------------- DSA min-memory backends
+    KernelEntry(
+        name="dsa_min_memory_triton",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_min_memory_triton.py",
+        ),
+        tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
+        kind="triton",
+        notes="Streaming top-k routing, selected-score forward/backward, scatter of the selected "
+        "gradient and the normalized weight gradient. The tests assert torch.equal against the "
+        "torch reference on the rows top-k orders stably.",
+    ),
+    KernelEntry(
+        name="dsa_min_memory_torch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_min_memory.py",),
+        tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
+        kind="torch-op",
+        notes="index_add_ accumulates the key, value and indexer-K gradients where top-k selects "
+        "one key more than once, so the sum order follows kernel scheduling. The accumulation runs "
+        "in FP32 regardless of the parameter dtype, which "
+        "test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32 pins.",
+    ),
 )
 
 
