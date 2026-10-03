@@ -490,3 +490,44 @@ def test_empty_reasoning_explicit_fallback_clears_reasoning_marker(text, kwargs)
 @pytest.mark.parametrize("parser", [DeepSeekR1ReasoningParser, NemotronV3ReasoningParser])
 def test_empty_reasoning_before_final_content_preserves_parser_result(parser):
     assert parser.parse("<think></think>answer") == ("answer", {"reasoning": ""})
+
+
+@pytest.mark.parametrize("name", ["t", " t", "t ", " t ", "\n\tt\t\n"])
+def test_qwen3_coder_normalizes_function_name_before_schema_lookup(name):
+    text = (
+        f"<tool_call><function={name}><parameter=i>7</parameter>"
+        "<parameter=b>false</parameter></function></tool_call>"
+    )
+    _, metadata = Qwen3CoderToolParser.parse(text, tools=COERCION_TOOLS)
+    call = metadata["tool_calls"][0]["function"]
+    assert call["name"] == "t"
+    assert json.loads(call["arguments"]) == {"i": 7, "b": False}
+
+
+@pytest.mark.parametrize("name", ["", " ", "\n\t"])
+def test_qwen3_coder_does_not_emit_empty_function_name(name):
+    text = f"<tool_call><function={name}></function></tool_call>"
+    content, metadata = Qwen3CoderToolParser.parse(text, tools=COERCION_TOOLS)
+    assert metadata == {}
+    assert content == text
+
+
+@pytest.mark.parametrize("name", [" t", "t ", "\n\tt\t\n"])
+@pytest.mark.parametrize("finished", [False, True])
+def test_qwen3_coder_truncated_whitespace_name_waits_until_finished(name, finished):
+    _, metadata = Qwen3CoderToolParser.parse(
+        f"<tool_call><function={name}", tools=COERCION_TOOLS, finished=finished
+    )
+    if finished:
+        call = metadata["tool_calls"][0]["function"]
+        assert call == {"name": "t", "arguments": "{}"}
+    else:
+        assert metadata == {}
+
+
+def test_qwen3_coder_preserves_unknown_nonempty_function_name():
+    _, metadata = Qwen3CoderToolParser.parse(
+        "<tool_call><function=unknown><parameter=i>7</parameter></function></tool_call>",
+        tools=COERCION_TOOLS,
+    )
+    assert metadata["tool_calls"][0]["function"] == {"name": "unknown", "arguments": '{"i": "7"}'}

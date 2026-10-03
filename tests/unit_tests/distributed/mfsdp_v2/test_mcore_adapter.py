@@ -627,6 +627,12 @@ class TestMcoreAdapterCudaGraph:
                 assert state["exp_avg_sq"].dtype == torch.bfloat16
         torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
 
+        # The optimizer holds the wrapper as its step attribute. The wrapper saves
+        # the original step method, which keeps a reference to the optimizer it
+        # operates on. Remove the wrapper to break this cycle so the optimizer's
+        # GPU memory can be released when the test returns.
+        del graph_optimizer.step
+
 
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
