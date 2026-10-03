@@ -159,7 +159,9 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
 
         # For padded sequences, ensure the embedding layer can map the token ID
         vocab_size = getattr(self.config.tokenizer, "vocab_size", None)
-        if is_out_of_vocab_token_id(self._pad_token_id, vocab_size):
+        if self._pad_token_id is not None and is_out_of_vocab_token_id(
+            self._pad_token_id, vocab_size
+        ):
             tokens[tokens == self._pad_token_id] = 0
             labels[labels == self._pad_token_id] = 0
 

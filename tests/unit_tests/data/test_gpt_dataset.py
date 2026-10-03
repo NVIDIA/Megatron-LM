@@ -192,6 +192,8 @@ def test_inter_document_masking():
 
 
 def test_is_out_of_vocab_token_id():
+    assert is_out_of_vocab_token_id(None) is False
+    assert is_out_of_vocab_token_id(None, vocab_size=8192) is False
     assert is_out_of_vocab_token_id(-1) is True
     assert is_out_of_vocab_token_id(-1, vocab_size=8192) is True
     assert is_out_of_vocab_token_id(0) is False
@@ -262,6 +264,60 @@ def test_pad_token_id_preservation():
         # for the sentinel), and the loss mask must be zeroed there in all cases.
         assert torch.all(sample["labels"][argmax + 1 :] == expected_pad_value)
         assert torch.all(sample["loss_mask"][argmax + 1 :] == 0.0)
+
+
+class _TokenizerWithMissingPad:
+    """Proxy that reports no pad token while forwarding every other attribute."""
+
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def __getattr__(self, name):
+        return getattr(self._tokenizer, name)
+
+    @property
+    def pad(self):
+        return None
+
+
+def test_missing_pad_token_falls_back_to_sentinel():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = _TokenizerWithMissingPad(
+        MegatronTokenizer.from_pretrained(
+            metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+        )
+    )
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,10,0",
+        reset_position_ids=True,
+        reset_attention_mask=True,
+        eod_mask_loss=True,
+        drop_last_partial_validation_sequence=False,
+        add_extra_token_to_sequence=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    datasets = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [0, None, 0], lambda: True, config
+    ).build()
+
+    dataset = datasets[1]
+    assert dataset._pad_token_id == -1
+
+    sample = dataset[0]
+    assert torch.all(sample["tokens"] >= 0)
+    assert torch.all(sample["labels"] >= 0)
 
 
 if __name__ == "__main__":
