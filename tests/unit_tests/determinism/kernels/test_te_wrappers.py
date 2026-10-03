@@ -30,7 +30,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
@@ -454,8 +454,11 @@ class TestTEWrappers:
         )
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
-    def test_te_dot_product_attention_replays(self, backend, monkeypatch):
+    @pytest.mark.parametrize("log_max_attention_logit", [False, True])
+    def test_te_dot_product_attention_replays(self, backend, log_max_attention_logit, monkeypatch):
         """GQA causal attention; TE must pick a deterministic backward (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)."""
+        if log_max_attention_logit and (backend == "flash" or not is_te_min_version("2.9.0")):
+            pytest.skip("Maximum attention logits require fused attention with TE 2.9.0 or later")
         seeded()
         # conftest forces both TE attention backends off per test; pick one explicitly.
         clear_nvte_env_vars()
@@ -481,7 +484,7 @@ class TestTEWrappers:
                 "backend_selection_requires_update": False,
             },
         )
-        config = _config()
+        config = _config(log_max_attention_logit=log_max_attention_logit)
         module = TEDotProductAttention(
             config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
         ).cuda()
@@ -502,10 +505,14 @@ class TestTEWrappers:
             for packed_seq_params in (None, runtime_cp1, None):
 
                 def fn(q, k, v):
+                    if log_max_attention_logit:
+                        module.current_max_attn_logits.fill_(float("-inf"))
                     output = module(
                         q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params
                     )
                     assert module.cp_group is None
+                    if log_max_attention_logit:
+                        return output, module.current_max_attn_logits.clone()
                     return output
 
                 result = assert_replays_bit_exact(
