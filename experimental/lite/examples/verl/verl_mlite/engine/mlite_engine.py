@@ -136,7 +136,7 @@ class _MegatronLiteLRScheduler:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
             if param_group.get("weight_decay", None) is not None:
-                param_group["weight_decay"] = wd
+                param_group["weight_decay"] = wd * param_group.get("wd_mult", 1.0)
 
     def _get_lr(self) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
