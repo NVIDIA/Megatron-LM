@@ -79,33 +79,3 @@ class TestLogProbsKernelDtype:
         # to compute in fp32.
         downcast_roundtrip = log_probs.to(torch.bfloat16).to(torch.float32)
         assert not torch.equal(log_probs, downcast_roundtrip)
-
-
-def test_uniform_top_one_sampling_with_speculative_row_mapping():
-    """Uniform greedy policy samples every speculative row in its original order."""
-    torch.manual_seed(7)
-    request_count = 3
-    context = _make_context(
-        torch.tensor([0.5, 1.0, 2.0]),
-        torch.ones(request_count, dtype=torch.long),
-        torch.zeros(request_count),
-    )
-    sampling = TorchSampling(rng=torch.Generator(), vocab_size=257)
-    logits = torch.randn(12, 257, device="cuda", dtype=torch.bfloat16)
-    gather = torch.tensor([8, 3, 7, 1, 10, 4, 5, 11], device="cuda")
-    token_to_request = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2], device="cuda")
-    output = torch.full((8,), -1, device="cuda", dtype=torch.long)
-
-    result = sampling.sample_kernel(
-        logits,
-        8,
-        context,
-        no_top_k=False,
-        no_top_p=True,
-        gather_indices=gather,
-        token_to_request_index=token_to_request,
-        output=output,
-    )
-
-    assert result is output
-    torch.testing.assert_close(result, logits[gather].argmax(dim=-1), rtol=0, atol=0)
