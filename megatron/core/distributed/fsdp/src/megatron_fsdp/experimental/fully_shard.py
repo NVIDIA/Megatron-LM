@@ -78,6 +78,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    parameter_to_owner: dict[nn.Parameter, int] | None = None,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -92,6 +93,11 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        parameter_to_owner: Construction-time owner assignments for TensorAtomic
+            parameters, keyed by the original parameters before sharding. Owners are
+            ranks in each parameter group's 1-D data-parallel mesh and must agree across
+            that mesh. Every TensorAtomic parameter needs an entry; other entries are
+            ignored. Tensors are packed by owner without changing logical parameter order.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -104,6 +110,7 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        parameter_to_owner=parameter_to_owner,
     )
     token = _FSDP_CONTEXT.set(context)
     try:

@@ -433,6 +433,8 @@ def test_mamba_state_shapes_are_selected_by_layer_config_type():
             SimpleNamespace(mamba_state_shapes_per_request=lambda: mamba_shapes),
         ],
     )
+    # No shortcut pairs, so the physical layers are the registered layers.
+    block.physical_layers = lambda: tuple(block.layers)
 
     assert HybridStack.mamba_state_shapes_per_request(block) == mamba_shapes
 
@@ -1152,7 +1154,7 @@ class TestHybridBlock:
         assert shortcut.overlap_mode is parallel
         assert isinstance(shortcut.moe_layer, TransformerLayer)
         state_keys = set(block.state_dict())
-        assert any(key.startswith("layers.0.attn_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
         assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
         assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
         assert "layers.0.shortcut_post_norm.weight" in state_keys
@@ -1168,7 +1170,7 @@ class TestHybridBlock:
             attention_mask = torch.triu(
                 torch.ones(1, 1, 16, 16, dtype=torch.bool, device=hidden_states.device), diagonal=1
             )
-            attn_layer = shortcut.attn_layer
+            attn_layer = shortcut.compute_layer
 
             def fail_if_mlp_runs(*args, **kwargs):
                 pytest.fail("attention shortcut output projection must not execute an MLP")
@@ -1269,9 +1271,9 @@ class TestHybridBlock:
         recomputed_output, recomputed_gradients = run(recomputed, recomputed_input)
 
         shortcut = recomputed.layers[0]
-        compute_read = getattr(shortcut.attn_layer, "residual_connection", None)
+        compute_read = getattr(shortcut.compute_layer, "residual_connection", None)
         if compute_read is None:
-            compute_read = shortcut.attn_layer.residual_connection_self_attn
+            compute_read = shortcut.compute_layer.residual_connection_self_attn
         independent_reads = (
             shortcut.shortcut_residual_read,
             compute_read,

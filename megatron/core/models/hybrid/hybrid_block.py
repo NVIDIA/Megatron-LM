@@ -469,12 +469,27 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def physical_layers(self) -> tuple[nn.Module, ...]:
+        """Return one layer per layer_type_list entry, in execution order.
+
+        self.layers holds what runs: Shortcut-MoE registers each paired layer and the MoE
+        after it as a single ShortcutMoEBlock. This unpacks those pairs, so the result lines up
+        index-for-index with layer_type_list and layer_config_list.
+        """
+        physical_layers = []
+        for layer in self.layers:
+            if isinstance(layer, ShortcutMoEBlock):
+                physical_layers.extend((layer.compute_layer, layer.moe_layer))
+            else:
+                physical_layers.append(layer)
+        return tuple(physical_layers)
+
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
-        for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
+        for layer_config, layer in zip(self.layer_config_list, self.physical_layers(), strict=True):
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:
