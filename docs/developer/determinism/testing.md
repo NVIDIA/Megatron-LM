@@ -106,7 +106,9 @@ scheduling is exactly what these tests are meant to catch, so running the
 bucket on GB200/GB300-class runners as well (GB200 unit tests are selected by
 the `launch_on_gb200` marker) is a tracked follow-up; until then, reproduce
 findings on Blackwell hardware manually as described in
-[`status.md`](./status.md).
+[`status.md`](./status.md). Measured replay evidence is collected on demand
+with `python -m tools.determinism.run_evidence`; see
+[measured coverage](./coverage.md).
 
 Run the gate locally against `main`:
 

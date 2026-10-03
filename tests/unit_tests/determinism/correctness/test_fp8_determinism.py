@@ -52,6 +52,7 @@ class TestQuantizationDeterminism:
         RUNNER.teardown()
 
     @pytest.mark.internal
+    @pytest.mark.determinism_model(model_id="gpt-quantized", parallelism={"TP": 2})
     @pytest.mark.parametrize("quant_overrides", _QUANT_RECIPES)
     def test_bit_exact_under_quantization(self, quant_overrides):
         RUNNER.run(quant_overrides, {"TP": 2})
