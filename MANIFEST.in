@@ -1,5 +1,6 @@
 include megatron/core/requirements.txt
 include megatron/core/README.md
 include megatron/core/package_info.py
+recursive-include megatron/core/tuning/tables *.json
 global-exclude LICENSE
 recursive-include requirements *

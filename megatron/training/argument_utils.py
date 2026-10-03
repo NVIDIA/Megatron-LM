@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
+from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -326,6 +327,32 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
+def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy | None:
+    """Build a typed policy from flat CLI controls or a nested Python/YAML config."""
+    # Every policy field has a matching ``--triton-autotune-*`` flag, so a new field
+    # cannot be parsed and then silently dropped here.
+    options = {
+        field.name: getattr(args, f'triton_autotune_{field.name}', None)
+        for field in dataclasses.fields(AutotunePolicy)
+    }
+    options = {name: value for name, value in options.items() if value is not None}
+    if options:
+        return AutotunePolicy(**options)
+
+    policy = getattr(args, 'triton_autotune', None)
+    if policy is None or isinstance(policy, AutotunePolicy):
+        return policy
+    if isinstance(policy, (Namespace, types.SimpleNamespace)):
+        policy = vars(policy)
+    if not isinstance(policy, dict):
+        raise TypeError('triton_autotune must be an AutotunePolicy or a mapping.')
+    policy = dict(policy)
+    if isinstance(policy.get('block_sizes'), (Namespace, types.SimpleNamespace)):
+        policy['block_sizes'] = vars(policy['block_sizes'])
+    # Null YAML values fall back to defaults, and unknown or mistyped keys raise.
+    return AutotunePolicy.from_mapping(policy)
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -437,6 +464,7 @@ def core_transformer_config_from_args(args, config_class=None):
     wide_residual = _wide_residual_config_from_args(args)
     if wide_residual is not None or 'wide_residual' not in kw_args:
         kw_args['wide_residual'] = wide_residual
+
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."

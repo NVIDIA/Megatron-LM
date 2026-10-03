@@ -129,6 +129,7 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.tuning import maybe_verify_choices
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -188,12 +189,12 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
-    get_run_config,
     set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -5289,6 +5290,11 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+
+        # Cross-rank agreement on Triton autotune choices, at the cadence
+        # AutotunePolicy.verify_every asks for. Off by default; a step boundary
+        # is where every rank arrives, which the collective inside requires.
+        maybe_verify_choices(iteration)
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (

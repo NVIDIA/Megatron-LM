@@ -12,11 +12,16 @@ import os
 
 import torch
 
+from megatron.core.tuning import AutotunePolicy, install, set_deterministic_mode
 from megatron.training.determinism import apply_determinism_env
 
-# The SSM Triton autotuners read the determinism policy when their modules are imported
-# (``megatron/core/ssm/ops/common/determinism.py``); pin it before any kernel module loads
-# so the tests measure the kernels, not Triton's timing-based config search.
+# Pin workspaces and future decorations, and cover autotuners that training imports
+# already loaded. Replay must not include Triton's timing-based configuration search.
+# Use the default scope, as --deterministic-mode does, so replays exercise the same
+# pinning (Transformer Engine and in-tree fusions included) that training runs under.
+set_deterministic_mode(True)
+install(AutotunePolicy(mode="pinned"))
+# External Mamba and causal-conv libraries retain their own environment controls.
 os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
 os.environ.setdefault("CAUSAL_CONV1D_DETERMINISTIC", "1")
 apply_determinism_env(os.environ)

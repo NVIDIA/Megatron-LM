@@ -26,7 +26,10 @@ import torch.nn.functional as F
 from megatron.core.activations import squared_relu
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
-from megatron.training.argument_utils import _mfsdp_v2_disables_pipeline_output_dealloc
+from megatron.training.argument_utils import (
+    _mfsdp_v2_disables_pipeline_output_dealloc,
+    _triton_autotune_config_from_args,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -359,6 +362,9 @@ def validate_yaml(args, defaults={}):
         assert not args.model_parallel.fp16, \
             "Expert parallelism is not supported with fp16 training."
 
+    # Built here so a bad section fails now; training installs it in initialize_megatron.
+    args.triton_autotune = _triton_autotune_config_from_args(args)
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -464,4 +470,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-
