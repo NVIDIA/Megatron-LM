@@ -24,6 +24,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
@@ -218,6 +219,41 @@ class TestFusedCrossEntropy:
             what="fused_vocab_parallel_cross_entropy",
         )
         assert grads["in[0]"].dtype == dtype
+
+    @staticmethod
+    def _peak_bytes(fn, logits, target):
+        """Peak allocation of one forward + backward beyond what is live before it."""
+        fn(logits, target).sum().backward()  # warm up compilation outside the measurement
+        logits.grad = None
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        live = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        fn(logits, target).sum().backward()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - live
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    def test_fused_vocab_parallel_cross_entropy_needs_no_logits_sized_temporary(self, dtype):
+        """The compiled pieces are split so that Inductor keeps the exp / gradient scaling in
+        place: the fused path must not need more transient memory than the unfused one. With
+        the reductions and the target scatter inside the compiled graphs Inductor copied the
+        mutated [s, b, v] tensor into a fresh buffer, one extra logits-sized allocation."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        logits = _act((TOKENS, 32768), dtype=dtype)
+        target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
+        logits_bytes = logits.numel() * logits.element_size()
+        fused = self._peak_bytes(
+            lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group), logits, target
+        )
+        unfused = self._peak_bytes(
+            lambda l, t: vocab_parallel_cross_entropy(l, t, 0.0, tp_group), logits, target
+        )
+        assert fused <= unfused + logits_bytes // 8, (
+            f"fused cross entropy peaked at {fused / logits_bytes:.2f}x the logits size, unfused "
+            f"at {unfused / logits_bytes:.2f}x: a logits-sized temporary is back"
+        )
 
 
 # --- DeepSeek-V4 hybrid attention: compiled query RMS norm -----------------------------------

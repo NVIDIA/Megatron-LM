@@ -461,3 +461,21 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
+    """fused_group_mlp and expert_fc1 + moe_act are equivalent spellings, so combining them is
+    rejected as redundant."""
+    common = dict(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        fine_grained_activation_offloading=True,
+    )
+    TransformerConfig(offload_modules=["fused_group_mlp"], **common)
+    TransformerConfig(offload_modules=["expert_fc1", "moe_act"], **common)
+    with pytest.raises(ValueError, match="cannot be combined with expert_fc1 or moe_act"):
+        TransformerConfig(offload_modules=["fused_group_mlp", "moe_act"], **common)
