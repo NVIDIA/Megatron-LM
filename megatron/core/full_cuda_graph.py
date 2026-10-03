@@ -7,6 +7,7 @@ import logging
 
 import torch
 
+from megatron.core.tensor_parallel.gtp_symmetric_memory import symmetric_wgrad_pool
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
     get_all_rng_states,
@@ -227,6 +228,7 @@ class FullCudaGraphWrapper:
                     FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
+            symmetric_wgrad_pool.reset_completed_reuse_events()
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
