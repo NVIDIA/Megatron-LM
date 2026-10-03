@@ -216,6 +216,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
     # reads `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` after the
     # `moe_router_padding_for_quantization` short-circuit fails.
     module.config = SimpleNamespace(
+        deterministic_mode=False,
         fp8=False,
         fp4=False,
         moe_router_padding_for_quantization=False,
@@ -257,6 +258,110 @@ def test_apply_bias_returns_input_unchanged_when_bias_is_none():
     )
 
     assert output is intermediate
+
+
+@pytest.mark.parametrize("global_mode", [False, True])
+@pytest.mark.parametrize("unsupported", [None, "bias", "output_buffer"])
+def test_deterministic_fused_forward_probability_gradients(global_mode, unsupported):
+    """The real dispatch method moves probability gradients outside the fused activation."""
+    seen = []
+
+    def fused_ops(hidden, _tokens, probabilities, *_args, **_kwargs):
+        seen.append(probabilities.detach().clone())
+        return hidden.square() + 1
+
+    module = SimpleNamespace(
+        config=SimpleNamespace(
+            deterministic_mode=True,
+            fp8=False,
+            fp4=False,
+            moe_router_padding_for_quantization=True,
+            moe_paged_stash=False,
+        ),
+        _use_grouped_tensor=True,
+        _fused_ops=(fused_ops,),
+        linear_fc2=SimpleNamespace(use_bias=unsupported == "bias"),
+    )
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4).requires_grad_()
+    probabilities = torch.tensor([0.25, 0.75], requires_grad=True)
+    kwargs = {"output_buffer": torch.empty_like(hidden)} if unsupported == "output_buffer" else {}
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    results = []
+    try:
+        torch.use_deterministic_algorithms(global_mode)
+        if unsupported is not None:
+            message = "FC2 without bias" if unsupported == "bias" else "zero-copy"
+            with pytest.raises(RuntimeError, match=message):
+                TEGroupedMLP._fused_forward(
+                    module, hidden, torch.tensor([1, 1]), probabilities, **kwargs
+                )
+            assert not seen
+            return
+        for _ in range(2):
+            output = TEGroupedMLP._fused_forward(
+                module, hidden, torch.tensor([1, 1]), probabilities
+            )
+            grads = torch.autograd.grad(output.sum(), (hidden, probabilities))
+            results.append((output.detach(), *grads))
+    finally:
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn_only)
+
+    # Independent formula for a bias-free FC2 output and its input/probability gradients.
+    expected = (
+        (hidden.detach().square() + 1) * probabilities.detach().unsqueeze(-1),
+        2 * hidden.detach() * probabilities.detach().unsqueeze(-1),
+        (hidden.detach().square() + 1).sum(dim=-1),
+    )
+    for first, second, reference in zip(*results, expected):
+        torch.testing.assert_close(first, reference, rtol=0, atol=0)
+        assert torch.equal(
+            first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+        )
+    assert all(torch.equal(value, torch.ones_like(probabilities)) for value in seen)
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("zero_copy", [False, True])
+def test_torch_flag_alone_preserves_fused_forward(use_bias, zero_copy):
+    """The torch flag alone preserves FC2 bias, probabilities, and zero-copy output storage."""
+    seen = {}
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    probabilities = torch.tensor([0.25, 0.75])
+    output_buffer = torch.empty_like(hidden) if zero_copy else None
+
+    def fused_ops(inputs, _tokens, probs, *_args, **kwargs):
+        seen.update(probs=probs, kwargs=kwargs)
+        if output_buffer is not None:
+            output_buffer.copy_(inputs)
+            return output_buffer
+        return inputs
+
+    module = SimpleNamespace(
+        config=SimpleNamespace(
+            deterministic_mode=False,
+            fp8=False,
+            fp4=False,
+            moe_router_padding_for_quantization=True,
+            moe_paged_stash=False,
+        ),
+        _use_grouped_tensor=True,
+        _fused_ops=(fused_ops,),
+        linear_fc2=SimpleNamespace(use_bias=use_bias),
+    )
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        output = TEGroupedMLP._fused_forward(
+            module, hidden, torch.tensor([1, 1]), probabilities, output_buffer=output_buffer
+        )
+    finally:
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
+    assert seen["probs"] is probabilities
+    assert output is (output_buffer if zero_copy else hidden)
+    if zero_copy:
+        assert output_buffer is next(iter(seen["kwargs"]["op_kwargs"][-1].values()))
 
 
 def test_apply_bias_combines_per_expert_bias_and_probs():
