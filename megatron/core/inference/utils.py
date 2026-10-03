@@ -311,7 +311,8 @@ def check_flashinfer_jit_cache_installed(log_version: bool = False):
         )
     elif cuda_major == "13":
         install_cmd = (
-            "Install it with:\n\npip install flashinfer-jit-cache "
+            "Install the 'inference' extra (e.g. `uv sync --extra inference`), or install "
+            "it with:\n\npip install flashinfer-jit-cache "
             "--index-url https://flashinfer.ai/whl/cu130\n"
         )
     else:
