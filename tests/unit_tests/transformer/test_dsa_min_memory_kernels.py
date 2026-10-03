@@ -20,6 +20,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     _SCORE_TILE_BUDGET_BYTES,
     _accumulate_simplified_learned_k_wgrad,
     _plan_execution,
+    _simplified_topk_index_tile,
     _sparse_attention_backward_torch_fp32,
     _sparse_attention_tile,
     dsa_dense_indexer_loss,
@@ -37,7 +38,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_simplified_selected_index_scores,
     triton_simplified_selected_index_scores_backward,
     triton_simplified_selected_index_scores_backward_qk,
-    triton_topk_index_block,
 )
 
 
@@ -340,121 +340,6 @@ def test_triton_query_chunk_is_not_shrunk_by_long_key_length():
     # Torch cannot narrow the key block, so the same budget binds on its query chunk once the
     # key length is long enough that one full-width tile no longer fits.
     assert _plan_execution(1, 524288, 524288, use_triton=False).query_chunk < _MAX_QUERY_CHUNK
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
-def test_triton_topk_index_block_matches_reference():
-    torch.manual_seed(123)
-    device = torch.device("cuda")
-    batch_size = 2
-    query_len = 35
-    key_len = 257
-    index_heads = 3
-    index_head_dim = 32
-    topk = 7
-    q_start = 256
-
-    # Standard DSA routes BF16 activations and accumulates their dot products in FP32. The
-    # Triton kernel deliberately uses Tensor Core input precision, so an FP32-input test with
-    # 1e-5 tolerance would incorrectly require an IEEE-FP32 routing contract.
-    q_index = torch.randn(
-        query_len, batch_size, index_heads, index_head_dim, device=device, dtype=torch.bfloat16
-    )
-    k_index = torch.randn(key_len, batch_size, index_head_dim, device=device, dtype=torch.bfloat16)
-    weights = torch.randn(query_len, batch_size, index_heads, device=device, dtype=torch.bfloat16)
-    scores = torch.einsum("qbhd,tbd->bqht", q_index.float(), k_index.float())
-    scores = torch.relu(scores)
-    scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1).float()).sum(dim=2)
-    query_positions = (q_start + torch.arange(query_len, device=device)).view(query_len, 1)
-    key_positions = torch.arange(key_len, device=device).view(1, key_len)
-    scores = scores.masked_fill((key_positions > query_positions).unsqueeze(0), float("-inf"))
-    ref_scores, ref_indices = scores.topk(topk, dim=-1)
-    ref_topk_plus_one = scores.topk(topk + 1, dim=-1).values
-
-    tri_scores, tri_indices = triton_topk_index_block(
-        q_index, weights, k_index, topk, q_start=q_start, k_start=0
-    )
-
-    # Every returned score must correspond to its returned key and be numerically close to the
-    # FP32 oracle evaluated on the same BF16 operands.
-    ref_scores_at_tri_indices = scores.gather(-1, tri_indices)
-    torch.testing.assert_close(tri_scores, ref_scores_at_tri_indices, rtol=5e-3, atol=5e-3)
-    torch.testing.assert_close(
-        tri_scores, tri_scores.sort(dim=-1, descending=True).values, rtol=0, atol=0
-    )
-
-    # A small score perturbation may legitimately exchange nearly tied candidates at the top-k
-    # boundary. Require exact support for rows whose reference margin is larger than the measured
-    # score error, and otherwise require every selected candidate to remain within that error of
-    # the true top-k threshold.
-    row_error = (tri_scores - ref_scores_at_tri_indices).abs().amax(dim=-1)
-    allowance = row_error + 1.0e-5
-    ref_threshold = ref_scores[..., -1]
-    assert torch.all(ref_scores_at_tri_indices.amin(dim=-1) >= ref_threshold - allowance)
-    ref_margin = ref_topk_plus_one[..., -2] - ref_topk_plus_one[..., -1]
-    stable_rows = ref_margin > (2.0 * allowance)
-    if stable_rows.any():
-        tri_support = tri_indices.sort(dim=-1).values
-        ref_support = ref_indices.sort(dim=-1).values
-        assert torch.equal(tri_support[stable_rows], ref_support[stable_rows])
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
-def test_triton_topk_index_block_large_topk_is_numerically_optimal():
-    """Exercise the 256-key sub-block merge used by production top-k=512 routing."""
-    torch.manual_seed(789)
-    device = torch.device("cuda")
-    batch_size = 1
-    query_len = 3
-    key_len = 1024
-    index_heads = 64
-    index_head_dim = 128
-    topk = 512
-    q_start = 764
-
-    q_index = torch.randn(
-        query_len, batch_size, index_heads, index_head_dim, device=device, dtype=torch.bfloat16
-    )
-    k_index = torch.randn(key_len, batch_size, index_head_dim, device=device, dtype=torch.bfloat16)
-    weights = torch.randn(query_len, batch_size, index_heads, device=device, dtype=torch.bfloat16)
-    weights.mul_((index_heads * index_head_dim) ** -0.5)
-
-    reference_scores = torch.einsum("qbhd,tbd->bqht", q_index.float(), k_index.float())
-    reference_scores = torch.relu(reference_scores)
-    reference_scores = (reference_scores * weights.permute(1, 0, 2).unsqueeze(-1).float()).sum(
-        dim=2
-    )
-    query_positions = q_start + torch.arange(query_len, device=device)
-    key_positions = torch.arange(key_len, device=device)
-    reference_scores.masked_fill_(
-        key_positions.view(1, 1, key_len) > query_positions.view(1, query_len, 1), float("-inf")
-    )
-
-    actual = triton_topk_index_block(q_index, weights, k_index, topk, q_start=q_start, k_start=0)
-    assert actual is not None
-    actual_scores, actual_indices = actual
-    sorted_indices = actual_indices.sort(dim=-1).values
-    assert not (sorted_indices[..., 1:] == sorted_indices[..., :-1]).any()
-
-    reference_at_actual = reference_scores.gather(-1, actual_indices)
-    score_error = (actual_scores - reference_at_actual).abs()
-    max_allowed = 5.0e-3 + 5.0e-3 * reference_at_actual.abs()
-    assert torch.all(score_error <= max_allowed)
-
-    reference_top_values, reference_top_indices = reference_scores.topk(topk, dim=-1)
-    row_error = score_error.amax(dim=-1)
-    allowance = row_error + 1.0e-5
-    selected_min = reference_at_actual.amin(dim=-1)
-    threshold = reference_top_values[..., -1]
-    assert torch.all(selected_min >= threshold - allowance)
-
-    top_plus_one = reference_scores.topk(topk + 1, dim=-1).values
-    boundary_margin = top_plus_one[..., -2] - top_plus_one[..., -1]
-    stable_rows = boundary_margin > (2.0 * allowance)
-    if stable_rows.any():
-        actual_support = actual_indices.sort(dim=-1).values
-        reference_support = reference_top_indices.sort(dim=-1).values
-        assert torch.equal(actual_support[stable_rows], reference_support[stable_rows])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
@@ -802,3 +687,56 @@ def test_triton_linear_wgrad_matches_reference(dtype):
         )
     else:
         torch.testing.assert_close(grad_weight, ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_simplified_routing_merges_key_blocks_into_the_true_topk():
+    """Splitting the key prefix into blocks must select the same keys as one pass over it.
+
+    Replaces the coverage the fused router's sub-block merge used to carry. The budget now
+    decides how many blocks routing makes, so the outer merge runs in production whenever a
+    prefix exceeds one tile, and its index bookkeeping -- the ``+ k_start`` that turns a
+    block-local position into a global one -- is what this pins.
+    """
+    torch.manual_seed(789)
+    device = torch.device("cuda")
+    batch_size, hidden, head_dim = 1, 64, 128
+    seq, topk = 2048, 128
+    # A query tile late in the sequence, so the causal prefix spans the whole key range.
+    q_start, q_end = seq - 256, seq
+
+    hidden_states = torch.randn(seq, batch_size, hidden, device=device, dtype=torch.bfloat16)
+    linear_q_weight = torch.randn(head_dim, hidden, device=device, dtype=torch.bfloat16)
+    linear_k_weight = torch.randn(head_dim, hidden, device=device, dtype=torch.bfloat16)
+    full_k_index = torch.randn(seq, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.empty(seq, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16)
+
+    def route(key_chunk_size):
+        return _simplified_topk_index_tile(
+            hidden_states,
+            key,
+            q_start,
+            q_end,
+            linear_q_weight,
+            topk,
+            head_dim,
+            0,
+            None,
+            False,
+            False,
+            head_dim**-0.5,
+            key_chunk_size,
+            None,
+            linear_k_weight,
+            full_k_index,
+        )
+
+    single_scores, single_indices, _ = route(seq)
+    # 512-wide blocks each prune 512 candidates to topk=128, so the merge has to do real work.
+    blocked_scores, blocked_indices, _ = route(512)
+
+    assert torch.equal(single_indices, blocked_indices)
+    torch.testing.assert_close(single_scores, blocked_scores, rtol=0, atol=0)
+    # Indices address global positions and stay inside the causal prefix.
+    assert int(blocked_indices.max()) < q_end
+    assert int(blocked_indices.min()) >= 0
