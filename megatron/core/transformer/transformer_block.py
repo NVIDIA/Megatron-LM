@@ -36,6 +36,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
+    CrossLayerState,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -539,6 +540,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -588,6 +590,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if cross_layer_state is not None:
+            if (self.config.recompute_granularity is not None
+                    or self.config.cuda_graph_impl != "none"
+                    or packed_seq_params is not None or inference_context is not None):
+                raise ValueError("External cross-layer state currently requires eager nonpacked training")
+
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
@@ -752,6 +760,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            **({"cross_layer_state": cross_layer_state}
+                               if cross_layer_state is not None else {}),
                             **extra_layer_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
