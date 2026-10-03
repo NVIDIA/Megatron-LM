@@ -1028,6 +1028,136 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def _vp_chunk_tokens(partition_vocab_size: int, target_bytes: int = 512 * 2**20) -> int:
+    """Derive tokens-per-chunk so that the buffers' memory-usage stays bounded."""
+    return max(1, target_bytes // 2 // (partition_vocab_size * 4))
+
+
+class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
+    """`selective_log_softmax` over vocab-parallel (TP-sharded) logits."""
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits, target, tp_group, chunk_tokens):
+        """See `vocab_parallel_selective_log_softmax` for the contract."""
+        orig_shape = target.shape
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.reshape(-1, partition_vocab_size)
+        target_1d = target.reshape(-1)
+
+        if tp_group is not None and torch.distributed.is_initialized():
+            tp_rank = torch.distributed.get_rank(tp_group)
+            tp_world = torch.distributed.get_world_size(tp_group)
+        else:
+            tp_rank, tp_world = 0, 1
+
+        # Same partition convention as the vocab-parallel output layer
+        # (VocabUtility.vocab_range_from_per_partition_vocab_size).
+        vocab_start = tp_rank * partition_vocab_size
+        vocab_end = vocab_start + partition_vocab_size
+
+        target_mask = (target_1d < vocab_start) | (target_1d >= vocab_end)
+        masked_target = (target_1d - vocab_start).masked_fill(target_mask, 0)
+
+        n = logits_2d.size(0)
+        chunk = chunk_tokens or _vp_chunk_tokens(partition_vocab_size)
+        # local_lse[i]: this rank's log-sum-exp over its own vocab partition for row i
+        #   (the local log_softmax normalizer). Recovered from log_softmax's output,
+        #   since log_softmax(x)_c = x_c - lse(x) for every column c.
+        #   Read at c = argmax: there the kernel's own value is exactly -log(sum(exp(x - max))),
+        #   so the recovery is max + log(sum) with a single rounding, and a -inf
+        #   logit elsewhere in the row cannot turn it into NaN.
+        # raw_target_logit[i]: logit[i, target] in fp32, nonzero only on the rank that
+        #   owns the target id (masked, same convention as the pre-log_softmax design).
+        local_lse = torch.empty(n, dtype=torch.float32, device=logits_2d.device)
+        raw_target_logit = torch.empty(n, dtype=torch.float32, device=logits_2d.device)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            # copy=True: `.float()` would alias (and log_softmax writing through
+            # that alias would corrupt) the saved logits when input is already fp32.
+            chunk_fp32 = logits_2d[s:e].to(torch.float32, copy=True)
+            row_log_softmax = torch.nn.functional.log_softmax(chunk_fp32, dim=-1)
+            row_max, row_argmax = chunk_fp32.max(dim=-1, keepdim=True)
+            local_lse[s:e] = (row_max - row_log_softmax.gather(-1, row_argmax)).squeeze(-1)
+            raw_target_logit[s:e] = chunk_fp32.gather(
+                -1, masked_target[s:e].unsqueeze(-1)
+            ).squeeze(-1)
+        raw_target_logit.masked_fill_(target_mask, 0.0)
+
+        if tp_world > 1:
+            # global_lse = logsumexp_r(local_lse_r): one MAX and one SUM all-reduce.
+            # NCCL picks the SUM's reduction order per message size, so this path is not
+            # batch-invariant; get_logprobs takes the gathered path under that mode.
+            rank_max = local_lse.clone()
+            torch.distributed.all_reduce(
+                rank_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            )
+            combined = torch.stack([(local_lse - rank_max).exp_(), raw_target_logit])
+            torch.distributed.all_reduce(
+                combined, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            global_lse = rank_max + combined[0].log()
+            target_logit = combined[1]
+        else:
+            global_lse = local_lse
+            target_logit = raw_target_logit
+
+        # log p(target) = logit[target] - logsumexp(logits)
+        logprobs = target_logit - global_lse
+
+        ctx.save_for_backward(vocab_parallel_logits, global_lse, target_mask, masked_target)
+        ctx.vp_chunk = chunk
+        return logprobs.view(orig_shape).to(vocab_parallel_logits.dtype)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        """d log p(target) / d logit_j = (1 if j == target else 0) - softmax_j."""
+        vocab_parallel_logits, global_lse, target_mask, masked_target = ctx.saved_tensors
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.reshape(-1, partition_vocab_size)
+        n = logits_2d.size(0)
+
+        grad_out_1d = grad_output.reshape(-1).float()
+        grad_input = torch.empty_like(vocab_parallel_logits)
+        grad_2d = grad_input.reshape(-1, partition_vocab_size)
+
+        chunk = ctx.vp_chunk
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            go = grad_out_1d[s:e]
+            # softmax_j = exp(logit_j - global_lse) (global_lse is TP-global);
+            # grad_j = go * delta_{j==target} - go * softmax_j.
+            sm = logits_2d[s:e].to(torch.float32, copy=True)
+            sm.sub_(global_lse[s:e].unsqueeze(-1)).exp_().mul_(go.unsqueeze(-1)).neg_()
+            # One-hot term via fixed-size arange + masked grad: no torch.nonzero,
+            # so no device-host sync (CUDA-graph-capture-safe).
+            arange = torch.arange(e - s, device=sm.device)
+            sm[arange, masked_target[s:e]] += go * (~target_mask[s:e]).to(go.dtype)
+            grad_2d[s:e] = sm.to(grad_input.dtype)
+        return grad_input, None, None, None
+
+
+def vocab_parallel_selective_log_softmax(
+    vocab_parallel_logits,
+    index,
+    tp_group=None,
+    chunk_tokens=None
+):
+    """Vocab-parallel, sequence-chunked drop-in for `selective_log_softmax`.
+
+    Args:
+        vocab_parallel_logits: [..., vocab/tp] logits sharded over the TP group.
+            Rank `r` owns rows `[r * Vp, (r + 1) * Vp]`.
+        index: target token ids.
+        tp_group: process group over which the vocab dimension is sharded.
+        chunk_tokens: tokens per chunk; used to restrict size of the temporary buffers.
+
+    Returns:
+        Logprobs with the same shape as `index`.
+    """
+    return _VocabParallelSelectiveLogProbs.apply(vocab_parallel_logits, index, tp_group, chunk_tokens)
+
+
 @dataclass
 class _CPScatterCache:
     """Per-bin CP partition artifacts, derived once from (packed_seq_params, cp_group).
@@ -1202,6 +1332,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             set_model_config_attribute(model, "flash_decode", False)
             fp32_output = not (args.fp16 or args.bf16)
 
+            # Keep the logits TP-shared and compute logprobs without gathering the full vocab.
+            use_vp_logprobs = not is_batch_invariant_mode_enabled()
+
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
                 tokens_in, position_ids_in, packed_seq_params_in, local_labels, cp_scatter = (
@@ -1220,7 +1353,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     position_ids_in,
                     attention_mask_for_forward,
                     packed_seq_params=packed_seq_params_in,
-                    runtime_gather_output=True,
+                    runtime_gather_output=not use_vp_logprobs,
                     fp32_output=fp32_output,
                 )
 
@@ -1232,9 +1365,15 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logits_or_hidden_states
 
         logits = logits_or_hidden_states
+        tp_group = pg_collection.tp if use_vp_logprobs else None
         with nvtx_range("rl/log-softmax", time=True):
             if cp_size > 1:
-                local_logprobs = selective_log_softmax(logits, local_labels)
+                if use_vp_logprobs:
+                    local_logprobs = vocab_parallel_selective_log_softmax(
+                        logits, local_labels, tp_group
+                    )
+                else:
+                    local_logprobs = selective_log_softmax(logits, local_labels)
                 # Differentiable all-gather so training pass can backprop through the reassembly.
                 # With no-grad, this acts as a plain all_gather.
                 gathered = torch.distributed.nn.functional.all_gather(
@@ -1245,7 +1384,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 logprobs = full[:, :-1]
             else:
                 # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                if use_vp_logprobs:
+                    logprobs = vocab_parallel_selective_log_softmax(
+                        logits[:, :-1, :], tokens[:, 1:], tp_group
+                    )
+                else:
+                    logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
         return logprobs
 
 
