@@ -4,6 +4,7 @@
 
 import gc
 import logging
+import os
 
 import torch
 
@@ -184,6 +185,51 @@ class FullCudaGraphWrapper:
                     data_list.append(None)
         return data_list
 
+    def _run_forward_backward(self, training_str, *args, **kwargs):
+        """Run one fixed workspace sequence for eager warmup or graph capture."""
+        use_mxfp8_vmm = os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+        use_nvfp4_vmm = os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+        if not use_mxfp8_vmm and not use_nvfp4_vmm:
+            return self.forward_backward_func(*args, **kwargs)
+
+        iteration_hooks = []
+        if use_mxfp8_vmm:
+            from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+                begin_mxfp8_vmm_workspace_iteration,
+                end_mxfp8_vmm_workspace_iteration,
+            )
+
+            iteration_hooks.append(
+                (begin_mxfp8_vmm_workspace_iteration, end_mxfp8_vmm_workspace_iteration)
+            )
+        if use_nvfp4_vmm:
+            from transformer_engine.pytorch.tensor.localized_nvfp4 import (
+                begin_nvfp4_vmm_workspace_iteration,
+                end_nvfp4_vmm_workspace_iteration,
+            )
+
+            iteration_hooks.append(
+                (begin_nvfp4_vmm_workspace_iteration, end_nvfp4_vmm_workspace_iteration)
+            )
+
+        started_hooks = []
+        try:
+            for begin_iteration, end_iteration in iteration_hooks:
+                begin_iteration(training_str)
+                started_hooks.append(end_iteration)
+            result = self.forward_backward_func(*args, **kwargs)
+        except Exception:
+            for end_iteration in reversed(started_hooks):
+                end_iteration(validate=False)
+            raise
+        # Validation is forward-only, so no backward callback will release
+        # leases retained by modules that still report training=True. All GPU
+        # consumers are ordered before this iteration boundary; return any
+        # remaining leases to the validation pool for the next warmup/capture.
+        for end_iteration in reversed(started_hooks):
+            end_iteration(validate=training_str != 'validation')
+        return result
+
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
         assert all(
@@ -210,6 +256,17 @@ class FullCudaGraphWrapper:
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
+            if (
+                os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+                or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+            ):
+                # Eager train-step warmups leave ordinary QKV allocations in
+                # PyTorch's cache. Raw VMM cuMemCreate calls cannot consume
+                # those reserved blocks, so return unused storage first.
+                FullCudaGraphWrapper.result[training_str] = None
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)
             else:
@@ -233,14 +290,17 @@ class FullCudaGraphWrapper:
                 pool=get_graph_pool(self.use_single_mempool),
                 capture_error_mode="thread_local",
             ):
-                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                FullCudaGraphWrapper.result[training_str] = self._run_forward_backward(
+                    training_str,
                     *args, **kwargs
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            FullCudaGraphWrapper.result[training_str] = self._run_forward_backward(
+                training_str, *args, **kwargs
+            )
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
@@ -269,3 +329,27 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
         gc.collect()
+        if (
+            (
+                os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+                or os.getenv("NVTE_NVFP4_VMM_LOCALIZATION", "0") == "1"
+            )
+            and FullCudaGraphWrapper.cuda_graph['training'] is None
+            and FullCudaGraphWrapper.cuda_graph['validation'] is None
+        ):
+            torch.cuda.synchronize()
+            from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+                clear_mla_vmm_scratch_buffers,
+            )
+            from transformer_engine.pytorch.tensor.vmm import clear_captured_vmm_allocations
+            from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+                clear_mxfp8_vmm_workspace_pools,
+            )
+            from transformer_engine.pytorch.tensor.localized_nvfp4 import (
+                clear_nvfp4_vmm_workspace_pools,
+            )
+
+            clear_mla_vmm_scratch_buffers()
+            clear_mxfp8_vmm_workspace_pools()
+            clear_nvfp4_vmm_workspace_pools()
+            clear_captured_vmm_allocations()
