@@ -176,6 +176,12 @@ runs:
         key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
 
+    - name: Get PR info for mandatory unit tests
+      id: unit-test-pr-info
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+      uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+      continue-on-error: true
+
     - name: Resolve unit Testmon mode
       id: unit-testmon
       if: inputs.is_unit_test == 'true'
@@ -185,6 +191,12 @@ runs:
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        PR_INFO_OUTCOME: ${{ steps.unit-test-pr-info.outcome }}
+        PR_NUMBER: ${{ fromJSON(steps.unit-test-pr-info.outputs.pr-info || '{}').number }}
+        PR_CHANGED_FILES: ${{ fromJSON(steps.unit-test-pr-info.outputs.pr-info || '{}').changed_files }}
+        PR_MERGE_SHA: ${{ fromJSON(steps.unit-test-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+        TESTED_SHA: ${{ inputs.sha || github.sha }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -200,7 +212,26 @@ runs:
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
-              EFFECTIVE_MODE=enforce
+              # Mandatory mappings use only the PR's files, independently of
+              # Testmon's baseline. The PR-files API returns at most 3,000 files.
+              # Check the PR revision before and after fetching its file list.
+              if [[ "$PR_INFO_OUTCOME" == "success" \
+                    && "$PR_MERGE_SHA" == "$TESTED_SHA" \
+                    && "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
+                    && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
+                    && "$PR_CHANGED_FILES" -le 3000 ]] \
+                && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+                  --jq '.[].filename' > assets_dir/testmon/changed-files \
+                && CHANGED_FILES=$(wc -l < assets_dir/testmon/changed-files | tr -d ' ') \
+                && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
+                && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
+                && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]]; then
+                EFFECTIVE_MODE=enforce
+              else
+                EFFECTIVE_MODE=full
+                FALLBACK_REASON="unable to read the complete PR changed-file list for the tested commit; running the full bucket without recording or saving"
+                echo "::notice::PR changed-file list unavailable or incomplete; running the full unit-test bucket."
+              fi
             else
               EFFECTIVE_MODE=full
               FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
@@ -222,6 +253,9 @@ runs:
           echo "- Effective mode: $EFFECTIVE_MODE"
           if [[ "$REQUESTED_MODE" == "enforce" ]]; then
             echo "- Restored cache key: ${MATCHED_KEY:-none}"
+          fi
+          if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
+            echo "- Changed files in PR: ${CHANGED_FILES}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
             echo "- Fallback: $FALLBACK_REASON"
