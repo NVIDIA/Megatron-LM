@@ -27,7 +27,6 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
-    ROUTER_KEY_SUB_BLOCK,
     set_min_memory_triton_enabled,
     triton_indexer_loss_grad,
     triton_linear_wgrad,
@@ -43,7 +42,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_sparse_attention_backward_supported,
     triton_sparse_attention_tile,
     triton_teacher_scores_tile,
-    triton_topk_index_block,
 )
 from megatron.core.utils import ensure_params_ready
 
@@ -920,7 +918,6 @@ def _simplified_topk_index_tile(
     topk = min(index_topk, causal_key_limit)
     running_scores = None
     running_indices = None
-    unit_weights = q_index.new_ones((q_end - q_start, hidden_states.size(1), 1))
     for k_start in range(0, causal_key_limit, key_chunk_size):
         k_end = min(k_start + key_chunk_size, causal_key_limit)
         if linear_k_weight is None:
@@ -941,24 +938,14 @@ def _simplified_topk_index_tile(
                 simplified_input_norm,
             )
         block_topk = min(topk, k_end - k_start)
-        triton_topk = triton_topk_index_block(
-            q_index,
-            unit_weights,
-            key_block[:, :, 0, :],
-            block_topk,
-            q_start,
-            k_start,
-            apply_relu=False,
-            score_scale=score_scale,
+        # Score the block, then select. _plan_execution sized the block so this tile fits the
+        # score budget, so there is nothing left for a fused select-while-scoring kernel to
+        # avoid: the key dimension is already streamed, by this loop.
+        block_scores = _simplified_index_scores_block(
+            q_index, key_block, score_scale, q_start, k_start
         )
-        if triton_topk is None:
-            block_scores = _simplified_index_scores_block(
-                q_index, key_block, score_scale, q_start, k_start
-            )
-            block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
-            block_indices = block_indices + k_start
-        else:
-            block_scores, block_indices = triton_topk
+        block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
+        block_indices = block_indices + k_start
         running_scores, running_indices = _merge_topk(
             running_scores, running_indices, block_scores, block_indices, topk
         )
