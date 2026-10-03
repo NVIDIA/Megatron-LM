@@ -27,6 +27,7 @@ def test_mimo_text_restores_global_batch_qb_bias(
     )
     saved = Namespace(
         model_provider=provider,
+        mimo_llm_tp=1,
         moe_router_load_balancing_type=routing_type,
         moe_router_quantile_balancing_estimation_scope=scope,
     )
