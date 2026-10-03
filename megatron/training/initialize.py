@@ -6,6 +6,7 @@ import os
 import random
 import time
 import warnings
+from dataclasses import fields
 from datetime import timedelta
 from typing import Optional
 
@@ -43,6 +44,7 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.global_vars import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -505,10 +507,14 @@ def _set_random_seed(
 def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     args = get_args()
+    cfg = get_run_config()
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+            if not hasattr(cfg.logger, arg):
+                writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+        for field in fields(cfg.logger):
+            writer.add_text(field.name, str(getattr(cfg.logger, field.name)), global_step=args.iteration)
 
 
 def set_jit_fusion_options(tp_size=None):
@@ -664,13 +670,13 @@ def setup_logging() -> None:
 
     Returns: None
     """
-    args = get_args()
+    cfg = get_run_config()
     logging_level = None
     env_logging_level = os.getenv('MEGATRON_LOGGING_LEVEL', None)
     if env_logging_level is not None:
         logging_level = int(env_logging_level)
-    if args.logging_level is not None:
-        logging_level = args.logging_level
+    if cfg.logger.logging_level is not None:
+        logging_level = cfg.logger.logging_level
 
     if logging_level is not None:
         if is_rank0():

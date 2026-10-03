@@ -132,17 +132,13 @@ class MegatronCheckpointLoaderBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.global_vars import set_global_variables, set_run_config
-            from megatron.training.argument_utils import inference_cfg_container_from_args
+            from megatron.training.global_vars import set_global_variables
             from megatron.core import mpu
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             self.queue.put("exit")
             sys.exit(1)
 
-        # Temporary args/config duplication during the training-loop refactor:
-        # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(inference_cfg_container_from_args(self.margs, build_model_config=False))
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)

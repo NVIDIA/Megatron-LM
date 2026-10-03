@@ -88,7 +88,8 @@ def inline_profiler(monkeypatch, run_config):
     def start(config, *, iteration=0, rank=0, tensorboard_dir=None):
         run_config.profiling = config
         args.iteration = iteration
-        args.tensorboard_dir = tensorboard_dir
+        args.tensorboard_dir = "stale"
+        run_config.logger.tensorboard_dir = tensorboard_dir
         monkeypatch.setattr(training.torch.distributed, "get_rank", lambda: rank)
         with pytest.raises(BeforeTrainStep):
             training.train(
@@ -397,6 +398,7 @@ def test_training_log_memory_snapshot_without_profiling_args(
     from megatron.training import training
 
     args, config = cli_config("--log-interval", "1", "--micro-batch-size", "1")
+    run_config.logger.log_interval = 1
     run_config.profiling = config
     config.record_memory_history = enabled
     config.profile_ranks = ranks
