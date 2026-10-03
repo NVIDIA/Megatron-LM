@@ -74,6 +74,36 @@ class TestGradNormAndClip:
             for j, (a, b) in enumerate(zip(ref, got)):
                 assert bytes_equal(a, b), f"clipped grad {j} differs on replay {i}"
 
+    @pytest.mark.parametrize(
+        'dtypes', [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)]
+    )
+    def test_mixed_dtype_norm_and_clip_replays(self, dtypes):
+        seeded()
+        numel = 1_048_578  # Multiple chunks per dtype, including a partial final chunk.
+        bases = [torch.randn(4 * numel, device='cuda', dtype=dtype) for dtype in dtypes]
+
+        def norm_and_clip(*storage):
+            grads = [base[:numel] for base in storage]
+            params = [torch.zeros_like(grad) for grad in grads]
+            for param, grad in zip(params, grads):
+                param.grad = grad
+            norm = get_grad_norm_fp32(
+                grads, grad_stats_parallel_group=torch.distributed.group.WORLD
+            )
+            clip_grad_by_total_norm_fp32(params, 1.0, norm)
+            return torch.as_tensor(norm, device='cuda'), *storage
+
+        # The harness clones whole bases, preserving padding for regressed mixed dispatch.
+        # Compare the norm and all backing bytes under side-stream scheduling pressure.
+        assert_replays_bit_exact(
+            norm_and_clip,
+            tuple(bases),
+            replays=4,
+            backward=False,
+            contention=True,
+            what='mixed_dtype_norm_and_clip',
+        )
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_tensor_metric_l2_replays(monkeypatch, dtype):
