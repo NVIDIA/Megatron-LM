@@ -265,6 +265,10 @@ if _TRITON_AVAILABLE:
             tl.store(ws_cs_ptr + (v_ws_base + t) * HC + offs_c, col_sum)
             M = M / (col_sum[None, :] + eps)
 
+        # The reverse pass can read scratch written by another warp after layout
+        # conversion. Publish all matrix and normalization stores before those reads.
+        tl.debug_barrier()
+
         # M is the final forward output. It is the right value for the first VJP
         # through the last column-normalization step.
         grad = tl.load(grad_out_ptr + mat_ptrs).to(tl.float32)
@@ -309,7 +313,13 @@ if _TRITON_AVAILABLE:
         out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         M_init = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         inp = input_logits.contiguous().view(N_batch, hc, hc)
-        _triton_sinkhorn_fwd_kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations)
+        kernel = _triton_sinkhorn_fwd_kernel
+        launch_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled():
+            # Fix the reduction layout, bypassing any timing-selected autotuner cache entry.
+            kernel = kernel.fn
+            launch_kwargs = {"num_warps": 4}
+        kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations, **launch_kwargs)
         return out.view(original_shape), M_init.view(original_shape)
 
     def _triton_sinkhorn_bwd(
@@ -325,8 +335,24 @@ if _TRITON_AVAILABLE:
         ws_M = torch.empty(N_batch * 2 * num_iterations * hc * hc, dtype=torch.float32, device=dev)
         ws_rs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         ws_cs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
-        _triton_sinkhorn_bwd_kernel[(N_batch,)](
-            go, mi, grad_input, ws_M, ws_rs, ws_cs, N_batch, eps, hc, num_iterations
+        kernel = _triton_sinkhorn_bwd_kernel
+        launch_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled():
+            # The backward row/column reductions need the same fixed launch policy.
+            kernel = kernel.fn
+            launch_kwargs = {"num_warps": 4}
+        kernel[(N_batch,)](
+            go,
+            mi,
+            grad_input,
+            ws_M,
+            ws_rs,
+            ws_cs,
+            N_batch,
+            eps,
+            hc,
+            num_iterations,
+            **launch_kwargs,
         )
         return grad_input.view(original_shape)
 
@@ -754,7 +780,14 @@ if _TRITON_AVAILABLE:
         )
 
         grid_b = lambda META: (triton.cdiv(sb, META["BLOCK_S"]),)
-        _triton_hpb_bwd_g_hp_hr_kernel[grid_b](
+        # Autotuned BLOCK_C changes the channel reduction tree and therefore g_hr/g_hp bits.
+        # Bypass the autotuner (including any non-deterministic-mode cache) for strict replay.
+        h_grad_kernel = _triton_hpb_bwd_g_hp_hr_kernel
+        h_grad_launch_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled():
+            h_grad_kernel = h_grad_kernel.fn
+            h_grad_launch_kwargs = {"BLOCK_C": 512, "BLOCK_S": 1, "num_warps": 4}
+        h_grad_kernel[grid_b](
             go_flat,
             orig_flat,
             x_flat,
@@ -774,6 +807,7 @@ if _TRITON_AVAILABLE:
             g_hr.stride(1),
             g_hr.stride(2),
             HAS_BIAS=(bias is not None),
+            **h_grad_launch_kwargs,
         )
 
         g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None

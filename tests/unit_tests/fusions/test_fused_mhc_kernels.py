@@ -523,6 +523,102 @@ class TestTritonHPostBDA:
                 msg=f"Triton vs cuTile mismatch on {name}",
             )
 
+    @_require_triton
+    @pytest.mark.parametrize("with_bias", [True, False])
+    def test_deterministic_bwd_ignores_prior_autotuning(self, monkeypatch, with_bias):
+        """Strict backward must ignore cached choices with different reduction trees."""
+        import triton
+
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        s, b, n, C = 3, 1, 4, 4096
+        generator = torch.Generator().manual_seed(193)
+
+        def make_input(shape, dtype):
+            data = torch.rand(shape, generator=generator) * 0.2 - 0.1
+            return data.to(device=DEVICE, dtype=dtype)
+
+        h_res = make_input((s, b, n, n), torch.float32)
+        original_residual = make_input((s, b, n, C), torch.bfloat16)
+        h_post = make_input((s, b, n), torch.float32)
+        x = make_input((s, b, C), torch.bfloat16)
+        bias = make_input((C,), torch.bfloat16) if with_bias else None
+        grad_output = make_input((s, b, n, C), torch.float32)
+        inputs = (h_res, original_residual, h_post, x, bias)
+
+        # CPU float64 autograd supplies a reference independent of the Triton reductions.
+        reference_inputs = tuple(
+            value.detach().cpu().double().requires_grad_() if value is not None else None
+            for value in inputs
+        )
+        _ref_h_post_bda(*reference_inputs).backward(grad_output.cpu().double())
+
+        reduction_tuner = kernels._triton_hpb_bwd_g_hp_hr_kernel
+        elementwise_tuner = kernels._triton_hpb_bwd_g_x_orig_kernel
+        configs = [
+            triton.Config({"BLOCK_C": block_c, "BLOCK_S": 1}, num_warps=4) for block_c in (64, 512)
+        ]
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        primed_gradients = []
+        deterministic_gradients = []
+        try:
+            with monkeypatch.context() as patch:
+                # Preserve autotuner diagnostics as well as its configuration/cache state.
+                for tuner in (reduction_tuner, elementwise_tuner):
+                    for name in ("best_config", "configs_timings", "bench_time", "nargs"):
+                        patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
+                    patch.setattr(tuner, "cache", {})
+                    patch.setattr(tuner, "cache_results", False, raising=False)
+                patch.setattr(elementwise_tuner, "configs", [configs[0]])
+                patch.setattr(reduction_tuner, "configs", configs)
+
+                for block_c in (64, 512):
+                    # Simulate either timing winner without benchmarking. Priming still
+                    # executes the selected GPU kernel and populates the real tuner cache.
+                    patch.setattr(reduction_tuner, "cache", {})
+                    patch.setattr(
+                        reduction_tuner,
+                        "_bench",
+                        lambda *args, config, selected_block_c=block_c, **kwargs: [
+                            0.0 if config.kwargs["BLOCK_C"] == selected_block_c else 1.0
+                        ],
+                    )
+                    torch.use_deterministic_algorithms(False)
+                    primed_gradients.append(kernels._triton_h_post_bda_bwd(grad_output, *inputs))
+                    assert reduction_tuner.cache
+                    assert all(
+                        config.kwargs["BLOCK_C"] == block_c
+                        for config in reduction_tuner.cache.values()
+                    )
+                    torch.use_deterministic_algorithms(True)
+                    deterministic_gradients.append(
+                        kernels._triton_h_post_bda_bwd(grad_output, *inputs)
+                    )
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+
+        # Ensure these inputs actually expose the differing channel reduction trees.
+        assert any(
+            not torch.equal(primed_gradients[0][index], primed_gradients[1][index])
+            for index in (0, 2)
+        )
+        for name, first, second, reference in zip(
+            ("h_res", "original_residual", "h_post", "x", "bias"),
+            *deterministic_gradients,
+            reference_inputs,
+        ):
+            if reference is None:
+                assert first is None and second is None
+                continue
+            assert torch.equal(
+                first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+            ), f"Deterministic {name} gradient depends on prior autotuning"
+            atol, rtol = (2e-6, 2e-5) if first.dtype == torch.float32 else (5e-4, 1e-2)
+            torch.testing.assert_close(
+                first.cpu().double(), reference.grad, atol=atol, rtol=rtol, msg=name
+            )
+
 
 class TestTritonHPostBDABwdE2EDebug:
     """Debug: run E2E forward, then compare cuTile vs Triton backward per-output."""
@@ -597,6 +693,88 @@ class TestTritonHPostBDABwdE2EDebug:
 
 
 class TestTritonSinkhorn:
+    @_require_triton
+    @pytest.mark.parametrize("hc", [4, 8])
+    def test_deterministic_ignores_prior_autotuning(self, monkeypatch, hc):
+        """Strict replay fixes both warp counts even when ordinary execution tuned first."""
+        import triton
+
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        generator = torch.Generator().manual_seed(193)
+        data = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        grad_out = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        reference_input = data.cpu().double().requires_grad_()
+        reference_output = _ref_sinkhorn(reference_input, 5)
+        reference_output.backward(grad_out.cpu().double())
+        tuners = (kernels._triton_sinkhorn_fwd_kernel, kernels._triton_sinkhorn_bwd_kernel)
+        configs = [triton.Config({}, num_warps=warps) for warps in (1, 8)]
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        was_fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+        launches = []
+        results = []
+
+        def run():
+            inp = data.clone().requires_grad_()
+            out = kernels.triton_fused_sinkhorn(inp, 5)
+            out.backward(grad_out)
+            return out.detach(), inp.grad
+
+        try:
+            torch.utils.deterministic.fill_uninitialized_memory = True
+            with monkeypatch.context() as patch:
+                for index, tuner in enumerate(tuners):
+                    for name in ("best_config", "configs_timings", "bench_time", "nargs"):
+                        patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
+                    patch.setattr(tuner, "cache_results", False, raising=False)
+                    patch.setattr(tuner, "configs", configs)
+                    original_run = tuner.fn.run
+
+                    def record_launch(*args, original=original_run, index=index, **kwargs):
+                        if torch.are_deterministic_algorithms_enabled():
+                            launches.append((index, kwargs.get("num_warps")))
+                        return original(*args, **kwargs)
+
+                    patch.setattr(tuner.fn, "run", record_launch)
+                for warps in (1, 8):
+                    for tuner in tuners:
+                        patch.setattr(tuner, "cache", {})
+                        patch.setattr(
+                            tuner,
+                            "_bench",
+                            lambda *args, config, selected=warps, **kwargs: [
+                                0.0 if config.num_warps == selected else 1.0
+                            ],
+                        )
+                    torch.use_deterministic_algorithms(False)
+                    run()
+                    for tuner in tuners:
+                        assert tuner.cache
+                        assert all(config.num_warps == warps for config in tuner.cache.values())
+                    torch.use_deterministic_algorithms(True)
+                    results.append(run())
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+            torch.utils.deterministic.fill_uninitialized_memory = was_fill_uninitialized
+
+        # A fixed policy is required even if this shape/compiler happens to make
+        # multiple warp counts numerically identical. No performance claim is made.
+        assert launches == [(0, 4), (1, 4), (0, 4), (1, 4)]
+        for name, first, second, reference in zip(
+            ("output", "input gradient"),
+            results[0],
+            results[1],
+            (reference_output, reference_input.grad),
+        ):
+            assert torch.isfinite(first).all() and torch.isfinite(second).all(), name
+            assert torch.equal(
+                first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+            )
+            torch.testing.assert_close(
+                first.cpu().double(), reference, atol=2e-6, rtol=2e-5, msg=name
+            )
+
     @_require_triton
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10), (8, 4, 4, 20)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
