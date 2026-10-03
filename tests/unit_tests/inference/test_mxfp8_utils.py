@@ -1166,6 +1166,69 @@ class TestPermuteAndQuantizeMxfp8:
         assert fused_calls == 1
         assert output.shape == hidden.shape
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("activation_type", ["squared_relu", "swiglu"])
+    def test_batch_invariant_moe_fused_matches_unfused(self, activation_type):
+        """Fused input preprocessing preserves the complete MXFP8 MoE output bitwise."""
+        from megatron.core.inference.moe import fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        if not fused_moe.HAVE_SCALED_GMM or torch.cuda.get_device_capability() != (10, 0):
+            pytest.skip("MXFP8 scaled_grouped_mm parity requires PyTorch 2.10+ and SM100")
+
+        torch.manual_seed(1234)
+        num_tokens, hidden_size, ffn_size, topk, num_experts = 17, 128, 128, 2, 4
+        hidden, probs, _ = self._make_inputs(num_tokens, hidden_size, topk, num_experts)
+        token_ids = torch.arange(num_tokens, device="cuda")
+        routing_map = torch.stack((token_ids % num_experts, (token_ids + 1) % num_experts), dim=1)
+        valid_tokens = _vt(num_tokens - 3)
+
+        def stack_weight(out_features, in_features):
+            weights = [
+                MXFP8Tensor.from_bf16(
+                    torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16),
+                    backend="triton",
+                )
+                for _ in range(num_experts)
+            ]
+            return MXFP8Tensor(
+                data=torch.stack([weight.data for weight in weights]).contiguous(),
+                scale=torch.stack([weight.scale for weight in weights]).contiguous(),
+                dtype=torch.bfloat16,
+                backend="triton",
+            )
+
+        is_swiglu = activation_type == "swiglu"
+        fc1 = stack_weight(ffn_size * (2 if is_swiglu else 1), hidden_size)
+        fc2 = stack_weight(hidden_size, ffn_size)
+        activation = (
+            fused_moe.ActivationType.SWIGLU if is_swiglu else fused_moe.ActivationType.SQUARED_RELU
+        )
+
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            fused = fused_moe.mcore_fused_moe(
+                hidden, probs, fc1, fc2, activation, num_experts, 0, valid_tokens, routing_map
+            )
+            unfused = fused_moe.mcore_fused_moe(
+                hidden,
+                probs,
+                fc1,
+                fc2,
+                activation,
+                num_experts,
+                0,
+                valid_tokens,
+                routing_map,
+                disable_fused_quant_kernels=True,
+            )
+
+        fused = fused[: num_tokens - 3]
+        unfused = unfused[: num_tokens - 3]
+        assert torch.count_nonzero(fused) > 0
+        assert torch.equal(fused.view(torch.uint8), unfused.view(torch.uint8))
+
 
 def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
     linear = torch.nn.Module()
