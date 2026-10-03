@@ -381,9 +381,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def update_fp32_param_by_new_param(self):
         """
         Update the fp32 parameters by the new parameters.
+
+        Prefer :meth:`reload_model_params`, which additionally re-seeds the pinned CPU
+        clones of offloaded params that this method does not touch. This method is kept
+        for backward compatibility with existing callers.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
             fp32_param.data.copy_(param)
+
+    def reload_model_params(self):
+        """Re-seed the detached copies the sub-optimizers step against.
+
+        Call whenever the parameters change outside the optimizer, e.g. loading a
+        checkpoint without its optimizer state; otherwise the next ``step()`` copies
+        the stale values back over them. See NVIDIA-NeMo/RL#2371.
+        """
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is not param:
+                inner_param.data.copy_(param.data)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
