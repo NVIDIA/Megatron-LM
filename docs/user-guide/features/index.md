@@ -26,5 +26,6 @@ paged_stash
 tokenizers
 megatron_energon
 megatron_rl
+offline_logits_distillation
 ../../mcore-inference-user-guide
 ```
