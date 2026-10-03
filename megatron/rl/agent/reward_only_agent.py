@@ -192,14 +192,27 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         problem_id = golden['problem_id'] if 'problem_id' in golden else None
 
         if isinstance(request.inference_interface, ReturnsTokens):
+            # The Megatron interface stages token ids and log probs with the engine;
+            # rank 0 joins them from the finished-request records, so the rollout carries None here.
+            staged = bool(responses) and all(r.token_ids is None for r in responses)
+            if not staged and any(r.token_ids is None for r in responses):
+                raise ValueError("every turn must carry token ids, or none of them")
             return TokenRollout(
-                trajectory=[r.token_ids for r in responses],
+                trajectory=None if staged else [r.token_ids for r in responses],
                 reward=reward,
-                logprobs=[r.logprobs for r in responses],
-                generation_mask=[
-                    [x >= r.prompt_length for x in range(len(r.token_ids))]
-                    for r in responses
-                ],
+                logprobs=(
+                    [r.logprobs for r in responses]
+                    if all(r.logprobs is not None for r in responses)
+                    else None
+                ),
+                generation_mask=(
+                    None
+                    if staged
+                    else [
+                        [x >= r.prompt_length for x in range(len(r.token_ids))]
+                        for r in responses
+                    ]
+                ),
                 env_id=self.env_id,
                 problem_id=problem_id,
                 completion_ids=[r.completion_id for r in responses],
@@ -221,8 +234,8 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
         assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+            request.inference_interface, (ReturnsRaw, ReturnsTokens)
+        ), "InferenceInterface must return raw text or tokens to provide rollouts."
 
         async def _single_rollout() -> Rollout:
             params = await self.prepare_group_rollout(request)
@@ -262,6 +275,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             response=response.response,
             reward=await self.get_reward(response_text, golden, response.finish_reason),
             problem_id=golden['problem_id'] if 'problem_id' in golden else None,
+            completion_ids=[response.completion_id] if response.completion_id else [],
         )
 
         return RewardOnlyEvaluationResponse(results=[result], env_id=self.env_id)

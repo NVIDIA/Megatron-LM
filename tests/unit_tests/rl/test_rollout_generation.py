@@ -63,10 +63,15 @@ async def test_megatron_local_preserves_explicit_greedy_temperature(
         generation_args={"temperature": temperature},
     )
 
-    await server.base_generate(request)
+    response = await server.base_generate(request)
 
     client.chat.completions.create.assert_awaited_once()
-    assert client.chat.completions.create.await_args.kwargs["temperature"] == expected_temperature
+    kwargs = client.chat.completions.create.await_args.kwargs
+    assert kwargs["temperature"] == expected_temperature
+    # Token ids and log probs are staged with the engine and joined by rank 0, not replied.
+    assert "return_tokenized_data" not in kwargs["extra_body"]
+    assert (response.token_ids, response.prompt_length, response.logprobs) == (None, None, None)
+    assert response.completion_id == "completion-id"
 
 
 class MockInferenceInterface(ReturnsRaw):
@@ -145,11 +150,13 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
 
 
 class FilteringMockGenerator(MockGenerator):
-    """Mock generator whose first `num_degenerate` prepared groups have zero reward variance."""
+    """Mock generator whose first `num_degenerate` prepared groups have zero reward variance;
+    with `token_rollouts` it emits token rollouts carrying one completion id per turn."""
 
-    def __init__(self, num_degenerate=0, **kwargs):
+    def __init__(self, num_degenerate=0, token_rollouts=False, **kwargs):
         super().__init__(**kwargs)
         self.num_degenerate = num_degenerate
+        self.token_rollouts = token_rollouts
 
     async def prepare_group_rollout(self, request):
         idx = self._call_count
@@ -160,7 +167,15 @@ class FilteringMockGenerator(MockGenerator):
 
         async def build_rollout(episode):
             rollout = await base_build(episode)
-            rollout.reward = 0.0 if degenerate else float(next(rollout_counter))
+            member = next(rollout_counter)
+            rollout.reward = 0.0 if degenerate else float(member)
+            if self.token_rollouts:
+                return TokenRollout(
+                    trajectory=[[idx]],
+                    reward=rollout.reward,
+                    env_id=rollout.env_id,
+                    completion_ids=[f"cc-{idx}-{member}"],
+                )
             return rollout
 
         return GroupRolloutParams(run_episode=params.run_episode, build_rollout=build_rollout)
@@ -448,7 +463,7 @@ class TestGroupedRollouts:
         parallel_generation_tasks,
     ):
         num_groups = 4
-        gen = FilteringMockGenerator(num_degenerate=num_degenerate)
+        gen = FilteringMockGenerator(num_degenerate=num_degenerate, token_rollouts=True)
         request = GroupedRolloutRequest(
             num_groups=num_groups,
             rollouts_per_group=2,
@@ -483,6 +498,9 @@ class TestGroupedRollouts:
             # Every dropped group cost exactly one extra prepare (no under-delivery).
             assert gen.prepare_group_rollout_calls == expected_count + num_degenerate
             assert pipeline.filtered_count == num_degenerate
+            # Dropped groups hand over their turns' completion ids once, for the ledger pops.
+            assert len(pipeline.take_dropped_completion_ids()) == 2 * num_degenerate
+            assert pipeline.take_dropped_completion_ids() == []
 
     @pytest.mark.asyncio
     async def test_pending_regeneration_does_not_block_delivery(self):
@@ -1108,14 +1126,20 @@ class TestGroupedRollouts:
 
 
 def make_response(
-    prompt_length, total_len, content="resp", finish_reason="stop", completion_id=None
+    prompt_length,
+    total_len,
+    content="resp",
+    finish_reason="stop",
+    completion_id=None,
+    with_logprobs=True,
+    with_tokens=True,
 ):
     return InferenceResponse(
         response=LLMChatMessage(role="assistant", content=content),
         raw_text=content,
-        token_ids=list(range(total_len)),
-        prompt_length=prompt_length,
-        logprobs=[0.0] * (total_len - prompt_length),
+        token_ids=list(range(total_len)) if with_tokens else None,
+        prompt_length=prompt_length if with_tokens else None,
+        logprobs=[0.0] * (total_len - prompt_length) if with_logprobs else None,
         finish_reason=finish_reason,
         completion_id=completion_id,
     )
@@ -1144,11 +1168,17 @@ class ScriptedInterface(ReturnsTokens, ReturnsRaw):
     maps to a response spec, so it stays deterministic under pipeline concurrency."""
 
     by_prompt_length: dict = Field(default_factory=dict)
+    with_logprobs: bool = True
+    with_tokens: bool = True
     seen_conversations: list = Field(default_factory=list)
 
     async def agenerate(self, request):
         self.seen_conversations.append(list(request.prompt))
-        return make_response(**self.by_prompt_length[len(request.prompt)])
+        return make_response(
+            **self.by_prompt_length[len(request.prompt)],
+            with_logprobs=self.with_logprobs,
+            with_tokens=self.with_tokens,
+        )
 
 
 class EpisodeAgent(RewardOnlyAgent):
@@ -1186,6 +1216,11 @@ class EpisodeAgent(RewardOnlyAgent):
 
 class TestMultiTurnEpisode:
 
+    @pytest.mark.parametrize(
+        "with_tokens, with_logprobs",
+        [(True, True), (True, False), (False, False)],
+        ids=["inline", "inline_tokens_ledger_logprobs", "staged"],
+    )
     @pytest.mark.parametrize("driver", ["reward_rollouts", "pipeline"])
     @pytest.mark.parametrize(
         "max_turns, done_at_turn, scripted, expected",
@@ -1225,11 +1260,15 @@ class TestMultiTurnEpisode:
         ],
     )
     @pytest.mark.asyncio
-    async def test_run_episode(self, driver, max_turns, done_at_turn, scripted, expected):
+    async def test_run_episode(
+        self, with_tokens, with_logprobs, driver, max_turns, done_at_turn, scripted, expected
+    ):
         """Episodes grow the conversation each turn and collapse into one per-turn rollout,
         identically through get_reward_rollouts and through the real _RolloutPipeline
         (get_grouped_rollouts) -- the latter proving run_episode runs in the infer stage."""
-        iface = ScriptedInterface(by_prompt_length=scripted)
+        iface = ScriptedInterface(
+            by_prompt_length=scripted, with_logprobs=with_logprobs, with_tokens=with_tokens
+        )
         agent = EpisodeAgent(max_turns=max_turns, done_at_turn=done_at_turn)
 
         if driver == "reward_rollouts":
@@ -1261,8 +1300,13 @@ class TestMultiTurnEpisode:
         assert rollout.problem_id == "p0"
         # Per-turn backend response ids ride onto the rollout for the ledger join.
         assert rollout.completion_ids == expected["completion_ids"]
-        # One trajectory entry per generated turn.
-        assert len(rollout.trajectory) == len(expected["genmask_sums"])
+        if with_tokens:
+            # One trajectory entry per generated turn.
+            assert len(rollout.trajectory) == len(expected["genmask_sums"])
+        else:
+            # Staged payloads: rank 0 rebuilds the turns from the records; nothing rides inline.
+            assert (rollout.trajectory, rollout.generation_mask) == (None, None)
+            assert not rollout.is_placeholder
         # Each turn's inference request = prior conversation (reply + observation appended).
         assert [[m.role for m in conv] for conv in iface.seen_conversations] == expected[
             "seen_roles"
@@ -1270,7 +1314,13 @@ class TestMultiTurnEpisode:
         # Default trajectory reward scores only the final response.
         assert agent.rewarded == expected["rewarded"]
         # Per-turn generation masks cover exactly each turn's generated tokens.
-        assert [sum(mask) for mask in rollout.generation_mask] == expected["genmask_sums"]
+        if with_tokens:
+            assert [sum(mask) for mask in rollout.generation_mask] == expected["genmask_sums"]
+        # Per-turn log probs ride inline only when the interface returned them; otherwise the
+        # rollout carries None and the finished-request ledger backfill owns them.
+        assert rollout.logprobs == (
+            [[0.0] * n for n in expected["genmask_sums"]] if with_logprobs else None
+        )
         # get_observation is consulted only when another generation is still possible -- never on
         # the final allowed turn.
         assert agent.observation_turns == expected["observation_turns"]
