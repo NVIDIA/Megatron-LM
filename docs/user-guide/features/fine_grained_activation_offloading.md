@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"shortcut_post_norm"`, and `"gdn_qkv"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`. `gdn_qkv` applies to Gated DeltaNet layers (`gdn` or `gdn2`).
 
 ## User Guide
 
@@ -24,7 +24,7 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm", "gdn_qkv".
 --offload-modules core_attn attn_proj expert_fc1
 ```
 
@@ -43,6 +43,7 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
+| `gdn_qkv` | Causal conv and q/k/v preparation in Gated DeltaNet | `gdn`/`gdn2` only; not with `gdn_pre_gated_delta_rule_fusion` or `gdn_in_proj` recompute |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the

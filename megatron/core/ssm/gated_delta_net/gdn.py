@@ -21,7 +21,6 @@ from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
-    a2a_cp_to_hp,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -220,20 +219,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
-
-        qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
-            qkvzba,
-            self.in_proj_split_sections,
-            self.cp_size,
-            self.pg_collection.cp,
-            cu_seqlens_q,
-            seq_len,
-            packed_seq_params,
+        # Input projection and CP-to-HP all-to-all (optionally recomputed: gdn_in_proj)
+        qkvzba, thd_cp_a2a_inv, in_proj_checkpoint = self._project_input(
+            hidden_states, cu_seqlens_q, seq_len, packed_seq_params
         )
+        qkv_checkpoint = None
+        qkv_offload = None
 
         if self.gdn_pre_gated_delta_rule_fusion:
             nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
@@ -253,10 +244,24 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
-            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba, batch, seq_len, self.cp_size, self.pg_collection.cp, cu_seqlens_q
+            # Transpose: s b x --> b s x (sbhd to bshd), then split into the conv input
+            # (qkv), the output gate (z), and the beta/alpha gate features.
+            qkv, gate, beta, alpha = self._split_projection(qkvzba.transpose(0, 1), batch, seq_len)
+            # Causal conv and q/k/v preparation (optionally recomputed / offloaded: gdn_qkv)
+            (query, key, value), qkv_checkpoint, qkv_offload = (
+                self._conv_and_prepare_qkv_maybe_recompute(qkv, batch, cu_seqlens_q)
             )
-            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
+            gate_inputs = self._prepare_gates_for_gated_delta_rule(
+                gate,
+                get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp),
+                get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp),
+                batch,
+                seq_len,
+                beta,
+                alpha,
+            )
+            gate = gate_inputs.pop("gate")
+            kernel_inputs = {"q": query, "k": key, "v": value, **gate_inputs}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
@@ -268,6 +273,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        core_attn_out = self._finish_core_attn(
+            core_attn_out, in_proj_checkpoint, qkv_checkpoint, qkv_offload
+        )
 
         if self.recompute_norm_out:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -477,51 +485,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
 
         # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
+        qkv = self._causal_conv_qkv(qkv, cp_size, cp_group, cu_seqlens_q)
         seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=cp_group,
-                split_sections=qkv_channels_split_sections,
-            )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
-        nvtx_range_pop(suffix="conv1d")
 
         A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group)
         dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group)

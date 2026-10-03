@@ -9,17 +9,21 @@
 
 import logging
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Callable, Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -272,8 +276,15 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
+        self.recompute_in_proj = False
+        self.recompute_qkv = False
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_in_proj = "gdn_in_proj" in self.config.recompute_modules
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
+        self.offload_gdn_qkv = bool(self.config.fine_grained_activation_offloading) and (
+            "gdn_qkv" in (self.config.offload_modules or [])
+        )
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -408,7 +419,6 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         y = y.to(x_dtype)
         return y
 
-    @jit_fuser
     def _prepare_input_for_gated_delta_rule(
         self,
         qkv: torch.Tensor,
@@ -422,14 +432,31 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         """
         Prepare all gated delta rule kernel inputs.
 
-        Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
-        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
+        Combines :meth:`_prepare_qkv_for_gated_delta_rule` (split, reshape, L2 norm,
+        repeat_interleave of q/k/v) with :meth:`_prepare_gates_for_gated_delta_rule`
+        (decay/gate activations). ``gate_feats`` holds the variant-specific in_proj
         sections, which ``_compute_gates`` turns into the decay and gating tensors.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
+        """
+        query, key, value = self._prepare_qkv_for_gated_delta_rule(qkv, batch, seq_len)
+        gate_inputs = self._prepare_gates_for_gated_delta_rule(
+            gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, *gate_feats
+        )
+        return {"q": query, "k": key, "v": value, **gate_inputs}
+
+    @jit_fuser
+    def _prepare_qkv_for_gated_delta_rule(
+        self, qkv: torch.Tensor, batch: int, seq_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the convolved ``qkv`` into contiguous query, key, and value kernel inputs.
+
+        Applies the optional L2 norm to query and key and expands them for grouped value
+        heads. This is the part of the kernel-input preparation that ``gdn_qkv``
+        recomputes together with the causal convolution.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
@@ -456,19 +483,205 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
 
+        return query.contiguous(), key.contiguous(), value.contiguous()
+
+    @jit_fuser
+    def _prepare_gates_for_gated_delta_rule(
+        self,
+        gate: torch.Tensor,
+        A_log_local_cp: torch.Tensor,
+        dt_bias_local_cp: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        *gate_feats: tuple[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Compute the decay and variant gates, and make the output gate (z) contiguous.
+
+        Returns:
+            (dict[str, Tensor]): ``g`` and the variant-specific gates keyed by kernel
+            argument name, plus the output gate under the ``gate`` key.
+        """
         g, variant_kernel_inputs = self._compute_gates(
             A_log_local_cp, dt_bias_local_cp, batch, seq_len, *gate_feats
         )
+        return {"g": g.contiguous(), "gate": gate.contiguous(), **variant_kernel_inputs}
 
-        kernel_inputs = {
-            "q": query.contiguous(),
-            "k": key.contiguous(),
-            "v": value.contiguous(),
-            "g": g.contiguous(),
-            "gate": gate.contiguous(),
-            **variant_kernel_inputs,
-        }
-        return kernel_inputs
+    def _causal_conv_qkv(
+        self,
+        qkv: torch.Tensor,
+        cp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply the depthwise causal convolution and activation to ``qkv`` in bshd layout."""
+        nvtx_range_push(suffix="conv1d")
+        seq_len = qkv.shape[1]
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=cp_group,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        if self.config.deterministic_mode:
+            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+            conv_out = F.conv1d(
+                input=qkv,  # Torch-native only accept [b, d, s] format input
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+        else:
+            assert self.activation in ["silu", "swish"]
+            qkv, _ = causal_conv1d(
+                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                bias=conv1d_bias,
+                activation=self.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens_q,
+            )
+        nvtx_range_pop(suffix="conv1d")
+        return qkv
+
+    def _conv_and_prepare_qkv(
+        self,
+        qkv: torch.Tensor,
+        batch: int,
+        cp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Causal conv plus q/k/v preparation: the unit ``gdn_qkv`` recomputes and offloads."""
+        qkv = self._causal_conv_qkv(qkv, cp_size, cp_group, cu_seqlens_q)
+        nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
+        outputs = self._prepare_qkv_for_gated_delta_rule(qkv, batch, qkv.shape[1])
+        nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
+        return outputs
+
+    def _in_proj_and_a2a(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens_q: Optional[torch.Tensor],
+        seq_len: int,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Input projection followed by the context-parallel to hidden-parallel all-to-all."""
+        nvtx_range_push(suffix="in_proj")
+        projected, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+        return a2a_cp_to_hp(
+            projected,
+            self.in_proj_split_sections,
+            self.cp_size,
+            self.pg_collection.cp,
+            cu_seqlens_q,
+            seq_len,
+            packed_seq_params,
+        )
+
+    def _project_input(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens_q: Optional[torch.Tensor],
+        seq_len: int,
+        packed_seq_params: Optional[PackedSeqParams],
+    ):
+        """Run :meth:`_in_proj_and_a2a`, optionally under ``gdn_in_proj`` recomputation.
+
+        Returns:
+            The hidden-parallel projection, the THD inverse permutation for
+            :func:`a2a_hp_to_cp` (or ``None``), and the ``CheckpointWithoutOutput`` to
+            discard once the projection's consumers have run (``None`` without recompute).
+        """
+        if not self.recompute_in_proj:
+            projected, thd_cp_a2a_inv = self._in_proj_and_a2a(
+                hidden_states, cu_seqlens_q, seq_len, packed_seq_params
+            )
+            return projected, thd_cp_a2a_inv, None
+
+        # Checkpoint the input projection and the CP all-to-all, discard the projection
+        # after the conv, gates, and output gate have consumed it, and rematerialize it in
+        # the backward pass. Only the (much smaller) hidden_states input is kept.
+        # The THD inverse permutation is an integer index tensor that depends only on
+        # cu_seqlens; it is captured from the forward run rather than returned, so that
+        # the checkpoint's only output is the tensor it discards.
+        a2a_context = {}
+
+        def run(hidden_states):
+            projected, a2a_context["thd_cp_a2a_inv"] = self._in_proj_and_a2a(
+                hidden_states, cu_seqlens_q, seq_len, packed_seq_params
+            )
+            return projected
+
+        # As in GatedDeltaProductMixer: the only quantized op being replayed is in_proj.
+        quantization = self.config.fp8 or self.config.fp4
+        in_proj_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
+        projected = in_proj_checkpoint.checkpoint(run, hidden_states)
+        return projected, a2a_context["thd_cp_a2a_inv"], in_proj_checkpoint
+
+    def _conv_and_prepare_qkv_maybe_recompute(
+        self, qkv: torch.Tensor, batch: int, cu_seqlens_q: Optional[torch.Tensor]
+    ):
+        """Run :meth:`_conv_and_prepare_qkv`, optionally under ``gdn_qkv`` recompute/offload.
+
+        Returns:
+            ``(query, key, value)``, the ``CheckpointWithoutOutput`` to discard once the
+            gated delta rule has consumed them (or ``None``), and the offload interface
+            whose group is committed downstream of the gated delta rule.
+        """
+        qkv_offload = off_interface(self.offload_gdn_qkv, qkv, "gdn_qkv")
+        qkv_checkpoint = None
+        with qkv_offload as qkv:
+            conv_and_prepare = partial(
+                self._conv_and_prepare_qkv,
+                batch=batch,
+                cp_size=self.cp_size,
+                cp_group=self.pg_collection.cp,
+                cu_seqlens_q=cu_seqlens_q,
+            )
+            if self.recompute_qkv:
+                qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                query, key, value = qkv_checkpoint.checkpoint(conv_and_prepare, qkv)
+            else:
+                query, key, value = conv_and_prepare(qkv)
+        return (query, key, value), qkv_checkpoint, qkv_offload
+
+    def _finish_core_attn(
+        self, core_attn_out: torch.Tensor, in_proj_checkpoint, qkv_checkpoint, qkv_offload
+    ) -> torch.Tensor:
+        """Discard recomputed activations and commit the ``gdn_qkv`` offload group.
+
+        The recompute hooks go on the raw gated-delta-rule output, so they run as soon as
+        its gradient is available and before any backward that reads the discarded
+        tensors: the input projection first (it restores the conv input that the q/k/v
+        recompute reads), then q/k/v. The offload group is committed on a tensor
+        downstream of that output, so its reload completes before those hooks run.
+        """
+        if in_proj_checkpoint is not None:
+            in_proj_checkpoint.discard_output_and_register_recompute(core_attn_out)
+        if qkv_checkpoint is not None:
+            qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
+        if qkv_offload is None:
+            return core_attn_out
+        return qkv_offload.group_offload(core_attn_out, forced_released_tensors=[])
 
     def _compute_gates(
         self,
