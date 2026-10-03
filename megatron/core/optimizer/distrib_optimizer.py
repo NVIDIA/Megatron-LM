@@ -417,12 +417,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 assert param.requires_grad
                 world_param_group_map[param] = group_index
 
-        # Optimizer group ranges & param-group mapping.
-        # - Build a mapping from groups to their contained parameters, and also
-        #   from parameters to their containing group index and order within
-        #   the group. The group index and order are particularly important for
-        #   saving and loading checkpoints.
-        local_param_group_map = {}
+        # Collect each group's local model parameters in buffer traversal order.
+        # The final optimizer parameter order is established when main parameter
+        # shards are constructed, so parameter indices cannot be assigned here.
         group_ranges = [{"params": []} for _ in param_groups]
         for gbuf_range_map in gbuf_ranges:
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_map.items():
@@ -431,14 +428,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         group_index = world_param_group_map[param]
                         group_range = group_ranges[group_index]
                         group_range["params"].append(param)
-                        local_param_group_map[param] = (group_index, len(group_range["params"]) - 1)
 
         # Squeeze zero-size group ranges.
         for group_index, group_range in enumerate(group_ranges):
             group_range["orig_group"] = param_groups[group_index]
             group_range["orig_group_idx"] = param_groups[group_index]
 
-        return local_param_group_map, group_ranges
+        return group_ranges
 
     @classmethod
     def _build_model_and_main_param_groups(
@@ -870,8 +866,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param.main_param_sharded = True
 
         # Optimizer ranges.
-        self.model_param_group_index_map, self.opt_group_ranges = (
-            self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
+        self.opt_group_ranges = self._build_optimizer_group_ranges(
+            self.optimizer.param_groups, self.gbuf_ranges
         )
 
         # Allocate main param shards.
@@ -884,6 +880,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
+
+        # Build the checkpoint lookup only after main parameter construction has
+        # established the optimizer order: FP32 shards, then FP16/BF16-derived shards.
+        # Buffer traversal order can differ when a group contains both model dtypes.
+        self.model_param_group_index_map = {
+            model_param: (group_index, group_order)
+            for group_index, (fp32_params, float16_params) in enumerate(
+                zip(self.model_fp32_groups, self.model_float16_groups)
+            )
+            for group_order, model_param in enumerate(fp32_params + float16_params)
+        }
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
