@@ -60,7 +60,6 @@ def create_test_args():
     args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
-    args.perform_rl_step = False
     args.phase_transition_iterations = None
 
     return args
@@ -127,7 +126,7 @@ class TestTraining:
         args = create_test_args()
         set_args(args)
 
-    def test_build_train_valid_test_data_iterators(self):
+    def test_build_train_valid_test_data_iterators(self, run_config):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
@@ -152,7 +151,7 @@ class TestTraining:
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
 
-    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets args.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
