@@ -365,12 +365,16 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
 
 
 @pytest.mark.parametrize("S", [1, 4])
-def test_gdp_decode_prepare_replays(S):
+@pytest.mark.parametrize(
+    "n,M,H,G,P,N",
+    [(256, 2, 16, 4, 128, 128), (32, 3, 32, 8, 64, 128)],
+    ids=["stress", "gb200_800m"],
+)
+def test_gdp_decode_prepare_replays(S, n, M, H, G, P, N):
     """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
     from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
 
     seeded()
-    n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
     x = torch.randn(n, S, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
     # `ba` reaches the kernel as a slice of the input projection, so only its last
     # dimension is contiguous and the token stride comes from the view, not the width.

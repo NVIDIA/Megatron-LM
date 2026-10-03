@@ -142,10 +142,13 @@ def gdp_decode_prepare_kernel(
 
     # The decay is per token, not per copy, and belongs on the *first* copy: the
     # state decays once per step, before the M Householder updates.
-    b_a = tl.load(p_ba + M * H + i_h).to(tl.float32)
-    b_dt = tl.load(dt_bias + i_h).to(tl.float32)
-    b_A = tl.load(A_log + i_h).to(tl.float32)
-    b_g = tl.where(i_m == 0, -libdevice.exp(b_A) * softplus(b_a + b_dt), 0.0)
+    if i_m == 0:
+        b_a = tl.load(p_ba + M * H + i_h).to(tl.float32)
+        b_dt = tl.load(dt_bias + i_h).to(tl.float32)
+        b_A = tl.load(A_log + i_h).to(tl.float32)
+        b_g = -libdevice.exp(b_A) * softplus(b_a + b_dt)
+    else:
+        b_g = 0.0
     tl.store(g + i_o, b_g)
 
 

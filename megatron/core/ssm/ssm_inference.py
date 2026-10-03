@@ -232,9 +232,9 @@ class SSMDynamicInferenceMixin:
                     f"({decode_token_count}) than the input projection contains "
                     f"({zxBCdt.shape[0]})."
                 )
-                zxBCdt_decode = zxBCdt[:decode_token_count]
-            else:
-                zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
+            # Global batch-invariant GEMM can pad token rows even when this
+            # context's SSM batch-invariant mode is disabled.
+            zxBCdt_decode = zxBCdt[:decode_token_count]
             # Reshape from [N*S, 1, d] to [N, S, d] for the decode kernels.
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
             y_decode = self.ssm_decode(
@@ -246,7 +246,8 @@ class SSMDynamicInferenceMixin:
                 intermediate_ssm_state=int_ssm_state,
             )
             # Flatten back to [N*S, 1, d] to match the merge logic.
-            y_decode = y_decode.view(decode_token_count, 1, -1)
+            # GDP can return a transposed, non-contiguous tensor when S > 1.
+            y_decode = y_decode.reshape(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
         if prefill_req_count > 0:
@@ -280,16 +281,16 @@ class SSMDynamicInferenceMixin:
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
 
-        if context.batch_invariant_mode:
-            # Restore the projection's token-only padding before the output projection.
-            # Its row count can be TP-local, unlike the context's global token count.
-            padding_token_count = zxBCdt.shape[0] - y.shape[0]
-            assert padding_token_count >= 0, (
-                "Batch-invariant SSM produced more token rows "
-                f"({y.shape[0]}) than the input projection contained ({zxBCdt.shape[0]})."
-            )
-            if padding_token_count > 0:
-                y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
+        # Restore the projection's token-only padding before the output projection.
+        # Global batch-invariant GEMM can add it without SSM batch-invariant mode.
+        # Its row count can be TP-local, unlike the context's global token count.
+        padding_token_count = zxBCdt.shape[0] - y.shape[0]
+        assert padding_token_count >= 0, (
+            "Dynamic SSM produced more token rows "
+            f"({y.shape[0]}) than the input projection contained ({zxBCdt.shape[0]})."
+        )
+        if padding_token_count > 0:
+            y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
         if is_using_quantization_scales(self.config):
