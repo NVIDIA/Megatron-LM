@@ -41,6 +41,7 @@ from megatron.core.transformer.residual_recompute import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -1455,27 +1456,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             moe_kwargs["input_ids"] = input_ids
 
         if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
-                # import here to avoid circular import
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                mlp_output_with_bias = te_checkpoint(
-                    apply_module(self.mlp),
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
-                    **moe_kwargs,
-                )
-            else:
-                mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(
-                        apply_module(self.mlp), padding_mask=padding_mask, **moe_kwargs
-                    ),
-                    False,
-                    pre_mlp_layernorm_output,
-                )
+            mlp_output_with_bias = precision_aware_checkpoint(
+                apply_module(self.mlp),
+                self.config,
+                self.pg_collection.tp,
+                pre_mlp_layernorm_output,
+                padding_mask=padding_mask,
+                **moe_kwargs,
+            )
         elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
             # Chunk input along sequence dimension
             num_chunks = min(
@@ -2839,28 +2827,14 @@ class MoETransformerLayer(TransformerLayer):
             )
 
             if self.moe_layer_recompute:
-                if self.config.fp8 or self.config.fp4:
-                    from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                    result = te_checkpoint(
-                        _forward_mlp_partial_cudagraphs,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        self.pg_collection.tp,
-                        hidden_states,
-                        padding_mask=padding_mask,
-                        input_ids=input_ids,
-                    )
-                else:
-                    result = tensor_parallel.checkpoint(
-                        functools.partial(
-                            _forward_mlp_partial_cudagraphs,
-                            padding_mask=padding_mask,
-                            input_ids=input_ids,
-                        ),
-                        False,
-                        hidden_states,
-                    )
+                result = precision_aware_checkpoint(
+                    _forward_mlp_partial_cudagraphs,
+                    self.config,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                )
             else:
                 result = _forward_mlp_partial_cudagraphs(
                     hidden_states, padding_mask=padding_mask, input_ids=input_ids
