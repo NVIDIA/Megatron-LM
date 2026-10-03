@@ -744,15 +744,6 @@ class MTPLossLoggingHelper:
         MTPLossLoggingHelper.clean_metrics_in_tracker()
 
 
-def _mtp_logits_are_vocab_sharded(
-    output_layer: Callable, runtime_gather_output: Optional[bool]
-) -> bool:
-    """Return whether MTP logits are still vocab-sharded across tensor-parallel ranks."""
-    if runtime_gather_output is not None:
-        return not runtime_gather_output
-    return not getattr(output_layer, "gather_output", False)
-
-
 def _vocab_parallel_argmax(
     vocab_parallel_logits: Tensor, tp_group: torch.distributed.ProcessGroup, tp_size: int
 ) -> Tensor:
@@ -778,18 +769,12 @@ def _compute_mtp_acceptance_counts(
     mtp_logits: Tensor,
     mtp_labels: Tensor,
     loss_mask: Tensor,
-    output_layer: Callable,
-    runtime_gather_output: Optional[bool],
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[Tensor, Tensor]:
     """Compute MTP acceptance correct/total counts."""
     with torch.no_grad():
-        logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(
-            output_layer, runtime_gather_output
-        )
         if (
             tp_group is None
-            and logits_are_vocab_sharded
             and parallel_state.is_initialized()
             and parallel_state.get_tensor_model_parallel_world_size() > 1
         ):
@@ -799,9 +784,7 @@ def _compute_mtp_acceptance_counts(
             )
         tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
 
-        # Apply TP rank offsets only when logits are vocab-sharded; gathered logits already
-        # contain global vocab ids in their last dimension.
-        if tp_group is not None and tp_size > 1 and logits_are_vocab_sharded:
+        if tp_size > 1:
             preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
         else:
             preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
@@ -1076,7 +1059,6 @@ def process_mtp_loss(
     loss_mask: Optional[Tensor],
     output_layer: Callable,
     output_weight: Optional[Tensor],
-    runtime_gather_output: Optional[bool],
     is_training: bool,
     compute_language_model_loss: Callable,
     config: TransformerConfig,
@@ -1100,7 +1082,6 @@ def process_mtp_loss(
         loss_mask (Optional[Tensor]): Mask for loss computation. If None, uses all ones.
         output_layer (Callable): Output layer method to compute logits.
         output_weight (Optional[Tensor]): Optional output weight for shared embeddings.
-        runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
         is_training (bool): Whether the model is in training mode.
         compute_language_model_loss (Callable): Method to compute language model loss.
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
@@ -1182,22 +1163,17 @@ def process_mtp_loss(
         mtp_logits, _ = output_layer(
             hidden_states_list[mtp_layer_number + 1],
             weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
+            runtime_gather_output=False,
         )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         if is_observing_tensor("mtp_logits"):
-            gather_output = (
-                getattr(output_layer, "gather_output")
-                if runtime_gather_output is None
-                else runtime_gather_output
-            )
             observe_tensor(
                 output_layer,
                 f"mtp_logits.{mtp_layer_number}",
                 "mtp_logits",
                 mtp_logits,
-                tp_shard_dim=None if gather_output else -1,
+                tp_shard_dim=-1,
                 sequence_dim=0,
                 batch_dim=1,
             )
@@ -1252,12 +1228,7 @@ def process_mtp_loss(
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
             correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits,
-                mtp_labels,
-                layer_loss_mask,
-                output_layer,
-                runtime_gather_output,
-                tp_group,
+                mtp_logits, mtp_labels, layer_loss_mask, tp_group=tp_group
             )
 
             if metric_avg_group is None:
