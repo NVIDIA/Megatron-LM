@@ -25,6 +25,7 @@ from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
@@ -1574,6 +1575,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            padding_mask (torch.Tensor, optional): Padding flags of shape [b, s/tp] with
+                sequence parallelism, otherwise [b, s]. True marks padding.
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
@@ -1613,14 +1616,34 @@ class MultiTokenPredictionLayer(MegatronModule):
             return_sum=False,
         )
         if padding_mask is not None:
-            padding_mask, _ = roll_tensor(
-                padding_mask,
+            # GPT has already SP-sharded this mask. Reconstruct the CP-local
+            # sequence before rolling so TP boundaries are not mistaken for ends
+            # and packed/CP metadata still describes the tensor being shifted.
+            if self.config.sequence_parallel:
+                padding_mask = gather_from_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=self.tp_group,
+                ).transpose(0, 1)
+            # roll_tensor zero-fills sequence ends. Roll validity so these new
+            # positions remain padding (True), including packed/CP boundaries.
+            valid_mask, _ = roll_tensor(
+                ~padding_mask,
                 shifts=-1,
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
+            padding_mask = ~valid_mask
+            if self.config.sequence_parallel:
+                padding_mask = (
+                    scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -2218,6 +2241,7 @@ class MultiTokenPredictionInputs:
     loss_mask: Optional[Tensor]
     mtp_input_mask: Optional[Tensor]
     packed_seq_params: Optional[PackedSeqParams]
+    padding_mask: Optional[Tensor] = None
 
 
 def _get_mtp_block_submodules(
@@ -2381,8 +2405,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_input_mask: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         cp_batch: Optional[ContextParallelBatch],
+        padding_mask: Optional[Tensor] = None,
     ) -> MultiTokenPredictionInputs:
-        """Prepare activations and token-aligned inputs for the MTP block's CP layout."""
+        """Prepare MTP inputs, including the batch-major, optionally SP-sharded padding mask."""
         source_layout = (
             cp_batch.boundary_layout if cp_batch is not None else self.config.linear_cp_layout
         )
@@ -2426,6 +2451,23 @@ class MultiTokenPredictionBlock(MegatronModule):
                     self.tp_cp_group,
                     cp_batch.thd_plan,
                 )
+            if padding_mask is not None:
+                # Convert validity so any new THD padding slots (zero-filled by
+                # layout conversion) remain excluded from routing.
+                padding_mask = (
+                    ~convert_cp_layout(
+                        (~padding_mask).transpose(0, 1).contiguous(),
+                        source_layout,
+                        target_layout,
+                        self.cp_group,
+                        self.sequence_parallel,
+                        self.tp_group,
+                        self.tp_cp_group,
+                        cp_batch.thd_plan,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
             packed_seq_params = cp_batch.get_packed_seq_params(target_layout)
             layout_batch = cp_batch.get_batch(target_layout)
             input_ids = layout_batch["tokens"]
@@ -2443,6 +2485,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             loss_mask=loss_mask,
             mtp_input_mask=mtp_input_mask,
             packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
 
     def _build_layers(self, pg_collection):
@@ -2615,6 +2658,19 @@ class MultiTokenPredictionBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
+                if padding_mask is not None:
+                    # Precomputed embeddings bypass the layer's _get_embeddings,
+                    # so shift validity here alongside those embeddings.
+                    valid_mask, _ = roll_tensor_precomputed_embeddings(
+                        (~padding_mask).transpose(0, 1).contiguous(),
+                        shifts=-1,
+                        dims=0,
+                        sp_group=self.tp_group if self.sequence_parallel else None,
+                        cp_group=self.cp_group,
+                        packed_seq_params=packed_seq_params,
+                        return_sum=False,
+                    )
+                    padding_mask = ~valid_mask.transpose(0, 1).contiguous()
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.
