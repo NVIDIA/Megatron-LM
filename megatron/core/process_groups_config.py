@@ -168,6 +168,14 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Gloo mirrors of the two groups the distributed optimizer needs for checkpoint I/O.
+    # May be None when the job was built without Gloo groups (including GTP remat jobs).
+    # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    intra_dp_cp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
+
+    # _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    intra_expt_dp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
+
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
@@ -291,6 +299,17 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 with_gtp_remat=False,
                 partial_expert_data_parallel=True,
+            ),
+            'intra_dp_cp_gloo': partial(
+                parallel_state.get_data_parallel_group_gloo,
+                with_context_parallel=True,
+                partial_data_parallel=True,
+                check_initialized=False,
+            ),
+            'intra_expt_dp_gloo': partial(
+                parallel_state.get_expert_data_parallel_group_gloo,
+                partial_expert_data_parallel=True,
+                check_initialized=False,
             ),
             'inter_dist_opt': partial(
                 parallel_state.get_inter_distributed_optimizer_instance_group,
@@ -502,13 +521,16 @@ class ProcessGroupCollection:
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
-                    intra_dist_opt_group = None
+                    # Megatron-FSDP leaves ddp_config.use_distributed_optimizer False but still
+                    # reduces gradient statistics over this group when OptimizerConfig enables
+                    # the distributed optimizer, so pass it through like the parallel_state path.
+                    intra_dist_opt_group = pg_set.get('intra_dist_opt')
             else:
                 # No ddp_config available - use simple fallback
                 intra_dp_cp_group = dp_cp_group
                 intra_expt_dp_group = expt_dp_group
                 inter_dist_opt_group = None
-                intra_dist_opt_group = None
+                intra_dist_opt_group = pg_set.get('intra_dist_opt')
 
             # 5. Model communication groups
             if 'mp' not in pg_set:
@@ -538,14 +560,23 @@ class ProcessGroupCollection:
             gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
             expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
 
-            # Gloo groups - not supported when pg_collection is provided
-            if use_gloo_process_groups:
-                raise ValueError(
-                    "Gloo process groups are not supported when pg_collection is "
-                    "provided. Please set use_gloo_process_groups to False."
-                )
-            intra_dp_cp_group_gloo = None
-            intra_expt_dp_group_gloo = None
+            # Gloo groups come from the collection. GTP_remat jobs build no Gloo groups (their
+            # optimizer uses DCP), so only those may enable Gloo without supplying the groups.
+            gtp_active = (gtp_remat_group is not None and gtp_remat_group.size() > 1) or (
+                expt_gtp_remat_group is not None and expt_gtp_remat_group.size() > 1
+            )
+            if use_gloo_process_groups and not gtp_active:
+                intra_dp_cp_group_gloo = vars(pg_collection).get('intra_dp_cp_gloo')
+                intra_expt_dp_group_gloo = vars(pg_collection).get('intra_expt_dp_gloo')
+                if intra_dp_cp_group_gloo is None or intra_expt_dp_group_gloo is None:
+                    raise ValueError(
+                        "use_gloo_process_groups=True requires the intra_dp_cp_gloo and "
+                        "intra_expt_dp_gloo groups in pg_collection. Build the job with Gloo "
+                        "process groups or pass use_gloo_process_groups=False."
+                    )
+            else:
+                intra_dp_cp_group_gloo = None
+                intra_expt_dp_group_gloo = None
 
         return {
             'dp_group': dp_group,
