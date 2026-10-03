@@ -2675,6 +2675,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # NonGraphedMHAMetadata: use actual max values.
             max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
             max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
+            # A batch containing prefill has ragged query lengths, so never advertise
+            # max_seqlen_q == 1: FlashAttention-2 reads that as "one query token per sequence"
+            # and, under GQA, takes its `seqlenq_ngroups_swapped` path, reshaping q to
+            # [num_seqs, num_heads_k, ngroups, head_size]. That assumes total_q == num_seqs,
+            # which a ragged batch breaks. This replaces the old scheduling-side clamp in
+            # `_compute_prefix_match`, which forced effective_prefill_chunk_length >= 2 and so
+            # gave up prefix-cache reuse (and could round the skip down onto a block with no
+            # cached Mamba state). The bound is only a kernel-sizing upper bound, so raising it
+            # is safe. Left alone when prefill_req_count == 0: a pure decode batch is uniform,
+            # total_q == num_seqs genuinely holds, and the swap is a real win on the hot path --
+            # the same distinction the graphed branch below already makes.
+            if self.num_prefill_requests > 0:
+                max_seqlen_q = max(2, max_seqlen_q)
         else:
             # GraphedMHAMetadata: use conservative bounds.
             if self.padded_batch_dimensions.prefill_req_count == 0:
@@ -3254,39 +3267,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
-        # Clamp so that effective_prefill_chunk_length >= 2 when possible.
-        # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
-        # which routes the batch into the flash-attention decode kernel and crashes.
-        # Round down to a block boundary to keep block-table indexing consistent.
-        if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
-            max_skip = prefill_chunk_length - 2
-            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
-
-            # Rounding down can land on a block that has no cached Mamba state.
-            # add_request() restores from `prefix_skip_tokens // block_size - 1`
-            # unconditionally and, when `restore_to_live` misses, ZEROES the SSM
-            # state while still skipping the tokens -- the request then resumes
-            # mid-prompt from a zero state and produces a wrong (but internally
-            # coherent) distribution for its first generated token.
-            #
-            # Mamba boundaries are sparse: only the few positions selected in
-            # `compute_and_store_offsets` are cached, so the clamped boundary is
-            # frequently not one of them. A 5889-token prompt caches state only at
-            # block 22 (offset 5888), the clamp moves the skip to 5632, and the
-            # restore then targets block 21, which has none.
-            #
-            # Walk back to the nearest block that actually has cached state, the
-            # same way the `raw_skip >= prefill_chunk_length` branch above does.
-            if (
-                self.is_hybrid_model
-                and self.mamba_slot_allocator is not None
-                and finished == 0
-                and prefix_skip_tokens > 0
-            ):
-                usable = self._find_mamba_match_count(
-                    req=req, start_block=0, end_block=prefix_skip_tokens // self.block_size_tokens
-                )
-                prefix_skip_tokens = usable * self.block_size_tokens
+        # NOTE: a single-token prefill chunk (effective == 1) used to be clamped away here,
+        # because it makes max_seqlen_q == 1 and FlashAttention-2 then takes its
+        # `seqlenq_ngroups_swapped` path, which assumes total_q == num_seqs and raises when
+        # padding or zero-length rows break that. That is a kernel-interface constraint, so it
+        # is now enforced where the bound is published (`initialize_attention_state`) rather than
+        # by distorting scheduling. The clamp cost real prefix-cache reuse, and its block-aligned
+        # round-down could land on a block with no cached Mamba state -- `add_request` then
+        # ZEROED the SSM state while still skipping the tokens, resuming mid-prompt from a zero
+        # state and producing a wrong (but internally coherent) first generated token.
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(

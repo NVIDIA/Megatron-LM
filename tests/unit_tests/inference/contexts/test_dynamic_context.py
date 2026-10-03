@@ -161,6 +161,41 @@ class TestDynamicContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
+    def test_prefill_batch_never_advertises_max_seqlen_q_of_one(self):
+        """A ragged (prefill-containing) batch must not report max_seqlen_q == 1.
+
+        FlashAttention-2 reads max_seqlen_q == 1 as "one query token per sequence" and, under
+        GQA, takes its `seqlenq_ngroups_swapped` path, reshaping q to
+        [num_seqs, num_heads_k, ngroups, head_size]. That assumes total_q == num_seqs, which a
+        batch carrying padding or zero-length rows breaks, and the reshape raises. A pure decode
+        batch IS uniform, so the bound is left alone there and the optimization still applies.
+        """
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+        )
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
+            )
+        )
+        assert ctx.num_prefill_requests == 1
+        ctx.initialize_attention_state()
+        _, max_seqlen_q = ctx.cu_query_lengths()
+        assert max_seqlen_q >= 2, (
+            "a one-token prefill chunk advertised max_seqlen_q == 1; FA2 would take the "
+            "uniform-decode reshape on a ragged batch"
+        )
+
+    @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_initialize_dynamic_context(self, is_hybrid_model: bool):

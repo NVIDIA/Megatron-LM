@@ -1143,41 +1143,40 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
 
     @pytest.mark.internal
-    def test_mamba_prefill_skip_clamp_lands_on_cached_block(self):
-        # The clamp that keeps effective_prefill_chunk_length >= 2 rounds the skip
-        # down to a block boundary, which can land on a block that has no cached
-        # Mamba state. The skip must walk back to the nearest block that does,
-        # otherwise add_request() zeroes the SSM state and resumes mid-prompt.
-        # One token past 3 full blocks: skipping all 3 leaves a 1-token chunk, so
-        # the clamp always fires and moves the boundary from block 3 to block 2.
+    def test_mamba_prefill_skip_keeps_full_reuse_without_the_old_clamp(self):
+        # A prompt one token past 3 full blocks: skipping all 3 leaves a 1-token chunk.
+        # That used to trip a clamp forcing effective_prefill_chunk_length >= 2, whose
+        # block-aligned round-down could land on a block with no cached Mamba state --
+        # so it then had to walk back, often all the way to skipping nothing.
+        #
+        # The single-token chunk was only ever a problem because it makes max_seqlen_q == 1,
+        # which FlashAttention-2 reads as a uniform one-token-per-sequence batch. That is now
+        # handled where the bound is published (`initialize_attention_state`), so scheduling is
+        # free to take the full skip -- and the full skip lands exactly on a block boundary
+        # whose state IS cached, which is strictly better than what the clamp produced.
         ctx = self._mctx()
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 3 + 1)
         ctx.add_request(self._req(ctx, prompt.clone()))
 
-        # Only the last block has Mamba state, so the clamped boundary has none
-        # and there is no earlier cached block to fall back to: skip nothing.
+        # Only the last matched block carries Mamba state. The match count is the farthest
+        # cached block + 1, so all 3 blocks are skipped and the restore targets block 2.
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[2:])
         req = self._req(ctx, prompt.clone(), request_id=2)
         _m = ctx._compute_prefix_match(req, len(prompt))
-        matched = _m.matched_block_ids
-        prefix_skip = _m.prefix_skip_tokens
-        eff_chunk = _m.effective_prefill_chunk_length
-        assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
+        assert len(_m.matched_block_ids) == 3
+        assert _m.prefix_skip_tokens == bs * 3
+        assert _m.effective_prefill_chunk_length == 1
 
-        # Same clamp, but the first block is also cached: back off to it rather
-        # than all the way to zero.
+        # No Mamba state cached anywhere: nothing to restore from, so skip nothing. This is
+        # the branch that must still refuse to skip, and it is unaffected by the clamp removal.
         ctx2 = self._mctx()
         p2 = self._prompt(bs * 3 + 1)
         ctx2.add_request(self._req(ctx2, p2.clone()))
-        blocks2 = self._block_ids(ctx2, 0, 3)
-        self._mamba_allocate_and_register(ctx2, [blocks2[0], blocks2[2]])
         req2 = self._req(ctx2, p2.clone(), request_id=2)
-        _m = ctx2._compute_prefix_match(req2, len(p2))
-        m2 = _m.matched_block_ids
-        ps2 = _m.prefix_skip_tokens
-        ec2 = _m.effective_prefill_chunk_length
-        assert len(m2) == 3 and ps2 == bs and ec2 == len(p2) - bs
+        _m2 = ctx2._compute_prefix_match(req2, len(p2))
+        assert _m2.prefix_skip_tokens == 0
+        assert _m2.effective_prefill_chunk_length == len(p2)
 
     @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
