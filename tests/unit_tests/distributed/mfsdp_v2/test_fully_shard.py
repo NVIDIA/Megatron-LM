@@ -715,9 +715,9 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    # A frozen linear alone with non-grad-requiring inputs has no backward graph.
-    # The trainable layer creates a gradient path through the frozen layer while
-    # the root module's input still does not require gradients.
+    # This is the simplest setup where an FSDP unit owns only frozen weights and
+    # has no grad-requiring inputs, but still allows backward() to reproduce the
+    # error: a separately sharded trainable child keeps the backward graph alive.
     trainable_linear = nn.Linear(4, 4, bias=False)
     frozen_linear = nn.Linear(4, 4, bias=False)
     frozen_linear.requires_grad_(False)
