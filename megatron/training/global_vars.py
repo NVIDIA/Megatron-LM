@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 from argparse import Namespace
+from dataclasses import asdict
 from datetime import timedelta
 
 import torch
@@ -45,6 +46,11 @@ def get_run_config():
     """Return the full pretrain config container."""
     _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     return _GLOBAL_RUN_CONFIG
+
+
+def is_run_config_initialized() -> bool:
+    """Whether argument adapters have a run-owned config available yet."""
+    return _GLOBAL_RUN_CONFIG is not None
 
 
 def get_train_state():
@@ -161,6 +167,8 @@ def set_global_variables(args, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
+    from megatron.training.argument_utils import inference_cfg_container_from_args
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args, build_tokenizer=build_tokenizer)
 
 
@@ -320,7 +328,9 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        cfg = get_run_config()
+        # Keep legacy metadata keys while serializing owned RNG settings directly.
+        wandb_config = {**vars(args), **asdict(cfg.rng)}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.

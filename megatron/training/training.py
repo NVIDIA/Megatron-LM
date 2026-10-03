@@ -194,7 +194,6 @@ from .global_vars import (
     get_timers,
     get_wandb_writer,
     get_run_config,
-    set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1692,7 +1691,6 @@ def pretrain(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
-    set_run_config(cfg_container)
     timers = get_timers()
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
@@ -2563,6 +2561,7 @@ def _forward_backward_grad_context(args):
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
+    cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
@@ -2758,7 +2757,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
