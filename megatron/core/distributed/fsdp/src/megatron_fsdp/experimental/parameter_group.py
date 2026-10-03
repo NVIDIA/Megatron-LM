@@ -85,6 +85,23 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
         parameter_group.sync_model_weight_from_main_weight()
 
 
+def _uses_fused_wgrad(
+    owning_module: nn.Module, fqns: Iterable[str], parameter: nn.Parameter
+) -> bool:
+    """Return whether Transformer Engine writes this parameter's gradient through ``main_grad``.
+
+    TE modules built with ``fuse_wgrad_accumulation=True`` write the gradients of their GEMM
+    weights, which are 2-D, into ``weight.main_grad``. Their other parameters, such as LayerNorm
+    weights and biases, still receive gradients through autograd.
+    """
+    if parameter.dim() != 2:
+        return False
+    return any(
+        getattr(get_parameter_owner(owning_module, fqn)[0], "fuse_wgrad_accumulation", False)
+        for fqn in fqns
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class FsdpParameter:
     """One physical parameter and its FSDP runtime representations."""
@@ -124,6 +141,10 @@ class FsdpParameterGroup:
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    # Aligned with fsdp_parameters: True where a TE module writes the gradient into main_grad.
+    fused_wgrad_mask: tuple[bool, ...]
+    # Reduce-scatter input for the backward in progress when this group has fused parameters.
+    _fused_grad_buffer: DBuffer | None
 
     def __init__(
         self,
@@ -164,6 +185,11 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.fused_wgrad_mask = tuple(
+            self.requires_grad and _uses_fused_wgrad(owning_module, fqns, parameter)
+            for parameter, fqns in parameter_to_fqns.items()
+        )
+        self._fused_grad_buffer = None
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -182,12 +208,22 @@ class FsdpParameterGroup:
             mixed_precision_policy,
             use_symmetric_memory,
         )
+        if self.has_fused_wgrad and not isinstance(self.model_weight, DBuffer):
+            raise ValueError(
+                "Transformer Engine wgrad fusion with MXFP8 parameters is not supported by "
+                "MFSDP v2 yet."
+            )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
         # _build_fsdp_parameters() creates views into this storage, which requires a valid
         # storage size. Release it only after construction; a later unshard reallocates it.
         self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
+
+    @property
+    def has_fused_wgrad(self) -> bool:
+        """Whether a Transformer Engine module writes any of this group's gradients."""
+        return any(self.fused_wgrad_mask)
 
     @staticmethod
     def _collect_parameter_metadata(
