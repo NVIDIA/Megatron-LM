@@ -1013,6 +1013,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: 0
 
       - name: Parse functional tests
         id: main
@@ -1020,33 +1021,64 @@ jobs:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
+          CADENCE_BYPASS: ${{ needs.configure.outputs.cadence_bypass }}
+          TARGET_BRANCH: ${{ needs.configure.outputs.target_branch }}
+          IS_PR_PUSH: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope $SCOPE)
-          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
-          # CADENCE is empty when label-based bypass is active; pass through
-          # only when set so generate_jet_trigger_job sees None and skips the filter.
-          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
+          # parse SCOPE TEST_CASES CADENCE OUTPUT: write a matrix fragment to
+          # OUTPUT.json. Each entry carries the scope/cadence it was resolved
+          # with so the test job can re-resolve the same recipe row.
+          parse() {
+            local scope=$1 test_cases=$2 cadence=$3 output=$4
+            ARGS=(--scope "$scope" --test-cases "$test_cases")
+            [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+            # CADENCE is empty when label-based bypass is active; pass through
+            # only when set so generate_jet_trigger_job sees None and skips the filter.
+            [ -n "$cadence" ] && ARGS+=(--cadence "$cadence")
 
-          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-            --n-repeat 5 \
-            --time-limit 2700 \
-            --test-cases all \
-            --container-image mcore_ci_dev \
-            --container-tag latest \
-            --dependent-job functional:configure \
-            --record-checkpoints false \
-            --slurm-account gh \
-            --no-enable-warmup \
-            --environment dev \
-            --platform dgx_h100 \
-            --cluster ghci \
-            ${ARGS[@]} \
-            --output-path integration-tests-h100.yaml
+            python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+              --n-repeat 5 \
+              --time-limit 2700 \
+              --container-image mcore_ci_dev \
+              --container-tag latest \
+              --dependent-job functional:configure \
+              --record-checkpoints false \
+              --slurm-account gh \
+              --no-enable-warmup \
+              --environment dev \
+              --platform dgx_h100 \
+              --cluster ghci \
+              ${ARGS[@]} \
+              --output-path "$output.yaml"
 
-          cat integration-tests-h100.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-h100.json
+            cat "$output.yaml" | \
+              yq -o json 'del(.default, .stages, .workflow) | to_entries | map(select(.value.stage != "empty-pipeline-placeholder") | {"model": .value.stage, "test_case": .key})' | \
+              jq -c --arg scope "$scope" --arg cadence "$cadence" 'map(. + {scope: $scope, cadence: $cadence})' > "$output.json"
+          }
+
+          parse "$SCOPE" all "$CADENCE" integration-tests-h100-default
+
+          # Unlabelled PR pushes additionally run every L0/L1 test case whose
+          # files the PR touches, regardless of cadence. `Run tests` /
+          # `Run functional tests` already select the full L1 tier.
+          if [ "$IS_PR_PUSH" == "true" ] && [ "$CADENCE_BYPASS" == "false" ]; then
+            BASE_REF="${TARGET_BRANCH#refs/heads/}"
+            git fetch origin "$BASE_REF"
+            CHANGED_TEST_CASES=$(git diff --name-only --diff-filter=ACMR --merge-base "origin/$BASE_REF" -- \
+              'tests/functional_tests/test_cases/' | awk -F/ 'NF >= 6 { print $5 }' | sort -u | paste -sd, -)
+            echo "Changed functional test cases: ${CHANGED_TEST_CASES:-none}"
+            if [ -n "$CHANGED_TEST_CASES" ]; then
+              for TIER in L0 L1; do
+                parse "$TIER" "$CHANGED_TEST_CASES" "" "integration-tests-h100-changed-$TIER"
+              done
+            fi
+          fi
+
+          shopt -s nullglob
+          jq -c -s 'add | unique_by(.test_case) | sort_by(.model, .test_case)' \
+            integration-tests-h100-default.json integration-tests-h100-changed-*.json > integration-tests-h100.json
 
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1087,10 +1119,10 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
-          scope: ${{ needs.configure.outputs.scope }}
+          scope: ${{ matrix.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
-          cadence: ${{ needs.configure.outputs.cadence }}
+          cadence: ${{ matrix.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-gb200:
@@ -1111,6 +1143,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: 0
 
       - name: Parse functional tests
         id: main
@@ -1118,33 +1151,64 @@ jobs:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
+          CADENCE_BYPASS: ${{ needs.configure.outputs.cadence_bypass }}
+          TARGET_BRANCH: ${{ needs.configure.outputs.target_branch }}
+          IS_PR_PUSH: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope $SCOPE)
-          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
-          # CADENCE is empty when label-based bypass is active; pass through
-          # only when set so generate_jet_trigger_job sees None and skips the filter.
-          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
+          # parse SCOPE TEST_CASES CADENCE OUTPUT: write a matrix fragment to
+          # OUTPUT.json. Each entry carries the scope/cadence it was resolved
+          # with so the test job can re-resolve the same recipe row.
+          parse() {
+            local scope=$1 test_cases=$2 cadence=$3 output=$4
+            ARGS=(--scope "$scope" --test-cases "$test_cases")
+            [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+            # CADENCE is empty when label-based bypass is active; pass through
+            # only when set so generate_jet_trigger_job sees None and skips the filter.
+            [ -n "$cadence" ] && ARGS+=(--cadence "$cadence")
 
-          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-            --n-repeat 5 \
-            --time-limit 2700 \
-            --test-cases all \
-            --container-image mcore_ci_dev \
-            --container-tag latest \
-            --dependent-job functional:configure \
-            --record-checkpoints false \
-            --slurm-account gh \
-            --no-enable-warmup \
-            --environment dev \
-            --platform dgx_gb200 \
-            --cluster dgxgb200_oci-hsg \
-            ${ARGS[@]} \
-            --output-path integration-tests-gb200.yaml
+            python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+              --n-repeat 5 \
+              --time-limit 2700 \
+              --container-image mcore_ci_dev \
+              --container-tag latest \
+              --dependent-job functional:configure \
+              --record-checkpoints false \
+              --slurm-account gh \
+              --no-enable-warmup \
+              --environment dev \
+              --platform dgx_gb200 \
+              --cluster dgxgb200_oci-hsg \
+              ${ARGS[@]} \
+              --output-path "$output.yaml"
 
-          cat integration-tests-gb200.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb200.json
+            cat "$output.yaml" | \
+              yq -o json 'del(.default, .stages, .workflow) | to_entries | map(select(.value.stage != "empty-pipeline-placeholder") | {"model": .value.stage, "test_case": .key})' | \
+              jq -c --arg scope "$scope" --arg cadence "$cadence" 'map(. + {scope: $scope, cadence: $cadence})' > "$output.json"
+          }
+
+          parse "$SCOPE" all "$CADENCE" integration-tests-gb200-default
+
+          # Unlabelled PR pushes additionally run every L0/L1 test case whose
+          # files the PR touches, regardless of cadence. `Run tests` /
+          # `Run functional tests` already select the full L1 tier.
+          if [ "$IS_PR_PUSH" == "true" ] && [ "$CADENCE_BYPASS" == "false" ]; then
+            BASE_REF="${TARGET_BRANCH#refs/heads/}"
+            git fetch origin "$BASE_REF"
+            CHANGED_TEST_CASES=$(git diff --name-only --diff-filter=ACMR --merge-base "origin/$BASE_REF" -- \
+              'tests/functional_tests/test_cases/' | awk -F/ 'NF >= 6 { print $5 }' | sort -u | paste -sd, -)
+            echo "Changed functional test cases: ${CHANGED_TEST_CASES:-none}"
+            if [ -n "$CHANGED_TEST_CASES" ]; then
+              for TIER in L0 L1; do
+                parse "$TIER" "$CHANGED_TEST_CASES" "" "integration-tests-gb200-changed-$TIER"
+              done
+            fi
+          fi
+
+          shopt -s nullglob
+          jq -c -s 'add | unique_by(.test_case) | sort_by(.model, .test_case)' \
+            integration-tests-gb200-default.json integration-tests-gb200-changed-*.json > integration-tests-gb200.json
 
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1187,11 +1251,11 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
-          scope: ${{ needs.configure.outputs.scope }}
+          scope: ${{ matrix.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
-          cadence: ${{ needs.configure.outputs.cadence }}
+          cadence: ${{ matrix.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
