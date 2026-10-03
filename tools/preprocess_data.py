@@ -412,9 +412,6 @@ def main():
             for p in processes:
                 p.join()
 
-            if args.partitions == 1:
-                continue
-
         def process_json_file(name, q, input_key):
             worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
             q.put(worker_performance)
