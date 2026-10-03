@@ -88,11 +88,16 @@ def _triton_dispatch_enabled(enabled: bool):
         set_min_memory_triton_enabled(previous)
 
 
-# Budget for one streamed index-score tile, which is [batch, query_chunk, key_chunk] in fp32 and
-# is what the chunk sizes exist to bound. 256 MiB is a starting point chosen to keep the tile well
-# inside a layer's activation headroom at the sequence lengths this path targets; it has not been
-# tuned against measured peak memory.
-_SCORE_TILE_BUDGET_BYTES = 256 << 20
+# Budget for one routing score tile, which is [batch, query_chunk, key_chunk] in fp32 and is what
+# the chunk sizes exist to bound. The tile is transient: it is freed before the next query chunk,
+# so this trades peak memory for key-block count rather than for anything that accumulates.
+#
+# 4 GiB buys the whole 131072-key prefix in a single block at batch 1, which is the shape the
+# 8B long-context runs use. Scoring a wide block in one pass costs one kernel launch and one
+# merge where a narrow block costs many of each, and 4 GiB is a few percent of an 186 GB device.
+# Lower this to trade throughput for memory: the planner responds by narrowing the key block and
+# iterating, so smaller values stay correct and simply run more passes.
+_SCORE_TILE_BUDGET_BYTES = 4 << 30
 # Upper bound on the query chunk. Past this the tile stops being the thing that limits occupancy,
 # and larger chunks mostly cost temporaries.
 _MAX_QUERY_CHUNK = 8192

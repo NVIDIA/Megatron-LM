@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     _MAX_QUERY_CHUNK,
+    _SCORE_TILE_BUDGET_BYTES,
     _accumulate_simplified_learned_k_wgrad,
     _plan_execution,
     _sparse_attention_backward_torch_fp32,
@@ -276,16 +277,34 @@ def test_min_memory_routes_over_the_full_key_length():
 
 
 def test_execution_plan_bounds_the_score_tile():
-    """The query chunk shrinks with the tile, so long context does not blow up temporaries."""
-    # Short sequence: the cap applies, not the budget.
-    assert _plan_execution(1, 8192, 8192, use_triton=True).query_chunk == 8192
-    # Long sequence under torch, where routing reads all 262144 keys: 256 MiB / (262144 * 4)
-    # leaves room for 256 query rows, far below the 8192 cap.
+    """The budget bounds the routing tile on both backends, each giving on a different axis."""
+    # Short sequence: the query cap applies and the whole key length fits one block.
+    short = _plan_execution(1, 8192, 8192, use_triton=True)
+    assert short.query_chunk == 8192
+    assert short.routing_key_chunk == 8192
+
+    # Triton holds the query chunk and narrows the key block. At batch 1 the budget covers the
+    # full 131072-key prefix in one block; batch 2 halves the block rather than doubling the tile.
+    assert _plan_execution(1, 131072, 131072, use_triton=True).routing_key_chunk == 131072
+    assert _plan_execution(2, 131072, 131072, use_triton=True).routing_key_chunk == 65536
+
+    # Torch may not chunk keys without breaking tie-equivalence, so it shrinks the query chunk
+    # to stay inside the same budget, and batch enters the same product.
     long_plan = _plan_execution(1, 262144, 262144, use_triton=False)
     assert long_plan.routing_key_chunk == 262144
-    assert long_plan.query_chunk == 256
-    # Batch enters the same product, so a larger batch shrinks the chunk proportionally.
-    assert _plan_execution(4, 262144, 262144, use_triton=False).query_chunk == 64
+    assert long_plan.query_chunk == 4096
+    assert _plan_execution(4, 262144, 262144, use_triton=False).query_chunk == 1024
+
+    # Whichever axis gives, the tile the budget exists to bound never exceeds it.
+    for batch, seq, triton in [
+        (1, 131072, True),
+        (2, 131072, True),
+        (1, 262144, False),
+        (4, 262144, False),
+    ]:
+        plan = _plan_execution(batch, seq, seq, use_triton=triton)
+        tile = batch * plan.query_chunk * plan.routing_key_chunk * 4
+        assert tile <= _SCORE_TILE_BUDGET_BYTES, (batch, seq, triton, tile)
 
 
 def test_tile_sizes_are_optional_on_every_public_entrypoint():
@@ -307,19 +326,20 @@ def test_tile_sizes_are_optional_on_every_public_entrypoint():
 
 
 def test_triton_query_chunk_is_not_shrunk_by_long_key_length():
-    """Triton budgets against its internal router sub-block, not the full routing width.
+    """Triton keeps the query chunk at the cap and narrows the key block instead.
 
-    The Triton router never materialises a [batch, query_chunk, key_chunk] score tile, so charging
-    the query chunk for one costs occupancy to pay for memory that is never allocated. Regression
-    test: at sequence 131072 this previously produced a 1024-wide outer key chunk and 128 routing
-    launches per query tile, which measured 3.1x slower end to end than routing the full length.
+    Shrinking the query chunk costs launches without bounding anything the key block cannot
+    bound more cheaply. Regression test: the planner once charged the query chunk for the full
+    routing width, which at sequence 131072 produced a 1024-wide key chunk and 128 routing
+    launches per query tile -- 3.1x slower end to end than routing wider blocks.
     """
     plan = _plan_execution(1, 131072, 131072, use_triton=True)
     assert plan.routing_key_chunk == 131072
     assert plan.query_chunk == _MAX_QUERY_CHUNK
 
-    # The budget still binds on the backend that does materialise the tile.
-    assert _plan_execution(1, 131072, 131072, use_triton=False).query_chunk < _MAX_QUERY_CHUNK
+    # Torch cannot narrow the key block, so the same budget binds on its query chunk once the
+    # key length is long enough that one full-width tile no longer fits.
+    assert _plan_execution(1, 524288, 524288, use_triton=False).query_chunk < _MAX_QUERY_CHUNK
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
