@@ -738,11 +738,12 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
         return tensor
 
     x = torch.ones(2, 4, device=device, requires_grad=False)
-    # The first argument (pack_hook) runs when forward saves a tensor for backward.
-    # The identity lambda preserves its storage so a copy cannot hide early resharding.
-    # The second (unpack_hook) runs when backward retrieves it; unpack checks that
-    # its storage still exists before a CUDA kernel can read it if rejection regresses.
-    with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, unpack):
+    # Preserve saved tensors' storage so a copy cannot hide early resharding.
+    # On retrieval during backward, unpack checks that storage still exists
+    # before a CUDA kernel can read it if rejection regresses.
+    with torch.autograd.graph.saved_tensors_hooks(
+        pack_hook=lambda tensor: tensor, unpack_hook=unpack
+    ):
         output = model(x)
         assert not x.requires_grad
         assert output.requires_grad
