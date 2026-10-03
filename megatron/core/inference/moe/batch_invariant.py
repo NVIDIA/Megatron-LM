@@ -214,7 +214,7 @@ def _weighted_silu_mul_bounded_kernel(
     """
     xbound = tl.load(bound_ptr)
     num_progs = tl.num_programs(0)
-    xoffset = tl.program_id(0) * XBLOCK
+    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
     while xoffset < xbound:
         xindex = xoffset + tl.arange(0, XBLOCK)[:]
         xmask = (xindex < xbound) & (xindex < xnumel)
