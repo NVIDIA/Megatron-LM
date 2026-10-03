@@ -722,18 +722,24 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         warnings.warn(msg)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+    if hasattr(args, "no_save_optim"):
+        ckpt_kwargs["save_optim"] = not getattr(args, "no_save_optim")
+    if hasattr(args, "no_save_rng"):
+        ckpt_kwargs["save_rng"] = not getattr(args, "no_save_rng")
+    if hasattr(args, "no_load_optim"):
+        ckpt_kwargs["load_optim"] = not getattr(args, "no_load_optim")
+    if hasattr(args, "no_load_rng"):
+        ckpt_kwargs["load_rng"] = not getattr(args, "no_load_rng")
+    if hasattr(args, "ckpt_fully_parallel_save"):
+        ckpt_kwargs["fully_parallel_save"] = getattr(args, "ckpt_fully_parallel_save")
+    if hasattr(args, "ckpt_fully_parallel_load"):
+        ckpt_kwargs["fully_parallel_load"] = getattr(args, "ckpt_fully_parallel_load")
 
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
     optim_cfg, _ = get_megatron_optimizer_config(args)
-    ddp_config = get_megatron_ddp_config(args)
+    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),
@@ -742,7 +748,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,
-        dist=_default_config_from_args(DistributedInitConfig, args),
+        dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         logger=_default_config_from_args(LoggerConfig, args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
@@ -794,18 +800,24 @@ def inference_cfg_container_from_args(
             model_cfg = gpt_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+    if hasattr(args, "no_save_optim"):
+        ckpt_kwargs["save_optim"] = not getattr(args, "no_save_optim")
+    if hasattr(args, "no_save_rng"):
+        ckpt_kwargs["save_rng"] = not getattr(args, "no_save_rng")
+    if hasattr(args, "no_load_optim"):
+        ckpt_kwargs["load_optim"] = not getattr(args, "no_load_optim")
+    if hasattr(args, "no_load_rng"):
+        ckpt_kwargs["load_rng"] = not getattr(args, "no_load_rng")
+    if hasattr(args, "ckpt_fully_parallel_save"):
+        ckpt_kwargs["fully_parallel_save"] = getattr(args, "ckpt_fully_parallel_save")
+    if hasattr(args, "ckpt_fully_parallel_load"):
+        ckpt_kwargs["fully_parallel_load"] = getattr(args, "ckpt_fully_parallel_load")
 
     cfg = InferenceConfigContainer(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
-        dist=_default_config_from_args(DistributedInitConfig, args),
+        dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         logger=_default_config_from_args(LoggerConfig, args),

@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 from argparse import Namespace
+from dataclasses import asdict
 from datetime import timedelta
 
 import torch
@@ -161,12 +162,15 @@ def set_global_variables(args, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
+    from megatron.training.argument_utils import inference_cfg_container_from_args
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args, build_tokenizer=build_tokenizer)
 
 
 def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
     """Construct services independently of CLI parsing and config construction."""
 
+    cfg = get_run_config()
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
@@ -204,7 +208,7 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
-    if args.disable_jit_fuser:
+    if cfg.dist.disable_jit_fuser:
         disable_jit_fuser()
 
 
@@ -320,7 +324,8 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        cfg = get_run_config()
+        wandb_config = {**vars(args), **asdict(cfg.dist)}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
@@ -407,7 +412,7 @@ def _detect_gpu_identity(local_rank):
 
     Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
     this runs from ``set_global_variables`` during arg parsing, before
-    ``torch.cuda.set_device(args.local_rank)`` happens in
+    ``torch.cuda.set_device(cfg.dist.local_rank)`` happens in
     ``_initialize_distributed`` -- ``current_device()`` would still read back
     the default (always 0) at this point. ``local_rank`` is resolved against
     ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
@@ -465,9 +470,9 @@ def build_telemetry_resource_attrs(args):
     """
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
-    resource_attrs = {}
+    cfg = get_run_config()
+    resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     for attr, arg_name in [
-        ('dl.local_rank', 'local_rank'),
         ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
         ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
         ('dl.data_parallel.size', 'data_parallel_size'),
@@ -492,7 +497,7 @@ def build_telemetry_resource_attrs(args):
     else:
         resource_attrs['megatron.precision'] = 'fp32'
 
-    resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+    resource_attrs.update(_detect_gpu_identity(cfg.dist.local_rank))
 
     # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
     # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's

@@ -37,7 +37,7 @@ def test_token_normalization_scale(num_tokens, expected):
     torch.testing.assert_close(scale, torch.tensor(expected))
 
 
-def test_configure_grad_sync_installs_production_overlap_hooks():
+def test_configure_grad_sync_installs_production_overlap_hooks(run_config):
     def no_sync():
         return None
 
