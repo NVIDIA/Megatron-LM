@@ -1211,20 +1211,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             use_qk_l2norm_in_kernel=True,
             intermediate_states=intermediate_ssm_state,
             steps_per_token=self.num_householder,
+            compact_output=True,
         )
-        core_attn_out = rearrange(
-            core_attn_out, "n (t m) h d -> n t m h d", m=self.num_householder
-        )[
-            ..., -1, :, :
-        ].contiguous()  # [n, 1, h, d]
+        # The recurrent kernel stores just the final Householder result per token,
+        # directly in the contiguous [request, token, head, dim] decode layout.
 
         # No scatter: the kernel above already wrote each request's final state into
         # its cache slot in place.
         #
-        # ``_postprocess`` returns the sequence-first layout, so transpose back to the
-        # batch-first [n, seq_len, d_inner] this method contracts to return; the
-        # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
-        # only runs at cp_size == 1.
+        # Decode has no CP exchange. Keep speculative output batch-first so the
+        # shared dynamic path can flatten it without copying a transposed result.
+        if zVKQba.shape[1] > 1:
+            y = rearrange(core_attn_out, "n t h d -> n t (h d)")
+            return self.norm(y, z.contiguous()) if self.rmsnorm else y
+
+        # ``_postprocess`` returns sequence-first; the transpose is free at l == 1.
         return self._postprocess(core_attn_out, z).transpose(0, 1)
 
     def ssm_prefill(

@@ -11,8 +11,8 @@
 Gated Delta Product decode reaches this kernel by folding the `M` Householder
 copies into the sequence dimension, so a single decode token becomes an
 `M`-length sequence with the query placed on the last copy and the decay on the
-first; the caller slices the answer back out. Under speculative decoding a step
-carries `S` draft tokens per request, so the folded sequence is `S * M` long.
+first; `compact_output` stores that last copy directly. Under speculative decoding
+a step carries `S` draft tokens per request, so the folded sequence is `S * M` long.
 
 Speculative decoding also needs the state *between* draft tokens, because
 verification may accept only a prefix of them and the recurrence must roll back
@@ -60,6 +60,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     scale,
     T,
     STEPS_PER_TOKEN: tl.constexpr,
+    PREFETCH_NEXT: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -74,6 +75,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     HAS_STATE_INDICES: tl.constexpr,
     STORE_INTERMEDIATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    COMPACT_OUTPUT: tl.constexpr = False,
 ):
     """Walk one sequence token by token, carrying the `[K, V]` state."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -115,7 +117,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     else:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
 
-    p_o = o + (bos * HV + i_hv) * V + o_v
+    if COMPACT_OUTPUT:
+        p_o = o + (i_n * (T // STEPS_PER_TOKEN) * HV + i_hv) * V + o_v
+    else:
+        p_o = o + (bos * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -126,51 +131,121 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_h0 = h0 + state_offset + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for i_t in tl.range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
+    # The longer folded sequence has draft tokens to overlap with the
+    # current recurrence. Keep the original loop for a single decode token.
+    if PREFETCH_NEXT:
+        b_q = tl.load(p_q, mask=mask_k & (T > 0), other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k & (T > 0), other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v & (T > 0), other=0).to(tl.float32)
         if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta).to(tl.float32)
+            b_beta = tl.load(p_beta, mask=T > 0, other=0).to(tl.float32)
         else:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-
+            b_beta = tl.load(p_beta, mask=mask_v & (T > 0), other=0).to(tl.float32)
         if USE_G:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= exp(b_g)
+            b_g = tl.load(p_g, mask=T > 0, other=0).to(tl.float32)
 
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        b_h += b_k[:, None] * b_v
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        for i_t in tl.range(0, T):
+            # Fetch the next step before this step's reductions. The math below and
+            # its operation order remain unchanged; the last iteration uses masked
+            # loads so it does not read past the input sequence.
+            has_next = i_t + 1 < T
+            next_q = tl.load(p_q + H * K, mask=mask_k & has_next, other=0).to(tl.float32)
+            next_k = tl.load(p_k + H * K, mask=mask_k & has_next, other=0).to(tl.float32)
+            next_v = tl.load(p_v + HV * V, mask=mask_v & has_next, other=0).to(tl.float32)
+            if IS_BETA_HEADWISE:
+                next_beta = tl.load(p_beta + HV, mask=has_next, other=0).to(tl.float32)
+            else:
+                next_beta = tl.load(p_beta + HV * V, mask=mask_v & has_next, other=0).to(tl.float32)
+            if USE_G:
+                next_g = tl.load(p_g + HV, mask=has_next, other=0).to(tl.float32)
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * scale
+            if USE_G:
+                b_h *= exp(b_g)
 
-        # Snapshot the state once per draft token, on the step that closes that
-        # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
-        # snapshot is the state a rollback to "this token accepted" must restore.
-        # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
-        # state cache untouched below.
-        if STORE_INTERMEDIATE and i_s >= 0:
-            if (i_t + 1) % STEPS_PER_TOKEN == 0:
-                p_int = (
-                    intermediate_states
-                    + int_offset
-                    + (i_t // STEPS_PER_TOKEN) * int_token_stride
-                    + o_k[:, None] * V
-                    + o_v[None, :]
-                )
-                tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            b_h += b_k[:, None] * b_v
+            if not COMPACT_OUTPUT or (i_t + 1) % STEPS_PER_TOKEN == 0:
+                b_o = tl.sum(b_h * b_q[:, None], 0)
+                # Each padding program writes zeros at its own output address.
+                tl.store(p_o, tl.where(i_s >= 0, b_o, 0).to(p_o.dtype.element_ty), mask=mask_v)
+                p_o += HV * V
 
-        p_q += H * K
-        p_k += H * K
-        p_v += HV * V
-        if USE_G:
-            p_g += HV
-        p_beta += HV * (1 if IS_BETA_HEADWISE else V)
-        p_o += HV * V
+            # Snapshot the state once per draft token, on the step that closes that
+            # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
+            # snapshot is the state a rollback to "this token accepted" must restore.
+            # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
+            # state cache untouched below.
+            if STORE_INTERMEDIATE and i_s >= 0:
+                if (i_t + 1) % STEPS_PER_TOKEN == 0:
+                    p_int = (
+                        intermediate_states
+                        + int_offset
+                        + (i_t // STEPS_PER_TOKEN) * int_token_stride
+                        + o_k[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+
+            p_q += H * K
+            p_k += H * K
+            p_v += HV * V
+            if USE_G:
+                p_g += HV
+            p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+            b_q, b_k, b_v, b_beta = next_q, next_k, next_v, next_beta
+            if USE_G:
+                b_g = next_g
+    else:
+        for i_t in tl.range(0, T):
+            b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * scale
+            if IS_BETA_HEADWISE:
+                b_beta = tl.load(p_beta).to(tl.float32)
+            else:
+                b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+
+            if USE_G:
+                b_g = tl.load(p_g).to(tl.float32)
+                b_h *= exp(b_g)
+
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            b_h += b_k[:, None] * b_v
+            if not COMPACT_OUTPUT or (i_t + 1) % STEPS_PER_TOKEN == 0:
+                b_o = tl.sum(b_h * b_q[:, None], 0)
+                # Each padding program writes zeros at its own output address.
+                tl.store(p_o, tl.where(i_s >= 0, b_o, 0).to(p_o.dtype.element_ty), mask=mask_v)
+                p_o += HV * V
+
+            # Snapshot the state once per draft token, on the step that closes that
+            # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
+            # snapshot is the state a rollback to "this token accepted" must restore.
+            # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
+            # state cache untouched below.
+            if STORE_INTERMEDIATE and i_s >= 0:
+                if (i_t + 1) % STEPS_PER_TOKEN == 0:
+                    p_int = (
+                        intermediate_states
+                        + int_offset
+                        + (i_t // STEPS_PER_TOKEN) * int_token_stride
+                        + o_k[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+
+            p_q += H * K
+            p_k += H * K
+            p_v += HV * V
+            if USE_G:
+                p_g += HV
+            p_beta += HV * (1 if IS_BETA_HEADWISE else V)
 
     if STORE_FINAL_STATE and i_s >= 0:
         p_ht = ht + state_offset + o_k[:, None] * V + o_v[None, :]
@@ -192,6 +267,7 @@ def fused_recurrent_gated_delta_rule_update(
     state_indices: torch.Tensor | None = None,
     intermediate_states: torch.Tensor | None = None,
     steps_per_token: int = 1,
+    compact_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the recurrent Gated Delta Rule forward pass.
 
@@ -218,10 +294,14 @@ def fused_recurrent_gated_delta_rule_update(
             verification can roll the recurrence back to any accepted prefix.
             Padding requests write nothing. `None` disables the snapshots.
         steps_per_token: Recurrence steps that make up one draft token, i.e. the
-            Householder count `M` folded into the sequence dimension. Only
-            meaningful together with `intermediate_states`.
+            Householder count `M` folded into the sequence dimension. Used for
+            snapshot placement and compact output placement.
+        compact_output: Store only the last recurrence output for each token.
+            Requires fixed-length input and a whole number of steps per token.
 
-    Returns `(o, final_state)` with `o` shaped like `v`. When `state` is given,
+    Returns `(o, final_state)` with `o` shaped like `v`, or with its time
+    dimension divided by `steps_per_token` when `compact_output` is true.
+    When `state` is given,
     `final_state` is that same cache tensor, updated in place.
     """
     assert HAVE_TRITON, "fused_recurrent_gated_delta_rule_update requires Triton"
@@ -250,7 +330,14 @@ def fused_recurrent_gated_delta_rule_update(
         state_indices is None or state is not None
     ), "state_indices requires the state cache it indexes into"
 
-    o = torch.empty_like(v)
+    if compact_output:
+        assert cu_seqlens is None, "compact_output requires fixed-length input"
+        assert (
+            steps_per_token >= 1 and T % steps_per_token == 0
+        ), "compact_output requires a whole number of steps per token"
+        o = torch.empty((B, T // steps_per_token, HV, V), device=v.device, dtype=v.dtype)
+    else:
+        o = torch.empty_like(v)
     if state is not None:
         assert state.shape[1:] == (HV, K, V), (
             f"state is expected to have shape [num_slots, {HV}, {K}, {V}], "
@@ -308,6 +395,8 @@ def fused_recurrent_gated_delta_rule_update(
         scale=scale,
         T=T,
         STEPS_PER_TOKEN=steps_per_token,
+        PREFETCH_NEXT=T > steps_per_token,
+        COMPACT_OUTPUT=compact_output,
         H=H,
         HV=HV,
         K=K,
@@ -320,9 +409,5 @@ def fused_recurrent_gated_delta_rule_update(
         num_stages=3,
     )
     if state_indices is not None:
-        # A padding row's recurrence ran over whatever the padded input buffer
-        # held, so its output is overwritten rather than merely left unwritten:
-        # the contract is zero, and a stale inf/NaN would survive a mask.
         assert cu_seqlens is None, "state_indices with cu_seqlens is not supported yet"
-        o.masked_fill_((state_indices < 0).view(-1, *([1] * (o.ndim - 1))), 0)
     return o, final_state
