@@ -15,6 +15,7 @@ from megatron.core.inference.moe.activations import (
     padded_squared_relu,
     padded_swiglu,
     squared_relu_and_quantize_mxfp8,
+    swiglu_and_quantize_mxfp8,
 )
 from megatron.core.inference.moe.permute import (
     permute_and_quantize_mxfp8,
@@ -96,14 +97,12 @@ def _get_activation_func(
         func = squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
         return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
     elif activation_type == ActivationType.SWIGLU:
-        if fused_quant:
-            raise NotImplementedError("SWIGLU requires separate activation and MXFP8 quantization")
         if activation_kwargs.get("clamp_scale") is not None:
             raise NotImplementedError(
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
-        return padded_swiglu
+        return swiglu_and_quantize_mxfp8 if fused_quant else padded_swiglu
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
 
@@ -124,7 +123,7 @@ def mcore_fused_moe(
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
-    Outside batch-invariant mode, MXFP8 squared-ReLU uses fused kernels that
+    Outside batch-invariant mode, MXFP8 squared-ReLU and SwiGLU use fused kernels that
     combine permute/activation with quantization unless
     ``disable_fused_quant_kernels=True``. Other MXFP8 paths quantize separately.
 
@@ -167,7 +166,7 @@ def mcore_fused_moe(
     # afterwards preserves the MXFP8 values without tying them to batch layout.
     use_fused_quant = (
         use_mxfp8
-        and activation_type == ActivationType.SQUARED_RELU
+        and activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
         and not disable_fused_quant_kernels
         and not batch_invariant_mode
     )

@@ -156,6 +156,14 @@ def test_inference_moe_activations_replay():
             quant, (x1,), backward=False, what="squared_relu_and_quantize_mxfp8"
         )
 
+        def swiglu_quant(x):
+            q = activations.swiglu_and_quantize_mxfp8(x, perm, n_used_t)
+            return live(q.data.view(torch.uint8)), q.scale.view(torch.uint8)
+
+        assert_replays_bit_exact(
+            swiglu_quant, (x2,), backward=False, what="swiglu_and_quantize_mxfp8"
+        )
+
 
 def test_batch_invariant_swiglu_matches_training():
     """Exercise rounding boundaries that sigmoid-based SiLU evaluates differently."""

@@ -1307,3 +1307,13 @@ class TestFusedMoeActivationClamp:
             )
             is squared_relu_and_quantize_mxfp8
         )
+
+    def test_mxfp8_swiglu_uses_fused_quant_kernel(self):
+        """The MXFP8 SwiGLU route must avoid materializing a BF16 activation tensor."""
+        from megatron.core.inference.moe.activations import swiglu_and_quantize_mxfp8
+        from megatron.core.inference.moe.fused_moe import ActivationType, _get_activation_func
+
+        assert (
+            _get_activation_func(ActivationType.SWIGLU, fused_quant=True)
+            is swiglu_and_quantize_mxfp8
+        )
