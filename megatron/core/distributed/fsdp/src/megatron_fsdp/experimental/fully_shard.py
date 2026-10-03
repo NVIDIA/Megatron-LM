@@ -130,6 +130,21 @@ def fully_shard(
     This attaches the FSDP mixin to the original module instance, so parent
     modules do not need to replace existing child-module references.
 
+    Automatic hooks initialize the gradient countdown from unique owned parameters
+    reachable from forward outputs, stopping at input edges. All differentiable
+    outputs must participate in backward. Corresponding microbatches must use the
+    same parameters and FSDP execution order across DP ranks, including delayed TE
+    callbacks. Unused weights within a participating unit contribute zero gradients.
+    Delayed TE wgrad must finish before reusing a unit.
+
+    Opaque reentrant checkpoint nodes retain the fixed count and require all owned
+    trainable parameters to produce gradients. A checkpointed unit's recomputed
+    forward is counted normally once its graph is visible. Manual hooks retain
+    the fixed count. Automatic graph counting covers one microbatch's
+    forward/backward at a time, including repeated shared-layer calls within it;
+    it does not account for future, separately scheduled backward GraphTasks.
+    Repeated shared-layer calls must use the same owned trainable parameters.
+
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
         mesh: Parent device mesh containing the data-parallel axes.
