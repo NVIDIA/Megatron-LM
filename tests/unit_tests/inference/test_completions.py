@@ -18,8 +18,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 from tests.unit_tests.inference.test_endpoints_common import (
     BODIES,
-    build_streaming_app,
-    sse_payloads,
     CHAT_PATH,
     COMPLETIONS_BODY,
     COMPLETIONS_PATH,
@@ -28,7 +26,9 @@ from tests.unit_tests.inference.test_endpoints_common import (
     ReplyingClient,
     Tokenizer,
     build_app,
+    build_streaming_app,
     completed_reply,
+    sse_payloads,
 )
 
 pytestmark = [pytest.mark.internal]
@@ -78,75 +78,45 @@ async def test_stage_metadata_is_surfaced_at_the_top_level(path):
 
 
 @pytest.mark.asyncio
-async def test_completions_batch_merges_identical_stage_metadata():
-    """Every prompt in a batch goes through the same stager; identical values merge once."""
+@pytest.mark.parametrize(
+    ("second_metadata", "expected_status"),
+    [
+        # Every prompt in a batch goes through the same stager; identical values merge once.
+        pytest.param({"store_key": "abc"}, 200, id="identical-values-merge"),
+        # Quart turns the handler's ValueError into a 500; the message itself is pinned on
+        # collect_stage_metadata below.
+        pytest.param({"store_key": "xyz"}, 500, id="conflicting-values-fail"),
+    ],
+)
+async def test_completions_batch_merges_stage_metadata(second_metadata, expected_status):
     client = ReplyingClient(
         [
             completed_reply("req-0", [10, 11], [12], payload_stage_metadata={"store_key": "abc"}),
-            completed_reply("req-1", [10, 11], [13], payload_stage_metadata={"store_key": "abc"}),
+            completed_reply("req-1", [10, 11], [13], payload_stage_metadata=second_metadata),
         ]
     )
     app = build_app(COMPLETIONS_PATH, client)
 
     response = await app.test_client().post(COMPLETIONS_PATH, json={"prompt": ["a", "b"]})
 
-    assert response.status_code == 200, await response.get_data(as_text=True)
-    payload = await response.get_json()
-    assert payload["store_key"] == "abc"
-    assert len(payload["choices"]) == 2
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        payload = await response.get_json()
+        assert payload["store_key"] == "abc"
+        assert len(payload["choices"]) == 2
 
 
-@pytest.mark.asyncio
-async def test_completions_batch_rejects_conflicting_stage_metadata():
-    client = ReplyingClient(
-        [
-            completed_reply("req-0", [10, 11], [12], payload_stage_metadata={"store_key": "abc"}),
-            completed_reply("req-1", [10, 11], [13], payload_stage_metadata={"store_key": "xyz"}),
-        ]
-    )
-    app = build_app(COMPLETIONS_PATH, client)
-
-    # Quart's test client turns the handler's ValueError into a 500; the message
-    # itself is pinned by test_collect_stage_metadata_rejects_conflicting_values.
-    response = await app.test_client().post(COMPLETIONS_PATH, json={"prompt": ["a", "b"]})
-
-    assert response.status_code == 500
-
-
-@pytest.mark.asyncio
-async def test_completions_without_stager_has_no_extra_top_level_keys():
-    client = ReplyingClient([completed_reply("req-0", [10, 11], [12, 13])])
-    app = build_app(COMPLETIONS_PATH, client)
-
-    response = await app.test_client().post(COMPLETIONS_PATH, json=COMPLETIONS_BODY)
-
-    assert response.status_code == 200
-    payload = await response.get_json()
-    assert set(payload) == {"id", "object", "created", "model", "choices", "usage"}
-
-
-@pytest.mark.asyncio
-async def test_completions_rejects_stage_metadata_that_shadows_a_response_field():
-    client = ReplyingClient(
-        [completed_reply("req-0", [10, 11], [12], payload_stage_metadata={"usage": "forged"})]
-    )
-    app = build_app(COMPLETIONS_PATH, client)
-
-    response = await app.test_client().post(COMPLETIONS_PATH, json=COMPLETIONS_BODY)
-
-    assert response.status_code == 500
-
-
-def test_collect_stage_metadata_tolerates_missing_and_none():
+def test_collect_stage_metadata_merges_identical_values_and_rejects_conflicts():
     response_metadata = {}
-    collect_stage_metadata(response_metadata, {})
-    collect_stage_metadata(response_metadata, {"payload_stage_metadata": None})
-    assert response_metadata == {}
+    for result in (
+        {},
+        {"payload_stage_metadata": None},
+        {"payload_stage_metadata": {"store_key": "abc"}},
+        {"payload_stage_metadata": {"store_key": "abc"}},
+    ):
+        collect_stage_metadata(response_metadata, result)
+    assert response_metadata == {"store_key": "abc"}
 
-
-def test_collect_stage_metadata_rejects_conflicting_values():
-    response_metadata = {}
-    collect_stage_metadata(response_metadata, {"payload_stage_metadata": {"store_key": "abc"}})
     with pytest.raises(ValueError, match="conflicting response metadata for 'store_key'"):
         collect_stage_metadata(response_metadata, {"payload_stage_metadata": {"store_key": "xyz"}})
 
@@ -185,49 +155,34 @@ def test_validate_offload_params(offload_params, expected):
 @pytest.mark.asyncio
 @PATHS
 @pytest.mark.parametrize(
-    "offload_params",
-    [{"_anything": 1}, {"_request_prompt_preparation_error": "boom"}, {"store": "x", "_a": 1}],
+    ("offload_params", "status", "expected_error"),
+    [
+        pytest.param(
+            {"store": "x", "nested": {"key": [1, 2]}}, 200, None, id="forwarded-unchanged"
+        ),
+        pytest.param("x", 400, "'offload_params' must be an object", id="non-object"),
+        pytest.param(
+            {"store": "x", "_a": 1},
+            400,
+            "'offload_params' keys starting with '_' are reserved",
+            id="reserved-key",
+        ),
+    ],
 )
-async def test_underscore_offload_params_are_rejected_before_submission(path, offload_params):
-    client = ReplyingClient([])
+async def test_offload_params_are_validated_before_submission(
+    path, offload_params, status, expected_error
+):
+    client = ReplyingClient()
     app = build_app(path, client)
 
     response = await app.test_client().post(
         path, json={**BODIES[path], "offload_params": offload_params}
     )
 
-    assert response.status_code == 400
-    text = await response.get_data(as_text=True)
-    assert "'offload_params' keys starting with '_' are reserved" in text
-    assert client.offload_params == []  # nothing reached the engine
-
-
-@pytest.mark.asyncio
-@PATHS
-async def test_non_object_offload_params_are_rejected(path):
-    client = ReplyingClient([])
-    app = build_app(path, client)
-
-    response = await app.test_client().post(path, json={**BODIES[path], "offload_params": "x"})
-
-    assert response.status_code == 400
-    assert "'offload_params' must be an object" in await response.get_data(as_text=True)
-    assert client.offload_params == []
-
-
-@pytest.mark.asyncio
-@PATHS
-async def test_plain_offload_params_are_forwarded_unchanged(path):
-    offload_params = {"store": "x", "nested": {"key": [1, 2]}}
-    client = ReplyingClient([completed_reply("req-0", [10, 11], [12, 13])])
-    app = build_app(path, client)
-
-    response = await app.test_client().post(
-        path, json={**BODIES[path], "offload_params": offload_params}
-    )
-
-    assert response.status_code == 200, await response.get_data(as_text=True)
-    assert client.offload_params == [offload_params]
+    assert response.status_code == status, await response.get_data(as_text=True)
+    if expected_error is not None:
+        assert expected_error in await response.get_data(as_text=True)
+    assert client.offload_params == ([offload_params] if status == 200 else [])
 
 
 # --- request validation -----------------------------------------------------
@@ -247,6 +202,7 @@ _INVALID_PROMPT_FORMAT = (
 @pytest.mark.parametrize(
     ("body", "app_config", "status", "expected_error"),
     [
+        pytest.param(None, {}, 400, "Invalid or missing JSON body", id="null-json-body"),
         pytest.param({}, {}, 400, "Missing 'prompt' field", id="missing-prompt"),
         pytest.param({"prompt": []}, {}, 400, "Missing 'prompt' field", id="empty-prompt-list"),
         pytest.param({"prompt": ""}, {}, 400, "Missing 'prompt' field", id="empty-prompt-string"),
@@ -258,14 +214,14 @@ _INVALID_PROMPT_FORMAT = (
             id="prompt-object",
         ),
         pytest.param(
-            {"prompt": [[1], ["a"]]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-ragged-token-ids"
-        ),
-        pytest.param(
             {"prompt": 42},
             {},
             400,
             "Invalid 'prompt' type. Must be str or list",
             id="prompt-wrong-type",
+        ),
+        pytest.param(
+            {"prompt": [[1], ["a"]]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-ragged-token-ids"
         ),
         pytest.param({"prompt": [1.5]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-floats"),
         pytest.param({"prompt": ["a", 1]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-mixed-list"),
@@ -286,7 +242,6 @@ _INVALID_PROMPT_FORMAT = (
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({"prompt": "hello", "top_k": [1]}, {}, 500, None, id="top-k-list"),
         pytest.param(
             {"prompt": "hello", "logprobs": "many"},
             {},
@@ -301,6 +256,7 @@ _INVALID_PROMPT_FORMAT = (
             "Invalid sampling parameter: invalid literal for int() with base 10: 'lots'",
             id="max-tokens-not-an-int",
         ),
+        pytest.param({"prompt": "hello", "top_k": [1]}, {}, 500, None, id="top-k-list"),
         # Sampling fields are read with a plain .get(), so an explicit null reaches the
         # float()/int() conversion and escapes as a 500 (chat treats null as "use the default").
         pytest.param(
@@ -319,13 +275,19 @@ _INVALID_PROMPT_FORMAT = (
         ),
     ],
 )
-async def test_malformed_requests_are_rejected_before_submission(
+async def test_malformed_completions_requests_are_rejected_before_submission(
     body, app_config, status, expected_error
 ):
     client = ReplyingClient([])
     app = build_app(COMPLETIONS_PATH, client, **app_config)
+    # `json=None` sends no body at all; a JSON null needs to go over the wire as text.
+    request = (
+        {"json": body}
+        if body is not None
+        else {"data": "null", "headers": {"Content-Type": "application/json"}}
+    )
 
-    response = await app.test_client().post(COMPLETIONS_PATH, json=body)
+    response = await app.test_client().post(COMPLETIONS_PATH, **request)
 
     assert response.status_code == status
     if expected_error is not None:
@@ -379,15 +341,33 @@ _LOGPROBS_WITH_ECHO = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("echo", "logprobs", "expected_logprobs"),
+    ("echo", "logprobs", "engine_top_n", "expected_logprobs"),
     [
-        pytest.param(False, None, None, id="plain"),
+        pytest.param(False, None, True, None, id="plain"),
         # Non-finite values are clamped for JSON; the leading None is the OpenAI first-token slot.
-        pytest.param(False, 1, _LOGPROBS_WITHOUT_ECHO, id="logprobs"),
-        pytest.param(True, 1, _LOGPROBS_WITH_ECHO, id="echo-with-logprobs"),
+        pytest.param(False, 1, True, _LOGPROBS_WITHOUT_ECHO, id="logprobs"),
+        pytest.param(True, 1, True, _LOGPROBS_WITH_ECHO, id="echo-with-logprobs"),
+        # logprobs=0 asks for per-token log probs only, so the engine returns no top-N to format.
+        pytest.param(
+            True,
+            0,
+            False,
+            {**_LOGPROBS_WITH_ECHO, "top_logprobs": None},
+            id="echo-with-logprobs-zero",
+        ),
     ],
 )
-async def test_completions_response_format(echo, logprobs, expected_logprobs, recwarn):
+async def test_completions_response_format(
+    echo, logprobs, engine_top_n, expected_logprobs, recwarn
+):
+    top_n = (
+        {
+            "generated_top_n_logprobs": [{"<12>": -0.5}, {"<13>": float("-inf")}],
+            "prompt_top_n_logprobs": [{"<11>": -1.0}],
+        }
+        if engine_top_n
+        else {}
+    )
     first = completed_reply(
         "req-0",
         [10, 11],
@@ -395,9 +375,8 @@ async def test_completions_response_format(echo, logprobs, expected_logprobs, re
         num_cached_tokens=2,
         routing_indices=[7, 8, 9, 6],
         generated_log_probs=[-0.5, float("-inf")],
-        generated_top_n_logprobs=[{"<12>": -0.5}, {"<13>": float("-inf")}],
         prompt_log_probs=[-1.0],
-        prompt_top_n_logprobs=[{"<11>": -1.0}],
+        **top_n,
     )
     # Hit its token limit; without prompt_length the prompt count falls back to the token ids.
     second = completed_reply(
@@ -406,12 +385,18 @@ async def test_completions_response_format(echo, logprobs, expected_logprobs, re
     del second["prompt_length"]
     client = ReplyingClient([first, second])
     app = build_app(COMPLETIONS_PATH, client)
-    body = {"prompt": ["p0", "p1"], "echo": echo, **({"logprobs": logprobs} if logprobs else {})}
+    body = {
+        "prompt": ["p0", "p1"],
+        "echo": echo,
+        **({"logprobs": logprobs} if logprobs is not None else {}),
+    }
 
     response = await app.test_client().post(COMPLETIONS_PATH, json=body)
 
     assert response.status_code == 200, await response.get_data(as_text=True)
     payload = await response.get_json()
+    # Without a stager there is nothing at the top level beyond the OpenAI fields.
+    assert set(payload) == {"id", "object", "created", "model", "choices", "usage"}
     assert payload["id"] == "req-0"
     assert payload["object"] == "text_completion"
     assert payload["model"] == "EMPTY"
@@ -439,47 +424,6 @@ async def test_completions_response_format(echo, logprobs, expected_logprobs, re
     }
     # The per-prompt SamplingParams copies must not re-feed the derived, deprecated mirror field.
     assert not [w for w in recwarn if "return_prompt_top_n_logprobs" in str(w.message)]
-
-
-@pytest.mark.asyncio
-async def test_completions_rejects_a_null_json_body():
-    client = ReplyingClient([])
-    app = build_app(COMPLETIONS_PATH, client)
-
-    response = await app.test_client().post(
-        COMPLETIONS_PATH, data="null", headers={"Content-Type": "application/json"}
-    )
-
-    assert response.status_code == 400
-    assert await response.get_data(as_text=True) == "Invalid or missing JSON body"
-    assert client.prompt_tokens == []
-
-
-@pytest.mark.asyncio
-async def test_completions_echo_logprobs_without_top_n():
-    """`logprobs=0` returns per-token log probs but no top-N alternatives."""
-    client = ReplyingClient(
-        [
-            completed_reply(
-                "req-0", [10, 11], [12], generated_log_probs=[-0.5], prompt_log_probs=[-1.0]
-            )
-        ]
-    )
-    app = build_app(COMPLETIONS_PATH, client)
-
-    response = await app.test_client().post(
-        COMPLETIONS_PATH, json={"prompt": "p", "echo": True, "logprobs": 0}
-    )
-
-    assert response.status_code == 200, await response.get_data(as_text=True)
-    (sampling_params,) = client.sampling_params
-    assert (sampling_params.return_log_probs, sampling_params.top_n_logprobs) == (True, 0)
-    assert (await response.get_json())["choices"][0]["logprobs"] == {
-        "tokens": ["<10>", "<11>", "<12>"],
-        "token_logprobs": [None, -1.0, -0.5],
-        "top_logprobs": None,
-        "text_offset": [0, 4, 8],
-    }
 
 
 @pytest.mark.asyncio

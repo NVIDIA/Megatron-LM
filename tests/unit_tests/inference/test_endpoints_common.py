@@ -11,6 +11,7 @@ import importlib
 import json
 import logging
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,106 +25,74 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 
 
-def test_apply_optional_sampling_default_skips_unset_value():
-    # This is the exact bug wdykas flagged on PR #7191: if startup ever goes back
-    # to setting the key unconditionally (even to a hardcoded default), tier 1 of
-    # resolve_sampling_default always wins and generation_config.json is dead code.
+@pytest.mark.parametrize(
+    ("value", "expected_config"),
+    [
+        # The bug wdykas flagged on PR #7191: if startup set the key unconditionally (even to a
+        # hardcoded default), tier 1 of resolve_sampling_default would always win and
+        # generation_config.json would be dead code.
+        pytest.param(None, {}, id="unset-leaves-no-key"),
+        pytest.param(0.6, {"default_temperature": 0.6}, id="configured"),
+        # 0 / 0.0 is a real, explicit configuration, not "unset". Only None means unset.
+        pytest.param(0, {"default_temperature": 0}, id="configured-zero-is-explicit"),
+    ],
+)
+def test_apply_optional_sampling_default(value, expected_config):
     app_config = {}
-    apply_optional_sampling_default(app_config, 'default_temperature', None)
-    assert 'default_temperature' not in app_config
+    apply_optional_sampling_default(app_config, "default_temperature", value)
+    assert app_config == expected_config
 
 
-def test_apply_optional_sampling_default_sets_configured_value():
-    app_config = {}
-    apply_optional_sampling_default(app_config, 'default_temperature', 0.6)
-    assert app_config['default_temperature'] == 0.6
-
-
-def test_apply_optional_sampling_default_sets_falsy_configured_value():
-    # 0 / 0.0 is a real, explicit configuration, not "unset". Only None means unset.
-    app_config = {}
-    apply_optional_sampling_default(app_config, 'default_top_k', 0)
-    assert app_config['default_top_k'] == 0
-
-
-def test_resolve_sampling_default_falls_through_to_generation_config_when_unset():
-    # End-to-end regression for the reported bug: a server started with no
-    # --default-temperature override (app_config never gets the key, per
-    # apply_optional_sampling_default above) must let the model's own
-    # generation_config.json value win, not silently fall to the hardcoded 1.0.
-    app_config = {}
-    gen_defaults = {"temperature": 0.6}
+@pytest.mark.parametrize(
+    ("app_config", "generation_defaults", "expected"),
+    [
+        # A server started without --default-temperature must let the model's own
+        # generation_config.json value win, not silently fall to the hardcoded 1.0.
+        pytest.param({}, {"temperature": 0.6}, 0.6, id="generation-config-when-server-unset"),
+        pytest.param({"default_temperature": 0.2}, {"temperature": 0.6}, 0.2, id="server-wins"),
+        # `config_key in app_config` rather than `.get(config_key, default)`: an operator-configured
+        # 0 is not mistaken for "unset".
+        pytest.param({"default_temperature": 0}, {"temperature": 0.6}, 0, id="configured-zero"),
+        pytest.param({}, {}, 1.0, id="hardcoded-fallback"),
+    ],
+)
+def test_resolve_sampling_default_tiers(app_config, generation_defaults, expected):
     assert (
         resolve_sampling_default(
-            app_config, gen_defaults, "temperature", "default_temperature", 1.0
+            app_config, generation_defaults, "temperature", "default_temperature", 1.0
         )
-        == 0.6
+        == expected
     )
 
 
-def test_resolve_sampling_default_prefers_explicit_server_config():
-    app_config = {"default_temperature": 0.2}
-    gen_defaults = {"temperature": 0.6}
-    assert (
-        resolve_sampling_default(
-            app_config, gen_defaults, "temperature", "default_temperature", 1.0
-        )
-        == 0.2
-    )
-
-
-def test_resolve_sampling_default_treats_configured_zero_as_explicit():
-    # `config_key in app_config` is used instead of `.get(config_key, default)`
-    # specifically so an operator-configured 0 (a real, valid top_k) is not
-    # mistaken for "unset". This guards that distinction directly.
-    app_config = {"default_top_k": 0}
-    gen_defaults = {"top_k": 5}
-    assert resolve_sampling_default(app_config, gen_defaults, "top_k", "default_top_k", 1) == 0
-
-
-def test_resolve_sampling_default_falls_back_to_hardcoded_when_neither_set():
-    assert resolve_sampling_default({}, {}, "temperature", "default_temperature", 1.0) == 1.0
-
-
-def test_generation_config_sampling_defaults_missing_attr_returns_empty():
-    class _Tokenizer:
-        pass
-
-    assert generation_config_sampling_defaults(_Tokenizer()) == {}
-
-
-def test_generation_config_sampling_defaults_non_dict_returns_empty():
-    class _Tokenizer:
-        generation_config = "not-a-dict"
-
-    assert generation_config_sampling_defaults(_Tokenizer()) == {}
-
-
-def test_generation_config_sampling_defaults_extracts_numeric_fields():
-    class _Tokenizer:
-        generation_config = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "do_sample": True}
-
-    assert generation_config_sampling_defaults(_Tokenizer()) == {
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "top_k": 20,
-    }
-
-
-def test_generation_config_sampling_defaults_rejects_bool_values():
-    # bool is an int subclass in Python; a stray `"top_k": true` must not be
-    # treated as a numeric sampling value.
-    class _Tokenizer:
-        generation_config = {"top_k": True}
-
-    assert generation_config_sampling_defaults(_Tokenizer()) == {}
-
-
-def test_generation_config_sampling_defaults_omits_non_numeric_fields():
-    class _Tokenizer:
-        generation_config = {"temperature": "warm", "top_p": 0.9}
-
-    assert generation_config_sampling_defaults(_Tokenizer()) == {"top_p": 0.9}
+@pytest.mark.parametrize(
+    ("tokenizer", "expected"),
+    [
+        pytest.param(SimpleNamespace(), {}, id="no-generation-config"),
+        pytest.param(SimpleNamespace(generation_config="not-a-dict"), {}, id="not-a-dict"),
+        pytest.param(
+            SimpleNamespace(
+                generation_config={
+                    "temperature": 0.6,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "do_sample": True,
+                }
+            ),
+            {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+            id="numeric-sampling-fields",
+        ),
+        # bool is an int subclass; a stray `"top_k": true` is not a numeric sampling value.
+        pytest.param(SimpleNamespace(generation_config={"top_k": True}), {}, id="bool-rejected"),
+        pytest.param(
+            SimpleNamespace(generation_config={"temperature": "warm", "top_p": 0.9}),
+            {"top_p": 0.9},
+            id="non-numeric-omitted",
+        ),
+    ],
+)
+def test_generation_config_sampling_defaults(tokenizer, expected):
+    assert generation_config_sampling_defaults(tokenizer) == expected
 
 
 # --- HTTP harness, shared with test_completions.py and test_chat_completions.py ---------------
@@ -206,6 +175,7 @@ class ReplyingClient:
         self.fail_admission_at = fail_admission_at
         self.prompt_tokens = []
         self.sampling_params = []
+        self.multi_modal_data = []
         self.offload_params = []
         self.aborted = []
         self.streamed = []
@@ -213,11 +183,11 @@ class ReplyingClient:
     def add_request_with_id(
         self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
     ):
-        del multi_modal_data
         if len(self.prompt_tokens) == self.fail_admission_at:
             raise RuntimeError("zmq send failed")
         self.prompt_tokens.append(list(prompt_tokens))
         self.sampling_params.append(sampling_params)
+        self.multi_modal_data.append(multi_modal_data)
         self.offload_params.append(offload_params)
         request_id = len(self.prompt_tokens)
         reply = (
@@ -351,6 +321,13 @@ _COMPLETIONS_DEFAULTS = {
         ),
         pytest.param(
             COMPLETIONS_PATH,
+            {"logprobs": 0, "echo": True},
+            {},
+            {"return_log_probs": True, "top_n_logprobs": 0, "skip_prompt_log_probs": False},
+            id="completions-logprobs-zero-scores-without-top-n",
+        ),
+        pytest.param(
+            COMPLETIONS_PATH,
             {"logprobs": 3},
             {},
             {"return_log_probs": True, "top_n_logprobs": 3, "skip_prompt_log_probs": True},
@@ -406,36 +383,6 @@ _COMPLETIONS_DEFAULTS = {
         ),
         pytest.param(
             CHAT_PATH, {"stop": "END"}, {}, {"stop_words": ["END"]}, id="chat-stop-string"
-        ),
-        # A temperature of zero means greedy decoding, whatever top_k/top_p say.
-        pytest.param(
-            CHAT_PATH,
-            {"temperature": 0, "top_k": 50, "top_p": 0.9},
-            {},
-            {"temperature": 0.0, "top_k": 1, "top_p": 0.0},
-            id="chat-zero-temperature-is-greedy",
-        ),
-        pytest.param(
-            COMPLETIONS_PATH,
-            {"temperature": 0, "top_k": 50, "top_p": 0.9},
-            {},
-            {"temperature": 0.0, "top_k": 1, "top_p": 0.0},
-            id="completions-zero-temperature-is-greedy",
-        ),
-        # An operator default outranks the model's generation_config.
-        pytest.param(
-            COMPLETIONS_PATH,
-            {},
-            {"tokenizer": GenerationConfigTokenizer(), "default_top_p": 0.5},
-            {"temperature": 0.6, "top_p": 0.5, "top_k": 20},
-            id="completions-server-default-beats-generation-config",
-        ),
-        pytest.param(
-            COMPLETIONS_PATH,
-            {"temperature": 0.3},
-            {"tokenizer": GenerationConfigTokenizer()},
-            {"temperature": 0.3},
-            id="completions-request-beats-generation-config",
         ),
         pytest.param(
             COMPLETIONS_PATH,
@@ -589,14 +536,22 @@ async def test_failures_before_formatting_are_a_500(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("path", "expected_log"),
+    ("path", "expected_logs"),
     [
-        (CHAT_PATH, "Batch of 3 requests (n=3) processed in"),
-        (COMPLETIONS_PATH, "Batch of 3 requests processed in"),
+        # Chat also logs every reply, with its token-id lists redacted.
+        (
+            CHAT_PATH,
+            [
+                "Batch of 3 requests (n=3) processed in",
+                "'prompt_tokens': '...truncated...'",
+                "'generated_tokens': '...truncated...'",
+            ],
+        ),
+        (COMPLETIONS_PATH, ["Batch of 3 requests processed in"]),
     ],
     ids=["chat", "completions"],
 )
-async def test_verbose_logs_the_batch_timing(path, expected_log, caplog):
+async def test_verbose_logs_the_batch_timing_and_redacted_replies(path, expected_logs, caplog):
     client = ReplyingClient()
     app = build_app(path, client, verbose=True)
 
@@ -604,65 +559,13 @@ async def test_verbose_logs_the_batch_timing(path, expected_log, caplog):
         response = await app.test_client().post(path, json=FAN_OUT_BODIES[path])
 
     assert response.status_code == 200, await response.get_data(as_text=True)
-    assert expected_log in caplog.text
+    for expected_log in expected_logs:
+        assert expected_log in caplog.text
 
 
 # --- failed requests ----------------------------------------------------------
 
 _COMPLETED = completed_reply("req-ok", [10, 11], [12])
-
-
-@pytest.mark.asyncio
-@PATHS
-@pytest.mark.parametrize(
-    ("replies", "expected"),
-    [
-        pytest.param(
-            [
-                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "bad"}),
-                _COMPLETED,
-                _COMPLETED,
-            ],
-            ("Inference request(s) failed: Request 0: bad", 400),
-            id="nontransient-is-400",
-        ),
-        pytest.param(
-            [
-                _COMPLETED,
-                failed_reply({"type": "ERROR_TRANSIENT", "payload": "timeout"}),
-                _COMPLETED,
-            ],
-            ("Inference request(s) failed: Request 1: timeout", 500),
-            id="transient-is-500",
-        ),
-        pytest.param(
-            [
-                failed_reply({"type": "ERROR_TRANSIENT", "payload": "t"}),
-                _COMPLETED,
-                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "nt"}),
-            ],
-            ("Inference request(s) failed: Request 0: t; Request 2: nt", 400),
-            id="mixed-nontransient-wins",
-        ),
-        pytest.param(
-            [failed_reply(), _COMPLETED, {"uid": "req-failed", "status": "FAILED"}],
-            (
-                "Inference request(s) failed: Request 0: Unknown error; Request 2: Unknown error",
-                500,
-            ),
-            id="no-error-events",
-        ),
-    ],
-)
-async def test_failed_requests_are_reported(path, replies, expected):
-    client = ReplyingClient(replies)
-    app = build_app(path, client)
-
-    response = await app.test_client().post(path, json=FAN_OUT_BODIES[path])
-
-    assert (await response.get_data(as_text=True), response.status_code) == expected
-
-
 _OVERFLOW = "MaxSequenceLengthOverflowError: prompt exceeds max_sequence_length"
 # Nemo-RL matches on this exact message.
 _NEMO_RL_OVERFLOW_BODY = (
@@ -672,40 +575,89 @@ _NEMO_RL_OVERFLOW_BODY = (
 _PLAIN_OVERFLOW_BODY = f"Inference request(s) failed: Request 0: {_OVERFLOW}"
 
 
+def _on_both_endpoints(expected):
+    return {CHAT_PATH: expected, COMPLETIONS_PATH: expected}
+
+
 @pytest.mark.asyncio
+@PATHS
 @pytest.mark.parametrize(
-    ("path", "event_type", "expected"),
+    ("replies", "expected_by_path"),
     [
-        # /v1/chat/completions reports the prompt length in the body Nemo-RL matches on,
-        # whatever the event type ...
         pytest.param(
-            CHAT_PATH, "ERROR_NONTRANSIENT", (_NEMO_RL_OVERFLOW_BODY, 400), id="chat-nontransient"
+            [
+                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "bad"}),
+                _COMPLETED,
+                _COMPLETED,
+            ],
+            _on_both_endpoints(("Inference request(s) failed: Request 0: bad", 400)),
+            id="nontransient-is-400",
         ),
         pytest.param(
-            CHAT_PATH, "ERROR_TRANSIENT", (_NEMO_RL_OVERFLOW_BODY, 400), id="chat-transient"
+            [
+                _COMPLETED,
+                failed_reply({"type": "ERROR_TRANSIENT", "payload": "timeout"}),
+                _COMPLETED,
+            ],
+            _on_both_endpoints(("Inference request(s) failed: Request 1: timeout", 500)),
+            id="transient-is-500",
         ),
-        # ... while /v1/completions reports an overflow like any other failure.
         pytest.param(
-            COMPLETIONS_PATH,
-            "ERROR_NONTRANSIENT",
-            (_PLAIN_OVERFLOW_BODY, 400),
-            id="completions-nontransient",
+            [
+                failed_reply({"type": "ERROR_TRANSIENT", "payload": "t"}),
+                _COMPLETED,
+                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "nt"}),
+            ],
+            _on_both_endpoints(("Inference request(s) failed: Request 0: t; Request 2: nt", 400)),
+            id="mixed-nontransient-wins",
         ),
         pytest.param(
-            COMPLETIONS_PATH,
-            "ERROR_TRANSIENT",
-            (_PLAIN_OVERFLOW_BODY, 500),
-            id="completions-transient",
+            [failed_reply(), _COMPLETED, {"uid": "req-failed", "status": "FAILED"}],
+            _on_both_endpoints(
+                (
+                    "Inference request(s) failed: Request 0: Unknown error; "
+                    "Request 2: Unknown error",
+                    500,
+                )
+            ),
+            id="no-error-events",
+        ),
+        # /v1/completions reports a context overflow like any other failure, while
+        # /v1/chat/completions reports the prompt length in the body Nemo-RL matches on, whatever
+        # the event type.
+        pytest.param(
+            [
+                failed_reply({"type": "ERROR_NONTRANSIENT", "payload": _OVERFLOW}),
+                _COMPLETED,
+                _COMPLETED,
+            ],
+            {
+                CHAT_PATH: (_NEMO_RL_OVERFLOW_BODY, 400),
+                COMPLETIONS_PATH: (_PLAIN_OVERFLOW_BODY, 400),
+            },
+            id="overflow-nontransient",
+        ),
+        pytest.param(
+            [
+                failed_reply({"type": "ERROR_TRANSIENT", "payload": _OVERFLOW}),
+                _COMPLETED,
+                _COMPLETED,
+            ],
+            {
+                CHAT_PATH: (_NEMO_RL_OVERFLOW_BODY, 400),
+                COMPLETIONS_PATH: (_PLAIN_OVERFLOW_BODY, 500),
+            },
+            id="overflow-transient",
         ),
     ],
 )
-async def test_context_overflow_failure_report(path, event_type, expected):
-    client = ReplyingClient([failed_reply({"type": event_type, "payload": _OVERFLOW})])
+async def test_failed_requests_are_reported(path, replies, expected_by_path):
+    client = ReplyingClient(replies)
     app = build_app(path, client)
 
-    response = await app.test_client().post(path, json=BODIES[path])
+    response = await app.test_client().post(path, json=FAN_OUT_BODIES[path])
 
-    assert (await response.get_data(as_text=True), response.status_code) == expected
+    assert (await response.get_data(as_text=True), response.status_code) == expected_by_path[path]
 
 
 # --- streaming ----------------------------------------------------------------
@@ -802,16 +754,3 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
         else []
     )
     assert client.aborted == []
-
-
-@pytest.mark.asyncio
-@PATHS
-async def test_streaming_reports_an_engine_failure_in_band(path, monkeypatch):
-    client = ReplyingClient([failed_reply({"type": "ERROR_NONTRANSIENT", "payload": "bad"})])
-    app = build_streaming_app(path, client, monkeypatch)
-
-    response = await app.test_client().post(path, json={**BODIES[path], "stream": True})
-
-    assert response.status_code == 200
-    # Headers are already sent, so the failure arrives as an error event without `[DONE]`.
-    assert await sse_payloads(response) == ([{"error": {"message": "bad"}}], False)
