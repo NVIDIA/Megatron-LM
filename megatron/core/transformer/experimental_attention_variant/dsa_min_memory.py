@@ -135,34 +135,34 @@ def _plan_execution(
     if key_chunk_override is not None and key_chunk_override > 0:
         key_chunk = min(key_chunk_override, key_length)
 
-    # The PyTorch backend is the numerical oracle. Streaming torch.topk over key chunks is not
-    # tie-equivalent to a single full torch.topk: exact zero ties are common in standard DSA
-    # after ReLU, and simplified routing can also contain equal scores. Routing therefore reads
-    # the whole key length under torch, so min-memory-torch reproduces reference routing. This
-    # is a correctness rule, not a tuning choice.
+    # Routing scores a [batch, query_chunk, key_chunk] fp32 tile, and the budget bounds it. The
+    # two backends absorb that bound on different axes, because only one of them may chunk keys.
     #
-    # Triton also routes over the whole key length, for a different reason. Its router does not
-    # materialise a [batch, query_chunk, key_chunk] tile at all: triton_topk_index_block streams
-    # the key dimension itself in ROUTER_KEY_SUB_BLOCK-wide sub-blocks and merges the per-sub-block
-    # top-k with the same merge the outer loop uses. An outer key chunk therefore buys no memory --
-    # it only repeats that merge and relaunches the kernel, 128 times over at sequence 131072.
-    routing_key_chunk = key_length
-    if use_triton and key_chunk_override is not None and key_chunk_override > 0:
-        # Honour an explicit override so tests can still force the outer multi-chunk merge.
-        routing_key_chunk = key_chunk
-
-    # Size the query chunk so the largest score tile stays inside the budget. Under torch the
-    # routing tile is the widest and sets the bound. Under Triton the widest thing resident is the
-    # router's internal sub-block, so budgeting the full routing width would shrink the query chunk
-    # to pay for a tile that is never allocated.
-    budget_key_width = (
-        min(routing_key_chunk, ROUTER_KEY_SUB_BLOCK) if use_triton else routing_key_chunk
-    )
-    tile_row_bytes = max(1, batch_size * budget_key_width * 4)
-    affordable = max(1, _SCORE_TILE_BUDGET_BYTES // tile_row_bytes)
-    query_chunk = min(query_length, _MAX_QUERY_CHUNK, affordable)
-    if query_chunk_override is not None and query_chunk_override > 0:
-        query_chunk = min(query_chunk_override, query_length)
+    # Torch is the numerical oracle: a streamed torch.topk over key chunks is not tie-equivalent
+    # to a single full torch.topk, and exact zero ties are common in standard DSA after ReLU. It
+    # must read the whole key length, so it pays for the budget by shrinking the query chunk.
+    # This is a correctness rule, not a tuning choice.
+    #
+    # Triton may chunk keys, so it holds the query chunk at the occupancy cap -- shrinking it
+    # would cost launches without buying anything -- and solves instead for the widest key block
+    # whose tile fits. The outer routing loop iterates whatever is left and _merge_topk combines
+    # the per-block results, which is the same merge a single full pass would produce up to ties.
+    if use_triton:
+        query_chunk = min(query_length, _MAX_QUERY_CHUNK)
+        if query_chunk_override is not None and query_chunk_override > 0:
+            query_chunk = min(query_chunk_override, query_length)
+        tile_row_bytes = max(1, batch_size * query_chunk * 4)
+        routing_key_chunk = min(key_length, max(1, _SCORE_TILE_BUDGET_BYTES // tile_row_bytes))
+        if key_chunk_override is not None and key_chunk_override > 0:
+            # Honour an explicit override so tests can force a narrower multi-block merge.
+            routing_key_chunk = min(key_chunk, key_length)
+    else:
+        routing_key_chunk = key_length
+        tile_row_bytes = max(1, batch_size * routing_key_chunk * 4)
+        affordable = max(1, _SCORE_TILE_BUDGET_BYTES // tile_row_bytes)
+        query_chunk = min(query_length, _MAX_QUERY_CHUNK, affordable)
+        if query_chunk_override is not None and query_chunk_override > 0:
+            query_chunk = min(query_chunk_override, query_length)
 
     return _DSAExecutionPlan(
         query_chunk=query_chunk, key_chunk=key_chunk, routing_key_chunk=routing_key_chunk
