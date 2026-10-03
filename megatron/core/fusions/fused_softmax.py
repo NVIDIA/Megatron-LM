@@ -230,7 +230,12 @@ class FusedScaleMaskSoftmax(nn.Module):
         # [b, np, sq, sk]
         assert input.dim() == 4
 
-        if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
+        # The fused kernels cannot apply a sliding window, so fall back to torch for SWA.
+        if (
+            self.is_kernel_available(mask, *input.size())
+            and softmax_offset is None
+            and self.window_size is None
+        ):
             return self.forward_fused_softmax(input, mask)
         else:
             return self.forward_torch_softmax(input, mask, softmax_offset)
