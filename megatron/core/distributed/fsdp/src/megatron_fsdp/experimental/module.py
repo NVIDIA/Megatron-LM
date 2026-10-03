@@ -25,6 +25,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
+from torch.utils._pytree import tree_leaves
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
@@ -176,7 +177,6 @@ class FsdpModule:
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
     _is_root: bool
-    _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
@@ -292,7 +292,9 @@ class FsdpModule:
             lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
         )
         module.register_forward_hook(
-            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+            lambda hooked_module, _args, output: cast(FsdpModule, hooked_module).post_forward(
+                output
+            )
         )
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
@@ -306,34 +308,33 @@ class FsdpModule:
 
         The hook runs when this module's backward is complete, so it can reshard
         this module's parameters and reduce their gradients. It is invoked once
-        all of this module's trainable parameters have accumulated gradients, or
-        via a full-backward hook when the module owns no trainable parameters.
+        all counted trainable parameters have accumulated gradients, or
+        via a full-backward hook when no trainable parameters are counted.
 
         Args:
-            post_backward_hook: Callback receiving this FSDP module after all of its
-                trainable parameters have accumulated gradients.
+            post_backward_hook: Callback receiving this FSDP module after its
+                expected parameter gradients have accumulated.
         """
         module = cast(nn.Module, self)
-        if self._trainable_parameter_countdown.initial_value == 0:
 
-            def grad_checking_post_backward_hook(hooked_module, grad_input, _grad_output):
-                module = cast(FsdpModule, hooked_module)
-                # With no grad-requiring inputs, PyTorch fires this hook at
-                # output gradients, before internal backward can read weights.
-                # Parameterless containers have no owned storage to release.
-                if module.parameter_groups and all(grad is None for grad in grad_input):
-                    raise NotImplementedError(
-                        "MFSDP requires input gradients in the full backward hook for units "
-                        "owning only frozen parameters. See "
-                        "https://github.com/NVIDIA/Megatron-LM/issues/7823."
-                    )
-                post_backward_hook(module)
+        def grad_checking_post_backward_hook(hooked_module, grad_input, _grad_output):
+            module = cast(FsdpModule, hooked_module)
+            if module._trainable_parameter_countdown.initial_value != 0:
+                return
+            # Without input gradients this hook can fire before internal backward
+            # consumes weights. Parameterless containers have no storage to release.
+            if module.parameter_groups and all(grad is None for grad in grad_input):
+                raise NotImplementedError(
+                    "MFSDP requires input gradients in the full backward hook for units "
+                    "with no used trainable parameters. See "
+                    "https://github.com/NVIDIA/Megatron-LM/issues/7823."
+                )
+            post_backward_hook(module)
 
-            module.register_full_backward_hook(grad_checking_post_backward_hook)
-            return
+        module.register_full_backward_hook(grad_checking_post_backward_hook)
 
         # Gradient reduction for trainable parameters is parameter-completion
-        # based: once every owned Parameter has accumulated its grad, this
+        # based: once every counted Parameter has accumulated its grad, this
         # FsdpModule can reduce and reshard. Module full-backward hooks can fire
         # before that when module inputs do not require grad.
         module_ref = ref(self)
@@ -471,8 +472,44 @@ class FsdpModule:
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
-    def post_forward(self) -> None:
+    def _count_used_parameters(self, output: object) -> int:
+        """Count unique owned leaves reachable from this forward's outputs."""
+        owned_count = sum(
+            len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
+        )
+        pending = [
+            torch.autograd.graph.get_gradient_edge(tensor).node
+            for tensor in tree_leaves(output)
+            if isinstance(tensor, torch.Tensor) and tensor.requires_grad
+        ]
+        visited = set()
+        used_parameters = set()
+        while pending:
+            node = pending.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            # This node exposes checkpoint inputs, but hides internal parameter
+            # leaves. Fall back to the owned count only for such an opaque graph.
+            if node.name() == "CheckpointFunctionBackward":
+                return owned_count
+            parameter = getattr(node, "variable", None)
+            if (
+                parameter is not None
+                and get_containing_parameter_group(parameter) in self._parameter_groups
+            ):
+                used_parameters.add(parameter)
+            pending.extend(parent for parent, _ in node.next_functions if parent is not None)
+        return len(used_parameters)
+
+    def post_forward(self, output: object = None) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        if (
+            output is not None
+            and torch.is_grad_enabled()
+            and self.phase is not FsdpModule.Phase.BACKWARD
+        ):
+            self._trainable_parameter_countdown = Countdown(self._count_used_parameters(output))
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
@@ -508,6 +545,8 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+        if self.phase is FsdpModule.Phase.BACKWARD:
+            return  # Repeated uses of a shared layer contribute to one countdown.
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
@@ -527,8 +566,19 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
+        # Packing clears unsharded gradients after each reduction, so missing
+        # gradients here belong to parameters unused by this backward.
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            for parameter in group.fsdp_parameters:
+                if parameter.unsharded.grad is None:
+                    parameter.unsharded.grad = torch.zeros_like(parameter.unsharded)
         self.reshard()
         self._reduce_gradient_groups()
+        if not self.context._post_backward_hook_registered:
+            # Delayed TE wgrad can finish after the final autograd callback.
+            self.context.current_stream().wait_stream(self.context.reduce_scatter_stream)
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
