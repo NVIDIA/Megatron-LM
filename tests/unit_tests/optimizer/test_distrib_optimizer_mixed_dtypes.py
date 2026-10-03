@@ -70,6 +70,7 @@ def _check_parameter_state_round_trip(model, optimizer):
             torch.testing.assert_close(value, second_step[param][key], rtol=0, atol=0)
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("precision_aware", [False, True])
 @pytest.mark.parametrize(
     "dtypes",
@@ -127,6 +128,7 @@ def test_parameter_state_round_trip(dtypes, precision_aware):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("precision_aware", [False, True])
 def test_mhc_bf16_parameter_state_round_trip(precision_aware):
     """Exercise real mHC FP32 markers and BF16 conversion without a training loop."""
