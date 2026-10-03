@@ -246,11 +246,8 @@ class SSMDynamicInferenceMixin:
                 intermediate_ssm_state=int_ssm_state,
             )
             # Flatten back to [N*S, 1, d] to match the merge logic. reshape, not view: with
-            # speculative decoding `seq_len > 1`, and the GatedDeltaProduct (FLA) decode kernel
-            # returns a non-contiguous [N, S, d], which `view` rejects. The logical shape is
-            # [N, S, d] and the merge wants a row-major (request-major, then token) flatten,
-            # which is exactly what reshape gives; it differs from view only by copying when
-            # the stride forbids a view.
+            # speculative decoding, some kernels (e.g. GatedDeltaProduct) return a
+            # non-contiguous [N, S, d].
             y_decode = y_decode.reshape(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
