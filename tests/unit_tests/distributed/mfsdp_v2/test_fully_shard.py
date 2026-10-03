@@ -747,7 +747,7 @@ def test_frozen_weights_without_input_gradients_reject_backward(distributed_setu
         output = model(x)
         assert not x.requires_grad
         assert output.requires_grad
-        with pytest.raises(NotImplementedError, match="MFSDP cannot safely reshard frozen weights"):
+        with pytest.raises(NotImplementedError, match="MFSDP requires input gradients"):
             output.sum().backward()
 
     frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded

@@ -323,8 +323,8 @@ class FsdpModule:
                 # Parameterless containers have no owned storage to release.
                 if module.parameter_groups and all(grad is None for grad in grad_input):
                     raise NotImplementedError(
-                        "MFSDP cannot safely reshard frozen weights when its full backward "
-                        "hook receives no input gradients. See "
+                        "MFSDP requires input gradients in the full backward hook for units "
+                        "owning only frozen parameters. See "
                         "https://github.com/NVIDIA/Megatron-LM/issues/7823."
                     )
                 post_backward_hook(module)
