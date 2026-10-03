@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,9 +35,15 @@ def join_paths(*paths: str) -> str:
 
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
-        return msc.os.path.join(*paths)
+        path_cls = msc.Path
+    else:
+        path_cls = Path
 
-    return os.path.join(*paths)
+    path = path_cls(paths[0])
+    for part in paths[1:]:
+        path = path / part
+
+    return str(path)
 
 
 def get_checkpoint_run_config_filename(checkpoints_path: str) -> str:
