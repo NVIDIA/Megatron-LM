@@ -144,6 +144,8 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
                 _validate_cadence(inner_cadence, test_case)
             cartesian_keys = [k for k in param_dict.keys() if k != "cadence"]
             cartesian_values = [param_dict[k] for k in cartesian_keys]
+            cartesian_keys.insert(0, "test_case")
+            cartesian_values.insert(0, product["test_case"])
 
             # Resolve effective cadence: inner overrides outer, default loose.
             # `explicit_cadence` is None when neither inner nor outer set it,
@@ -159,7 +161,6 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
             for value_combination in param_combinations:
                 # Map parameter names to their values
                 flattened = dict(zip(cartesian_keys, value_combination))
-                flattened["test_case"] = test_case
                 # Apply legacy scope alias per row so that scope: [mr, nightly]
                 # produces two rows with the right (tier, cadence) each.
                 row_cadence = default_cadence
