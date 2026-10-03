@@ -53,6 +53,11 @@ def get_train_state():
     return _GLOBAL_TRAIN_STATE
 
 
+def get_train_state_if_initialized():
+    """Return the active train state, or ``None`` for legacy initialization paths."""
+    return _GLOBAL_TRAIN_STATE
+
+
 def get_tokenizer():
     """Return tokenizer."""
     _ensure_var_is_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
