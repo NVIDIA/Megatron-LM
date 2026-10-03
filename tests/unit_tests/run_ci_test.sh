@@ -277,7 +277,7 @@ merge_rank_selections() {
 
 # Unit tests mapped to changed source directories in
 # tests/unit_tests/testmon_mandatory_tests.yaml always run on top of the
-# Testmon selection. The host writes the changed-file list next to the baseline.
+# Testmon selection. The host writes the PR's changed-file list next to the baseline.
 apply_mandatory_tests() {
     local phase="$1"
     uv run --no-sync python tests/unit_tests/testmon_mandatory.py \

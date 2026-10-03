@@ -793,6 +793,10 @@ jobs:
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -880,6 +884,10 @@ jobs:
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest-gb200:
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:

@@ -2,9 +2,9 @@
 # what Testmon selects. This file is only consulted in the selective (`enforce`)
 # unit-test mode; full and baseline runs already execute every test.
 #
-# A mapping fires when any file changed between the restored Testmon baseline
-# commit and the tested commit lives under one of its `source_dirs` (prefix
-# match; glob patterns are also accepted). Its `test_buckets` are keyed by the
+# A mapping fires when a file in the PR's changed-file list lives under one of
+# its `source_dirs` (prefix match; glob patterns are also accepted). This list
+# is independent of the Testmon baseline. Its `test_buckets` are keyed by the
 # recipe platform (`dgx_h100`, `dgx_gb200`) and list test paths or globs; only
 # the files that belong to the bucket currently being executed are added to that
 # bucket's selection. Naming a whole bucket runs that bucket exhaustively.
