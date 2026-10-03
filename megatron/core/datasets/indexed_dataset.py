@@ -820,6 +820,8 @@ class IndexedDataset(torch.utils.data.Dataset):
             sequence_modes = (
                 self.index.sequence_modes[idx] if self.multimodal else None  # type: ignore[index]
             )
+            if start >= stop:
+                return ([], sequence_modes) if sequence_modes is not None else []
             sequence_offsets = list(accumulate(sequence_lengths))
             sequences = numpy.split(
                 self.bin_reader.read(
