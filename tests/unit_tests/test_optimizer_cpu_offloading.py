@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
+from copy import deepcopy
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import SGD, Adam
+from torch.optim import SGD, Adam, AdamW
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as GPUAdam
@@ -21,6 +22,7 @@ from megatron.core.transformer.module import (
     convert_module_to_dtype_except_fp32_marked,
     mark_keep_in_fp32,
 )
+from tests.unit_tests.determinism.kernels.harness import bytes_equal
 
 
 class Fp32MarkedToyNet(nn.Module):
@@ -73,6 +75,117 @@ class BigNet(nn.Module):
         x = F.relu(self.fc3(x))
         x = self.fc4(x)
         return x
+
+
+@pytest.mark.parametrize('overlap', [False, True])
+@pytest.mark.parametrize('gpu_dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('gradient_dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
+def test_hybrid_decoupled_gradient_and_missing_grad(
+    overlap: bool, gpu_dtype: torch.dtype, gradient_dtype: torch.dtype
+) -> None:
+    """Route native FP32 gradients and skip absent gradients on both devices."""
+    cpu_owned = nn.Parameter(torch.ones(64, device='cuda', dtype=torch.bfloat16))
+    gpu_owned = nn.Parameter(torch.ones(64, device='cuda', dtype=gpu_dtype))
+    reference = nn.Parameter(gpu_owned.detach().float().clone())
+    optimizer = HybridDeviceOptimizer(
+        [cpu_owned, gpu_owned],
+        offload_fraction=0.5,
+        cpu_optimizer_cls=AdamW,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        overlap_cpu_optimizer_d2h_h2d=overlap,
+        lr=0.1,
+        weight_decay=0.01,
+        fused=True,
+    )
+    reference_optimizer = GPUAdam([reference], lr=0.1, weight_decay=0.01)
+    assert cpu_owned in optimizer.gpu_params_map_cpu_copy
+    assert gpu_owned not in optimizer.gpu_params_map_cpu_copy
+    assert (gpu_owned in optimizer.param_to_fp32_param) == (gpu_dtype != torch.float32)
+
+    for value in (1.0, None, 0.5):
+        before = [parameter.detach().clone() for parameter in (cpu_owned, gpu_owned)]
+        gradient = (
+            None if value is None else torch.full_like(reference, value, dtype=gradient_dtype)
+        )
+        cpu_owned.decoupled_grad = gradient
+        gpu_owned.decoupled_grad = gradient
+        reference.grad = None if gradient is None else gradient.float().clone()
+        if overlap and gradient is not None:
+            # A GPU update must not depend on a cast queued behind delayed D2H work.
+            with torch.cuda.stream(optimizer._d2h_stream):
+                torch.cuda._sleep(10_000_000)
+        optimizer.step()
+        reference_optimizer.step()
+        torch.cuda.synchronize()
+        assert torch.equal(gpu_owned, reference.to(gpu_dtype)), "GPU gradient was not consumed"
+        assert gpu_owned.requires_grad, "An absent gradient must not freeze the model parameter"
+        for old, parameter in zip(before, (cpu_owned, gpu_owned)):
+            if value is None:
+                assert torch.equal(old, parameter), "Absent gradient reused a stale child buffer"
+            else:
+                assert not torch.equal(
+                    old, parameter
+                ), "A supplied gradient did not update its owner"
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('overlap', [False, True])
+@pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
+def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool) -> None:
+    """A native checkpoint must preserve more than the first resumed update."""
+    initial = [
+        torch.linspace(-0.5, 0.5, size, device='cuda').to(dtype) for size in (65, 93, 33, 101)
+    ]
+
+    def construct():
+        parameters = [nn.Parameter(value.clone()) for value in initial]
+        optimizer = HybridDeviceOptimizer(
+            [{'params': parameters[:3]}, {'params': parameters[3:]}],
+            offload_fraction=0.5,
+            cpu_optimizer_cls=AdamW,
+            gpu_optimizer_cls=GPUAdam,
+            param_update_in_fp32=True,
+            overlap_cpu_optimizer_d2h_h2d=overlap,
+            lr=0.01,
+            fused=True,
+        )
+        assert optimizer.cpu_optimizers and optimizer.gpu_optimizer is not None
+        return parameters, optimizer
+
+    def step(parameters, optimizer, index):
+        for parameter in parameters:
+            gradient = torch.full_like(parameter, index * 0.125, dtype=torch.float32)
+            if dtype == torch.bfloat16:
+                parameter.decoupled_grad = gradient
+            else:
+                parameter.grad = gradient
+        optimizer.step()
+
+    parameters, optimizer = construct()
+    for index in (1, 2, 3):
+        step(parameters, optimizer, index)
+    torch.cuda.synchronize()
+    checkpoint = deepcopy(optimizer.state_dict())
+    restored_parameters, restored_optimizer = construct()
+    for old, new in zip(parameters, restored_parameters):
+        new.data.copy_(old.data)
+    restored_optimizer.load_state_dict(checkpoint)
+
+    for index in (4, 5):
+        step(parameters, optimizer, index)
+        step(restored_parameters, restored_optimizer, index)
+        torch.cuda.synchronize()
+        for child in (optimizer.gpu_optimizer, restored_optimizer.gpu_optimizer):
+            assert all(group['step'] == index for group in child.param_groups)
+        for left, right in zip(parameters, restored_parameters):
+            assert torch.equal(left, right), "Native resume changed parameter bytes"
+            left_state, right_state = optimizer.state[left], restored_optimizer.state[right]
+            assert left_state.keys() == right_state.keys()
+            for key in left_state:
+                a, b = left_state[key], right_state[key]
+                assert bytes_equal(a, b), f"Native resume changed {key} bytes"
 
 
 def setup_seed(seed):
