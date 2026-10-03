@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import activations, parallel_state
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
@@ -108,6 +109,27 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
+
+
+@pytest.mark.skipif(
+    te_ext._te_mark_grouped_tensor is None,
+    reason="Transformer Engine does not provide mark_grouped_tensor",
+)
+@pytest.mark.parametrize(
+    "name,activation",
+    [("swiglu", weighted_bias_swiglu_impl), ("quick_geglu", weighted_bias_quick_geglu_impl)],
+)
+def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation):
+    """Marker propagation through activation views must preserve bit-exact numerics."""
+    seeded()
+    x = _act((TOKENS, 2 * FFN))
+    weights = _weights(TOKENS)
+
+    def fn(x, weights):
+        te_ext.mark_grouped_tensor(x)
+        return activation(x, None, weights)
+
+    assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
 
 
 # --- plain compiled activations -----------------------------------------------------------
