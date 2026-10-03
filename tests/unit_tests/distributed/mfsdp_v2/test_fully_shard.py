@@ -728,6 +728,50 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     assert group.main_grad is None
 
 
+def test_frozen_weights_without_input_gradients_reject_backward(distributed_setup):
+    """Reject the unsafe full-backward-hook path before releasing frozen weights."""
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    # This is the simplest setup where an FSDP unit owns only frozen weights and
+    # has no grad-requiring inputs, but still allows backward() to reproduce the
+    # error: a separately sharded trainable child keeps the backward graph alive.
+    trainable_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear.requires_grad_(False)
+    model = nn.Sequential(trainable_linear, frozen_linear).to(device)
+    # Shard the trainable layer separately so the root FSDP unit owns only the
+    # frozen weight. Backward still needs that weight to reach the trainable layer.
+    with fully_shard_context(device=device):
+        fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    assert all(not group.requires_grad for group in model.parameter_groups)
+
+    def unpack(tensor):
+        # Fail before a CUDA kernel reads freed storage. Suppress traceback tensor
+        # formatting, which would also try to read that storage.
+        if tensor.untyped_storage().nbytes() == 0:
+            pytest.fail("Frozen weight was resharded before backward consumed it", pytrace=False)
+        return tensor
+
+    x = torch.ones(2, 4, device=device, requires_grad=False)
+    # Preserve saved tensors' storage so a copy cannot hide early resharding.
+    # On retrieval during backward, unpack checks that storage still exists
+    # before a CUDA kernel can read it if rejection regresses.
+    with torch.autograd.graph.saved_tensors_hooks(
+        pack_hook=lambda tensor: tensor, unpack_hook=unpack
+    ):
+        output = model(x)
+        assert not x.requires_grad
+        assert output.requires_grad
+        with pytest.raises(NotImplementedError, match="MFSDP requires input gradients"):
+            output.sum().backward()
+
+    frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
+    assert frozen_weight.untyped_storage().nbytes() > 0
+
+
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
     rank = distributed_setup.rank

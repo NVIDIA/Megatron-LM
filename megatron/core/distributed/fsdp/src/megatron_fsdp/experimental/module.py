@@ -321,11 +321,21 @@ class FsdpModule:
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
-            module.register_full_backward_hook(
-                lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
-                    cast(FsdpModule, hooked_module)
-                )
-            )
+
+            def grad_checking_post_backward_hook(hooked_module, grad_input, _grad_output):
+                module = cast(FsdpModule, hooked_module)
+                # With no grad-requiring inputs, PyTorch fires this hook at
+                # output gradients, before internal backward can read weights.
+                # Parameterless containers have no owned storage to release.
+                if module.parameter_groups and all(grad is None for grad in grad_input):
+                    raise NotImplementedError(
+                        "MFSDP requires input gradients in the full backward hook for units "
+                        "owning only frozen parameters. See "
+                        "https://github.com/NVIDIA/Megatron-LM/issues/7823."
+                    )
+                post_backward_hook(module)
+
+            module.register_full_backward_hook(grad_checking_post_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
