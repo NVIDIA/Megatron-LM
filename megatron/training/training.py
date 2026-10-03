@@ -4424,6 +4424,7 @@ def post_training_step_callbacks(
     prof,
     num_floating_point_operations_since_last_log_event,
     nsys_nvtx_context = None,
+    num_floating_point_operations_so_far = 0,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -4458,7 +4459,13 @@ def post_training_step_callbacks(
 
     # Autoresume.
     if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
-        check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
+        check_adlr_autoresume_termination(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+        )
 
     # Profiling.
     if (
@@ -5504,6 +5511,7 @@ def train(
             prof,
             num_floating_point_operations_since_last_log_event,
             nsys_nvtx_context,
+            num_floating_point_operations_so_far=num_floating_point_operations_so_far,
         )
 
         # Checkpoint and decide whether to exit.
