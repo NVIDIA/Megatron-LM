@@ -15,6 +15,19 @@ LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
+def generation_finish_reason(result: dict) -> str:
+    """Use the engine's termination cause, including stops at the token budget.
+
+    The length fallback supports replies from engines predating finish metadata.
+    """
+    reason = result.get("finish_reason")
+    if reason in ("stop", "length"):
+        return reason
+    requested = (result.get("sampling_params") or {}).get("num_tokens_to_generate")
+    generated = len(result.get("generated_tokens") or [])
+    return "length" if requested is not None and generated >= requested else "stop"
+
+
 def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
     """Tell the coordinator to stop generating the given requests.
 

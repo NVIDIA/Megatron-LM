@@ -281,3 +281,28 @@ async def test_plain_offload_params_are_forwarded_unchanged(blueprint, path, bod
 
     assert response.status_code == 200, await response.get_data(as_text=True)
     assert client.offload_params == [offload_params]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("blueprint", "path", "body"), _ENDPOINTS)
+@pytest.mark.parametrize("payload_offloaded", [False, True])
+@pytest.mark.parametrize("reason", ["stop", "length"])
+async def test_engine_finish_reason_wins_at_token_budget(
+    blueprint, path, body, payload_offloaded, reason
+):
+    result = _reply(
+        "boundary",
+        [10, 11],
+        [12, 2],
+        finish_reason=reason,
+        sampling_params={"num_tokens_to_generate": 2},
+        payload_offloaded=payload_offloaded,
+    )
+    response = (
+        await _build_app(blueprint, _ReplyingClient([result]))
+        .test_client()
+        .post(path, json={**body, "max_tokens": 2})
+    )
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    payload = await response.get_json()
+    assert payload["choices"][0]["finish_reason"] == reason
