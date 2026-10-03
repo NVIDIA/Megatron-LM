@@ -19,6 +19,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     InferenceBatchDimensions,
 )
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
@@ -2721,7 +2722,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
 
         if self.moe_enable_routing_replay:
-            if self.using_cuda_graph_this_step():
+            if (
+                self.config.async_sched_mode == AsyncScheduleMode.ASYNC
+                or self.using_cuda_graph_this_step()
+            ):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()

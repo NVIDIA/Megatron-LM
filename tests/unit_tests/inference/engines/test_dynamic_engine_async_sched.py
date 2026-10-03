@@ -35,7 +35,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    AsyncScheduleLogitsState,
+    AsyncScheduleForwardState,
     DecodeOnly,
     DynamicBatchControllerStepResult,
     TextGenerationController,
@@ -126,7 +126,7 @@ def _make_engine(
         ({"materialize_only_last_token_logits": False}, False),
         ({"model_config_expert_model_parallel_size": 2}, False),
         ({"model_config_num_moe_experts": 4}, False),
-        ({"model_config_moe_enable_routing_replay": True}, True),
+        ({"model_config_moe_enable_routing_replay": True}, False),
     ],
 )
 def test_validate_async_sched_support_for_config(overrides, should_raise):
@@ -336,9 +336,24 @@ def test_async_forward_routes_one_controller_iteration(
     assert engine.schedule_waiting_requests.call_count == expected_schedule_calls
     nvtx_range_push.assert_called_once_with(expected_nvtx_range)
     nvtx_range_pop.assert_called_once_with(expected_nvtx_range)
+    finalize_requests = (
+        engine.controller.async_generate_output_tokens_dynamic_batch.await_args.kwargs[
+            "finalize_requests"
+        ]
+    )
+    assert finalize_requests.func == engine._finalize_finished_requests
+    assert finalize_requests.args == (
+        {},
+        {key: value for key, value in context_state.items() if key != "kv_stats"},
+        False,
+    )
+    if output is not None:
+        assert finalize_requests.args[0] is output["completed_requests"]
     if mode == AsyncScheduleMode.LEGACY:
         engine._should_run_async_sched_overlap.assert_not_called()
-        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with()
+        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
+            finalize_requests=finalize_requests
+        )
     else:
         engine._should_run_async_sched_overlap.assert_called_once_with()
         engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
@@ -346,6 +361,7 @@ def test_async_forward_routes_one_controller_iteration(
             schedule_waiting_requests=(
                 None if run_async_overlap else engine.schedule_waiting_requests
             ),
+            finalize_requests=finalize_requests,
         )
     engine.context.is_decode_only.assert_not_called()
 
@@ -1225,7 +1241,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
 
     controller._sampling.log_probs_kernel = traced_log_probs_kernel
 
-    original_compact = controller._compact_async_sched_logits
+    original_compact = controller._compact_async_sched_forward
 
     def traced_compact(survivor_idxs):
         if survivor_idxs.numel() > 0:
@@ -1237,7 +1253,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             )
         return original_compact(survivor_idxs)
 
-    controller._compact_async_sched_logits = traced_compact
+    controller._compact_async_sched_forward = traced_compact
 
     allocator = context.kv_block_allocator
     original_deregister = allocator._deregister_blocks
@@ -1482,17 +1498,17 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             step()
             if wave_idx == 0 and "suspend-resume" in scenario.signals:
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
-                pending_before_suspend = env.engine.controller._async_sched_logits.is_valid
+                pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
                 env.engine.suspend()
                 runtime["pending-after-suspend"] += int(
-                    env.engine.controller._async_sched_logits.is_valid
+                    env.engine.controller._async_sched_forward.is_valid
                 )
                 env.engine.resume()
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
-                    env.engine.controller._async_sched_logits.is_valid
+                    env.engine.controller._async_sched_forward.is_valid
                 )
                 runtime["suspend-resume"] += 1
                 runtime["static-pointer-preserved"] += int(
@@ -1526,7 +1542,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         assert runtime["sampling-kernel"] > 0
         assert runtime["metadata-consumed"] > 0
         assert runtime["metadata-compactions"] > 0
-        assert not controller._async_sched_logits.is_valid
+        assert not controller._async_sched_forward.is_valid
         assert context.total_request_count == context.active_token_count == 0
 
         signals = set(scenario.signals)
@@ -2016,8 +2032,8 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
 
 def _controller_with_pending_logits():
     controller = TextGenerationController.__new__(TextGenerationController)
-    controller._async_sched_logits = AsyncScheduleLogitsState()
-    controller._async_sched_logits.set_pending(4, torch.tensor([0, 1, 2]))
+    controller._async_sched_forward = AsyncScheduleForwardState()
+    controller._async_sched_forward.set_pending(4, torch.tensor([0, 1, 2]))
     return controller
 
 
@@ -2043,8 +2059,8 @@ def test_async_reset_clears_pending_logits():
     ):
         engine.reset()
 
-    assert not engine.controller._async_sched_logits.is_valid
-    assert engine.controller._async_sched_logits.token_row_indices is None
+    assert not engine.controller._async_sched_forward.is_valid
+    assert engine.controller._async_sched_forward.token_row_indices is None
 
 
 @pytest.mark.parametrize(
@@ -2079,13 +2095,13 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     ):
         engine.suspend()
 
-    assert engine.controller._async_sched_logits.is_valid is preserve_pending
+    assert engine.controller._async_sched_forward.is_valid is preserve_pending
     if preserve_pending:
         assert torch.equal(
-            engine.controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 2])
+            engine.controller._async_sched_forward.token_row_indices, torch.tensor([0, 1, 2])
         )
     else:
-        assert engine.controller._async_sched_logits.token_row_indices is None
+        assert engine.controller._async_sched_forward.token_row_indices is None
 
 
 @pytest.mark.parametrize(
@@ -2102,8 +2118,8 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
     controller._enable_cuda_graph = False
     original_logits = torch.arange(32).reshape(1, 8, 4)
     controller._all_logits_cuda = original_logits.clone()
-    controller._async_sched_logits = AsyncScheduleLogitsState()
-    controller._async_sched_logits.set_pending(4, torch.arange(8))
+    controller._async_sched_forward = AsyncScheduleForwardState()
+    controller._async_sched_forward.set_pending(4, torch.arange(8))
 
     metadata = {
         "temperature": torch.tensor([0.5, 0.7, 0.9, 1.1]),
@@ -2124,7 +2140,7 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     expected = {label: values[survivor_idxs].clone() for label, values in metadata.items()}
 
-    controller._compact_async_sched_logits(torch.tensor(survivor_idxs))
+    controller._compact_async_sched_forward(torch.tensor(survivor_idxs))
 
     for label, values in expected.items():
         assert torch.equal(
@@ -2135,7 +2151,7 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
     assert torch.equal(gpu_view.top_p[: len(survivor_idxs)], expected["top_p"])
     assert torch.equal(controller._all_logits_cuda, original_logits[:, expected_token_rows])
     assert torch.equal(
-        controller._async_sched_logits.token_row_indices, torch.tensor(expected_token_rows)
+        controller._async_sched_forward.token_row_indices, torch.tensor(expected_token_rows)
     )
 
 
@@ -2196,14 +2212,6 @@ def test_post_process_enforces_per_request_logprob_policy():
             log_probs=None,
             consumed_chunked_prefill_request_id=-1,
         )
-
-
-def test_async_negative_routing_replay():
-    engine = _make_engine(
-        model_config_num_moe_experts=4, model_config_moe_enable_routing_replay=True
-    )
-    with pytest.raises(ValueError, match="routing replay"):
-        engine._validate_async_sched_support_for_config()
 
 
 def test_async_negative_mtp_depth_mismatch():

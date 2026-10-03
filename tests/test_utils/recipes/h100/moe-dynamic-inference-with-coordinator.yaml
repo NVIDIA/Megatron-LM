@@ -73,6 +73,17 @@ products:
       - environment: [dev]
         scope: [mr] #[mr, mr-github] - broken on github after NGC PyTorch26.02
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_routing_replay_async_sched]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case:
+      [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_routing_replay_prefix_cache_cudagraph_async_sched]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq_suspend_resume]
     products:
       - environment: [dev]
