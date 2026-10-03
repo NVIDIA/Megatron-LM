@@ -402,6 +402,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
                 gtp_remat_size=args.gtp_weight_remat_size,
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
+                gtp_remat_fold_cp=args.gtp_remat_fold_cp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,

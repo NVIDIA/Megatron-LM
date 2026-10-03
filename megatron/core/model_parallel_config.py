@@ -75,6 +75,12 @@ class ModelParallelConfig:
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
 
+    gtp_remat_fold_cp: bool = False
+    """Share CP and GTP ranks without increasing the weight-shard count.
+    With TP=PP=1, CP=GTP=64 needs only 64 GPUs; CP=64/GTP=1 keeps weights replicated.
+    Requires TP-fastest, PP-last rank ordering.
+    """
+
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
@@ -570,6 +576,9 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+
+        if self.gtp_remat_fold_cp and self.sequence_packing_scheduler is not None:
+            raise ValueError("gtp_remat_fold_cp does not support sequence_packing_scheduler")
 
         if self.sequence_packing_scheduler is not None:
             supported_schedulers = ['dp_balanced']

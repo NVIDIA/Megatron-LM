@@ -152,6 +152,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gdp_cutedsl_kernel": False,
     "gdp_num_chunk_states_to_recompute": 2,
     "gdp_num_householder": 3,
+    "gtp_remat_fold_cp": False,
     "gtp_remat_opt_in_modules": [],
     "gtp_weight_remat_size": 1,
     "glu_linear_offset": 0.0,
