@@ -40,6 +40,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -111,6 +112,12 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
+def reset_rounder():
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
 class TestMambaPrefixCachingE2E:
@@ -144,6 +151,7 @@ class TestMambaPrefixCachingE2E:
         # Free captured CUDA graphs and their private mempools between tests;
         # otherwise graph memory accumulates across a --count/whole-file run and OOMs.
         delete_cuda_graphs()
+        reset_rounder()
 
     @pytest.fixture(params=["mamba", "gdp"], autouse=True)
     def ssm_mixer(self, request):
