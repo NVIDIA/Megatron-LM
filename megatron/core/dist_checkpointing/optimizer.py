@@ -97,6 +97,28 @@ def make_sharded_optimizer_tensor(
     if isinstance(model_param, ShardedTensorFactory):
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
 
+    if tuple(optim_param.shape) != model_param.local_shape:
+        # NorMuon's second moment reduces one matrix axis, which must not be sharded.
+        assert optim_param.ndim == len(model_param.local_shape) == 2
+        assert all(o == m or o == 1 for o, m in zip(optim_param.shape, model_param.local_shape))
+        assert model_param.flattened_range is None
+        assert model_param.has_regular_grid, 'Reduced optimizer states require a regular grid'
+        global_shape = list(model_param.global_shape)
+        for dim, (o, m) in enumerate(zip(optim_param.shape, model_param.local_shape)):
+            if o != m:
+                axis = dim + model_param.prepend_axis_num
+                assert (
+                    model_param.axis_fragmentations[axis] == 1
+                ), 'Reduced optimizer states require an unsharded reduction axis'
+                global_shape[axis] = 1
+        model_param = replace(
+            model_param,
+            data=optim_param,
+            dtype=optim_param.dtype,
+            local_shape=tuple(optim_param.shape),
+            global_shape=tuple(global_shape),
+        )
+
     assert tuple(optim_param.shape) == model_param.local_shape, (
         f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape '
         f'({model_param.local_shape})'
