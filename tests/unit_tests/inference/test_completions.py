@@ -18,6 +18,8 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 from tests.unit_tests.inference.test_endpoints_common import (
     BODIES,
+    build_streaming_app,
+    sse_payloads,
     CHAT_PATH,
     COMPLETIONS_BODY,
     COMPLETIONS_PATH,
@@ -121,6 +123,18 @@ async def test_completions_without_stager_has_no_extra_top_level_keys():
     assert response.status_code == 200
     payload = await response.get_json()
     assert set(payload) == {"id", "object", "created", "model", "choices", "usage"}
+
+
+@pytest.mark.asyncio
+async def test_completions_rejects_stage_metadata_that_shadows_a_response_field():
+    client = ReplyingClient(
+        [completed_reply("req-0", [10, 11], [12], payload_stage_metadata={"usage": "forged"})]
+    )
+    app = build_app(COMPLETIONS_PATH, client)
+
+    response = await app.test_client().post(COMPLETIONS_PATH, json=COMPLETIONS_BODY)
+
+    assert response.status_code == 500
 
 
 def test_collect_stage_metadata_tolerates_missing_and_none():
@@ -235,6 +249,17 @@ _INVALID_PROMPT_FORMAT = (
     [
         pytest.param({}, {}, 400, "Missing 'prompt' field", id="missing-prompt"),
         pytest.param({"prompt": []}, {}, 400, "Missing 'prompt' field", id="empty-prompt-list"),
+        pytest.param({"prompt": ""}, {}, 400, "Missing 'prompt' field", id="empty-prompt-string"),
+        pytest.param(
+            {"prompt": {"text": "hi"}},
+            {},
+            400,
+            "Invalid 'prompt' type. Must be str or list",
+            id="prompt-object",
+        ),
+        pytest.param(
+            {"prompt": [[1], ["a"]]}, {}, 400, _INVALID_PROMPT_FORMAT, id="prompt-ragged-token-ids"
+        ),
         pytest.param(
             {"prompt": 42},
             {},
@@ -262,6 +287,20 @@ _INVALID_PROMPT_FORMAT = (
             id="temperature-not-a-number",
         ),
         pytest.param({"prompt": "hello", "top_k": [1]}, {}, 500, None, id="top-k-list"),
+        pytest.param(
+            {"prompt": "hello", "logprobs": "many"},
+            {},
+            400,
+            "Invalid sampling parameter: invalid literal for int() with base 10: 'many'",
+            id="logprobs-not-an-int",
+        ),
+        pytest.param(
+            {"prompt": "hello", "max_tokens": "lots"},
+            {},
+            400,
+            "Invalid sampling parameter: invalid literal for int() with base 10: 'lots'",
+            id="max-tokens-not-an-int",
+        ),
         # Sampling fields are read with a plain .get(), so an explicit null reaches the
         # float()/int() conversion and escapes as a 500 (chat treats null as "use the default").
         pytest.param(
@@ -400,3 +439,63 @@ async def test_completions_response_format(echo, logprobs, expected_logprobs, re
     }
     # The per-prompt SamplingParams copies must not re-feed the derived, deprecated mirror field.
     assert not [w for w in recwarn if "return_prompt_top_n_logprobs" in str(w.message)]
+
+
+@pytest.mark.asyncio
+async def test_completions_rejects_a_null_json_body():
+    client = ReplyingClient([])
+    app = build_app(COMPLETIONS_PATH, client)
+
+    response = await app.test_client().post(
+        COMPLETIONS_PATH, data="null", headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 400
+    assert await response.get_data(as_text=True) == "Invalid or missing JSON body"
+    assert client.prompt_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_completions_echo_logprobs_without_top_n():
+    """`logprobs=0` returns per-token log probs but no top-N alternatives."""
+    client = ReplyingClient(
+        [
+            completed_reply(
+                "req-0", [10, 11], [12], generated_log_probs=[-0.5], prompt_log_probs=[-1.0]
+            )
+        ]
+    )
+    app = build_app(COMPLETIONS_PATH, client)
+
+    response = await app.test_client().post(
+        COMPLETIONS_PATH, json={"prompt": "p", "echo": True, "logprobs": 0}
+    )
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    (sampling_params,) = client.sampling_params
+    assert (sampling_params.return_log_probs, sampling_params.top_n_logprobs) == (True, 0)
+    assert (await response.get_json())["choices"][0]["logprobs"] == {
+        "tokens": ["<10>", "<11>", "<12>"],
+        "token_logprobs": [None, -1.0, -0.5],
+        "top_logprobs": None,
+        "text_offset": [0, 4, 8],
+    }
+
+
+@pytest.mark.asyncio
+async def test_completions_streaming_echoes_each_prompt_first(monkeypatch):
+    client = ReplyingClient()
+    app = build_streaming_app(COMPLETIONS_PATH, client, monkeypatch)
+
+    response = await app.test_client().post(
+        COMPLETIONS_PATH, json={"prompt": ["a", "b"], "echo": True, "stream": True}
+    )
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    payloads, done = await sse_payloads(response)
+    assert done
+    texts = {0: [], 1: []}
+    for payload in payloads:
+        for choice in payload["choices"]:
+            texts[choice["index"]].append(choice["text"])
+    assert texts == {0: ["a", "<12><13>", ""], 1: ["b", "<12><13>", ""]}

@@ -3,8 +3,13 @@
 import asyncio
 import base64
 import copy
+import json
+import logging
 import re
+import socket
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -24,15 +29,24 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
 )
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+    chat_completions as chat_completions_module,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _coerce_to_token_id_list,
     _expanded_prefix_stitching_metadata,
     _extract_media_url_bytes,
     _extract_multimodal_from_messages,
     _has_previous_turn_tokens,
     _last_assistant_message,
+    _normalize_tool_calls,
+    _NoRedirectHandler,
+    _redact_token_id_lists_for_logging,
     _replace_prefix_tokens,
     _replace_prefix_tokens_metadata,
     _sanitize_messages_for_template,
+    _sanitize_tools_for_template,
+    _serialize_eos_token_ids,
     _suffix_tokens_after_prefix,
     _tokenize_with_media_slots_sync,
 )
@@ -41,8 +55,11 @@ from tests.unit_tests.inference.test_endpoints_common import (
     CHAT_PATH,
     NOT_A_NUMBER_ERROR,
     ReplyingClient,
+    Tokenizer,
     build_app,
+    build_streaming_app,
     completed_reply,
+    sse_payloads,
 )
 
 
@@ -1494,3 +1511,728 @@ async def test_chat_response_format(
     )
     assert choice_1["finish_reason"] == "length"
     assert "moe_topk_indices" not in choice_1
+
+
+# --- media fetching -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "224.0.0.1",
+        "240.0.0.1",
+        "0.0.0.0",
+    ],
+)
+def test_extract_media_refuses_non_public_addresses(monkeypatch, address):
+    module = sys.modules[_extract_media_url_bytes.__module__]
+    monkeypatch.setattr(module.socket, "gethostbyname", lambda host: address)
+    monkeypatch.setattr(
+        module._no_redirect_opener, "open", mock.Mock(side_effect=AssertionError("fetched"))
+    )
+
+    with pytest.raises(ValueError, match="non-public address: media.example"):
+        _extract_media_url_bytes("http://media.example/a.png")
+
+
+def test_extract_media_reports_an_unresolvable_host(monkeypatch):
+    module = sys.modules[_extract_media_url_bytes.__module__]
+
+    def unresolvable(host):
+        raise socket.gaierror(host)
+
+    monkeypatch.setattr(module.socket, "gethostbyname", unresolvable)
+
+    with pytest.raises(ValueError, match="Cannot resolve media URL host: nowhere.invalid"):
+        _extract_media_url_bytes("https://nowhere.invalid/a.png")
+
+
+@pytest.mark.parametrize(
+    ("url", "error"),
+    [
+        ("http:///a.png", "Invalid media URL"),
+        ("ftp://example.com/a.png", "Unsupported media URL scheme"),
+        ("file:///etc/passwd", "Unsupported media URL scheme"),
+        ("data:image/png;base64", "Malformed media data URL"),
+    ],
+)
+def test_extract_media_rejects_malformed_urls(url, error):
+    with pytest.raises(ValueError, match=error):
+        _extract_media_url_bytes(url)
+
+
+def test_extract_media_remote_fetch_sets_user_agent_and_timeout(fake_remote_media, monkeypatch):
+    module = sys.modules[_extract_media_url_bytes.__module__]
+    fake_remote_media._data = b"image"
+    opened = mock.Mock(return_value=fake_remote_media)
+    monkeypatch.setattr(module._no_redirect_opener, "open", opened)
+
+    _extract_media_url_bytes("https://example.com/cat.png")
+
+    (request,), kwargs = opened.call_args
+    assert request.get_header("User-agent") == module._MEDIA_FETCH_USER_AGENT
+    assert kwargs == {"timeout": module._MEDIA_FETCH_TIMEOUT_S}
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_media_fetch_refuses_redirects(code):
+    request = urllib.request.Request("https://example.com/a.png")
+    redirect = getattr(_NoRedirectHandler(), f"http_error_{code}")
+
+    with pytest.raises(urllib.error.HTTPError) as error:
+        redirect(request, None, code, "Moved", {"Location": "http://127.0.0.1/"})
+
+    assert error.value.code == code
+
+
+@pytest.mark.asyncio
+async def test_chat_rejects_an_image_that_cannot_be_loaded():
+    client = ReplyingClient([])
+    app = build_app(CHAT_PATH, client)
+    image = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png"}}
+
+    response = await app.test_client().post(
+        CHAT_PATH, json={"messages": [{"role": "user", "content": [image]}]}
+    )
+
+    assert response.status_code == 400
+    assert await response.get_data(as_text=True) == (
+        "Failed to load image_url: Unsupported media URL scheme: 'ftp://example.com/a.png'"
+    )
+    assert client.prompt_tokens == []
+
+
+# --- multimodal message extraction --------------------------------------------
+
+
+def test_extract_multimodal_rejects_mixed_image_and_video():
+    messages = [
+        {"role": "user", "content": [_media_block("image", 0)]},
+        {"role": "user", "content": [_media_block("video", 0)]},
+    ]
+
+    with pytest.raises(ValueError, match="Mixing image and video"):
+        _extract_multimodal_from_messages(messages, MultimodalPromptConfig())
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}},
+        {"type": "input_video", "video": None},
+    ],
+    ids=["remote-url", "missing"],
+)
+def test_extract_multimodal_requires_inline_video(block):
+    with pytest.raises(ValueError, match="must be base64 data URLs"):
+        _extract_multimodal_from_messages(
+            [{"role": "user", "content": [block]}], MultimodalPromptConfig()
+        )
+
+
+def test_extract_multimodal_accepts_input_video_with_a_bare_data_url():
+    block = {
+        "type": "input_video",
+        "video": f"data:video/mp4;base64,{base64.b64encode(b'v').decode()}",
+    }
+
+    _, images, videos, slots = _extract_multimodal_from_messages(
+        [{"role": "user", "content": [block]}], MultimodalPromptConfig()
+    )
+
+    assert (images, videos) == ([], [b"v"])
+    assert [(modality, index) for _, modality, index in slots] == [("video", 0)]
+
+
+def test_extract_multimodal_skips_image_blocks_without_a_url():
+    message = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {}}, {"type": "text", "text": "hi"}],
+    }
+
+    rewritten, images, videos, slots = _extract_multimodal_from_messages(
+        [message], MultimodalPromptConfig()
+    )
+
+    assert rewritten == [message]
+    assert (images, videos, slots) == ([], [], [])
+
+
+def test_extract_multimodal_strips_the_input_marker_from_text():
+    prompt_config = MultimodalPromptConfig(image_spec=MediaPromptSpec(input_marker="<image>"))
+    message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "look <image> here"}, _media_block("image", 0)],
+    }
+
+    rewritten, _, _, slots = _extract_multimodal_from_messages([message], prompt_config)
+
+    assert rewritten[0]["content"] == [
+        {"type": "text", "text": "look  here"},
+        {"type": "text", "text": slots[0][0]},
+    ]
+    assert message["content"][0]["text"] == "look <image> here"
+
+
+def test_extract_multimodal_passes_non_list_messages_through():
+    assert _extract_multimodal_from_messages("hi", MultimodalPromptConfig()) == ("hi", [], [], [])
+
+
+# --- template sanitization ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ({"type": "text", "text": "hi"}, "hi"),
+        (None, ""),
+        (5, "5"),
+        # Bare strings and any dict with `text` are kept; other blocks and values are dropped.
+        (["a", {"type": "text", "text": "b"}, {"text": "c"}, {"type": "image_url"}, 7], "abc"),
+    ],
+    ids=["dict", "none", "number", "mixed-list"],
+)
+def test_sanitize_messages_flattens_content_to_a_string(content, expected):
+    (sanitized,) = _sanitize_messages_for_template([{"role": "user", "content": content}])
+
+    assert sanitized["content"] == expected
+
+
+def test_sanitize_messages_coerces_tool_call_arguments_to_mappings():
+    calls = [
+        {"function": {"name": "a", "arguments": '{"x": 1}'}},
+        {"function": {"name": "b", "arguments": "[1, 2]"}},
+        {"function": {"name": "c", "arguments": "not-json"}},
+        {"function": {"name": "d"}},
+        "opaque",
+    ]
+    message = {"role": "assistant", "content": None, "tool_calls": calls}
+    original = copy.deepcopy(message)
+
+    (sanitized,) = _sanitize_messages_for_template([message])
+
+    assert [call["function"]["arguments"] for call in sanitized["tool_calls"][:4]] == [
+        {"x": 1},
+        {},
+        {},
+        {},
+    ]
+    assert sanitized["tool_calls"][4] == "opaque"
+    assert message == original
+
+
+def test_sanitize_messages_rejects_media_without_a_prompt_config():
+    with pytest.raises(ValueError, match="requires a prompt config"):
+        _sanitize_messages_for_template(
+            [{"role": "user", "content": [{"type": "text", "text": "__S0__"}]}],
+            media_slots=[("__S0__", "image", 0)],
+        )
+
+
+def test_sanitize_messages_rejects_media_with_conflicting_separators():
+    prompt_config = MultimodalPromptConfig(
+        image_spec=MediaPromptSpec(content_part_separator="\n"),
+        video_spec=MediaPromptSpec(content_part_separator=" "),
+    )
+
+    with pytest.raises(ValueError, match="same content-part separator"):
+        _sanitize_messages_for_template(
+            [{"role": "user", "content": [{"type": "text", "text": "__S0__"}]}],
+            media_slots=[("__S0__", "image", 0), ("__S1__", "video", 0)],
+            prompt_config=prompt_config,
+        )
+
+
+def test_sanitize_tools_drops_non_dicts_and_fills_missing_parameters():
+    valid = {"type": "function", "function": {"name": "g", "parameters": {"type": "object"}}}
+    tools = [{"type": "function", "function": {"name": "f", "parameters": "bad"}}, "junk", valid]
+    original = copy.deepcopy(tools)
+
+    assert _sanitize_tools_for_template(tools) == [
+        {
+            "type": "function",
+            "function": {"name": "f", "parameters": {"type": "object", "properties": {}}},
+        },
+        valid,
+    ]
+    assert tools == original
+    assert _sanitize_tools_for_template({"not": "a list"}) is None
+
+
+# --- tool call normalization --------------------------------------------------
+
+
+def _arguments(call, tools=None):
+    (normalized,) = _normalize_tool_calls([call], tools)
+    return normalized["function"]["arguments"]
+
+
+def test_normalize_tool_calls_skips_calls_without_a_name():
+    assert _normalize_tool_calls([{"function": {"arguments": "{}"}}, {}]) == []
+
+
+def test_normalize_tool_calls_generates_a_missing_id():
+    (normalized,) = _normalize_tool_calls([{"function": {"name": "f", "arguments": "{}"}}])
+
+    assert re.fullmatch(r"call_[0-9a-f]{24}", normalized["id"])
+    assert normalized["type"] == "function"
+
+
+def test_normalize_tool_calls_reads_attribute_style_calls():
+    call = SimpleNamespace(id="c1", function=SimpleNamespace(name="f", arguments={"x": 1}))
+
+    assert _normalize_tool_calls([call]) == [
+        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": '{"x": 1}'}}
+    ]
+
+
+class _Unserializable:
+    def __str__(self):
+        return "unserializable"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ("not json", "not json"),
+        ("[1]", "[1]"),
+        ([1, 2], "[1, 2]"),
+        (None, "null"),
+        (_Unserializable(), "unserializable"),
+        ({"city": "Zürich"}, '{"city": "Zürich"}'),
+    ],
+    ids=["invalid-json", "json-array", "list", "none", "unserializable", "non-ascii"],
+)
+def test_normalize_tool_calls_serializes_arguments(arguments, expected):
+    assert _arguments({"function": {"name": "f", "arguments": arguments}}) == expected
+
+
+def test_normalize_tool_calls_parses_structured_arguments_declared_by_the_schema():
+    properties = {
+        "items": {"type": "array"},
+        "options": {"anyOf": [{"type": "null"}, {"type": "object"}]},
+        "tags": {"type": ["array", "null"]},
+        "note": {"type": "string"},
+        "broken": {"type": "array"},
+    }
+    tools = [
+        {"function": {"name": "f", "parameters": {"type": "object", "properties": properties}}}
+    ]
+    arguments = {
+        "items": "[1, 2]",
+        "options": '{"a": 1}',
+        "tags": '["x"]',
+        "note": "[3]",
+        "broken": "[1,",
+    }
+
+    assert json.loads(_arguments({"function": {"name": "f", "arguments": arguments}}, tools)) == {
+        "items": [1, 2],
+        "options": {"a": 1},
+        "tags": ["x"],
+        "note": "[3]",
+        "broken": "[1,",
+    }
+
+
+# --- tokenization helpers -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        [1, 2],
+        (1, 2),
+        {"input_ids": [1, 2]},
+        {"input_ids": [[1, 2]]},
+        {"input_ids": torch.tensor([[1, 2]])},
+        SimpleNamespace(ids=[1, 2]),
+        torch.tensor([1, 2]),
+        torch.tensor([[1, 2]]),
+    ],
+    ids=[
+        "list",
+        "tuple",
+        "batch-encoding",
+        "batched-batch-encoding",
+        "batch-encoding-tensor",
+        "fast-encoding",
+        "tensor",
+        "batched-tensor",
+    ],
+)
+def test_coerce_to_token_id_list(result):
+    assert _coerce_to_token_id_list(result) == [1, 2]
+
+
+class _MediaSlotTokenizer:
+    unk_token_id = 0
+
+    def __init__(self, rendered, media_token_id=99):
+        self.rendered = rendered
+        self.media_token_id = media_token_id
+
+    def apply_chat_template(self, *_args, **_kwargs):
+        return self.rendered
+
+    def convert_tokens_to_ids(self, _token):
+        return self.media_token_id
+
+    def __call__(self, _text, add_special_tokens=False):
+        return []
+
+
+@pytest.mark.parametrize(
+    ("tokenizer", "error"),
+    [
+        (_MediaSlotTokenizer([1, 2]), "must return a string"),
+        (_MediaSlotTokenizer("no slot"), "did not preserve media slot __S0__"),
+        (_MediaSlotTokenizer("__S0__ __S0__"), "did not preserve media slot __S0__"),
+        (_MediaSlotTokenizer("__S0__", media_token_id=0), "does not define media token"),
+    ],
+    ids=["not-a-string", "slot-dropped", "slot-duplicated", "unknown-media-token"],
+)
+def test_tokenize_with_media_slots_rejects_unusable_renders(tokenizer, error):
+    with pytest.raises((TypeError, ValueError), match=error):
+        _tokenize_with_media_slots_sync(
+            tokenizer,
+            messages=[],
+            media_slots=[("__S0__", "image", 0)],
+            prompt_config=MultimodalPromptConfig(),
+            tools=None,
+            chat_template_kwargs={},
+        )
+
+
+@pytest.mark.parametrize(("eos_token_ids", "expected"), [(2, [2]), ({3, 1}, [1, 3]), ((2, 2), [2])])
+def test_serialize_eos_token_ids(eos_token_ids, expected):
+    assert _serialize_eos_token_ids(eos_token_ids) == expected
+
+
+@pytest.mark.parametrize("eos_token_ids", [[], None, True, "2", [2, "3"], [2.0]])
+def test_serialize_eos_token_ids_rejects_non_integers(eos_token_ids):
+    with pytest.raises(ValueError, match="EOS token IDs"):
+        _serialize_eos_token_ids(eos_token_ids)
+
+
+def test_redact_token_id_lists_for_logging():
+    record = {
+        "uid": "r",
+        "prompt_tokens": [1, 2],
+        "routing_indices": [[1, 2], [3, 4]],
+        "extra_token_ids": [5],
+        "precomputed_block_hashes": [9],
+        "tpot": [0.1, 0.2],
+        "nested": [{"generated_tokens": [3]}],
+        "generated_tokens": "not-a-list",
+        "events": [{"type": "ADD"}],
+    }
+
+    truncated = "...truncated..."
+    assert _redact_token_id_lists_for_logging(record) == {
+        "uid": "r",
+        "prompt_tokens": truncated,
+        "routing_indices": truncated,
+        "extra_token_ids": truncated,
+        "precomputed_block_hashes": truncated,
+        "tpot": truncated,
+        "nested": [{"generated_tokens": truncated}],
+        "generated_tokens": "not-a-list",
+        "events": [{"type": "ADD"}],
+    }
+
+
+# --- parsers ------------------------------------------------------------------
+
+
+def test_apply_parsers_rejects_an_unknown_parser():
+    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", {}):
+        with pytest.raises(ValueError, match="Parser missing not found"):
+            chat_completions_module.apply_parsers("text", None, ["missing"], False)
+
+
+@pytest.mark.parametrize("tools_requested", [False, True])
+def test_apply_parsers_chains_parsers_and_forwards_markers_only_with_tools(tools_requested):
+    reasoning = _parser(("answer <tool_call>", {"reasoning": "why"}))
+    reasoning.implicit_reasoning_end_markers = ("<tool_call>",)
+    tool = _parser(("answer", {}))
+    mapping = {"reasoning": reasoning, "tool": tool}
+
+    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", mapping):
+        text, metadata = chat_completions_module.apply_parsers(
+            "raw", None, ["reasoning", "tool"], tools_requested, finished=False
+        )
+
+    assert (text, metadata) == ("answer", {"reasoning": "why"})
+    assert tool.parse.call_args.args == ("answer <tool_call>",)
+    markers = ("<tool_call>",) if tools_requested else ()
+    for parser in (reasoning, tool):
+        assert parser.parse.call_args.kwargs["implicit_reasoning_end_markers"] == markers
+        assert parser.parse.call_args.kwargs["finished"] is False
+
+
+def test_apply_parsers_rejects_parsers_reporting_the_same_field():
+    mapping = {"a": _parser(("x", {"reasoning": "1"})), "b": _parser(("x", {"reasoning": "2"}))}
+
+    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", mapping):
+        with pytest.raises(AssertionError, match="Multiple parsers"):
+            chat_completions_module.apply_parsers("raw", None, ["a", "b"], False)
+
+
+# --- HTTP: tokenization -------------------------------------------------------
+
+
+class _RecordingTokenizer(Tokenizer):
+    def __init__(self, prompt_tokens=(10, 11), error=None):
+        self.prompt_tokens = list(prompt_tokens)
+        self.error = error
+        self.template_calls = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_calls.append((messages, kwargs))
+        if self.error is not None:
+            raise self.error
+        return list(self.prompt_tokens)
+
+
+class _NoTemplateTokenizer(Tokenizer):
+    chat_template = None
+
+    def __init__(self):
+        self.texts = []
+
+    def tokenize(self, prompt):
+        self.texts.append(prompt)
+        return [10, 11]
+
+
+@pytest.mark.asyncio
+async def test_chat_without_a_template_joins_message_contents():
+    tokenizer = _NoTemplateTokenizer()
+    client = ReplyingClient()
+    app = build_app(CHAT_PATH, client, tokenizer=tokenizer)
+    messages = [{"role": "system", "content": "a"}, {"role": "user", "content": "b"}]
+
+    with pytest.warns(UserWarning, match="does not support 'apply_chat_template'"):
+        response = await app.test_client().post(CHAT_PATH, json={"messages": messages})
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert tokenizer.texts == ["a\nb"]
+    assert client.prompt_tokens == [[10, 11]]
+
+
+@pytest.mark.asyncio
+async def test_chat_without_a_template_rejects_media():
+    client = ReplyingClient([])
+    app = build_app(CHAT_PATH, client, tokenizer=_NoTemplateTokenizer())
+
+    response = await app.test_client().post(
+        CHAT_PATH, json={"messages": [{"role": "user", "content": [_media_block("image", 0)]}]}
+    )
+
+    assert response.status_code == 400
+    assert await response.get_data(as_text=True) == (
+        "Invalid 'messages': Multimodal chat requests require a chat template."
+    )
+    assert client.prompt_tokens == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_template", [None, "server-template"])
+async def test_chat_template_comes_from_the_server_never_the_request(server_template):
+    tokenizer = _RecordingTokenizer()
+    app = build_app(CHAT_PATH, ReplyingClient(), tokenizer=tokenizer, chat_template=server_template)
+    body = {
+        **CHAT_BODY,
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+        "chat_template_kwargs": {"chat_template": "{{ request }}", "enable_thinking": False},
+    }
+
+    response = await app.test_client().post(CHAT_PATH, json=body)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    ((messages, kwargs),) = tokenizer.template_calls
+    assert messages == CHAT_BODY["messages"]
+    assert kwargs.get("chat_template") == server_template
+    assert kwargs["enable_thinking"] is False
+    assert (kwargs["tokenize"], kwargs["add_generation_prompt"]) == (True, True)
+    # Tools reach the template with the parameters it expects.
+    assert kwargs["tools"][0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
+@pytest.mark.asyncio
+async def test_chat_template_renders_with_the_private_tokenizer_copy():
+    shared = _RecordingTokenizer()
+    private = _RecordingTokenizer(prompt_tokens=[20, 21])
+    client = ReplyingClient()
+    app = build_app(CHAT_PATH, client, tokenizer=shared, tokenizer_copy=private)
+
+    response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert (len(shared.template_calls), len(private.template_calls)) == (0, 1)
+    assert client.prompt_tokens == [[20, 21]]
+
+
+@pytest.mark.asyncio
+async def test_chat_template_prefers_the_wrapped_hugging_face_tokenizer():
+    hf_tokenizer = _RecordingTokenizer(prompt_tokens=[20, 21])
+    wrapper = _RecordingTokenizer()
+    wrapper._tokenizer = SimpleNamespace(tokenizer=hf_tokenizer)
+    client = ReplyingClient()
+    app = build_app(CHAT_PATH, client, tokenizer=wrapper)
+
+    response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert (len(wrapper.template_calls), len(hf_tokenizer.template_calls)) == (0, 1)
+    assert client.prompt_tokens == [[20, 21]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "status", "expected"),
+    [
+        (ValueError("bad role"), 400, "Invalid 'messages': bad role"),
+        (RuntimeError("boom"), 500, "Error processing 'messages': boom"),
+    ],
+    ids=["value-error", "other-error"],
+)
+async def test_chat_template_errors(error, status, expected):
+    client = ReplyingClient([])
+    app = build_app(CHAT_PATH, client, tokenizer=_RecordingTokenizer(error=error))
+
+    response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+
+    assert (await response.get_data(as_text=True), response.status_code) == (expected, status)
+    assert client.prompt_tokens == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("add_BOS", "expected_prompt"), [(False, [10, 11]), (True, [1, 10, 11])])
+async def test_chat_collapses_template_bos_tokens(add_BOS, expected_prompt):
+    tokenizer = _RecordingTokenizer(prompt_tokens=[1, 1, 10, 11])
+    tokenizer.bos = 1
+    client = ReplyingClient()
+    app = build_app(CHAT_PATH, client, tokenizer=tokenizer)
+
+    response = await app.test_client().post(CHAT_PATH, json={**CHAT_BODY, "add_BOS": add_BOS})
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert client.prompt_tokens == [expected_prompt]
+
+
+# --- HTTP: response formatting ------------------------------------------------
+
+
+async def _post_with_parser(parse_result, body, reply):
+    client = ReplyingClient([reply])
+    app = build_app(CHAT_PATH, client, parsers=["p"])
+    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", {"p": _parser(parse_result)}):
+        response = await app.test_client().post(CHAT_PATH, json={**CHAT_BODY, **body})
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    (choice,) = (await response.get_json())["choices"]
+    return choice
+
+
+@pytest.mark.asyncio
+async def test_chat_finish_reason_length_outranks_tool_calls():
+    reply = completed_reply(
+        "chat-0", [10, 2], [30, 31], sampling_params={"num_tokens_to_generate": 2}
+    )
+
+    choice = await _post_with_parser(_TOOL_PARSE_RESULT, {"tools": _TOOLS}, reply)
+
+    assert choice["message"]["tool_calls"] == _NORMALIZED_TOOL_CALLS
+    assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+async def test_chat_reports_reasoning_without_tool_calls():
+    reply = completed_reply("chat-0", [10, 2], [30])
+
+    choice = await _post_with_parser(("answer", {"reasoning": "why"}), {}, reply)
+
+    assert choice["message"] == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "why",
+        "generation_log_probs": None,
+    }
+    assert choice["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_chat_verbose_logs_redact_token_ids(caplog):
+    app = build_app(CHAT_PATH, ReplyingClient(), verbose=True)
+
+    with caplog.at_level(logging.INFO):
+        response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert "'prompt_tokens': '...truncated...'" in caplog.text
+    assert "'generated_tokens': '...truncated...'" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply_fields", "warns"),
+    [
+        ({}, True),
+        ({"generated_log_probs": [-0.5, -0.25]}, False),
+        ({"payload_offloaded": True}, False),
+    ],
+    ids=["missing", "present", "offloaded"],
+)
+async def test_chat_warns_when_generation_log_probs_are_missing(reply_fields, warns, caplog):
+    client = ReplyingClient([completed_reply("chat-0", [10, 2], [30, 31], **reply_fields)])
+    app = build_app(CHAT_PATH, client)
+
+    with caplog.at_level(logging.WARNING):
+        response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert ("Generation log probs is None" in caplog.text) is warns
+
+
+# --- HTTP: streaming ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "marker_prefixes", "named_tool_choice"),
+    [
+        ({}, (), False),
+        ({"tools": _TOOLS}, ("<tool_call>",), False),
+        ({"tools": _TOOLS, "tool_choice": "none"}, (), False),
+        ({"tools": _TOOLS, "tool_choice": _NAMED_TOOL_CHOICE}, ("<tool_call>",), True),
+    ],
+    ids=["no-tools", "tools", "tool-choice-none", "named-tool-choice"],
+)
+async def test_chat_streaming_builds_a_parser_per_choice(
+    body, marker_prefixes, named_tool_choice, monkeypatch
+):
+    parser = _parser(("<12><13>", {}))
+    parser.streaming_markers = ("<tool_call>",)
+    monkeypatch.setattr(chat_completions_module, "PARSER_MAPPING", {"p": parser})
+    streaming_parser = mock.Mock(wraps=chat_completions_module.StreamingChatParser)
+    monkeypatch.setattr(chat_completions_module, "StreamingChatParser", streaming_parser)
+    app = build_streaming_app(CHAT_PATH, ReplyingClient(), monkeypatch, parsers=["p"])
+
+    response = await app.test_client().post(
+        CHAT_PATH, json={**CHAT_BODY, "n": 2, "stream": True, **body}
+    )
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    _, done = await sse_payloads(response)
+    assert done
+    assert streaming_parser.call_count == 2
+    assert streaming_parser.call_args.kwargs == {
+        "marker_prefixes": marker_prefixes,
+        "named_tool_choice": named_tool_choice,
+    }
