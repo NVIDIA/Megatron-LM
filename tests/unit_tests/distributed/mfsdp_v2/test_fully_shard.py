@@ -534,7 +534,9 @@ def test_fused_wgrad_losses_match_unfused(
             mesh, placements, variant, dtype, fuse, device
         )
         losses = _train_fused_wgrad_model(model, context, optimizer, microbatches, set_to_none)
-        weights = [parameter.full_tensor() for parameter in model.parameters()]
+        # MFSDP's row-atomic layout can place a whole parameter on one rank, which
+        # full_tensor() rejects. Both runs share one layout, so compare local shards.
+        weights = [parameter.to_local().detach().clone() for parameter in model.parameters()]
         results[fuse] = (losses, weights)
 
     torch.testing.assert_close(results[True][0], results[False][0], **tolerance)
