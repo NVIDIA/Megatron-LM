@@ -5,6 +5,7 @@ import logging
 import os
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -12,6 +13,10 @@ import torch
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -22,6 +27,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, set_current_microbatch
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -416,6 +422,7 @@ def _build_gpt_model(
     offload_modules: Optional[List[str]],
     min_offloaded_tensor_size: int,
     is_mla: bool,
+    fine_grained_offloading_buffer_size_gib: float = 0.0,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
@@ -438,6 +445,7 @@ def _build_gpt_model(
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
+        fine_grained_offloading_buffer_size_gib=fine_grained_offloading_buffer_size_gib,
     )
     gpt_model = GPTModel(
         config=transformer_config,
@@ -521,21 +529,25 @@ def _run_one_iter_and_capture(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules",
+    "is_moe, is_mla, offload_modules, buffer_size_gib",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"]),
-        (True, False, ["qkv_linear"]),
-        (True, False, ["core_attn"]),
+        (False, True, ["attn_norm"], 0.0),
+        (True, False, ["qkv_linear"], 0.0),
+        (True, False, ["core_attn"], 0.0),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
-        (True, False, ["mlp_norm"]),
-        (True, False, ["expert_fc1"]),
-        (True, False, ["moe_act"]),
+        (True, True, ["core_attn", "attn_proj"], 0.0),
+        (True, False, ["mlp_norm"], 0.0),
+        (True, False, ["expert_fc1"], 0.0),
+        (True, False, ["moe_act"], 0.0),
+        # Non-power-of-two pinned storage with fixed and variable activation shapes.
+        (False, True, ["attn_norm"], 1.5),
+        (True, False, ["moe_act"], 1.5),
+        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 1.5),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
-    is_moe: bool, is_mla: bool, offload_modules: List[str]
+    is_moe: bool, is_mla: bool, offload_modules: List[str], buffer_size_gib: float
 ):
     """
     Initialize a GPTModel and verify:
@@ -621,6 +633,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            fine_grained_offloading_buffer_size_gib=buffer_size_gib,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -645,6 +658,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
         )
         expected_offload_mib = expected_offload_bytes / (1024**2)
+        pool = mgr.cpu_tensor_pool
+        assert pool.uses_fixed_buffer == bool(buffer_size_gib)
+        if buffer_size_gib:
+            fixed = pool.get_pool_status()["fixed_buffer"]
+            assert fixed["capacity_bytes"] == int(buffer_size_gib * 2**30)
+            assert fixed["peak_live_bytes"] > 0
 
         _reset_cuda_memory()
         off_logits, off_grads, off_peak = _run_one_iter_and_capture(
@@ -654,6 +673,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             attention_mask=attention_mask,
             enable_offload_reset=True,
         )
+        if buffer_size_gib:
+            assert pool.get_pool_status()["fixed_buffer"]["live_bytes"] == 0
         del off_model
         _reset_cuda_memory()
 
@@ -987,6 +1008,7 @@ def _build_gpt_model_with_cuda_graph(
     cuda_graph_warmup_steps: int,
     delay_offload_until_cuda_graph: bool = False,
     activation_offload_fraction: float = 1.0,
+    offloading_buffer_size_gib: float = 0.0,
 ) -> GPTModel:
     """Build a GPTModel with CUDA Graph support and fine-grained activation offloading."""
     model_parallel_cuda_manual_seed(seed)
@@ -1011,6 +1033,7 @@ def _build_gpt_model_with_cuda_graph(
         min_offloaded_tensor_size=min_offloaded_tensor_size,
         delay_offload_until_cuda_graph=delay_offload_until_cuda_graph,
         activation_offload_fraction=activation_offload_fraction,
+        fine_grained_offloading_buffer_size_gib=offloading_buffer_size_gib,
         # CUDA Graph settings
         cuda_graph_impl=cuda_graph_impl,
         cuda_graph_scope=cuda_graph_scope,
@@ -1295,4 +1318,191 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
         )
 
     finally:
+        Utils.destroy_model_parallel()
+
+
+def _run_iters_with_te_cuda_graph(
+    model: GPTModel,
+    *,
+    warmup_stream: torch.cuda.Stream,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_warmup_iters: int,
+    num_measure_iters: int,
+    enable_offload_reset: bool,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], int]:
+    """
+    Run multiple forward+backward iterations with CUDA graph capture.
+
+    Returns:
+      - logits from last iteration (CPU float32)
+      - selected grads from last iteration (CPU float32)
+      - peak_memory_allocated (bytes) during measurement iterations
+    """
+    if enable_offload_reset:
+        off_interface.reset()
+
+    # Reuse the side stream across variants to avoid extra per-stream workspaces.
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(num_warmup_iters):
+            if enable_offload_reset:
+                off_interface.reset()
+            logits = model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            )
+            loss = logits.float().sum()
+            loss.backward()
+            # Zero grads for next iteration
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    # Trigger post-warmup offload decisions
+    if enable_offload_reset:
+        off_interface.reset()
+
+    # Create CUDA graphs after warmup
+    graph_helper = TECudaGraphHelper(
+        model=[model],
+        config=model.config,
+        seq_length=input_ids.size(1),
+        micro_batch_size=input_ids.size(0),
+    )
+    # This test uses a bare GPTModel, not DDP with persistent gradient buffers.
+    # Preserve returned grads: later layer replays may overwrite TE's shared buffers.
+    sample_args, capture_kwargs = graph_helper._get_cuda_graph_input_data()
+    if "clone_param_grads_on_return" in capture_kwargs:
+        capture_kwargs["clone_param_grads_on_return"] = True
+    with (
+        patch.object(model, "zero_grad_buffer", model.zero_grad, create=True),
+        patch.object(
+            graph_helper, "_get_cuda_graph_input_data", return_value=(sample_args, capture_kwargs)
+        ),
+    ):
+        graph_helper.create_cudagraphs()
+    assert graph_helper.graphs_created()
+    assert all(layer.cuda_graphs for layer in model.decoder.layers)
+    if model.config.fine_grained_offloading_buffer_size_gib:
+        pool = PipelineOffloadManager.get_instance().cpu_tensor_pool
+        assert pool.uses_fixed_buffer
+        if (
+            "core_attn" in model.config.offload_modules
+            and model.config.activation_offload_fraction == 1.0
+        ):
+            assert pool.get_pool_status()["fixed_buffer"]["graph_reserved_bytes"] > 0
+
+    # Measurement iterations (with CUDA graph replay)
+    torch.cuda.reset_peak_memory_stats()
+    for i in range(num_measure_iters):
+        if enable_offload_reset:
+            off_interface.reset()
+        set_current_microbatch(model, 0)
+        logits = model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        loss = logits.float().sum()
+        loss.backward()
+        if i < num_measure_iters - 1:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+
+    torch.cuda.synchronize()
+    peak_bytes = int(torch.cuda.max_memory_allocated())
+
+    # Capture grads from last iteration
+    grads: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
+
+    # Cleanup CUDA graphs
+    graph_helper.delete_cuda_graphs()
+
+    return logits.detach().float().cpu(), grads, peak_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(not is_te_min_version("2.14.0"), reason="Offload capture requires TE >= 2.14")
+@pytest.mark.parametrize("delay_offload", [False, True])
+def test_fixed_buffer_with_mixed_cuda_graph_offloading(delay_offload):
+    """Compare real TE attention replay plus eager MoE with and without fixed host storage."""
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+
+    for variable in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+        os.environ.pop(variable, None)
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    micro_batch_size, seq_length = 2, 512
+    init_num_microbatches_calculator(
+        rank=torch.distributed.get_rank(),
+        global_batch_size=micro_batch_size * torch.distributed.get_world_size(),
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=torch.distributed.get_world_size(),
+    )
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=torch.device("cuda")
+    )
+    results = []
+    warmup_stream = torch.cuda.Stream()
+    try:
+        # No offload checks numerical correctness; cached offload is the GPU-memory
+        # control because graph copy buffers exist with either host allocator.
+        for offload, budget in ((False, 0.0), (True, 0.0), (True, 1.5)):
+            off_interface.reset_instance()
+            _reset_cuda_memory()
+            # Exclude persistent library allocations left by earlier variants.
+            before_model_bytes = torch.cuda.memory_allocated()
+            model = _build_gpt_model_with_cuda_graph(
+                seed=123,
+                num_layers=4,
+                hidden_size=1024,
+                num_attention_heads=8,
+                vocab_size=512,
+                seq_length=seq_length,
+                num_experts=4,
+                fine_grained_activation_offloading=offload,
+                offload_modules=["core_attn", "attn_proj", "expert_fc1"] if offload else None,
+                min_offloaded_tensor_size=1024,
+                is_mla=False,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_scope=["attn", "moe_router"],
+                cuda_graph_warmup_steps=3,
+                delay_offload_until_cuda_graph=delay_offload,
+                offloading_buffer_size_gib=budget,
+            ).cuda()
+            model.train()
+            logits, grads, peak_bytes = _run_iters_with_te_cuda_graph(
+                model,
+                warmup_stream=warmup_stream,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                num_warmup_iters=3,
+                num_measure_iters=3,
+                enable_offload_reset=offload,
+            )
+            results.append((logits, grads, peak_bytes - before_model_bytes))
+            del model
+            _reset_cuda_memory()
+
+        base_logits, base_grads, _ = results[0]
+        assert torch.isfinite(base_logits).all()
+        for logits, grads, _ in results[1:]:
+            assert torch.allclose(logits, base_logits, rtol=1e-2, atol=1e-2)
+            assert grads.keys() == base_grads.keys()
+            for name, expected in base_grads.items():
+                actual = grads[name]
+                if expected is None or actual is None:
+                    assert expected is None and actual is None, name
+                else:
+                    assert torch.isfinite(expected).all(), name
+                    assert torch.isfinite(actual).all(), name
+                    assert torch.allclose(actual, expected, rtol=1e-2, atol=1e-2), name
+        assert results[2][2] <= results[1][2] + DELTA * 2**20
+    finally:
+        off_interface.reset_instance()
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
