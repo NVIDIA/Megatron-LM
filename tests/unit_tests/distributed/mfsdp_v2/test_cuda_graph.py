@@ -1,9 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""CUDA graph tests for Megatron-FSDP.
-
-Add tests here for CUDA graph capture and replay.
-"""
+"""CUDA graph tests for Megatron-FSDP."""
 
 import logging
 

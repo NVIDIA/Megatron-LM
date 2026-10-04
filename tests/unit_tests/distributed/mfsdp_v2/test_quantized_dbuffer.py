@@ -1,10 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for MFSDP v2 MXFP8 buffers.
-
-Add tests here for quantized buffer data and scales, tensor views, quantization,
-redistribution, and GEMM compatibility.
-"""
+"""Tests for MFSDP v2 MXFP8 buffers."""
 
 import pytest
 import torch

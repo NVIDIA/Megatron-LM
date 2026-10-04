@@ -1,10 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Quantized training tests for the experimental Megatron-FSDP path.
-
-Add tests here for quantized MFSDP training correctness and mixed-precision
-integration.
-"""
+"""Quantized training tests for the experimental Megatron-FSDP path."""
 
 import pytest
 import torch

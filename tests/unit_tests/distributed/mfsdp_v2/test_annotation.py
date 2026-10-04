@@ -1,9 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for experimental Megatron-FSDP annotations.
-
-Add tests here for NVTX ranges and other profiling annotations.
-"""
+"""Unit tests for experimental Megatron-FSDP annotations."""
 
 import re
 from typing import Literal, NamedTuple

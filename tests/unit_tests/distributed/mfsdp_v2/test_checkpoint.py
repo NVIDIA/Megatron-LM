@@ -1,10 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""DCP save/load roundtrip tests for the experimental Megatron-FSDP path.
-
-Add tests here for checkpoint save/load, metadata, chunk layout, and round-trip
-correctness. Activation recomputation tests belong with the behavior they exercise.
-"""
+"""DCP save/load roundtrip tests for the experimental Megatron-FSDP path."""
 
 import math
 from pathlib import Path

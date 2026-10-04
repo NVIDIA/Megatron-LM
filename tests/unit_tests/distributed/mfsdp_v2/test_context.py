@@ -2,8 +2,8 @@
 
 """Unit tests for experimental Megatron-FSDP runtime contexts.
 
-Add tests here for context construction, sharing and scoping, module traversal
-and prefetch order, and microbatch context state.
+Test prefetch-order construction here; test communication/computation overlap
+in ``test_overlap.py``.
 """
 
 from unittest.mock import Mock

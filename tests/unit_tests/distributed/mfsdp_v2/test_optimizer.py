@@ -1,10 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for Megatron-FSDP optimizer behavior.
-
-Add tests here for optimizer adapters, parameter/gradient dtype compatibility,
-post-step synchronization, and visibility of updated weights.
-"""
+"""Unit tests for Megatron-FSDP optimizer behavior."""
 
 import pytest
 import torch

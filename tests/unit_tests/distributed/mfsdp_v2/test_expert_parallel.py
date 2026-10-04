@@ -2,9 +2,6 @@
 
 """Megatron-FSDP v2 composed with expert parallelism through a real MCore HybridModel.
 
-Add tests here for MFSDP composition with expert parallelism and comparison
-against a full-batch reference.
-
 Checks that an ``EP=4`` transformer-MoE ``HybridModel`` (an attention layer + a MoE layer)
 sharded with mFSDP v2 (experts over the expert-DP sub-mesh, dense params over the full DP
 mesh), consuming its ``1/dp`` shard of a global batch, reproduces a single **full-batch

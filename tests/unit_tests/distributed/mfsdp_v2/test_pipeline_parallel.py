@@ -2,9 +2,6 @@
 
 """Pipeline-parallel context-sharing test for MFSDP v2.
 
-Add tests here for pipeline-parallel model wrapping and context sharing across
-virtual pipeline chunks.
-
 ``virtual_pipeline_model_parallel_size > 1`` manifests as multiple model chunks
 on a rank, and ``wrap_model_chunks_with_ddp`` wraps each chunk in its own
 ``FullyShardedDataParallelV2``. For MFSDP v2 the helper opens one ambient

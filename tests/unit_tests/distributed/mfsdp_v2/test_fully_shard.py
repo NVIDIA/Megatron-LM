@@ -1,9 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Fallback tests for MFSDP v2.
+"""Unit tests for MFSDP v2.
 
-Use this file only as a last resort when no focused test file fits. Read the
-other test files' module docstrings to choose a destination.
+Use this file only as a last resort when no focused test file fits.
 """
 
 import logging

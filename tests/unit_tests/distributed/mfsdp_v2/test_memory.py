@@ -2,8 +2,8 @@
 
 """Memory-accounting tests for Megatron-FSDP.
 
-Add tests here for persistent or peak allocation sizes, buffer lifetime, and
-storage release, including cases parametrized over sharding strategies.
+Tests asserting memory usage or storage release belong here, including during
+CUDA graph capture and replay.
 """
 
 import logging
