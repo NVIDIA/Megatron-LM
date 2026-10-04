@@ -321,8 +321,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
-        notes="MoELayer replay through allgather / alltoall (EP=1, EP=2) and flex+DeepEP; "
-        "NCCL EP eager dispatch/combine with stale zero-copy buffers when available.",
+        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -336,9 +335,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/fused_a2a.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="external-lib",
-        notes="DeepEP flex dispatcher cell and NCCL EP eager dispatch/combine "
-        "(skipped without their dependencies / >=2 GPUs). HybridEP and NCCL EP zero-copy "
-        "are not yet replayed bit-exactly here.",
+        notes="DeepEP flex dispatcher cell (skipped without deep_ep / >=2 GPUs). HybridEP and NCCL-EP backends are not yet "
+        "replayed bit-exactly here.",
     ),
     KernelEntry(
         name="moe_shared_experts",

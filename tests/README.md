@@ -17,13 +17,6 @@ checks that no new registered groups remain. This keeps
 communication memory bounded across the full dispatcher, precision, MTP, and
 recompute matrix.
 
-## CUDA Graph Test Isolation
-
-Reference outputs retained across capture must be detached after eager backward so
-their autograd nodes do not retain warmup-stream state. Capture errors restore the
-process-wide warmup/capture flags before propagating the error; otherwise later DDP
-backwards can incorrectly suppress gradient accumulation.
-
 ## Updating Functional Test Golden Values
 
 When adding new functional tests, it may be necessary to update the golden values used to verify if the test is

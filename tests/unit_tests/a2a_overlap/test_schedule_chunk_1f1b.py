@@ -15,6 +15,7 @@ from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     apply_flex_backend_kwargs,
@@ -234,11 +235,61 @@ def capture_overlap_grads(layers, extra_kwargs, use_mtp_input_mask=False):
     return captures
 
 
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+@pytest.mark.parametrize(
+    "overlap_enabled,cuda_graph_impl,error_match",
+    [
+        (True, "none", None),
+        (True, "local", "full recompute is only supported with full iteration CUDA graph"),
+        (
+            True,
+            "transformer_engine",
+            "full recompute is only supported with full iteration CUDA graph",
+        ),
+        (
+            True,
+            "full_iteration",
+            "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+            "together with CUDA graphs",
+        ),
+        (False, "full_iteration", None),
+    ],
+)
+def test_ep_a2a_full_recompute_cuda_graph_compatibility(
+    recompute_method, overlap_enabled, cuda_graph_impl, error_match
+):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=overlap_enabled,
+        bf16=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        recompute_granularity="full",
+        recompute_method=recompute_method,
+        recompute_num_layers=1,
+        cuda_graph_impl=cuda_graph_impl,
+    )
+    if error_match is not None:
+        with pytest.raises(AssertionError, match=error_match):
+            TransformerConfig(**kwargs)
+    else:
+        config = TransformerConfig(**kwargs)
+        assert config.cuda_graph_impl == cuda_graph_impl
+        assert config.overlap_moe_expert_parallel_comm == overlap_enabled
+
+
 @contextmanager
 def model_parallel_context(tp_size=1):
     """Own a fixed parallel topology and its backend buffers for a test scope."""
     Utils.initialize_distributed()
     torch.cuda.synchronize()
+    # Own NCCL EP state within this file; no preceding topology's buffers may survive.
+    nccl_ep_release_context()
     fused_a2a.reset_hybrid_ep_buffer()
     fused_a2a._buffer = None
     # MCore clears NCCL references without unregistering groups from c10d. Own only
@@ -259,6 +310,7 @@ def model_parallel_context(tp_size=1):
         gc.collect()
         fused_a2a.reset_hybrid_ep_buffer()
         fused_a2a._buffer = None
+        nccl_ep_release_context()
         Utils.destroy_model_parallel()
         for group in reversed(list(pg_map)):
             if group not in existing_groups:

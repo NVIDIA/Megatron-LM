@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Model and data parallel groups."""
 
@@ -2583,14 +2583,14 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
-    # Release the shared zero-copy buffers and NCCL EP context (if bootstrapped) before the
+    # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
     # Idempotent and a no-op when NCCL EP was never bootstrapped.
     try:
-        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 
-        nccl_ep_release_context()
+        nccl_ep_finalize()
     except Exception:  # finalize must never block teardown
         pass
 

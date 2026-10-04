@@ -625,16 +625,6 @@ class _CudagraphGlobalRecord:
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
         try:
             return cls._create_cudagraphs()
-        except Exception:
-            # A failed capture must not make later eager backwards look like capture:
-            # DDP skips gradient accumulation while this process-wide flag is set.
-            _set_warmup_end()
-            _set_capture_end()
-            if HAVE_TE_GRAPHS:
-                te_set_capture_end()
-            if FREEZE_GC:
-                gc.unfreeze()
-            raise
         finally:
             cls._disable_saved_tensors_observer()
 

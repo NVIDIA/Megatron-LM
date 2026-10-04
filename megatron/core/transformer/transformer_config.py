@@ -3581,6 +3581,12 @@ class TransformerConfig(ModelParallelConfig):
                 # recompute_num_layers keep their non-overlap meaning and are validated
                 # by the shared checks in __post_init__. See
                 # megatron/core/models/common/model_chunk_schedule_plan.py.
+                # Segment replay is currently supported only in eager execution,
+                # including when the generic full-iteration graph checks allow recompute.
+                assert self.cuda_graph_impl == "none", (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'together with CUDA graphs (cuda_graph_impl != "none").'
+                )
                 # The replay is hand-rolled rather than a checkpoint primitive, so it
                 # cannot shard the retained segment input across TP ranks.
                 assert not self.distribute_saved_activations, (
