@@ -430,6 +430,8 @@ def test_unused_parameters_wait_for_delayed_te_gradients(distributed_setup, sepa
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
             else:
                 assert all(unit.phase is FsdpModule.Phase.RESTING for unit in model)
+                # Isolate countdown correctness from the separate delayed-TE stream race.
+                torch.cuda.synchronize()
             optimizer.step()
         return losses
 

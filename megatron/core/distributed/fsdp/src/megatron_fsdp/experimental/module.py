@@ -549,9 +549,6 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
         self._reduce_gradient_groups()
-        if not self.context._post_backward_hook_registered:
-            # Delayed TE wgrad can finish after the final autograd callback.
-            self.context.current_stream().wait_stream(self.context.reduce_scatter_stream)
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
