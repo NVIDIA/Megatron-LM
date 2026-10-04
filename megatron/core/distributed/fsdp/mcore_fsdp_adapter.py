@@ -670,18 +670,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
-        # open and finalize our own.
+        # open and finalize our own. MCore's finalize_model_grads() owns the wait
+        # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
         construction_context = (
             nullcontext(active_context)
             if active_context is not None
-            else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
+            else fully_shard_context(
+                device=device,
+                use_symmetric_memory=ddp_config.nccl_ub,
+                caller_managed_grad_sync=True,
+            )
         )
         with construction_context as context:
-            # MCore's finalize_model_grads() calls finish_grad_sync() after the schedule
-            # completes, including delayed wgrad and custom 1F1B backward work. Apply the
-            # opt-in to both adapter-owned and ambient contexts shared by model chunks.
-            context.caller_managed_grad_sync = True
+            if not context.caller_managed_grad_sync:
+                raise ValueError(
+                    "MCore MFSDP v2 requires shared contexts to be constructed with "
+                    "caller_managed_grad_sync=True."
+                )
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives

@@ -265,6 +265,26 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
+    def test_rejects_shared_context_without_caller_managed_grad_sync(self, distributed_setup):
+        """The adapter rejects an incompatible shared context before sharding the model."""
+        config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+        layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
+        with fully_shard_context(device=distributed_setup.device) as context:
+            with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
+                FullyShardedDataParallel(
+                    config=config,
+                    ddp_config=DistributedDataParallelConfig(
+                        use_megatron_fsdp=True,
+                        megatron_fsdp_version=2,
+                        use_distributed_optimizer=False,
+                        data_parallel_sharding_strategy="optim_grads_params",
+                    ),
+                    module=layer,
+                    pg_collection=self.pg_collection,
+                )
+            assert not context.caller_managed_grad_sync
+            assert not isinstance(layer, FsdpModule)
+
     @pytest.mark.parametrize("share_context", [False, True])
     def test_finish_grad_sync_waits_for_delayed_wgrad(
         self, distributed_setup, monkeypatch, share_context
@@ -288,7 +308,7 @@ class TestMcoreAdapterDense:
         )
         # Cover both standalone adapter construction and an ambient context such as VPP's.
         construction_context = (
-            fully_shard_context(device=distributed_setup.device)
+            fully_shard_context(device=distributed_setup.device, caller_managed_grad_sync=True)
             if share_context
             else contextlib.nullcontext()
         )
