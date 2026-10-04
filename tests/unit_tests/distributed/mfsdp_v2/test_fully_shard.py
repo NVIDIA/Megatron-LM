@@ -274,8 +274,8 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
-    """TE's callback, not AccumulateGrad, completes MFSDP backward."""
+def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup, monkeypatch):
+    """Delayed TE wgrad must finish reduction before current-stream consumers."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -297,7 +297,20 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
     assert model.weight.grad is None
     assert model.phase is FsdpModule.Phase.BACKWARD
 
+    group = model.parameter_groups[0]
+    reduce_partial_gradients = group.reduce_partial_gradients
+
+    def delayed_reduce(*args, **kwargs):
+        # Keep reduction pending while the consumer stream reads the gradient.
+        torch.cuda._sleep(200_000_000)
+        return reduce_partial_gradients(*args, **kwargs)
+
+    monkeypatch.setattr(group, "reduce_partial_gradients", delayed_reduce)
     model.backward_dw()
+    # Read before synchronizing: checking only .grad existence misses stream races.
+    consumed_gradient = model.weight.grad.clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(consumed_gradient, model.weight.grad)
 
     assert model.weight.grad is not None
     assert model.phase is FsdpModule.Phase.RESTING
