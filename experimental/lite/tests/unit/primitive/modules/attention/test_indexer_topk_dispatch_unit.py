@@ -267,7 +267,7 @@ def test_dsa_shared_layer_has_no_geometry(monkeypatch):
     _, full = _dsa(monkeypatch, **INDEX_SHARE["full"])
     _, shared = _dsa(monkeypatch, **INDEX_SHARE["shared"])
     assert shared.skip_topk and shared.indexer is None and not full.skip_topk
-    assert full.indexer_geometry() == IndexerGeometry(num_heads=4, head_dim=16, topk=4)
+    assert full.indexer_geometry() == IndexerGeometry(num_heads=4, head_dim=16, topk=4, key_ratio=1)
     assert shared.indexer_geometry() is None
     with pytest.raises(ValueError, match="top-k of layer 1 .* takes no binding"):
         shared.set_indexer_topk(FakeBinding())

@@ -37,6 +37,9 @@ import torch
 from torch import Tensor
 
 from megatron.lite.primitive.kernels.indexer_topk.config import (
+    SLAB_CANDIDATES_PER_TOPK,
+    SLAB_MIN_CANDIDATES,
+    SLAB_RECORD_BYTES,
     IndexerTopKFormat,
     ResolvedIndexerTopKTuning,
 )
@@ -72,6 +75,13 @@ STATUS_REFINE_OVERFLOW = 1
 STATUS_CAPACITY = 2
 STATUS_FAILED = 3
 
+# Tiles of the ``fp4_slab`` route whose rows see more keys than the slab limit are not given to
+# LiteTopK (the previous integration's rule). The limit is the plugin's ``merge_cap`` setting;
+# when that is unset it is the plugin's built-in slab size, raised to cover sequences of up to
+# _SLAB_AUTO_KEYS keys. The slab a tile is given is sized separately (see _capacity).
+_SLAB_DEFAULT_KEYS = 196608
+_SLAB_AUTO_KEYS = 262144
+
 # The block-major key caches of every engine in the process (one per device, stream and format).
 _KEY_CACHES = KeyCachePool()
 
@@ -87,8 +97,8 @@ class IndexerTopKStats:
         calls: Selection calls.
         rows: Local query rows of those calls.
         litetopk_rows: Rows of the tiles the plugin selected.
-        reference_rows: Rows the reference selector selected: the rows planned for it and the
-            tiles the plugin declined on the host.
+        reference_rows: Rows the reference selector (or the upstream selector) selected: the
+            rows planned for it and the tiles the plugin declined on the host.
         bootstrap_rows: The part of ``reference_rows`` in tiles selected by the reference
             selector to vote a first seed.
         padding_rows: Rows outside every segment (all -1).
@@ -110,6 +120,9 @@ class IndexerTopKStats:
         declined_tiles: Tiles the plugin declined on the host, by reason.
         tile_rows: Tiles the plugin selected, by tile length.
         status_rows: Rows whose plugin status was not OK at the status read, by status code.
+        candidate_slab_bytes: The largest candidate slab a tile of the slab route was given,
+            in bytes (rows of the segment's largest tile, times candidates per row, times
+            6-byte records); 0 without slab tiles. A high-water mark, not a sum.
         padded_litetopk_rows: The part of ``litetopk_rows`` the plugin scored with zero-padded
             query heads (``IndexerTopKConfig.head_padding``).
         padded_reference_rows: Rows the reference selector scored with zero-padded query heads
@@ -137,6 +150,7 @@ class IndexerTopKStats:
     declined_tiles: Counter[str] = field(default_factory=Counter)
     tile_rows: Counter[int] = field(default_factory=Counter)
     status_rows: Counter[int] = field(default_factory=Counter)
+    candidate_slab_bytes: int = 0
     padded_litetopk_rows: int = 0
     padded_reference_rows: int = 0
 
@@ -168,7 +182,7 @@ class IndexerOperands:
     therefore score byte-identical operands.
 
     Attributes:
-        fmt: Operand format: ``fp8``.
+        fmt: Operand format: ``fp8`` or ``mxfp4``.
         q: Indexer queries ``[rows, H, D]``.
         weights: Per-head weights ``[rows, H]``, before ``softmax_scale``.
         keys: The quantized keys, covering every key a row of the call sees; None when no
@@ -216,6 +230,7 @@ class _SegmentState:
     hot_key: Hashable
     views: KeyCacheViews
     key_scales: Tensor
+    capacity: int | None
 
 
 # Called with the tiles the plugin declined on the host and the reason; selects their rows with
@@ -256,6 +271,26 @@ class LiteTopKEngine:
         self.vote_rows = int(plugin.module.carry_vote_rows())
         self._layer_key = layer_key
 
+    def max_tile_keys(self, key_count: int, topk: int) -> int | None:
+        """Return the most keys a tile row may see on this route, or None for no limit.
+
+        Args:
+            key_count: Keys of the sequence.
+            topk: Keys selected per row.
+
+        Returns:
+            None for the paged route. For the slab route the slab limit, or 0 (no tile) when
+            the limit is below the smallest slab a tile is given.
+        """
+        if self.route.name != "fp4_slab":
+            return None
+        limit = self.plugin.settings.merge_cap
+        if limit is None:
+            limit = max(_SLAB_DEFAULT_KEYS, min(key_count, _SLAB_AUTO_KEYS))
+        if limit < max(SLAB_MIN_CANDIDATES, SLAB_CANDIDATES_PER_TOPK * topk):
+            return 0
+        return limit
+
     def run_segment(
         self,
         operands: IndexerOperands,
@@ -287,6 +322,11 @@ class LiteTopKEngine:
         """
         dispatched: list[tuple[Tile, ...]] = []
         with self._segment(operands, plan, segment_index, out.device) as state:
+            if state.capacity is not None:
+                rows = max(tile.rows for tile in plan.tiles)
+                stats.candidate_slab_bytes = max(
+                    stats.candidate_slab_bytes, rows * state.capacity * SLAB_RECORD_BYTES
+                )
             if plan.seed == "reference":
                 self._stash(state, operands, out, plan.vote_rows, stats)
             reseed = False
@@ -373,9 +413,29 @@ class LiteTopKEngine:
                 hot_key=hot_key,
                 views=views,
                 key_scales=views.scales.view(keys.scale.dtype).reshape(segment.key_count),
+                capacity=self._capacity(operands, plan),
             )
         finally:
             module.drop_carry(device, hot_key)
+
+    def _capacity(self, operands: IndexerOperands, plan: SegmentPlan) -> int | None:
+        """Candidates per row of the slab of the segment's tiles (None on the paged route).
+
+        A tile row has at most one candidate per key it sees, so a slab of as many candidates as
+        the segment's last tile sees keys cannot overflow. The slab is never smaller than the
+        plugin's minimum, and is bounded by ``tuning.candidate_capacity`` when that is set, else
+        by ``tuning.candidate_budget_bytes`` for a tile of ``tuning.tile_rows`` rows. Rows with
+        more candidates than their slab holds report a capacity status.
+        """
+        if self.route.name != "fp4_slab":
+            return None
+        last = plan.groups[-1].tiles[-1]
+        visible = operands.layout.visible_keys(plan.segment, last.row_end - 1)
+        smallest = max(SLAB_MIN_CANDIDATES, SLAB_CANDIDATES_PER_TOPK * operands.topk)
+        if self.tuning.candidate_capacity is not None:
+            return min(max(smallest, visible), self.tuning.candidate_capacity)
+        budget = self.tuning.candidate_budget_bytes // (self.tuning.tile_rows * SLAB_RECORD_BYTES)
+        return max(smallest, min(visible, budget))
 
     def _vote_before(self, plan: SegmentPlan, group: TileGroup) -> tuple[int, int]:
         """The rows that precede a tile group and vote its seed."""
@@ -450,6 +510,8 @@ class LiteTopKEngine:
                 dtype=torch.int64,
                 device=out.device,
             )
+            if layout.key_ratio != 1:
+                ends = torch.div(ends, layout.key_ratio, rounding_mode="floor")
             ends = ends.clamp_(max=segment.key_count).to(torch.int32)
             data, scales, weights = operands.queries(
                 tile.row_start, tile.row_end, kernel_heads=self.kernel_heads
@@ -467,9 +529,7 @@ class LiteTopKEngine:
                 permuted_plan=handle,
                 num_reqs=1,
                 ke_min_hint=group.common_end,
-                # Part of the ABI v1 call; no route this version accepts uses a candidate
-                # capacity.
-                cap=None,
+                cap=state.capacity,
                 hot_key=state.hot_key,
                 ks_common_hint=0,
                 carry_extent_hint=layout.visible_keys(segment, tile.row_end - 1),

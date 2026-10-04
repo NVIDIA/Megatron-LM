@@ -17,27 +17,36 @@ from megatron.lite.primitive.kernels.indexer_topk import (
     QueryLayout,
     QuerySegment,
     quantize_indexer_fp8_rows,
+    quantize_indexer_mxfp4_rows_reference,
 )
 from megatron.lite.primitive.kernels.indexer_topk import reference as reference_module
-from megatron.lite.primitive.kernels.indexer_topk import (
-    reference_topk,
-    sort_topk_rows_,
-)
+from megatron.lite.primitive.kernels.indexer_topk import reference_topk, sort_topk_rows_
 from megatron.lite.primitive.kernels.indexer_topk.reference import (
     ReferenceSelector,
     quantize_keys,
-    quantize_queries,
     score_kernel_heads,
 )
 
 pytestmark = pytest.mark.mlite
 
+_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
+
+
+def _dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    codes = packed.view(torch.uint8).to(torch.int64)
+    code = torch.stack((codes & 0xF, codes >> 4), dim=-1).reshape(*packed.shape[:-1], -1)
+    value = torch.where((code & 8) != 0, -_E2M1[code & 7], _E2M1[code & 7])
+    exponents = torch.stack([(scales >> shift) & 0xFF for shift in (0, 8, 16, 24)], dim=-1)
+    group_scale = torch.pow(2.0, exponents.to(torch.float64) - 127.0)
+    return (value.reshape(*value.shape[:-1], 4, 32) * group_scale[..., None]).flatten(-2)
+
 
 def _operands(q, kv, weights):
     """float64 queries [n, H, D], keys [N, D] and per-(row, head, key) scale folding."""
     (q_data, q_sf), (k_data, k_scale) = q, kv
-    assert q_sf is None  # FP8: the query scales are folded into the weights, key scales outside.
-    return q_data.double(), k_data.double(), k_scale.double()
+    if q_sf is None:  # FP8: the query scales are folded into the weights, key scales outside.
+        return q_data.double(), k_data.double(), k_scale.double()
+    return _dequantize_mxfp4(q_data, q_sf), _dequantize_mxfp4(k_data, k_scale), None
 
 
 class FakeScoreKernel:
@@ -94,19 +103,26 @@ def exact_topk_kernel(scores, lengths, top_k):
     return ids
 
 
-def _expected(q, k, weights, layout, topk, softmax_scale):
+def _expected(q, k, weights, layout, topk, softmax_scale, fmt):
     """Exact top-k of every row over its visible keys, from the quantized operands."""
-    q_data, q_scale = quantize_indexer_fp8_rows(q)
-    k_data, k_scale = quantize_indexer_fp8_rows(k)
-    queries, keys = q_data.double(), k_data.double()
-    head_weights = (weights.float() * softmax_scale * q_scale).double()
+    if fmt == "fp8":
+        q_data, q_scale = quantize_indexer_fp8_rows(q)
+        k_data, k_scale = quantize_indexer_fp8_rows(k)
+        queries, keys = q_data.double(), k_data.double()
+        head_weights = (weights.float() * softmax_scale * q_scale).double()
+    else:
+        queries = _dequantize_mxfp4(*quantize_indexer_mxfp4_rows_reference(q))
+        keys = _dequantize_mxfp4(*quantize_indexer_mxfp4_rows_reference(k))
+        k_scale = None
+        head_weights = (weights.float() * softmax_scale).double()
     out = torch.full((layout.rows, topk), -1, dtype=torch.int32)
     for segment in layout.segments:
         for row in range(segment.row_start, segment.row_end):
             visible = layout.visible_keys(segment, row)
             window = keys[segment.key_start : segment.key_start + visible]
             scores = (torch.relu(queries[row] @ window.T) * head_weights[row][:, None]).sum(0)
-            scores = scores * k_scale[segment.key_start : segment.key_start + visible].double()
+            if k_scale is not None:
+                scores = scores * k_scale[segment.key_start : segment.key_start + visible].double()
             order = torch.sort(-scores.float().double(), stable=True).indices[:topk]
             out[row, : order.numel()] = order.int() + segment.index_base
     return sort_topk_rows_(out)
@@ -151,15 +167,17 @@ def _select(selector, q, k, weights, layout, topk, softmax_scale, row_ranges=Non
     return out, lengths, calls
 
 
-def test_select_batches_segments_into_varlen_calls(monkeypatch):
+@pytest.mark.parametrize("fmt", ["fp8", "mxfp4"])
+def test_select_batches_segments_into_varlen_calls(monkeypatch, fmt):
     kernel = FakeScoreKernel()
     monkeypatch.setattr(reference_module, "_mqa_logits", kernel)
     cu_seqlens = [0, 23, 23, 71, 90]
-    layout = QueryLayout.packed(cu_seqlens, row_start=10, rows=84, absolute_ids=True)
-    q, k, weights = _inputs(84, cu_seqlens[-1], 16, seed=1)
-    out, lengths, calls = _select(_selector("fp8", 16), q, k, weights, layout, 8, 0.25)
+    layout = QueryLayout.packed(cu_seqlens, row_start=10, rows=84, key_ratio=2, absolute_ids=True)
+    key_rows = sum((end - start) // 2 for start, end in zip(cu_seqlens, cu_seqlens[1:]))
+    q, k, weights = _inputs(84, key_rows, 16, seed=1)
+    out, lengths, calls = _select(_selector(fmt, 16), q, k, weights, layout, 8, 0.25)
 
-    expected = _expected(q, k, weights, layout, 8, 0.25)
+    expected = _expected(q, k, weights, layout, 8, 0.25, fmt)
     assert torch.equal(sort_topk_rows_(out.clone()), expected)
     assert torch.equal(lengths, (expected >= 0).sum(1, dtype=torch.int32))
     assert (out[80:] == -1).all() and (lengths[80:] == 0).all()  # padding rows past the pack
@@ -174,8 +192,8 @@ def test_select_batches_segments_into_varlen_calls(monkeypatch):
     assert call["width"] == max(widths) and call["keys"] == max(call["ke"])
 
 
-def test_select_chunking_invariant(monkeypatch):
-    fmt = "fp8"
+@pytest.mark.parametrize("fmt", ["fp8", "mxfp4"])
+def test_select_chunking_invariant(monkeypatch, fmt):
     monkeypatch.setattr(reference_module, "_mqa_logits", FakeScoreKernel())
     layout = QueryLayout.contiguous(96, position=40, keys=160)
     q, k, weights = _inputs(96, 160, 16, seed=2)
@@ -206,11 +224,8 @@ def test_select_empty_windows_and_uncovered_rows(monkeypatch):
     monkeypatch.setattr(reference_module, "_mqa_logits", kernel)
     layout = QueryLayout(
         rows=12,
-        segments=(
-            QuerySegment(2, 5, 0, 0, 0, 0),
-            QuerySegment(5, 6, 0, 0, 1, 0),
-            QuerySegment(8, 10, 0, 10, 0, 10),
-        ),
+        key_ratio=4,
+        segments=(QuerySegment(2, 6, 0, 0, 10, 0), QuerySegment(8, 10, 0, 10, 10, 10)),
     )
     q, k, weights = _inputs(12, 20, 16, seed=3)
     out, lengths, calls = _select(_selector("fp8", 16), q, k, weights, layout, 4, 1.0)
@@ -221,45 +236,50 @@ def test_select_empty_windows_and_uncovered_rows(monkeypatch):
     assert lengths.sum() == 1
     # A single segment with an id offset: its rows are scored against a view of its keys (plain
     # score rows, windows from column 0) and its ids are returned as key tensor rows.
-    layout = QueryLayout(rows=6, segments=(QuerySegment(0, 6, 2, 8, 9, 8),))
+    layout = QueryLayout(rows=6, key_ratio=1, segments=(QuerySegment(0, 6, 2, 8, 9, 8),))
     out, lengths, calls = _select(_selector("fp8", 16), q[:6], k, weights[:6], layout, 4, 1.0)
     call = kernel.calls[-1]
     assert calls == 1 and (call["width"], call["keys"]) == (0, 8)
     assert call["ks"] == [0] * 6 and call["ke"] == [3, 4, 5, 6, 7, 8]
-    expected = _expected(q[:6], k, weights[:6], layout, 4, 1.0)
+    expected = _expected(q[:6], k, weights[:6], layout, 4, 1.0, "fp8")
     assert torch.equal(sort_topk_rows_(out), expected)
     assert int(expected[expected >= 0].min()) >= 8 and lengths.tolist() == [3, 4, 4, 4, 4, 4]
     # The kernel needs 16-byte aligned operands: the 4-byte scales of a key view that starts at
     # key 7 are not, so the selector scores against an aligned copy of them, still in the plain
     # mode (the key rows of the view are aligned).
-    layout = QueryLayout(rows=6, segments=(QuerySegment(0, 6, 2, 7, 9, 7),))
+    layout = QueryLayout(rows=6, key_ratio=1, segments=(QuerySegment(0, 6, 2, 7, 9, 7),))
     out, lengths, calls = _select(_selector("fp8", 16), q[:6], k, weights[:6], layout, 4, 1.0)
     call = kernel.calls[-1]
     assert (call["width"], call["keys"]) == (0, 8) and call["ks"] == [0] * 6
     assert call["ke"] == [3, 4, 5, 6, 7, 8]
     assert call["scale_aligned"] and not call["scale_is_view"]
-    assert torch.equal(sort_topk_rows_(out), _expected(q[:6], k, weights[:6], layout, 4, 1.0))
+    assert torch.equal(
+        sort_topk_rows_(out), _expected(q[:6], k, weights[:6], layout, 4, 1.0, "fp8")
+    )
     # A view whose scales are aligned is used in place.
-    layout = QueryLayout(rows=6, segments=(QuerySegment(0, 6, 2, 8, 9, 8),))
+    layout = QueryLayout(rows=6, key_ratio=1, segments=(QuerySegment(0, 6, 2, 8, 9, 8),))
     _select(_selector("fp8", 16), q[:6], k, weights[:6], layout, 4, 1.0)
     assert kernel.calls[-1]["scale_is_view"] and kernel.calls[-1]["width"] == 0
     # Rows that see no key at all need no score call.
-    layout = QueryLayout(rows=3, segments=(QuerySegment(0, 3, 0, 0, 0, 0),))
+    layout = QueryLayout(rows=3, key_ratio=4, segments=(QuerySegment(0, 3, 0, 0, 10, 0),))
     out, lengths, calls = _select(_selector("fp8", 16), q[:3], k, weights[:3], layout, 4, 1.0)
     assert calls == 0 and (out == -1).all() and (lengths == 0).all()
 
 
-def test_select_pads_heads(monkeypatch):
+@pytest.mark.parametrize("fmt", ["fp8", "mxfp4"])
+def test_select_pads_heads(monkeypatch, fmt):
     kernel = FakeScoreKernel()
     monkeypatch.setattr(reference_module, "_mqa_logits", kernel)
     layout = QueryLayout.full(40, keys=40)
     q, k, weights = _inputs(40, 40, 12, seed=4)
-    out, lengths, _ = _select(_selector("fp8", 32), q, k, weights, layout, 6, 0.5)
-    assert torch.equal(sort_topk_rows_(out), _expected(q, k, weights, layout, 6, 0.5))
+    out, lengths, _ = _select(_selector(fmt, 32), q, k, weights, layout, 6, 0.5)
+    assert torch.equal(sort_topk_rows_(out), _expected(q, k, weights, layout, 6, 0.5, fmt))
     (call,) = kernel.calls
     q_data, q_sf = call["q"]
     assert call["heads"] == 32 and (call["weights"][:, 12:] == 0).all()
-    assert (q_data[:, 12:].view(torch.uint8) == 0).all() and q_sf is None
+    assert (q_data[:, 12:].view(torch.uint8) == 0).all()
+    if fmt == "mxfp4":
+        assert (q_sf[:, 12:] == 0x7F7F7F7F).all()
 
 
 def test_rows_per_scoring_call():
@@ -271,25 +291,26 @@ def test_rows_per_scoring_call():
     ]
     assert fp8.rows_per_scoring_call(16) == 32768  # the top-k kernel row limit
     # Explicit rows per call replace the wave plan and are bounded by the budget.
-    h64 = _selector("fp8", 64, budget_bytes=1 << 30, rows_per_call=4096, num_sms=148)
-    assert h64.rows_per_scoring_call(65536) == 4096
-    assert h64.rows_per_scoring_call(131072) == 2048
-    h64 = _selector("fp8", 64, budget_bytes=1 << 30, num_sms=148)
-    assert h64.rows_per_scoring_call(65536) == 3848
+    fp4 = _selector("mxfp4", 64, budget_bytes=1 << 30, rows_per_call=4096, num_sms=148)
+    assert fp4.rows_per_scoring_call(65536) == 4096
+    assert fp4.rows_per_scoring_call(131072) == 2048
+    fp4 = _selector("mxfp4", 64, budget_bytes=1 << 30, num_sms=148)
+    assert fp4.rows_per_scoring_call(65536) == 3848
 
 
 def test_quantize_keys_chunks_rows(monkeypatch):
     k = torch.randn((50, 128), generator=torch.Generator().manual_seed(5)).to(torch.bfloat16)
-    whole = quantize_keys(k, "fp8")
+    whole = [quantize_keys(k, fmt) for fmt in ("fp8", "mxfp4")]
     monkeypatch.setattr(reference_module, "_KEY_QUANTIZE_ROWS", 7)
-    chunked = quantize_keys(k, "fp8")
-    assert torch.equal(chunked.data.view(torch.uint8), whole.data.view(torch.uint8))
-    assert torch.equal(chunked.scale, whole.scale)
-    prefix = quantize_keys(k, "fp8", rows=20)
-    assert torch.equal(prefix.data.view(torch.uint8), whole.data[:20].view(torch.uint8))
+    for fmt, expected in zip(("fp8", "mxfp4"), whole):
+        chunked = quantize_keys(k, fmt)
+        assert torch.equal(chunked.data.view(torch.uint8), expected.data.view(torch.uint8))
+        assert torch.equal(chunked.scale, expected.scale)
+        prefix = quantize_keys(k, fmt, rows=20)
+        assert torch.equal(prefix.data.view(torch.uint8), expected.data[:20].view(torch.uint8))
     fp8_data, fp8_scale = quantize_indexer_fp8_rows(k)
-    assert torch.equal(whole.data.view(torch.uint8), fp8_data.view(torch.uint8))
-    assert torch.equal(whole.scale, fp8_scale)
+    assert torch.equal(whole[0].data.view(torch.uint8), fp8_data.view(torch.uint8))
+    assert torch.equal(whole[0].scale, fp8_scale)
 
 
 def test_score_kernel_heads_probe(monkeypatch):
@@ -300,7 +321,7 @@ def test_score_kernel_heads_probe(monkeypatch):
     cpu = torch.device("cpu")
     assert score_kernel_heads(32, fmt="fp8", head_dim=128, device=cpu) == 32
     assert score_kernel_heads(48, fmt="fp8", head_dim=128, device=cpu) == 64
-    assert score_kernel_heads(8, fmt="fp8", head_dim=128, device=cpu) == 16
+    assert score_kernel_heads(8, fmt="mxfp4", head_dim=128, device=cpu) == 16
     probes = len(kernel.calls)
     assert score_kernel_heads(48, fmt="fp8", head_dim=128, device=cpu) == 64
     assert len(kernel.calls) == probes  # cached
@@ -322,5 +343,51 @@ def test_reference_topk_validation():
         reference_topk(q, k, weights, layout=layout, topk=2, softmax_scale=1.0, fmt="fp8")
     with pytest.raises(ValueError, match="fmt"):
         reference_topk(q, k, weights, layout=layout, topk=2, softmax_scale=1.0, fmt="fp4")
+
+
+@pytest.mark.parametrize(
+    "offset, stride, columns, direct",
+    [(0, 32, 25, True), (8, 32, 24, True), (1, 32, 24, False), (0, 30, 24, False)],
+)
+def test_radix_padded_score_view(monkeypatch, offset, stride, columns, direct):
+    # DeepGEMM score rows include unused padding. The radix adapter must preserve
+    # aligned views and copy incompatible views without changing visible scores.
+    storage = torch.arange(4 * stride + offset, dtype=torch.float32)
+    scores = storage.as_strided((4, columns), (stride, 1), offset)
+    lengths = torch.tensor([0, 5, columns - 1, columns], dtype=torch.int32)
+    expected = exact_topk_kernel(scores, lengths, 4)
+    seen = []
+
+    class Namespace:
+        @staticmethod
+        def indexer_top_k_wrapper(actual, actual_lengths, *, top_k, next_n, return_val):
+            seen.append(actual)
+            assert next_n == 1 and not return_val
+            assert torch.equal(actual, scores) and actual_lengths is lengths
+            return {"indices": exact_topk_kernel(actual, actual_lengths, top_k)}
+
+    monkeypatch.setattr(reference_module, "_cudnn_dsa_namespace", lambda: Namespace)
+    actual = reference_module.topk_kernel(None)(scores, lengths, 4)
+    assert torch.equal(actual, expected)
+    assert (seen[0].data_ptr() == scores.data_ptr()) == direct
+
+
+@pytest.mark.parametrize("rows", [0, 4])
+def test_quantize_keys_rejects_invalid_mxfp4_width(rows):
+    with pytest.raises(ValueError, match="128"):
+        quantize_keys(torch.zeros((rows, 64)), "mxfp4")
+
+
+def test_reference_rejects_invalid_formats():
     with pytest.raises(ValueError, match="fmt"):
-        quantize_queries(q, weights, "bf16", softmax_scale=1.0, kernel_heads=16)
+        quantize_keys(torch.zeros((0, 128)), "fp4")
+    with pytest.raises(ValueError, match="fmt"):
+        reference_module.quantize_queries(
+            torch.zeros((0, 16, 128)),
+            torch.zeros((0, 16)),
+            "fp4",
+            softmax_scale=1.0,
+            kernel_heads=16,
+        )
+    with pytest.raises(ValueError, match="fmt"):
+        _selector("fp4", 16)

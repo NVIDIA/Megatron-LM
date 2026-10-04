@@ -25,11 +25,12 @@ __all__ = [
     "pack_key_cache",
 ]
 
-KeyCacheFormat = Literal["fp8"]
+KeyCacheFormat = Literal["fp8", "mxfp4"]
 
 _CACHE_BLOCK_SIZE = 64
 _SCALE_BYTES = 4
 _CAPACITY_ROWS = 4096
+_MXFP4_HEAD_DIM = 128
 
 
 class KeyCacheViews(NamedTuple):
@@ -39,9 +40,9 @@ class KeyCacheViews(NamedTuple):
         cache: uint8 ``[blocks, 64, value_bytes + 4]``; each block holds 64 value records, then
             their 64 scales.
         keys: The gather destination of the values, ``[rows, value_bytes]``: float8_e4m3fn for
-            the ``fp8`` format.
+            the ``fp8`` format, uint8 (two E2M1 codes per byte) for ``mxfp4``.
         scales: The gather destination of the scales, uint8 ``[rows, 4]`` (a float32 scale for
-            ``fp8``).
+            ``fp8``, four packed UE8M0 exponents for ``mxfp4``).
         block_table: int32 ``[1, blocks]``, the identity block table ``0, 1, ..., blocks - 1``.
     """
 
@@ -68,7 +69,14 @@ class _Workspace:
 def _value_layout(fmt: str, head_dim: int) -> tuple[int, torch.dtype]:
     if fmt == "fp8":
         return head_dim, torch.float8_e4m3fn
-    raise ValueError(f"key cache format must be 'fp8', got {fmt!r}")
+    if fmt == "mxfp4":
+        if head_dim != _MXFP4_HEAD_DIM:
+            raise ValueError(
+                f"the mxfp4 key cache stores four group scales per {_MXFP4_HEAD_DIM}-value row, "
+                f"got head_dim={head_dim}"
+            )
+        return head_dim // 2, torch.uint8
+    raise ValueError(f"key cache format must be 'fp8' or 'mxfp4', got {fmt!r}")
 
 
 def _device_key(device: torch.device) -> tuple[torch.device, str]:
@@ -158,9 +166,10 @@ def pack_key_cache(cache: Tensor, values: Tensor, scales: Tensor, *, start_row: 
     Args:
         cache: ``KeyCacheViews.cache`` of a pooled cache.
         values: Contiguous ``[rows, value_bytes]`` with one-byte elements: the ``float8_e4m3fn``
-            rows of ``quantize_indexer_fp8_rows``.
-        scales: Contiguous ``[rows]`` with four-byte elements: the float32 row scales of the
-            same call.
+            rows of ``quantize_indexer_fp8_rows`` or the int8 codes of
+            ``quantize_indexer_mxfp4_rows``.
+        scales: Contiguous ``[rows]`` with four-byte elements: the float32 row scales or the
+            int32 packed UE8M0 exponents of the same call.
         start_row: The first cache row to write; a multiple of 64, which lets a caller pack a
             long sequence in chunks.
 
@@ -221,10 +230,10 @@ class KeyCachePool:
         next :meth:`acquire` on the same device, stream and format returns the same storage.
 
         Args:
-            fmt: The operand format, ``fp8``.
+            fmt: The operand format, ``fp8`` or ``mxfp4``.
             rows: The number of keys, at least 1.
             device: The device of the cache.
-            head_dim: The indexer head dimension.
+            head_dim: The indexer head dimension (128 for ``mxfp4``).
 
         Returns:
             The cache, gather destinations and block table for ``rows`` keys.

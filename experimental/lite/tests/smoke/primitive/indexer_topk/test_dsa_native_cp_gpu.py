@@ -10,7 +10,8 @@ scores, cuDNN radix top-k) and the matched-precision reference selector (FP8, th
 (sequence boundaries inside both ranks, and sequences of three tokens and of one token), with
 2000 tokens (the gathered keys get the 512-row alignment padding), the bound forward must build
 no dense causal mask, and its selection must equal the upstream selection and a float64 oracle on
-every row. The cuDNN frontend 1.27 is needed, for example through the runner's ``PYTHONPATH``.
+every row. The cuDNN frontend 1.27 is needed (as for the upstream CSA THD tests), for example
+through the runner's ``PYTHONPATH``.
 """
 
 from __future__ import annotations

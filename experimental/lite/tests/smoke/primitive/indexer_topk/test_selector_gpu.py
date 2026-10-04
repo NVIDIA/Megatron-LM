@@ -11,8 +11,8 @@ their locations are given as JSON, inline or as the path of a JSON file::
     experimental/lite/tests/run_tests.sh \\
         experimental/lite/tests/smoke/primitive/indexer_topk/test_selector_gpu.py
 
-A selector entry holds the operand format of the indexer (``fp8``), the precision, the indexer
-heads and top-k, the ``LiteTopKPluginConfig`` fields under ``litetopk`` and optional
+A selector entry holds the operand format of the indexer (``fp8`` or ``mxfp4``), the precision,
+the indexer heads and top-k, the ``LiteTopKPluginConfig`` fields under ``litetopk`` and optional
 ``plugin_settings`` (``LiteTopKPluginSettings`` fields). Every entry runs in a fresh interpreter,
 because plugin settings are process-wide: it selects a 262144-token prompt of random operands
 once with the reference backend and twice with the LiteTopK backend.
@@ -109,6 +109,17 @@ def test_fp8_paged_tiles(spec):
     assert report["recall_min"] >= 0.99 and report["recall_mean"] >= 0.999
 
 
+@pytest.mark.parametrize("spec", _specs("mxfp4", "fast"), ids=_spec_id)
+def test_fp4_slab_tiles(spec):
+    report = _report(spec)
+    _check_common(report)
+    stats = report["litetopk"]["stats"]
+    # Identity seed: no stash, one plan per tile.
+    assert stats["carry_stashes"] == 0 and stats["plans"] == stats["tiles"]
+    assert report["tile_rows"] == report["planned_tile_rows"]
+    assert report["recall_min"] >= 0.99 and report["recall_mean"] >= 0.999
+
+
 @pytest.mark.parametrize("spec", _specs(precision="exact"), ids=_spec_id)
 def test_exact_mode_bitwise(spec):
     report = _report(spec)
@@ -147,8 +158,9 @@ def _child(spec: dict) -> dict:
 
     selector = spec["selector"]
     fmt = selector["native_format"]
+    ratio = 1 if fmt == "fp8" else 4
     heads, topk = selector["heads"], selector["topk"]
-    geometry = IndexerGeometry(num_heads=heads, head_dim=128, topk=topk)
+    geometry = IndexerGeometry(num_heads=heads, head_dim=128, topk=topk, key_ratio=ratio)
 
     class Consumer(torch.nn.Module):
         binding = None
@@ -181,11 +193,11 @@ def _child(spec: dict) -> dict:
 
     device = torch.device("cuda", 0)
     generator = torch.Generator(device=device).manual_seed(20260930)
-    keys = _TOKENS
+    keys = _TOKENS // ratio
     q = torch.randn((_TOKENS, heads, 128), generator=generator, device=device).to(torch.bfloat16)
     k = torch.randn((keys, 128), generator=generator, device=device).to(torch.bfloat16)
     weights = torch.rand((_TOKENS, heads), generator=generator, device=device) * heads**-0.5
-    layout = QueryLayout.full(_TOKENS, keys=keys)
+    layout = QueryLayout.full(_TOKENS, keys=keys, key_ratio=ratio)
 
     def select(binding):
         with torch.no_grad():
@@ -254,10 +266,11 @@ def _child(spec: dict) -> dict:
 
     # The plan the binding must have followed, from the planner and the resolved tuning.
     resolved = lite.resolved_tuning(device)
-    route = lite.plugin.info.route("fp8_paged")
+    route = lite.plugin.info.route("fp8_paged" if fmt == "fp8" else "fp4_slab")
     (plan,) = [
         plan_segment(
             segment,
+            key_ratio=ratio,
             route=route,
             tuning=resolved,
             topk=topk,

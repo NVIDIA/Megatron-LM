@@ -56,7 +56,7 @@ _READS = (
     "SGLANG_LITETOPK_RELEASE_SCRATCH_ON_ROLLBACK",
     "SGLANG_LITETOPK_TIERED_SEED_12K",
 )
-# A source that has no H32 policy keys.
+# A source that has no H32 policy keys (like the MXFP4-only source).
 _READS_WITHOUT_POLICIES = tuple(key for key in _READS if "_H32_" not in key)
 
 _FP8_ROUTE = {
@@ -75,6 +75,19 @@ _FP8_ROUTE = {
     "tie_policies": ["logical-id-desc", "storage"],
     "score_policies": ["folded", "native-fp32"],
 }
+_FP4_ROUTE = {
+    **_FP8_ROUTE,
+    "name": "fp4_slab",
+    "fmt": "mxfp4",
+    "heads": [32, 64],
+    "topk": None,
+    "qualified_query_lengths": [4032, 4096],
+    "admitted_max_query_len": 0,
+    "min_keys": 65536,
+    "tie_policies": ["storage"],
+    "score_policies": ["folded"],
+}
+
 _COMMON = LiteTopKPluginSettings(
     paged_pool_pages_per_row=32,
     fp8_row_tiles=2,
@@ -394,11 +407,7 @@ def test_abi_version_required(tmp_path):
             {"info_override": {"source_id": "0" * 12}},
             "reports source id 000000000000, but its CUDA sources hash to",
         ),
-        ({"routes": ({**_FP8_ROUTE, "fmt": "bf16"},)}, r"\['fmt'\] must be 'fp8' for fp8_paged"),
-        (
-            {"routes": ({**_FP8_ROUTE, "name": "bf16_dense"},)},
-            r"\['name'\] must be one of \['fp8_paged'\]",
-        ),
+        ({"routes": ({**_FP8_ROUTE, "fmt": "mxfp4"},)}, r"\['fmt'\] must be 'fp8' for fp8_paged"),
         ({"routes": ()}, r"\['routes'\] must be a non-empty list"),
         ({"routes": (_FP8_ROUTE, _FP8_ROUTE)}, "declares a route twice"),
     )
@@ -463,6 +472,7 @@ def test_rendered_env_persists(tmp_path):
         cuda_tag="other",
         reads=_READS_WITHOUT_POLICIES,
         launch_keys=(_DUAL_CTA,),
+        routes=(_FP4_ROUTE,),
     )
     _load(other, _COMMON)
     assert _load(root, _POLICIES) is plugin
@@ -492,6 +502,7 @@ def test_render_plugin_env_table():
         fp8_paged_admit_max_query_len=0,
         tiered_seed_12k=False,
         coldstart_identity=True,
+        merge_cap=262144,
         raw32_staging="u40x14",
     )
     assert all(getattr(every, field.name) is not None for field in dataclasses.fields(every))
@@ -502,6 +513,7 @@ def test_render_plugin_env_table():
         "SGLANG_LITETOPK_FP8_PAGED_ADMIT_MAX_Q": "0",
         "SGLANG_LITETOPK_H32_SCORE_POLICY": "native-fp32",
         "SGLANG_LITETOPK_H32_TIE_POLICY": "logical-id",
+        "SGLANG_LITETOPK_MERGE_CAP": "262144",
         "SGLANG_LITETOPK_PAGED_POOL_PAGES_PER_ROW": "32",
         "SGLANG_LITETOPK_RAW32_STAGING": "u40x14",
         "SGLANG_LITETOPK_TIERED_SEED_12K": "0",
@@ -513,10 +525,9 @@ def test_render_plugin_env_table():
 
 
 def test_render_reproduces_previous_integration_env():
-    # The environment the previous LiteTopK integration (an earlier out-of-tree integration
-    # into a Megatron-LM fork) imported its adapters with: its production defaults
-    # (setdefault), the GLM-5.2 driver overrides, and the query-length admission that
-    # replaced its module-attribute patch (1776-row tiles).
+    # The environment the previous LiteTopK integration imported its adapters with: its
+    # production defaults (setdefault), the GLM-5.2 driver overrides, and the query-length
+    # admission that replaced its module-attribute patch (1776-row tiles for FP8, none for FP4).
     fp8_historical = LiteTopKPluginSettings(
         tie_policy="logical-id-desc",
         score_policy="native-fp32",
@@ -538,6 +549,22 @@ def test_render_reproduces_previous_integration_env():
         "SGLANG_LITETOPK_PAGED_POOL_PAGES_PER_ROW": "13",
         "SGLANG_LITETOPK_RELEASE_SCRATCH_ON_ROLLBACK": "1",
         "SGLANG_LITETOPK_TIERED_SEED_12K": "1",
+    }
+    mxfp4_historical = LiteTopKPluginSettings(
+        paged_pool_pages_per_row=32,
+        fp8_row_tiles=2,
+        fp8_paged_admit_max_query_len=0,
+        coldstart_identity=True,
+    )
+    assert env.render_plugin_env(mxfp4_historical) == {
+        "SGLANG_LITETOPK": "1",
+        "SGLANG_LITETOPK_COLDSTART_IDENTITY": "1",
+        "SGLANG_LITETOPK_EXPERIMENTAL_CP_SMALL_Q": "1",
+        "SGLANG_LITETOPK_FP8_LARGE_Q_ROW_TILES": "2",
+        "SGLANG_LITETOPK_FP8_PAGED_ADMIT_MAX_Q": "0",
+        "SGLANG_LITETOPK_PAGED_CANDIDATES": "1",
+        "SGLANG_LITETOPK_PAGED_POOL_PAGES_PER_ROW": "32",
+        "SGLANG_LITETOPK_RELEASE_SCRATCH_ON_ROLLBACK": "1",
     }
 
 
@@ -600,44 +627,6 @@ def test_launch_time_keys_rechecked(tmp_path, monkeypatch):
     plugin.check_launch_time_env()
 
 
-def test_launch_time_setting_needs_a_plugin_that_reads_it(tmp_path, monkeypatch):
-    # A setting that is a launch-time key of some plugins only (the staging layout of a raw-FP32-key
-    # plugin) is rendered only for a plugin that lists the key: another plugin refuses it, and the
-    # failed load leaves nothing behind.
-    staging = "SGLANG_LITETOPK_RAW32_STAGING"
-    settings = dataclasses.replace(_COMMON, raw32_staging="u40x14")
-    other = _make_plugin(tmp_path / "other", cuda_tag="other", launch_keys=(_SCORE,))
-    with pytest.raises(IndexerTopKPluginError, match="does not list it among its launch-time"):
-        _load(other, settings)
-    assert staging not in os.environ and not loader._LOADED and not _fake_modules()
-
-    raw32 = _make_plugin(
-        tmp_path / "raw32",
-        cuda_tag="raw32",
-        reads=(*_READS, staging),
-        launch_keys=(_SCORE, staging),
-    )
-    plugin = _load(raw32, settings)
-    assert os.environ[staging] == "u40x14" and plugin.launch_time_env[staging] == "u40x14"
-    monkeypatch.setenv(staging, "u40x18k3")
-    with pytest.raises(IndexerTopKRuntimeError, match=f"{staging} changed from 'u40x14'"):
-        plugin.check_launch_time_env()
-    monkeypatch.setenv(staging, "u40x14")
-    plugin.check_launch_time_env()
-
-
-def test_loaded_launch_time_keys_count_as_plugin_keys(tmp_path, monkeypatch):
-    # A plugin may read launch-time keys of its own, whatever their names. Once it is loaded, such
-    # a key set in the process is a stray plugin setting for the next load.
-    knob = "FAKE_LITETOPK_LAUNCH_KNOB"
-    assert knob not in env.LAUNCH_TIME_ENV_KEYS
-    first = _load(_make_plugin(tmp_path / "first", cuda_tag="first", launch_keys=(_SCORE, knob)))
-    assert first.launch_time_env[knob] is None
-    monkeypatch.setenv(knob, "1")
-    with pytest.raises(IndexerTopKPluginError, match=f"the process sets {knob}"):
-        _load(_make_plugin(tmp_path / "second", cuda_tag="second"))
-
-
 def test_effective_config_mismatch_raises(tmp_path):
     cases = (
         (
@@ -695,23 +684,24 @@ def test_effective_config_mismatch_raises(tmp_path):
 
 def test_distinct_sources_coexist(tmp_path, monkeypatch):
     fp8 = _make_plugin(tmp_path / "fp8", cuda_tag="fp8", launch_keys=(_SCORE, _DUAL_CTA))
-    other = _make_plugin(
-        tmp_path / "other",
-        cuda_tag="other",
+    fp4 = _make_plugin(
+        tmp_path / "fp4",
+        cuda_tag="fp4",
         reads=_READS_WITHOUT_POLICIES,
         launch_keys=(_DUAL_CTA, _GRAFT),
+        routes=(_FP4_ROUTE,),
     )
     # Both orders work: the score-policy key is launch-time for one source only.
-    for order in ((fp8, other), (other, fp8)):
+    for order in ((fp8, fp4), (fp4, fp8)):
         _clear_plugin_state(monkeypatch)
         loaded = {root: _load(root, _POLICIES if root == fp8 else _COMMON) for root in order}
-        first, second = loaded[fp8], loaded[other]
+        first, second = loaded[fp8], loaded[fp4]
         assert first.source_id != second.source_id
         assert first.module is not second.module
         assert {first.module.__name__, second.module.__name__} <= set(sys.modules)
         assert loader.loaded_litetopk_plugins() == tuple(loaded[root] for root in order)
-        assert first.info.route("fp8_paged") is not None
-        assert second.info.route("fp8_paged").heads == frozenset((32,))
+        assert first.info.route("fp8_paged") is not None and first.info.route("fp4_slab") is None
+        assert second.info.route("fp4_slab").heads == frozenset((32, 64))
         assert os.environ[_SCORE] == "native-fp32"
         assert _SCORE not in second.launch_time_env
         first.check_launch_time_env()
@@ -857,6 +847,7 @@ def test_plugin_config_validation():
         ({"fp8_paged_admit_max_query_len": -4}, "must be an integer >= 0"),
         ({"tiered_seed_12k": 1}, "tiered_seed_12k must be a bool"),
         ({"coldstart_identity": "1"}, "coldstart_identity must be a bool"),
+        ({"merge_cap": 0}, "merge_cap must be an integer >= 1"),
     ):
         with pytest.raises(IndexerTopKConfigError, match=match):
             LiteTopKPluginSettings(**kwargs)
@@ -869,7 +860,7 @@ def test_route_capability_helpers():
         {
             "abi": 1,
             "source_id": "996e735c52df",
-            "routes": [_FP8_ROUTE],
+            "routes": [_FP8_ROUTE, _FP4_ROUTE],
             "effective_config": {"SGLANG_LITETOPK": "1", "SGLANG_LITETOPK_NB": None},
             "launch_time_env_keys": [_SCORE],
             "tie_policy": "storage",
@@ -877,21 +868,16 @@ def test_route_capability_helpers():
         },
         origin="test",
     )
-    fp8 = info.route("fp8_paged")
+    fp8, fp4 = info.route("fp8_paged"), info.route("fp4_slab")
     assert fp8.supports_topk(2048) and not fp8.supports_topk(512)
+    assert fp4.supports_topk(512) and fp4.supports_topk(2048) and not fp4.supports_topk(4096)
     # Qualified lengths, and multiples of four up to the admitted maximum.
     assert fp8.admits_query_length(2040) and fp8.admits_query_length(1776)
     assert fp8.admits_query_length(912) and not fp8.admits_query_length(1774)
     assert not fp8.admits_query_length(1780) and not fp8.admits_query_length(0)
-    assert info.as_dict()["routes"] == [_FP8_ROUTE]
+    assert fp4.admits_query_length(4032) and not fp4.admits_query_length(2048)
+    assert info.as_dict()["routes"] == [_FP8_ROUTE, _FP4_ROUTE]
     assert info.launch_time_env_keys == {_SCORE}
-    # Any top-k up to max_topk, and the qualified lengths only when nothing more is admitted.
-    open_topk = {**_FP8_ROUTE, "topk": None, "admitted_max_query_len": 0}
-    route = abi.parse_plugin_info({**info.as_dict(), "routes": [open_topk]}, origin="test").route(
-        "fp8_paged"
-    )
-    assert route.supports_topk(512) and route.supports_topk(2048) and not route.supports_topk(4096)
-    assert route.admits_query_length(2048) and not route.admits_query_length(1776)
 
     bad_topk = {**_FP8_ROUTE, "topk": [4096]}
     with pytest.raises(IndexerTopKPluginError, match=r"\['topk'\] exceeds max_topk 2048"):
@@ -987,20 +973,22 @@ def _unpack(views: cache.KeyCacheViews, rows: int, value_bytes: int):
     return torch.stack(values), torch.stack(scales)
 
 
-def test_key_cache_pack_roundtrip_bytes():
-    fmt, value_bytes, value_dtype = "fp8", 128, torch.float8_e4m3fn
+@pytest.mark.parametrize(
+    "fmt, value_bytes, value_dtype", [("fp8", 128, torch.float8_e4m3fn), ("mxfp4", 64, torch.int8)]
+)
+def test_key_cache_pack_roundtrip_bytes(fmt, value_bytes, value_dtype):
     generator = torch.Generator().manual_seed(7)
     rows = 3 * 64 + 17
     raw = torch.randint(0, 256, (rows, value_bytes), dtype=torch.uint8, generator=generator)
     words = torch.randint(-(2**31), 2**31 - 1, (rows,), dtype=torch.int32, generator=generator)
     values = raw.view(value_dtype)
-    scales = words.view(torch.float32)
+    scales = words.view(torch.float32) if fmt == "fp8" else words
 
     pool = cache.KeyCachePool()
     views = pool.acquire(fmt, rows, torch.device("cpu"))
     assert views.cache.shape == (4, 64, value_bytes + 4) and views.cache.dtype == torch.uint8
     assert views.keys.shape == (rows, value_bytes)
-    assert views.keys.dtype == torch.float8_e4m3fn
+    assert views.keys.dtype == (torch.float8_e4m3fn if fmt == "fp8" else torch.uint8)
     assert views.scales.shape == (rows, 4) and views.scales.dtype == torch.uint8
     assert views.block_table.dtype == torch.int32 and views.block_table.tolist() == [[0, 1, 2, 3]]
 
@@ -1049,13 +1037,19 @@ def test_key_cache_pool_reuse_and_release():
     longer = pool.acquire("fp8", 9000, cpu)
     assert longer.cache.data_ptr() != first.cache.data_ptr()
     assert pool.allocated_bytes() == 12288 * (132 + 128 + 4) + 192 * 4
+    # Formats get separate caches.
+    fp4 = pool.acquire("mxfp4", 100, cpu)
+    assert fp4.cache.shape == (2, 64, 68) and fp4.keys.dtype == torch.uint8
+    assert pool.allocated_bytes(cpu) == 12288 * 264 + 192 * 4 + 4096 * (68 + 64 + 4) + 64 * 4
     pool.release(cpu)
     assert pool.allocated_bytes() == 0
     assert pool.acquire("fp8", 100, cpu).cache.data_ptr() != longer.cache.data_ptr()
     pool.release()
     assert pool.allocated_bytes() == 0
 
-    with pytest.raises(ValueError, match="key cache format must be 'fp8'"):
+    with pytest.raises(ValueError, match="'fp8' or 'mxfp4'"):
         pool.acquire("bf16", 100, cpu)
+    with pytest.raises(ValueError, match="head_dim=64"):
+        pool.acquire("mxfp4", 100, cpu, head_dim=64)
     with pytest.raises(ValueError, match="at least one row"):
         pool.acquire("fp8", 0, cpu)

@@ -94,7 +94,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_ROUTE_OF_FORMAT = {"fp8": "fp8_paged"}
+_ROUTE_OF_FORMAT = {"fp8": "fp8_paged", "mxfp4": "fp4_slab"}
 # A failed tile group whose seed was voted from a failed tile is run again with a seed voted from
 # the repaired rows at most this many times per call; later failed groups, and every failed
 # group after such a second run failed as well (its seed was valid, so seeds do not explain the
@@ -322,10 +322,14 @@ class IndexerTopKBinding:
         plans = [
             plan_segment(
                 segment,
+                key_ratio=layout.key_ratio,
                 route=None if engine is None else engine.route,
                 tuning=tuning,
                 topk=topk,
                 vote_rows=1 if engine is None else engine.vote_rows,
+                max_tile_keys=(
+                    None if engine is None else engine.max_tile_keys(segment.key_count, topk)
+                ),
             )
             for segment in layout.segments
         ]
@@ -382,6 +386,11 @@ class IndexerTopKBinding:
         if type(topk) is not int or not 0 < topk <= geometry.topk:
             raise ValueError(
                 f"layer {self.name}: topk must be an integer in [1, {geometry.topk}], got {topk!r}"
+            )
+        if layout.key_ratio != geometry.key_ratio:
+            raise ValueError(
+                f"layer {self.name}: the layout has key ratio {layout.key_ratio}, the indexer "
+                f"{geometry.key_ratio}"
             )
         key_rows = max(
             (segment.key_start + segment.key_count for segment in layout.segments), default=0
@@ -804,7 +813,7 @@ def configure_indexer_topk(
         config: The selection configuration (or its dict form). None or backend ``default``
             unbinds every module: the modules then run their upstream selectors.
         native_format: The operand format of the model's indexers: ``fp8`` (E4M3 rows with
-            float32 scales).
+            float32 scales) or ``mxfp4`` (E2M1 values with packed UE8M0 group scales).
         tuning: Expert overrides of the selection plan (harnesses and tests only).
 
     Returns:

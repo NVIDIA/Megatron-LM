@@ -18,7 +18,8 @@ bound, how many heads each selector of the layer scores with:
   and votes seeds with see the same bytes as the plugin's rows; with precision ``fast`` and a
   head count DeepGEMM supports, it keeps the layer's own head count.
 
-Zero heads are appended after quantization: FP8 query codes 0 with folded weights 0. A zero
+Zero heads are appended after quantization: FP8 query codes 0 with folded weights 0; MXFP4 query
+codes 0 with group scales 127 (the UE8M0 code of 1.0; 255 encodes NaN) and weights 0. A zero
 head adds ``relu(+-0) * 0``, a zero, to every score. The score kernels reduce the heads in four
 float32 FMA chains (heads ``j`` with ``j % 4`` equal, accumulated in head order, rounded to
 nearest, starting at +0), so the appended heads end every chain, and ``x + (+-0) == x`` bit for
@@ -62,12 +63,12 @@ class IndexerHeads:
             the route the layer is padded to; None without a plugin route.
         reference_heads: Heads the reference score kernel runs with while LiteTopK selects rows
             of the layer: the plugin's kernel heads when LiteTopK pads (except with precision
-            ``fast`` when DeepGEMM supports ``num_heads``), else ``baseline_heads``. None in a
-            record built without negotiation.
+            ``fast`` when DeepGEMM supports ``num_heads``), else ``baseline_heads``. None when
+            the module's upstream selector selects the rows LiteTopK does not cover.
         baseline_heads: Heads the reference score kernel needs for the layer on its own:
             ``num_heads`` when DeepGEMM supports it, else its next supported head count. The
             reference backend scores with this count, and so does a binding whose plan gives
-            LiteTopK no row. None in a record built without negotiation.
+            LiteTopK no row. None with the upstream selector.
     """
 
     num_heads: int
@@ -163,7 +164,7 @@ def negotiate_indexer_heads(
     head_padding: bool,
     route: RouteCapability | None,
     source_id: str | None,
-    reference_heads: ReferenceHeads,
+    reference_heads: ReferenceHeads | None,
 ) -> IndexerHeads:
     """Decide the head counts the selectors of one layer score with (see the module docstring).
 
@@ -178,7 +179,8 @@ def negotiate_indexer_heads(
         route: The plugin route that serves the layer, or None without LiteTopK.
         source_id: The plugin's source id, for error messages; None without LiteTopK.
         reference_heads: The head counts of the reference score kernel (see
-            :data:`ReferenceHeads`).
+            :data:`ReferenceHeads`), or None when the module's upstream selector selects the rows
+            LiteTopK does not cover.
 
     Returns:
         The negotiated head counts.
@@ -198,6 +200,8 @@ def negotiate_indexer_heads(
         return probed[heads]
 
     def reference_serves(heads: int) -> bool:
+        if reference_heads is None:
+            return True  # the upstream selector selects any head count
         try:
             reference(heads)
         except IndexerTopKConfigError:
@@ -214,6 +218,8 @@ def negotiate_indexer_heads(
             head_padding=head_padding,
             reference_serves=reference_serves,
         )
+    if reference_heads is None:
+        return IndexerHeads(geometry.num_heads, litetopk_heads=litetopk)
     baseline = reference(geometry.num_heads)
     selected = baseline
     if litetopk is not None and not (precision == "fast" and baseline == geometry.num_heads):

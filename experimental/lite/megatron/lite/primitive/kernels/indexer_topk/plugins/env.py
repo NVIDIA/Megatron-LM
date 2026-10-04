@@ -64,6 +64,7 @@ _SETTING_KEYS = {
     "fp8_paged_admit_max_query_len": "SGLANG_LITETOPK_FP8_PAGED_ADMIT_MAX_Q",
     "tiered_seed_12k": "SGLANG_LITETOPK_TIERED_SEED_12K",
     "coldstart_identity": "SGLANG_LITETOPK_COLDSTART_IDENTITY",
+    "merge_cap": "SGLANG_LITETOPK_MERGE_CAP",
     "raw32_staging": "SGLANG_LITETOPK_RAW32_STAGING",
 }
 # Settings that are launch-time keys of some plugins only: a load that renders one of them needs
@@ -85,8 +86,8 @@ DIAGNOSTIC_ENV_KEYS = frozenset(
 )
 
 # The keys the CUDA extensions of the known plugin sources (996e735c52df, e4a1280b4416,
-# 83669db87b20, 7e5eb835fb7f) read with getenv on each launch: the complete `grep getenv`
-# of their three CUDA files. Only the check for stray keys before a plugin is imported uses this
+# ac1c7f51b362, 83669db87b20) read with getenv on each launch: the complete `grep getenv` of
+# their three CUDA files. Only the check for stray keys before a plugin is imported uses this
 # list (it names the one key without the SGLANG_LITETOPK prefix). Loading never relies on it:
 # every key a plugin lists in plugin_info()["launch_time_env_keys"] is checked, recorded and
 # rechecked before each selection, including keys this list does not know.

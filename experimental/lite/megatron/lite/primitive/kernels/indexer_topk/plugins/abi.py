@@ -38,7 +38,7 @@ PLUGIN_ABI_VERSION = 1
 LITETOPK_KERNEL_FILES = ("dsa_litetopk.cu", "sm100_dsa_litetopk.cuh", "dense_topk_litetopk.cuh")
 
 _SOURCE_ID = re.compile(r"[0-9a-f]{12}")
-_ROUTE_FORMATS = {"fp8_paged": "fp8"}
+_ROUTE_FORMATS = {"fp8_paged": "fp8", "fp4_slab": "mxfp4"}
 _ROUTE_KEYS = frozenset(
     (
         "name",
@@ -112,8 +112,9 @@ class RouteCapability:
     """One selection route of a LiteTopK plugin, as its ``plugin_info()`` declares it.
 
     Attributes:
-        name: ``fp8_paged`` (FP8 operands, paged candidate pool).
-        fmt: The operand format of the route: ``fp8``.
+        name: ``fp8_paged`` (FP8 operands, paged candidate pool) or ``fp4_slab`` (indexer MXFP4
+            operands, contiguous candidate slab).
+        fmt: The operand format of the route: ``fp8`` or ``mxfp4``.
         heads: The indexer head counts the route's kernels are built for (other head counts
             can be zero-padded to one of them, see :meth:`padded_heads`).
         head_dims: The supported indexer head dimensions.
@@ -132,8 +133,8 @@ class RouteCapability:
         score_policies: The score policies the route supports.
     """
 
-    name: Literal["fp8_paged"]
-    fmt: Literal["fp8"]
+    name: Literal["fp8_paged", "fp4_slab"]
+    fmt: Literal["fp8", "mxfp4"]
     heads: frozenset[int]
     head_dims: frozenset[int]
     topk: frozenset[int] | None
@@ -260,10 +261,7 @@ class LiteTopKModuleV1(Protocol):
         ...
 
     def production_min_s(self, use_fp4: bool) -> int:
-        """Return the qualified minimum key count of the plugin's FP8 routes (``use_fp4=False``).
-
-        Megatron Lite reads ``min_keys`` from ``plugin_info()``.
-        """
+        """Return the qualified minimum key count of the FP8 or MXFP4 routes."""
         ...
 
     def carry_vote_rows(self) -> int:

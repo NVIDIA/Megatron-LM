@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 IndexerTopKBackend = Literal["default", "reference", "litetopk"]
-IndexerTopKFormat = Literal["fp8"]
+IndexerTopKFormat = Literal["fp8", "mxfp4"]
 IndexerTopKPrecision = Literal["exact", "fast"]
 
 # The modules of the external exact-tie top-k package (a modified cuDNN CuTe DSL radix top-k).
@@ -61,14 +61,14 @@ _TIE_POLICIES = ("storage", "logical-id", "logical-id-desc")
 _SCORE_POLICIES = ("folded", "native-fp32")
 _ROW_TILES = (1, 2, 4, 8)
 _BACKENDS = ("default", "reference", "litetopk")
-_FORMATS = ("fp8",)
+_FORMATS = ("fp8", "mxfp4")
 _PRECISIONS = ("exact", "fast")
 _SEED_BOOTSTRAPS = ("reference", "identity")
 _INDEX_ORDERS = ("ascending", "selector")
 _STATUS_CHECKS = ("sync_recompute", "sync_recompute_tail", "device_assert")
 
 # Byte budget of the float32 scores of one reference scoring call, per operand format.
-REFERENCE_BUDGET_BYTES = {"fp8": 2 << 30}
+REFERENCE_BUDGET_BYTES = {"fp8": 2 << 30, "mxfp4": 1 << 30}
 # Rows per top-k kernel call. The cuDNN frontend radix top-k (and the exact-tie package derived
 # from it) is verified only up to this row count per call; a fused call with more rows silently
 # corrupts the rows past it once the process has made any earlier call.
@@ -103,6 +103,26 @@ _FP8_POOL_PAGES_PER_ROW = 13
 # without it the tiles of the synthetic inputs collect 3-4x the candidates, and a call on the
 # strict-gap inputs was 1.5x (256K) and 2.8x (512K) slower than the reference selector alone.
 _FP8_TIERED_SEED = True
+
+# MXFP4 LiteTopK tiles start at the causal position whose row sees this many (compressed) keys.
+# Cold per-call timing of DeepSeek-V4 indexer inputs on B200 (in-model layers 2 and 22 and
+# synthetic inputs at 256K tokens, synthetic inputs at 512K): a slab tile, with its plan and query
+# operands, costs as much as the reference selector on the same rows at 37K-53K visible keys,
+# more below and less above. Of the start positions measured, 45056 keys gave the fastest calls:
+# the reference selector alone took 1.009-1.024x their time at 256K (0.968-0.991x when the tiles
+# start at the HOT prefix, 12288 keys, as in the previous integration) and 1.08-1.10x at 512K.
+_MXFP4_STARTUP_KEYS = 45056
+
+# The candidate slab of the MXFP4 slab route holds, per query row of a tile, one record of
+# SLAB_RECORD_BYTES bytes (a 16-bit score code and a 32-bit key id) per candidate; the plugin
+# accepts slabs of at least SLAB_MIN_CANDIDATES and SLAB_CANDIDATES_PER_TOPK * topk candidates.
+SLAB_RECORD_BYTES = 6
+SLAB_MIN_CANDIDATES = 16384
+SLAB_CANDIDATES_PER_TOPK = 32
+# Byte budget of the slab of one MXFP4 tile: 65536 candidates per row for 4096-row tiles, about
+# the 60000-candidate slab (1.37 GiB) the previous integration ran DeepSeek-V4 with. Rows with
+# more candidates report a capacity status and are recomputed by the reference selector.
+CANDIDATE_BUDGET_BYTES = 3 << 29
 
 
 class IndexerTopKConfigError(ValueError):
@@ -385,6 +405,7 @@ class LiteTopKPluginSettings:
             tile lengths.
         tiered_seed_12k: Use the tiered HOT seed calibration.
         coldstart_identity: Start a sequence without a carried seed from the identity HOT seed.
+        merge_cap: Candidate capacity of the legacy contiguous slab route.
         raw32_staging: Staging layout of the scan of a raw-FP32-key plugin, a launch-time
             setting (for example ``u40x18k3``, that plugin's compiled default, or ``u40x14``;
             the plugin validates the name). Only a plugin that lists the key among its
@@ -398,6 +419,7 @@ class LiteTopKPluginSettings:
     fp8_paged_admit_max_query_len: int | None = None
     tiered_seed_12k: bool | None = None
     coldstart_identity: bool | None = None
+    merge_cap: int | None = None
     raw32_staging: str | None = None
 
     def __post_init__(self) -> None:
@@ -410,6 +432,7 @@ class LiteTopKPluginSettings:
         _check_int(owner, "fp8_paged_admit_max_query_len", self.fp8_paged_admit_max_query_len, 0)
         _check_bool(owner, "tiered_seed_12k", self.tiered_seed_12k)
         _check_bool(owner, "coldstart_identity", self.coldstart_identity)
+        _check_int(owner, "merge_cap", self.merge_cap, 1)
         if self.raw32_staging is not None and (
             not isinstance(self.raw32_staging, str) or _LAYOUT.fullmatch(self.raw32_staging) is None
         ):
@@ -435,6 +458,8 @@ class IndexerTopKTuning:
     group_tiles: int | None = None
     seed_bootstrap: Literal["reference", "identity"] | None = None
     min_litetopk_pairs: int | None = None
+    candidate_capacity: int | None = None
+    candidate_budget_bytes: int | None = None
     reference_budget_bytes: int | None = None
     reference_rows_per_call: int | None = None
     index_order: Literal["ascending", "selector"] | None = None
@@ -456,6 +481,8 @@ def _check_tuning_fields(tuning: object, owner: str) -> None:
     _check_int(owner, "group_tiles", tuning.group_tiles, 1)
     _check_choice(owner, "seed_bootstrap", tuning.seed_bootstrap, _SEED_BOOTSTRAPS)
     _check_int(owner, "min_litetopk_pairs", tuning.min_litetopk_pairs, 0)
+    _check_int(owner, "candidate_capacity", tuning.candidate_capacity, 1)
+    _check_int(owner, "candidate_budget_bytes", tuning.candidate_budget_bytes, 1)
     _check_int(owner, "reference_budget_bytes", tuning.reference_budget_bytes, 1)
     _check_int(owner, "reference_rows_per_call", tuning.reference_rows_per_call, 1)
     _check_choice(owner, "index_order", tuning.index_order, _INDEX_ORDERS)
@@ -477,31 +504,46 @@ class ResolvedIndexerTopKTuning:
         required: Raise an ``IndexerTopKRuntimeError`` instead of falling back to the reference
             selector when rows planned for LiteTopK are declined or fail (for benchmarks).
             Default False.
-        tile_rows: Query rows of a LiteTopK tile, a multiple of 4. Default: three waves of the
-            score kernel for the heads the LiteTopK kernels run with
+        tile_rows: Query rows of a LiteTopK tile, a multiple of 4. Default: FP8 three waves of
+            the score kernel for the heads the LiteTopK kernels run with
             (``3 * num_sms * (128 // kernel_heads)``) and at least 12 rows per SM, rounded down
-            to a multiple of 4: 1776 rows for 32 and for 64 heads on 148 SMs.
+            to a multiple of 4: 1776 rows for 32 and for 64 heads on 148 SMs; MXFP4 4096.
         startup_position: First causal position a LiteTopK tile may start at (a tile also
             needs rows that see the route's HOT prefix), or None when the plan gives LiteTopK
-            no row. Default: 8192 before the route's qualified minimum key count (188416 for a
-            196608-key minimum), the start measured with 32 kernel heads, and None with 64
+            no row. Default: FP8 8192 before the route's qualified minimum key count (188416 for
+            a 196608-key minimum), the start measured with 32 kernel heads, and None with 64
             kernel heads, where no start made LiteTopK faster than the reference backend at
-            every measured length (512K, 768K and 1M keys). None as well when LiteTopK runs
+            every measured length (512K, 768K and 1M keys); MXFP4 the position whose row sees
+            45056 keys (180224 with four query tokens per key), where a slab tile starts to be
+            faster than the reference selector on the same rows. None as well when LiteTopK runs
             zero-padded heads and the reference selector would score the layer with fewer
             heads on its own: no crossover was measured for that case. 0 lets only the HOT
-            prefix limit it.
-        group_tiles: Consecutive tiles of equal length that share one plan. Default 8.
+            prefix limit it, the previous integration's MXFP4 plan.
+        group_tiles: Consecutive tiles of equal length that share one plan. Default: FP8 8,
+            MXFP4 1.
         seed_bootstrap: How the first tile group of a segment gets its HOT seed: ``reference``
             votes with the reference selections of the rows that precede it (or of the
             segment's first tile, then computed by the reference selector, when too few rows
-            precede it); ``identity`` starts from the plugin's cold-start seed. Default
-            ``reference``.
+            precede it); ``identity`` starts from the plugin's cold-start seed. Default: FP8
+            ``reference``, MXFP4 ``identity``.
         min_litetopk_pairs: The per-segment crossover: a segment uses LiteTopK only when its
             LiteTopK tiles cover at least this many query-key pairs (the visible keys summed
             over their rows, not counting a reference bootstrap tile). Default 0 (every eligible
             segment).
+        candidate_capacity: Candidates per query row of the slab of an MXFP4 slab tile, as an
+            explicit bound: the slab of a segment's tiles holds as many candidates as the
+            segment's last tile sees keys (a tile row has at most one candidate per visible
+            key), at least ``max(16384, 32 * topk)``, and at most this value. None bounds it by
+            ``candidate_budget_bytes`` instead.
+        candidate_budget_bytes: Byte budget of the candidate slab of one MXFP4 slab tile
+            (``tile_rows * candidates * 6`` bytes) when ``candidate_capacity`` is None. Default
+            1.5 GiB: 65536 candidates per row for 4096-row tiles. A row with more candidates
+            than its slab holds reports a capacity status and is recomputed by the reference
+            selector. Must hold at least ``max(16384, 32 * topk)`` candidates per row; None for
+            FP8 (the paged route's pool is the ``paged_pool_pages_per_row`` plugin setting).
         reference_budget_bytes: Byte budget of the float32 scores of one reference scoring
-            call; the top-k kernel needs scratch of about twice that on top. Default 2 GiB.
+            call; the top-k kernel needs scratch of about twice that on top. Default: FP8
+            2 GiB, MXFP4 1 GiB.
         reference_rows_per_call: Rows per reference scoring call, bounded by the budget; None
             plans whole SM waves of the score kernel within the budget.
         index_order: ``ascending`` sorts every output row (ids ascending, -1 last);
@@ -512,13 +554,20 @@ class ResolvedIndexerTopKTuning:
             also recomputes every LiteTopK row after a failed tile in its segment;
             ``device_assert`` asserts on the device that every status is 0 and reads nothing.
             Default ``sync_recompute``.
-        plugin_settings: Import-time settings of the LiteTopK plugin. Default: the tiered 12K
-            HOT seed, 13 pool pages per row, 2 row tiles, the identity cold-start seed,
+        plugin_settings: Import-time settings of the LiteTopK plugin. Default FP8: the tiered
+            12K HOT seed, 13 pool pages per row, 2 row tiles, the identity cold-start seed,
             paged tiles of up to ``tile_rows`` rows admitted (the default tiles of the layer's
             own head count: the settings are rendered before the plugin, and with it the
             route's head counts, is loaded, and the tiles of zero-padded heads are shorter)
             and, for precision ``exact``, the policies exact selection needs (``logical-id``
             ties on ``native-fp32`` scores).
+            Default MXFP4: the environment the previous integration ran its slab route with
+            (32 pool pages per row, 2 row tiles, the identity cold-start seed, no admission
+            beyond the qualified tile lengths). Plugin settings are process-wide (the plugins
+            read them from the environment), and the two defaults differ in
+            ``fp8_paged_admit_max_query_len`` (and in the pool and seed settings), so an FP8
+            model (GLM-5) and an MXFP4 model (DeepSeek-V4) with default settings cannot load
+            their plugins in one process: run them in separate jobs.
     """
 
     required: bool
@@ -527,6 +576,8 @@ class ResolvedIndexerTopKTuning:
     group_tiles: int
     seed_bootstrap: Literal["reference", "identity"]
     min_litetopk_pairs: int
+    candidate_capacity: int | None
+    candidate_budget_bytes: int | None
     reference_budget_bytes: int
     reference_rows_per_call: int | None
     index_order: Literal["ascending", "selector"]
@@ -535,7 +586,12 @@ class ResolvedIndexerTopKTuning:
 
     def __post_init__(self) -> None:
         owner = "ResolvedIndexerTopKTuning"
-        optional = ("startup_position", "reference_rows_per_call")
+        optional = (
+            "startup_position",
+            "candidate_capacity",
+            "candidate_budget_bytes",
+            "reference_rows_per_call",
+        )
         unset = [
             field.name
             for field in dataclasses.fields(self)
@@ -567,7 +623,7 @@ def resolve_indexer_topk_tuning(
 
     Args:
         tuning: Expert overrides, or None for the derived values.
-        fmt: Operand format of the layer: ``fp8``.
+        fmt: Operand format of the layer: ``fp8`` or ``mxfp4``.
         route: The plugin route that serves the layer, or None when only the reference
             selector runs (its route-dependent values are then unused).
         geometry: The indexer geometry of the layer.
@@ -609,22 +665,34 @@ def resolve_indexer_topk_tuning(
     kernel_heads = geometry.num_heads
     if heads is not None and heads.litetopk_heads is not None:
         kernel_heads = heads.litetopk_heads
-    startup, why = _default_startup(route, heads, kernel_heads)
+    startup, why = _default_startup(fmt, route, geometry, heads, kernel_heads)
 
-    tile_rows = _override(tuning.tile_rows, _fp8_tile_rows(num_sms, kernel_heads))
-    exact = precision == "exact"
-    settings = LiteTopKPluginSettings(
-        tie_policy="logical-id" if exact else None,
-        score_policy="native-fp32" if exact else None,
-        paged_pool_pages_per_row=_FP8_POOL_PAGES_PER_ROW,
-        fp8_row_tiles=2,
-        fp8_paged_admit_max_query_len=_override(
-            tuning.tile_rows, _fp8_tile_rows(num_sms, geometry.num_heads)
-        ),
-        tiered_seed_12k=_FP8_TIERED_SEED,
-        coldstart_identity=True,
-    )
-    group_tiles, seed_bootstrap = 8, "reference"
+    if fmt == "fp8":
+        tile_rows = _override(tuning.tile_rows, _fp8_tile_rows(num_sms, kernel_heads))
+        exact = precision == "exact"
+        settings = LiteTopKPluginSettings(
+            tie_policy="logical-id" if exact else None,
+            score_policy="native-fp32" if exact else None,
+            paged_pool_pages_per_row=_FP8_POOL_PAGES_PER_ROW,
+            fp8_row_tiles=2,
+            fp8_paged_admit_max_query_len=_override(
+                tuning.tile_rows, _fp8_tile_rows(num_sms, geometry.num_heads)
+            ),
+            tiered_seed_12k=_FP8_TIERED_SEED,
+            coldstart_identity=True,
+        )
+        group_tiles, seed_bootstrap = 8, "reference"
+        candidate_budget = tuning.candidate_budget_bytes
+    else:
+        tile_rows = _override(tuning.tile_rows, 4096)
+        settings = LiteTopKPluginSettings(
+            paged_pool_pages_per_row=32,
+            fp8_row_tiles=2,
+            fp8_paged_admit_max_query_len=0,
+            coldstart_identity=True,
+        )
+        group_tiles, seed_bootstrap = 1, "identity"
+        candidate_budget = _override(tuning.candidate_budget_bytes, CANDIDATE_BUDGET_BYTES)
     if tuning.plugin_settings is not None:
         settings = dataclasses.replace(
             settings,
@@ -641,6 +709,8 @@ def resolve_indexer_topk_tuning(
         group_tiles=_override(tuning.group_tiles, group_tiles),
         seed_bootstrap=_override(tuning.seed_bootstrap, seed_bootstrap),
         min_litetopk_pairs=_override(tuning.min_litetopk_pairs, 0),
+        candidate_capacity=tuning.candidate_capacity,
+        candidate_budget_bytes=candidate_budget,
         reference_budget_bytes=_override(
             tuning.reference_budget_bytes, REFERENCE_BUDGET_BYTES[fmt]
         ),
@@ -649,8 +719,10 @@ def resolve_indexer_topk_tuning(
         status_check=_override(tuning.status_check, "sync_recompute"),
         plugin_settings=settings,
     )
-    if precision == "exact" and (
-        (settings.tie_policy, settings.score_policy) != ("logical-id", "native-fp32")
+    if (
+        precision == "exact"
+        and fmt == "fp8"
+        and (settings.tie_policy, settings.score_policy) != ("logical-id", "native-fp32")
     ):
         raise IndexerTopKConfigError(
             "precision='exact' needs plugin_settings tie_policy='logical-id' and "
@@ -658,6 +730,19 @@ def resolve_indexer_topk_tuning(
             f"float32 scores, equal scores by ascending key id); got {settings.tie_policy!r} "
             f"and {settings.score_policy!r}"
         )
+    if resolved.candidate_capacity is not None and resolved.candidate_capacity < geometry.topk:
+        raise IndexerTopKConfigError(
+            f"tuning.candidate_capacity={resolved.candidate_capacity} is below top-k "
+            f"{geometry.topk}"
+        )
+    if fmt == "mxfp4" and resolved.candidate_capacity is None:
+        smallest = max(SLAB_MIN_CANDIDATES, SLAB_CANDIDATES_PER_TOPK * geometry.topk)
+        if candidate_budget // (tile_rows * SLAB_RECORD_BYTES) < smallest:
+            raise IndexerTopKConfigError(
+                f"tuning.candidate_budget_bytes={candidate_budget} cannot hold the smallest slab "
+                f"of a {tile_rows}-row tile ({smallest} candidates of {SLAB_RECORD_BYTES} bytes "
+                "per row)"
+            )
     if resolved.required and route is not None and resolved.startup_position is None:
         raise IndexerTopKConfigError(
             f"IndexerTopKTuning.required needs LiteTopK rows, but the default plan gives "
@@ -673,10 +758,16 @@ def _fp8_tile_rows(num_sms: int, heads: int) -> int:
 
 
 def _default_startup(
-    route: RouteCapability | None, heads: IndexerHeads | None, kernel_heads: int
+    fmt: IndexerTopKFormat,
+    route: RouteCapability | None,
+    geometry: IndexerGeometry,
+    heads: IndexerHeads | None,
+    kernel_heads: int,
 ) -> tuple[int | None, str]:
     """The default first position of LiteTopK tiles, and why it is None when it is."""
-    if route is None:
+    if fmt == "mxfp4":
+        startup = _MXFP4_STARTUP_KEYS * geometry.key_ratio
+    elif route is None:
         return 0, ""
     elif kernel_heads in _FP8_MEASURED_STARTUP:
         startup = _FP8_MEASURED_STARTUP[kernel_heads]

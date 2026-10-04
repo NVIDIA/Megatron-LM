@@ -72,7 +72,8 @@ _READS = (
 _KERNEL_FILES = ("dsa_litetopk.cu", "sm100_dsa_litetopk.cuh", "dense_topk_litetopk.cuh")
 
 HEADS, HEAD_DIM, TOPK, VOTE_ROWS, HOT_PREFIX = 8, 128, 8, 12, 24
-FP8_GEOMETRY = IndexerGeometry(num_heads=HEADS, head_dim=HEAD_DIM, topk=TOPK)
+FP8_GEOMETRY = IndexerGeometry(num_heads=HEADS, head_dim=HEAD_DIM, topk=TOPK, key_ratio=1)
+FP4_GEOMETRY = IndexerGeometry(num_heads=HEADS, head_dim=HEAD_DIM, topk=TOPK, key_ratio=4)
 _FP8_ROUTE = {
     "name": "fp8_paged",
     "fmt": "fp8",
@@ -89,8 +90,21 @@ _FP8_ROUTE = {
     "tie_policies": ["logical-id", "logical-id-desc", "storage"],
     "score_policies": ["folded", "native-fp32"],
 }
+_FP4_ROUTE = {
+    **_FP8_ROUTE,
+    "name": "fp4_slab",
+    "fmt": "mxfp4",
+    "topk": None,
+    "qualified_query_lengths": [12, 16],
+    "min_keys": 64,
+    "tie_policies": ["storage"],
+    "score_policies": ["folded"],
+}
 # A scaled-down wave: a reference prefix up to position 160, 16-row tiles in groups of three.
 FP8_TUNING = IndexerTopKTuning(tile_rows=16, startup_position=160, group_tiles=3)
+# MXFP4 tiles from the first row that sees the HOT prefix (the scaled-down sequences are far
+# below the default start position).
+FP4_TUNING = IndexerTopKTuning(tile_rows=16, startup_position=0)
 
 # The adapter only forwards every ABI call to the FakeLiteTopK the test installs.
 _FAKE_ADAPTER = '''
@@ -185,14 +199,30 @@ def release(device, *, release_scratch=True):
     return BEHAVIOR.release(device, release_scratch=release_scratch)
 '''
 
+_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
+
+
+def _dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    codes = packed.view(torch.uint8).to(torch.int64)
+    code = torch.stack((codes & 0xF, codes >> 4), dim=-1).reshape(*packed.shape[:-1], -1)
+    value = torch.where((code & 8) != 0, -_E2M1[code & 7], _E2M1[code & 7])
+    exponents = torch.stack([(scales >> shift) & 0xFF for shift in (0, 8, 16, 24)], dim=-1)
+    group_scale = torch.pow(2.0, exponents.to(torch.float64) - 127.0)
+    return (value.reshape(*value.shape[:-1], 4, 32) * group_scale[..., None]).flatten(-2)
+
 
 def _row_scores(q_data, q_sf, weights, k_data, k_scale, row, start, end) -> torch.Tensor:
     """float32 scores of one quantized query row against the keys [start, end)."""
-    assert q_sf is None  # FP8: the query scales are folded into the weights
-    queries, keys = q_data[row].double(), k_data[start:end].double()
-    key_scale = k_scale[start:end].double()
+    if q_sf is None:  # FP8: the query scales are folded into the weights
+        queries, keys = q_data[row].double(), k_data[start:end].double()
+        key_scale = k_scale[start:end].double()
+    else:
+        queries = _dequantize_mxfp4(q_data[row], q_sf[row])
+        keys = _dequantize_mxfp4(k_data[start:end], k_scale[start:end])
+        key_scale = None
     scores = (torch.relu(queries @ keys.T) * weights[row].double()[:, None]).sum(0)
-    scores = scores * key_scale
+    if key_scale is not None:
+        scores = scores * key_scale
     return scores.float()
 
 
@@ -436,7 +466,7 @@ def _make_plugin(
         (kernels / name).write_text(f"// {name} of fake source {root.name}\n", encoding="utf-8")
     (root / "litetopk.py").write_text(_FAKE_ADAPTER, encoding="utf-8")
     if routes is None:
-        routes = [{**_FP8_ROUTE, "exact": exact}]
+        routes = [{**_FP8_ROUTE, "exact": exact}, _FP4_ROUTE]
     config = {
         "reads": list(reads),
         "routes": routes,
@@ -478,7 +508,7 @@ def _bind(
     geometry=None,
 ):
     """Configure one consumer and return (binding, fake plugin behind it or None)."""
-    geometry = geometry or FP8_GEOMETRY
+    geometry = geometry or (FP8_GEOMETRY if fmt == "fp8" else FP4_GEOMETRY)
     fields = {"backend": backend, "precision": precision}
     if backend == "litetopk":
         root = tmp_path / name
@@ -488,7 +518,7 @@ def _bind(
     if precision == "exact":
         fields["exact_topk"] = ExactTopKConfig(source=str(tmp_path))
     if tuning is None and backend == "litetopk":
-        tuning = FP8_TUNING
+        tuning = FP8_TUNING if fmt == "fp8" else FP4_TUNING
     consumer = Consumer(geometry)
     installation = binding_module.configure_indexer_topk(
         [consumer], IndexerTopKConfig(**fields), native_format=fmt, tuning=tuning
@@ -619,32 +649,111 @@ def test_fp8_bootstrap_tile_and_context_parallel_shard(tmp_path, score_kernel):
     assert (binding.stats.bootstrap_rows, binding.stats.reference_rows) == (16, 16)
 
 
-def test_fp8_identity_seed_sequence(tmp_path, score_kernel):
-    # seed_bootstrap="identity": the first tile group starts from the plugin's cold-start seed,
-    # so no reference rows vote a seed; later groups use the carry of the group before them.
-    identity = dataclasses.replace(FP8_TUNING, seed_bootstrap="identity")
-    binding, fake, (q, k, weights, layout) = _wave(tmp_path, tuning=identity)
-    out = _select(binding, q, k, weights, layout)
-    assert torch.equal(out, _expected(q, k, weights, layout, TOPK, 0.5, "fp8"))
+def test_fp4_identity_seed_sequence(tmp_path, score_kernel):
+    binding, fake = _bind(tmp_path, "mxfp4")
+    # 396 tokens over 96 compressed keys: the rows of the last tile see every key (the cap).
+    rows, keys = 396, 96
+    q, k, weights = _inputs(rows, keys, seed=2)
+    layout = QueryLayout.full(rows, keys=keys, key_ratio=4)
+    out = _select(binding, q, k, weights, layout, scale=HEAD_DIM**-0.5)
+    assert torch.equal(out, _expected(q, k, weights, layout, TOPK, HEAD_DIM**-0.5, "mxfp4"))
 
     key = ("rolling", 0)
-    assert fake.events == [
-        ("begin_call", key, 250),
-        ("plan", key, 250, 16, 163, None),  # no carry: the plugin's identity seed
-        ("tile", key, 163, 16, False, None, False, 178),
-        ("tile", key, 179, 16, False, None, False, 194),
-        ("tile", key, 195, 16, True, None, False, 210),
-        ("plan", key, 250, 16, 211, "tile"),
-        ("tile", key, 211, 16, False, None, False, 226),
-        ("tile", key, 227, 16, True, None, False, 242),
-        ("plan", key, 250, 8, 243, "tile"),
-        ("tile", key, 243, 8, False, None, False, 250),
-        ("drop", key),
-    ]
-    assert "stash" not in fake.names() and score_kernel.rows == 162
-    stats = binding.stats
-    assert (stats.tiles, stats.plans, stats.carry_stashes, stats.bootstrap_rows) == (6, 3, 0, 0)
-    assert dict(stats.tile_rows) == {16: 5, 8: 1}
+    tiles = [(start, start + 16) for start in range(96, 384, 16)] + [(384, 396)]
+    expected = [("begin_call", key, keys)]
+    for index, (start, end) in enumerate(tiles):
+        # One plan per tile; the first starts from the identity seed (no carry), and every
+        # tile but the last publishes the seed of the next. The slab holds at least 16384
+        # candidates.
+        seed = None if index == 0 else "tile"
+        publish = index + 1 < len(tiles)
+        first_end, last_end = (start + 1) // 4, min(keys, end // 4)
+        expected.append(("plan", key, keys, end - start, first_end, seed))
+        expected.append(("tile", key, first_end, end - start, publish, 16384, False, last_end))
+    expected.append(("drop", key))
+    assert fake.events == expected
+    assert "stash" not in fake.names() and score_kernel.rows == 96
+    # MXFP4 tiles carry their group scales; the weights hold only the softmax scale.
+    data, scales, folded = fake.operands[0]
+    expected_operands = quantize_queries(
+        q[96:112], weights[96:112], "mxfp4", softmax_scale=HEAD_DIM**-0.5, kernel_heads=HEADS
+    )
+    assert torch.equal(data, expected_operands[0]) and torch.equal(scales, expected_operands[1])
+    assert torch.equal(folded, expected_operands[2])
+    assert dict(binding.stats.tile_rows) == {16: 18, 12: 1}
+
+
+def test_slab_capacity_rule(tmp_path, score_kernel):
+    rows, keys = 396, 99
+    q, k, weights = _inputs(rows, keys, seed=2)
+    layout = QueryLayout.full(rows, keys=keys, key_ratio=4)
+    caps = {}
+    for label, tuning in {
+        "clamped": dataclasses.replace(FP4_TUNING, candidate_capacity=60),
+        "limit": dataclasses.replace(
+            FP4_TUNING, plugin_settings=LiteTopKPluginSettings(merge_cap=70)
+        ),
+    }.items():
+        binding, fake = _bind(tmp_path, "mxfp4", tuning=tuning, name=label)
+        fake.events.clear()
+        _select(binding, q, k, weights, layout)
+        caps[label] = {event[5] for event in fake.events if event[0] == "tile"}
+        if label == "clamped":
+            # An explicit capacity bounds the slab of every tile.
+            assert caps[label] == {60} and binding.stats.tiles == 19
+        else:
+            # A slab limit below the smallest slab a tile is given: no tile runs.
+            assert caps[label] == set() and binding.stats.reference_rows == rows
+        _new_process()
+    engine = binding_module.LiteTopKEngine
+    plugin = type("Plugin", (), {})()
+    plugin.module = type("Module", (), {"carry_vote_rows": staticmethod(lambda: 12)})
+    for merge_cap, key_count, topk, limit in (
+        (None, 65536, 512, 196608),
+        (None, 262144, 512, 262144),
+        (None, 1 << 20, 512, 262144),
+        (300000, 1 << 20, 512, 300000),
+        (16383, 65536, 512, 0),
+        (40000, 65536, 2048, 0),
+    ):
+        plugin.settings = LiteTopKPluginSettings(merge_cap=merge_cap)
+        route = type("Route", (), {"name": "fp4_slab"})()
+        built = engine(plugin, route, None, exact=False, kernel_heads=64, layer_key=object())
+        assert built.max_tile_keys(key_count, topk) == limit
+        route.name = "fp8_paged"
+        assert built.max_tile_keys(key_count, topk) is None
+
+
+def test_slab_capacity_follows_visible_keys_and_budget(tmp_path, score_kernel):
+    # A context-parallel shard late in a long sequence: its rows see more keys than the smallest
+    # slab (16384), so a tile's slab holds as many candidates as the segment's last tile sees
+    # keys, bounded by the byte budget of a tile or by an explicit capacity.
+    routes = [dict(_FP8_ROUTE), {**_FP4_ROUTE, "max_keys": 1 << 20}]
+    keys, rows, position = 20000, 32, 67440
+    q, k, weights = _inputs(rows, keys, seed=6)
+    layout = QueryLayout.contiguous(rows, position=position, keys=keys, key_ratio=4)
+    (segment,) = layout.segments
+    visible = layout.visible_keys(segment, rows - 1)
+    assert visible == (position + rows) // 4 == 16868 > 16384
+    budget = 16 * 6 * 16500  # 16500 candidates of 6 bytes per row of a 16-row tile
+    cases = {
+        "visible": (FP4_TUNING, visible),
+        "budget": (dataclasses.replace(FP4_TUNING, candidate_budget_bytes=budget), 16500),
+        "smallest": (dataclasses.replace(FP4_TUNING, candidate_budget_bytes=16 * 6 * 16384), 16384),
+        "explicit": (dataclasses.replace(FP4_TUNING, candidate_capacity=16600), 16600),
+    }
+    for label, (tuning, capacity) in cases.items():
+        _make_plugin(tmp_path / label, routes=routes)
+        binding, fake = _bind(tmp_path, "mxfp4", tuning=tuning, name=label)
+        out = _select(binding, q, k, weights, layout, scale=HEAD_DIM**-0.5)
+        if label == "visible":
+            expected = _expected(q, k, weights, layout, TOPK, HEAD_DIM**-0.5, "mxfp4")
+            assert torch.equal(out, expected)
+        tiles = [event for event in fake.events if event[0] == "tile"]
+        assert len(tiles) == 2 and {event[5] for event in tiles} == {capacity}, label
+        # The slab of a 16-row tile, 6 bytes per candidate.
+        assert binding.stats.candidate_slab_bytes == 16 * capacity * 6
+        _new_process()
 
 
 def test_rolling_keys_dropped_in_finally(tmp_path, score_kernel):
@@ -950,7 +1059,7 @@ def test_plugin_specific_launch_time_keys(tmp_path, score_kernel, monkeypatch):
         # Once the plugin is loaded its keys are known plugin keys: another plugin load refuses
         # them as stray settings.
         with pytest.raises(Exception, match=f"the process sets {key}"):
-            _bind(tmp_path, "fp8", name=f"other-{key}")
+            _bind(tmp_path, "mxfp4", name=f"other-{key}")
         monkeypatch.delenv(key)
     _select(binding, q, k, weights, layout)
 
@@ -1014,7 +1123,9 @@ def test_uncovered_rows_minus_one(tmp_path, score_kernel):
 
     # Padding before and between segments as well.
     gaps = QueryLayout(
-        rows=300, segments=(QuerySegment(6, 40, 0, 0, 34, 0), QuerySegment(44, 294, 0, 34, 246, 34))
+        rows=300,
+        key_ratio=1,
+        segments=(QuerySegment(6, 40, 0, 0, 34, 0), QuerySegment(44, 294, 0, 34, 246, 34)),
     )
     binding.stats.reset()
     out = _select(binding, q, k, weights, gaps)
@@ -1038,7 +1149,7 @@ def test_reference_backend_needs_no_plugin(tmp_path, score_kernel):
     stats = binding.stats
     assert (stats.reference_rows, stats.litetopk_rows, stats.tiles) == (WAVE_ROWS, 0, 0)
     # The reference backend runs on any device the score kernel supports.
-    assert binding.resolved_tuning(torch.device("cpu")).required is False
+    assert binding.resolved_tuning(torch.device("cpu")).reference_budget_bytes > 0
 
     # A smaller top-k than the geometry's (a short sequence) is selected by the reference.
     short = QueryLayout.full(6, keys=6)
@@ -1068,6 +1179,7 @@ def test_stats(tmp_path, score_kernel):
     assert stats.litetopk_segments == 1 and stats.reference_segments == {
         "fewer keys than the route minimum": 2
     }
+    assert stats.candidate_slab_bytes == 0  # the paged route has no slab
 
 
 def test_no_collectives_runtime(tmp_path, score_kernel, monkeypatch):
@@ -1192,30 +1304,25 @@ def test_binding_deepcopy_shares_binding(tmp_path):
 
 
 def test_negotiation_errors(tmp_path, score_kernel, monkeypatch):
-    # A plugin that declares a route this version does not know fails to load.
-    unknown = _make_plugin(tmp_path / "unknown", routes=[{**_FP8_ROUTE, "name": "bf16_dense"}])
+    fp4_only = _make_plugin(tmp_path / "fp4-only", routes=[_FP4_ROUTE])
     config = IndexerTopKConfig(
-        backend="litetopk", precision="fast", litetopk=LiteTopKPluginConfig(source=str(unknown))
+        backend="litetopk", precision="fast", litetopk=LiteTopKPluginConfig(source=str(fp4_only))
     )
-    with pytest.raises(IndexerTopKPluginError, match=r"must be one of \['fp8_paged'\]"):
+    with pytest.raises(IndexerTopKConfigError, match="has no fp8_paged route"):
         binding_module.configure_indexer_topk([Consumer(FP8_GEOMETRY)], config, native_format="fp8")
     _new_process()  # the load above rendered FP8 settings for this source
-    plugin = _make_plugin(tmp_path / "eight-heads")
-    config = IndexerTopKConfig(
-        backend="litetopk", precision="fast", litetopk=LiteTopKPluginConfig(source=str(plugin))
-    )
-    wide = IndexerGeometry(num_heads=16, head_dim=HEAD_DIM, topk=TOPK)
-    consumers = [Consumer(FP8_GEOMETRY), Consumer(wide)]
+    wide = IndexerGeometry(num_heads=16, head_dim=HEAD_DIM, topk=TOPK, key_ratio=4)
+    consumers = [Consumer(FP4_GEOMETRY), Consumer(wide)]
     with pytest.raises(IndexerTopKConfigError, match=r"supports indexer heads \[8\].*H=16"):
         binding_module.configure_indexer_topk(
-            [nn.Sequential(*consumers)], config, native_format="fp8", tuning=FP8_TUNING
+            [nn.Sequential(*consumers)], config, native_format="mxfp4", tuning=FP4_TUNING
         )
     # Nothing is bound when any layer fails: not even the layers before it.
     assert [consumer.binding for consumer in consumers] == ["unset", "unset"]
 
     # A top-k the route does not select goes to the reference selector, unless required.
     _new_process()
-    small = IndexerGeometry(num_heads=HEADS, head_dim=HEAD_DIM, topk=4)
+    small = IndexerGeometry(num_heads=HEADS, head_dim=HEAD_DIM, topk=4, key_ratio=1)
     required = IndexerTopKTuning(tile_rows=16, startup_position=160, required=True)
     with pytest.raises(IndexerTopKConfigError, match="does not select top-k 4"):
         _bind(tmp_path, "fp8", geometry=small, tuning=required)
@@ -1231,6 +1338,8 @@ def test_negotiation_errors(tmp_path, score_kernel, monkeypatch):
     binding, fake = _bind(tmp_path, "fp8")
     with pytest.raises(ValueError, match="expected q"):
         _select(binding, q[:, :4], k, weights[:, :4], layout)
+    with pytest.raises(ValueError, match="key ratio"):
+        _select(binding, q, k, weights, QueryLayout.full(WAVE_ROWS, keys=WAVE_ROWS, key_ratio=4))
     with pytest.raises(ValueError, match="topk must be"):
         with torch.no_grad():
             binding.select(q, k, weights, layout=layout, topk=TOPK + 1, softmax_scale=0.5)
@@ -1263,7 +1372,7 @@ def test_head_count_probed_at_configure(tmp_path, score_kernel, monkeypatch):
         return heads
 
     monkeypatch.setattr(binding_module, "score_kernel_heads", probe)
-    odd = IndexerGeometry(num_heads=12, head_dim=HEAD_DIM, topk=TOPK)
+    odd = IndexerGeometry(num_heads=12, head_dim=HEAD_DIM, topk=TOPK, key_ratio=1)
     consumers = [Consumer(FP8_GEOMETRY), Consumer(odd)]
     reference = {"backend": "reference", "precision": "fast"}
     # A head count the reference score kernel does not support fails when the model is built,
@@ -1274,8 +1383,8 @@ def test_head_count_probed_at_configure(tmp_path, score_kernel, monkeypatch):
         )
     assert probes == [(8, "fp8", HEAD_DIM, "cpu"), (12, "fp8", HEAD_DIM, "cpu")]
     assert [consumer.binding for consumer in consumers] == ["unset", "unset"]
-    # The probe of a supported head count happens at configure, before any selection.
     probes.clear()
+    # The probe of a supported head count happens at configure, before any selection.
     binding, _ = _bind(tmp_path, "fp8")
     assert probes == [(8, "fp8", HEAD_DIM, "cpu")]
 

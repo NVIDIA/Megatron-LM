@@ -1,15 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU contracts of the indexer head-count negotiation and of zero-head padding.
 
-* The capability matrix: indexer heads 4 to 128 against a LiteTopK route with kernels for 32 and
+* The capability matrix: indexer heads 4 to 128 against LiteTopK routes with kernels for 32 and
   64 heads and a reference score kernel that accepts 16, 32 and 64 heads (DeepGEMM 0.1.3), for
-  both precisions, with and without ``head_padding``: the exact kernel heads of every selector
-  and the default plan, or the exact error text.
+  both operand formats, with and without ``head_padding``: the exact kernel heads of every
+  selector and the default plan, or the exact error text.
 * The float32 head reduction of the score kernels (four FMA chains), simulated with exact
   rational arithmetic and one round-to-nearest-even per operation: appending zero heads leaves
   every chain, the head sum and the score bit for bit unchanged.
 * A pure-Python ABI v1 plugin built in tmp_path and loaded through the real loader receives the
-  padded operands (zero query codes and weights) and selects with them;
+  padded operands (zero query codes and weights, MXFP4 group scales 127) and selects with them;
   the reference selector scores the same operands, and every selection equals the unpadded one.
 """
 
@@ -40,9 +40,7 @@ from megatron.lite.primitive.kernels.indexer_topk import (
     normalize_indexer_topk_config,
 )
 from megatron.lite.primitive.kernels.indexer_topk import reference as reference_module
-from megatron.lite.primitive.kernels.indexer_topk import (
-    sort_topk_rows_,
-)
+from megatron.lite.primitive.kernels.indexer_topk import sort_topk_rows_
 from megatron.lite.primitive.kernels.indexer_topk.heads import negotiate_indexer_heads
 from megatron.lite.primitive.kernels.indexer_topk.plugins import cache, env, loader
 from megatron.lite.primitive.kernels.indexer_topk.plugins.abi import RouteCapability
@@ -78,8 +76,8 @@ HEAD_DIM = 128
 DEEPGEMM_HEADS = frozenset({16, 32, 64})
 SMS = 4
 
-# A production-like route: kernels for 32 and 64 heads (the raw32h64 FP8 paged route, which
-# selects exactly).
+# Production-like routes: kernels for 32 and 64 heads (the raw32h64 FP8 paged route, which
+# selects exactly, and the slab route of the DeepSeek-V4 plugin).
 _FP8_ROUTE = {
     "name": "fp8_paged",
     "fmt": "fp8",
@@ -96,6 +94,18 @@ _FP8_ROUTE = {
     "tie_policies": ["logical-id", "logical-id-desc", "storage"],
     "score_policies": ["folded", "native-fp32"],
 }
+_FP4_ROUTE = {
+    **_FP8_ROUTE,
+    "name": "fp4_slab",
+    "fmt": "mxfp4",
+    "topk": None,
+    "qualified_query_lengths": [4032, 4096],
+    "min_keys": 65536,
+    "exact": False,
+    "tie_policies": ["storage"],
+    "score_policies": ["folded"],
+}
+
 _FAKE_ADAPTER = '''
 """A pure-Python ABI v1 LiteTopK adapter that forwards its calls to a test double."""
 import hashlib
@@ -184,14 +194,30 @@ def release(device, *, release_scratch=True):
     return None
 '''
 
+_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
+
+
+def _dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    codes = packed.view(torch.uint8).to(torch.int64)
+    code = torch.stack((codes & 0xF, codes >> 4), dim=-1).reshape(*packed.shape[:-1], -1)
+    value = torch.where((code & 8) != 0, -_E2M1[code & 7], _E2M1[code & 7])
+    exponents = torch.stack([(scales >> shift) & 0xFF for shift in (0, 8, 16, 24)], dim=-1)
+    group_scale = torch.pow(2.0, exponents.to(torch.float64) - 127.0)
+    return (value.reshape(*value.shape[:-1], 4, 32) * group_scale[..., None]).flatten(-2)
+
 
 def _row_scores(q_data, q_sf, weights, k_data, k_scale, row, start, end) -> torch.Tensor:
     """float32 scores of one quantized query row (any head count) against the keys [start, end)."""
-    assert q_sf is None  # FP8: the query scales are folded into the weights
-    queries, keys = q_data[row].double(), k_data[start:end].double()
-    key_scale = k_scale[start:end].double()
+    if q_sf is None:  # FP8: the query scales are folded into the weights
+        queries, keys = q_data[row].double(), k_data[start:end].double()
+        key_scale = k_scale[start:end].double()
+    else:
+        queries = _dequantize_mxfp4(q_data[row], q_sf[row])
+        keys = _dequantize_mxfp4(k_data[start:end], k_scale[start:end])
+        key_scale = None
     scores = (torch.relu(queries @ keys.T) * weights[row].double()[:, None]).sum(0)
-    scores = scores * key_scale
+    if key_scale is not None:
+        scores = scores * key_scale
     return scores.float()
 
 
@@ -359,8 +385,10 @@ class Consumer(nn.Module):
         self.binding = binding
 
 
-def _geometry(heads: int) -> IndexerGeometry:
-    return IndexerGeometry(num_heads=heads, head_dim=HEAD_DIM, topk=2048)
+def _geometry(heads: int, fmt: str) -> IndexerGeometry:
+    if fmt == "fp8":
+        return IndexerGeometry(num_heads=heads, head_dim=HEAD_DIM, topk=2048, key_ratio=1)
+    return IndexerGeometry(num_heads=heads, head_dim=HEAD_DIM, topk=512, key_ratio=4)
 
 
 def _configure(tmp_path, geometry, fmt, *, backend="litetopk", precision, padding, tuning=None):
@@ -370,7 +398,7 @@ def _configure(tmp_path, geometry, fmt, *, backend="litetopk", precision, paddin
     if backend == "litetopk":
         root = tmp_path / "plugin"
         if not root.exists():
-            _make_plugin(root, [_FP8_ROUTE])
+            _make_plugin(root, [_FP8_ROUTE, _FP4_ROUTE])
         fields["litetopk"] = LiteTopKPluginConfig(source=str(root))
     if precision == "exact":
         fields["exact_topk"] = ExactTopKConfig(source=str(tmp_path))
@@ -391,18 +419,26 @@ def _configure(tmp_path, geometry, fmt, *, backend="litetopk", precision, paddin
 _PADDED = {4: 32, 8: 32, 12: 32, 16: 32, 20: 32, 48: 64}
 _BASELINE = {4: 16, 8: 16, 12: 16, 16: 16, 20: 32, 32: 32, 48: 64, 64: 64}
 # Default first LiteTopK position of a layer whose reference selector scores as many heads as
-# LiteTopK: 8192 before the 196608-key route minimum with 32 kernel heads, none (LiteTopK is
-# slower than the reference selector) with 64.
-_STARTUP = {("fp8", 32): 188416, ("fp8", 64): None}
+# LiteTopK: FP8 8192 before the 196608-key route minimum with 32 kernel heads, none (LiteTopK is
+# slower than the reference selector) with 64; MXFP4 the row that sees 45056 compressed keys.
+_STARTUP = {("fp8", 32): 188416, ("fp8", 64): None, ("mxfp4", 32): 180224, ("mxfp4", 64): 180224}
 _MATRIX_HEADS = (4, 8, 12, 16, 20, 32, 48, 64, 96, 128)
 
 
+def _route_text(fmt: str) -> tuple[str, str]:
+    if fmt == "fp8":
+        return "fp8_paged", "[2048]"
+    return "fp4_slab", "<= 2048"
+
+
 @pytest.mark.parametrize("heads", _MATRIX_HEADS)
-@pytest.mark.parametrize("fmt, precision", [("fp8", "exact"), ("fp8", "fast")], ids=str)
+@pytest.mark.parametrize(
+    "fmt, precision", [("fp8", "exact"), ("fp8", "fast"), ("mxfp4", "fast")], ids=str
+)
 def test_capability_matrix(tmp_path, monkeypatch, fmt, precision, heads):
     _score_kernel(monkeypatch)
-    geometry = _geometry(heads)
-    route, topk_text = "fp8_paged", "[2048]"
+    geometry = _geometry(heads, fmt)
+    route, topk_text = _route_text(fmt)
     for padding in (False, True):
         result = _configure(tmp_path, geometry, fmt, precision=precision, padding=padding)
         source = next(iter(loader._LOADED.values())).source_id
@@ -499,7 +535,7 @@ def test_negotiation_error_texts_and_order():
             reference_heads=deepgemm,
         )
         arguments.update(overrides)
-        return negotiate_indexer_heads(_geometry(heads), **arguments)
+        return negotiate_indexer_heads(_geometry(heads, "fp8"), **arguments)
 
     # A route head count DeepGEMM has no kernel for: precision exact needs the reference
     # selector to score the plugin's operands (48 heads) and it would pad them to 64.
@@ -520,7 +556,7 @@ def test_negotiation_error_texts_and_order():
     with pytest.raises(IndexerTopKConfigError, match=r"has H=42, D=128, K=2048\. Use backend"):
         negotiate(42)
     # Padding cannot help another head dimension; the advice depends on the reference selector.
-    wide = IndexerGeometry(num_heads=48, head_dim=64, topk=2048)
+    wide = IndexerGeometry(num_heads=48, head_dim=64, topk=2048, key_ratio=1)
     with pytest.raises(IndexerTopKConfigError, match=r"has H=48, D=64, K=2048\. Use backend"):
         negotiate_indexer_heads(
             wide,
@@ -537,6 +573,10 @@ def test_negotiation_error_texts_and_order():
     assert str(error.value).endswith(
         "Set indexer_topk.head_padding=True to pad heads to 48 (1.50x scoring work)."
     )
+    # The upstream selector selects the reference rows: no probe, no reference heads.
+    probes.clear()
+    assert negotiate(32, reference_heads=None) == IndexerHeads(32, 48, None, None)
+    assert probes == []
     # Without a route only the reference selector negotiates.
     assert negotiate(20, route=None, source_id=None) == IndexerHeads(20, None, 32, 32)
     with pytest.raises(IndexerTopKConfigError, match="no head count from 96"):
@@ -593,8 +633,8 @@ def test_head_records(tmp_path, monkeypatch):
             IndexerHeads(**bad)
     # The installation records the head counts of every binding.
     _new_process()
-    root = _make_plugin(tmp_path / "plugin", [_FP8_ROUTE])
-    consumer = Consumer(_geometry(16))
+    root = _make_plugin(tmp_path / "plugin", [_FP8_ROUTE, _FP4_ROUTE])
+    consumer = Consumer(_geometry(16, "fp8"))
     installation = binding_module.configure_indexer_topk(
         [consumer],
         {
@@ -613,7 +653,7 @@ def test_required_needs_a_default_litetopk_start(tmp_path, monkeypatch):
     _score_kernel(monkeypatch)
     required = IndexerTopKTuning(required=True)
     result = _configure(
-        tmp_path, _geometry(16), "fp8", precision="exact", padding=True, tuning=required
+        tmp_path, _geometry(16, "fp8"), "fp8", precision="exact", padding=True, tuning=required
     )
     assert result == (
         "IndexerTopKTuning.required needs LiteTopK rows, but the default plan gives LiteTopK "
@@ -622,7 +662,7 @@ def test_required_needs_a_default_litetopk_start(tmp_path, monkeypatch):
         "anyway"
     )
     result = _configure(
-        tmp_path, _geometry(64), "fp8", precision="exact", padding=False, tuning=required
+        tmp_path, _geometry(64, "fp8"), "fp8", precision="exact", padding=False, tuning=required
     )
     assert result.startswith("IndexerTopKTuning.required needs LiteTopK rows") and (
         "with 64 kernel heads (no start was faster than the reference selector at every "
@@ -631,7 +671,7 @@ def test_required_needs_a_default_litetopk_start(tmp_path, monkeypatch):
     # An explicit start position enables LiteTopK.
     explicit = IndexerTopKTuning(required=True, startup_position=188416)
     binding = _configure(
-        tmp_path, _geometry(64), "fp8", precision="exact", padding=False, tuning=explicit
+        tmp_path, _geometry(64, "fp8"), "fp8", precision="exact", padding=False, tuning=explicit
     )
     assert binding.resolved_tuning(torch.device("cpu")).startup_position == 188416
 
@@ -829,7 +869,22 @@ _SMALL_FP8 = {
     "max_keys": 4096,
     "hot_prefix": 24,
 }
-_SMALL_TUNING = IndexerTopKTuning(tile_rows=16, startup_position=160, group_tiles=3)
+_SMALL_FP4 = {
+    **_SMALL_FP8,
+    "name": "fp4_slab",
+    "fmt": "mxfp4",
+    "topk": None,
+    "exact": False,
+    "qualified_query_lengths": [12, 16],
+    "min_keys": 64,
+    "tie_policies": ["storage"],
+    "score_policies": ["folded"],
+}
+_SMALL_TUNING = {
+    "fp8": IndexerTopKTuning(tile_rows=16, startup_position=160, group_tiles=3),
+    "mxfp4": IndexerTopKTuning(tile_rows=16, startup_position=0),
+}
+_UE8M0_ONE = 0x7F7F7F7F  # four group scales of 127, the UE8M0 code of 1.0
 
 
 def _inputs(rows, keys, heads, seed):
@@ -866,16 +921,22 @@ def _expected(q, k, weights, layout, topk, softmax_scale, fmt):
         ("fp8", "fast", 8, 8, 8),
         # Precision fast, but DeepGEMM pads the head count anyway: the plugin's operands.
         ("fp8", "fast", 4, 16, 8),
+        ("mxfp4", "fast", 12, 16, 16),
         # The route's own head count: head_padding pads nothing and counts no padded row.
         ("fp8", "exact", 16, 16, 16),
+        ("mxfp4", "fast", 16, 16, 16),
     ],
 )
 def test_padded_operands_passed_to_plugin(
     tmp_path, monkeypatch, fmt, precision, heads, reference_heads, baseline_heads
 ):
     kernel = _score_kernel(monkeypatch, supported={8, 16})
-    root = _make_plugin(tmp_path / "plugin", [_SMALL_FP8], min_keys=(96, 64), vote_rows=12)
-    geometry = IndexerGeometry(num_heads=heads, head_dim=HEAD_DIM, topk=8)
+    root = _make_plugin(
+        tmp_path / "plugin", [_SMALL_FP8, _SMALL_FP4], min_keys=(96, 64), vote_rows=12
+    )
+    geometry = IndexerGeometry(
+        num_heads=heads, head_dim=HEAD_DIM, topk=8, key_ratio=1 if fmt == "fp8" else 4
+    )
     fields = {
         "backend": "litetopk",
         "precision": precision,
@@ -886,15 +947,19 @@ def test_padded_operands_passed_to_plugin(
         fields["exact_topk"] = {"source": str(tmp_path)}
     consumer = Consumer(geometry)
     binding_module.configure_indexer_topk(
-        [consumer], fields, native_format=fmt, tuning=_SMALL_TUNING
+        [consumer], fields, native_format=fmt, tuning=_SMALL_TUNING[fmt]
     )
     binding = consumer.binding
     assert binding.heads == IndexerHeads(heads, 16, reference_heads, baseline_heads)
     fake = binding.plugin.module.BEHAVIOR = FakeLiteTopK()
     kernel.calls.clear()  # the head-count probes of the configuration
 
-    rows, keys, scale = 250, 250, 0.5
-    layout = QueryLayout.full(rows, keys=keys)
+    if fmt == "fp8":
+        rows, keys, scale = 250, 250, 0.5
+        layout = QueryLayout.full(rows, keys=keys)
+    else:
+        rows, keys, scale = 396, 96, HEAD_DIM**-0.5
+        layout = QueryLayout.full(rows, keys=keys, key_ratio=4)
     q, k, weights = _inputs(rows, keys, heads, seed=heads)
     with torch.no_grad():
         out = binding.select(q, k, weights, layout=layout, topk=8, softmax_scale=scale)
@@ -902,17 +967,21 @@ def test_padded_operands_passed_to_plugin(
     assert torch.equal(out, _expected(q, k, weights, layout, 8, scale, fmt))
 
     # The plugin got 16 heads per row: the layer's quantized heads, then (below 16 heads) zero
-    # codes and zero weights.
+    # codes and zero weights (and MXFP4 group scales 127).
     assert fake.operands
     for data, scales, folded in fake.operands:
         assert data.shape[1:] == (16, data.shape[2]) and folded.shape[1] == 16
         assert not data[:, heads:].view(torch.uint8).any()
         assert not folded[:, heads:].any() and not folded[:, heads:].signbit().any()
-        assert scales is None
+        if fmt == "fp8":
+            assert scales is None
+        else:
+            assert bool((scales[:, heads:] == _UE8M0_ONE).all())
+            assert bool((scales[:, heads:].view(torch.uint8) == 127).all())
     # The first tile's own heads are the layer's quantized heads.
-    tile_data, _, tile_weights = fake.operands[0]
+    tile_data, tile_scales, tile_weights = fake.operands[0]
     tile_rows = tile_data.shape[0]
-    tile_start = 162
+    tile_start = 162 if fmt == "fp8" else 96
     expected = quantize_queries(
         q[tile_start : tile_start + tile_rows],
         weights[tile_start : tile_start + tile_rows],
@@ -922,6 +991,8 @@ def test_padded_operands_passed_to_plugin(
     )
     assert torch.equal(tile_data[:, :heads].view(torch.uint8), expected[0].view(torch.uint8))
     assert torch.equal(tile_weights[:, :heads], expected[2])
+    if fmt == "mxfp4":
+        assert torch.equal(tile_scales[:, :heads], expected[1])
 
     # The reference selector scored the head count the negotiation chose.
     assert kernel.calls and {call["heads"] for call in kernel.calls} == {reference_heads}
@@ -939,8 +1010,10 @@ def test_padding_default_plan_leaves_rows_to_the_reference(tmp_path, monkeypatch
     # measured for that, so the default plan gives LiteTopK no row and the reference selector
     # keeps the layer's own head count.
     kernel = _score_kernel(monkeypatch, supported={8, 16})
-    root = _make_plugin(tmp_path / "plugin", [_SMALL_FP8], min_keys=(96, 64), vote_rows=12)
-    geometry = IndexerGeometry(num_heads=8, head_dim=HEAD_DIM, topk=8)
+    root = _make_plugin(
+        tmp_path / "plugin", [_SMALL_FP8, _SMALL_FP4], min_keys=(96, 64), vote_rows=12
+    )
+    geometry = IndexerGeometry(num_heads=8, head_dim=HEAD_DIM, topk=8, key_ratio=1)
     consumer = Consumer(geometry)
     binding_module.configure_indexer_topk(
         [consumer],

@@ -3,20 +3,24 @@
 
 CP-sim on one Blackwell GPU: the rows of every rank of a contiguous P-rank split (P = 2, 4, 8) are
 selected one rank at a time against all keys, with the layout that rank of Lite's context
-parallelism builds, and the ranks together must equal the selection of the whole prompt. The
-layouts are those of DSA native CP for FP8 indexers: one sequence,
-``QueryLayout.contiguous(L, position=r * L, keys=S)``, and two packed sequences,
-``QueryLayout.packed(cu, row_start=r * L, rows=L, absolute_ids=True)`` (ids into the
-gathered keys).
+parallelism builds, and the ranks together must equal the selection of the whole prompt:
+
+* FP8 indexers (DSA native CP): one sequence, ``QueryLayout.contiguous(L, position=r * L,
+  keys=S)``, and two packed sequences, ``QueryLayout.packed(cu, row_start=r * L, rows=L,
+  absolute_ids=True)`` (ids into the gathered keys);
+* MXFP4 indexers (CSA THD CP, four query tokens per compressed key): one sequence and two packed
+  sequences, ``QueryLayout.packed(cu, row_start=r * L, rows=L, key_ratio=4,
+  absolute_ids=False)`` (sequence-relative ids).
 
 The matched-precision reference selector and plugin routes with exact selection must match the
 whole prompt bit for bit. A fast route may differ where a rank's plan differs from the whole
-prompt's (another reference bootstrap, tile grid or seed), among nearly tied keys only: every
-row of the CP-sim selection that differs from the exact reference selection of the whole
-prompt is classified by the relative distance between the scores of the keys it swaps and the
-row's cutoff (the smallest score among the reference's keys), with float64 scores of the
-quantized operands, and no row may be farther than the near-tie limit (``_NEAR_TIE_LIMIT``).
-The whole prompt's own fast selection is held to the same limit.
+prompt's (another reference bootstrap, tile grid or seed), among nearly tied keys only
+(DESIGN-REVISIONS M7): every row of the CP-sim selection that differs from the exact reference
+selection of the whole prompt is classified by the relative distance between the scores of the
+keys it swaps and the row's cutoff (the smallest score among the reference's keys), with float64
+scores of the quantized operands, and no row may be farther than the format's near-tie limit
+(``_NEAR_TIE_LIMIT``, from the repeated runs of the previous integration). The whole prompt's own
+fast selection is held to the same limit.
 
 Plugins and the exact-tie top-k are given as for ``test_selector_gpu.py``
 (``LITETOPK_TEST_SELECTORS``, ``LITETOPK_TEST_EXACT_TOPK``); every entry runs in a fresh
@@ -42,17 +46,23 @@ _SELECTORS_VARIABLE = "LITETOPK_TEST_SELECTORS"
 _EXACT_VARIABLE = "LITETOPK_TEST_EXACT_TOPK"
 _INPUTS_VARIABLE = "LITETOPK_TEST_CP_INPUTS"
 _PARTS = (2, 4, 8)
-# Prompt tokens and the start of the second of two packed sequences. The second sequence starts
-# inside rank 0 of every split and is long enough for LiteTopK tiles: FP8 routes need 196608 keys
-# per sequence.
-_TOKENS = 262144
-_SECOND_SEQUENCE = 4100
-# The farthest a fast route may swap a key from a row's cutoff score, relative to that score:
-# 1e-3. The fast FP8 plugin of the previous LiteTopK integration (an earlier out-of-tree
-# integration into a Megatron-LM fork) swapped keys at most 4.0e-4 from the cutoff on two
-# GLM-5.2 layers in repeated runs (4.3e-4 in CP-sim). On this file's random operands every
-# swap of the fast routes stays below 1e-4.
-_NEAR_TIE_LIMIT = 1e-3
+# Prompt tokens and the start of the second of two packed sequences, per format. The second
+# sequence starts inside rank 0 of every split and is long enough for LiteTopK tiles: FP8 routes
+# need 196608 keys per sequence, MXFP4 routes 65536 compressed keys (262144 tokens).
+_TOKENS = {"fp8": 262144, "mxfp4": 270336}
+_SECOND_SEQUENCE = {"fp8": 4100, "mxfp4": 6148}
+_KEY_RATIO = {"fp8": 1, "mxfp4": 4}
+# The farthest a fast route may swap a key from a row's cutoff score, relative to that score
+# (DESIGN-REVISIONS M7: no row farther than the repeated runs of the previous integration on the
+# same operands). FP8: the M7 "significant" line, 1e-3; the farthest swap of the previous
+# integration's FP8 plugin on two GLM-5.2 layers was 4.0e-4 (4.3e-4 in CP-sim). MXFP4: the slab
+# selector is not set-deterministic at near ties, and on the indexer operands of a DeepSeek-V4-
+# sized C4 layer it swaps a key 1.097e-3 from the cutoff in 5 of 8 runs, in the previous
+# integration as in this one (the same CUDA code): an inherent near tie above that line, which
+# the limit (the largest distance of those repeated runs, rounded up) admits. On this file's
+# random operands every swap of both formats' fast routes stays below 1e-4.
+_NEAR_TIE_LIMIT = {"fp8": 1e-3, "mxfp4": 1.1e-3}
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def _read_json(variable: str):
@@ -89,7 +99,7 @@ def test_cp_sim_equals_whole_prompt(spec):
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     report = json.loads(result.stdout.strip().splitlines()[-1])
     exact_route = spec["precision"] == "exact"
-    limit = _NEAR_TIE_LIMIT
+    limit = _NEAR_TIE_LIMIT[spec["native_format"]]
     for name, case in report["cases"].items():
         whole = case["whole"]
         assert whole["litetopk"]["tiles"] > 0, name
@@ -145,23 +155,48 @@ def cp_sim(binding, q, k, weights, *, parts: int, layout, topk: int, softmax_sca
     return torch.cat(outputs), ranks
 
 
-def layouts(tokens: int, packed: list[int] | None):
-    """The whole prompt's layout and the layout of rank ``r`` of a ``P``-rank split, as DSA
-    native context parallelism builds them (ids index the gathered keys)."""
+def layouts(fmt: str, tokens: int, packed: list[int] | None):
+    """The whole prompt's layout and the layout of rank ``r`` of a ``P``-rank split, as the
+    format's context-parallel module builds them."""
     from megatron.lite.primitive.kernels.indexer_topk import QueryLayout
 
+    ratio = _KEY_RATIO[fmt]
+    absolute = fmt == "fp8"  # DSA ids index the gathered keys; CSA ids are sequence-relative
     if packed is None:
-        whole = QueryLayout.full(tokens, keys=tokens)
+        whole = QueryLayout.full(tokens, keys=tokens // ratio, key_ratio=ratio)
     else:
-        whole = QueryLayout.packed(packed, row_start=0, rows=tokens, absolute_ids=True)
+        whole = QueryLayout.packed(
+            packed, row_start=0, rows=tokens, key_ratio=ratio, absolute_ids=absolute
+        )
 
     def rank_layout(parts: int, rank: int):
         local = tokens // parts
-        if packed is None:
+        if packed is None and fmt == "fp8":
             return QueryLayout.contiguous(local, position=rank * local, keys=tokens)
-        return QueryLayout.packed(packed, row_start=rank * local, rows=local, absolute_ids=True)
+        # CSA THD describes one sequence as packed sequence offsets too.
+        return QueryLayout.packed(
+            [0, tokens] if packed is None else packed,
+            row_start=rank * local,
+            rows=local,
+            key_ratio=ratio,
+            absolute_ids=absolute,
+        )
 
     return whole, rank_layout
+
+
+def _dequantize_mxfp4(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Exact float64 values of packed E2M1 rows ``[..., 64]`` with UE8M0 group scales ``[...]``
+    (four 32-value groups per 128-value row, group ``g`` in bits ``[8g, 8g + 8)``)."""
+    nibbles = codes.view(torch.uint8).to(torch.int64)
+    code = torch.stack((nibbles & 0xF, nibbles >> 4), dim=-1).flatten(-2)
+    grid = torch.tensor(_E2M1, dtype=torch.float64, device=codes.device)
+    value = torch.where((code & 0x8) != 0, -grid[code & 0x7], grid[code & 0x7])
+    exponents = torch.stack(
+        [(scales.to(torch.int64) >> shift) & 0xFF for shift in (0, 8, 16, 24)], dim=-1
+    )
+    group_scale = torch.exp2(exponents.to(torch.float64) - 127.0)
+    return (value.unflatten(-1, (4, 32)) * group_scale[..., None]).flatten(-2)
 
 
 class Float64Scorer:
@@ -173,21 +208,27 @@ class Float64Scorer:
 
         self.fmt, self.q, self.weights, self.softmax_scale = fmt, q, weights, softmax_scale
         keys = quantize_keys(k, fmt)
-        self.keys = keys.data.to(torch.float64) * keys.scale.to(torch.float64)[:, None]
+        if fmt == "fp8":
+            self.keys = keys.data.to(torch.float64) * keys.scale.to(torch.float64)[:, None]
+        else:
+            self.keys = _dequantize_mxfp4(keys.data, keys.scale)
 
     def scores(self, rows: torch.Tensor, key_rows: torch.Tensor) -> torch.Tensor:
         """float64 ``[len(rows), K]`` scores of ``key_rows[i]`` (``[len(rows), K]``) for query
         row ``rows[i]``."""
         from megatron.lite.primitive.kernels.indexer_topk.reference import quantize_queries
 
-        data, _, folded = quantize_queries(
+        data, scales, folded = quantize_queries(
             self.q[rows],
             self.weights[rows],
             self.fmt,
             softmax_scale=self.softmax_scale,
             kernel_heads=self.q.shape[1],
         )
-        queries = data.to(torch.float64)
+        if self.fmt == "fp8":
+            queries = data.to(torch.float64)
+        else:
+            queries = _dequantize_mxfp4(data, scales)
         dots = torch.einsum("rhd,rkd->rkh", queries, self.keys[key_rows])
         return (torch.relu(dots) * folded.to(torch.float64)[:, None, :]).sum(dim=-1)
 
@@ -239,7 +280,7 @@ def bindings(spec: dict, heads: int, topk: int, fmt: str) -> dict:
     selector = spec["selector"]
     exact_spec = dict(spec["exact_topk"])
     exact_spec.pop("pythonpath", None)
-    geometry = IndexerGeometry(num_heads=heads, head_dim=128, topk=topk)
+    geometry = IndexerGeometry(num_heads=heads, head_dim=128, topk=topk, key_ratio=_KEY_RATIO[fmt])
 
     class Consumer(torch.nn.Module):
         binding = None
@@ -274,28 +315,32 @@ def bindings(spec: dict, heads: int, topk: int, fmt: str) -> dict:
 def operands(spec: dict, device) -> dict:
     """A random prompt (one sequence and two packed sequences) and the real operands."""
     selector = spec["selector"]
-    heads, tokens = selector["heads"], _TOKENS
+    fmt, heads = selector["native_format"], selector["heads"]
+    tokens, ratio = _TOKENS[fmt], _KEY_RATIO[fmt]
     generator = torch.Generator(device=device).manual_seed(20260930)
     random = dict(
         q=torch.randn((tokens, heads, 128), generator=generator, device=device).to(torch.bfloat16),
-        k=torch.randn((tokens, 128), generator=generator, device=device).to(torch.bfloat16),
+        k=torch.randn((tokens // ratio, 128), generator=generator, device=device).to(
+            torch.bfloat16
+        ),
         weights=torch.rand((tokens, heads), generator=generator, device=device) * heads**-0.5,
         softmax_scale=128**-0.5,
     )
     cases = {
         "random": dict(random, packed=None),
-        "random-packed": dict(random, packed=[0, _SECOND_SEQUENCE, tokens]),
+        "random-packed": dict(random, packed=[0, _SECOND_SEQUENCE[fmt], tokens]),
     }
-    for entry in spec.get("inputs") or []:
-        payload = torch.load(entry["path"], map_location="cpu", weights_only=False, mmap=True)
-        tensors = payload["tensors"]
-        cases[Path(entry["path"]).stem] = dict(
-            q=tensors["q"].to(device),
-            k=tensors["k"].to(device),
-            weights=tensors["weights"].to(device),
-            softmax_scale=float(entry["softmax_scale"]),
-            packed=None,
-        )
+    if fmt == "fp8":
+        for entry in spec.get("inputs") or []:
+            payload = torch.load(entry["path"], map_location="cpu", weights_only=False, mmap=True)
+            tensors = payload["tensors"]
+            cases[Path(entry["path"]).stem] = dict(
+                q=tensors["q"].to(device),
+                k=tensors["k"].to(device),
+                weights=tensors["weights"].to(device),
+                softmax_scale=float(entry["softmax_scale"]),
+                packed=None,
+            )
     return cases
 
 
@@ -312,7 +357,7 @@ def _child(spec: dict) -> dict:
     for name, case in operands(spec, device).items():
         q, k, weights, scale = case["q"], case["k"], case["weights"], case["softmax_scale"]
         tokens = q.shape[0]
-        whole_layout, rank_layout = layouts(tokens, case["packed"])
+        whole_layout, rank_layout = layouts(fmt, tokens, case["packed"])
         scorer = Float64Scorer(fmt, q, k, weights, scale)
         whole, entry = {}, {"tokens": tokens, "packed": case["packed"], "whole": {}, "cp": {}}
         for arm, binding in arms.items():

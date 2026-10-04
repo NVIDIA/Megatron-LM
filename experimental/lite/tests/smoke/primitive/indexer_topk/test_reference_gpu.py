@@ -27,6 +27,7 @@ from megatron.lite.primitive.kernels.indexer_topk import (
     QueryLayout,
     QuerySegment,
     quantize_indexer_fp8_rows,
+    quantize_indexer_mxfp4_rows,
     reference_topk,
     sort_topk_rows_,
 )
@@ -34,6 +35,7 @@ from megatron.lite.primitive.kernels.indexer_topk import (
 pytestmark = [pytest.mark.gpus(1, min_architecture="blackwell"), pytest.mark.optional]
 
 _EXACT_VARIABLE = "LITETOPK_TEST_EXACT_TOPK"
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 @pytest.fixture(scope="module")
@@ -53,20 +55,28 @@ def _deep_gemm():
     pytest.importorskip("deep_gemm")
 
 
-def _exact_inputs(rows: int, keys: int, heads: int, seed: int):
+def _exact_inputs(fmt: str, rows: int, keys: int, heads: int, seed: int):
     """Queries, keys and weights whose quantized scores are exact multiples of 1/8.
 
     FP8 rows hold small integers plus one entry of 448 (so the row scale is exactly 1), in
-    different columns for queries and keys. Every product and sum is then exact in float32, so
-    the float64 reference below is exactly what DeepGEMM computes, and the small value range
-    makes equal scores frequent.
+    different columns for queries and keys; MXFP4 groups hold E2M1 grid values with one entry of
+    6 (so the group scale is exactly 1). Every product and sum is then exact in float32, so the
+    float64 reference below is exactly what DeepGEMM computes, and the small value range makes
+    equal scores frequent.
     """
     generator = torch.Generator(device="cuda").manual_seed(seed)
 
     def draw(count: int, hot_column: int) -> torch.Tensor:
-        values = torch.randint(-3, 4, (count, 128), generator=generator, device="cuda")
-        values[:, hot_column] = 448
-        return values.float()
+        if fmt == "fp8":
+            values = torch.randint(-3, 4, (count, 128), generator=generator, device="cuda")
+            values[:, hot_column] = 448
+            return values.float()
+        grid = torch.tensor(_E2M1, device="cuda")
+        signs = torch.randint(0, 2, (count, 128), generator=generator, device="cuda") * 2 - 1
+        values = grid[torch.randint(0, 5, (count, 128), generator=generator, device="cuda")]
+        values = (values * signs).reshape(count, 4, 32)
+        values[:, :, 7] = 6.0
+        return values.reshape(count, 128)
 
     q = draw(rows * heads, 0).reshape(rows, heads, 128).to(torch.bfloat16)
     k = draw(keys, 1).to(torch.bfloat16)
@@ -74,17 +84,27 @@ def _exact_inputs(rows: int, keys: int, heads: int, seed: int):
     return q, k, weights
 
 
-def _dequantize(value: torch.Tensor) -> torch.Tensor:
-    data, scale = quantize_indexer_fp8_rows(value)
-    return data.double() * scale.double()[..., None]
+def _dequantize(fmt: str, value: torch.Tensor) -> torch.Tensor:
+    if fmt == "fp8":
+        data, scale = quantize_indexer_fp8_rows(value)
+        return data.double() * scale.double()[..., None]
+    packed, scales = quantize_indexer_mxfp4_rows(value)
+    codes = packed.view(torch.uint8).long()
+    code = torch.stack((codes & 15, codes >> 4), dim=-1).flatten(-2)
+    grid = torch.tensor(_E2M1, dtype=torch.float64, device=value.device)
+    values = torch.where(code >= 8, -grid[code & 7], grid[code & 7])
+    exponents = torch.stack([(scales >> shift) & 255 for shift in (0, 8, 16, 24)], -1)
+    return (
+        values.unflatten(-1, (4, 32)) * torch.pow(2.0, exponents.double() - 127)[..., None]
+    ).flatten(-2)
 
 
-def _expected(q, k, weights, layout, topk, softmax_scale, ties=None):
+def _expected(fmt, q, k, weights, layout, topk, softmax_scale, ties=None):
     """Exact top-k (score descending, lower id first) in float64 over the quantized operands.
 
     ``ties`` (a list) receives the number of rows whose cutoff falls between equal scores.
     """
-    queries, keys = _dequantize(q), _dequantize(k)
+    queries, keys = _dequantize(fmt, q), _dequantize(fmt, k)
     out = torch.full((layout.rows, topk), -1, dtype=torch.int32, device=q.device)
     for segment in layout.segments:
         window = keys[segment.key_start : segment.key_start + segment.key_count]
@@ -94,7 +114,7 @@ def _expected(q, k, weights, layout, topk, softmax_scale, ties=None):
             scores = torch.einsum("rhd,kd->rhk", queries[rows], window).relu()
             scores = (scores * (weights[rows].double() * softmax_scale)[..., None]).sum(1)
             positions = segment.position + rows - segment.row_start
-            visible = (positions + 1).clamp(max=segment.key_count)
+            visible = ((positions + 1) // layout.key_ratio).clamp(max=segment.key_count)
             scores = scores.masked_fill(columns[None, :] >= visible[:, None], float("-inf"))
             # A stable sort by descending score keeps equal scores in ascending id order.
             ranked, order = torch.sort(-scores, dim=1, stable=True)
@@ -107,25 +127,33 @@ def _expected(q, k, weights, layout, topk, softmax_scale, ties=None):
     return sort_topk_rows_(out)
 
 
-def _layouts():
+def _layouts(fmt: str):
+    ratio = 1 if fmt == "fp8" else 4
     return {
-        "full": (QueryLayout.full(3000, keys=3000), 3000),
-        "cp_shard": (QueryLayout.contiguous(1100, position=2900, keys=4000), 4000),
+        "full": (QueryLayout.full(3000, keys=3000 // ratio, key_ratio=ratio), 3000 // ratio),
+        "cp_shard": (
+            QueryLayout.contiguous(1100, position=2900, keys=4000 // ratio, key_ratio=ratio),
+            4000 // ratio,
+        ),
         "packed": (
             QueryLayout.packed(
-                [0, 700, 701, 2400, 3001], row_start=500, rows=2600, absolute_ids=True
+                [0, 700, 701, 2400, 3001],
+                row_start=500,
+                rows=2600,
+                key_ratio=ratio,
+                absolute_ids=fmt == "fp8",
             ),
-            3001,
+            sum(length // ratio for length in (700, 1, 1699, 601)),
         ),
     }
 
 
-# 48 heads are padded to a head count DeepGEMM supports (64 with DeepGEMM 0.1.3).
-@pytest.mark.parametrize("heads", [32, 48])
-def test_reference_matches_torch_exact_small(exact_topk, heads):
+# 48 and 8 heads are padded to a head count DeepGEMM supports (64 and 16 with DeepGEMM 0.1.3).
+@pytest.mark.parametrize(("fmt", "heads"), [("fp8", 32), ("fp8", 48), ("mxfp4", 64), ("mxfp4", 8)])
+def test_reference_matches_torch_exact_small(exact_topk, fmt, heads):
     ties = []
-    for name, (layout, keys) in _layouts().items():
-        q, k, weights = _exact_inputs(layout.rows, keys, heads, seed=len(name))
+    for name, (layout, keys) in _layouts(fmt).items():
+        q, k, weights = _exact_inputs(fmt, layout.rows, keys, heads, seed=len(name))
         for topk in (64, 700):
             selected = reference_topk(
                 q,
@@ -134,24 +162,27 @@ def test_reference_matches_torch_exact_small(exact_topk, heads):
                 layout=layout,
                 topk=topk,
                 softmax_scale=0.5,
-                fmt="fp8",
+                fmt=fmt,
                 exact_topk=exact_topk,
             )
-            expected = _expected(q, k, weights, layout, topk, 0.5, ties)
+            expected = _expected(fmt, q, k, weights, layout, topk, 0.5, ties)
             mismatched = (selected != expected).any(dim=1).nonzero().flatten()
-            assert mismatched.numel() == 0, (heads, name, topk, mismatched[:8].tolist())
+            assert mismatched.numel() == 0, (fmt, heads, name, topk, mismatched[:8].tolist())
     assert sum(ties) > 100  # the inputs put many cutoffs between equal scores
 
 
-def test_reference_budget_chunking_invariant(exact_topk):
-    heads = 32
+@pytest.mark.parametrize(("fmt", "heads"), [("fp8", 32), ("mxfp4", 64)])
+def test_reference_budget_chunking_invariant(exact_topk, fmt, heads):
     generator = torch.Generator(device="cuda").manual_seed(7)
+    ratio = 1 if fmt == "fp8" else 4
     cu_seqlens = [0, 3000, 3003, 9000, 12288]
-    rows = keys = cu_seqlens[-1]
+    rows, keys = cu_seqlens[-1], sum((b - a) // ratio for a, b in zip(cu_seqlens, cu_seqlens[1:]))
     q = torch.randn((rows, heads, 128), generator=generator, device="cuda").to(torch.bfloat16)
     k = torch.randn((keys, 128), generator=generator, device="cuda").to(torch.bfloat16)
     weights = torch.randn((rows, heads), generator=generator, device="cuda").to(torch.bfloat16)
-    layout = QueryLayout.packed(cu_seqlens, row_start=0, rows=rows, absolute_ids=True)
+    layout = QueryLayout.packed(
+        cu_seqlens, row_start=0, rows=rows, key_ratio=ratio, absolute_ids=True
+    )
 
     def select(layout, q, weights, **kwargs):
         return reference_topk(
@@ -161,7 +192,7 @@ def test_reference_budget_chunking_invariant(exact_topk):
             layout=layout,
             topk=512,
             softmax_scale=128**-0.5,
-            fmt="fp8",
+            fmt=fmt,
             exact_topk=exact_topk,
             **kwargs,
         )
@@ -179,12 +210,13 @@ def test_reference_budget_chunking_invariant(exact_topk):
             segment.key_count,
             segment.index_base,
         )
-        single = QueryLayout(rows=segment.rows, segments=(alone,))
+        single = QueryLayout(rows=segment.rows, key_ratio=ratio, segments=(alone,))
         part = slice(segment.row_start, segment.row_end)
         assert torch.equal(select(single, q[part], weights[part]), reference[part])
 
 
-def test_unaligned_key_view_plain_scores_bitwise():
+@pytest.mark.parametrize(("fmt", "heads"), [("fp8", 32), ("mxfp4", 64)])
+def test_unaligned_key_view_plain_scores_bitwise(fmt, heads):
     # The keys of a sequence that starts at key 3003 have scales at an address 12 bytes past a
     # 16-byte boundary. The selector scores such a view in the plain mode against an aligned
     # copy of its scales; the scores equal the row-relative mode's on the unmoved keys bit for
@@ -192,7 +224,6 @@ def test_unaligned_key_view_plain_scores_bitwise():
     # alone with those of a batched call, whose chunks span sequences.)
     from megatron.lite.primitive.kernels.indexer_topk import reference as reference_module
 
-    fmt, heads = "fp8", 32
     generator = torch.Generator(device="cuda").manual_seed(13)
     rows, first, width = 1024, 3003, 4096
     q = torch.randn((rows, heads, 128), generator=generator, device="cuda").to(torch.bfloat16)
@@ -231,10 +262,10 @@ def test_reference_radix_topk_selects_the_best_scores():
     weights = torch.rand((2048, 32), generator=generator, device="cuda")
     layout = QueryLayout.full(2048, keys=2048)
     selected = reference_topk(q, k, weights, layout=layout, topk=256, softmax_scale=1.0, fmt="fp8")
-    expected = _expected(q, k, weights, layout, 256, 1.0)
+    expected = _expected("fp8", q, k, weights, layout, 256, 1.0)
     # Without the exact-tie package equal scores may be ordered either way: compare the scores
     # (float64 here, so keys whose float32 scores are nearly equal may also swap).
-    queries, keys = _dequantize(q), _dequantize(k)
+    queries, keys = _dequantize("fp8", q), _dequantize("fp8", k)
     scores = torch.cat(
         [
             (

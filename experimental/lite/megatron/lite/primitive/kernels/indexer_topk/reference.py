@@ -2,8 +2,8 @@
 """The matched-precision reference selector of the indexer top-k.
 
 The reference selector scores every visible key of a query row with DeepGEMM
-``fp8_fp4_mqa_logits`` on the same quantized operands the LiteTopK plugin reads (FP8 queries
-and keys from :mod:`.quant`, float32 head weights folded by
+``fp8_fp4_mqa_logits`` on the same quantized operands the LiteTopK plugin reads (FP8 or indexer
+MXFP4 queries and keys from :mod:`.quant`, float32 head weights folded by
 :func:`~.quant.fold_indexer_weights`), then keeps the ``topk`` best keys of the row with the
 exact-tie top-k (score descending, lower key id first on equal float32 scores) or, without it,
 the cuDNN frontend radix top-k (equal scores in unspecified order). It selects the rows
@@ -46,6 +46,7 @@ from megatron.lite.primitive.kernels.indexer_topk.plugins.loader import load_exa
 from megatron.lite.primitive.kernels.indexer_topk.quant import (
     fold_indexer_weights,
     quantize_indexer_fp8_rows,
+    quantize_indexer_mxfp4_rows,
 )
 
 __all__ = [
@@ -64,7 +65,7 @@ __all__ = [
 # of every float32 score row r, as int32 [rows, top_k] column ids with -1 for missing ones.
 TopKKernel = Callable[[Tensor, Tensor, int], Tensor]
 
-_FORMATS = ("fp8",)
+_FORMATS = ("fp8", "mxfp4")
 # A score kernel block covers 128 (query row, head) pairs: 128 // heads rows per SM.
 _SCORE_BLOCK_PAIRS = 128
 _MAX_SCORE_HEADS = 128
@@ -74,6 +75,8 @@ _KEY_QUANTIZE_ROWS = 65536
 # of the keys of a later sequence can start at any key: its key rows (64 or 128 bytes each) stay
 # aligned, but its scales (4 bytes per key) may not, and are then copied to an aligned buffer.
 _KERNEL_OPERAND_ALIGNMENT = 16
+# Four UE8M0 exponents of 1.0: the group scales of padded MXFP4 query heads.
+_UE8M0_ONES = 0x7F7F7F7F
 _HEAD_SUPPORT: dict[tuple[str, int, int, tuple[int, int]], bool] = {}
 
 
@@ -119,9 +122,11 @@ class QuantizedKeys:
     """Indexer keys in a score kernel operand format.
 
     Attributes:
-        fmt: ``fp8``.
-        data: ``float8_e4m3fn`` ``[N, D]``.
-        scale: float32 ``[N]`` row scales.
+        fmt: ``fp8`` or ``mxfp4``.
+        data: FP8 ``float8_e4m3fn`` ``[N, D]``, or MXFP4 int8 ``[N, D // 2]`` (two E2M1 codes per
+            byte).
+        scale: FP8 float32 ``[N]`` row scales, or MXFP4 int32 ``[N]`` packed UE8M0 group
+            exponents.
     """
 
     fmt: IndexerTopKFormat
@@ -136,7 +141,8 @@ def quantize_keys(k: Tensor, fmt: IndexerTopKFormat, *, rows: int | None = None)
 
     Args:
         k: Indexer keys ``[N, D]``.
-        fmt: ``fp8`` (:func:`~.quant.quantize_indexer_fp8_rows`).
+        fmt: ``fp8`` (:func:`~.quant.quantize_indexer_fp8_rows`) or ``mxfp4``
+            (:func:`~.quant.quantize_indexer_mxfp4_rows`, D = 128).
         rows: Keys to quantize, from the first; defaults to all.
 
     Returns:
@@ -149,14 +155,22 @@ def quantize_keys(k: Tensor, fmt: IndexerTopKFormat, *, rows: int | None = None)
         raise ValueError(f"fmt must be one of {_FORMATS}, got {fmt!r}")
     if k.ndim != 2:
         raise ValueError(f"expected keys [N, D], got {tuple(k.shape)}")
+    if fmt == "mxfp4" and k.shape[1] != 128:
+        raise ValueError(f"indexer MXFP4 requires rows of 128 values, got {tuple(k.shape)}")
     count = k.shape[0] if rows is None else rows
     if type(count) is not int or not 0 <= count <= k.shape[0]:
         raise ValueError(f"rows must be an integer in [0, {k.shape[0]}], got {rows!r}")
-    data = torch.empty((count, k.shape[1]), dtype=torch.float8_e4m3fn, device=k.device)
-    scale = torch.empty((count,), dtype=torch.float32, device=k.device)
+    if fmt == "fp8":
+        data = torch.empty((count, k.shape[1]), dtype=torch.float8_e4m3fn, device=k.device)
+        scale = torch.empty((count,), dtype=torch.float32, device=k.device)
+        quantize = quantize_indexer_fp8_rows
+    else:
+        data = torch.empty((count, k.shape[1] // 2), dtype=torch.int8, device=k.device)
+        scale = torch.empty((count,), dtype=torch.int32, device=k.device)
+        quantize = quantize_indexer_mxfp4_rows
     for start in range(0, count, _KEY_QUANTIZE_ROWS):
         end = min(start + _KEY_QUANTIZE_ROWS, count)
-        chunk_data, chunk_scale = quantize_indexer_fp8_rows(k[start:end])
+        chunk_data, chunk_scale = quantize(k[start:end])
         data[start:end].copy_(chunk_data)
         scale[start:end].copy_(chunk_scale)
     return QuantizedKeys(fmt=fmt, data=data, scale=scale)
@@ -185,23 +199,28 @@ def quantize_queries(
     Args:
         q: Indexer queries ``[n, H, D]``.
         weights: Per-head weights ``[n, H]``, not yet multiplied by ``softmax_scale``.
-        fmt: ``fp8``.
+        fmt: ``fp8`` or ``mxfp4`` (D = 128).
         softmax_scale: Positive score scale folded into the weights.
         kernel_heads: Heads of the score kernel, at least H; the missing heads are appended as
-            zero queries with zero weights, which add exact zeros to a score.
+            zero queries with zero weights (and unit scales), which add exact zeros to a score.
 
     Returns:
-        ``(data, scales, weights)``: ``float8_e4m3fn`` ``[n, kernel_heads, D]``, no scales (None)
-        and float32 weights with the query row scales folded in.
-
-    Raises:
-        ValueError: If ``fmt`` is not a supported operand format.
+        ``(data, scales, weights)``: FP8 ``float8_e4m3fn`` ``[n, kernel_heads, D]``, no scales
+        and float32 weights with the query row scales folded in; or MXFP4 int8
+        ``[n, kernel_heads, D // 2]``, int32 ``[n, kernel_heads]`` packed UE8M0 group exponents
+        and float32 weights.
     """
     if fmt not in _FORMATS:
         raise ValueError(f"fmt must be one of {_FORMATS}, got {fmt!r}")
-    data, q_scale = quantize_indexer_fp8_rows(q)
-    folded = fold_indexer_weights(weights, softmax_scale=softmax_scale, q_scale=q_scale)
-    return _pad_heads(data, kernel_heads, 0), None, _pad_heads(folded, kernel_heads, 0.0)
+    if fmt == "fp8":
+        data, q_scale = quantize_indexer_fp8_rows(q)
+        folded = fold_indexer_weights(weights, softmax_scale=softmax_scale, q_scale=q_scale)
+        scales = None
+    else:
+        data, scales = quantize_indexer_mxfp4_rows(q)
+        folded = fold_indexer_weights(weights, softmax_scale=softmax_scale, q_scale=None)
+        scales = _pad_heads(scales, kernel_heads, _UE8M0_ONES)
+    return _pad_heads(data, kernel_heads, 0), scales, _pad_heads(folded, kernel_heads, 0.0)
 
 
 def _mqa_logits(
@@ -241,7 +260,10 @@ def _score_kernel_accepts(fmt: str, heads: int, head_dim: int, device: torch.dev
     queries = torch.zeros((rows, heads, head_dim), dtype=torch.bfloat16, device=device)
     keys = quantize_keys(torch.zeros((256, head_dim), dtype=torch.bfloat16, device=device), fmt)
     weights = torch.zeros((rows, heads), dtype=torch.float32, device=device)
-    q = (quantize_indexer_fp8_rows(queries)[0], None)
+    if fmt == "fp8":
+        q = (quantize_indexer_fp8_rows(queries)[0], None)
+    else:
+        q = quantize_indexer_mxfp4_rows(queries)
     starts = torch.zeros((rows,), dtype=torch.int32, device=device)
     ends = torch.full((rows,), 256, dtype=torch.int32, device=device)
     try:
@@ -336,8 +358,17 @@ def topk_kernel(exact_topk: ExactTopKConfig | None) -> TopKKernel:
     namespace = _cudnn_dsa_namespace()
 
     def radix(scores: Tensor, lengths: Tensor, top_k: int) -> Tensor:
+        # DeepGEMM pads score rows. cuDNN reads these views directly when every
+        # row starts on a 32-byte boundary and the columns have unit stride.
+        if not (
+            scores.stride(1) == 1
+            and scores.stride(0) >= scores.shape[1]
+            and (scores.stride(0) * scores.element_size()) % 32 == 0
+            and scores.data_ptr() % 32 == 0
+        ):
+            scores = scores.contiguous()
         result = namespace.indexer_top_k_wrapper(
-            scores.contiguous(), lengths, top_k=top_k, next_n=1, return_val=False
+            scores, lengths, top_k=top_k, next_n=1, return_val=False
         )
         return result["indices"].to(torch.int32)
 
@@ -400,7 +431,7 @@ class ReferenceSelector:
     """The matched-precision reference selector with fixed kernels and chunking.
 
     Attributes:
-        fmt: Operand format: ``fp8``.
+        fmt: Operand format: ``fp8`` or ``mxfp4``.
         topk_kernel: The top-k kernel (:func:`topk_kernel`).
         kernel_heads: Heads the score kernel runs with; queries with fewer heads are padded with
             zero heads (see :func:`score_kernel_heads`).
@@ -515,6 +546,8 @@ class ReferenceSelector:
         for segment, start, end in pieces:
             first = segment.position + start - segment.row_start + 1
             seen = torch.arange(first, first + end - start, dtype=torch.int64, device=q.device)
+            if layout.key_ratio != 1:
+                seen = torch.div(seen, layout.key_ratio, rounding_mode="floor")
             visible.append(seen.clamp_(max=segment.key_count).to(torch.int32))
         windows = visible[0] if len(visible) == 1 else torch.cat(visible)
         rows_per_call = self.rows_per_scoring_call(width)
@@ -642,8 +675,8 @@ def reference_topk(
 ) -> Tensor:
     """Select the top-k keys of every query row with the matched-precision reference selector.
 
-    Quantizes the queries and keys to ``fmt``, folds ``softmax_scale`` and the query scales into
-    float32 weights, scores every visible key with DeepGEMM ``fp8_fp4_mqa_logits``
+    Quantizes the queries and keys to ``fmt``, folds ``softmax_scale`` (and, for FP8, the query
+    scales) into float32 weights, scores every visible key with DeepGEMM ``fp8_fp4_mqa_logits``
     and keeps the ``topk`` best keys of every row with the exact-tie top-k (score descending,
     lower key id first on equal scores) or, without ``exact_topk``, the cuDNN frontend radix
     top-k (equal scores in unspecified order). The indexer top-k bindings run the same selector
@@ -659,9 +692,10 @@ def reference_topk(
         layout: The query rows and the keys each one sees.
         topk: Keys selected per row (at most 2048 with the exact-tie top-k).
         softmax_scale: Positive score scale, folded into the weights.
-        fmt: ``fp8`` (E4M3 rows with float32 scales).
+        fmt: ``fp8`` (E4M3 rows with float32 scales) or ``mxfp4`` (indexer MXFP4, D = 128).
         exact_topk: The exact-tie top-k package; None uses the cuDNN frontend radix top-k.
-        budget_bytes: Byte budget of the float32 scores of one scoring call; defaults to 2 GiB.
+        budget_bytes: Byte budget of the float32 scores of one scoring call; defaults to 2 GiB
+            for FP8 and 1 GiB for MXFP4.
         rows_per_call: Rows per scoring call, bounded by the budget; defaults to whole score
             kernel waves within the budget (:func:`plan_score_rows`).
         out: Optional int32 ``[layout.rows, topk]`` destination.
