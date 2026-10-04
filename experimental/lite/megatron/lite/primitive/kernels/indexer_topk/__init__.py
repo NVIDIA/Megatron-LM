@@ -42,6 +42,8 @@ from megatron.lite.primitive.kernels.indexer_topk.order import compact_valid_top
 from megatron.lite.primitive.kernels.indexer_topk.quant import (
     fold_indexer_weights,
     quantize_indexer_fp8_rows,
+    quantize_indexer_mxfp4_rows,
+    quantize_indexer_mxfp4_rows_reference,
 )
 from megatron.lite.primitive.kernels.indexer_topk.reference import plan_score_rows, reference_topk
 
@@ -68,6 +70,8 @@ __all__ = [
     "normalize_indexer_topk_config",
     "plan_score_rows",
     "quantize_indexer_fp8_rows",
+    "quantize_indexer_mxfp4_rows",
+    "quantize_indexer_mxfp4_rows_reference",
     "reference_topk",
     "release_indexer_topk_workspaces",
     "resolve_indexer_topk_tuning",

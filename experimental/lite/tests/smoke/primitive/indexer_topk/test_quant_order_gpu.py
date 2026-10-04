@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""GPU equivalence of the indexer top-k row-order Triton kernels and their torch semantics.
+"""GPU equivalence of the indexer top-k Triton kernels and the torch semantics they implement.
 
 Run explicitly (optional suite)::
 
@@ -12,13 +12,123 @@ from __future__ import annotations
 import pytest
 import torch
 
-from megatron.lite.primitive.kernels.indexer_topk import compact_valid_topk_, order, sort_topk_rows_
+from megatron.lite.primitive.kernels.indexer_topk import (
+    compact_valid_topk_,
+    order,
+    quantize_indexer_mxfp4_rows,
+    quantize_indexer_mxfp4_rows_reference,
+    sort_topk_rows_,
+)
 
 pytestmark = [pytest.mark.gpus(1, min_architecture="blackwell"), pytest.mark.optional]
 
 pytest.importorskip("triton")
 
 _INT32_MAX = torch.iinfo(torch.int32).max
+_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def _finite_bf16_values() -> torch.Tensor:
+    values = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    return values[torch.isfinite(values)]
+
+
+def _midpoint_sweep() -> torch.Tensor:
+    """Every E2M1 midpoint, and its bfloat16 neighbours, at every reachable finite group scale.
+
+    A group of amax ``6 * 2**(e - 127)`` has exactly the scale ``2**(e - 127)``; e = 114 is the
+    1e-4 floor and e = 252 the largest scale whose amax is finite in bfloat16.
+    """
+    middle = torch.tensor(_MIDPOINTS, dtype=torch.bfloat16)
+    below = (middle.view(torch.int16) - 1).view(torch.bfloat16)
+    above = (middle.view(torch.int16) + 1).view(torch.bfloat16)
+    group = torch.cat(
+        [
+            torch.tensor([6.0, -6.0]),
+            below.float(),
+            middle.float(),
+            above.float(),
+            -middle.float(),
+            torch.tensor([-0.0, 0.0]),
+        ]
+    )
+    groups = [group * 2.0 ** (exponent - 127) for exponent in range(114, 253)]
+    groups += [torch.zeros(32)] * (-len(groups) % 4)
+    return torch.stack(groups).to(torch.bfloat16).reshape(-1, 128)
+
+
+def _mxfp4_case(name: str) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(20260930)
+    if name == "random_rows":
+        return torch.randn(4103, 128, generator=generator).to(torch.bfloat16) * 3
+    if name == "row_tails":
+        return torch.randn(33, 128, generator=generator).to(torch.bfloat16)
+    if name == "leading_dims":
+        return torch.randn(5, 64, 128, generator=generator).to(torch.bfloat16)
+    if name == "all_finite_bf16_shuffled":
+        values = _finite_bf16_values()
+        return values[torch.randperm(values.numel(), generator=generator)].reshape(-1, 128)
+    if name == "all_finite_bf16_by_magnitude":
+        values = _finite_bf16_values()
+        return values[values.float().abs().argsort(stable=True)].reshape(-1, 128)
+    if name == "midpoint_sweep":
+        return _midpoint_sweep()
+    if name == "specials":
+        special = torch.zeros(4, 128)
+        special[0, :8] = torch.tensor([*_MIDPOINTS, 6.0])
+        special[1, :32] = 1.0e-5
+        special[1, 32:64] = -0.0
+        special[2, 0], special[2, 1], special[2, 2] = float("inf"), float("-inf"), 1.0
+        special[3] = torch.finfo(torch.bfloat16).max
+        return special.to(torch.bfloat16)
+    if name == "float16":
+        return torch.randn(257, 128, generator=generator).to(torch.float16) * 100
+    if name == "float32":
+        magnitude = torch.exp(torch.randn(257, 128, generator=generator) * 8)
+        return magnitude * torch.randn(257, 128, generator=generator).sign()
+    if name == "non_contiguous":
+        return torch.randn(128, 257, generator=generator).to(torch.bfloat16).t()
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "random_rows",
+        "row_tails",
+        "leading_dims",
+        "all_finite_bf16_shuffled",
+        "all_finite_bf16_by_magnitude",
+        "midpoint_sweep",
+        "specials",
+        "float16",
+        "float32",
+        "non_contiguous",
+        "large_row_offsets",
+    ],
+)
+@torch.no_grad()
+def test_mxfp4_triton_matches_reference_bitwise(case):
+    if case == "large_row_offsets":
+        # With 2**24 + 17 rows the last rows start beyond 2**31 elements of the source.
+        torch.manual_seed(871)
+        rows = 2**24 + 17
+        value = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+        packed, scales = quantize_indexer_mxfp4_rows(value)
+        for part in (slice(0, 17), slice(rows - 17, rows)):
+            expected_packed, expected_scales = quantize_indexer_mxfp4_rows_reference(value[part])
+            assert torch.equal(packed[part], expected_packed)
+            assert torch.equal(scales[part], expected_scales)
+        return
+
+    source = _mxfp4_case(case)
+    packed, scales = quantize_indexer_mxfp4_rows(source.cuda())
+    reference_packed, reference_scales = quantize_indexer_mxfp4_rows_reference(source.cuda())
+    cpu_packed, cpu_scales = quantize_indexer_mxfp4_rows_reference(source)
+
+    assert packed.shape == (*source.shape[:-1], 64) and scales.shape == source.shape[:-1]
+    assert torch.equal(packed, reference_packed) and torch.equal(scales, reference_scales)
+    assert torch.equal(packed.cpu(), cpu_packed) and torch.equal(scales.cpu(), cpu_scales)
 
 
 def _index_chunk(start: int, stop: int, keys: int, topk: int) -> torch.Tensor:
