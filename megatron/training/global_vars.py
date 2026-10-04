@@ -154,16 +154,15 @@ def _graceful_shutdown(signum, frame):
     sys.exit(0)
 
 
-def set_global_variables(args, build_tokenizer=True):
-    """Register args and construct runtime services for args-only callers."""
+def set_global_variables(args, cfg_container, build_tokenizer=True):
+    """Register caller-provided args/config and construct runtime services."""
 
     assert args is not None
+    assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    set_run_config(cfg_container)
     set_args(args)
-
-    from megatron.training.argument_utils import inference_cfg_container_from_args
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args, build_tokenizer=build_tokenizer)
 
 
@@ -324,8 +323,8 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        # Keep legacy metadata keys while serializing owned logging settings directly.
-        wandb_config = {**vars(args), **asdict(cfg.logger)}
+        # Keep legacy metadata keys while serializing owned settings directly.
+        wandb_config = {**vars(args), **asdict(cfg.logger), **asdict(cfg.profiling)}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.

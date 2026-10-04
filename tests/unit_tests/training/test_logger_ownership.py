@@ -39,7 +39,6 @@ def test_cli_aliases_and_native_config_match(run_config):
             '--otel-span-groups',
             'checkpoint',
             '--no-barrier-with-level-1-timing',
-            '--run-workload-inspector-server',
         ]
     )
     config = _default_config_from_args(LoggerConfig, args)
@@ -53,7 +52,6 @@ def test_cli_aliases_and_native_config_match(run_config):
         otel_enabled=True,
         otel_service_name='service',
         otel_span_groups='checkpoint',
-        run_workload_inspector_server=True,
     )
     assert asdict(config) == asdict(expected)
 
@@ -127,14 +125,16 @@ def test_wandb_uses_owned_settings_and_detached_metadata(monkeypatch, tmp_path, 
         wandb_save_dir=str(tmp_path),
         log_interval=17,
     )
-    args = Namespace(rank=0, world_size=1, log_interval=99)
+    args = Namespace(rank=0, world_size=1, log_interval=99, run_workload_inspector_server=False)
     before = vars(args).copy()
     run_config.logger = config
+    run_config.profiling.run_workload_inspector_server = True
     global_vars._set_wandb_writer(args)
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)
     assert kwargs['config']['log_interval'] == 17
+    assert kwargs['config']['run_workload_inspector_server'] is True
     assert vars(args) == before
 
 
@@ -195,15 +195,18 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
 def test_tensorboard_metadata_uses_config(monkeypatch, run_config):
     from megatron.training import initialize
 
-    args = Namespace(iteration=13, log_interval=99)
+    args = Namespace(iteration=13, log_interval=99, run_workload_inspector_server=False)
     writer = Mock()
     monkeypatch.setattr(initialize, 'get_args', lambda: args)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
     run_config.logger = LoggerConfig(log_interval=17)
+    run_config.profiling.run_workload_inspector_server = True
     write_args_to_tensorboard()
     writer.add_text.assert_any_call('log_interval', '17', global_step=13)
+    writer.add_text.assert_any_call('run_workload_inspector_server', 'True', global_step=13)
     assert all(call.args != ('log_interval', '99') for call in writer.add_text.call_args_list)
     assert args.log_interval == 99
+    assert args.run_workload_inspector_server is False
 
 
 def test_async_worker_telemetry_uses_config(monkeypatch, run_config):

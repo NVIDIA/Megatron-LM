@@ -6,7 +6,7 @@ import os
 import random
 import time
 import warnings
-from dataclasses import fields
+from dataclasses import asdict
 from datetime import timedelta
 from typing import Optional
 
@@ -510,11 +510,9 @@ def write_args_to_tensorboard():
     cfg = get_run_config()
     writer = get_tensorboard_writer()
     if writer:
-        for arg in vars(args):
-            if not hasattr(cfg.logger, arg):
-                writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
-        for field in fields(cfg.logger):
-            writer.add_text(field.name, str(getattr(cfg.logger, field.name)), global_step=args.iteration)
+        metadata = {**vars(args), **asdict(cfg.logger), **asdict(cfg.profiling)}
+        for name, value in metadata.items():
+            writer.add_text(name, str(value), global_step=args.iteration)
 
 
 def set_jit_fusion_options(tp_size=None):

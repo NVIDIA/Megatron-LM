@@ -4761,7 +4761,7 @@ def train(
     if args.hybrid_context_parallel:
         train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
-    if cfg.logger.run_workload_inspector_server:
+    if cfg.profiling.run_workload_inspector_server:
         try:
             import threading
 
