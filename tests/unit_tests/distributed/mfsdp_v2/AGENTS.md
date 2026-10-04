@@ -3,6 +3,4 @@
 - Read the test files' module docstrings to choose a focused destination by the
   behavior being tested. Extend an existing test or parametrization when it
   covers the same behavior.
-- Keep parametrized cases together in the appropriate file, including tests
-  that cover multiple placement or mesh configurations.
 - Use `test_fully_shard.py` only as a last resort when no focused file fits.
