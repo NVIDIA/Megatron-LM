@@ -184,7 +184,12 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+        if self.caller_managed_grad_sync:
+            # Leave the wait to the caller's finish_grad_sync(), after all backward work,
+            # including delayed weight-gradient computation, has been launched.
+            return
+        if self._post_backward_hook_registered:
+            # Another root sharing this context already queued the completion wait.
             return
         self._post_backward_hook_registered = True
 
