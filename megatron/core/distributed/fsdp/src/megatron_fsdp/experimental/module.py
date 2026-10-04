@@ -559,8 +559,8 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
-        self._reduce_gradient_groups()
         self.context.validate_grad_sync()
+        self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 

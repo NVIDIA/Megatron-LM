@@ -299,8 +299,6 @@ def test_fully_shard_rejects_delayed_te_weight_gradient(distributed_setup):
 
     with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
         model.backward_dw()
-    # Drain reductions launched before validation rejected this backward.
-    torch.cuda.synchronize()
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
