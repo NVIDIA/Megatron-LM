@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Memory-accounting tests for Megatron-FSDP."""
+"""Memory-accounting tests for Megatron-FSDP.
+
+Add tests here for persistent or peak allocation sizes, buffer lifetime, and
+storage release, including cases parametrized over sharding strategies.
+"""
 
 import logging
 

@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for MFSDP v2 parameter ownership and lifecycle."""
+"""Unit tests for MFSDP v2 parameter ownership and lifecycle.
+
+Add tests here for parameter ownership and lifecycle: nested ownership, tied or
+frozen parameters, CPU/meta initialization, and parameter-view validity.
+"""
 
 import pytest
 import torch

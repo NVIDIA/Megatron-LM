@@ -1,9 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for MFSDP v2."""
+"""Fallback tests for MFSDP v2.
 
-# Use this file only as a last resort when no focused test file fits.
-# See AGENTS.md in this directory for test placement guidance.
+Use this file only as a last resort when no focused test file fits. Read the
+other test files' module docstrings to choose a destination.
+"""
 
 import logging
 from typing import NamedTuple

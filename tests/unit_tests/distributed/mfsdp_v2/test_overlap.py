@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Communication-overlap tests for the minimal Megatron-FSDP path."""
+"""Communication-overlap tests for the minimal Megatron-FSDP path.
+
+Add tests here for communication/computation overlap and the effect of prefetch
+settings on overlap.
+"""
 
 from itertools import chain
 

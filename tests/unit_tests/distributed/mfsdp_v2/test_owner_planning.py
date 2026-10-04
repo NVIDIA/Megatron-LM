@@ -1,7 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""
-Pure CPU tests for the parameter layout and owner-compute packing logic.
+"""Pure CPU tests for the parameter layout and owner-compute packing logic.
+
+Add tests here for owner-compute layouts, work assignment, and gather/scatter
+packing plans without distributed communication.
 
 These tests exercise functions without a process group or any `torch.distributed` dependency. P2P
 communication is simulated in-process by `_simulate_p2p`.

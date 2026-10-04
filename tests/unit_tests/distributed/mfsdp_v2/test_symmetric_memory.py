@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for experimental FSDP symmetric-memory staging."""
+"""Unit tests for experimental FSDP symmetric-memory staging.
+
+Add tests here for symmetric-memory staging and communication backend behavior.
+"""
 
 from itertools import chain
 

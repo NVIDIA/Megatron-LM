@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""MCore adapter and optimizer integration tests for experimental MFSDP v2."""
+"""MCore adapter and optimizer integration tests for experimental MFSDP v2.
+
+Add tests here for MCore adapter configuration and integration with MCore models
+and optimizers.
+"""
 
 import contextlib
 import logging

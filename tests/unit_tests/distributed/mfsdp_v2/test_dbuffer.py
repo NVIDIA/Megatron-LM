@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for Megatron-FSDP DBuffer."""
+"""Unit tests for Megatron-FSDP DBuffer.
+
+Add tests here for DBuffer layout, padding, views, casting, redistribution, and
+collective operations.
+"""
 
 from collections.abc import Iterable
 

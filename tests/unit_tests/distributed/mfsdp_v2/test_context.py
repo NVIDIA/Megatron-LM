@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for experimental Megatron-FSDP runtime contexts."""
+"""Unit tests for experimental Megatron-FSDP runtime contexts.
+
+Add tests here for context construction, sharing and scoping, module traversal
+and prefetch order, and microbatch context state.
+"""
 
 from unittest.mock import Mock
 
