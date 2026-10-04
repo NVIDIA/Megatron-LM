@@ -1567,6 +1567,12 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    fine_grained_offloading_buffer_size_gib: float = 0.0
+    """Fixed pinned activation buffer capacity per rank, in GiB; zero disables it.
+    Capacity in bytes must be a power of two and at least 256 bytes, avoiding host
+    allocator rounding beyond this budget. Storage is preallocated and never grows.
+    This bounds the shared offload buffer, not other host allocations or allocator caches."""
+
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
@@ -2596,6 +2602,21 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+        buffer_size = self.fine_grained_offloading_buffer_size_gib
+        if buffer_size != 0:
+            buffer_bytes = buffer_size * 2**30
+            if not math.isfinite(buffer_bytes) or buffer_bytes <= 0:
+                raise ValueError("Pinned offload buffer requires a finite positive buffer_size_gib")
+            if not self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "Pinned offload buffer requires fine_grained_activation_offloading"
+                )
+            capacity = int(buffer_bytes)
+            if capacity != buffer_bytes or capacity < 256 or capacity & (capacity - 1):
+                raise ValueError(
+                    "Pinned offload buffer capacity must be a power of two and at least 256 bytes"
                 )
 
         if self.fine_grained_activation_offloading:
