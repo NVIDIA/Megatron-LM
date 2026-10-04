@@ -54,15 +54,16 @@ class TorchSampling(Sampling):
         *,
         vocab_size: Optional[int] = None,
     ) -> Tensor:
-        """Temperature-scale then top-k/top-p filter logits; filtered entries become -inf.
+        """Temperature-scale and top-k/top-p filter logits in FP32.
 
-        Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
-        `log_probs_kernel` so sampling and processed log-probs apply the same filter.
+        Returns a new tensor with filtered entries set to -inf (input unmodified).
+        Shared by `sample_from_logits` and `log_probs_kernel` so sampling and
+        processed log-probs apply the same filter.
         """
         top_p_active = not is_no_op_top_p(top_p)
         assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
-        # Clone needed: .div_() and the filters below modify in-place.
-        last_token_logits = last_token_logits.clone()
+        # Copy needed: .div_() and the filters below modify in-place.
+        last_token_logits = last_token_logits.to(dtype=torch.float32, copy=True)
         if temperature != 1.0:
             last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
         if not is_no_op_top_k(top_k):
