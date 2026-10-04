@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
+requires = ["setuptools>=80", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -83,7 +83,7 @@ mlm = [
 ]
 
 dev = [
-    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
     "nvidia-resiliency-ext==0.6.0",
     "tqdm",
@@ -169,7 +169,7 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0,>=77.0.0",
+    "setuptools>=80",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
