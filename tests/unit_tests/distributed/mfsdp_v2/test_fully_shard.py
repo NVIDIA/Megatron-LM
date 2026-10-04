@@ -274,11 +274,8 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
-def test_fully_shard_delayed_te_weight_gradient(
-    distributed_setup, monkeypatch, caller_managed_grad_sync
-):
-    """Delayed TE wgrad requires an explicit opt-in and a wait before consuming grads."""
+def test_fully_shard_rejects_delayed_te_weight_gradient(distributed_setup):
+    """Default automatic synchronization rejects weight gradients produced after autograd."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -292,9 +289,7 @@ def test_fully_shard_delayed_te_weight_gradient(
         delay_wgrad_compute=True,
         fuse_wgrad_accumulation=False,
     )
-    with fully_shard_context(
-        device=device, caller_managed_grad_sync=caller_managed_grad_sync
-    ) as context:
+    with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -302,32 +297,10 @@ def test_fully_shard_delayed_te_weight_gradient(
     assert model.weight.grad is None
     assert model.phase is FsdpModule.Phase.BACKWARD
 
-    if not caller_managed_grad_sync:
-        with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
-            model.backward_dw()
-        # Drain reductions launched before validation rejected this backward.
-        torch.cuda.synchronize()
-        return
-
-    group = model.parameter_groups[0]
-    group.main_grad.local_buffer.fill_(float("nan"))
-    reduce_partial_gradients = group.reduce_partial_gradients
-
-    def delayed_reduce(*args, **kwargs):
-        # Keep reduction pending while the consumer stream reads the gradient.
-        torch.cuda._sleep(200_000_000)
-        return reduce_partial_gradients(*args, **kwargs)
-
-    monkeypatch.setattr(group, "reduce_partial_gradients", delayed_reduce)
-    model.backward_dw()
-    context.finish_grad_sync()
-    # Read before synchronizing: checking only .grad existence misses stream races.
-    consumed_gradient = model.weight.grad.clone()
+    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
+        model.backward_dw()
+    # Drain reductions launched before validation rejected this backward.
     torch.cuda.synchronize()
-    torch.testing.assert_close(consumed_gradient, model.weight.grad)
-
-    assert model.weight.grad is not None
-    assert model.phase is FsdpModule.Phase.RESTING
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
