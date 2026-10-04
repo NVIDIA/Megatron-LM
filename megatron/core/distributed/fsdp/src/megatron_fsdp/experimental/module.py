@@ -560,6 +560,7 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
         self._reduce_gradient_groups()
+        self.context.validate_grad_sync()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
@@ -573,8 +574,6 @@ class FsdpModule:
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
-
-                context.validate_grad_sync()
 
                 with torch.cuda.stream(reduce_scatter_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
