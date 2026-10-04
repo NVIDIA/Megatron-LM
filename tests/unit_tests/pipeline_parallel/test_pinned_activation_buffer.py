@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 import os
 
 import pytest
 import torch
 
+from megatron.core.pipeline_parallel import pinned_activation_buffer
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     ChunkOffloadHandler,
     OffloadTensorGroup,
@@ -321,13 +323,83 @@ def test_typed_views_preserve_shape_stride_and_alignment(shape, dtype):
         pool.free(host)
 
 
-@pytest.mark.parametrize("capacity", [0, -MIB, 128, 3 * MIB])
+@pytest.mark.parametrize("capacity", [0, -MIB, 128, 3 * MIB + 1])
 def test_invalid_fixed_capacity(capacity):
-    with pytest.raises(ValueError, match="power of two"):
+    with pytest.raises(ValueError, match="multiple of 256 bytes"):
         PinnedActivationBuffer(capacity)
 
 
-@pytest.mark.parametrize("size_gib", [0, 0.5, 8])
+def _mapping_bytes(address):
+    """Return the size of the /proc/self/maps mapping that contains ``address``."""
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            start, end = (int(x, 16) for x in line.split(maxsplit=1)[0].split("-"))
+            if start <= address < end:
+                return end - start
+    raise AssertionError(f"no mapping contains {address:#x}")
+
+
+# Each capacity leaves several MiB below the next power of two for page rounding.
+@pytest.mark.parametrize("capacity", [16 * MIB + 256, 5 * MIB])
+def test_non_power_of_two_capacity_is_pinned_exactly(capacity):
+    before = torch.cuda.host_memory_stats()
+    arena = PinnedActivationBuffer(capacity)
+    after = torch.cuda.host_memory_stats()
+    # The storage does not come from the pinned caching allocator, which rounds up.
+    assert after["active_requests.allocated"] == before["active_requests.allocated"]
+    assert arena._storage.numel() == capacity and arena._storage.is_pinned()
+    if os.path.exists("/proc/self/maps"):
+        # The driver rounds to whole pages only, never to the next power of two.
+        assert capacity <= _mapping_bytes(arena._storage.data_ptr()) < 1 << capacity.bit_length()
+    host = arena.allocate((capacity // 4,), torch.float32)
+    with pytest.raises(RuntimeError, match="budget exceeded"):
+        arena.allocate((1,), torch.uint8)
+    source = torch.randn(capacity // 4, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        host.copy_(source, non_blocking=True)
+        result = torch.empty_like(source)
+        result.copy_(host, non_blocking=True)
+        arena.release(host, stream=stream)
+    torch.cuda.synchronize()
+    assert torch.equal(result, source)
+
+
+def test_storage_is_freed_only_after_the_last_view(caplog):
+    arena = PinnedActivationBuffer(MIB)
+    free = arena._free
+    view = arena.allocate((MIB,), torch.uint8)
+    del arena
+    gc.collect()
+    # A surviving view keeps the pinned pages allocated and usable.
+    assert free.alive and view.is_pinned()
+    view.fill_(5)
+    assert torch.all(view == 5)
+    del view
+    gc.collect()
+    assert not free.alive
+    assert "cudaFreeHost" not in caplog.text
+
+
+def test_failed_host_allocation_raises(monkeypatch):
+    runtime = pinned_activation_buffer._cuda_runtime()
+
+    class FailingRuntime:
+        cudaError_t = runtime.cudaError_t
+        cudaHostAllocDefault = runtime.cudaHostAllocDefault
+        cudaGetLastError = staticmethod(runtime.cudaGetLastError)
+
+        @staticmethod
+        def cudaHostAlloc(nbytes, flags):
+            return runtime.cudaError_t.cudaErrorMemoryAllocation, 0
+
+    monkeypatch.setattr(pinned_activation_buffer, "_cuda_runtime", lambda: FailingRuntime)
+    with pytest.raises(RuntimeError, match=f"cudaHostAlloc of {3 * MIB} bytes"):
+        PinnedActivationBuffer(3 * MIB)
+
+
+@pytest.mark.parametrize("size_gib", [0, 0.5, 8, 3, 152])
 def test_pinned_buffer_config(size_gib):
     config = TransformerConfig(
         num_layers=2,
@@ -340,7 +412,7 @@ def test_pinned_buffer_config(size_gib):
     assert config.fine_grained_offloading_buffer_size_gib == size_gib
 
 
-@pytest.mark.parametrize("size_gib", [-1, float("nan"), float("inf"), 3, 2**-24])
+@pytest.mark.parametrize("size_gib", [-1, float("nan"), float("inf"), 0.1, 1000 / 2**30, 2**-24])
 def test_invalid_pinned_buffer_config(size_gib):
     with pytest.raises(ValueError, match="Pinned offload buffer"):
         TransformerConfig(
@@ -350,4 +422,14 @@ def test_invalid_pinned_buffer_config(size_gib):
             fine_grained_activation_offloading=True,
             offload_modules=["moe_act"],
             fine_grained_offloading_buffer_size_gib=size_gib,
+        )
+
+
+def test_pinned_buffer_requires_activation_offloading():
+    with pytest.raises(ValueError, match="requires fine_grained_activation_offloading"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            fine_grained_offloading_buffer_size_gib=1.5,
         )

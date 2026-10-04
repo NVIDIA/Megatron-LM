@@ -166,7 +166,9 @@ class OffloadTensorPool:
         pool.free(tensor)
     """
 
-    def __init__(self, device: str = 'cuda', pin_memory: bool = False, capacity_bytes: int = 0):
+    def __init__(
+        self, device: str = "cuda", pin_memory: bool = False, capacity_bytes: int = 0
+    ) -> None:
         """
         Initialize offload tensor pool.
 

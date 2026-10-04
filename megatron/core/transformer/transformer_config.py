@@ -1569,9 +1569,16 @@ class TransformerConfig(ModelParallelConfig):
 
     fine_grained_offloading_buffer_size_gib: float = 0.0
     """Fixed pinned activation buffer capacity per rank, in GiB; zero disables it.
-    Capacity in bytes must be a power of two and at least 256 bytes, avoiding host
-    allocator rounding beyond this budget. Storage is preallocated and never grows.
-    This bounds the shared offload buffer, not other host allocations or allocator caches."""
+    Capacity in bytes must be a positive multiple of 256 bytes and is pinned at that
+    size, not rounded up to a power of two. The buffer is allocated once, at the first
+    forward pass, and never grows; running out raises an error. Space is reused only
+    once every backup has been reloaded, so the buffer must hold everything offloaded
+    between such points, with each tensor aligned to 256 bytes. That is one microbatch
+    when each backward finishes before the next forward starts (PP=1, or the last
+    pipeline stage without virtual pipeline stages, and no
+    overlap_moe_expert_parallel_comm); otherwise it is everything the rank offloads in
+    an iteration, across all microbatches and model chunks. This bounds the shared
+    offload buffer, not other host allocations or allocator caches."""
 
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
@@ -2614,9 +2621,12 @@ class TransformerConfig(ModelParallelConfig):
                     "Pinned offload buffer requires fine_grained_activation_offloading"
                 )
             capacity = int(buffer_bytes)
-            if capacity != buffer_bytes or capacity < 256 or capacity & (capacity - 1):
+            if capacity != buffer_bytes or capacity < 256 or capacity % 256:
                 raise ValueError(
-                    "Pinned offload buffer capacity must be a power of two and at least 256 bytes"
+                    "Pinned offload buffer capacity must be a positive multiple of 256 bytes, "
+                    "so the size in GiB must be a multiple of 2**-22 (for example 152 or "
+                    f"152.5); got fine_grained_offloading_buffer_size_gib={buffer_size} "
+                    f"({buffer_bytes} bytes)"
                 )
 
         if self.fine_grained_activation_offloading:

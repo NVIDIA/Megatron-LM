@@ -2,9 +2,17 @@
 
 """Bounded pinned storage for fine-grained activation offloading."""
 
+import ctypes
+import logging
 import math
+import time
+import weakref
 
 import torch
+
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
 
 
 def _cuda_runtime():
@@ -14,6 +22,19 @@ def _cuda_runtime():
     except ImportError as error:
         raise RuntimeError("A fixed pinned activation buffer requires cuda-python") from error
     return cuda_runtime
+
+
+def _free_host(address: int, device: int) -> None:
+    """Free a cudaHostAlloc allocation with the allocating device current.
+
+    Garbage collection may run this on any thread; selecting the device keeps the
+    runtime from creating a context on another GPU.
+    """
+    cuda_runtime = _cuda_runtime()
+    with torch.cuda.device(device):
+        (error,) = cuda_runtime.cudaFreeHost(address)
+    if error != cuda_runtime.cudaError_t.cudaSuccess:
+        logger.warning("cudaFreeHost of the pinned activation buffer failed: %s", error)
 
 
 class PinnedActivationBuffer:
@@ -29,27 +50,28 @@ class PinnedActivationBuffer:
     separate range, reusable within that capture after its readers finish.
     Eager epochs use the remaining tail and cannot overwrite graph backups.
 
-    Capacity must be a power of two so the host allocator cannot round the
-    backing allocation beyond the budget. Storage is allocated at construction
-    and stays alive with this object, including while captured graphs retain
-    its addresses. Exhaustion raises an error; the buffer never grows.
+    Capacity may be any positive multiple of 256 bytes and is pinned at that size:
+    the storage comes from cudaHostAlloc directly rather than from the PyTorch
+    pinned host allocator, which would round the request up to the next power
+    of two. Storage is allocated at construction and freed once this object and
+    every view of it are gone. Captured graphs hold raw addresses, so keep this
+    object alive while any graph that uses it can replay. Exhaustion raises an
+    error; the buffer never grows.
     """
 
     ALIGNMENT = 256
 
     def __init__(self, capacity_bytes: int) -> None:
-        if capacity_bytes < self.ALIGNMENT or capacity_bytes & (capacity_bytes - 1):
+        if capacity_bytes < self.ALIGNMENT or capacity_bytes % self.ALIGNMENT:
             raise ValueError(
-                "Pinned activation buffer capacity must be a power of two and at least 256 bytes"
+                "Pinned activation buffer capacity must be a positive multiple of 256 bytes"
             )
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Create the pinned activation buffer before CUDA graph capture")
         self.capacity_bytes = capacity_bytes
         self.peak_live_bytes = 0
         self.live_bytes = 0
-        self._storage = torch.empty(
-            capacity_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
-        )
+        self._storage = self._allocate_storage(capacity_bytes)
         self._typed_storage: dict[torch.dtype, torch.Tensor] = {}
         self._offset = 0
         self.graph_reserved_bytes = 0
@@ -60,6 +82,37 @@ class PinnedActivationBuffer:
         self._pending_events: list[torch.cuda.Event] = []
         self._captured_events: list[torch.cuda.Event] = []
         self._writers_waited: set[int] = set()
+
+    def _allocate_storage(self, capacity_bytes: int) -> torch.Tensor:
+        """Pin exactly ``capacity_bytes`` (rounded up to whole pages) with cudaHostAlloc.
+
+        This is the same page-locked, mapped allocation the PyTorch pinned host
+        allocator makes, without its power-of-two rounding. ``torch.frombuffer`` keeps
+        the backing object alive while any view of the storage exists, so its finalizer
+        frees the pages only after the last view is gone. The finalizer does not run at
+        interpreter exit: cudaFreeHost synchronizes the device, and process exit
+        releases the pages anyway.
+        """
+        cuda_runtime = _cuda_runtime()
+        started = time.perf_counter()
+        error, address = cuda_runtime.cudaHostAlloc(
+            capacity_bytes, cuda_runtime.cudaHostAllocDefault
+        )
+        if error != cuda_runtime.cudaError_t.cudaSuccess:
+            raise RuntimeError(
+                f"cudaHostAlloc of {capacity_bytes} bytes for the pinned activation "
+                f"buffer failed: {error}"
+            )
+        memory = (ctypes.c_uint8 * capacity_bytes).from_address(address)
+        self._free = weakref.finalize(memory, _free_host, address, torch.cuda.current_device())
+        self._free.atexit = False
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Pinned {capacity_bytes / 2**30:.2f} GiB for the activation offload buffer in "
+            f"{time.perf_counter() - started:.1f} s",
+        )
+        return torch.frombuffer(memory, dtype=torch.uint8)
 
     def allocate(
         self, shape: tuple, dtype: torch.dtype, *, stream: torch.cuda.Stream | None = None
