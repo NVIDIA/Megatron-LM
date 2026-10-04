@@ -4,9 +4,9 @@
 :func:`plan_segment` splits one :class:`~.layout.QuerySegment` into the rows the
 matched-precision reference selector selects and the query tiles the LiteTopK plugin selects,
 using host integers only. A tile row is eligible when its causal position is at least
-``startup_position`` (below it the reference selector is faster) and it sees the route's HOT
-prefix (the keys scored for the seed of every tile); visibility grows with the position, so the
-eligible rows of a segment are a suffix of it.
+``startup_position`` (below it the reference selector is faster; no row is eligible when it is
+None) and it sees the route's HOT prefix (the keys scored for the seed of every tile);
+visibility grows with the position, so the eligible rows of a segment are a suffix of it.
 
 The tile grid of the ``fp8_paged`` route (any tile of a multiple of four rows up to the admitted
 length): tiles of ``tile_rows`` rows from the first eligible row and a shorter last tile. When
@@ -212,6 +212,8 @@ def plan_segment(
         return reference_only("fewer keys than the route minimum")
     if segment.key_count > route.max_keys:
         return reference_only("more keys than the route maximum")
+    if tuning.startup_position is None:
+        return reference_only("no LiteTopK start position for the kernel heads")
     first_position = max(tuning.startup_position, route.hot_prefix - 1, segment.position)
     first_row = segment.row_start + first_position - segment.position
     if segment.key_count < route.hot_prefix or first_row >= segment.row_end:

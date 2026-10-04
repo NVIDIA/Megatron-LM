@@ -334,6 +334,36 @@ def test_seam_defaults():
     assert tuned.as_dict()["plugin_settings"]["paged_pool_pages_per_row"] == 13
 
 
+def test_default_start_only_for_measured_kernel_heads():
+    # The default start position was measured with 32 kernel heads. A 64-head layer on a route with
+    # 64-head kernels gets no LiteTopK row from the default plan; an explicit start enables it.
+    route = dataclasses.replace(FP8_ROUTE, heads=frozenset({32, 64}))
+    geometry = IndexerGeometry(num_heads=64, head_dim=128, topk=2048)
+
+    def resolve(**overrides):
+        return resolve_indexer_topk_tuning(
+            IndexerTopKTuning(**overrides),
+            fmt="fp8",
+            route=route,
+            geometry=geometry,
+            precision="exact",
+            num_sms=B200_SMS,
+        )
+
+    assert _fp8_tuning().startup_position == 188416
+    default = resolve()
+    assert default.startup_position is None
+    (plan,) = _plan(QueryLayout.full(524288, keys=524288), route, default, 2048)
+    assert not plan.tiles and plan.reference_rows == ((0, 524288),)
+    assert plan.reason == "no LiteTopK start position for the kernel heads"
+    explicit = resolve(startup_position=188416)
+    (plan,) = _plan(QueryLayout.full(524288, keys=524288), route, explicit, 2048)
+    assert plan.tiles and plan.tiles[0].row_start == 188416
+    with pytest.raises(IndexerTopKConfigError, match="required needs LiteTopK rows"):
+        resolve(required=True)
+    assert resolve(required=True, startup_position=188416).startup_position == 188416
+
+
 def test_tuning_validation():
     for field, value, match in (
         ("tile_rows", 1778, "multiple of 4"),

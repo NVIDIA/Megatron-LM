@@ -68,8 +68,15 @@ TOPK_ROWS_PER_CALL_LIMIT = 32768
 # Scores of the FP8 score kernels are computed for 128 // heads query rows per SM, and a LiteTopK
 # FP8 tile covers this many such waves over all SMs.
 _FP8_TILE_WAVES = 3
-# FP8 LiteTopK starts this many positions before the route's qualified minimum key count.
+# FP8 LiteTopK starts this many positions before the route's qualified minimum key count, the
+# start measured on GLM-5.2 indexer inputs (32 heads).
 _FP8_STARTUP_MARGIN = 8192
+# The kernel head counts that start was measured with. The default plan gives LiteTopK no row
+# of a layer whose kernels run another head count (IndexerTopKTuning.startup_position enables
+# it): with 64 heads (glm-litetopk-raw32h64-abi1) and tiles from that start, a call on
+# GLM-5.2 layer 0 with real weights (its heads duplicated) took 3.4% longer than the
+# reference backend at 512K keys.
+_FP8_MEASURED_HEADS = frozenset((32,))
 # Candidate pool pages per query row of the FP8 paged route. With cold per-layer timing on
 # GLM-5.2 indexer inputs (six in-model layers at 256K, real-weight layer 0 at 512K and 1M,
 # synthetic inputs up to 1M) the pool size does not change the speed of a tile, and the worst
@@ -343,8 +350,10 @@ class ResolvedIndexerTopKTuning:
             score kernel (``3 * num_sms * (128 // num_heads)``, rounded down to a multiple of 4;
             1776 for 32 heads on 148 SMs).
         startup_position: First causal position a LiteTopK tile may start at (a tile also
-            needs rows that see the route's HOT prefix). Default: 8192 before the route's
-            qualified minimum key count (188416 for a 196608-key minimum). 0 lets only the HOT
+            needs rows that see the route's HOT prefix), or None when the plan gives LiteTopK
+            no row. Default: 8192 before the route's qualified minimum key count (188416 for a
+            196608-key minimum), the start measured with 32 kernel heads, and None with any
+            other kernel head count, for which no start was measured. 0 lets only the HOT
             prefix limit it.
         group_tiles: Consecutive tiles of equal length that share one plan. Default 8.
         seed_bootstrap: How the first tile group of a segment gets its HOT seed: ``reference``
@@ -376,7 +385,7 @@ class ResolvedIndexerTopKTuning:
 
     required: bool
     tile_rows: int
-    startup_position: int
+    startup_position: int | None
     group_tiles: int
     seed_bootstrap: Literal["reference", "identity"]
     min_litetopk_pairs: int
@@ -388,7 +397,7 @@ class ResolvedIndexerTopKTuning:
 
     def __post_init__(self) -> None:
         owner = "ResolvedIndexerTopKTuning"
-        optional = ("reference_rows_per_call",)
+        optional = ("startup_position", "reference_rows_per_call")
         unset = [
             field.name
             for field in dataclasses.fields(self)
@@ -430,8 +439,9 @@ def resolve_indexer_topk_tuning(
         The resolved settings.
 
     Raises:
-        IndexerTopKConfigError: If an argument is invalid, the route serves another format, or
-            the overrides conflict with the precision or the geometry.
+        IndexerTopKConfigError: If an argument is invalid, the route serves another format, the
+            overrides conflict with the precision or the geometry, or LiteTopK is required but
+            the plan gives it no row.
     """
     if tuning is None:
         tuning = IndexerTopKTuning()
@@ -452,7 +462,8 @@ def resolve_indexer_topk_tuning(
 
     waves = _FP8_TILE_WAVES * num_sms * max(1, 128 // geometry.num_heads)
     tile_rows = _override(tuning.tile_rows, max(4, waves // 4 * 4))
-    startup = 0 if route is None else max(0, route.min_keys - _FP8_STARTUP_MARGIN)
+    kernel_heads = geometry.num_heads
+    startup, why = _default_startup(route, kernel_heads)
     exact = precision == "exact"
     settings = LiteTopKPluginSettings(
         tie_policy="logical-id" if exact else None,
@@ -497,7 +508,22 @@ def resolve_indexer_topk_tuning(
             f"float32 scores, equal scores by ascending key id); got {settings.tie_policy!r} "
             f"and {settings.score_policy!r}"
         )
+    if resolved.required and route is not None and resolved.startup_position is None:
+        raise IndexerTopKConfigError(
+            f"IndexerTopKTuning.required needs LiteTopK rows, but the default plan gives "
+            f"LiteTopK none for {fmt} operands with {kernel_heads} kernel heads ({why}); set "
+            "IndexerTopKTuning.startup_position to select with LiteTopK anyway"
+        )
     return resolved
+
+
+def _default_startup(route: RouteCapability | None, kernel_heads: int) -> tuple[int | None, str]:
+    """The default first position of LiteTopK tiles, and why it is None when it is."""
+    if route is None:
+        return 0, ""
+    if kernel_heads not in _FP8_MEASURED_HEADS:
+        return None, "no start position was measured for this kernel head count"
+    return max(0, route.min_keys - _FP8_STARTUP_MARGIN), ""
 
 
 def _override(value: Any, default: Any) -> Any:
