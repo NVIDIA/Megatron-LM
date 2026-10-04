@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 def _make_train_config(ps):
@@ -239,9 +236,7 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     torch.manual_seed(777)
     cp_model = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     torch.manual_seed(777)
-    ref_model = _make_glm5_model(cfg, ps=ParallelState()).to(
-        device=device, dtype=torch.bfloat16
-    )
+    ref_model = _make_glm5_model(cfg, ps=ParallelState()).to(device=device, dtype=torch.bfloat16)
     cp_model.eval()
     ref_model.eval()
 
@@ -304,10 +299,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.protocol import (
-        _forward_step,
-        unpack_forward_output,
-    )
+    from megatron.lite.model.glm5.lite.protocol import _forward_step, unpack_forward_output
     from megatron.lite.primitive.parallel.state import ParallelState
     from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -315,17 +307,10 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     world = dist.get_world_size()
     rank = dist.get_rank()
     cfg_kwargs = _tiny_config_kwargs()
-    cfg_kwargs.update(
-        max_position_embeddings=64,
-        num_hidden_layers=6,
-        num_nextn_predict_layers=1,
-    )
+    cfg_kwargs.update(max_position_embeddings=64, num_hidden_layers=6, num_nextn_predict_layers=1)
     indexer_types = ["full", "full", "full", "shared", "shared", "shared"]
     cfg = Glm5Config(
-        **cfg_kwargs,
-        index_topk_freq=4,
-        index_skip_topk_offset=3,
-        indexer_types=indexer_types,
+        **cfg_kwargs, index_topk_freq=4, index_skip_topk_offset=3, indexer_types=indexer_types
     )
     cfg.mlp_layer_types = ["dense"] * 7
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
@@ -340,17 +325,13 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     batch = PackedBatch(
         input_ids=torch.cat(
             [
-                torch.randint(
-                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
-                )
+                torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
                 for length in lengths
             ]
         ),
         labels=torch.cat(
             [
-                torch.randint(
-                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
-                )
+                torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
                 for length in lengths
             ]
         ),
@@ -363,10 +344,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     assert "mtp_loss" in out
     assert model.layers[3].self_attention.self_attention.skip_topk is True
     assert model.mtp is not None
-    assert (
-        model.mtp.layers[0].transformer_layer.self_attention.self_attention.skip_topk
-        is False
-    )
+    assert model.mtp.layers[0].transformer_layer.self_attention.self_attention.skip_topk is False
     out["loss"].backward()
 
     grad_norm = torch.zeros((), device=device)
@@ -448,10 +426,7 @@ def test_glm5_protocol_cp2_eval_forward_with_indexer_topk(indexer_topk):
     assert installation.config == IndexerTopKConfig(**indexer_topk)
     attentions = [layer.self_attention.self_attention for layer in bound.layers]
     # The IndexShare shared layer reuses the top-k of its source layer and stays unbound.
-    assert [attention._indexer_topk for attention in attentions] == [
-        *installation.bindings,
-        None,
-    ]
+    assert [attention._indexer_topk for attention in attentions] == [*installation.bindings, None]
 
     outputs = {"bound": [], "unbound": []}
     hooks = [

@@ -1,16 +1,17 @@
 # Indexer top-k selection in Megatron Lite
 
-The sparse attention layers of the native `glm5` model (DSA) select, for every query token, the
-`index_topk` keys its attention reads: an indexer scores the keys the token sees and keeps the
-best ones. By default every layer runs its upstream selector. `ImplConfig.indexer_topk` installs
-an indexer top-k binding on every such layer instead; in eval mode with gradients disabled, the
-binding selects with:
+The sparse attention layers of the native `glm5` model (DSA) and the compressed sparse attention
+layers with compression ratio 4 of the native `deepseek_v4` model (CSA) select, for every query
+token, the `index_topk` keys its attention reads: an indexer scores the keys the token sees and
+keeps the best ones. By default every layer runs its upstream selector. `ImplConfig.indexer_topk`
+installs an indexer top-k binding on every such layer instead; in eval mode with gradients
+disabled, the binding selects with:
 
 - the matched-precision reference selector: the indexer queries and keys are quantized to the
-  model's indexer format (FP8 E4M3 rows with float32 scales), DeepGEMM `fp8_fp4_mqa_logits`
-  scores every visible key in float32, and a top-k kernel keeps the best keys of each row. Rows
-  are scored in chunks whose scores fit a byte budget, so a long prompt never holds the scores of
-  all its rows at once;
+  model's indexer format (DSA: FP8 E4M3 rows with float32 scales; CSA: indexer MXFP4), DeepGEMM
+  `fp8_fp4_mqa_logits` scores every visible key in float32, and a top-k kernel keeps the best
+  keys of each row. Rows are scored in chunks whose scores fit a byte budget, so a long prompt
+  never holds the scores of all its rows at once;
 - LiteTopK, an external CUDA selector loaded as a plugin, on the rows of long sequences that its
   plan gives it. The reference selector selects every other row and recomputes the rows the
   plugin reports as overflowing or failed.
@@ -65,6 +66,39 @@ with runtime.eval_mode(handle):  # model chunks in eval mode, gradients disabled
     ...  # forward passes here select through the bindings
 ```
 
+DeepSeek-V4 takes the same field. The qualified MXFP4 LiteTopK plugin does not select exactly, so its LiteTopK
+configuration uses `precision="fast"`; the exact-tie top-k remains optional there and makes the
+reference rows choose among keys tied at a row's cutoff score deterministically (lowest key id
+first):
+
+```python
+impl_cfg = {
+    "use_thd": True,
+    "optimizer": None,
+    "indexer_topk": {
+        "backend": "litetopk",
+        "precision": "fast",
+        "litetopk": {
+            "source": "/deps/plugins/dsv4-litetopk-ac1c-abi1",
+            "expected_source_id": "ac1c7f51b362",
+            "expected_adapter_sha256": (
+                "69f3e88a0a6ce49a532a0932a95e99db02b42974b4465fda7b9b80615e380318"
+            ),
+            "prebuilt_extension": (
+                "/deps/build/ac1c-abi1/sglang_litetopk_dsa_b200_production_ac1c7f51b362.so"
+            ),
+        },
+        "exact_topk": {"source": "/deps/native-exact-tie"},
+    },
+}
+```
+
+For deterministic exact MXFP4 selection, use `backend="reference"`, `precision="exact"`
+and configure `exact_topk`. This ranks the quantized MXFP4 operands exactly. The fast slab
+plugin folds its score epilogue and stores a truncated 24-bit score code; setting `exact_topk`
+only controls its reference rows and does not make its LiteTopK rows exact. Requesting
+`backend="litetopk"`, `precision="exact"` with that plugin fails at model construction.
+
 Without the runtime, pass the field to the protocol's `ImplConfig` (a mapping or an
 `IndexerTopKConfig`):
 
@@ -91,14 +125,15 @@ installation = bundle.extras["indexer_topk"]  # IndexerTopKInstallation
 - `ImplConfig` validates the field when it is built: unknown keys and invalid values or
   combinations raise `IndexerTopKConfigError` (a `ValueError`). It keeps the value as given.
 - `build_model` hands the field to `configure_indexer_topk` right after it builds the model
-  chunks, with the model's indexer format (GLM-5: `native_format="fp8"`), and puts the result
-  in `ModelBundle.extras["indexer_topk"]`: an `IndexerTopKInstallation`, or None for
-  `backend="default"`. Unset, `build_model` does not touch the layers, adds no `extras` key and
-  imports nothing of the indexer top-k package.
+  chunks, with the model's indexer format (GLM-5: `native_format="fp8"`; DeepSeek-V4:
+  `native_format="mxfp4"`), and puts the result in `ModelBundle.extras["indexer_topk"]`: an
+  `IndexerTopKInstallation`, or None for `backend="default"`. Unset, `build_model` does not touch
+  the layers, adds no `extras` key and imports nothing of the indexer top-k package.
 - `configure_indexer_topk` binds every DSA layer that selects its own top-k (IndexShare shared
-  layers reuse the top-k of their source layer and stay unbound). It validates every layer before
-  it binds any: it negotiates the layer's head counts with the reference score kernel, which it
-  probes, and, for `backend="litetopk"`, loads the plugin and negotiates its route (see
+  layers reuse the top-k of their source layer and stay unbound) and every CSA layer with
+  compression ratio 4. It validates every layer before it binds any: it negotiates the layer's
+  head counts with the reference score kernel, which it probes, and, for `backend="litetopk"`,
+  loads the plugin and negotiates its route (see
   [Head counts](#head-counts-and-zero-head-padding)), so an unusable configuration fails when the
   model is built.
 - The model configuration carries no tuning values. The selection plan (tile length, start
@@ -133,11 +168,8 @@ Every pin is optional. Unpinned values are computed, logged once as a warning an
 | --- | --- | --- | --- | --- |
 | `glm-litetopk-raw32-abi1` | `83669db87b20` | `46db6d898e4b4487e502f0687df7bb22ce075869667b13bf0c43a8e2a0e27bd2` | `fp8_paged`, exact | GLM-5 (32 FP8 indexer heads), exact |
 | `glm-litetopk-raw32h64-abi1` | `7e5eb835fb7f` | `65951346a8c60d44945f1e7f03c5701e9c7e034f27d5274ee727a91d1a64aaac` | `fp8_paged`, exact | FP8 indexers with 32 or 64 heads, exact |
+| `dsv4-litetopk-ac1c-abi1` | `ac1c7f51b362` | `69f3e88a0a6ce49a532a0932a95e99db02b42974b4465fda7b9b80615e380318` | `fp4_slab`, fast | DeepSeek-V4 |
 | `glm-litetopk-996e-abi1` | `996e735c52df` | `37ff4143292871e0293c6e388ee96c90549c4fe60edf24dc9498e0bc165c2051` | `fp8_paged`, fast | GLM-5, the previous integration's selector |
-
-The previous integration, in this document, is the earlier out-of-tree integration of LiteTopK
-into a Megatron-LM fork; it selected with fast FP8 routes only, and `glm-litetopk-996e-abi1`
-carries its CUDA selector.
 
 These plugins and the exact-tie top-k package below are external (ABI version 1) and not yet
 publicly released. Until they are, the only configuration that runs with public dependencies is
@@ -198,9 +230,8 @@ checks the signatures against the calls Megatron Lite makes.
 
 - `plugin_info()` returns exactly the keys `abi`, `source_id`, `routes`, `effective_config`,
   `launch_time_env_keys`, `tie_policy` and `score_policy`. Each route declares its name
-  (`fp8_paged`, the only route name this version accepts), format, head counts, head
-  dimensions, top-k sizes, query tile lengths, key range, HOT prefix, whether it selects exactly,
-  and its tie and score policies.
+  (`fp8_paged` or `fp4_slab`), format, head counts, head dimensions, top-k sizes, query tile
+  lengths, key range, HOT prefix, whether it selects exactly, and its tie and score policies.
 - ABI v1 plugins read their configuration from `SGLANG_LITETOPK*` environment keys: the adapter
   snapshots them when it is imported and the CUDA extension reads a few of them on every launch.
   Megatron Lite renders its `LiteTopKPluginSettings` into these keys before the import, keeps
@@ -209,7 +240,9 @@ checks the signatures against the calls Megatron Lite makes.
   `SGLANG_LITETOPK*` key (or known launch-time key) that no loaded plugin rendered, except the
   diagnostic keys. The launch-time keys are compared with their load-time values before every
   selection.
-- One plugin source loads with one settings profile per process.
+- One plugin source loads with one settings profile per process. The default settings of FP8
+  (GLM-5) and MXFP4 (DeepSeek-V4) layers differ, so the two models select with LiteTopK in
+  separate processes.
 - Every tile writes one status code per row on the device: 0 valid, 1 or 2 a row whose candidates
   overflowed (that row is recomputed by the reference selector), 3 a failure (the whole tile is
   recomputed). A call reads the statuses once, after all its tiles.
@@ -230,8 +263,9 @@ so every row is exact.
 `precision="fast"`: LiteTopK rows may differ from the exact selection among nearly tied keys, and
 unless `exact_topk` is set, which of the keys tied at a reference row's cutoff score are selected
 can differ from run to run. The optional GPU tests bound every key a fast route swaps to a relative
-distance of 1e-3 from the row's cutoff score. The previous LiteTopK integration selected with
-fast routes only; `glm-litetopk-996e-abi1` carries its CUDA selector.
+distance of 1e-3 (FP8) or 1.1e-3 (MXFP4) from the row's cutoff score. The MXFP4 slab route can swap
+different near ties from run to run. The previous LiteTopK integration selected with fast routes
+only; `glm-litetopk-996e-abi1` and `dsv4-litetopk-ac1c-abi1` carry its CUDA selectors.
 
 With either precision every output row lists ascending key ids, followed by -1 for the missing
 keys of a row that sees fewer than top-k keys. Neither precision reproduces the upstream
@@ -247,6 +281,7 @@ The plugin routes declare their capabilities in `plugin_info()`; Megatron Lite h
 | `glm-litetopk-raw32-abi1` | `fp8_paged` | FP8 | 32 | 128 | 2048 | 196608 to 1048576 | yes |
 | `glm-litetopk-raw32h64-abi1` | `fp8_paged` | FP8 | 32, 64 | 128 | 2048 | 196608 to 1048576 | yes |
 | `glm-litetopk-996e-abi1` | `fp8_paged` | FP8 | 32 | 128 | 2048 | 196608 to 1048576 | no |
+| `dsv4-litetopk-ac1c-abi1` | `fp4_slab` | MXFP4 | 32, 64 | 128 | 1 to 2048 | 65536 to 1048576 compressed keys | no |
 
 - A layer whose head count the route has no kernels for fails when the model is built, unless
   `head_padding=True` lets it run on a larger head count of the route (see
@@ -254,19 +289,21 @@ The plugin routes declare their capabilities in `plugin_info()`; Megatron Lite h
   route does not serve. Use `backend="reference"` for such a layer. A layer whose top-k the route
   does not select is selected by the reference selector alone.
 - Within a sequence that has the route's minimum key count, LiteTopK tiles start at a fixed causal
-  position, measured per kernel head count: FP8 tiles of the 32-head kernels 8192 positions
-  before the route's minimum key count (position 188416 with the routes above); FP8 tiles of the
-  64-head kernels nowhere by default, because no start was measured to keep LiteTopK at least as
-  fast as the reference backend at every prompt length it would serve (see
-  [Performance](#performance)). These are the starts that gave the fastest calls in the
-  measurements behind the defaults; FP8 tiles hold 1776 rows (on 148 SMs) with 32 and with 64
-  kernel heads. Earlier rows, shorter sequences and the tiles the plugin declines go to the
-  reference selector. `IndexerTopKInstallation.stats()` counts the rows each selector took and
-  why a segment got no LiteTopK tile.
+  position, measured per operand format and kernel head count: FP8 tiles of the 32-head kernels
+  8192 positions before the route's minimum key count (position 188416 with the routes above);
+  FP8 tiles of the 64-head kernels nowhere by default, because no start was measured to keep
+  LiteTopK at least as fast as the reference backend at every prompt length it would serve (see
+  [Performance](#performance)); MXFP4 tiles at the position whose row sees 45056 compressed keys
+  (position 180224). These are the starts
+  that gave the fastest calls in the measurements behind the defaults; FP8 tiles hold 1776 rows
+  (on 148 SMs) with 32 and with 64 kernel heads. Earlier rows, shorter sequences and the tiles the
+  plugin declines go to the reference selector. `IndexerTopKInstallation.stats()` counts the rows
+  each selector took and why a segment got no LiteTopK tile.
 - Reference selector: `configure_indexer_topk` probes DeepGEMM for the layer's head count when the
   model is built and pads an unsupported count with zero query heads, which add exact zeros to
   every score. With `sgl-deep-gemm` 0.1.3 the score kernel accepts 16, 32 and 64 heads, for FP8
-  operands. The exact-tie top-k selects up to 2048 keys per row among up to 2**20 keys.
+  and for MXFP4 operands. The exact-tie top-k selects up to 2048 keys per row among up to 2**20
+  keys.
 
 ## Head counts and zero-head padding
 
@@ -289,8 +326,8 @@ architecture).
   `precision="fast"` and a head count DeepGEMM supports, it keeps the layer's own head count. When
   the plan gives LiteTopK no row, it scores as the reference backend does.
 
-With the FP8 route of `glm-litetopk-raw32h64-abi1` (kernels for 32 and 64 heads) and
-`sgl-deep-gemm` 0.1.3 (16, 32 and 64 heads):
+With the FP8 route of `glm-litetopk-raw32h64-abi1` or the MXFP4 route of `dsv4-litetopk-ac1c-abi1`
+(kernels for 32 and 64 heads) and `sgl-deep-gemm` 0.1.3 (16, 32 and 64 heads):
 
 | Indexer heads | LiteTopK, `head_padding=False` | LiteTopK, `head_padding=True` | Reference backend |
 | --- | --- | --- | --- |
@@ -305,8 +342,9 @@ With the FP8 route of `glm-litetopk-raw32h64-abi1` (kernels for 32 and 64 heads)
 `glm-litetopk-raw32-abi1` and `glm-litetopk-996e-abi1` have FP8 kernels for 32 heads only: they
 serve 4 to 28 heads with padding, and no head count above 32.
 
-Zero heads are appended after quantization: FP8 query codes 0 and folded weights 0. They change
-no score value. The score kernels sum the weighted heads in four float32 FMA chains that start at +0
+Zero heads are appended after quantization: FP8 query codes 0 and folded weights 0; MXFP4 query
+codes 0, group scales 127 (the UE8M0 code of 1.0; 255 encodes NaN) and weights 0. They change no
+score value. The score kernels sum the weighted heads in four float32 FMA chains that start at +0
 (heads `j` with equal `j % 4`, in head order, rounded to nearest), the zero heads end every chain,
 and adding a zero leaves a partial sum bit for bit unchanged unless it is -0. A chain holds -0 only
 after a negative product below half the smallest float32 subnormal rounded to zero, which needs a
@@ -346,12 +384,25 @@ against the keys the model has already gathered, so a rank whose plugin declines
 recomputes locally and every rank issues the same collectives as before. A call is planned per
 segment (a run of local rows of one sequence) on the host, from the rank's layout: DSA native
 context parallelism (contiguous layout) describes the rank's rows as a contiguous slice of one
-sequence or of the packed sequences, and builds no dense causal mask for a bound layer. Each rank
-therefore plans its own LiteTopK tiles; ranks whose rows lie before the start position select
-with the reference selector only. With `dsa_cp_mode="legacy_gather_all"` every rank gathers the
-whole sequence and selects all of its rows. There is no context-parallel configuration.
+sequence or of the packed sequences, and builds no dense causal mask for a bound layer; the CSA
+THD path describes them as packed segments with sequence-relative ids. Each rank therefore plans
+its own LiteTopK tiles; ranks whose rows lie before the start position select with the reference
+selector only. With `dsa_cp_mode="legacy_gather_all"` every rank gathers the whole sequence and
+selects all of its rows. There is no context-parallel configuration.
+
+CSA's THD binding returns sequence-relative compressed-key ids. It does not add the BSHD
+KV offset: Core's existing `build_attention_indices` maps those ids into the rank-major KV
+layout after compression. Each completed group of four tokens exposes one compressed key;
+the first three tokens of a sequence therefore have no compressed key. Bound CSA bypasses
+only `compute_cp_indexer_topk`, retaining its boundary exchange, gathers and attention-index
+construction. Compression ratios other than four have no indexer binding.
 
 ## Lifecycle and memory
+
+The reference radix selector reads DeepGEMM's padded score views directly when the data pointer
+and row stride are 32-byte aligned and columns are contiguous. It copies incompatible views
+before calling cuDNN. This removes the extra full score-buffer copy in the common aligned case
+without changing scores, visible lengths or selected keys.
 
 - A selection call is self-contained: there is no request scope, and the plugin state a call
   creates (its seed carries) is dropped when the call ends, also on error.
@@ -377,6 +428,9 @@ default plan:
   0.822 on four 256K inputs with real weights and embedding-level proxy activations, which give
   LiteTopK more candidates per row (a mean of 9.2K to 10.9K, against 3.3K to 7.3K in the captured
   layers).
+- DeepSeek-V4 indexer inputs, MXFP4, `precision="fast"`, `dsv4-litetopk-ac1c-abi1`: 1.009 to 1.024
+  at 256K tokens (two layers captured in the model, two synthetic inputs) and 1.083 to 1.098 at
+  512K tokens (two synthetic inputs).
 - FP8 indexers with 64 heads, `precision="exact"`, `glm-litetopk-raw32h64-abi1`, on synthetic
   inputs (structured, strict-gap) and on GLM-5.2 layer 0 with real weights and its 32 heads
   duplicated, with explicit start positions (the default plan gives these layers no LiteTopK
@@ -409,8 +463,8 @@ reference backend sorts as well, which makes its calls 3.3% to 7.2% slower at 25
   upstream selectors, also when they run without autograd: Lite's reentrant activation recompute
   runs a training forward under `torch.no_grad()` and again with gradients in the backward pass,
   and both runs must select the same top-k. The indexer loss therefore never sees a binding.
-- The native GLM-5 protocol rejects tensor parallelism (`tp > 1`, `etp > 1`); a binding needs
-  every indexer head of a layer, because the top-k ranks the sum over all heads.
+- The native GLM-5 and DeepSeek-V4 protocols reject tensor parallelism (`tp > 1`, `etp > 1`); a
+  binding needs every indexer head of a layer, because the top-k ranks the sum over all heads.
 - Selection under CUDA graph capture raises: tiles are planned on the host.
 - A dense batch of several sequences (a batch dimension above 1) keeps the upstream selector;
   packed THD batches select through the bindings.
@@ -425,7 +479,7 @@ reference backend sorts as well, which makes its calls 3.3% to 7.2% slower at 25
 | `IndexerTopKConfigError: indexer_topk.backend must be one of 'default', 'reference', 'litetopk'` (or `precision`) | `ImplConfig` | Fix the value |
 | `IndexerTopKConfigError: indexer_topk.litetopk.source is required: LiteTopK kernels are not bundled with Megatron Lite` | `ImplConfig` | Set `litetopk.source` (see [Dependencies](#dependencies)) or use `backend="reference"` |
 | `IndexerTopKConfigError: indexer_topk.exact_topk.source is required for precision='exact'` | `ImplConfig` | Set `exact_topk.source` or use `precision="fast"` |
-| `IndexerTopKConfigError: LiteTopK source ... has no fp8_paged route` | `build_model` | Use a plugin with an `fp8_paged` route |
+| `IndexerTopKConfigError: LiteTopK source ... has no fp8_paged route` (or `fp4_slab`) | `build_model` | Use the plugin of the model's format (FP8: GLM-5, MXFP4: DeepSeek-V4) |
 | `IndexerTopKConfigError: LiteTopK route ... supports indexer heads [...], head_dim [...], topk ...; layer ... has H=..., D=..., K=.... Set indexer_topk.head_padding=True to pad heads to ... (...x scoring work) or use backend='reference'.` | `build_model` | `head_padding=True` (see [Head counts](#head-counts-and-zero-head-padding)) or `backend="reference"`; without the padding sentence, `backend="reference"`, or `backend="default"` when the message says the reference score kernel cannot score the head count either |
 | `IndexerTopKConfigError: precision='exact' needs a LiteTopK route that advertises exact selection` | `build_model` | Use an exact plugin (raw32) with the qualified DeepGEMM, or `precision="fast"` |
 | `IndexerTopKConfigError: precision='exact' scores the rows LiteTopK does not cover on the plugin's operands, but the reference score kernel cannot score ... heads` | `build_model` | `precision="fast"`, or a plugin whose head counts DeepGEMM scores |
@@ -437,9 +491,8 @@ reference backend sorts as well, which makes its calls 3.3% to 7.2% slower at 25
 | `IndexerTopKPluginError: LiteTopK plugin at ...: load_extension() failed: RuntimeError: LiteTopK prebuilt basename must be sglang_litetopk_dsa_b200_production_<source id>.so, got ...` | `build_model` | Keep the plugin's file name for its prebuilt extension (see [LiteTopK plugins](#litetopk-plugins)) |
 | `IndexerTopKPluginError: LiteTopK plugin at ...: source id is ..., expected ...` (or `adapter sha256`, `prebuilt extension sha256`) | `build_model` | The plugin differs from its pins: use the pinned files or update the pins |
 | `IndexerTopKPluginError: LiteTopK plugin at ... exposes ABI ...` | `build_model` | Use an ABI v1 plugin (see [Plugin ABI](#plugin-abi)) |
-| `IndexerTopKPluginError: LiteTopK plugin at ...: plugin_info()['routes'][...]['name'] must be one of ['fp8_paged']` | `build_model` | The plugin declares a route this version does not serve: use a plugin whose routes are `fp8_paged` |
 | `IndexerTopKPluginError: SGLANG_LITETOPK_...=... is already set in the process but the plugin settings need ...`, or `the process sets ..., which the plugin settings do not render` | `build_model` | Unset the `SGLANG_LITETOPK*` keys; Megatron Lite renders them |
-| `IndexerTopKPluginError: LiteTopK source ... is already loaded in this process with different settings` | `build_model` | One settings profile per plugin source per process |
+| `IndexerTopKPluginError: LiteTopK source ... is already loaded in this process with different settings` | `build_model` | One settings profile per plugin source per process; run GLM-5 and DeepSeek-V4 LiteTopK jobs in separate processes |
 | `IndexerTopKPluginError: exact top-k package at ...` | `build_model` | Fix the path or the pins; install the cuDNN frontend and the CUTLASS DSL it imports |
 | `IndexerTopKRuntimeError: indexer top-k binding cannot run under CUDA graph capture` | forward | Run the forward outside graph capture |
 | `IndexerTopKRuntimeError: LiteTopK requires an SM100 (Blackwell) GPU` | first forward | Use a Blackwell GPU or `backend="reference"` |
@@ -451,7 +504,7 @@ The CPU tests run in the standard workflow (`experimental/lite/tests/run_tests.s
 are marked `optional` and run only when their paths are given. The tests that need a plugin or the
 exact-tie package skip unless its location is given as JSON, inline or as the path of a JSON file:
 
-- `LITETOPK_TEST_SELECTORS`: a list of `{"native_format": "fp8", "precision": ...,
+- `LITETOPK_TEST_SELECTORS`: a list of `{"native_format": "fp8" | "mxfp4", "precision": ...,
   "heads": ..., "topk": ..., "litetopk": {<LiteTopKPluginConfig fields>}, "plugin_settings":
   {<LiteTopKPluginSettings fields>}}` (`plugin_settings` optional);
 - `LITETOPK_TEST_EXACT_TOPK`: `{<ExactTopKConfig fields>, "pythonpath": [...]}`, where the optional
@@ -477,8 +530,10 @@ experimental/lite/tests/run_tests.sh \
 | `smoke/model/glm5/lite/test_glm5_lite_cp_smoke.py` (the `indexer_topk` case) | 2 | DeepGEMM, cuDNN frontend |
 | `smoke/primitive/indexer_topk/test_plugins_gpu.py` | 1 | `LITETOPK_TEST_PLUGINS`; `LITETOPK_TEST_EXACT_TOPK` for its exact-tie test |
 | `smoke/primitive/indexer_topk/test_selector_gpu.py`, `test_cp_sim_gpu.py` | 1 | `LITETOPK_TEST_SELECTORS`, `LITETOPK_TEST_EXACT_TOPK` |
-| `smoke/primitive/indexer_topk/test_heads_gpu.py` | 1 | DeepGEMM, `LITETOPK_TEST_EXACT_TOPK`; the LiteTopK tests need an exact FP8 entry of `LITETOPK_TEST_SELECTORS`; each skips an entry whose route lacks the kernels it needs (64-head FP8 kernels as in `glm-litetopk-raw32h64-abi1`, or the 32-head FP8 kernels that 16 heads pad to) |
+| `smoke/primitive/indexer_topk/test_heads_gpu.py` | 1 | DeepGEMM, `LITETOPK_TEST_EXACT_TOPK`; the FP8 LiteTopK tests need an exact FP8 entry of `LITETOPK_TEST_SELECTORS` and the MXFP4 padding test a fast MXFP4 entry; each skips an entry whose route lacks the kernels it needs (64-head FP8 kernels as in `glm-litetopk-raw32h64-abi1`, the 32-head FP8 kernels that 16 heads pad to, or the 64-head MXFP4 kernels that 48 heads pad to) |
 | `smoke/primitive/indexer_topk/test_cp_modules_gpu.py` | 2 and 4 | an exact FP8 entry of `LITETOPK_TEST_SELECTORS`, `LITETOPK_TEST_EXACT_TOPK` |
+| `smoke/primitive/indexer_topk/test_csa_cp_modules_gpu.py` | 4 | an MXFP4 entry of `LITETOPK_TEST_SELECTORS`, `LITETOPK_TEST_EXACT_TOPK` |
+| `smoke/primitive/indexer_topk/test_csa_protocol_gpu.py` | 2 | DeepGEMM, cuDNN frontend; builds the DeepSeek-V4 protocol with C4 and C128 layers |
 
 The single-GPU plugin tests run every entry in a fresh interpreter, because plugin settings are
 process-wide.
