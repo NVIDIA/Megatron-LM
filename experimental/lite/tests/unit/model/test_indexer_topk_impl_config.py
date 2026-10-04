@@ -1,12 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The ``indexer_topk`` field of the GLM-5 ``ImplConfig`` (CPU).
+"""The ``indexer_topk`` field of the GLM-5 and DeepSeek-V4 ``ImplConfig`` (CPU).
 
 ``ImplConfig.indexer_topk`` takes an ``IndexerTopKConfig``, its mapping form or None (the
 default). A value is validated when the ``ImplConfig`` is built and kept as given;
 ``build_model`` hands it to ``configure_indexer_topk`` with the model's indexer operand format
-(GLM-5 DSA: ``fp8``) and puts the result in ``ModelBundle.extras["indexer_topk"]``. Unset,
-nothing of the indexer top-k package is imported (checked in a child interpreter).
-``build_model`` runs here on the CPU with a stand-in model chunk.
+(GLM-5 DSA: ``fp8``; DeepSeek-V4 CSA: ``mxfp4``) and puts the result in
+``ModelBundle.extras["indexer_topk"]``. Unset, nothing of the indexer top-k package is imported
+(checked in a child interpreter). ``build_model`` runs here on the CPU with a stand-in model
+chunk.
 """
 
 from __future__ import annotations
@@ -34,7 +35,13 @@ REPO_ROOT = LITE_ROOT.parents[1]
 # Per model: protocol package, model class, indexer operand format, and the build_model step
 # that the binding follows.
 _MODELS = {
-    "glm5": ("megatron.lite.model.glm5.lite", "Glm5Model", "fp8", "set_cross_entropy_fusion")
+    "glm5": ("megatron.lite.model.glm5.lite", "Glm5Model", "fp8", "set_cross_entropy_fusion"),
+    "deepseek_v4": (
+        "megatron.lite.model.deepseek_v4.lite",
+        "DeepseekV4Model",
+        "mxfp4",
+        "_configure_attention_backend",
+    ),
 }
 # The indexer top-k package and the bindings module.
 _PACKAGES = (
@@ -82,7 +89,7 @@ class _Consumer(nn.Module):
 
 
 class _Chunk(nn.Module):
-    """Stands in for ``Glm5Model``: one parameter, one consumer."""
+    """Stands in for ``Glm5Model`` and ``DeepseekV4Model``: one parameter, one consumer."""
 
     def __init__(self, *_args, **_kwargs) -> None:
         super().__init__()
@@ -272,9 +279,11 @@ def test_build_model_default_backend_unbinds(model, monkeypatch):
 
 
 def test_not_in_architecture_config():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
     from megatron.lite.model.glm5.config import Glm5Config
 
-    assert "indexer_topk" not in {field.name for field in dataclasses.fields(Glm5Config)}
+    for config in (Glm5Config, DeepseekV4Config):
+        assert "indexer_topk" not in {field.name for field in dataclasses.fields(config)}
     for model in _MODELS:
         fields = {field.name for field in dataclasses.fields(_protocol(model).ImplConfig)}
         assert "indexer_topk" in fields
@@ -299,7 +308,7 @@ def test_runtime_forwards_indexer_topk_unchanged(model):
 
 
 def test_protocol_import_is_package_free_when_unset(tmp_path):
-    """Importing the GLM-5 protocol, building its ImplConfig and running build_model with
+    """Importing both protocols, building their ImplConfig and running build_model with
     ``indexer_topk`` unset import nothing of the indexer top-k package; a configured field
     does (the control)."""
     script = textwrap.dedent("""
