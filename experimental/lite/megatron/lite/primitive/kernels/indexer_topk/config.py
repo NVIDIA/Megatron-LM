@@ -1,9 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Configuration and error types of the indexer top-k selectors.
 
-The LiteTopK kernels and the exact-tie top-k used by the reference selector are external
-dependencies: Megatron Lite does not bundle them. They are loaded from the explicit paths given
-here, never from environment variables, and every path can be pinned by content hash.
+:class:`IndexerTopKConfig` is what a model configuration carries: which selector runs, how
+precise it must be, and where its external dependencies are. The LiteTopK kernels and the
+exact-tie top-k used by the reference selector are not bundled with Megatron Lite. They are
+loaded from the explicit paths given here, never from environment variables, and every path
+can be pinned by content hash.
 
 Expert tuning of the selection plan goes through one policy seam,
 :func:`resolve_indexer_topk_tuning`: it derives every value from the plugin route, the operand
@@ -25,6 +27,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ExactTopKConfig",
+    "IndexerTopKBackend",
+    "IndexerTopKConfig",
     "IndexerTopKConfigError",
     "IndexerTopKFormat",
     "IndexerTopKPluginError",
@@ -34,9 +38,11 @@ __all__ = [
     "LiteTopKPluginConfig",
     "LiteTopKPluginSettings",
     "ResolvedIndexerTopKTuning",
+    "normalize_indexer_topk_config",
     "resolve_indexer_topk_tuning",
 ]
 
+IndexerTopKBackend = Literal["default", "reference", "litetopk"]
 IndexerTopKFormat = Literal["fp8"]
 IndexerTopKPrecision = Literal["exact", "fast"]
 
@@ -53,6 +59,7 @@ _LAYOUT = re.compile(r"[a-z0-9]+")
 _TIE_POLICIES = ("storage", "logical-id", "logical-id-desc")
 _SCORE_POLICIES = ("folded", "native-fp32")
 _ROW_TILES = (1, 2, 4, 8)
+_BACKENDS = ("default", "reference", "litetopk")
 _FORMATS = ("fp8",)
 _PRECISIONS = ("exact", "fast")
 _SEED_BOOTSTRAPS = ("reference", "identity")
@@ -211,6 +218,110 @@ class ExactTopKConfig:
                     f"expected one of {', '.join(EXACT_TOPK_FILES)}"
                 )
             _check_hex(owner, f"expected_sha256[{name!r}]", digest, _SHA256, "a SHA-256")
+
+
+@dataclass(frozen=True)
+class IndexerTopKConfig:
+    """How a model selects its indexer top-k (the ``indexer_topk`` field of an ``ImplConfig``).
+
+    Attributes:
+        backend: ``default`` installs nothing: every module keeps its upstream selector.
+            ``reference`` selects every row with the matched-precision reference selector
+            (operands quantized to the model's indexer format, scored by DeepGEMM, memory
+            bounded for long contexts). ``litetopk`` selects with an external LiteTopK plugin
+            where its plan allows and with the reference selector elsewhere.
+        precision: ``exact``: every selected set is the exact top-k of the matched-precision
+            scores (score descending, lower key id first on equal scores); it needs
+            ``exact_topk`` and, for LiteTopK, a plugin route that advertises exact selection.
+            ``fast``: LiteTopK rows may differ from that set among nearly tied keys, and
+            without ``exact_topk`` equal scores are ordered arbitrarily.
+        litetopk: The LiteTopK plugin; required by backend ``litetopk``.
+        exact_topk: The exact-tie top-k package of the reference selector; required by
+            precision ``exact`` unless the backend is ``default``.
+    """
+
+    backend: IndexerTopKBackend = "default"
+    precision: IndexerTopKPrecision = "exact"
+    litetopk: LiteTopKPluginConfig | None = None
+    exact_topk: ExactTopKConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.backend not in _BACKENDS:
+            raise IndexerTopKConfigError(
+                "indexer_topk.backend must be one of 'default', 'reference', 'litetopk'; "
+                f"got {self.backend!r}"
+            )
+        if self.precision not in _PRECISIONS:
+            raise IndexerTopKConfigError(
+                f"indexer_topk.precision must be one of 'exact', 'fast'; got {self.precision!r}"
+            )
+        for name, expected in (("litetopk", LiteTopKPluginConfig), ("exact_topk", ExactTopKConfig)):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, expected):
+                raise IndexerTopKConfigError(
+                    f"indexer_topk.{name} must be {expected.__name__} or None, got "
+                    f"{type(value).__name__}"
+                )
+        if self.backend == "litetopk" and self.litetopk is None:
+            raise IndexerTopKConfigError(
+                "indexer_topk.litetopk.source is required: LiteTopK kernels are not bundled "
+                "with Megatron Lite (see experimental/lite/docs/indexer_topk.md#dependencies)"
+            )
+        if self.backend != "default" and self.precision == "exact" and self.exact_topk is None:
+            raise IndexerTopKConfigError(
+                "indexer_topk.exact_topk.source is required for precision='exact': the "
+                "exact-tie top-k is not bundled with Megatron Lite (set it, or use "
+                "precision='fast')"
+            )
+
+
+def _from_mapping(owner: str, cls: type, value: object) -> Any:
+    """Build the config dataclass ``cls`` from a mapping, rejecting unknown keys."""
+    if value is None or isinstance(value, cls):
+        return value
+    if not isinstance(value, Mapping):
+        raise IndexerTopKConfigError(
+            f"{owner} must be {cls.__name__}, a mapping or None, got {type(value).__name__}"
+        )
+    known = [field.name for field in dataclasses.fields(cls)]
+    unknown = sorted(set(value) - set(known), key=str)
+    if unknown:
+        raise IndexerTopKConfigError(
+            f"{owner} has unknown keys {unknown}; valid keys are {', '.join(known)}"
+        )
+    try:
+        return cls(**value)
+    except TypeError as exc:
+        raise IndexerTopKConfigError(f"{owner} is incomplete: {exc}") from None
+
+
+def normalize_indexer_topk_config(
+    value: IndexerTopKConfig | Mapping[str, Any] | None,
+) -> IndexerTopKConfig | None:
+    """Return an indexer top-k configuration as a validated :class:`IndexerTopKConfig`.
+
+    Args:
+        value: A configuration, its mapping form (for example from a YAML file; ``litetopk``
+            and ``exact_topk`` may be mappings too), or None.
+
+    Returns:
+        The configuration, or None when ``value`` is None.
+
+    Raises:
+        IndexerTopKConfigError: If a key is unknown or a value or combination is invalid.
+    """
+    if value is None or isinstance(value, IndexerTopKConfig):
+        return value
+    if not isinstance(value, Mapping):
+        raise IndexerTopKConfigError(
+            "indexer_topk must be IndexerTopKConfig, a mapping or None, got "
+            f"{type(value).__name__}"
+        )
+    fields = dict(value)
+    for name, cls in (("litetopk", LiteTopKPluginConfig), ("exact_topk", ExactTopKConfig)):
+        if name in fields:
+            fields[name] = _from_mapping(f"indexer_topk.{name}", cls, fields[name])
+    return _from_mapping("indexer_topk", IndexerTopKConfig, fields)
 
 
 def _check_choice(owner: str, name: str, value: object, choices: tuple[object, ...]) -> None:

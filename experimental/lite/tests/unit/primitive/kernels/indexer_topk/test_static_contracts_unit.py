@@ -5,6 +5,8 @@
 * Only ``plugins/`` imports external modules by path or manipulates ``sys.modules``.
 * Nothing in the package uses ``torch.distributed``: selection issues no collectives.
 * The package imports without Triton, DeepGEMM or cuDNN, and without Megatron Core.
+
+The per-module bindings (``modules/attention/indexer_topk.py``) follow the same source rules.
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ PACKAGE_ROOT = LITE_ROOT / "megatron" / "lite" / "primitive" / "kernels" / "inde
 PLUGINS_ROOT = PACKAGE_ROOT / "plugins"
 ENV_MODULE = PLUGINS_ROOT / "env.py"
 PACKAGE = "megatron.lite.primitive.kernels.indexer_topk"
+BINDINGS_MODULE = (
+    LITE_ROOT / "megatron" / "lite" / "primitive" / "modules" / "attention" / "indexer_topk.py"
+)
 
 _ENVIRONMENT_ATTRIBUTES = {"environ", "environb", "getenv", "getenvb", "putenv", "unsetenv"}
 _EXTERNAL_LOADERS = {
@@ -46,6 +51,12 @@ def _package_files() -> list[Path]:
     return files
 
 
+def _source_files() -> list[Path]:
+    """The package and the bindings module: every file the source rules apply to."""
+    assert BINDINGS_MODULE.is_file()
+    return [*_package_files(), BINDINGS_MODULE]
+
+
 def _relative(path: Path) -> str:
     return str(path.relative_to(LITE_ROOT))
 
@@ -65,7 +76,7 @@ def _names_in(node: ast.AST) -> set[str]:
 
 def test_only_env_module_mentions_sglang_env() -> None:
     violations = []
-    for path in _package_files():
+    for path in _source_files():
         if path == ENV_MODULE:
             continue
         text = path.read_text(encoding="utf-8")
@@ -89,7 +100,7 @@ def test_only_env_module_mentions_sglang_env() -> None:
 
 def test_only_plugins_load_external_modules() -> None:
     violations = []
-    for path in _package_files():
+    for path in _source_files():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         in_plugins = PLUGINS_ROOT in path.parents
         for node in ast.walk(tree):
@@ -124,7 +135,7 @@ def test_only_plugins_load_external_modules() -> None:
 
 def test_no_torch_distributed_in_package() -> None:
     violations = []
-    for path in _package_files():
+    for path in _source_files():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             location = f"{_relative(path)}:{getattr(node, 'lineno', 0)}"
@@ -178,7 +189,7 @@ def _matches(module: str, prefixes: tuple[str, ...]) -> bool:
 
 def test_top_level_imports_are_torch_stdlib_or_lite_primitive() -> None:
     violations = []
-    for path in _package_files():
+    for path in _source_files():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for line, module, guarded in _top_level_imports(tree):
             root = module.split(".")[0]
