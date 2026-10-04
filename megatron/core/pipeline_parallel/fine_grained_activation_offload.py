@@ -17,6 +17,7 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
+from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -152,28 +153,31 @@ class OffloadTensorPool:
     Memory pool for efficient allocation and deallocation of tensors.
 
     Features:
-    - Supports multiple tensor shapes and dtypes, each with its own pool
+    - Supports multiple tensor shapes and dtypes, each with its own pool by default
     - Dynamic allocation: tensors are created on-demand during allocation
     - Efficient reuse: freed tensors are returned to the pool for reuse
     - Uses queue-based management for O(1) allocation and deallocation
+    - Optional fixed pinned backing storage supports reuse across shapes and dtypes
 
     Example:
         pool = OffloadTensorPool(device='cuda:0')
         tensor = pool.allocate((128, 512), dtype=torch.float32)
         # ... use tensor ...
-        pool.free(tensor, (128, 512), dtype=torch.float32)
+        pool.free(tensor)
     """
 
-    def __init__(self, device: str = 'cuda', pin_memory: bool = False):
+    def __init__(self, device: str = 'cuda', pin_memory: bool = False, capacity_bytes: int = 0):
         """
         Initialize offload tensor pool.
 
         Args:
             device: Device, default 'cuda'
             pin_memory: Whether to use pinned memory (mainly for CPU tensors)
+            capacity_bytes: Fixed pinned capacity; zero selects the shape/dtype cache.
         """
         self.device = torch.device(device)
         self.pin_memory = pin_memory
+        self._fixed_buffer: PinnedActivationBuffer | None = None
 
         # Maintain a separate pool for each (shape, dtype) combination
         # Structure: {(shape, dtype): {'free': deque, 'all': list, 'allocated_count': int}}
@@ -189,7 +193,26 @@ class OffloadTensorPool:
             'pool_misses': 0,  # Number of times a new tensor was created
         }
 
-        debug_rank("OffloadTensorPool: Initialized with dynamic allocation")
+        if capacity_bytes:
+            self.configure_fixed_buffer(capacity_bytes)
+
+    def configure_fixed_buffer(self, capacity_bytes: int) -> None:
+        """Select fixed pinned storage before the pool is first used.
+
+        The manager configures its shared pool when the first model chunk supplies
+        the offload configuration. Storage and events live as long as this pool.
+        """
+        if self.device.type != "cpu" or not self.pin_memory:
+            raise ValueError("Fixed offload storage requires a pinned CPU pool")
+        if self._fixed_buffer is not None or self._stats["allocation_requests"]:
+            raise RuntimeError("Configure fixed offload storage only once, before allocations")
+        self._fixed_buffer = PinnedActivationBuffer(capacity_bytes)
+        self._stats["total_allocated"] = 1
+
+    @property
+    def uses_fixed_buffer(self) -> bool:
+        """Whether this pool supports fixed-capacity reuse across tensor shapes."""
+        return self._fixed_buffer is not None
 
     def _get_pool_key(self, shape: Tuple, dtype: torch.dtype) -> Tuple:
         """Generate a unique key for the pool based on shape and dtype."""
@@ -204,18 +227,33 @@ class OffloadTensorPool:
             numel *= dim
         return numel * element_size
 
-    def allocate(self, shape: Tuple, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    def allocate(
+        self,
+        shape: Tuple,
+        dtype: torch.dtype = torch.float32,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
         """
         Allocate a tensor with the specified shape and dtype.
 
         Args:
             shape: Shape of the tensor
             dtype: Data type of the tensor, default torch.float32
+            stream: Already-active copy stream, avoiding repeated stream lookup for fixed storage.
 
         Returns:
-            Allocated tensor
+            Allocated tensor. With fixed storage, its first write must use the
+            current CUDA stream so reuse waits precede that write.
         """
         self._stats['allocation_requests'] += 1
+
+        if self._fixed_buffer is not None:
+            tensor = self._fixed_buffer.allocate(shape, dtype, stream=stream)
+            self._stats["current_in_use"] += 1
+            # Fixed allocations always reuse the one preallocated backing tensor.
+            self._stats["pool_hits"] += 1
+            return tensor
 
         pool_key = self._get_pool_key(shape, dtype)
 
@@ -258,17 +296,26 @@ class OffloadTensorPool:
 
         return tensor
 
-    def free(self, tensor: torch.Tensor):
+    def free(self, tensor: torch.Tensor, *, stream: Optional[torch.cuda.Stream] = None):
         """
         Return a tensor to the pool for reuse.
 
+        For fixed storage, call on the stream that enqueued the final H2D read.
+        The buffer records that reader and delays subsequent writes until it finishes.
+
         Args:
             tensor: Tensor to free
+            stream: Already-active H2D stream; defaults to the current stream.
 
         Raises:
             ValueError: If tensor doesn't belong to this pool
         """
         self._stats['free_requests'] += 1
+
+        if self._fixed_buffer is not None:
+            self._fixed_buffer.release(tensor, stream=stream)
+            self._stats["current_in_use"] -= 1
+            return
 
         shape = tensor.shape
         dtype = tensor.dtype
@@ -312,6 +359,19 @@ class OffloadTensorPool:
         Returns:
             Dictionary containing status information
         """
+        if self._fixed_buffer is not None:
+            if shape is not None or dtype is not None:
+                raise ValueError("Fixed offload storage has no per-shape pools")
+            return {
+                "global_stats": self._stats.copy(),
+                "pools": {},
+                "fixed_buffer": {
+                    "capacity_bytes": self._fixed_buffer.capacity_bytes,
+                    "live_bytes": self._fixed_buffer.live_bytes,
+                    "peak_live_bytes": self._fixed_buffer.peak_live_bytes,
+                    "graph_reserved_bytes": self._fixed_buffer.graph_reserved_bytes,
+                },
+            }
         if shape is not None:
             if dtype is None:
                 raise ValueError("dtype must be specified when shape is provided")
@@ -345,7 +405,11 @@ class OffloadTensorPool:
             return status
 
     def reset(self):
-        """Reset the pool, marking all tensors as available."""
+        """Reset cached tensors; fixed storage reclaims only fully released epochs."""
+        if self._fixed_buffer is not None:
+            # Manager resets must not discard outstanding backups or the events
+            # protecting their H2D readers. The allocator advances epochs itself.
+            return
         debug_rank("OffloadTensorPool: Resetting pool...")
 
         for pool_key, pool in self._pools.items():
@@ -359,7 +423,11 @@ class OffloadTensorPool:
         debug_rank("OffloadTensorPool: Reset complete")
 
     def clear(self):
-        """Clear the pool and release all GPU memory."""
+        """Clear cached tensors; fixed storage stays alive for captured graph reuse."""
+        if self._fixed_buffer is not None:
+            # Even an idle buffer can be referenced by a captured graph. Keep its
+            # backing allocation and external events for the pool's lifetime.
+            return
         debug_rank("OffloadTensorPool: Clearing pool...")
 
         for pool_key, pool in self._pools.items():
@@ -398,8 +466,8 @@ class OffloadTensorGroup:
         self.duplicate_storage_tensor_count = 0
         self.duplicate_storage_bytes = 0
         # Using memory pool is for the compatibility with cuda graph.
-        # Shapes of tensors for MoE activation offload groups are not known in advance,
-        # so we do not use CPU pool for them.
+        # Variable MoE shapes bypass the shape/dtype cache. ChunkOffloadHandler
+        # overrides this when the pool has fixed byte storage for cross-shape reuse.
         if name in ("expert_fc1", "moe_act", "fused_group_mlp"):
             self.use_cpu_pool = False
         else:
@@ -478,6 +546,7 @@ class PipelineOffloadManager:
         self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
         self._cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
+        self._offload_buffer_size_gib = None
 
         # Whether the manager is in warmup phase.
         self._is_warmup = True
@@ -748,6 +817,7 @@ class PipelineOffloadManager:
         delta_offload_bytes_across_pp_ranks=0,
         activation_offload_fraction: float = 1.0,
         max_inflight_offloads: Optional[int] = None,
+        buffer_size_gib: float = 0.0,
     ):
         """
         Initialize a chunk offload handler for a model chunk (microbatch).
@@ -763,6 +833,7 @@ class PipelineOffloadManager:
             max_inflight_offloads: If set, cap pending offloads per group name before main
                 wait_event; see ``fine_grained_offloading_max_inflight_offloads`` on
                 ``TransformerConfig``.
+            buffer_size_gib: Fixed shared pinned capacity per rank; zero disables it.
         """
         if not self._is_warmup:
             return
@@ -785,7 +856,16 @@ class PipelineOffloadManager:
         if cur_vpp_rank == self._vpp - 1:
             self.flush()
 
-        # Use shared CPU tensor pool for better reuse across chunks
+        if self._offload_buffer_size_gib is None:
+            if buffer_size_gib:
+                self._cpu_tensor_pool.configure_fixed_buffer(int(buffer_size_gib * 2**30))
+            self._offload_buffer_size_gib = buffer_size_gib
+        elif buffer_size_gib != self._offload_buffer_size_gib:
+            raise ValueError(
+                "All offload chunks on a rank must share the same pinned buffer budget"
+            )
+
+        # Use shared CPU storage so the budget is per rank, not per chunk.
         cur_chunk = ChunkOffloadHandler(
             min_offloaded_tensor_size,
             self._cpu_tensor_pool,
@@ -892,7 +972,7 @@ class ChunkOffloadHandler:
     BASE_OFFLOAD_MIN_COVERAGE = 0.5
 
     @_otel_trace_fn('activation_offload', 'megatron.activation.offload')
-    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
+    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True, stream=None):
         """Offload.
 
         A non-contiguous view that covers most of its underlying storage is
@@ -922,8 +1002,13 @@ class ChunkOffloadHandler:
             else:
                 src_tensor = src_tensor.contiguous()
 
+        # Variable-shape MoE groups bypass the shape/dtype cache, but can share
+        # the fixed byte buffer. Preserve a boolean ownership flag for reload.
+        use_cpu_pool = use_cpu_pool or (pin_memory and self.cpu_tensor_pool.uses_fixed_buffer)
         if use_cpu_pool:
-            cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
+            cpu_backup = self.cpu_tensor_pool.allocate(
+                src_tensor.shape, dtype=src_tensor.dtype, stream=stream
+            )
         else:
             cpu_backup = torch.empty(
                 src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
@@ -934,7 +1019,7 @@ class ChunkOffloadHandler:
         return state
 
     @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
-    def reload(self, state, non_blocking=None):
+    def reload(self, state, non_blocking=None, stream=None):
         """Reload."""
         debug_rank("------reload")
         dev, cpu_backup, use_cpu_pool, view_meta = state
@@ -945,7 +1030,7 @@ class ChunkOffloadHandler:
         )
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
-            self.cpu_tensor_pool.free(cpu_backup)
+            self.cpu_tensor_pool.free(cpu_backup, stream=stream)
         if view_meta is not None:
             size, stride, storage_offset = view_meta
             gpu_tensor = gpu_tensor.as_strided(size, stride, storage_offset)
@@ -1113,7 +1198,9 @@ class ChunkOffloadHandler:
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
-                        tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
+                        tensor_on_device,
+                        use_cpu_pool=group_to_offload.use_cpu_pool,
+                        stream=self.d2h_stream,
                     )
                     # Account the bytes actually copied to CPU (the base storage
                     # for view offloads).
@@ -1186,7 +1273,7 @@ class ChunkOffloadHandler:
             for tensor_tag, state in group_to_reload._tensors.items():
                 # Only reload if tensor was offloaded (stored as tuple)
                 if isinstance(state, tuple):
-                    recovered_tensor = self.reload(state)
+                    recovered_tensor = self.reload(state, stream=self.h2d_stream)
                     debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
@@ -1532,6 +1619,7 @@ class FineGrainedActivationOffloadingInterface:
         delta_offload_bytes_across_pp_ranks,
         activation_offload_fraction,
         max_inflight_offloads: Optional[int] = None,
+        buffer_size_gib: float = 0.0,
     ):
         """Initialize the chunk handler, called at the start of a microbatch forward pass."""
         PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
@@ -1542,6 +1630,7 @@ class FineGrainedActivationOffloadingInterface:
             delta_offload_bytes_across_pp_ranks,
             activation_offload_fraction,
             max_inflight_offloads=max_inflight_offloads,
+            buffer_size_gib=buffer_size_gib,
         )
 
     @staticmethod
