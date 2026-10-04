@@ -677,7 +677,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if active_context is not None
             else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
         )
-        with construction_context:
+        with construction_context as context:
+            # MCore's finalize_model_grads() calls finish_grad_sync() after the schedule
+            # completes, including delayed wgrad and custom 1F1B backward work. Apply the
+            # opt-in to both adapter-owned and ambient contexts shared by model chunks.
+            context.manual_grad_sync = True
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -872,12 +876,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
-        if self.config.overlap_moe_expert_parallel_comm:
-            # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
-            # Synchronize gradients here to ensure it is safe to call optimizer.step().
-            context = self.module.context
-            context.current_stream().wait_stream(context.reduce_scatter_stream)
+        """Wait on all submitted reductions, including delayed weight gradients."""
+        self.module.context.finish_grad_sync()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
@@ -889,7 +889,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
     def stop_communication(self) -> None:
-        """MFSDP v2 communication is complete when backward returns."""
+        """Wait for any pending gradient reductions."""
+        self.finish_grad_sync()
 
 
 def FullyShardedDataParallel(

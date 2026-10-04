@@ -51,6 +51,13 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    manual_grad_sync: bool
+    """Allow reductions without a pending autograd callback.
+
+    The caller must call ``finish_grad_sync()`` after all gradient producers,
+    including delayed weight-gradient computation, and before consuming gradients.
+    Ordinary backward retains its automatic completion callback.
+    """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -67,6 +74,7 @@ class FsdpContext:
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        manual_grad_sync: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -78,10 +86,13 @@ class FsdpContext:
                 communication stream to reduce peak transient memory.
             parameter_to_owner: Construction-time TensorAtomic owner assignments. See
                 ``fully_shard_context``.
+            manual_grad_sync: Allow gradient reductions outside autograd completion.
+                The caller must synchronize them with ``finish_grad_sync()``.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.manual_grad_sync = manual_grad_sync
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
@@ -140,9 +151,18 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def post_backward(self) -> None:
-        """Order current-stream consumers after this context's gradient reductions."""
+    def finish_grad_sync(self) -> None:
+        """Order current-stream consumers after all gradient reductions submitted so far.
+
+        Call after all backward work, including delayed weight-gradient computation,
+        and before reading or modifying gradients. This enqueues a stream dependency;
+        it does not block the CPU or wait for reductions that have not yet been launched.
+        """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+
+    def post_backward(self) -> None:
+        """Order current-stream consumers after this backward's gradient reductions."""
+        self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
@@ -525,9 +545,6 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
         self._reduce_gradient_groups()
-        if not self.context._post_backward_hook_registered:
-            # Delayed TE wgrad can launch reductions after the final autograd callback.
-            self.context.current_stream().wait_stream(self.context.reduce_scatter_stream)
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
@@ -541,6 +558,14 @@ class FsdpModule:
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
+
+                if not context._post_backward_hook_registered and not context.manual_grad_sync:
+                    raise RuntimeError(
+                        "Gradient reduction has no pending autograd completion callback. "
+                        "Use fully_shard_context(manual_grad_sync=True) and call "
+                        "context.finish_grad_sync() after all backward work, including "
+                        "delayed weight-gradient computation, before consuming gradients."
+                    )
 
                 with torch.cuda.stream(reduce_scatter_stream):
                     partial_grad = group.allocate_partial_grad_buffer()

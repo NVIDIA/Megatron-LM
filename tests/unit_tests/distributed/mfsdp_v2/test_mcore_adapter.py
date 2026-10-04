@@ -9,6 +9,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
@@ -16,6 +17,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -262,6 +264,76 @@ class TestMcoreAdapterDense:
         )
 
         assert fully_shard_context_calls == [True]
+
+    @pytest.mark.parametrize("share_context", [False, True])
+    def test_finish_grad_sync_waits_for_delayed_wgrad(
+        self, distributed_setup, monkeypatch, share_context
+    ):
+        """MCore opts into manual sync and fences delayed reductions without MoE overlap."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        layer = te.Linear(
+            16,
+            16,
+            bias=False,
+            params_dtype=config.params_dtype,
+            device=distributed_setup.device,
+            delay_wgrad_compute=True,
+            fuse_wgrad_accumulation=False,
+        )
+        # Cover both standalone adapter construction and an ambient context such as VPP's.
+        construction_context = (
+            fully_shard_context(device=distributed_setup.device)
+            if share_context
+            else contextlib.nullcontext()
+        )
+        with construction_context as shared_context:
+            model = FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=False,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                ),
+                module=layer,
+                pg_collection=self.pg_collection,
+            )
+        if share_context:
+            assert model.module.context is shared_context
+
+        group = model.module.parameter_groups[0]
+        reduce_partial_gradients = group.reduce_partial_gradients
+
+        def delayed_reduce(*args, **kwargs):
+            torch.cuda._sleep(200_000_000)
+            return reduce_partial_gradients(*args, **kwargs)
+
+        monkeypatch.setattr(group, "reduce_partial_gradients", delayed_reduce)
+        # Repeat to exercise callback state and persistent gradient-buffer reuse.
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            group.main_grad.local_buffer.fill_(float("nan"))
+            x = torch.randn(
+                4,
+                16,
+                device=distributed_setup.device,
+                dtype=config.params_dtype,
+                requires_grad=True,
+            )
+            model(x).float().square().mean().backward()
+            assert model.module.weight.grad is None
+            model.module.backward_dw()
+
+            model.finish_grad_sync()
+            consumed_gradient = model.module.weight.grad.clone()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(consumed_gradient, model.module.weight.grad)
 
     def test_build_train_and_step(self):
         """Match eager training against an MFSDP v2 train-and-step sequence."""

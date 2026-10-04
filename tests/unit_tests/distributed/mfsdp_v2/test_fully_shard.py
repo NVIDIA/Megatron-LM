@@ -274,8 +274,9 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup, monkeypatch):
-    """Delayed TE wgrad must finish reduction before current-stream consumers."""
+@pytest.mark.parametrize("manual_grad_sync", [False, True])
+def test_fully_shard_delayed_te_weight_gradient(distributed_setup, monkeypatch, manual_grad_sync):
+    """Delayed TE wgrad requires an explicit opt-in and a wait before consuming grads."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -289,7 +290,7 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup, mon
         delay_wgrad_compute=True,
         fuse_wgrad_accumulation=False,
     )
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, manual_grad_sync=manual_grad_sync) as context:
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -297,7 +298,14 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup, mon
     assert model.weight.grad is None
     assert model.phase is FsdpModule.Phase.BACKWARD
 
+    if not manual_grad_sync:
+        with pytest.raises(RuntimeError, match="manual_grad_sync=True"):
+            model.backward_dw()
+        assert model.weight.grad is None
+        return
+
     group = model.parameter_groups[0]
+    group.main_grad.local_buffer.fill_(float("nan"))
     reduce_partial_gradients = group.reduce_partial_gradients
 
     def delayed_reduce(*args, **kwargs):
@@ -307,6 +315,7 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup, mon
 
     monkeypatch.setattr(group, "reduce_partial_gradients", delayed_reduce)
     model.backward_dw()
+    context.finish_grad_sync()
     # Read before synchronizing: checking only .grad existence misses stream races.
     consumed_gradient = model.weight.grad.clone()
     torch.cuda.synchronize()
