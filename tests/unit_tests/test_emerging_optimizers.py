@@ -12,7 +12,10 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -739,7 +742,9 @@ class TestMuonOptimizerMultiRankTP:
         )
         model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(multi_latent_attention=True),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                multi_latent_attention=True
+            ),
             vocab_size=32,
             max_sequence_length=8,
             pre_process=False,
@@ -1223,13 +1228,20 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
         pg_collection=None,
     )
 
-    actual = optimizer.orthogonalize(param, grad)
-    expected = torch.cat(
-        [
-            optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
-            for head in torch.split(grad, [2] * 4)
-        ]
-    )
+    # orthogonalize() does not apply fp32_matmul_prec (step() does), and TF32 lets the
+    # batched and 2D GEMM kernels round differently, so pin full FP32 precision here.
+    prev_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+                for head in torch.split(grad, [2] * 4)
+            ]
+        )
+    finally:
+        torch.set_float32_matmul_precision(prev_precision)
     torch.testing.assert_close(actual, expected)
 
 
