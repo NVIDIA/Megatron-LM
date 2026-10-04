@@ -14,6 +14,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoEncoderFloat16Module, MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import Float16Module
 from megatron.training.initialize import _set_random_seed
 from megatron.training.models.dist_utils import (
     prepare_existing_model_chunks_for_distributed_training,
