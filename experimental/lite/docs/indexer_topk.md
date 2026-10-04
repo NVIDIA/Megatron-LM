@@ -86,6 +86,7 @@ installation = bundle.extras["indexer_topk"]  # IndexerTopKInstallation
 | `precision` | `"exact"` | `exact` or `fast`, see [Precision](#precision) |
 | `litetopk` | None | The plugin directory and its optional pins (`LiteTopKPluginConfig`: `source`, `expected_source_id`, `expected_adapter_sha256`, `prebuilt_extension`, `prebuilt_extension_sha256`, `build_dir`, `deepgemm_include_dir`). Required by `backend="litetopk"` |
 | `exact_topk` | None | The exact-tie top-k package (`ExactTopKConfig`: `source`, and `expected_sha256`, per-file pins). Required by `precision="exact"` unless the backend is `default` |
+| `head_padding` | `False` | Let LiteTopK serve a layer whose indexer head count its route has no kernels for, on the route's next larger head count with zero heads appended; see [Head counts](#head-counts-and-zero-head-padding) |
 
 - `ImplConfig` validates the field when it is built: unknown keys and invalid values or
   combinations raise `IndexerTopKConfigError` (a `ValueError`). It keeps the value as given.
@@ -96,9 +97,10 @@ installation = bundle.extras["indexer_topk"]  # IndexerTopKInstallation
   imports nothing of the indexer top-k package.
 - `configure_indexer_topk` binds every DSA layer that selects its own top-k (IndexShare shared
   layers reuse the top-k of their source layer and stay unbound). It validates every layer before
-  it binds any: it probes the reference score kernel for the layer's head count and, for
-  `backend="litetopk"`, loads the plugin and negotiates its route, so an unusable configuration
-  fails when the model is built.
+  it binds any: it negotiates the layer's head counts with the reference score kernel, which it
+  probes, and, for `backend="litetopk"`, loads the plugin and negotiates its route (see
+  [Head counts](#head-counts-and-zero-head-padding)), so an unusable configuration fails when the
+  model is built.
 - The model configuration carries no tuning values. The selection plan (tile length, start
   position, seeding, memory budgets, plugin settings) is derived per layer by
   `resolve_indexer_topk_tuning`, the single policy seam in
@@ -246,22 +248,96 @@ The plugin routes declare their capabilities in `plugin_info()`; Megatron Lite h
 | `glm-litetopk-raw32h64-abi1` | `fp8_paged` | FP8 | 32, 64 | 128 | 2048 | 196608 to 1048576 | yes |
 | `glm-litetopk-996e-abi1` | `fp8_paged` | FP8 | 32 | 128 | 2048 | 196608 to 1048576 | no |
 
-- A layer whose head count or head dimension the route does not serve fails when the model is
-  built; use `backend="reference"` for it. A layer whose top-k the route does not select is
-  selected by the reference selector alone.
+- A layer whose head count the route has no kernels for fails when the model is built, unless
+  `head_padding=True` lets it run on a larger head count of the route (see
+  [Head counts](#head-counts-and-zero-head-padding)); so does a layer whose head dimension the
+  route does not serve. Use `backend="reference"` for such a layer. A layer whose top-k the route
+  does not select is selected by the reference selector alone.
 - Within a sequence that has the route's minimum key count, LiteTopK tiles start at a fixed causal
-  position, measured for 32 kernel heads: FP8 tiles 8192 positions before the route's minimum
-  key count (position 188416 with the routes above), the start that gave the fastest calls in
-  the measurements behind this default. For any other kernel head count (64 heads with
-  `glm-litetopk-raw32h64-abi1`) the default plan gives LiteTopK no row, because no start was
-  measured for it (see [Performance](#performance)); `IndexerTopKTuning.startup_position`
-  enables it. Earlier rows, shorter sequences and the tiles the plugin declines go to the
+  position, measured per kernel head count: FP8 tiles of the 32-head kernels 8192 positions
+  before the route's minimum key count (position 188416 with the routes above); FP8 tiles of the
+  64-head kernels nowhere by default, because no start was measured to keep LiteTopK at least as
+  fast as the reference backend at every prompt length it would serve (see
+  [Performance](#performance)). These are the starts that gave the fastest calls in the
+  measurements behind the defaults; FP8 tiles hold 1776 rows (on 148 SMs) with 32 and with 64
+  kernel heads. Earlier rows, shorter sequences and the tiles the plugin declines go to the
   reference selector. `IndexerTopKInstallation.stats()` counts the rows each selector took and
   why a segment got no LiteTopK tile.
 - Reference selector: `configure_indexer_topk` probes DeepGEMM for the layer's head count when the
-  model is built and pads an unsupported count with zero-weight query heads, which add exact zeros
-  to every score. With `sgl-deep-gemm` 0.1.3 the FP8 score kernel accepts 16, 32 and 64 heads.
-  The exact-tie top-k selects up to 2048 keys per row among up to 2**20 keys.
+  model is built and pads an unsupported count with zero query heads, which add exact zeros to
+  every score. With `sgl-deep-gemm` 0.1.3 the score kernel accepts 16, 32 and 64 heads, for FP8
+  operands. The exact-tie top-k selects up to 2048 keys per row among up to 2**20 keys.
+
+## Head counts and zero-head padding
+
+An indexer ranks keys by a weighted sum over all its heads, so every selector of a layer scores
+all of them, and score kernels exist for some head counts only. Megatron Lite hard-codes none:
+when the model is built, `configure_indexer_topk` negotiates, for every layer, the head counts its
+selectors score with, from the heads the plugin route declares in `plugin_info()` and from a probe
+of the reference score kernel (one small DeepGEMM call per format, head count and device
+architecture).
+
+- LiteTopK runs a head count of its route as is. With `head_padding=True` it runs a head count
+  that is a multiple of four and below the route's largest one on the route's next larger head
+  count, with zero heads appended (16 heads on 32-head kernels, 48 on 64). Any other head count,
+  or such a head count without `head_padding`, fails when the model is built; the message gives
+  the padded head count and its cost.
+- The reference selector pads where DeepGEMM has no kernel for the head count, to the next head
+  count it has, with or without `head_padding`. While LiteTopK pads, the reference selector scores
+  the plugin's padded operands, so that the rows it selects, recomputes and votes seeds with are
+  scored from exactly the plugin's bytes, which `precision="exact"` relies on; with
+  `precision="fast"` and a head count DeepGEMM supports, it keeps the layer's own head count. When
+  the plan gives LiteTopK no row, it scores as the reference backend does.
+
+With the FP8 route of `glm-litetopk-raw32h64-abi1` (kernels for 32 and 64 heads) and
+`sgl-deep-gemm` 0.1.3 (16, 32 and 64 heads):
+
+| Indexer heads | LiteTopK, `head_padding=False` | LiteTopK, `head_padding=True` | Reference backend |
+| --- | --- | --- | --- |
+| 4, 8, 12 | error, suggests padding to 32 | 32 heads | 16 heads |
+| 16 | error, suggests padding to 32 | 32 heads | 16 heads |
+| 20 | error, suggests padding to 32 | 32 heads | 32 heads |
+| 32 | 32 heads | 32 heads | 32 heads |
+| 48 | error, suggests padding to 64 | 64 heads | 64 heads |
+| 64 | 64 heads | 64 heads | 64 heads |
+| 96, 128 | error (the reference selector cannot score them either) | error | error |
+
+`glm-litetopk-raw32-abi1` and `glm-litetopk-996e-abi1` have FP8 kernels for 32 heads only: they
+serve 4 to 28 heads with padding, and no head count above 32.
+
+Zero heads are appended after quantization: FP8 query codes 0 and folded weights 0. They change
+no score value. The score kernels sum the weighted heads in four float32 FMA chains that start at +0
+(heads `j` with equal `j % 4`, in head order, rounded to nearest), the zero heads end every chain,
+and adding a zero leaves a partial sum bit for bit unchanged unless it is -0. A chain holds -0 only
+after a negative product below half the smallest float32 subnormal rounded to zero, which needs a
+product below 2**-102 in magnitude; then a score of -0 can become +0, an equal value with another
+bit pattern.
+The CPU tests check this with an exact simulation of the chains; the GPU tests show that DeepGEMM
+scores 16 heads padded to 32 or 64 bit for bit like 16 heads and selects the same keys.
+
+Padding multiplies the scoring work by the kernel heads over the layer's heads (2.00x for 16
+heads on 32-head kernels, 1.33x for 48 on 64); the key reads do not change. Measured cold on one
+B200 with 16 heads at 512K tokens: the reference selector took 673 ms with DeepGEMM's 16-head
+kernel and 872 ms padded to 32 heads (+29.7%; its top-k does not grow), and LiteTopK on 32-head
+kernels (tiles from position 188416, its reference rows padded as well) took 702 ms, 4.7% more
+than the 16-head reference backend; all three selected the same keys.
+
+The start positions of LiteTopK tiles above were measured against a reference selector that
+scores as many heads as LiteTopK. When LiteTopK pads and the reference backend scores the layer
+with fewer heads (16 heads on 32-head kernels, as DeepGEMM has 16-head kernels), LiteTopK has the
+more work, as measured above, and the default plan gives LiteTopK no row of the layer;
+`IndexerTopKTuning.startup_position` enables it. Padded layers whose reference selector pads to
+the same head count (20 heads on 32, 48 on 64) take the start position of their kernel heads,
+carried over from the unpadded measurements (both selectors score the same heads there too); these
+padded head counts were not timed. A tuning with `required=True` fails when the model is built if
+the default plan gives a layer no LiteTopK row.
+
+The negotiated head counts are recorded in `IndexerTopKBinding.heads`, an `IndexerHeads` (the
+indexer heads, the LiteTopK and reference kernel heads, the head count the reference selector
+needs on its own, and whether LiteTopK and the reference selector pad), and per layer in
+`IndexerTopKInstallation.heads()`; `IndexerTopKStats` counts the rows each selector scored with
+zero heads (`padded_litetopk_rows`, `padded_reference_rows`), and every binding logs its kernel
+head counts with its plan at its first selection on a device.
 
 ## Context parallelism
 
@@ -301,15 +377,21 @@ default plan:
   0.822 on four 256K inputs with real weights and embedding-level proxy activations, which give
   LiteTopK more candidates per row (a mean of 9.2K to 10.9K, against 3.3K to 7.3K in the captured
   layers).
-- FP8 indexers with 64 heads, `precision="exact"`, `glm-litetopk-raw32h64-abi1`, with the start
-  position of the 32-head kernels set explicitly (the default plan gives these layers no
-  LiteTopK row; tiles of three score-kernel waves, 888 rows on 148 SMs, from position
-  188416), on GLM-5.2 layer 0 with real weights and its 32 heads duplicated and
-  on synthetic inputs: 0.967 (real weights, so LiteTopK is slower) and 1.022 (synthetic) at 512K
-  tokens, 1.032 at 768K (synthetic) and 1.005 to 1.058 at 1M; 256K was not measured. In the
-  plugin's own harness, which times only the LiteTopK tiles (1776 rows) against the reference
-  selector on the same rows, the tiles took 0.5% to 11.4% longer at 256K and 512K tokens on
-  synthetic inputs.
+- FP8 indexers with 64 heads, `precision="exact"`, `glm-litetopk-raw32h64-abi1`, on synthetic
+  inputs (structured, strict-gap) and on GLM-5.2 layer 0 with real weights and its 32 heads
+  duplicated, with explicit start positions (the default plan gives these layers no LiteTopK
+  row): tiles from position 188416, 0.986 (real weights) and 1.024 (structured) at 512K tokens,
+  1.035 at 768K (structured) and 1.011 to 1.059 at 1M; tiles from position 524288 or 655360,
+  0.973 to 1.025 at 768K (strict-gap below 1) and 1.025 to 1.054 at 1M; tiles from position
+  786432 (none at 768K), 1.035 to 1.041 at 1M. The reference backend scores fewer rows per
+  DeepGEMM call as sequences get longer (whole score-kernel waves within its 2 GiB budget of
+  float32 scores: 888 rows up to 604575 keys, 592 up to 906862, 296 above). Its rows therefore
+  cost 1.5% to 6.2% more at 1M than at the same positions of a 768K call, and the LiteTopK backend
+  scores its reference rows in a narrower call with more rows per DeepGEMM call; much of
+  LiteTopK's advantage at 1M comes from that. Up to 906862 tokens the reference backend scores
+  as at 768K, where the strict-gap tiles took 5.7% to 6.2% longer than the reference rows they
+  replace; prompts of 786433 to 906862 tokens were not measured. For 1M-token prompts
+  `IndexerTopKTuning.startup_position` (for example 524288) enables LiteTopK.
 
 `precision="exact"` costs more than the fast selection of the previous LiteTopK integration
 (historical fast: `glm-litetopk-996e-abi1` with that integration's plan and settings), measured the
@@ -344,8 +426,9 @@ reference backend sorts as well, which makes its calls 3.3% to 7.2% slower at 25
 | `IndexerTopKConfigError: indexer_topk.litetopk.source is required: LiteTopK kernels are not bundled with Megatron Lite` | `ImplConfig` | Set `litetopk.source` (see [Dependencies](#dependencies)) or use `backend="reference"` |
 | `IndexerTopKConfigError: indexer_topk.exact_topk.source is required for precision='exact'` | `ImplConfig` | Set `exact_topk.source` or use `precision="fast"` |
 | `IndexerTopKConfigError: LiteTopK source ... has no fp8_paged route` | `build_model` | Use a plugin with an `fp8_paged` route |
-| `IndexerTopKConfigError: LiteTopK route ... supports indexer heads [...], head_dim [...]; layer ... has H=..., D=....` | `build_model` | `backend="reference"` |
+| `IndexerTopKConfigError: LiteTopK route ... supports indexer heads [...], head_dim [...], topk ...; layer ... has H=..., D=..., K=.... Set indexer_topk.head_padding=True to pad heads to ... (...x scoring work) or use backend='reference'.` | `build_model` | `head_padding=True` (see [Head counts](#head-counts-and-zero-head-padding)) or `backend="reference"`; without the padding sentence, `backend="reference"`, or `backend="default"` when the message says the reference score kernel cannot score the head count either |
 | `IndexerTopKConfigError: precision='exact' needs a LiteTopK route that advertises exact selection` | `build_model` | Use an exact plugin (raw32) with the qualified DeepGEMM, or `precision="fast"` |
+| `IndexerTopKConfigError: precision='exact' scores the rows LiteTopK does not cover on the plugin's operands, but the reference score kernel cannot score ... heads` | `build_model` | `precision="fast"`, or a plugin whose head counts DeepGEMM scores |
 | `IndexerTopKConfigError: IndexerTopKTuning.required needs LiteTopK rows, but the default plan gives LiteTopK none ...` | `build_model` | Set `IndexerTopKTuning.startup_position`, or drop `required` |
 | `IndexerTopKConfigError: DeepGEMM fp8_fp4_mqa_logits supports no head count from ...` | `build_model` | A DeepGEMM that supports the head count |
 | `IndexerTopKRuntimeError: the matched-precision indexer top-k reference selector needs DeepGEMM` | `build_model` | Install DeepGEMM or keep `backend="default"` |
@@ -394,6 +477,7 @@ experimental/lite/tests/run_tests.sh \
 | `smoke/model/glm5/lite/test_glm5_lite_cp_smoke.py` (the `indexer_topk` case) | 2 | DeepGEMM, cuDNN frontend |
 | `smoke/primitive/indexer_topk/test_plugins_gpu.py` | 1 | `LITETOPK_TEST_PLUGINS`; `LITETOPK_TEST_EXACT_TOPK` for its exact-tie test |
 | `smoke/primitive/indexer_topk/test_selector_gpu.py`, `test_cp_sim_gpu.py` | 1 | `LITETOPK_TEST_SELECTORS`, `LITETOPK_TEST_EXACT_TOPK` |
+| `smoke/primitive/indexer_topk/test_heads_gpu.py` | 1 | DeepGEMM, `LITETOPK_TEST_EXACT_TOPK`; the LiteTopK tests need an exact FP8 entry of `LITETOPK_TEST_SELECTORS`; each skips an entry whose route lacks the kernels it needs (64-head FP8 kernels as in `glm-litetopk-raw32h64-abi1`, or the 32-head FP8 kernels that 16 heads pad to) |
 | `smoke/primitive/indexer_topk/test_cp_modules_gpu.py` | 2 and 4 | an exact FP8 entry of `LITETOPK_TEST_SELECTORS`, `LITETOPK_TEST_EXACT_TOPK` |
 
 The single-GPU plugin tests run every entry in a fresh interpreter, because plugin settings are

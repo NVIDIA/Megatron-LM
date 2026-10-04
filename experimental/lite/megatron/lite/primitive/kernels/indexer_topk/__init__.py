@@ -3,11 +3,11 @@
 
 The operand quantizers and row-order kernels shared by every indexer top-k selector: the
 selectors must consume byte-identical operands and return rows in a deterministic order. The
-query layouts that describe the rows of a selection call, the tuning policy seam of the
-selection plan, and the matched-precision reference selector. Also the configuration and error
-types of the selectors and of their external plugins, which Megatron Lite loads from explicit
-paths only. The per-module bindings that run the selectors live in
-``megatron.lite.primitive.modules.attention.indexer_topk``.
+query layouts that describe the rows of a selection call, the head counts the selectors of a
+layer score with, the tuning policy seam of the selection plan, and the matched-precision
+reference selector. Also the configuration and error types of the selectors and of their
+external plugins, which Megatron Lite loads from explicit paths only. The per-module bindings
+that run the selectors live in ``megatron.lite.primitive.modules.attention.indexer_topk``.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from megatron.lite.primitive.kernels.indexer_topk.engine import (
     IndexerTopKStats,
     release_indexer_topk_workspaces,
 )
+from megatron.lite.primitive.kernels.indexer_topk.heads import IndexerHeads
 from megatron.lite.primitive.kernels.indexer_topk.layout import (
     IndexerGeometry,
     QueryLayout,
@@ -47,6 +48,7 @@ from megatron.lite.primitive.kernels.indexer_topk.reference import plan_score_ro
 __all__ = [
     "ExactTopKConfig",
     "IndexerGeometry",
+    "IndexerHeads",
     "IndexerTopKBackend",
     "IndexerTopKConfig",
     "IndexerTopKConfigError",

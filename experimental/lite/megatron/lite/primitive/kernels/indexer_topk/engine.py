@@ -110,6 +110,10 @@ class IndexerTopKStats:
         declined_tiles: Tiles the plugin declined on the host, by reason.
         tile_rows: Tiles the plugin selected, by tile length.
         status_rows: Rows whose plugin status was not OK at the status read, by status code.
+        padded_litetopk_rows: The part of ``litetopk_rows`` the plugin scored with zero-padded
+            query heads (``IndexerTopKConfig.head_padding``).
+        padded_reference_rows: Rows the reference selector scored with zero-padded query heads
+            (planned, declined, bootstrap and recomputed rows alike).
     """
 
     calls: int = 0
@@ -133,6 +137,8 @@ class IndexerTopKStats:
     declined_tiles: Counter[str] = field(default_factory=Counter)
     tile_rows: Counter[int] = field(default_factory=Counter)
     status_rows: Counter[int] = field(default_factory=Counter)
+    padded_litetopk_rows: int = 0
+    padded_reference_rows: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-ready copy (counter keys as strings, sorted)."""
@@ -225,7 +231,9 @@ class LiteTopKEngine:
         route: The plugin route that serves the layer.
         tuning: The resolved settings of the layer.
         exact: Request exact selection from the plugin (the route must advertise it).
-        kernel_heads: Heads the plugin kernels run with.
+        kernel_heads: Heads the plugin kernels run with: a head count of the route, at least the
+            indexer's. The query operands of every tile get the missing heads as zero heads
+            (see :func:`~.reference.quantize_queries`).
         layer_key: The identity of the layer: part of the rolling carry keys, so layers and
             segments never share a carry.
     """
@@ -479,6 +487,8 @@ class LiteTopKEngine:
                 stats.tiles += 1
                 stats.tile_rows[tile.rows] += 1
                 stats.litetopk_rows += tile.rows
+                if self.kernel_heads > operands.q.shape[1]:
+                    stats.padded_litetopk_rows += tile.rows
         return len(group.tiles), ""
 
 

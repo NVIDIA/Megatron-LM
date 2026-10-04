@@ -114,7 +114,8 @@ class RouteCapability:
     Attributes:
         name: ``fp8_paged`` (FP8 operands, paged candidate pool).
         fmt: The operand format of the route: ``fp8``.
-        heads: The indexer head counts the route's kernels are built for.
+        heads: The indexer head counts the route's kernels are built for (other head counts
+            can be zero-padded to one of them, see :meth:`padded_heads`).
         head_dims: The supported indexer head dimensions.
         topk: The supported top-k sizes; None means any top-k up to ``max_topk``.
         max_topk: The largest supported top-k.
@@ -151,6 +152,25 @@ class RouteCapability:
         if self.topk is not None:
             return topk in self.topk
         return 0 < topk <= self.max_topk
+
+    def padded_heads(self, num_heads: int) -> int | None:
+        """Return the head count of the route that ``num_heads`` heads are zero-padded to.
+
+        Zero heads add exact zeros to every score, so a head count the route's kernels are not
+        built for can run on the smallest larger head count of the route. Padding is offered for
+        head counts that are multiples of four, the granularity of the score kernels' head
+        reduction.
+
+        Args:
+            num_heads: The indexer heads of a layer.
+
+        Returns:
+            The smallest head count of the route above ``num_heads``, or None when
+            ``num_heads`` is not a multiple of four or the route has no larger head count.
+        """
+        if num_heads < 1 or num_heads % 4:
+            return None
+        return min((heads for heads in self.heads if heads > num_heads), default=None)
 
     def admits_query_length(self, query_length: int) -> bool:
         """Return whether the route accepts a query tile of ``query_length`` rows."""

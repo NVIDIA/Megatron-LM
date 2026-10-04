@@ -23,6 +23,11 @@ calls. :meth:`IndexerTopKBinding.select`
    rows, at most twice per call and not after such a second run failed as well;
 5. sorts every row (ids ascending, -1 last).
 
+The selectors of a binding score the head counts negotiated when it is built (see
+``megatron.lite.primitive.kernels.indexer_topk.heads``): the plugin's kernels may need zero heads
+appended to the layer's (``IndexerTopKConfig.head_padding``), and the reference selector then
+scores the same padded operands.
+
 Selection issues no collective: under context parallelism every rank selects its local rows
 against keys the model has already gathered, so a fallback on one rank cannot desynchronize the
 ranks. Bindings select only in eval mode with gradients disabled: they are inactive while autograd
@@ -61,6 +66,7 @@ from megatron.lite.primitive.kernels.indexer_topk.engine import (
     LiteTopKEngine,
     release_indexer_topk_workspaces,
 )
+from megatron.lite.primitive.kernels.indexer_topk.heads import IndexerHeads, negotiate_indexer_heads
 from megatron.lite.primitive.kernels.indexer_topk.layout import IndexerGeometry, QueryLayout
 from megatron.lite.primitive.kernels.indexer_topk.order import sort_topk_rows_
 from megatron.lite.primitive.kernels.indexer_topk.planner import SegmentPlan, Tile, plan_segment
@@ -145,11 +151,18 @@ def _device_scope(device: torch.device) -> contextlib.AbstractContextManager:
 
 @dataclass
 class _DeviceState:
-    """The device-dependent parts of a binding, resolved at the first selection on a device."""
+    """The device-dependent parts of a binding, resolved at the first selection on a device.
+
+    ``reference_heads`` is what the reference selector scores with: the negotiated
+    ``heads.reference_heads`` when the plan can give LiteTopK rows, else
+    ``heads.baseline_heads`` (no LiteTopK operands to match).
+    """
 
     tuning: ResolvedIndexerTopKTuning
     num_sms: int
     engine: LiteTopKEngine | None
+    heads: IndexerHeads
+    reference_heads: int | None
     reference: ReferenceSelector | None = None
 
 
@@ -164,6 +177,10 @@ class IndexerTopKBinding:
         name: The name of the bound module, used in logs and error messages.
         geometry: The indexer shape the binding was negotiated for.
         config: The configuration it was built from.
+        heads: The head counts its selectors score with, negotiated by
+            :func:`configure_indexer_topk` (see
+            :func:`~megatron.lite.primitive.kernels.indexer_topk.heads.negotiate_indexer_heads`)
+            and again on every device it selects on; None for a binding built without it.
         stats: The counters of its selection calls.
     """
 
@@ -178,10 +195,12 @@ class IndexerTopKBinding:
         kernel: TopKKernel | None,
         plugin: LoadedLiteTopKPlugin | None,
         route: RouteCapability | None,
+        heads: IndexerHeads | None = None,
     ) -> None:
         self.name = name
         self.geometry = geometry
         self.config = config
+        self.heads = heads
         self.stats = IndexerTopKStats()
         self._fmt = fmt
         self._tuning = tuning
@@ -388,6 +407,9 @@ class IndexerTopKBinding:
                     f"LiteTopK requires an SM100 (Blackwell) GPU, got compute capability {found}"
                 )
         num_sms = _num_sms(device)
+        heads = _negotiate_heads(
+            self.name, self.geometry, self.config, self._fmt, plugin, route, device=device
+        )
         tuning = resolve_indexer_topk_tuning(
             self._tuning,
             fmt=self._fmt,
@@ -395,6 +417,7 @@ class IndexerTopKBinding:
             geometry=self.geometry,
             precision=self.config.precision,
             num_sms=num_sms,
+            heads=heads,
         )
         engine = None
         if plugin is not None and route is not None:
@@ -409,14 +432,23 @@ class IndexerTopKBinding:
                 route,
                 tuning,
                 exact=self.config.precision == "exact",
-                kernel_heads=self.geometry.num_heads,
+                kernel_heads=heads.litetopk_heads,
                 layer_key=self._layer_key,
             )
-        state = _DeviceState(tuning=tuning, num_sms=num_sms, engine=engine)
+        # Without LiteTopK rows there are no plugin operands to match.
+        litetopk = engine is not None and tuning.startup_position is not None
+        state = _DeviceState(
+            tuning=tuning,
+            num_sms=num_sms,
+            engine=engine,
+            heads=heads,
+            reference_heads=heads.reference_heads if litetopk else heads.baseline_heads,
+        )
         self._states[key] = state
         logger.info(
             "indexer top-k binding of layer %s on %s: backend %s, precision %s, format %s, "
-            "route %s, source %s, heads %d, tuning %s",
+            "route %s, source %s, heads %d (LiteTopK kernels %s, reference kernel %s), "
+            "tuning %s",
             self.name,
             device,
             self.config.backend,
@@ -425,21 +457,18 @@ class IndexerTopKBinding:
             None if route is None else route.name,
             None if plugin is None else plugin.source_id,
             self.geometry.num_heads,
+            _kernel_heads_text(heads.litetopk_heads, self.geometry.num_heads),
+            _kernel_heads_text(state.reference_heads, self.geometry.num_heads),
             tuning.as_dict(),
         )
         return state
 
-    def _reference_selector(self, state: _DeviceState, device: torch.device) -> ReferenceSelector:
+    def _reference_selector(self, state: _DeviceState) -> ReferenceSelector:
         if state.reference is None:
             state.reference = ReferenceSelector(
                 fmt=self._fmt,
                 topk_kernel=self._kernel,
-                kernel_heads=score_kernel_heads(
-                    self.geometry.num_heads,
-                    fmt=self._fmt,
-                    head_dim=self.geometry.head_dim,
-                    device=device,
-                ),
+                kernel_heads=state.reference_heads,
                 budget_bytes=state.tuning.reference_budget_bytes,
                 rows_per_call=state.tuning.reference_rows_per_call,
                 num_sms=state.num_sms,
@@ -482,7 +511,9 @@ class IndexerTopKBinding:
         if not ranges:
             return
         self.stats.reference_calls += 1
-        self.stats.reference_score_calls += self._reference_selector(state, out.device).select(
+        if state.reference_heads > self.geometry.num_heads:
+            self.stats.padded_reference_rows += sum(end - start for start, end in ranges)
+        self.stats.reference_score_calls += self._reference_selector(state).select(
             operands.q,
             operands.weights,
             operands.keys,
@@ -650,6 +681,15 @@ class IndexerTopKInstallation:
         """Return the counters of every binding, keyed by module name."""
         return {binding.name: binding.stats for binding in self.bindings}
 
+    def heads(self) -> dict[str, dict[str, Any]]:
+        """Return the negotiated head counts of every binding, keyed by module name.
+
+        For provenance records: the layer's indexer heads, the heads the LiteTopK kernels and
+        the reference score kernel run with, and whether they are zero-padded (see
+        :class:`~megatron.lite.primitive.kernels.indexer_topk.heads.IndexerHeads`).
+        """
+        return {binding.name: binding.heads.as_dict() for binding in self.bindings}
+
     def reset_stats(self) -> None:
         """Reset the counters of every binding."""
         for binding in self.bindings:
@@ -673,15 +713,8 @@ def _consumers(chunks: Sequence[nn.Module]) -> list[tuple[str, Any]]:
     return consumers
 
 
-def _negotiate_route(
-    name: str,
-    geometry: IndexerGeometry,
-    config: IndexerTopKConfig,
-    fmt: IndexerTopKFormat,
-    required: bool,
-    plugin: LoadedLiteTopKPlugin,
-) -> RouteCapability:
-    """Return the plugin route that serves a layer, or raise what keeps it from doing so."""
+def _route(name: str, fmt: IndexerTopKFormat, plugin: LoadedLiteTopKPlugin) -> RouteCapability:
+    """Return the plugin route of the layer's operand format, or raise when there is none."""
     route_name = _ROUTE_OF_FORMAT[fmt]
     route = plugin.info.route(route_name)
     if route is None:
@@ -689,12 +722,18 @@ def _negotiate_route(
             f"LiteTopK source {plugin.source_id} has no {route_name} route, which {fmt} "
             f"indexers need (layer {name}); use another plugin or backend='reference'"
         )
-    if geometry.num_heads not in route.heads or geometry.head_dim not in route.head_dims:
-        raise IndexerTopKConfigError(
-            f"LiteTopK route {route.name} (source {plugin.source_id}) supports indexer heads "
-            f"{sorted(route.heads)}, head_dim {sorted(route.head_dims)}; layer {name} has "
-            f"H={geometry.num_heads}, D={geometry.head_dim}. Use backend='reference'."
-        )
+    return route
+
+
+def _check_route(
+    name: str,
+    geometry: IndexerGeometry,
+    config: IndexerTopKConfig,
+    required: bool,
+    plugin: LoadedLiteTopKPlugin,
+    route: RouteCapability,
+) -> None:
+    """Raise when the route cannot select a layer with the configured precision and top-k."""
     if config.precision == "exact" and not route.exact:
         raise IndexerTopKConfigError(
             f"precision='exact' needs a LiteTopK route that advertises exact selection; source "
@@ -706,7 +745,38 @@ def _negotiate_route(
             f"LiteTopK route {route.name} (source {plugin.source_id}) does not select top-k "
             f"{geometry.topk} (layer {name}), so a required LiteTopK selection cannot run"
         )
-    return route
+
+
+def _negotiate_heads(
+    name: str,
+    geometry: IndexerGeometry,
+    config: IndexerTopKConfig,
+    fmt: IndexerTopKFormat,
+    plugin: LoadedLiteTopKPlugin | None,
+    route: RouteCapability | None,
+    *,
+    device: torch.device,
+) -> IndexerHeads:
+    """The head counts the selectors of a layer score with on ``device``."""
+
+    def reference_heads(heads: int) -> int:
+        return score_kernel_heads(heads, fmt=fmt, head_dim=geometry.head_dim, device=device)
+
+    return negotiate_indexer_heads(
+        geometry,
+        name=name,
+        precision=config.precision,
+        head_padding=config.head_padding,
+        route=route,
+        source_id=None if plugin is None else plugin.source_id,
+        reference_heads=reference_heads,
+    )
+
+
+def _kernel_heads_text(heads: int | None, num_heads: int) -> str:
+    if heads is None:
+        return "none"
+    return f"{heads} (zero-padded)" if heads > num_heads else str(heads)
 
 
 def configure_indexer_topk(
@@ -721,10 +791,13 @@ def configure_indexer_topk(
     Every module of ``chunks`` that implements :class:`IndexerTopKConsumer` and reports an
     indexer geometry gets a binding; modules without a geometry (layers that reuse another
     layer's top-k) are unbound. Configuring again replaces the binding of every module; plugin
-    loads are cached for the process. Every module is validated before any is changed: the head
-    count is probed against the reference score kernel and, for backend ``litetopk``, against
-    the plugin route. When the configuration is invalid, a module cannot be served or a plugin
-    fails to load, the call raises and every module keeps the binding it had before.
+    loads are cached for the process. Every module is validated before any is changed: its head
+    count is negotiated (see
+    :func:`~megatron.lite.primitive.kernels.indexer_topk.heads.negotiate_indexer_heads`) with the
+    reference score kernel, which is probed for the head counts it supports, and, for backend
+    ``litetopk``, with the plugin route, which zero-pads a head count it has no kernels for
+    only with ``head_padding``. When the configuration is invalid, a module cannot be served or
+    a plugin fails to load, the call raises and every module keeps the binding it had before.
 
     Args:
         chunks: The model chunks whose modules are bound.
@@ -739,7 +812,9 @@ def configure_indexer_topk(
 
     Raises:
         IndexerTopKConfigError: If the configuration is invalid, the reference score kernel
-            supports no head count for a layer, or a plugin route cannot serve a layer.
+            supports no head count for a layer, a plugin route cannot serve a layer (also when
+            its head count could be padded but ``head_padding`` is off), or the tuning requires
+            LiteTopK where the plan gives it no row.
         IndexerTopKPluginError: If a plugin or the exact-tie package fails to load.
         IndexerTopKRuntimeError: If DeepGEMM, which the reference selector scores with, is
             missing.
@@ -765,14 +840,8 @@ def configure_indexer_topk(
         if geometry is None:
             bound.append((module, None))
             continue
-        # Fails here, at build time, when the reference score kernel supports no head count
-        # for the layer; the result is cached per device architecture for the selections.
-        score_kernel_heads(
-            geometry.num_heads,
-            fmt=native_format,
-            head_dim=geometry.head_dim,
-            device=_module_device(module),
-        )
+        # The device the module selects on.
+        device = _module_device(module)
         plugin = route = None
         if config.backend == "litetopk":
             settings = resolve_indexer_topk_tuning(
@@ -781,21 +850,29 @@ def configure_indexer_topk(
                 route=None,
                 geometry=geometry,
                 precision=config.precision,
-                num_sms=_num_sms(_module_device(module)),
+                num_sms=_num_sms(device),
             ).plugin_settings
             plugin = load_litetopk_plugin(config.litetopk, settings)
             plugins[plugin.owner] = plugin
-            route = _negotiate_route(name, geometry, config, native_format, required, plugin)
-        else:
-            # Validate the overrides now rather than at the first selection.
-            resolve_indexer_topk_tuning(
-                tuning,
-                fmt=native_format,
-                route=None,
-                geometry=geometry,
-                precision=config.precision,
-                num_sms=1,
-            )
+            route = _route(name, native_format, plugin)
+        # Fails here, at build time, when a selector cannot serve the layer's head count. The
+        # reference score kernel's answers are cached per device architecture for the
+        # selections, which negotiate again on their device.
+        heads = _negotiate_heads(
+            name, geometry, config, native_format, plugin, route, device=device
+        )
+        if route is not None:
+            _check_route(name, geometry, config, required, plugin, route)
+        # Validate the overrides now rather than at the first selection.
+        resolve_indexer_topk_tuning(
+            tuning,
+            fmt=native_format,
+            route=route,
+            geometry=geometry,
+            precision=config.precision,
+            num_sms=1 if route is None else _num_sms(device),
+            heads=heads,
+        )
         binding = IndexerTopKBinding(
             name=name,
             geometry=geometry,
@@ -805,6 +882,7 @@ def configure_indexer_topk(
             kernel=kernel,
             plugin=plugin,
             route=route,
+            heads=heads,
         )
         bound.append((module, binding))
     for module, binding in bound:

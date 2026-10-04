@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from megatron.lite.primitive.kernels.indexer_topk.heads import IndexerHeads
     from megatron.lite.primitive.kernels.indexer_topk.layout import IndexerGeometry
     from megatron.lite.primitive.kernels.indexer_topk.plugins.abi import RouteCapability
 
@@ -73,17 +74,24 @@ REFERENCE_BUDGET_BYTES = {"fp8": 2 << 30}
 # corrupts the rows past it once the process has made any earlier call.
 TOPK_ROWS_PER_CALL_LIMIT = 32768
 # Scores of the FP8 score kernels are computed for 128 // heads query rows per SM, and a LiteTopK
-# FP8 tile covers this many such waves over all SMs.
+# FP8 tile covers this many such waves over all SMs, and at least _FP8_TILE_ROWS_PER_SM rows per
+# SM: the 1776-row tiles of 148 SMs, which the 32-head kernels were measured fastest with. With
+# 64 kernel heads (two rows per SM and wave) cold per-call timing at 512K to 1M keys found 1776-row
+# tiles 0.1% to 2.1% faster than three-wave (888-row) ones on every input.
 _FP8_TILE_WAVES = 3
+_FP8_TILE_ROWS_PER_SM = 12
 # FP8 LiteTopK starts this many positions before the route's qualified minimum key count, the
 # start measured on GLM-5.2 indexer inputs (32 heads).
 _FP8_STARTUP_MARGIN = 8192
-# The kernel head counts that start was measured with. The default plan gives LiteTopK no row
-# of a layer whose kernels run another head count (IndexerTopKTuning.startup_position enables
-# it): with 64 heads (glm-litetopk-raw32h64-abi1) and tiles from that start, a call on
-# GLM-5.2 layer 0 with real weights (its heads duplicated) took 3.4% longer than the
-# reference backend at 512K keys.
-_FP8_MEASURED_HEADS = frozenset((32,))
+# Start positions of FP8 LiteTopK tiles measured for other kernel head counts, which replace the
+# rule above; None: the default plan gives LiteTopK no row. 64 heads (BLOCK_Q 2, the
+# glm-litetopk-raw32h64-abi1 route), cold per-call timing against the reference backend on
+# synthetic (structured, strict-gap) and real-weight (GLM-5.2 layer 0, heads duplicated) inputs:
+# with tiles from position 188416 the calls of the real-weight input were 1.4% slower at 512K
+# keys, with tiles from 524288 or 655360 those of the strict-gap input 1.7% to 2.8% slower at
+# 768K; only at 1M keys was LiteTopK faster on every input (by 1.1% to 5.9%), largely because
+# the reference backend's scoring calls are smallest there.
+_FP8_MEASURED_STARTUP: dict[int, int | None] = {64: None}
 # Candidate pool pages per query row of the FP8 paged route. With cold per-layer timing on
 # GLM-5.2 indexer inputs (six in-model layers at 256K, real-weight layer 0 at 512K and 1M,
 # synthetic inputs up to 1M) the pool size does not change the speed of a tile, and the worst
@@ -238,12 +246,20 @@ class IndexerTopKConfig:
         litetopk: The LiteTopK plugin; required by backend ``litetopk``.
         exact_topk: The exact-tie top-k package of the reference selector; required by
             precision ``exact`` unless the backend is ``default``.
+        head_padding: Let LiteTopK serve a layer whose indexer head count its route has no
+            kernels for by appending zero heads up to the smallest larger head count of the
+            route (for a head count that is a multiple of four). Zero heads change no score
+            value (see :mod:`.heads`); the scoring work grows by the padded head count over the
+            layer's. Without it such a layer fails when it is bound. Backends other than
+            ``litetopk`` ignore it: the reference selector pads only where its score kernel has
+            no kernel for the head count, with or without it.
     """
 
     backend: IndexerTopKBackend = "default"
     precision: IndexerTopKPrecision = "exact"
     litetopk: LiteTopKPluginConfig | None = None
     exact_topk: ExactTopKConfig | None = None
+    head_padding: bool = False
 
     def __post_init__(self) -> None:
         if self.backend not in _BACKENDS:
@@ -254,6 +270,10 @@ class IndexerTopKConfig:
         if self.precision not in _PRECISIONS:
             raise IndexerTopKConfigError(
                 f"indexer_topk.precision must be one of 'exact', 'fast'; got {self.precision!r}"
+            )
+        if type(self.head_padding) is not bool:
+            raise IndexerTopKConfigError(
+                f"indexer_topk.head_padding must be a bool, got {self.head_padding!r}"
             )
         for name, expected in (("litetopk", LiteTopKPluginConfig), ("exact_topk", ExactTopKConfig)):
             value = getattr(self, name)
@@ -458,13 +478,17 @@ class ResolvedIndexerTopKTuning:
             selector when rows planned for LiteTopK are declined or fail (for benchmarks).
             Default False.
         tile_rows: Query rows of a LiteTopK tile, a multiple of 4. Default: three waves of the
-            score kernel (``3 * num_sms * (128 // num_heads)``, rounded down to a multiple of 4;
-            1776 for 32 heads on 148 SMs).
+            score kernel for the heads the LiteTopK kernels run with
+            (``3 * num_sms * (128 // kernel_heads)``) and at least 12 rows per SM, rounded down
+            to a multiple of 4: 1776 rows for 32 and for 64 heads on 148 SMs.
         startup_position: First causal position a LiteTopK tile may start at (a tile also
             needs rows that see the route's HOT prefix), or None when the plan gives LiteTopK
             no row. Default: 8192 before the route's qualified minimum key count (188416 for a
-            196608-key minimum), the start measured with 32 kernel heads, and None with any
-            other kernel head count, for which no start was measured. 0 lets only the HOT
+            196608-key minimum), the start measured with 32 kernel heads, and None with 64
+            kernel heads, where no start made LiteTopK faster than the reference backend at
+            every measured length (512K, 768K and 1M keys). None as well when LiteTopK runs
+            zero-padded heads and the reference selector would score the layer with fewer
+            heads on its own: no crossover was measured for that case. 0 lets only the HOT
             prefix limit it.
         group_tiles: Consecutive tiles of equal length that share one plan. Default 8.
         seed_bootstrap: How the first tile group of a segment gets its HOT seed: ``reference``
@@ -490,8 +514,11 @@ class ResolvedIndexerTopKTuning:
             Default ``sync_recompute``.
         plugin_settings: Import-time settings of the LiteTopK plugin. Default: the tiered 12K
             HOT seed, 13 pool pages per row, 2 row tiles, the identity cold-start seed,
-            paged tiles of up to ``tile_rows`` rows admitted and, for precision ``exact``, the
-            policies exact selection needs (``logical-id`` ties on ``native-fp32`` scores).
+            paged tiles of up to ``tile_rows`` rows admitted (the default tiles of the layer's
+            own head count: the settings are rendered before the plugin, and with it the
+            route's head counts, is loaded, and the tiles of zero-padded heads are shorter)
+            and, for precision ``exact``, the policies exact selection needs (``logical-id``
+            ties on ``native-fp32`` scores).
     """
 
     required: bool
@@ -531,6 +558,7 @@ def resolve_indexer_topk_tuning(
     geometry: IndexerGeometry,
     precision: IndexerTopKPrecision,
     num_sms: int,
+    heads: IndexerHeads | None = None,
 ) -> ResolvedIndexerTopKTuning:
     """Resolve the selection plan settings of one layer: the single tuning policy seam.
 
@@ -545,6 +573,9 @@ def resolve_indexer_topk_tuning(
         geometry: The indexer geometry of the layer.
         precision: ``exact`` or ``fast``.
         num_sms: Streaming multiprocessors of the device.
+        heads: The negotiated head counts of the layer
+            (:func:`~.heads.negotiate_indexer_heads`); None when every selector scores the
+            layer's own head count.
 
     Returns:
         The resolved settings.
@@ -570,18 +601,26 @@ def resolve_indexer_topk_tuning(
         )
     if type(num_sms) is not int or num_sms < 1:
         raise IndexerTopKConfigError(f"num_sms must be a positive integer, got {num_sms!r}")
-
-    waves = _FP8_TILE_WAVES * num_sms * max(1, 128 // geometry.num_heads)
-    tile_rows = _override(tuning.tile_rows, max(4, waves // 4 * 4))
+    if heads is not None and heads.num_heads != geometry.num_heads:
+        raise IndexerTopKConfigError(
+            f"the negotiated heads are for {heads.num_heads} indexer heads; this layer has "
+            f"{geometry.num_heads}"
+        )
     kernel_heads = geometry.num_heads
-    startup, why = _default_startup(route, kernel_heads)
+    if heads is not None and heads.litetopk_heads is not None:
+        kernel_heads = heads.litetopk_heads
+    startup, why = _default_startup(route, heads, kernel_heads)
+
+    tile_rows = _override(tuning.tile_rows, _fp8_tile_rows(num_sms, kernel_heads))
     exact = precision == "exact"
     settings = LiteTopKPluginSettings(
         tie_policy="logical-id" if exact else None,
         score_policy="native-fp32" if exact else None,
         paged_pool_pages_per_row=_FP8_POOL_PAGES_PER_ROW,
         fp8_row_tiles=2,
-        fp8_paged_admit_max_query_len=tile_rows,
+        fp8_paged_admit_max_query_len=_override(
+            tuning.tile_rows, _fp8_tile_rows(num_sms, geometry.num_heads)
+        ),
         tiered_seed_12k=_FP8_TIERED_SEED,
         coldstart_identity=True,
     )
@@ -628,13 +667,34 @@ def resolve_indexer_topk_tuning(
     return resolved
 
 
-def _default_startup(route: RouteCapability | None, kernel_heads: int) -> tuple[int | None, str]:
+def _fp8_tile_rows(num_sms: int, heads: int) -> int:
+    rows = num_sms * max(_FP8_TILE_ROWS_PER_SM, _FP8_TILE_WAVES * max(1, 128 // heads))
+    return max(4, rows // 4 * 4)
+
+
+def _default_startup(
+    route: RouteCapability | None, heads: IndexerHeads | None, kernel_heads: int
+) -> tuple[int | None, str]:
     """The default first position of LiteTopK tiles, and why it is None when it is."""
     if route is None:
         return 0, ""
-    if kernel_heads not in _FP8_MEASURED_HEADS:
-        return None, "no start position was measured for this kernel head count"
-    return max(0, route.min_keys - _FP8_STARTUP_MARGIN), ""
+    elif kernel_heads in _FP8_MEASURED_STARTUP:
+        startup = _FP8_MEASURED_STARTUP[kernel_heads]
+        if startup is None:
+            return None, "no start was faster than the reference selector at every measured length"
+    else:
+        startup = max(0, route.min_keys - _FP8_STARTUP_MARGIN)
+    # The start positions above were measured against a reference selector that scores as many
+    # heads as LiteTopK. One that scores fewer, because LiteTopK runs zero-padded heads and the
+    # reference score kernel supports the layer's own head count, is faster than measured.
+    if route is not None and heads is not None:
+        baseline = heads.num_heads if heads.baseline_heads is None else heads.baseline_heads
+        if baseline < kernel_heads:
+            return None, (
+                f"LiteTopK runs {kernel_heads} zero-padded heads, the reference selector "
+                f"{baseline}"
+            )
+    return startup, ""
 
 
 def _override(value: Any, default: Any) -> Any:
