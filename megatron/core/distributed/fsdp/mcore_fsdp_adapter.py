@@ -673,21 +673,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
-        construction_context = (
-            nullcontext(active_context)
-            if active_context is not None
-            else fully_shard_context(
-                device=device,
-                use_symmetric_memory=ddp_config.nccl_ub,
-                caller_managed_grad_sync=True,
-            )
-        )
-        with construction_context as context:
-            if not context.caller_managed_grad_sync:
+        if active_context is not None:
+            if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
                     "caller_managed_grad_sync=True."
                 )
+            construction_context = nullcontext(active_context)
+        else:
+            construction_context = fully_shard_context(
+                device=device,
+                use_symmetric_memory=ddp_config.nccl_ub,
+                caller_managed_grad_sync=True,
+            )
+        with construction_context:
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
