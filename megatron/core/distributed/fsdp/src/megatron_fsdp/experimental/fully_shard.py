@@ -79,7 +79,7 @@ def fully_shard_context(
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
     parameter_to_owner: dict[nn.Parameter, int] | None = None,
-    manual_grad_sync: bool = False,
+    caller_managed_grad_sync: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -99,7 +99,7 @@ def fully_shard_context(
             ranks in each parameter group's 1-D data-parallel mesh and must agree across
             that mesh. Every TensorAtomic parameter needs an entry; other entries are
             ignored. Tensors are packed by owner without changing logical parameter order.
-        manual_grad_sync: Allow reductions without a pending autograd completion callback,
+        caller_managed_grad_sync: Allow reductions without a pending autograd completion callback,
             for delayed weight gradients or custom backward schedules. The caller must
             call ``context.finish_grad_sync()`` after all backward work and before reading
             or modifying gradients. Ordinary backward keeps its automatic synchronization.
@@ -116,7 +116,7 @@ def fully_shard_context(
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
         parameter_to_owner=parameter_to_owner,
-        manual_grad_sync=manual_grad_sync,
+        caller_managed_grad_sync=caller_managed_grad_sync,
     )
     token = _FSDP_CONTEXT.set(context)
     try:

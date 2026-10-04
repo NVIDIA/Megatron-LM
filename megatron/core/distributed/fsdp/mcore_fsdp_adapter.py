@@ -681,7 +681,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # MCore's finalize_model_grads() calls finish_grad_sync() after the schedule
             # completes, including delayed wgrad and custom 1F1B backward work. Apply the
             # opt-in to both adapter-owned and ambient contexts shared by model chunks.
-            context.manual_grad_sync = True
+            context.caller_managed_grad_sync = True
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives

@@ -51,7 +51,7 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
-    manual_grad_sync: bool
+    caller_managed_grad_sync: bool
     """Allow reductions without a pending autograd callback.
 
     The caller must call ``finish_grad_sync()`` after all gradient producers,
@@ -74,7 +74,7 @@ class FsdpContext:
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        manual_grad_sync: bool = False,
+        caller_managed_grad_sync: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -86,13 +86,13 @@ class FsdpContext:
                 communication stream to reduce peak transient memory.
             parameter_to_owner: Construction-time TensorAtomic owner assignments. See
                 ``fully_shard_context``.
-            manual_grad_sync: Allow gradient reductions outside autograd completion.
+            caller_managed_grad_sync: Allow gradient reductions outside autograd completion.
                 The caller must synchronize them with ``finish_grad_sync()``.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
-        self.manual_grad_sync = manual_grad_sync
+        self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
@@ -150,6 +150,17 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    def validate_grad_sync(self) -> None:
+        """Require a caller-owned wait or a pending autograd completion callback."""
+        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+            return
+        raise RuntimeError(
+            "Gradient reduction has no pending autograd completion callback. "
+            "Use fully_shard_context(caller_managed_grad_sync=True) and call "
+            "context.finish_grad_sync() after all backward work, including "
+            "delayed weight-gradient computation, before consuming gradients."
+        )
 
     def finish_grad_sync(self) -> None:
         """Order current-stream consumers after all gradient reductions submitted so far.
@@ -559,13 +570,7 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
-                if not context._post_backward_hook_registered and not context.manual_grad_sync:
-                    raise RuntimeError(
-                        "Gradient reduction has no pending autograd completion callback. "
-                        "Use fully_shard_context(manual_grad_sync=True) and call "
-                        "context.finish_grad_sync() after all backward work, including "
-                        "delayed weight-gradient computation, before consuming gradients."
-                    )
+                context.validate_grad_sync()
 
                 with torch.cuda.stream(reduce_scatter_stream):
                     partial_grad = group.allocate_partial_grad_buffer()

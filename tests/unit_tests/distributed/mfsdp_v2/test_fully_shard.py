@@ -274,8 +274,10 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-@pytest.mark.parametrize("manual_grad_sync", [False, True])
-def test_fully_shard_delayed_te_weight_gradient(distributed_setup, monkeypatch, manual_grad_sync):
+@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+def test_fully_shard_delayed_te_weight_gradient(
+    distributed_setup, monkeypatch, caller_managed_grad_sync
+):
     """Delayed TE wgrad requires an explicit opt-in and a wait before consuming grads."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -290,7 +292,9 @@ def test_fully_shard_delayed_te_weight_gradient(distributed_setup, monkeypatch, 
         delay_wgrad_compute=True,
         fuse_wgrad_accumulation=False,
     )
-    with fully_shard_context(device=device, manual_grad_sync=manual_grad_sync) as context:
+    with fully_shard_context(
+        device=device, caller_managed_grad_sync=caller_managed_grad_sync
+    ) as context:
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -298,8 +302,8 @@ def test_fully_shard_delayed_te_weight_gradient(distributed_setup, monkeypatch, 
     assert model.weight.grad is None
     assert model.phase is FsdpModule.Phase.BACKWARD
 
-    if not manual_grad_sync:
-        with pytest.raises(RuntimeError, match="manual_grad_sync=True"):
+    if not caller_managed_grad_sync:
+        with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
             model.backward_dw()
         assert model.weight.grad is None
         return
