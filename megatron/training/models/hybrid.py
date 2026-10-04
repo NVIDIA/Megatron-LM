@@ -2,7 +2,9 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Literal, override
+from typing import Any, Callable, ClassVar, Literal
+
+from typing_extensions import override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
