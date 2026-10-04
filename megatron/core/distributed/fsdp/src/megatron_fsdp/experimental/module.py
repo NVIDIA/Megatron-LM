@@ -52,11 +52,10 @@ class FsdpContext:
     use_symmetric_memory: bool
     unify_communication_stream: bool
     caller_managed_grad_sync: bool
-    """Allow reductions without a pending autograd callback.
+    """Leave gradient synchronization to the caller instead of an autograd callback.
 
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
-    Ordinary backward retains its automatic completion callback.
     """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -86,8 +85,8 @@ class FsdpContext:
                 communication stream to reduce peak transient memory.
             parameter_to_owner: Construction-time TensorAtomic owner assignments. See
                 ``fully_shard_context``.
-            caller_managed_grad_sync: Allow gradient reductions outside autograd completion.
-                The caller must synchronize them with ``finish_grad_sync()``.
+            caller_managed_grad_sync: Disable the automatic autograd completion callback.
+                The caller must synchronize gradient reductions with ``finish_grad_sync()``.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
@@ -177,7 +176,7 @@ class FsdpContext:
         self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
-        """Register one context-level final callback for the current backward.
+        """Register one final callback unless the caller manages gradient synchronization.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -185,7 +184,7 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self._post_backward_hook_registered:
+        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
             return
         self._post_backward_hook_registered = True
 

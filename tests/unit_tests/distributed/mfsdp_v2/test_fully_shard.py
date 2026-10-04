@@ -754,7 +754,10 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     assert group.main_grad is None
 
 
-def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
+@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+def test_backward_averages_across_dp_and_accumulates_across_calls(
+    distributed_setup, monkeypatch, caller_managed_grad_sync
+):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -766,13 +769,28 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     model = nn.Linear(1, world_size, bias=False).to(device)
     nn.init.constant_(model.weight, 1.0)
 
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(
+        device=device, caller_managed_grad_sync=caller_managed_grad_sync
+    ) as context:
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
+    post_backward_calls = 0
+    post_backward = context.post_backward
+
+    def record_post_backward():
+        nonlocal post_backward_calls
+        post_backward_calls += 1
+        post_backward()
+
+    monkeypatch.setattr(context, "post_backward", record_post_backward)
     x = torch.full((1, 1), float(rank + 1), device=device)
     with microbatch(context, is_last=False):
         model(x).sum().backward()
         model(x).sum().backward()
+
+    assert post_backward_calls == (0 if caller_managed_grad_sync else 2)
+    if caller_managed_grad_sync:
+        context.finish_grad_sync()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()

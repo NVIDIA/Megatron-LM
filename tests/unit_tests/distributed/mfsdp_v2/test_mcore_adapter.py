@@ -429,6 +429,8 @@ class TestMcoreAdapterDense:
                     loss = output.float().square().mean()
                     (loss / len(microbatches)).backward()
                     microbatch_losses.append(loss.detach())
+                if isinstance(optimizer, FullyShardedOptimizer):
+                    model.finish_grad_sync()
                 success, _, _ = optimizer.step()
                 assert success
                 losses.append(torch.stack(microbatch_losses).mean())
@@ -486,6 +488,7 @@ class TestMcoreAdapterDense:
             attention_mask=None,
         )
         output.float().square().mean().backward()
+        model.finish_grad_sync()
 
         success, _, _ = optimizer.step()
         assert success
@@ -554,6 +557,7 @@ class TestMcoreAdapterDense:
             attention_mask=None,
         )
         output.float().square().sum().backward()
+        model.finish_grad_sync()
 
         parameters = [
             parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
@@ -666,6 +670,7 @@ class TestMcoreAdapterCudaGraph:
                 loss = output.float().square().mean()
                 (loss / num_microbatches).backward()
                 microbatch_losses.append({"loss": loss.detach()})
+            model[0].finish_grad_sync()
             return microbatch_losses
 
         steps = [
@@ -881,6 +886,7 @@ class TestMcoreAdapterExpertParallel:
                 targets[input_slice],
             )
             loss.backward()
+            model.finish_grad_sync()
             success, _, _ = optimizer.step()
             assert success
             loss = loss.detach()
@@ -976,6 +982,7 @@ class TestMcoreAdapterHybrid:
                     loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
                     loss.backward()
                 step_losses.append(loss.detach())
+            model.finish_grad_sync()
             success, _, _ = optimizer.step()
             assert success
             # No update happens until optimizer.step(), so every microbatch in a step sees
@@ -1010,6 +1017,7 @@ class TestMcoreAdapterHybrid:
             attention_mask=None,
         )
         output.float().square().sum().backward()
+        model.finish_grad_sync()
 
         expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
         graded = [p for p in model.parameters() if p.grad is not None]
@@ -1125,6 +1133,7 @@ class TestMcoreAdapterHybrid:
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
         output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
         output.float().square().mean().backward()
+        model.finish_grad_sync()
         success, _, _ = optimizer.step()
         assert success
 

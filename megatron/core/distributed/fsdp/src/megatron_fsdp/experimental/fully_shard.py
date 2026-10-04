@@ -99,10 +99,10 @@ def fully_shard_context(
             ranks in each parameter group's 1-D data-parallel mesh and must agree across
             that mesh. Every TensorAtomic parameter needs an entry; other entries are
             ignored. Tensors are packed by owner without changing logical parameter order.
-        caller_managed_grad_sync: Allow reductions without a pending autograd completion callback,
-            for delayed weight gradients or custom backward schedules. The caller must
+        caller_managed_grad_sync: Disable the automatic autograd completion callback,
+            allowing delayed weight gradients or custom backward schedules. The caller must
             call ``context.finish_grad_sync()`` after all backward work and before reading
-            or modifying gradients. Ordinary backward keeps its automatic synchronization.
+            or modifying gradients.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
