@@ -7,7 +7,8 @@ import contextlib
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 
 
-# See https://github.com/NVIDIA/Megatron-LM/issues/7223 for why this helper exists.
+# Avoid the training loop's global state.
+# See https://github.com/NVIDIA/Megatron-LM/issues/7223.
 def forward_backward(
     model, microbatches, forward_step, *, loss_scale=1.0, delayed_wgrad_compute=None
 ):
