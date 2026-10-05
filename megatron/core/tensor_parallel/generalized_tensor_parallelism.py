@@ -319,12 +319,15 @@ _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 class _EagerWgradRingSlot(GraphWgradRingSlot):
     """Persistent eager input whose previous reduce-scatter must finish before reuse."""
 
-    owner: object = None
+    rs_owner: object = None
 
     def wait_for_reader(self) -> None:
         """Finalize a deferred reduction before another GEMM writes into its input."""
-        if self.owner is not None and self.owner._wgrad_rs_handle is not None:
-            self.owner._wait_reduce_scatter(finalize_grad=True)
+        rs_owner = self.rs_owner
+        if rs_owner is not None and rs_owner._wgrad_rs_handle is not None:
+            rs_owner._wait_reduce_scatter(finalize_grad=True)
+            # The previous result is accounted for; its marker must not suppress the next one.
+            rs_owner._already_finalized = False
         self.ready_event.wait()
 
 
@@ -515,9 +518,8 @@ class GTPRematConfig:
     # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
     calculate_per_token_loss: bool = False
     # Run the gtp_remat wgrad reduce-scatter as all-to-all + local FP32 sum: same bytes on the
-    # wire, but accumulation no longer loses precision as the axis grows, and the FP32 shard sum
-    # is added into main_grad unrounded (one BF16 rounding per microbatch). Bypassed at axis
-    # size <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
+    # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
+    # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
     # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
     # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
@@ -1261,12 +1263,7 @@ class GTPShardedParam(torch.nn.Parameter):
     @property
     def _weights(self):
         """Individual weight shards (self for non-routed, weight_list for routed)."""
-        # Only the first routed-expert shard owns ``weight_list``. Virtual-expert
-        # autograd intentionally connects every discrete optimizer parameter so
-        # CUDA-graph/DDP bookkeeping can visit a non-leader shard directly.
-        weights = (
-            self.weight_list if self.is_routed_expert and self.weight_list is not None else [self]
-        )
+        weights = self.weight_list if self.is_routed_expert else [self]
         # Only meaningful when _set_state is actively tracking transitions.
         if GTP_CONFIG.check_param_states:
             assert all(w.state == weights[0].state for w in weights)
@@ -2107,7 +2104,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if self._wgrad_rs_handle is not None:
                 waited = True
                 self._wgrad_rs_handle.wait()
-                self._record_graph_wgrad_ring_slots_ready()
+                self._record_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
                 if finalize_grad:
@@ -2147,7 +2144,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 symmetric_wgrad_pool.free(buf)
             setattr(self, attr, None)
 
-    def _record_graph_wgrad_ring_slots_ready(self) -> None:
+    def _record_wgrad_ring_slots_ready(self) -> None:
         """Publish that this RS has finished reading its persistent input slots."""
         seen = set()
         for weight in self._weights:
@@ -2175,10 +2172,6 @@ class GTPShardedParam(torch.nn.Parameter):
     def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
         """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
 
-        ``out`` is FP32 whatever the wgrad dtype: the consumer's ``main_grad.add_`` then
-        performs the only rounding of a BF16 gradient, instead of rounding the sum into a
-        BF16 output first and again on the add.
-
         Always issued async, even for a sync RS: under a coalescing manager the all-to-all is
         only enqueued at context exit, so the handle's FP32 sum must never run inline here. The
         caller waits the handle (immediately when sync) and then releases the scratch.
@@ -2194,12 +2187,7 @@ class GTPShardedParam(torch.nn.Parameter):
         tensor = tensor.contiguous()
         if out_buffer is None:
             out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
-            out_buffer = torch.empty(out_shape, dtype=torch.float32, device=tensor.device)
-        elif out_buffer.dtype != torch.float32:
-            raise RuntimeError(
-                "[GTP] fp32-accumulating reduce-scatter needs an FP32 output buffer, got "
-                f"{out_buffer.dtype} for {self._debug_name}."
-            )
+            out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
 
         a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
         handle = reduce_scatter_with_fp32_accumulation(
@@ -2232,17 +2220,8 @@ class GTPShardedParam(torch.nn.Parameter):
 
         wgrads, release_bufs = self._prepare_wgrad_reduce_scatter_inputs(wgrads)
 
-        # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups. Its shard
-        # sum stays FP32 all the way into main_grad.add_, so a BF16 main_grad rounds once per
-        # microbatch instead of once into a BF16 output and again on the add.
-        fp32_accumulation = (
-            GTP_CONFIG.reduce_scatter_with_fp32_accumulation
-            and self.group.size() > 2
-            and not is_gtp_symm_pool_registered(self.group)
-        )
-
         if async_op:
-            dtypes = [torch.float32 if fp32_accumulation else w.dtype for w in wgrads]
+            dtypes = [w.dtype for w in wgrads]
             out_buffers = []
             cache = get_global_GTP_cache()
             for p, dt in zip(self._weights, dtypes):
@@ -2270,7 +2249,12 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            if fp32_accumulation:
+            # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups.
+            if (
+                GTP_CONFIG.reduce_scatter_with_fp32_accumulation
+                and self.group.size() > 2
+                and not is_gtp_symm_pool_registered(self.group)
+            ):
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
                 if len(wgrads) > 1:
@@ -2380,7 +2364,7 @@ class GTPShardedParam(torch.nn.Parameter):
                     slot.wait_for_reader()
                 logical_view.copy_(wgrad)
             if isinstance(slot, _EagerWgradRingSlot):
-                slot.owner = self
+                slot.rs_owner = self
             send_bufs.append(slot.tensor)
             release_bufs.append(wgrad)
 
@@ -2416,9 +2400,8 @@ class GTPShardedParam(torch.nn.Parameter):
         # the one handle we track -- discarding that gradient with no error. Finish it first.
         if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
             self._wait_reduce_scatter(finalize_grad=True)
-        # A persistent-buffer acquisition may have finalized the previous generation early.
-        # The cascade must still account for the new reduction issued below.
-        self._already_finalized = False
+            # Accounted for here, so the cascade below must not skip the next one.
+            self._already_finalized = False
 
         if async_op is None:
             async_op = GTP_CONFIG.async_reduction and self.prev_w is not None
@@ -2438,7 +2421,7 @@ class GTPShardedParam(torch.nn.Parameter):
             wgrads, _, release_bufs = self._reduce_scatter(
                 wgrads, async_op=False, nvtx_label=nvtx_label
             )
-            self._record_graph_wgrad_ring_slots_ready()
+            self._record_wgrad_ring_slots_ready()
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
                 weights[0].main_grad.add_(wgrads[0])
