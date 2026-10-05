@@ -2921,27 +2921,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
-            padding_rows = 0
-            if (
-                self.num_virtual_experts
-                and cpu_offload is not None
-                and cpu_offload.is_cpu_offload_enabled()
-            ):
-                # Offloading disables TE's grouped-tensor path. Its split fallback needs
-                # exactly the routed rows, while HybridEP allocates a larger capacity
-                # buffer. Preserve that capacity for the downstream combine operation.
-                routed_rows = int(m_splits.sum())
-                padding_rows = x.shape[0] - routed_rows
-                x = x[:routed_rows]
-
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
-            if padding_rows:
-                if self.te_return_bias:
-                    output, bias = out
-                    out = F.pad(output, (0, 0, 0, padding_rows)), bias
-                else:
-                    out = F.pad(out, (0, 0, 0, padding_rows))
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
