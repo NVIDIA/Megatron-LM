@@ -20,6 +20,7 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
     deterministic_algorithms,
     seeded,
 )
@@ -236,3 +237,27 @@ def test_engram_duplicate_rows_replay(groups):
     ids = torch.tensor([[[1, 3], [1, 3], [5, 2], [1, 3]]], device="cuda")
     with deterministic_algorithms(True):
         assert_module_replays_bit_exact(module, (ids,))
+
+
+def test_csa2_chunked_indexer_scores_replay():
+    """The inference-only chunked CSA2 score path is bit-exact and matches dense scoring."""
+    from megatron.core.transformer.experimental_attention_variant.csa2 import (
+        _chunked_csa2_indexer_scores,
+    )
+
+    seeded()
+    q = torch.randn(11, 2, 3, 8, device="cuda", dtype=torch.float32)
+    indexer_k = torch.randn(7, 2, 8, device="cuda", dtype=torch.float32)
+    weights = torch.randn(11, 2, 3, device="cuda", dtype=torch.float32)
+
+    def chunked(query, keys, head_weights):
+        with torch.no_grad():
+            return _chunked_csa2_indexer_scores(query, keys, head_weights, key_chunk_size=3)
+
+    with deterministic_algorithms(True):
+        actual, _ = assert_replays_bit_exact(
+            chunked, (q, indexer_k, weights), backward=False, what="CSA2 chunked indexer scores"
+        )
+    expected = torch.einsum("sbhd,tbd->bsht", q, indexer_k).relu()
+    expected = (expected * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+    torch.testing.assert_close(actual["out"], expected, rtol=1e-5, atol=1e-6)
