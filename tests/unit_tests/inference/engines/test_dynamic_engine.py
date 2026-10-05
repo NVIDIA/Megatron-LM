@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
 import msgpack
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -40,6 +41,8 @@ from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
     DynamicInferenceContext,
+    MaxSequenceLengthOverflowError,
+    PromptPreparationError,
     RequestOverflowError,
     TokenOverflowError,
 )
@@ -50,6 +53,7 @@ from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
+    RESUMED_GENERATION_FIELD,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -59,6 +63,7 @@ from megatron.core.inference.inference_request import (
     OffloadedRequestPayload,
     RequestPayloadStageResult,
     RequestPromptPreparationResult,
+    ResumedGeneration,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
@@ -2537,7 +2542,7 @@ def _make_request_entry(loop, request_id: int, status: Status, resolve: bool = T
         record=DynamicInferenceRequestRecord.from_request(request), future=loop.create_future()
     )
     if resolve:
-        DynamicInferenceEngine._complete_request(entry)
+        entry.future.set_result(entry.record.merge())
     return entry
 
 
@@ -2581,6 +2586,8 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
         engine.request_counter = iter(range(10))
         engine.requests = {}
         engine.failed_request_ids = []
+        engine.context = mock.Mock()
+        engine.finished_request_count = 0
 
         def add_request(request_id, _prompt, _sampling_params):
             status = Status.FAILED if request_id == 0 else Status.ACTIVE_AND_GENERATING_TOKENS
@@ -2593,7 +2600,7 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
         def finish_pending_request():
             entry = engine.requests.pop(1)
             entry.record[-1].status = Status.COMPLETED
-            finished_request = DynamicInferenceEngine._complete_request(entry)
+            finished_request = engine._complete_request(entry)
             return {"finished_requests": [finished_request]}
 
         engine.add_request = mock.Mock(side_effect=add_request)
@@ -2941,18 +2948,20 @@ def test_streaming_partials_are_sent():
 
 
 class _RecordingStager:
-    """RequestPayloadStager test double: keeps every staged (uid, payload) and returns
-    ``response_metadata``, or raises ``error`` without staging anything."""
+    """RequestPayloadStager test double: keeps every staged (uid, payload) and each stage by
+    uid, and returns ``response_metadata``, or raises ``error`` without staging anything."""
 
     def __init__(self, error=None, response_metadata=None):
         self.staged = []
         self.error = error
         self.response_metadata = response_metadata or {}
+        self.by_uid = {}
 
     def stage(self, uid, payload, *, finished_metadata, offload_params=None):
         if self.error is not None:
             raise self.error
         self.staged.append((uid, payload))
+        self.by_uid[uid] = (payload, finished_metadata, offload_params)
         self.finished_metadata = finished_metadata
         self.offload_params = offload_params
         return RequestPayloadStageResult(response_metadata=self.response_metadata)
@@ -3230,11 +3239,33 @@ def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params)
     )
 
 
-def test_engine_prepares_prompt_before_model_parallel_broadcast():
+@pytest.mark.parametrize(
+    "resumed",
+    [
+        None,
+        ResumedGeneration(
+            [7, 8],
+            8,
+            log_probs=[-0.5, -0.25],
+            prompt_log_probs=[-1.0],
+            policy_epoch=[(0, 3), (5, 4)],
+            kv_cache_epoch=[(0, 3)],
+            num_evictions=2,
+            finished=True,
+        ),
+    ],
+    ids=["prompt", "resumed-generation"],
+)
+def test_engine_prepares_prompt_before_model_parallel_broadcast(resumed):
+    """Rank zero rewrites only the prompt and offload frames; a resume the preparer wrote under
+    its reserved key rides the offload frame untouched and reads back whole."""
+
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
             metadata = dict(offload_params or {})
             metadata["prepared"] = True
+            if resumed is not None:
+                metadata[RESUMED_GENERATION_FIELD] = resumed.to_wire()
             return RequestPromptPreparationResult(prompt=[1, 2, *prompt], offload_params=metadata)
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -3251,10 +3282,10 @@ def test_engine_prepares_prompt_before_model_parallel_broadcast():
     assert prepared[0] is message[0]
     assert msgpack.unpackb(prepared[1], raw=False) == [1, 2, 3, 4]
     assert prepared[2] is message[2]
-    assert msgpack.unpackb(prepared[3], raw=False) == {
-        "ng_capture": {"rollout_id": "r0"},
-        "prepared": True,
-    }
+    params = msgpack.unpackb(prepared[3], raw=False)
+    wire = params.pop(RESUMED_GENERATION_FIELD, None)
+    assert params == {"ng_capture": {"rollout_id": "r0"}, "prepared": True}
+    assert (wire if wire is None else ResumedGeneration.from_wire(wire)) == resumed
 
 
 def test_engine_skips_prompt_preparation_without_offload_params():
@@ -3270,6 +3301,148 @@ def test_engine_skips_prompt_preparation_without_offload_params():
     message = [undecodable, undecodable, undecodable, msgpack.packb(None, use_bin_type=True)]
 
     assert engine._prepare_submit_request_message(message) is message
+
+
+_SCORED = dict(log_probs=[-0.5, -0.25])
+_STAMPED = dict(policy_epoch=[(0, 3), (3, 4)], kv_cache_epoch=[(0, 3), (3, 4)])
+_FILLED = ResumedGeneration(
+    [7, 8, 9, 10, 11, 12],
+    6,
+    log_probs=[-0.1] * 6,
+    prompt_log_probs=[-1.0, -1.1, -1.2],
+    policy_epoch=[(0, 7)],
+    kv_cache_epoch=[(0, 6)],
+    num_evictions=2,
+    finished=True,
+)
+
+
+@pytest.mark.parametrize(
+    ("multimodal", "resumed", "outcome"),
+    [
+        (False, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 9)], **_SCORED), None),
+        (False, ResumedGeneration([7, 8], 5, **_SCORED, **_STAMPED), None),
+        (True, ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED), None),
+        (True, ResumedGeneration([7, 8], 7, finished=True, **_SCORED, **_STAMPED), None),
+        (False, _FILLED, None),
+        (False, ResumedGeneration([], 6, **_STAMPED), "refused"),
+        (False, ResumedGeneration([7, 8], 6, log_probs=[-0.5], **_STAMPED), "refused"),
+        (False, ResumedGeneration([7, 8], 6, **_STAMPED), "refused"),
+        (False, ResumedGeneration([7, 8], 6, **_SCORED), "refused"),
+        (False, ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED), "overflow"),
+    ],
+    ids=[
+        "text-continued-same-epoch-without-kv",
+        "text-continued-under-the-banked-budget",
+        "multimodal-continued",
+        "multimodal-served-under-the-banked-budget",
+        "text-served-budget-filled",
+        "no-tokens-refused",
+        "misaligned-refused",
+        "unscored-refused",
+        "unstamped-refused",
+        "overflow-fails-as-admission",
+    ],
+)
+def test_admit_resumed_generation(multimodal, resumed, outcome):
+    """add_request admits a resume on the request as built, under the banked budget rather than
+    the request's; a multimodal resume's boundaries are measured on the expanded prompt."""
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+    engine.context.max_sequence_length = 2 if outcome == "overflow" else 32
+    engine.context.max_tokens, engine.context.num_speculative_tokens = 32, 0
+    engine.context.kv_block_allocator.pool_size = 8
+    engine._generation_epoch, engine.rank = 9, 1
+    engine.requests, engine.waiting_request_ids, engine.failed_request_ids = {}, deque(), []
+    engine.use_coordinator = engine.enable_chunked_prefill = False
+    engine.materialize_only_last_token_logits = False
+    engine.finished_request_count = 0
+    engine.stop_word_being_finished_ids = set()
+    engine.controller.terminating_token_ids.return_value = frozenset()
+    engine._loop = asyncio.new_event_loop()
+    offload_params = {"ng_capture": "c", RESUMED_GENERATION_FIELD: resumed.to_wire()}
+    media = (
+        {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])} if multimodal else {}
+    )
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        future = engine.add_request(
+            1,
+            [10, 42, 20],
+            SamplingParams(num_tokens_to_generate=6, termination_id=0, return_log_probs=True),
+            offload_params=offload_params,
+            **media,
+        )
+    prompt = [10, 99, 99, 20] if multimodal else [10, 42, 20]
+    shift = len(prompt) - 3  # the media expansion moves the resume's boundaries
+
+    def shifted(boundaries):
+        return [(p + shift if p >= 3 else p, epoch) for p, epoch in boundaries]
+
+    if outcome:
+        failed = future.result()
+        (error,) = [
+            e.payload
+            for e in failed.events
+            if e.type is DynamicInferenceEventType.ERROR_NONTRANSIENT
+        ]
+        reason = failed.offload_params.pop(dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD, None)
+        assert failed.status == Status.FAILED and engine.failed_request_ids == [1]
+        assert not engine.waiting_request_ids and failed.offload_params == {"ng_capture": "c"}
+        if outcome == "overflow":
+            assert isinstance(error, MaxSequenceLengthOverflowError) and reason is None
+        else:
+            assert isinstance(error, PromptPreparationError) and reason in str(error)
+            assert reason == "invalid resumed generation"
+        return
+    if resumed.finished:
+        completed = future.result()
+        payload = OffloadedRequestPayload.from_request(completed)
+        engine.context.remove_vlm_request_data.assert_called_once_with(1)
+        assert completed.status == Status.COMPLETED and engine.requests == {}
+        assert not engine.waiting_request_ids and completed.offload_params == {"ng_capture": "c"}
+        assert completed.sampling_params.num_tokens_to_generate == resumed.num_tokens_to_generate
+        filled = len(resumed.token_ids) == resumed.num_tokens_to_generate
+        assert completed.finish_reason == ("length" if filled else "stop")
+        assert (payload.prompt_token_ids, payload.generated_token_ids) == (
+            prompt,
+            resumed.token_ids,
+        )
+        assert (payload.generated_log_probs, payload.prompt_log_probs) == (
+            resumed.log_probs,
+            resumed.prompt_log_probs,
+        )
+        assert (payload.media_tensors is None) is not multimodal
+        assert FinishedRequestRecord.from_request(completed) == FinishedRequestRecord(
+            shifted(resumed.policy_epoch),
+            shifted(resumed.kv_cache_epoch),
+            resumed.num_evictions,
+            resumed.num_tokens_to_generate,
+        )
+        return
+    record = engine.requests[1].record
+    continuation = record[-1]
+    assert list(engine.waiting_request_ids) == [1] and len(record.requests) == 2
+    assert continuation.status == Status.ACTIVE_AND_GENERATING_TOKENS
+    engine.context.remove_vlm_request_data.assert_not_called()
+    assert isinstance(continuation, DynamicVLMInferenceRequest) is multimodal
+    assert (record[0].generated_tokens, record[0].generated_log_probs) == (
+        resumed.token_ids,
+        resumed.log_probs,
+    )
+    assert continuation.prompt_tokens.tolist() == [*prompt, *resumed.token_ids]
+    banked = resumed.num_tokens_to_generate  # replaces the request's 6
+    assert record[0].sampling_params.num_tokens_to_generate == banked
+    assert continuation.sampling_params.num_tokens_to_generate == banked - len(resumed.token_ids)
+    assert continuation.offload_params == {"ng_capture": "c"}
+    boundaries = shifted(resumed.policy_epoch)
+    restamp = [] if boundaries[-1][1] == 9 else [(len(prompt) + len(resumed.token_ids) - 1, 9)]
+    assert (
+        continuation.policy_epoch == [*boundaries, *restamp] and continuation.kv_cache_epoch is None
+    )
+    assert (
+        FinishedRequestRecord.from_request(record.merge()).num_evictions
+        == resumed.num_evictions + 1
+    )
 
 
 def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
@@ -3324,20 +3497,19 @@ def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
     assert remaining == {"stager_metadata": {"key": "value"}}
 
 
-@pytest.mark.parametrize("bad_output", ["numpy_prompt", "tensor_in_params"])
-def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_output):
-    """An unserializable preparer result fails the request instead of killing rank 0."""
-    import numpy as np
+@pytest.mark.parametrize(
+    "bad_result",
+    [dict(prompt=[np.int64(1), 3, 4]), dict(offload_params={"embedding": torch.tensor([1.0])})],
+    ids=["numpy_prompt", "tensor_in_params"],
+)
+def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_result):
+    """An unserializable preparer result fails the request instead of killing rank 0: the
+    original prompt and params are broadcast with the error field and no resume."""
 
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
-            if bad_output == "numpy_prompt":
-                return RequestPromptPreparationResult(
-                    prompt=[np.int64(1), *prompt], offload_params=offload_params
-                )
             return RequestPromptPreparationResult(
-                prompt=prompt,
-                offload_params={**(offload_params or {}), "embedding": torch.tensor([1.0])},
+                **{"prompt": prompt, "offload_params": offload_params, **bad_result}
             )
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -3353,6 +3525,7 @@ def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_outpu
     assert msgpack.unpackb(prepared[1], raw=False) == [3, 4]
     assert prepared[2] is message[2]
     assert offload_params["ng_capture"] == {"rollout_id": "r0"}
+    assert RESUMED_GENERATION_FIELD not in offload_params
     assert offload_params[dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
 
 
@@ -3416,25 +3589,19 @@ def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
 
 def test_handle_failed_request_releases_vlm_request_data():
     """Media registered before admission is dropped when the request fails."""
-    request = DynamicInferenceRequest(
-        request_id=42,
-        prompt_tokens=torch.tensor([3, 4]),
-        sampling_params=SamplingParams(num_tokens_to_generate=1),
-    )
-    record = DynamicInferenceRequestRecord.from_request(request)
-    entry = types.SimpleNamespace(record=record)
+    loop = asyncio.new_event_loop()
+    entry = _make_request_entry(loop, 42, None, resolve=False)
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.requests = {42: entry}
     engine.failed_request_ids = []
     engine.rank, engine.use_coordinator = 1, False
     engine.context = mock.Mock()
-    engine._complete_request = mock.Mock(return_value=record[-1])
 
     engine._handle_failed_request(42)
 
     engine.context.remove_vlm_request_data.assert_called_once_with(42)
-    engine._complete_request.assert_called_once_with(entry)
-    assert (record[-1].status, engine.failed_request_ids) == (Status.FAILED, [42])
+    assert (entry.future.result().status, engine.failed_request_ids) == (Status.FAILED, [42])
+    loop.close()
 
 
 def test_streaming_partials_buffer_until_token_interval():
@@ -8860,6 +9027,146 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify engine state is clean.
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_kill_and_resume(self) -> None:
+        """Kill an engine mid-decode; a fresh engine resumes every call through its preparer from
+        the snapshot of the live calls and the stager's finished ones. Finished calls are served at
+        admission with the banked payload and provenance; cut calls continue from the banked token
+        to the original budget and merge into one generation that enters the new epoch at the cut
+        and counts the kill as one eviction. Both reach the stager and the ledger under the new
+        admission's clean params."""
+        config = DynamicEngineTestConfig(
+            num_requests=8,
+            num_tokens_to_generate=16,
+            use_fixed_output_lengths=True,  # random budgets spread the finish times
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            materialize_only_last_token_logits=False,
+            top_k=1,
+        )
+        env = self._build_test_env(config)
+        prompts = {r.request_id: r.prompt_tokens.tolist() for r in env.requests}
+        call_ids = {r.request_id: f"call-{r.request_id}" for r in env.requests}
+        budgets = {
+            call_ids[r.request_id]: r.sampling_params.num_tokens_to_generate for r in env.requests
+        }
+
+        def wire_and_submit(engine, epoch, resumes):
+            """The wiring a framework performs, with a preparer handing back durable prefixes by
+            call id, then the coordinator path: rank 0 prepares every frame and every rank admits.
+            """
+            engine.use_coordinator = engine.is_mp_coordinator = True
+            engine.socket_for_receiving_requests = mock.MagicMock()
+            engine.payload_stager = _RecordingStager()
+            engine.local_metadata_ledger_enabled = True
+            engine._generation_epoch = epoch
+
+            def prepare_prompt(prompt, *, offload_params=None):
+                resumed = resumes.pop(offload_params["call_id"], None)
+                if resumed is not None:
+                    offload_params = {**offload_params, RESUMED_GENERATION_FIELD: resumed.to_wire()}
+                return RequestPromptPreparationResult(prompt=prompt, offload_params=offload_params)
+
+            engine.prompt_preparer = types.SimpleNamespace(prepare_prompt=prepare_prompt)
+            futures = {}
+            for r in env.requests:
+                params = SamplingParams.deserialize(r.sampling_params.serialize())
+                message = _submit_request_message(
+                    r.request_id,
+                    params.serialize(),
+                    prompts[r.request_id],
+                    {"call_id": call_ids[r.request_id]},
+                )
+                prepared = engine._prepare_submit_request_message(message)
+                futures[r.request_id] = engine.add_request(
+                    r.request_id,
+                    msgpack.unpackb(prepared[1], raw=False),
+                    params,
+                    offload_params=msgpack.unpackb(prepared[3], raw=False),
+                )
+            return futures
+
+        def snapshot(engine):
+            return engine._loop.run_until_complete(engine.snapshot_live_requests())
+
+        engine = env.engine
+        wire_and_submit(engine, epoch=3, resumes={})
+        for _ in range(1000):  # step until some calls finished and some are still in flight
+            self._run_step(env)
+            if engine.local_metadata_ledger and engine.requests:
+                break
+        assert engine.local_metadata_ledger and engine.requests, "test setup: population not mixed"
+
+        # THE KILL. What survives: the stager's finished payloads and the framework's snapshot of
+        # the live calls; together they cover every call exactly once.
+        banked = {
+            params["call_id"]: (payload, telemetry)
+            for payload, telemetry, params in engine.payload_stager.by_uid.values()
+        }
+        live = {s.offload_params["call_id"]: (s.payload, s.record) for s in snapshot(engine)}
+        assert set(banked) | set(live) == set(call_ids.values()) and not set(banked) & set(live)
+        truth = {**banked, **live}
+        resumes = {
+            call_id: ResumedGeneration(
+                payload.generated_token_ids,
+                budgets[call_id],
+                payload.generated_log_probs,
+                payload.prompt_log_probs,
+                policy_epoch=telemetry.policy_epoch,
+                kv_cache_epoch=telemetry.kv_cache_epoch,
+                num_evictions=telemetry.num_evictions,
+                finished=call_id in banked,
+            )
+            for call_id, (payload, telemetry) in truth.items()
+        }
+
+        # RESTART: a fresh engine; the framework's preparer hands back the durable prefixes.
+        restarted = self._build_test_env(config)
+        engine = restarted.engine
+        futures = wire_and_submit(engine, epoch=4, resumes=resumes)
+        assert resumes == {}  # every call resumed something
+        for request_id, future in futures.items():
+            assert future.done() is (call_ids[request_id] in banked)  # served iff it had finished
+        while engine.has_unfinished_requests():
+            self._run_step(restarted)
+        assert snapshot(engine) == []
+
+        by_call = {
+            params["call_id"]: (uid, payload, telemetry)
+            for uid, (payload, telemetry, params) in engine.payload_stager.by_uid.items()
+        }
+        for r in env.requests:
+            call_id, prompt = call_ids[r.request_id], prompts[r.request_id]
+            (bank, bank_telemetry), served = truth[call_id], call_id in banked
+            uid, payload, telemetry = by_call[call_id]
+            cut = len(prompt) + len(bank.generated_token_ids) - 1
+            # The banked tokens lead a payload that runs to the budget. A served generation keeps
+            # the banked provenance; a cut one enters epoch 4 at the cut, is prefilled under it,
+            # and counts the kill as one eviction.
+            assert payload.prompt_token_ids == prompt
+            assert payload.prompt_log_probs == bank.prompt_log_probs
+            assert payload.generated_token_ids[: cut + 1 - len(prompt)] == bank.generated_token_ids
+            assert payload.generated_log_probs[: cut + 1 - len(prompt)] == bank.generated_log_probs
+            assert (
+                len(payload.generated_token_ids)
+                == len(payload.generated_log_probs)
+                == r.sampling_params.num_tokens_to_generate
+            )
+            assert futures[r.request_id].result().generated_tokens == payload.generated_token_ids
+            continued = FinishedRequestRecord(
+                [*bank_telemetry.policy_epoch, (cut, 4)],
+                [(0, 4)],
+                bank_telemetry.num_evictions + 1,
+                bank_telemetry.num_tokens_to_generate,
+            )
+            assert telemetry == (bank_telemetry if served else continued)
+            assert engine.local_metadata_ledger[uid] == telemetry
+            assert engine.payload_stager.by_uid[uid][2] == {"call_id": call_id}
 
 
 @pytest.mark.internal
