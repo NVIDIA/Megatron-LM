@@ -52,7 +52,9 @@ class _NeverCompletingClient:
         self.aborted = []
         self.all_admitted = asyncio.Event()
 
-    def add_request_with_id(self, prompt, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(
+        self, prompt, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
         request_id = self.next_request_id
         self.next_request_id += 1
         self.submitted.append(request_id)

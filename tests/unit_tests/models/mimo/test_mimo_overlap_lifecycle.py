@@ -145,6 +145,7 @@ def test_mimo_optimizer_scopes_param_group_alignment_to_module(mocker):
         ddp_config=SimpleNamespace(
             overlap_param_gather=True, num_distributed_optimizer_instances=1
         ),
+        parameters=lambda: iter((SimpleNamespace(requires_grad=True),)),
     )
     grid = SimpleNamespace(is_current_rank_in_grid=lambda: True)
     mimo_model = SimpleNamespace(

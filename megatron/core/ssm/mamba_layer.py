@@ -26,6 +26,7 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -65,6 +66,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     output of the same size.
     """
 
+    #: Whether this layer class owns a wide-residual connection around its mixer.
+    supports_wide_residual_connections: bool = False
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -73,6 +77,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         """Initialize Mamba Layer.
 
@@ -80,12 +85,22 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config)
+        if (
+            config.wide_residual is not None
+            and not self.supports_wide_residual_connections
+            and not is_mtp_layer
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not implement wide-residual streams. Build the "
+                "hybrid stack with WideResidualMambaLayer when wide_residual is configured."
+            )
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
         self.tp_group = pg_collection.tp
 
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -127,22 +142,45 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             and self.mixer.supports_two_stage_attention()
         )
 
-    def _prepare_mixer_input(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
-        """Apply the layer's residual conversion and pre-mixer normalization."""
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
+    def _prepare_mixer_input(self, hidden_states: Tensor) -> Tensor:
+        """Convert a branch input to parameter precision and normalize it."""
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = apply_module(self.norm)(hidden_states)
-        return hidden_states, residual
+        return apply_module(self.norm)(hidden_states)
+
+    def _prepare_residual(self, hidden_states: Tensor) -> Tensor:
+        """Preserve an ordinary residual stream in its configured dtype."""
+
+        return hidden_states.float() if self.config.fp32_residual_connection else hidden_states
 
     def _apply_mixer_bda(self, mixer_out_with_bias, residual: Tensor) -> Tensor:
         """Apply the layer's bias-dropout-add tail to a projected mixer output."""
+
         with self.bias_dropout_add_exec_handler():
             return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(
                 mixer_out_with_bias, residual, self.hidden_dropout
             )
+
+    def _prepare_mixer_state(
+        self,
+        hidden_states: Tensor,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ) -> tuple[Tensor, Tensor, tuple[Tensor, ...] | None, ResidualStreamRecomputeContext | None]:
+        """Prepare branch input and residual state for the shared mixer schedule."""
+
+        residual = self._prepare_residual(hidden_states)
+        hidden_states = self._prepare_mixer_input(hidden_states)
+        return hidden_states, residual, None, None
+
+    def _apply_mixer_update(
+        self,
+        mixer_out_with_bias,
+        residual: Tensor,
+        connection_state: tuple[Tensor, ...] | None = None,
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ) -> Tensor:
+        """Complete the ordinary mixer update using its saved residual."""
+
+        return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
     def forward_pre_attn_and_core_attn(
         self,
@@ -156,7 +194,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
-    ):
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, tuple[Tensor, ...]]:
         """Run normalization, input projection, and the selective SSM/SSD.
 
         Args:
@@ -168,20 +207,25 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
-            Tuple containing the core SSM result and residual.
+            Core SSM result and residual, followed by connection state for a connected layer.
+            Pass the entire tuple to the layer's ``forward_post_core_attn`` method.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         assert inference_context is None, "Two-stage mixer execution does not support inference."
 
-        hidden_states, residual = self._prepare_mixer_input(hidden_states)
+        hidden_states, residual, connection_state, _ = self._prepare_mixer_state(
+            hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+        )
 
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
             hidden_states,
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
-        return ssm_output, residual
+        if connection_state is None:
+            return ssm_output, residual
+        return ssm_output, residual, connection_state
 
     def forward_post_core_attn(
         self,
@@ -189,11 +233,17 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         residual: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         padding_mask: Optional[Tensor] = None,
-    ):
-        """Apply Mamba's output projection and the original residual/BDA operation."""
+    ) -> Tensor:
+        """Apply Mamba's output projection and ordinary bias-dropout-add update."""
+
         del inference_context, padding_mask
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
         return self._apply_mixer_bda(mixer_out_with_bias, residual)
+
+    def _get_residual_connection(self):
+        """Return an optional architecture-owned connection around the Mamba mixer."""
+
+        return None
 
     def forward(
         self,
@@ -201,6 +251,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -221,6 +272,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
                 packed-sequence metadata for chunkwise CP.
+            residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
+                Call-local ordered replay state for a configured residual connection.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -235,10 +288,16 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
+            hidden_states, residual, connection_state, recompute_context = (
+                self._prepare_mixer_state(
+                    hidden_states,
+                    residual_stream_recompute_context=residual_stream_recompute_context,
+                )
+            )
+
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
-            hidden_states, residual = self._prepare_mixer_input(hidden_states)
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
                 if packed_sequence_cp_metadata is None:
                     mixer_out_with_bias = self.mixer(
@@ -253,7 +312,12 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                         packed_seq_params=packed_seq_params,
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     )
-            return self._apply_mixer_bda(mixer_out_with_bias, residual)
+
+            hidden_states = self._apply_mixer_update(
+                mixer_out_with_bias, residual, connection_state, recompute_context=recompute_context
+            )
+
+            return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
