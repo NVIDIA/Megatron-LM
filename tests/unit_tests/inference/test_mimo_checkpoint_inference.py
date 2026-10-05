@@ -12,6 +12,9 @@ from examples.multimodal.mimo_checkpoint_model import (
     vision_projection_config,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     vlm_dynamic_inference,
 )
@@ -53,6 +56,18 @@ def test_mimo_checkpoint_prefix_map(checkpoint_keys):
     checkpoint_keys += [f'{_MODALITY}encoders.other_encoder.patch_embed.weight']
     with pytest.raises(ValueError, match='one vision encoder'):
         vlm_dynamic_inference._mimo_checkpoint_prefix_map(args)
+
+
+def test_enable_checkpoint_expert_bias(checkpoint_keys):
+    args = SimpleNamespace(moe_router_enable_expert_bias=False)
+    checkpoint_keys += [_LANGUAGE_KEY]
+    vlm_dynamic_inference._enable_checkpoint_expert_bias(args)
+    assert not args.moe_router_enable_expert_bias
+
+    # Trained biases in the checkpoint win over its saved args.
+    checkpoint_keys += ['language_model.module.module.decoder.layers.1.mlp.router.expert_bias']
+    vlm_dynamic_inference._enable_checkpoint_expert_bias(args)
+    assert args.moe_router_enable_expert_bias
 
 
 def test_sharded_state_dict_uses_checkpoint_keys(monkeypatch):
@@ -156,3 +171,34 @@ def test_mimo_vision_configs():
 def test_native_vit_image_embeddings_have_no_class_token():
     # Native mcore ViTs (e.g. pixtral-vit-large) are built without class tokens.
     assert get_num_image_embeddings(1540, 1540, 14, 'pixtral-vit-large', False, 1, False) == 110**2
+
+
+@pytest.mark.parametrize("separators", [(None, None), (20, 19)])
+def test_dynamic_image_rows(separators):
+    break_id, end_id = separators
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace(
+        image_token_index=18,
+        dynamic_resolution=True,
+        patch_dim=14,
+        _pixel_shuffle=False,
+        _conv_merging=True,
+        _drop_vision_class_token=True,
+    )
+    wrapper.inference_context = SimpleNamespace(
+        config=SimpleNamespace(
+            image_preprocessing_config=SimpleNamespace(
+                image_break_token_id=break_id, image_end_token_id=end_id
+            )
+        )
+    )
+    # 56x84 pixels -> 4x6 patches -> 2 rows of 3 merged tokens.
+    expanded, mask = wrapper.expand_image_tokens(
+        [[5, 18, 7]], imgs_sizes=torch.tensor([[56, 84]]), image_token_id=18
+    )
+    if break_id is None:
+        assert expanded == [[5, -1, -1, -1, -1, -1, -1, 7]]
+        assert mask == [[None, 0, 1, 2, 3, 4, 5, None]]
+    else:
+        assert expanded == [[5, -1, -1, -1, 20, -1, -1, -1, 19, 7]]
+        assert mask == [[None, 0, 1, 2, None, 3, 4, 5, None, None]]
