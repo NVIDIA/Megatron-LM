@@ -193,6 +193,7 @@ from .global_vars import (
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
+    get_run_config,
     set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -1214,18 +1215,18 @@ def num_floating_point_operations(
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
-            # Calculate number of dense and MoE Transformer MLPs.
+            # The attention pattern describes only the main decoder layers.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
                     0 if ((i + 1) % args.linear_attention_freq == 0)
-                    else 1 for i in range(num_layers)
+                    else 1 for i in range(args.num_layers)
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+                assert len(linear_attention_pattern) == args.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
+                    f"expected {args.num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
@@ -1240,7 +1241,10 @@ def num_floating_point_operations(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            # MTP repeats the last decoder layer's attention type, not the pattern.
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if is_gated_delta_net_variant(args.experimental_attention_variant):
@@ -1651,6 +1655,8 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    cfg_container.validate()
+
     callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
@@ -1683,6 +1689,8 @@ def pretrain(
 
     timestamp_after_initialize_megatron = time.time()
 
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
     set_run_config(cfg_container)
     timers = get_timers()
@@ -2017,7 +2025,7 @@ def pretrain(
             # Determine which context manager to use for model allocation
             # Use torch_memory_saver if offloading is requested but UVM is not enabled
             use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
+                args.rl_offload_inference_model_weights
                 and uvm_level == 0
                 and HAVE_TORCH_MEMORY_SAVER
             )
@@ -2042,9 +2050,9 @@ def pretrain(
             inference_model[0].eval()
 
         # Validate: offloading flag requires a separate inference model
-        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
+        if args.rl_offload_inference_model_weights and inference_model is None:
             raise ValueError(
-                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
+                "--rl-offload-inference-model-weights requires a separate inference model. "
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
@@ -2892,6 +2900,8 @@ def setup_model_and_optimizer(
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -3662,6 +3672,9 @@ def training_log(
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -3950,10 +3963,10 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        should_prof_rank = (args.profile_ranks == [] or safe_get_rank() in args.profile_ranks)  # [] is all ranks
-        if args.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
+        should_prof_rank = (cfg.profiling.profile_ranks == [] or safe_get_rank() in cfg.profiling.profile_ranks)  # [] is all ranks
+        if cfg.profiling.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
-            base, ext = os.path.splitext(args.memory_snapshot_path)
+            base, ext = os.path.splitext(cfg.profiling.memory_snapshot_path)
             snapshot_filename = f"{base}_{rank}{ext}"
             torch.cuda.memory._dump_snapshot(snapshot_filename)
 
@@ -4414,6 +4427,9 @@ def post_training_step_callbacks(
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
     if args.train_sync_interval and iteration % args.train_sync_interval == 0:
@@ -4446,15 +4462,15 @@ def post_training_step_callbacks(
 
     # Profiling.
     if (
-        args.profile
-        and iteration == args.profile_step_end
-        and (len(args.profile_ranks) == 0 or
-             torch.distributed.get_rank() in args.profile_ranks)
+        (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
+        and iteration == cfg.profiling.profile_step_end
+        and (len(cfg.profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
         # Disable NVTX range when profiling ends.
-        if args.nvtx_ranges:
+        if cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(False)
-        if args.use_pytorch_profiler:
+        if cfg.profiling.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
             if prof.execution_trace_observer is not None:
@@ -4624,6 +4640,9 @@ def train(
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
     timers = get_timers()
 
     fault_injector_kwargs = {}
@@ -4933,12 +4952,11 @@ def train(
     prof = None
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
-        args.profile
-        and (len(args.profile_ranks) == 0 or
-             torch.distributed.get_rank() in args.profile_ranks)
-        and args.use_pytorch_profiler
+        cfg.profiling.use_pytorch_profiler
+        and (len(cfg.profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
-        if args.pytorch_profiler_collect_chakra:
+        if cfg.profiling.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
             et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
@@ -4950,14 +4968,14 @@ def train(
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
-                wait=max(args.profile_step_start - 1, 0),
-                warmup=1 if args.profile_step_start > 0 else 0,
-                active=args.profile_step_end - args.profile_step_start,
+                wait=max(cfg.profiling.profile_step_start - 1, 0),
+                warmup=1 if cfg.profiling.profile_step_start > 0 else 0,
+                active=cfg.profiling.profile_step_end - cfg.profiling.profile_step_start,
                 repeat=1,
             ),
             on_trace_ready=trace_handler,
-            record_shapes=args.pytorch_profiler_collect_shapes,
-            with_stack=args.pytorch_profiler_collect_callstack,
+            record_shapes=cfg.profiling.pytorch_profiler_collect_shapes,
+            with_stack=cfg.profiling.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
         )
         prof.start()
@@ -5019,18 +5037,18 @@ def train(
         # trace instead of accreting into a run-long one. Must be the first thing in
         # the pass so everything below nests under the current interval root.
         _maybe_reroot_otel_interval()
-        if (args.profile
-            and (len(args.profile_ranks) == 0 or
-                 torch.distributed.get_rank() in args.profile_ranks)):
+        if ((cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
+            and (len(cfg.profiling.profile_ranks) == 0 or
+                 torch.distributed.get_rank() in cfg.profiling.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.
-            if iteration == args.profile_step_start and args.nvtx_ranges:
+            if iteration == cfg.profiling.profile_step_start and cfg.profiling.nvtx_ranges:
                 configure_nvtx_profiling(True)
-            if args.use_pytorch_profiler:
+            if cfg.profiling.use_pytorch_profiler:
                 prof.step()
-            elif iteration == args.profile_step_start:
+            elif iteration == cfg.profiling.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                if args.record_shapes:
-                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
+                if cfg.profiling.record_shapes:
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=cfg.profiling.record_shapes)
                     nsys_nvtx_context.__enter__()
 
         # Fault-tolerance heartbeat at the top of the loop -- uninstrumented

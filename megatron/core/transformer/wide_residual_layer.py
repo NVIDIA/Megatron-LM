@@ -152,6 +152,38 @@ class StreamwiseSigmoidMap(nn.Module):
         return self.logit if return_logits else self.factors()
 
 
+class StreamwiseSigmoidWideResidualRead(nn.Module):
+    """Learn an independent ordinary-width read from a wide residual stream."""
+
+    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+        super().__init__()
+        if config.wide_residual is None:
+            raise ValueError("StreamwiseSigmoidWideResidualRead requires wide_residual config.")
+        wr = config.wide_residual
+        self.layer_number = layer_number
+        self.branch_name = branch_name
+        self.num_streams = wr.num_streams
+        self.residual_stream_hidden_size = wr.num_streams * config.hidden_size
+        self.branch_hidden_size = config.hidden_size
+        self.branch_input_dtype = config.params_dtype
+        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Read in branch precision; the operator fixes the output shape and dtype."""
+
+        if hidden_states.shape[-1] != self.residual_stream_hidden_size:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualRead expected residual-stream hidden size "
+                f"{self.residual_stream_hidden_size}, got {hidden_states.shape[-1]}."
+            )
+        return streamwise_sigmoid_read(
+            hidden_states,
+            self.read_map(return_logits=True),
+            self.num_streams,
+            output_dtype=self.branch_input_dtype,
+        )
+
+
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
     """Positive streamwise maps around one ordinary-width residual branch."""
 
@@ -194,6 +226,21 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             (),
         )
 
+    def _read_with_output_dtype(
+        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
+    ) -> tuple[Tensor, ResidualConnectionWriteState]:
+        """Fuse an optional branch-output conversion into the streamwise read."""
+
+        return (
+            streamwise_sigmoid_read(
+                hidden_states,
+                self.read_map(return_logits=True),
+                self.num_streams,
+                output_dtype=output_dtype,
+            ),
+            (),
+        )
+
     def _write(
         self,
         branch_output: ResidualBranchOutput,
@@ -208,7 +255,18 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         else:
             branch_update, bias = branch_output, None
 
-        branch_update = branch_update.to(dtype=residual_stream.dtype)
+        dropout_is_active = training and dropout_probability > 0.0
+        defer_update_cast = (
+            residual_stream.dtype == torch.float32
+            and branch_update.dtype in (torch.bfloat16, torch.float16)
+            and bias is None
+            and not dropout_is_active
+        )
+        # Bias addition and active dropout currently run in residual precision. Only defer the
+        # update cast when neither operation can observe its placement; the mixed-dtype Triton
+        # write then performs the BF16/FP16 -> FP32 conversion while loading the update.
+        if not defer_update_cast:
+            branch_update = branch_update.to(dtype=residual_stream.dtype)
         if bias is not None:
             branch_update = branch_update + bias.to(
                 device=branch_update.device, dtype=branch_update.dtype
@@ -243,8 +301,14 @@ class WideResidualTransformerLayer(TransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ) -> None:
+        if is_mtp_layer:
+            raise ValueError(
+                "MTP auxiliary stacks must use ordinary-width TransformerLayer, not "
+                "WideResidualTransformerLayer."
+            )
         super().__init__(
             config=config,
             submodules=submodules,
@@ -255,6 +319,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             is_mtp_layer=is_mtp_layer,
             add_layer_offset=add_layer_offset,
             pp_layer_offset=pp_layer_offset,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
             name=name,
         )
 
