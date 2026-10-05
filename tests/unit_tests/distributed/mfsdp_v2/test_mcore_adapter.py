@@ -322,8 +322,10 @@ class TestMcoreAdapterDense:
         )
 
         def forward():
-            output = model(x).float()
-            return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+            output = model(x)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32)
+            )
 
         def run_backward():
             # Retain the grad views so reduction includes the accumulation kernel.
@@ -414,8 +416,10 @@ class TestMcoreAdapterDense:
                 batches = iter(microbatches)
 
                 def forward():
-                    output = model(hidden_states=next(batches), attention_mask=None).float()
-                    return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+                    output = model(hidden_states=next(batches), attention_mask=None)
+                    return torch.nn.functional.mse_loss(
+                        output.float(), torch.zeros_like(output, dtype=torch.float32)
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 microbatch_losses = run_forward_backward_on_microbatches(
@@ -476,8 +480,10 @@ class TestMcoreAdapterDense:
         hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
         def forward():
-            output = model(hidden_states=hidden, attention_mask=None).float()
-            return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+            output = model(hidden_states=hidden, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32)
+            )
 
         optimizer.zero_grad(set_to_none=True)
         run_forward_backward_on_microbatches(model, forward)
@@ -544,8 +550,10 @@ class TestMcoreAdapterDense:
         ).expand(8, 2, -1) * (torch.distributed.get_rank() + 1)
 
         def forward():
-            output = model(hidden_states=hidden, attention_mask=None).float()
-            return torch.nn.functional.mse_loss(output, torch.zeros_like(output), reduction="sum")
+            output = model(hidden_states=hidden, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32), reduction="sum"
+            )
 
         run_forward_backward_on_microbatches(model, forward)
 
@@ -655,8 +663,10 @@ class TestMcoreAdapterCudaGraph:
 
             def forward():
                 hidden = next(data_iterator[0])["hidden_states"]
-                output = model[0](hidden_states=hidden, attention_mask=None).float()
-                return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+                output = model[0](hidden_states=hidden, attention_mask=None)
+                return torch.nn.functional.mse_loss(
+                    output.float(), torch.zeros_like(output, dtype=torch.float32)
+                )
 
             # Pipeline schedules receive model chunks as a list, including with PP=1.
             losses = run_forward_backward_on_microbatches(
@@ -972,8 +982,10 @@ class TestMcoreAdapterHybrid:
             batch_iterator = iter(batches)
 
             def forward():
-                output = model(hidden_states=next(batch_iterator), attention_mask=None).float()
-                return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+                output = model(hidden_states=next(batch_iterator), attention_mask=None)
+                return torch.nn.functional.mse_loss(
+                    output.float(), torch.zeros_like(output, dtype=torch.float32)
+                )
 
             step_losses = run_forward_backward_on_microbatches(
                 model, forward, num_microbatches=microbatches
@@ -1009,8 +1021,10 @@ class TestMcoreAdapterHybrid:
         hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
         def forward():
-            output = model(hidden_states=hidden, attention_mask=None).float()
-            return torch.nn.functional.mse_loss(output, torch.zeros_like(output), reduction="sum")
+            output = model(hidden_states=hidden, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32), reduction="sum"
+            )
 
         run_forward_backward_on_microbatches(model, forward)
 
@@ -1128,10 +1142,10 @@ class TestMcoreAdapterHybrid:
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
 
         def forward():
-            output = model(
-                input_ids=input_ids, position_ids=position_ids, attention_mask=None
-            ).float()
-            return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+            output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32)
+            )
 
         run_forward_backward_on_microbatches(model, forward)
         success, _, _ = optimizer.step()
