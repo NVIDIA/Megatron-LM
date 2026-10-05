@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
@@ -17,12 +20,10 @@ pytestmark = [
 ]
 
 
-def test_csa_protocol_cp2_reference_matches_upstream_and_bypasses_training():
-    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-    from megatron.lite.model.deepseek_v4.lite import protocol
-    from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
-    from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
-
+@pytest.fixture(scope="module")
+def cp_world():
+    # Runtime process groups are cached across model builds. Keep the world alive
+    # across both precision cases so cached subgroups remain valid.
     if not torch.cuda.is_available() or int(os.environ.get("WORLD_SIZE", "1")) != 2:
         pytest.skip("run with torchrun on two Blackwell GPUs")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -30,15 +31,59 @@ def test_csa_protocol_cp2_reference_matches_upstream_and_bypasses_training():
     if created_group:
         dist.init_process_group("nccl", timeout=timedelta(seconds=300))
     try:
-        _check_protocol(
-            protocol, DeepseekV4Config, CompressedSparseAttention, PackedBatch, ParallelConfig
-        )
+        yield
     finally:
         if created_group:
             dist.destroy_process_group()
 
 
-def _check_protocol(protocol, config_type, attention_type, batch_type, parallel_type):
+@pytest.mark.parametrize("precision", ("fast", "exact"))
+def test_csa_protocol_cp2_matches_upstream_and_bypasses_training(precision, cp_world):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.model.deepseek_v4.lite import protocol
+    from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
+    from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+
+    _check_protocol(
+        protocol,
+        DeepseekV4Config,
+        CompressedSparseAttention,
+        PackedBatch,
+        ParallelConfig,
+        precision,
+    )
+
+
+def _check_protocol(protocol, config_type, attention_type, batch_type, parallel_type, precision):
+    selector = {"backend": "reference", "precision": "fast"}
+    if precision == "exact":
+
+        def read(variable):
+            value = os.environ.get(variable, "").strip()
+            if not value:
+                pytest.skip(f"{variable} is not set")
+            return json.loads(value if value[0] in "[{" else Path(value).read_text())
+
+        spec = next(
+            (
+                s
+                for s in read("LITETOPK_TEST_SELECTORS")
+                if s["native_format"] == "mxfp4" and s["precision"] == "exact"
+            ),
+            None,
+        )
+        if spec is None:
+            pytest.skip("an exact MXFP4 selector is required")
+        exact = read("LITETOPK_TEST_EXACT_TOPK")
+        for entry in reversed(exact.pop("pythonpath", [])):
+            sys.path.insert(0, entry)
+        selector = {
+            "backend": "litetopk",
+            "precision": "exact",
+            "litetopk": spec["litetopk"],
+            "exact_topk": exact,
+        }
+
     cfg = config_type(
         vocab_size=64,
         hidden_size=128,
@@ -74,7 +119,7 @@ def _check_protocol(protocol, config_type, attention_type, batch_type, parallel_
 
     torch.manual_seed(20261004)
     unbound_bundle = build(None)
-    bound_bundle = build({"backend": "reference", "precision": "fast"})
+    bound_bundle = build(selector)
     unbound, bound = unbound_bundle.chunks[0].eval(), bound_bundle.chunks[0].eval()
     bound.load_state_dict(unbound.state_dict())
     installation = bound_bundle.extras["indexer_topk"]

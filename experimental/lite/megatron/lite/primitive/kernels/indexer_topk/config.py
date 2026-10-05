@@ -667,9 +667,9 @@ def resolve_indexer_topk_tuning(
         kernel_heads = heads.litetopk_heads
     startup, why = _default_startup(fmt, route, geometry, heads, kernel_heads)
 
+    exact = precision == "exact"
     if fmt == "fp8":
         tile_rows = _override(tuning.tile_rows, _fp8_tile_rows(num_sms, kernel_heads))
-        exact = precision == "exact"
         settings = LiteTopKPluginSettings(
             tie_policy="logical-id" if exact else None,
             score_policy="native-fp32" if exact else None,
@@ -686,6 +686,8 @@ def resolve_indexer_topk_tuning(
     else:
         tile_rows = _override(tuning.tile_rows, 4096)
         settings = LiteTopKPluginSettings(
+            tie_policy="logical-id" if exact else None,
+            score_policy="native-fp32" if exact else None,
             paged_pool_pages_per_row=32,
             fp8_row_tiles=2,
             fp8_paged_admit_max_query_len=0,
@@ -719,10 +721,9 @@ def resolve_indexer_topk_tuning(
         status_check=_override(tuning.status_check, "sync_recompute"),
         plugin_settings=settings,
     )
-    if (
-        precision == "exact"
-        and fmt == "fp8"
-        and (settings.tie_policy, settings.score_policy) != ("logical-id", "native-fp32")
+    if precision == "exact" and (settings.tie_policy, settings.score_policy) != (
+        "logical-id",
+        "native-fp32",
     ):
         raise IndexerTopKConfigError(
             "precision='exact' needs plugin_settings tie_policy='logical-id' and "

@@ -561,3 +561,40 @@ def test_tuning_validation():
         )
     with pytest.raises(IndexerTopKConfigError, match="concrete values"):
         dataclasses.replace(_fp8_tuning(), tile_rows=None)
+
+
+@pytest.mark.parametrize("override", (None, "storage", "folded"))
+def test_fp4_exact_policies_and_raw32_budget(override):
+    route = dataclasses.replace(
+        FP4_ROUTE,
+        exact=True,
+        candidate_record_bytes=8,
+        tie_policies=frozenset({"logical-id"}),
+        score_policies=frozenset({"native-fp32"}),
+    )
+    settings = None
+    if override == "storage":
+        settings = LiteTopKPluginSettings(tie_policy="storage")
+    elif override == "folded":
+        settings = LiteTopKPluginSettings(score_policy="folded")
+
+    def resolve(budget):
+        return resolve_indexer_topk_tuning(
+            IndexerTopKTuning(candidate_budget_bytes=budget, plugin_settings=settings),
+            fmt="mxfp4",
+            route=route,
+            geometry=FP4_GEOMETRY,
+            precision="exact",
+            num_sms=B200_SMS,
+        )
+
+    minimum = 4096 * 16384 * 8
+    if override is not None:
+        with pytest.raises(IndexerTopKConfigError, match="precision='exact'"):
+            resolve(minimum)
+        return
+    resolved = resolve(minimum)
+    assert resolved.plugin_settings.tie_policy == "logical-id"
+    assert resolved.plugin_settings.score_policy == "native-fp32"
+    with pytest.raises(IndexerTopKConfigError, match="16384 candidates of 8 bytes"):
+        resolve(minimum - 1)

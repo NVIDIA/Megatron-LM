@@ -289,6 +289,8 @@ def test_csa_thd_cp4_litetopk_matches_reference(monkeypatch):
         assert torch.equal(reference_call["result"], expected), name
         # LiteTopK: tiles on the ranks past the plan's start, near ties only.
         stats = arms["litetopk"]["stats"]
+        assert stats["recomputed_rows"] == stats["recomputed_tiles"] == 0, (name, stats)
+        assert stats["status_rows"] == {} and stats["declined_tiles"] == {}, (name, stats)
         rows_differ, distance = _max_near_tie_distance(
             lite_call, lite_call["result"], reference_call["result"]
         )

@@ -66,8 +66,8 @@ with runtime.eval_mode(handle):  # model chunks in eval mode, gradients disabled
     ...  # forward passes here select through the bindings
 ```
 
-DeepSeek-V4 takes the same field. The qualified MXFP4 LiteTopK plugin does not select exactly, so its LiteTopK
-configuration uses `precision="fast"`; the exact-tie top-k remains optional there and makes the
+DeepSeek-V4 takes the same field. The legacy `dsv4-litetopk-ac1c-abi1` plugin uses
+`precision="fast"`; the exact-tie top-k remains optional there and makes the
 reference rows choose among keys tied at a row's cutoff score deterministically (lowest key id
 first):
 
@@ -93,11 +93,23 @@ impl_cfg = {
 }
 ```
 
-For deterministic exact MXFP4 selection, use `backend="reference"`, `precision="exact"`
-and configure `exact_topk`. This ranks the quantized MXFP4 operands exactly. The fast slab
-plugin folds its score epilogue and stores a truncated 24-bit score code; setting `exact_topk`
-only controls its reference rows and does not make its LiteTopK rows exact. Requesting
-`backend="litetopk"`, `precision="exact"` with that plugin fails at model construction.
+For exact MXFP4 LiteTopK selection, use the `fp4-litetopk-raw32-abi1` plugin:
+
+```python
+impl_cfg["indexer_topk"].update(
+    precision="exact",
+    litetopk={
+        "source": "/deps/plugins/fp4-litetopk-raw32-abi1",
+        "expected_source_id": "b86ce05bca11",
+    },
+)
+```
+
+Keep `exact_topk` configured for the reference prefix and status repair. The new plugin uses
+native FP32 scoring, 8-byte candidate records and deterministic logical-id ties. It supports
+32/64 indexer heads, head dimension 128 and K=1..2048 on B200. `backend="reference"` remains
+available for exact selection without a LiteTopK plugin. The legacy fast plugin still rejects
+`precision="exact"`: configuring an exact-tie selector does not change its fused score arithmetic.
 
 Without the runtime, pass the field to the protocol's `ImplConfig` (a mapping or an
 `IndexerTopKConfig`):
@@ -232,6 +244,8 @@ checks the signatures against the calls Megatron Lite makes.
   `launch_time_env_keys`, `tie_policy` and `score_policy`. Each route declares its name
   (`fp8_paged` or `fp4_slab`), format, head counts, head dimensions, top-k sizes, query tile
   lengths, key range, HOT prefix, whether it selects exactly, and its tie and score policies.
+  Optional `candidate_record_bytes` is 6 for legacy slabs (the default), or 8 for raw FP32
+  candidates. The loader validates it and the engine uses it for slab budgets and statistics.
 - ABI v1 plugins read their configuration from `SGLANG_LITETOPK*` environment keys: the adapter
   snapshots them when it is imported and the CUDA extension reads a few of them on every launch.
   Megatron Lite renders its `LiteTopKPluginSettings` into these keys before the import, keeps
@@ -255,15 +269,15 @@ descending and, for equal scores, by ascending key id. The reference selector me
 exact-tie top-k. A LiteTopK route meets it only when it advertises exact selection: the raw32
 plugins keep the unrounded float32 score of every candidate (as an order-preserving 32-bit code)
 with its key id and rank the candidates by (score descending, key id ascending) themselves, on the
-same operand bytes the reference selector scores. Exact FP8 selection also needs the plugin
+same operand bytes the reference selector scores. Exact FP8 and MXFP4 selection need the plugin
 settings `tie_policy="logical-id"` and `score_policy="native-fp32"`, which the policy seam derives
-for it. Rows a plugin reports as overflowing or failed are recomputed by the reference selector,
+for them. Rows a plugin reports as overflowing or failed are recomputed by the reference selector,
 so every row is exact.
 
 `precision="fast"`: LiteTopK rows may differ from the exact selection among nearly tied keys, and
 unless `exact_topk` is set, which of the keys tied at a reference row's cutoff score are selected
 can differ from run to run. The optional GPU tests bound every key a fast route swaps to a relative
-distance of 1e-3 (FP8) or 1.1e-3 (MXFP4) from the row's cutoff score. The MXFP4 slab route can swap
+distance of 1e-3 (FP8) or 1.1e-3 (MXFP4) from the row's cutoff score. The legacy fast MXFP4 slab route can swap
 different near ties from run to run. The previous LiteTopK integration selected with fast routes
 only; `glm-litetopk-996e-abi1` and `dsv4-litetopk-ac1c-abi1` carry its CUDA selectors.
 
@@ -282,6 +296,7 @@ The plugin routes declare their capabilities in `plugin_info()`; Megatron Lite h
 | `glm-litetopk-raw32h64-abi1` | `fp8_paged` | FP8 | 32, 64 | 128 | 2048 | 196608 to 1048576 | yes |
 | `glm-litetopk-996e-abi1` | `fp8_paged` | FP8 | 32 | 128 | 2048 | 196608 to 1048576 | no |
 | `dsv4-litetopk-ac1c-abi1` | `fp4_slab` | MXFP4 | 32, 64 | 128 | 1 to 2048 | 65536 to 1048576 compressed keys | no |
+| `fp4-litetopk-raw32-abi1` | `fp4_slab` | MXFP4 | 32, 64 | 128 | 1 to 2048 | 65536 to 1048576 compressed keys | yes |
 
 - A layer whose head count the route has no kernels for fails when the model is built, unless
   `head_padding=True` lets it run on a larger head count of the route (see
