@@ -74,7 +74,7 @@ A recurring pitfall: putting training loss on a span attribute instead of a metr
 
 Don't do it the other way. Loss on a span attribute produces no useful time series in Jaeger; it's wasted data. Iteration on a metric label produces one metric series per iteration — unbounded cardinality explosion.
 
-See [lens: metrics — Metric vs span attribute vs resource attribute](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/metrics.mdx#metrics-vs-span-attributes-vs-resource-attributes).
+See [lens: metrics — Metric vs span attribute vs resource attribute](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/metrics.mdx#metrics-span-attributes-and-resource-attributes).
 
 ## Adding custom metrics
 
