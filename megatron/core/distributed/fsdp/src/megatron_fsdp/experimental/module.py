@@ -37,6 +37,7 @@ from .schedule import SchedulePolicy
 
 if TYPE_CHECKING:
     from .context import FsdpContext
+    from .indexed_order import IndexedOrder
 
 
 def _is_in_backward() -> bool:
@@ -185,9 +186,7 @@ class FsdpModule:
         )
         self.register_post_backward_hook(FsdpModule.post_backward)
 
-    def register_post_backward_hook(
-        self, post_backward_hook: Callable[["FsdpModule"], None]
-    ) -> None:
+    def register_post_backward_hook(self, post_backward_hook: Callable[[FsdpModule], None]) -> None:
         """Register a post-backward hook to run after this module's backward completes.
 
         The hook runs when this module's backward is complete, so it can reshard
@@ -315,7 +314,7 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
+        self, order: IndexedOrder[FsdpModule], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         next_module = order.next_item(self)
