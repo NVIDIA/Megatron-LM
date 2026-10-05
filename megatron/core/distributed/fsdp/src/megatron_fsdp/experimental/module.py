@@ -69,7 +69,7 @@ class FsdpContext:
 
     def __init__(
         self,
-        device: torch.device,
+        device: torch.device | None = None,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
@@ -78,16 +78,28 @@ class FsdpContext:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
-            device: Device on which this context schedules communication.
+            device: CUDA device on which this context schedules communication. Defaults to
+                the current CUDA device.
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
-                communication stream to reduce peak transient memory.
-            parameter_to_owner: Construction-time TensorAtomic owner assignments. See
-                ``fully_shard_context``.
-            caller_managed_grad_sync: Disable the automatic autograd completion callback.
-                The caller must synchronize gradient reductions with ``finish_grad_sync()``.
+                communication stream to reduce peak transient memory. See
+                https://github.com/NVIDIA/Megatron-LM/issues/6471.
+            parameter_to_owner: Construction-time owner assignments for TensorAtomic
+                parameters, keyed by the original parameters before sharding. Owners are
+                ranks in each parameter group's 1-D data-parallel mesh and must agree across
+                that mesh. Every TensorAtomic parameter needs an entry; other entries are
+                ignored. Tensors are packed by owner without changing logical parameter order.
+            caller_managed_grad_sync: Disable the automatic autograd completion callback,
+                allowing delayed weight gradients or custom backward schedules. The caller must
+                call ``finish_grad_sync()`` after all backward work and before reading or
+                modifying gradients.
         """
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if device.type != "cuda":
+            raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
+
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream

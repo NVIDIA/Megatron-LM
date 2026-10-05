@@ -73,14 +73,7 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 @contextmanager
-def fully_shard_context(
-    device: torch.device | None = None,
-    *,
-    use_symmetric_memory: bool = False,
-    unify_communication_stream: bool = False,
-    parameter_to_owner: dict[nn.Parameter, int] | None = None,
-    caller_managed_grad_sync: bool = False,
-) -> Iterator[FsdpContext]:
+def fully_shard_context(device: torch.device | None = None, **kwargs) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
@@ -89,35 +82,12 @@ def fully_shard_context(
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
-        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
-        unify_communication_stream: Whether all-gathers and reduce-scatters share one
-            communication stream to reduce peak transient memory. See
-            https://github.com/NVIDIA/Megatron-LM/issues/6471.
-        parameter_to_owner: Construction-time owner assignments for TensorAtomic
-            parameters, keyed by the original parameters before sharding. Owners are
-            ranks in each parameter group's 1-D data-parallel mesh and must agree across
-            that mesh. Every TensorAtomic parameter needs an entry; other entries are
-            ignored. Tensors are packed by owner without changing logical parameter order.
-        caller_managed_grad_sync: Disable the automatic autograd completion callback,
-            allowing delayed weight gradients or custom backward schedules. The caller must
-            call ``context.finish_grad_sync()`` after all backward work and before reading
-            or modifying gradients.
+        **kwargs: Options forwarded to :class:`FsdpContext`.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
 
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    if device.type != "cuda":
-        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
-
-    context = FsdpContext(
-        device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
-        parameter_to_owner=parameter_to_owner,
-        caller_managed_grad_sync=caller_managed_grad_sync,
-    )
+    context = FsdpContext(device=device, **kwargs)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
