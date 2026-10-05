@@ -76,12 +76,15 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     objects), and the `step` override replaces the inner's per-parameter all-gather path
     with the pipelined owner-compute algorithm.
 
-    Each step, per `torch` param group and per contained `FsdpParameterGroup`: the
-    active parameters' gather is posted, then their inputs are orthogonalized,
-    scattered, and applied on the group's own CUDA stream — a group's Newton-Schulz
-    work thereby overlaps the next group's communications. At the end, the caller's
-    stream is ordered behind every group stream and the touched groups' model weights
-    are synced from their main weights.
+    Each step runs in two posting phases: first every active group's gather is
+    posted (local pre-orthogonalization chunks computed on the caller's stream,
+    P2P stream-ordered on each group's own CUDA stream), then the groups'
+    Newton-Schulz work, scatter, and apply run per group on its stream. Because
+    no scatter is enqueued before every gather, no scatter's Newton-Schulz
+    dependency can head-of-line-block another group's gather on the shared NCCL
+    communicator, so the groups' Newton-Schulz work genuinely overlaps. At the end, the caller's
+    stream is ordered behind every group stream and the touched groups' model
+    weights are synced from their main weights.
 
     Args:
         params: Parameters or param-group dicts to optimize.
@@ -360,13 +363,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         else:
             loss = None
 
-        # Insertion-ordered: both loops below post P2P ops and collectives whose
+        # Insertion-ordered: the loops below post P2P ops and collectives whose
         # order must match on every rank — NCCL matches P2P FIFO per peer pair
         # (tags unsupported), and `sync_model_weight_from_main_weight` is a
         # collective on the shared mesh. Set iteration order is id-hash dependent
         # and can differ across ranks; the param list is rank-identical.
         touched: dict[FsdpParameterGroup, None] = {}
         temporaries: list[Any] = []
+
+        # The per-group `(group, active layout, torch group, lr)` records of this step,
+        # in rank-identical order.
+        actives: list[tuple[FsdpParameterGroup, GroupOwnerLayout, dict[str, Any], float]] = []
         for torch_group in self.param_groups:
             self._init_group(torch_group)
             lr = torch_group["lr"]
@@ -384,8 +391,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             for fsdp_group in fsdp_groups:
                 owner_layout = self._owner_layouts.get(fsdp_group)
                 if owner_layout is None:
-                    # Built once per group — layouts and owners are step-independent.
-                    # Everything participates; dimensionalities are a validation concern.
+                    # Built once per group — layouts are step-independent. Everything
+                    # participates; dimensionalities are a validation concern.
                     owner_layout = self._owner_layouts[fsdp_group] = GroupOwnerLayout.from_groups(
                         [fsdp_group],
                         cost_fn=ns_cost_fn(self._num_ns_steps),
@@ -396,24 +403,43 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     for i, fp in enumerate(fsdp_group.fsdp_parameters)
                     if fp.sharded in grad_bearing
                 ]
-                active = GroupOwnerLayout(
-                    mesh=fsdp_group.mesh,
-                    layouts={i: owner_layout.layouts[i] for i in active_indices},
-                    owners={i: owner_layout.owners[i] for i in active_indices},
-                )
+                if not active_indices:
+                    continue
                 # The `orthogonalize` kernel rejects <2D inputs, but only the owner
                 # calls it: a per-rank raise there would leave the other ranks
                 # deadlocked in the gather/scatter P2P. Validate rank-uniformly from
                 # the rank-identical layouts before posting any communication.
-                for i, layout in active.layouts.items():
+                for i in active_indices:
+                    layout = owner_layout.layouts[i]
                     if len(layout.full_shape) < 2:
                         raise ValueError(
                             f"Only 2D or higher-dimensional parameters can be "
                             f"orthogonalized; parameter {i} of {fsdp_group!r} has "
                             f"shape {tuple(layout.full_shape)}."
                         )
+                active = GroupOwnerLayout(
+                    mesh=fsdp_group.mesh,
+                    layouts={i: owner_layout.layouts[i] for i in active_indices},
+                    owners={i: owner_layout.owners[i] for i in active_indices},
+                )
                 if active.layouts:
-                    temporaries.extend(self._step_active(fsdp_group, active, torch_group, lr))
+                    actives.append((fsdp_group, active, torch_group, lr))
+
+        # Post every group's gather before any group's scatter: a scatter's NCCL
+        # kernel is stream-ordered behind its group's Newton-Schulz work, so if
+        # scatter(k) is enqueued first, it head-of-line-blocks gather(k+1) on the
+        # shared communicator FIFO and serializes the groups' Newton-Schulz work.
+        # With every gather ahead of every scatter, group k+1's gather completes
+        # while group k orthogonalizes, so the Newton-Schulz work truly overlaps.
+        posted: list[tuple[FsdpParameterGroup, GroupOwnerLayout, dict[str, Any], float, dict[int, torch.Tensor]]] = []
+        for fsdp_group, active, torch_group, lr in actives:
+            source, destination = self._step_gather(fsdp_group, active, torch_group, lr)
+            temporaries.extend((source, destination))
+            posted.append((fsdp_group, active, torch_group, lr, destination))
+        for fsdp_group, active, torch_group, lr, destination in posted:
+            temporaries.extend(
+                self._step_apply(fsdp_group, active, torch_group, lr, destination)
+            )
 
         # Order the caller's stream behind every group stream. All step temporaries stay
         # referenced until after these waits, so their blocks cannot be reused before
@@ -426,27 +452,21 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             fsdp_group.sync_model_weight_from_main_weight()
         return loss
 
-    def _step_active(
+    def _step_gather(
         self,
         fsdp_group: FsdpParameterGroup,
         active: GroupOwnerLayout,
         torch_group: dict[str, Any],
         lr: float,
-    ) -> list[Any]:
-        """Three-stage pipelined owner-compute step for one group's active parameters.
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """Compute the local pre-orthogonalization chunks and post the group's gather.
 
-        Stage 1 computes the local pre-orthogonalization chunks and posts the group's
-        gather. Stages 2 and 3 run on the group's stream: orthogonalize the gathered
-        inputs, scatter the updates, and apply them — so this group's Newton-Schulz
-        work overlaps the next group's communications (posting is host-asynchronous
-        and each group has its own stream).
-
-        Returns the step temporaries, which the caller must keep referenced until it
-        has ordered its stream behind every group stream.
+        The gather's P2P runs on the group's own stream inside a `waiting_stream_scope`, which
+        waits on the caller's stream at entry; the caller's stream itself is never blocked.
+        Returns the step temporaries `(source, destination)`, which the caller must keep
+        referenced until it has ordered its stream behind every group stream.
         """
         this_rank = self._this_rank()
-        group_kwargs = {k: v for k, v in torch_group.items() if k != "params"}
-        temporaries: list[Any] = []
 
         # Stage 1: local pre-orthogonalization chunks, then post the group's gather.
         source: dict[int, torch.Tensor] = {}
@@ -469,9 +489,29 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 )
                 for i in owned
             }
-        temporaries.extend((source, destination))
         with self._p2p_scope(self._stream_for(fsdp_group)):
             gather(source, destination, owner_layout=active)
+        return source, destination
+
+    def _step_apply(
+        self,
+        fsdp_group: FsdpParameterGroup,
+        active: GroupOwnerLayout,
+        torch_group: dict[str, Any],
+        lr: float,
+        destination: dict[int, torch.Tensor],
+    ) -> list[Any]:
+        """Stages 2 and 3 for one group's active parameters, on the group's stream:
+        orthogonalize the gathered inputs, scatter the updates, and apply them.
+
+        With every group's gather posted before any group's scatter, this group's Newton-Schulz
+        work overlaps the other groups' gathers and Newton-Schulz work.
+
+        Returns the step temporaries, which the caller must keep referenced until it has
+        ordered its stream behind every group stream.
+        """
+        this_rank = self._this_rank()
+        group_kwargs = {k: v for k, v in torch_group.items() if k != "params"}
 
         # Stages 2 and 3, on the group's stream.
         stream = self._stream_for(fsdp_group)
@@ -499,8 +539,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 else:
                     update_shard = scratch[i]
                 self._apply_update(self._sharded_dtensor(fsdp_group, i), update_shard, lr)
-            temporaries.extend((updates, scratch))
-        return temporaries
+            return [updates, scratch]
 
 
 class FsdpMuon(FsdpOrthogonalizedOptimizer):
