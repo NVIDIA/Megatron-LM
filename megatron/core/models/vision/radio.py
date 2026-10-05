@@ -468,7 +468,7 @@ class RADIOViTModel(VisionModule):
         """Group consecutive video frames into tubelets for temporal compression."""
         T = self.temporal_patch_dim
         total_frames = sum(num_frames)
-        num_imgs_sizes = imgs_sizes.shape[0]
+        num_imgs_sizes = len(imgs_sizes)
         expected_tubelets = sum(1 if nf == 1 else math.ceil(nf / T) for nf in num_frames)
 
         assert total_frames == num_imgs_sizes, (
