@@ -81,7 +81,24 @@ def _config(**overrides):
 
 @pytest.mark.parametrize("parallel_mode", ["column", "row"])
 @pytest.mark.parametrize("singleton_local_shards", [False, True])
-def test_te_grouped_linear_virtual_expert_checkpoint(parallel_mode, singleton_local_shards):
+@pytest.mark.parametrize(
+    "quantized",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=[
+                pytest.mark.internal,
+                pytest.mark.launch_on_gb200,
+                pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameters need Blackwell"),
+            ],
+        ),
+    ],
+    ids=["bf16", "mxfp8"],
+)
+def test_te_grouped_linear_virtual_expert_checkpoint(
+    parallel_mode, singleton_local_shards, quantized
+):
     """Runtime replicas preserve owned initialization and the upstream checkpoint layout."""
     Utils.initialize_distributed()
     if torch.distributed.get_world_size() % 2:
@@ -93,36 +110,51 @@ def test_te_grouped_linear_virtual_expert_checkpoint(parallel_mode, singleton_lo
         expert_model_parallel_size=2,
         moe_grouped_gemm=True,
         moe_single_grouped_weight=False,
+        fp8="e4m3" if quantized else None,
+        fp8_recipe=Fp8Recipe.mxfp8,
+        fp8_param=quantized,
     )
     linear = (
         TEColumnParallelGroupedLinear if parallel_mode == "column" else TERowParallelGroupedLinear
     )
 
     def build(num_virtual_experts):
-        return linear(
-            2,
-            128,
-            256,
-            num_virtual_experts=num_virtual_experts,
-            config=config,
-            init_method=init_method_normal(0.02),
-            bias=False,
-            skip_bias_add=False,
-            is_expert=True,
-            pg_collection=pg,
-        ).cuda()
+        with get_fp8_context(config, 0, is_init=True):
+            return linear(
+                2,
+                128,
+                256,
+                num_virtual_experts=num_virtual_experts,
+                config=config,
+                init_method=init_method_normal(0.02),
+                bias=False,
+                skip_bias_add=False,
+                is_expert=True,
+                pg_collection=pg,
+            ).cuda()
+
+    def assert_weight_equal(actual, expected):
+        if is_mxfp8tensor(actual):
+            actual = actual.dequantize()
+        if is_mxfp8tensor(expected):
+            expected = expected.dequantize()
+        assert bytes_equal(actual, expected)
 
     try:
         model_parallel_cuda_manual_seed(123)
         owned, following_owned = build(0), build(0)
         model_parallel_cuda_manual_seed(123)
         virtual, following_virtual = build(2), build(0)
+        for module in (owned, following_owned, virtual, following_virtual):
+            assert is_mxfp8tensor(module.weight0) is quantized
         assert virtual.num_gemms == 4
         assert set(dict(virtual.named_parameters())) == {"weight0", "weight1"}
         assert virtual.state_dict().keys() == owned.state_dict().keys()
         for index in range(2):
-            assert bytes_equal(getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}"))
-            assert bytes_equal(
+            assert_weight_equal(
+                getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}")
+            )
+            assert_weight_equal(
                 getattr(following_virtual, f"weight{index}"),
                 getattr(following_owned, f"weight{index}"),
             )
@@ -138,7 +170,7 @@ def test_te_grouped_linear_virtual_expert_checkpoint(parallel_mode, singleton_lo
             assert shard.key == reference.key
             assert shard.global_shape == reference.global_shape
             assert shard.global_offset == reference.global_offset
-            assert bytes_equal(shard.data, reference.data)
+            assert_weight_equal(shard.data, reference.data)
             if singleton_local_shards:
                 assert shard.key == f"{global_expert}.experts.weight"
                 assert shard.global_shape == (256, 128)
@@ -147,19 +179,36 @@ def test_te_grouped_linear_virtual_expert_checkpoint(parallel_mode, singleton_lo
                 assert shard.global_shape == (4, 256, 128)
                 assert shard.global_offset == (global_expert, 0, 0)
 
+        # Distributed checkpoint loading presents one extra-state object per owned expert.
+        restored = build(2)
+        restored.load_state_dict(
+            {name.removeprefix("experts."): shard.data for name, shard in actual.items()},
+            strict=True,
+        )
+        for index in range(2):
+            assert_weight_equal(
+                getattr(restored, f"weight{index}"), getattr(virtual, f"weight{index}")
+            )
+        if quantized:
+            assert restored.fp8_meta["num_gemms"] == restored.num_gemms
+
         # Loading in either direction must work regardless of the runtime slot count.
         with torch.no_grad():
             for index, parameter in enumerate(virtual.parameters()):
                 parameter.fill_(torch.distributed.get_rank(pg.ep) * 2 + index + 1)
         owned.load_state_dict(virtual.state_dict(), strict=True)
         for index in range(2):
-            assert bytes_equal(getattr(owned, f"weight{index}"), getattr(virtual, f"weight{index}"))
+            assert_weight_equal(
+                getattr(owned, f"weight{index}"), getattr(virtual, f"weight{index}")
+            )
         with torch.no_grad():
             for parameter in virtual.parameters():
                 parameter.zero_()
         virtual.load_state_dict(owned.state_dict(), strict=True)
         for index in range(2):
-            assert bytes_equal(getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}"))
+            assert_weight_equal(
+                getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}")
+            )
     finally:
         Utils.destroy_model_parallel()
 

@@ -340,7 +340,7 @@ update difference.
 
 Planner correctness and CUDA graph replay live in
 `tests/unit_tests/determinism/kernels/test_moe_kernels.py`. Owned-expert checkpoint layout,
-loading across virtual-slot counts, and initialization parity are covered by
+loading BF16/MXFP8 checkpoints across virtual-slot counts, and initialization parity are covered by
 `test_te_grouped_linear_virtual_expert_checkpoint` in the neighboring `test_te_wrappers.py`.
 
 Each layer fixes its local token count on its first forward and rejects later changes.
