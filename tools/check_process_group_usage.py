@@ -10,8 +10,10 @@ This check is a ratchet, not a cleanup. Every existing violation is recorded in 
 the build stays green; the check fails only when a *new* one appears, or when the allowlist
 claims a violation that no longer exists (so the allowlist shrinks as the migration lands).
 Entries count each accessor within its enclosing function/class, independently of line numbers.
-This is a syntactic check of imported accessors, not data-flow analysis: aliases created through
-assignments or dynamic attribute lookup are outside its scope.
+This is a syntactic check of imported accessors, not data-flow analysis. A call sees the most
+recent import of its name that precedes it in the same scope, even if the name is reassigned
+later; aliases created through assignments (``grid = parallel_state``) or dynamic attribute
+lookup are outside its scope.
 
 Usage::
 
@@ -39,7 +41,9 @@ EXEMPT = {"megatron/core/parallel_state.py", "megatron/core/process_groups_confi
 # (the intended long-term surface) and the virtual-pipeline and memory-buffer globals, which have
 # no replacement yet and are tracked separately.
 DEPRECATED_PREFIXES = ("get_",)
-DEPRECATED_SUFFIXES = ("_group", "_groups", "_rank", "_ranks", "_world_size", "_src_rank")
+# "_gloo" covers the Gloo group accessors (get_data_parallel_group_gloo,
+# get_expert_data_parallel_group_gloo), which also return groups of the global grid.
+DEPRECATED_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
 NOT_DEPRECATED = {
     "get_nccl_options",
     "get_all_ranks",
@@ -65,19 +69,28 @@ def _qualified_name(node):
 
 
 def _scope_bindings(node):
-    """Collect imports and shadowing bindings without leaking nested scopes into their parent."""
+    """Collect the binding events of one scope without leaking nested scopes into their parent.
+
+    Returns ``{name: [(position, target), ...]}`` in source order. ``target`` is the dotted path
+    a name was imported from, or ``""`` for any other binding (parameter, assignment, nested
+    definition).
+    """
 
     class Bindings(ast.NodeVisitor):
         """Collect names bound by the current module, function, or class."""
 
         def __init__(self):
-            self.names = {}
+            self.events = {}
+
+        def bind(self, name, node, target):
+            """Record that ``name`` is bound to ``target`` at ``node``'s position."""
+            self.events.setdefault(name, []).append(((node.lineno, node.col_offset), target))
 
         def visit_Import(self, node):
             """Record the module bound by each import name."""
             for alias in node.names:
                 name = alias.asname or alias.name.split(".")[0]
-                self.names[name] = alias.name if alias.asname else name
+                self.bind(name, node, alias.name if alias.asname else name)
 
         def visit_ImportFrom(self, node):
             """Record direct imports, including relative imports of core compatibility modules."""
@@ -86,16 +99,16 @@ def _scope_bindings(node):
             if node.level and module in ("", "parallel_state", "process_groups_config"):
                 module = "megatron.core" + (f".{module}" if module else "")
             for alias in node.names:
-                self.names[alias.asname or alias.name] = f"{module}.{alias.name}"
+                self.bind(alias.asname or alias.name, node, f"{module}.{alias.name}")
 
         def visit_Name(self, node):
             """Keep simple assignments from being mistaken for imported module aliases."""
             if isinstance(node.ctx, ast.Store):
-                self.names[node.id] = ""
+                self.bind(node.id, node, "")
 
         def visit_FunctionDef(self, node):
             """Bind a nested definition's name without collecting imports from its body."""
-            self.names[node.name] = ""
+            self.bind(node.name, node, "")
 
         visit_AsyncFunctionDef = visit_FunctionDef
         visit_ClassDef = visit_FunctionDef
@@ -115,10 +128,29 @@ def _scope_bindings(node):
         args = node.args
         for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
             if arg:
-                bindings.names[arg.arg] = ""
+                # Parameters are bound before any statement of the body runs.
+                bindings.events.setdefault(arg.arg, []).append(((0, -1), ""))
     for statement in node.body:
         bindings.visit(statement)
-    return bindings.names
+    return bindings.events
+
+
+def _binding_at(events, position):
+    """Return what a name refers to at ``position`` in the scope that binds it.
+
+    A call sees the most recent import of the name that precedes it, even when the name is
+    reassigned afterwards: the accessor has already run against the global grid by then. Other
+    bindings never hide an earlier import (a conservative choice for branches and loops), but a
+    name bound in the scope without a preceding import is a local value, not a module.
+    """
+    imported = [target for start, target in events if target and start < position]
+    return imported[-1] if imported else ""
+
+
+def _binding_seen_by_nested_scopes(events):
+    """Return what a name in an enclosing scope refers to when a nested scope runs later."""
+    imported = [target for _, target in events if target]
+    return imported[-1] if imported else ""
 
 
 def _violations_in(path: pathlib.Path):
@@ -131,7 +163,8 @@ def _violations_in(path: pathlib.Path):
         def __init__(self):
             self.scope = []
             self.hits = []
-            self.bindings = [("module", _scope_bindings(tree))]
+            # One (kind, names visible from enclosing scopes, own binding events) per scope.
+            self.bindings = [("module", {}, _scope_bindings(tree))]
 
         def visit_FunctionDef(self, node):
             """Resolve function-local imports independently of sibling and class bindings."""
@@ -149,8 +182,14 @@ def _violations_in(path: pathlib.Path):
             self._visit_scope(node, "class")
 
         def _visit_scope(self, node, kind):
-            outer = next(names for scope, names in reversed(self.bindings) if scope != "class")
-            self.bindings.append((kind, {**outer, **_scope_bindings(node)}))
+            _, outer, events = next(
+                binding for binding in reversed(self.bindings) if binding[0] != "class"
+            )
+            visible = {
+                **outer,
+                **{name: _binding_seen_by_nested_scopes(seen) for name, seen in events.items()},
+            }
+            self.bindings.append((kind, visible, _scope_bindings(node)))
             self.scope.append(node.name)
             for statement in node.body:
                 self.visit(statement)
@@ -161,7 +200,12 @@ def _violations_in(path: pathlib.Path):
             """Record calls resolved through an import, including import aliases."""
             name = _qualified_name(node.func)
             root, separator, suffix = name.partition(".")
-            name = self.bindings[-1][1].get(root, root) + separator + suffix
+            _, outer, events = self.bindings[-1]
+            if root in events:
+                target = _binding_at(events[root], (node.lineno, node.col_offset))
+            else:
+                target = outer.get(root, root)
+            name = target + separator + suffix
             module, _, accessor = name.rpartition(".")
             identity = None
             if module in ("megatron.core.parallel_state", "megatron.core.mpu"):

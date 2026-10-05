@@ -105,6 +105,52 @@ class TestDetection(unittest.TestCase):
             len(self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in names))), 3
         )
 
+    def test_flags_gloo_group_accessors(self):
+        for name in ("get_data_parallel_group_gloo", "get_expert_data_parallel_group_gloo"):
+            identity = f"<module>:accessor:parallel_state.{name}"
+            cases = [
+                (IMPORT, f"parallel_state.{name}()"),
+                ("from megatron.core import mpu\n", f"mpu.{name}()"),
+                (f"from megatron.core.parallel_state import {name}\n", f"{name}()"),
+                (f"from ..parallel_state import {name} as get_group\n", "get_group()"),
+            ]
+            for prefix, call in cases:
+                with self.subTest(prefix=prefix, call=call):
+                    self.assertEqual(self.hits(prefix + call), [identity])
+
+    def test_reassignment_does_not_hide_an_earlier_imported_call(self):
+        self.assertEqual(
+            self.hits(
+                "def model(config):\n"
+                "    from megatron.core import parallel_state as grid\n"
+                "    group = grid.get_tensor_model_parallel_group()\n"
+                "    grid = config\n"
+                "    return group\n"
+            ),
+            ["model:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+        self.assertEqual(
+            self.hits(
+                "from megatron.core import parallel_state as grid\n"
+                "group = grid.get_tensor_model_parallel_group()\n"
+                "grid = None\n"
+            ),
+            ["<module>:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+
+    def test_reassignment_keeps_the_import_binding_for_later_calls(self):
+        # Conservative: a branch or loop may skip the reassignment, so later calls still count.
+        self.assertEqual(
+            self.hits(
+                "def model(config):\n"
+                "    from megatron.core import parallel_state as grid\n"
+                "    if config.override:\n"
+                "        grid = config\n"
+                "    return grid.get_tensor_model_parallel_group()\n"
+            ),
+            ["model:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+
     def test_function_local_import_does_not_hide_a_sibling_call(self):
         self.assertEqual(
             self.hits(
@@ -276,6 +322,20 @@ class TestRatchet(unittest.TestCase):
             path = self.root / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(IMPORT + CALL, encoding="utf-8")
+        self.assertEqual(self.run_check(), 0)
+
+    def test_update_keeps_a_call_before_a_reassignment(self):
+        self.source.write_text(
+            "def model(config):\n"
+            "    from megatron.core import parallel_state as grid\n"
+            "    group = grid.get_tensor_model_parallel_group()\n"
+            "    grid = config\n"
+            "    return group\n",
+            encoding="utf-8",
+        )
+        self.allowlist.write_text(json.dumps({"allowed": checker.scan()}), encoding="utf-8")
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(json.loads(self.allowlist.read_text())["total"], 1)
         self.assertEqual(self.run_check(), 0)
 
     def test_stats_does_not_hide_new_calls_in_check_mode(self):
