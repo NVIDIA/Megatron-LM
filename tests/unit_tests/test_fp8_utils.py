@@ -59,6 +59,39 @@ class MockTELinear(nn.Module):
         return x @ self.weight.t()
 
 
+def test_get_fp8_backward_quantization_update_context():
+    context = Mock()
+    scope = Mock(return_value=context)
+    transformer_engine = Mock()
+    transformer_engine.pytorch.quantization_backward_scope = scope
+
+    with (
+        patch.object(fp8_utils, 'HAVE_TE', True),
+        patch.object(fp8_utils, 'transformer_engine', transformer_engine, create=True),
+    ):
+        assert fp8_utils.get_fp8_backward_quantization_update_context() is context
+
+    scope.assert_called_once_with()
+
+
+def test_get_fp8_backward_quantization_update_context_without_te():
+    with patch.object(fp8_utils, 'HAVE_TE', False):
+        with fp8_utils.get_fp8_backward_quantization_update_context():
+            pass
+
+
+def test_get_fp8_backward_quantization_update_context_without_scope_api():
+    transformer_engine = Mock()
+    transformer_engine.pytorch.quantization_backward_scope = None
+
+    with (
+        patch.object(fp8_utils, 'HAVE_TE', True),
+        patch.object(fp8_utils, 'transformer_engine', transformer_engine, create=True),
+    ):
+        with fp8_utils.get_fp8_backward_quantization_update_context():
+            pass
+
+
 class TestFP8Padding:
 
     def setup_method(self, method):
