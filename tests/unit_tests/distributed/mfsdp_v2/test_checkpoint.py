@@ -108,9 +108,10 @@ def _build_sharded(
     mesh: DeviceMesh,
     device: torch.device,
     *,
-    param_dtype: torch.dtype,
-    zero_init: bool,
+    param_dtype: torch.dtype | None = None,
+    zero_init: bool = False,
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
+    """Shard each direct child module and create an optimizer for the model."""
     model = model.to(device=device, dtype=param_dtype)
     if zero_init:
         # Zero the destination weights so they are obviously different from the saved (trained)
@@ -118,24 +119,11 @@ def _build_sharded(
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
     with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
+        for child in model.children():
+            fully_shard(child, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
-    fully_shard_optimizer(optimizer)
-    return model, optimizer
-
-
-def _build_packed_sharded(
-    model: nn.Module, mesh: DeviceMesh, device: torch.device
-) -> tuple[nn.Module, torch.optim.Optimizer]:
-    """Shard a :class:`_PackedModel`, whose packing no canonical ``Shard(0)`` split describes."""
-    model = model.to(device=device)
-    with fully_shard_context(device=device):
-        fully_shard(model.block, mesh=mesh, placements=_default_placements())
-        fully_shard(model.linear, mesh=mesh, placements=_default_placements())
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(optimizer)
     return model, optimizer
 
@@ -343,7 +331,7 @@ def test_saved_chunks_match_the_stable_path(
 
     model = _PackedModel()
     expected_shapes = _global_shapes(model)
-    model, optimizer = _build_packed_sharded(model, mesh, device)
+    model, optimizer = _build_sharded(model, mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -385,7 +373,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
 
     model = _PackedModel()
     expected_shapes = _global_shapes(model)
-    model, optimizer = _build_packed_sharded(model, mesh, device)
+    model, optimizer = _build_sharded(model, mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -448,7 +436,7 @@ def test_metadata_attach_issues_no_collectives(
 
     model = _PackedModel()
     expected_shapes = _global_shapes(model)
-    model, optimizer = _build_packed_sharded(model, mesh, device)
+    model, optimizer = _build_sharded(model, mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
