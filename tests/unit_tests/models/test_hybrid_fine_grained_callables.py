@@ -250,6 +250,39 @@ def test_ncclep_probabilities_do_not_reconnect_schedule_graphs(cpu_streams, zero
         assert dispatch_grad_ptrs == [manager._zc_bwd_token_buf.data_ptr()]
 
 
+def test_moe_routing_receives_the_batch_first_padding_mask():
+    """Route and preprocess get the chunk's padding mask unchanged, as in MoELayer.forward."""
+    layer = _moe_layer(_config())
+    layer._forward_pre_mlp_layernorm = lambda hidden_states: hidden_states
+    layer.mlp_norm_manager = None
+    layer.mlp.shared_experts_compute = lambda hidden_states: None
+    received = {}
+
+    def route(hidden_states, padding_mask):
+        received["route"] = padding_mask
+        return hidden_states, None
+
+    def preprocess(hidden_states, probs, routing_map, padding_mask):
+        received["preprocess"] = padding_mask
+        return hidden_states, probs
+
+    layer.mlp.route = route
+    layer.mlp.preprocess = preprocess
+    # Batch-first [b, s] with b != s, so a transposed mask cannot stand in for it.
+    padding_mask = torch.tensor([[False, False, True], [False, True, True]])
+    node = SimpleNamespace(
+        layer_state=SimpleNamespace(),
+        chunk_state=_chunk_state(),
+        detach=lambda tensor: tensor.detach(),
+    )
+    node.chunk_state.padding_mask = padding_mask
+
+    hybrid_callables._run_moe_preprocess(layer, node, torch.ones(3, 2, 1))
+
+    assert received["route"] is padding_mask
+    assert received["preprocess"] is padding_mask
+
+
 @pytest.mark.parametrize("recompute", [False, True])
 def test_norm_offload_uses_its_microbatch_manager_after_bda(cpu_streams, recompute):
     """Two in-flight microbatches keep distinct offload managers and single recompute hooks."""
@@ -262,7 +295,7 @@ def test_norm_offload_uses_its_microbatch_manager_after_bda(cpu_streams, recompu
     layer.mlp_bda = lambda *args: lambda output, residual, dropout: output[0] + residual
     layer.mlp.shared_experts_compute = lambda hidden: None
     layer.mlp.route = lambda hidden, mask: (hidden, None)
-    layer.mlp.preprocess = lambda hidden, probs, routing: (hidden, probs)
+    layer.mlp.preprocess = lambda hidden, probs, routing, mask: (hidden, probs)
     layer.mlp.routed_experts_compute = lambda hidden, probs: (hidden * 3, None)
     layer.mlp.combine = lambda output: output
     layer.mlp.postprocess = lambda output, shared: output
