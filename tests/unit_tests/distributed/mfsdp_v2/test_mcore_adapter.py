@@ -59,7 +59,9 @@ def _block_loss(model, hidden_states):
     return model(hidden_states=hidden_states, attention_mask=None).float().square().mean()
 
 
-def _forward_backward(model, microbatches, forward_step, *, loss_scale=1.0, backward_dw=None):
+def _forward_backward(
+    model, microbatches, forward_step, *, loss_scale=1.0, delayed_wgrad_compute=None
+):
     """Run a step's microbatches and return detached losses with gradients ready to use.
 
     Like MCore's schedules, accumulate all but the last microbatch under no_sync,
@@ -77,8 +79,8 @@ def _forward_backward(model, microbatches, forward_step, *, loss_scale=1.0, back
         with sync_context:
             loss = forward_step(model, batch)
             (loss * loss_scale).backward()
-            if backward_dw is not None:
-                backward_dw()
+            if delayed_wgrad_compute is not None:
+                delayed_wgrad_compute()
         losses.append(loss.detach())
     if is_fsdp:
         model.finish_grad_sync()
@@ -361,7 +363,7 @@ class TestMcoreAdapterDense:
             model,
             [x],
             lambda model, batch: model(batch).float().square().mean(),
-            backward_dw=model.module.backward_dw,
+            delayed_wgrad_compute=model.module.backward_dw,
         )
         consumed_gradient = model.module.weight.grad.clone()
         torch.cuda.synchronize()
