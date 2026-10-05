@@ -176,8 +176,8 @@ def _pinned_block_h(block_h):
     under replay and still move from run to run in a real job.
     """
     kernels = [
-        fused_mla_rope_module._mla_rope_fwd_inplace_kernel,
-        fused_mla_rope_module._mla_rope_bwd_inplace_kernel,
+        fused_mla_rope_module._autotuned_mla_rope_fwd_inplace_kernel,
+        fused_mla_rope_module._autotuned_mla_rope_bwd_inplace_kernel,
         fused_mla_rope_module._mla_rope_fwd_kv_split_kernel,
         fused_mla_rope_module._mla_rope_bwd_kv_split_kernel,
     ]
