@@ -44,7 +44,15 @@ HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capac
 --moe-paged-stash-buffer-size-factor-cuda 1.10
 # Host spill (0 = off); same sign rule as CUDA
 --moe-paged-stash-buffer-size-factor-cpu 0.0
+# Stash copy/pop kernel launch: elements per program per iteration (power of two), max programs
+--moe-paged-stash-copy-block-size 1024
+--moe-paged-stash-copy-max-blocks 2048
 ```
+
+The stash copy/pop kernels are memory-bound; with the defaults, wide activations (thousands of
+elements per token) do not saturate DRAM bandwidth. For example, on VR200 with DeepSeek-V3
+(hidden size 7168), `--moe-paged-stash-copy-block-size 4096 --moe-paged-stash-copy-max-blocks 8192`
+makes the stash kernels ~2.3x faster.
 
 ## What `moe_expert_rank_capacity_factor` and `moe_paged_stash_buffer_size_factor_cuda` mean
 
