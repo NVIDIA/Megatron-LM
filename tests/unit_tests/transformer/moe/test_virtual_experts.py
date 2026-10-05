@@ -736,9 +736,9 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
         for step, (values, expected) in enumerate(zip(actual, reference)):
             assert values.keys() == expected.keys()
             for name in values:
-                # MXFP8 can round tiny gradients to zero or change their sign. Adam's
-                # first step amplifies this: eight zero/nonzero changes among 16,384
-                # elements produced 2.19% update L2 with only 0.26% gradient L2.
+                # Storing split native/virtual wgrad partials in BF16 can erase tiny
+                # cancellation residuals. Adam's first step amplified eight zeroed
+                # gradients among 16,384 into 2.19% update L2 with 0.26% gradient L2.
                 if name == 'loss':
                     tolerance, peak_tolerance = 1e-4, 1e-4
                 elif name.startswith('optimizer update'):
