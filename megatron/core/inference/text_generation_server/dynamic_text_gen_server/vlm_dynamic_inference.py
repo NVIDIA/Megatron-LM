@@ -374,6 +374,12 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
             args.mimo_checkpoint_prefix_map = prefix_map
             _resolve_mimo_vision_args(args, checkpoint_args, user_passed_attrs)
             return True
+        # Without a vision encoder, run text inference on the language model alone as a
+        # HybridModel, loading only its keys.
+        if 'model_provider' not in user_passed_attrs:
+            args.model_provider = 'hybrid'
+        args.checkpoint_model_prefix = _MIMO_LANGUAGE_MODEL_PREFIX
+        return False
     if not hasattr(checkpoint_args, 'language_model_type'):
         return False
     if checkpoint_args.language_model_type is None:
