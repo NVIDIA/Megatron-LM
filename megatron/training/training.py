@@ -3106,6 +3106,57 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
         _otel_step_tracer = get_telemetry().tracer
 
+    optimizer_config = getattr(optimizer, 'config', None)
+    chunked_optimizer_state_offload = bool(
+        optimizer_config is not None
+        and getattr(optimizer_config, 'chunked_optimizer_state_offload', False)
+        and getattr(optimizer_config, 'optimizer_state_offload_fraction', 1.0) > 0.0
+    )
+    pre_forward_param_sync_before_master_offload = (
+        chunked_optimizer_state_offload
+        and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+    )
+    delay_master_offload_for_param_buffer = (
+        chunked_optimizer_state_offload
+        and args.reuse_grad_buf_for_mxfp8_param_ag
+        and args.overlap_param_gather
+    )
+    if chunked_optimizer_state_offload:
+        # Prefetch masters and the first state chunk as late as possible so H2D overlaps
+        # gradient finalization. Preserve custom hooks and avoid wrapping more than once.
+        finalize_model_grads_func = getattr(config, 'finalize_model_grads_func', None)
+        if (
+            getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
+                None,
+            )
+            is not optimizer
+        ):
+            base_finalize_model_grads_func = getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                None,
+            )
+            if base_finalize_model_grads_func is None:
+                base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
+
+            def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
+                return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
+
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
+                optimizer,
+            )
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                base_finalize_model_grads_func,
+            )
+            config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
@@ -3118,12 +3169,29 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
+        # remain readable until their delayed D2H after the main-param copy below.
+        if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+
+        if pre_forward_param_sync_before_master_offload:
+            # Compact LayerWise FP8 gather consumes fp32 masters. Finish the normally
+            # overlapped gather after grad-buffer reset. If a sibling DistOpt still needs
+            # MXFP8 staging, keep masters until that copy below completes.
+            optimizer.ensure_master_weights_for_pre_forward_param_sync()
+            optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
@@ -3170,6 +3238,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in mxfp8_overlap_optimizers:
                     optim_instance._copy_main_params_to_param_buffer()
+
+        # In the delayed MXFP8 path, optimizer state was offloaded above while masters
+        # remained resident for main-param staging. Start master D2H after that copy.
+        if delay_master_offload_for_param_buffer:
+            optimizer.offload_optimizer_state_for_forward()
 
         if getattr(config, "sequence_packing_scheduler", None) is not None:
             (

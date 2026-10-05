@@ -638,6 +638,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         super().__init__(optimizers)
 
+        self._managed_optimizer_state_offload_indices = tuple(
+            index
+            for index, optimizer in enumerate(self.chained_optimizers)
+            if getattr(optimizer, '_optimizer_state_offloader', None) is not None
+        )
+
         # Assign self.model_chunks AFTER super().__init__: ChainedOptimizer.__init__
         # resets self.model_chunks to [] and then repopulates only from chained
         # children that have a model_chunks attribute (DistOpt does, Float16-wrapped
@@ -986,7 +992,34 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             expert_tp_group=self.expert_tp_group,
         )
 
-    def start_param_sync_for_bucket_group_subset(self) -> None:
+    def _managed_optimizer_state_offload_child_indices(self) -> tuple[int, ...]:
+        """Return child indices that execute through a chunked state offloader."""
+
+        if (
+            not self.config.chunked_optimizer_state_offload
+            or self.config.optimizer_state_offload_fraction == 0.0
+        ):
+            return ()
+        return self._managed_optimizer_state_offload_indices
+
+    def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
+        """Prefetch all masters and the managed Muon child's first state chunk."""
+
+        self.prefetch_optimizer_master_weights_for_step()
+        managed_indices = self._managed_optimizer_state_offload_child_indices()
+        if managed_indices:
+            self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
+
+    def _before_child_step(self, optimizer_idx: int) -> None:
+        """Ensure the managed Muon child's state is prefetched before child steps."""
+
+        managed_indices = self._managed_optimizer_state_offload_child_indices()
+        if not managed_indices:
+            return
+        if optimizer_idx == 0:
+            self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
+
+    def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 
         Walks each model chunk's dense + expert-parallel bucket groups and
@@ -1003,7 +1036,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
                     bucket_group.buckets[0]
                 ):
-                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
