@@ -27,6 +27,7 @@ from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -75,6 +76,12 @@ def test_hybrid_cp_scheduler_uses_precreated_aligned_groups():
             if group_size < 8:
                 group_start = (ranks[0] // group_size) * group_size
                 assert ranks == list(range(group_start, group_start + group_size))
+    
+
+@pytest.fixture(autouse=True)
+def reset_dsa_loss_scale():
+    yield
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
 
 def test_reset_activation_offload_uses_language_model_group(mocker):
