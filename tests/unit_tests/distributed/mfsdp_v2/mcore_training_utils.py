@@ -4,7 +4,7 @@
 
 import contextlib
 
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 
 
 def _forward_backward(
@@ -16,12 +16,12 @@ def _forward_backward(
     then finish gradient synchronization after all backward work, including delayed wgrad.
     Keep the optimizer step separate so tests can inspect gradients or capture it separately.
     """
-    is_fsdp = isinstance(model, FullyShardedDataParallelV2)
+    is_data_parallel = isinstance(model, _BaseDataParallel)
     losses = []
     for index, batch in enumerate(microbatches):
         sync_context = (
             model.no_sync()
-            if is_fsdp and index < len(microbatches) - 1
+            if is_data_parallel and index < len(microbatches) - 1
             else contextlib.nullcontext()
         )
         with sync_context:
@@ -30,6 +30,6 @@ def _forward_backward(
             if delayed_wgrad_compute is not None:
                 delayed_wgrad_compute()
         losses.append(loss.detach())
-    if is_fsdp:
+    if is_data_parallel:
         model.finish_grad_sync()
     return losses
