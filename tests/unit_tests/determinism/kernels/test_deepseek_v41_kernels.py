@@ -18,6 +18,7 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
     deterministic_algorithms,
     seeded,
 )
@@ -75,6 +76,34 @@ def test_modality_inputs_replay_through_shared_mhc_layer(groups):
     )
     with deterministic_algorithms(True):
         assert_module_replays_bit_exact(ModalityBranch(), inputs)
+
+
+def test_modality_router_padding_replays(groups):
+    """Padding and zero-rate bias accounting remain bit-exact across router replays."""
+    from megatron.core.models.deepseek_v41.moe import ModalityRouter
+
+    seeded()
+    config = tiny_config(moe_router_bias_update_rate=0.0)
+    router = ModalityRouter(config, groups).cuda()
+    logits = torch.randn(
+        12, config.num_moe_experts, device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    image_mask = torch.tensor(
+        [False, True, False, True, False, False, True, False, True, False, True, False],
+        device="cuda",
+    )
+    padding_mask = torch.tensor(
+        [False, False, True, False, True, False, False, True, False, False, True, False],
+        device="cuda",
+    )
+
+    def routing(x):
+        return router.routing(x, image_mask=image_mask, padding_mask=padding_mask)
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            routing, (logits,), what="DeepSeek V4.1 modality routing with padding"
+        )
 
 
 class _SinglePassBranch(torch.nn.Module):

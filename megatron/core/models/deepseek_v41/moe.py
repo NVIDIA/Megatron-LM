@@ -59,16 +59,23 @@ class ModalityRouter(Router):
         if self.config.moe_router_topk > 1:
             weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
         weights = weights * self.config.moe_router_topk_scaling_factor
-        probs = torch.zeros_like(scores).scatter(-1, indices, weights)
-        route = torch.zeros_like(scores, dtype=torch.bool).scatter(-1, indices, True)
-        counted_route = route
         if padding_mask is not None:
             valid = ~padding_mask.reshape(-1, 1)
-            # Keep routing rows for the dropless dispatcher, but zero padded-token
-            # probabilities and exclude those tokens from balance counters.
-            probs = probs * valid
-            counted_route = route & valid
-        if self.training and torch.is_grad_enabled() and self.config.moe_router_enable_expert_bias:
+            # Mask the selected experts before scatter to avoid a dense mask multiply.
+            weights = weights * valid
+        probs = torch.zeros_like(scores).scatter(-1, indices, weights)
+        route = torch.zeros_like(scores, dtype=torch.bool).scatter(-1, indices, True)
+        # Keep routing rows for the dropless dispatcher, but exclude padded
+        # tokens from balance counters below.
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and self.config.moe_router_enable_expert_bias
+            and self.config.moe_router_bias_update_rate != 0.0
+        ):
+            counted_route = route
+            if padding_mask is not None:
+                counted_route = route & valid
             with torch.no_grad():
                 self.text_balance.local_tokens_per_expert.add_(
                     (counted_route & ~image[:, None]).sum(0)
