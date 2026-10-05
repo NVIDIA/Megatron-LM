@@ -55,10 +55,6 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
     )
 
 
-def _block_loss(model, hidden_states):
-    return model(hidden_states=hidden_states, attention_mask=None).float().square().mean()
-
-
 def _destroy_model_parallel():
     """Utils.destroy_model_parallel, plus the groups it leaves behind.
 
@@ -414,7 +410,13 @@ class TestMcoreAdapterDense:
             for microbatches in steps:
                 optimizer.zero_grad(set_to_none=True)
                 microbatch_losses = forward_backward(
-                    model, microbatches, _block_loss, loss_scale=1 / len(microbatches)
+                    model,
+                    microbatches,
+                    lambda model, batch: model(hidden_states=batch, attention_mask=None)
+                    .float()
+                    .square()
+                    .mean(),
+                    loss_scale=1 / len(microbatches),
                 )
                 success, _, _ = optimizer.step()
                 assert success
@@ -469,7 +471,10 @@ class TestMcoreAdapterDense:
         forward_backward(
             model,
             [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
-            _block_loss,
+            lambda model, batch: model(hidden_states=batch, attention_mask=None)
+            .float()
+            .square()
+            .mean(),
         )
 
         success, _, _ = optimizer.step()
@@ -648,7 +653,10 @@ class TestMcoreAdapterCudaGraph:
             losses = forward_backward(
                 model[0],
                 [next(data_iterator[0])["hidden_states"] for _ in range(num_microbatches)],
-                _block_loss,
+                lambda model, batch: model(hidden_states=batch, attention_mask=None)
+                .float()
+                .square()
+                .mean(),
                 loss_scale=1 / num_microbatches,
             )
             return [{"loss": loss} for loss in losses]
@@ -950,7 +958,14 @@ class TestMcoreAdapterHybrid:
                     torch.distributed.get_rank() + 1 + step + index
                 )
                 batches.append(hidden)
-            step_losses = forward_backward(model, batches, _block_loss)
+            step_losses = forward_backward(
+                model,
+                batches,
+                lambda model, batch: model(hidden_states=batch, attention_mask=None)
+                .float()
+                .square()
+                .mean(),
+            )
             success, _, _ = optimizer.step()
             assert success
             # No update happens until optimizer.step(), so every microbatch in a step sees
