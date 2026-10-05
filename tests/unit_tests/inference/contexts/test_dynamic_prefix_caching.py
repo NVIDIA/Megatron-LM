@@ -22,6 +22,7 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
 )
+from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
 from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
@@ -1064,13 +1065,17 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert "memory-only" in caplog.text
 
     @pytest.mark.internal
-    def test_mamba_cache_budget_too_small_raises(self):
+    def test_mamba_cache_budget_too_small_raises(self, monkeypatch):
         # The CUDA-graph extraction scratch (sized to the per-step token-budget
         # cap, max_mamba_intermediate_states_per_step) is reserved from
         # prefix_caching_mamba_gb before the durable cache is sized. A budget too
         # small to fit the scratch plus at least one durable slot is a hard
         # configuration error, not a silent over-allocation (which previously
         # could OOM at startup).
+        def _fail_scratch(self, *args, **kwargs):
+            raise AssertionError("scratch allocated before the budget check")
+
+        monkeypatch.setattr(PrefixCachedMambaMetadata, "allocate_scratch_buffers", _fail_scratch)
         with pytest.raises(ValueError, match="prefix cache budget"):
             self._mctx(prefix_caching_mamba_gb=1e-5)
 
@@ -1863,18 +1868,25 @@ def _make_cpu_mamba_slot_allocator(
     monkeypatch, *, total_blocks: int, max_slots: int
 ) -> MambaSlotAllocator:
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
-    kv_allocator = SimpleNamespace(
-        pool_size=total_blocks,
-        pc_state=SimpleNamespace(
-            block_ref_counts=torch.ones(total_blocks, dtype=torch.int32),
-            block_timestamps=torch.zeros(total_blocks, dtype=torch.int64),
-            block_hashes=torch.full((total_blocks,), -1, dtype=torch.int64),
-        ),
+    # The allocator asserts the prefix-cached metadata with its scratch allocated.
+    mamba_metadata = PrefixCachedMambaMetadata(
+        max_requests=1, max_tokens=128, max_intermediate_count=1, d_conv=1
     )
+    mamba_metadata.allocate_scratch_buffers(
+        num_mamba_layers=1,
+        conv_states_shape=(1,),
+        ssm_states_shape=(1,),
+        conv_states_dtype=torch.float32,
+        ssm_states_dtype=torch.float32,
+    )
+    # The real (CPU-only) block state: the allocator reads its eviction policy,
+    # ref counts, timestamps and hashes. Every block starts actively held.
+    pc_state = PrefixCacheBlockState(total_blocks, PrefixCachingEvictionPolicy.LRU)
+    pc_state.block_ref_counts.fill_(1)
+    kv_allocator = SimpleNamespace(pool_size=total_blocks, pc_state=pc_state)
     context = SimpleNamespace(
         max_requests=1,
         max_mamba_intermediate_states_per_step=1,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         kv_block_allocator=kv_allocator,
         # A real context always sets these together (see
         # DynamicInferenceContext.__init__), and the allocator asserts the
@@ -1884,6 +1896,7 @@ def _make_cpu_mamba_slot_allocator(
         mamba_chunk_size=128,
         ssm_chunk_alignment=128,
         gdp_num_householder=0,
+        mamba_metadata=mamba_metadata,
     )
     return MambaSlotAllocator(
         context=context,
@@ -1941,7 +1954,7 @@ def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, m
     allocator._copy_intermediate_to_cache = lambda *args: copy_calls.append(args)
     allocator.store_from_live_batch = lambda *args: store_calls.append(args)
     allocator.register_block_hashes_batch = lambda *args: register_calls.append(args)
-    allocator._clear_intermediate_state = lambda: clear_calls.append(True)
+    allocator.context.mamba_metadata.clear_intermediate_state = lambda ctx: clear_calls.append(True)
 
     allocator.commit_intermediate_states()
 

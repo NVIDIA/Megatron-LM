@@ -768,11 +768,6 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         max_requests: int,
         max_tokens: int,
         *,
-        num_mamba_layers: int,
-        conv_states_shape: tuple,
-        ssm_states_shape: tuple,
-        conv_states_dtype: torch.dtype,
-        ssm_states_dtype: torch.dtype,
         max_intermediate_count: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
@@ -781,10 +776,6 @@ class PrefixCachedMambaMetadata(MambaMetadata):
     ):
         """
         Args (beyond `MambaMetadata`):
-            num_mamba_layers (int): Number of SSM layers; sizes the scratch output buffers.
-            conv_states_shape / ssm_states_shape: Per-slot state shapes (excluding the
-                layer and slot dims).
-            conv_states_dtype / ssm_states_dtype: Dtypes of the state tensors.
             max_intermediate_count (int): Per-step bound on Mamba intermediate-state extractions.
         """
         super().__init__(
@@ -819,22 +810,6 @@ class PrefixCachedMambaMetadata(MambaMetadata):
                 max_intermediate_count, dtype=torch.int64, device=self.device
             )
 
-        # Pre-allocated "scratch" output buffers for CUDA graph compatible
-        # extraction (GPU): per-step staging that the kernels write intermediate
-        # states into before `MambaSlotAllocator.commit_intermediate_states` copies
-        # them to the durable cache. The budget accounting in
-        # DynamicInferenceContext refers to these as the "scratch" buffers.
-        self.intermediate_ssm_out = torch.zeros(
-            (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
-            dtype=ssm_states_dtype,
-            device=self.device,
-        )
-        self.intermediate_conv_out = torch.zeros(
-            (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
-            dtype=conv_states_dtype,
-            device=self.device,
-        )
-
         # Per-request CPU bookkeeping for intermediate state extraction.
         k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         self._intermediate_offsets_cpu = torch.zeros(
@@ -849,6 +824,34 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         )
         # CPU flag to skip the commit pipeline when nothing was extracted.
         self._has_intermediates = False
+
+    def allocate_scratch_buffers(
+        self,
+        num_mamba_layers: int,
+        conv_states_shape: tuple,
+        ssm_states_shape: tuple,
+        conv_states_dtype: torch.dtype,
+        ssm_states_dtype: torch.dtype,
+    ) -> None:
+        """Allocate the GPU "scratch" output buffers for intermediate-state extraction.
+
+        Args:
+            num_mamba_layers: Number of SSM layers; sizes the leading dim.
+            conv_states_shape / ssm_states_shape: Per-slot state shapes (excluding the
+                layer and slot dims).
+            conv_states_dtype / ssm_states_dtype: Dtypes of the state tensors.
+        """
+        assert self.intermediate_ssm_out is None, "scratch buffers are already allocated"
+        self.intermediate_ssm_out = torch.zeros(
+            (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
+            dtype=ssm_states_dtype,
+            device=self.device,
+        )
+        self.intermediate_conv_out = torch.zeros(
+            (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
+            dtype=conv_states_dtype,
+            device=self.device,
+        )
 
     def update(
         self,
@@ -1204,6 +1207,51 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         offsets = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
         counts = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
         return offsets, counts
+
+    def collect_commit_records(self, ctx) -> Tuple[list, list, list, list]:
+        """Flatten the staged cache records for the current prefill batch.
+
+        Returns:
+            `(intermediate_bids, src_offsets, eos_bids, eos_ctx_indices)`
+            Row `src_offsets[i]` of the scratch holds the state for KV block `intermediate_bids[i]`;
+            the state of `eos_ctx_indices[i]` corresponds to KV block `eos_bids[i]`.
+            All four lists are empty when there is nothing to commit.
+        """
+        prefill_count = ctx.batch_dimensions.prefill_req_count
+        if prefill_count == 0:
+            return [], [], [], []
+        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
+
+        # Block IDs and EOS block IDs live on CPU.
+        all_block_ids_cpu = self._intermediate_block_ids_cpu[
+            prefill_start : prefill_start + prefill_count
+        ].tolist()
+        eos_bids_cpu = self._eos_cache_block_id_cpu[
+            prefill_start : prefill_start + prefill_count
+        ].tolist()
+
+        # Flatten intermediate block IDs and their scratch rows.
+        # The rows follow the per-request counts the extraction kernels were given this step.
+        intermediate_bids = []
+        src_offsets = []
+        if self.intermediate_count > 0:
+            ssm_offset = 0
+            for req_idx, count in enumerate(self.per_request_intermediate_counts):
+                for j in range(count):
+                    intermediate_bids.append(all_block_ids_cpu[req_idx][j])
+                    src_offsets.append(ssm_offset + j)
+                ssm_offset += count
+
+        # Collect EOS block IDs and their context indices.
+        eos_bids = []
+        eos_ctx_indices = []
+        for req_batch_idx in range(prefill_count):
+            eos_bid = eos_bids_cpu[req_batch_idx]
+            if eos_bid >= 0:
+                eos_bids.append(eos_bid)
+                eos_ctx_indices.append(prefill_start + req_batch_idx)
+
+        return intermediate_bids, src_offsets, eos_bids, eos_ctx_indices
 
     def clear_intermediate_state(self, ctx) -> None:
         """Clear per-request intermediate state for the current prefill batch."""

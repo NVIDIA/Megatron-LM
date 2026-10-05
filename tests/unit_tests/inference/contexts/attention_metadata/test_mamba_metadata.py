@@ -570,15 +570,10 @@ class TestGDPIntermediateChunkIndices:
 
     def _metadata(self, max_requests=8, max_tokens=2048, max_intermediate_count=16):
         # Intermediate extraction lives on the prefix-cached subclass; the scratch
-        # buffers are irrelevant here, so keep them minimal.
+        # output buffers are irrelevant here, so leave them unallocated.
         return PrefixCachedMambaMetadata(
             max_requests=max_requests,
             max_tokens=max_tokens,
-            num_mamba_layers=1,
-            conv_states_shape=(1,),
-            ssm_states_shape=(1,),
-            conv_states_dtype=torch.float32,
-            ssm_states_dtype=torch.float32,
             max_intermediate_count=max_intermediate_count,
             d_conv=4,
             gdp_num_householder=self.NUM_HOUSEHOLDER,

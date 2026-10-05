@@ -1079,11 +1079,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.mamba_metadata = PrefixCachedMambaMetadata(
                     max_requests=self.max_requests,
                     max_tokens=self.max_tokens,
-                    num_mamba_layers=self.num_mamba_layers,
-                    conv_states_shape=self.mamba_conv_states_shape,
-                    ssm_states_shape=self.mamba_ssm_states_shape,
-                    conv_states_dtype=self.mamba_conv_states_dtype,
-                    ssm_states_dtype=self.mamba_ssm_states_dtype,
                     max_intermediate_count=self.max_mamba_intermediate_states_per_step,
                     mamba_chunk_size=self.mamba_chunk_size,
                     d_conv=self.mamba_conv_states_shape[-1],
@@ -1999,10 +1994,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
 
-        # MambaSlotAllocator allocates two GPU buffer families with the same
-        # per-slot footprint, both of which must fit in this budget:
-        #   - "durable" cache:  self.ssm_states / self.conv_states, sized to
-        #                       `max_slots` slots (computed below).
+        # Two GPU buffer families with the same per-slot footprint are charged to
+        # this budget, and both are allocated below only once the checks pass:
+        #   - "durable" cache:  MambaSlotAllocator.ssm_states / conv_states, sized
+        #                       to `max_slots` slots (computed below).
         #   - "scratch" buffers: PrefixCachedMambaMetadata.intermediate_ssm_out /
         #                       intermediate_conv_out,
         #                       fixed CUDA-graph-safe staging for intermediate-state
@@ -2052,6 +2047,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 f"reduce max_tokens."
             )
 
+        self.mamba_metadata.allocate_scratch_buffers(
+            num_mamba_layers=self.num_mamba_layers,
+            conv_states_shape=self.mamba_conv_states_shape,
+            ssm_states_shape=self.mamba_ssm_states_shape,
+            conv_states_dtype=self.mamba_conv_states_dtype,
+            ssm_states_dtype=self.mamba_ssm_states_dtype,
+        )
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
             max_slots=max_slots,

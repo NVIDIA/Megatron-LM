@@ -7,6 +7,7 @@ from torch import Tensor
 
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
+from .attention_context.mamba_metadata import PrefixCachedMambaMetadata
 from .prefix_cache_registry import PrefixCacheRegistry
 
 if TYPE_CHECKING:
@@ -62,6 +63,17 @@ class MambaSlotAllocator:
         self.registry = prefix_cache_registry
         self.registry.clear_mamba()
         self.registry.set_mamba_evict_callback(self._on_mamba_evicted)
+
+        # The commit path reads the per-request records and scratch buffers that
+        # only the prefix-cached metadata carries, so make that coupling explicit.
+        assert isinstance(context.mamba_metadata, PrefixCachedMambaMetadata), (
+            "MambaSlotAllocator requires context.mamba_metadata to be a "
+            f"PrefixCachedMambaMetadata; got {type(context.mamba_metadata).__name__}."
+        )
+        assert context.mamba_metadata.intermediate_ssm_out is not None, (
+            "PrefixCachedMambaMetadata.allocate_scratch_buffers() must run before "
+            "constructing MambaSlotAllocator."
+        )
 
         # PrefixCachedMambaMetadata.compute_and_store_offsets() records extraction
         # offsets on the model-wide SSM chunk quantum, and each mixer converts those
@@ -444,7 +456,7 @@ class MambaSlotAllocator:
         self.context.mamba_metadata.clear_intermediate_state(self.context)
 
     def _collect_commit_data(self):
-        """Pull per-request commit data from metadata and KV-side block hashes.
+        """Pull the metadata's commit records and the KV-side block hashes.
 
         Returns:
             Tuple of (intermediate_bids, src_offsets, eos_bids, eos_ctx_indices,
@@ -453,46 +465,9 @@ class MambaSlotAllocator:
         """
         ctx = self.context
         metadata = ctx.mamba_metadata
-        prefill_count = ctx.batch_dimensions.prefill_req_count
-        if prefill_count == 0:
-            metadata.clear_intermediate_state(ctx)
-            return None
-
-        active_start = ctx.paused_request_count
-        decode_count = ctx.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
-
-        # Block IDs and EOS block IDs live on CPU (no GPU sync needed).
-        intermediate_count = metadata.intermediate_count
-        per_request_counts = metadata.per_request_intermediate_counts
-
-        all_block_ids_cpu = metadata._intermediate_block_ids_cpu[
-            prefill_start : prefill_start + prefill_count
-        ].tolist()
-        eos_bids_cpu = metadata._eos_cache_block_id_cpu[
-            prefill_start : prefill_start + prefill_count
-        ].tolist()
-
-        # Flatten intermediate block IDs and source offsets
-        intermediate_bids = []
-        src_offsets = []
-        if intermediate_count > 0:
-            ssm_offset = 0
-            for req_idx, count in enumerate(per_request_counts):
-                for j in range(count):
-                    intermediate_bids.append(all_block_ids_cpu[req_idx][j])
-                    src_offsets.append(ssm_offset + j)
-                ssm_offset += count
-
-        # Collect EOS block IDs and their context indices
-        eos_bids = []
-        eos_ctx_indices = []
-        for req_batch_idx in range(prefill_count):
-            eos_bid = eos_bids_cpu[req_batch_idx]
-            if eos_bid >= 0:
-                eos_bids.append(eos_bid)
-                eos_ctx_indices.append(prefill_start + req_batch_idx)
-
+        intermediate_bids, src_offsets, eos_bids, eos_ctx_indices = metadata.collect_commit_records(
+            ctx
+        )
         if not intermediate_bids and not eos_bids:
             metadata.clear_intermediate_state(ctx)
             return None
