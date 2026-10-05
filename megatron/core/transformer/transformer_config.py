@@ -360,7 +360,10 @@ class TransformerConfig(ModelParallelConfig):
     """Layer offset for DSA cross-layer top-k sharing."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+    """Coefficient for the DSA indexer KL divergence loss.
+    Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
+    frozen and excluded from gradient/optimizer bookkeeping.
+    """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -414,9 +417,9 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     dsa_indexer_kpool_always_select_tail: bool = True
-    """Append each query's incomplete causal pool after selected history tokens.
-    The default preserves legacy fixed-width pool selection; models that require the explicit
-    tail contract should enable it in their model bridge. Only applies when
+    """Append each query's incomplete causal pool after selected history pools.
+    This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
+    Set to False for fixed-width pool-only selection. Only applies when
     ``dsa_indexer_kpool > 1``.
     """
 
