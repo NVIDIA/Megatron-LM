@@ -27,7 +27,6 @@ from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
 from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
-from megatron.core.transformer.moe.fused_a2a import hybrid_ep_dense_topk_routing
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -43,6 +42,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -56,9 +56,10 @@ else:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, False, None, None)
 
 
 def switch_load_balancing_loss_func(
@@ -779,6 +780,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -807,6 +809,8 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices (e.g. for quantile balancing). Defaults to None.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -816,7 +820,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -838,11 +843,11 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        index_output = {}
         if dense_output:
-            index_output["topk_indices"] = torch.empty(
-                (num_tokens, topk), dtype=torch.int64, device=logits.device
-            )
+            assert (
+                fused_topk_with_score_function_supports_topk_indices
+            ), "Virtual experts require TE's fused top-k index output API."
+            topk_indices = torch.empty((num_tokens, topk), dtype=torch.int64, device=logits.device)
         probs, routing_map = fused_topk_with_score_function(
             logits=logits,
             topk=topk,
@@ -852,10 +857,14 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
-            **index_output,
+            **(
+                {"topk_indices": topk_indices}
+                if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None
+                else {}
+            ),
         )
         if dense_output:
-            probs = probs.gather(1, routing_map)
+            probs = probs.gather(1, routing_map.long())
         return probs, routing_map
 
     def _compute_topk(
@@ -949,15 +958,7 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
-    return dense_routing_from_topk(logits, top_indices, probs)
 
-
-def dense_routing_from_topk(
-    logits: torch.Tensor, top_indices: torch.Tensor, probs: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Scatter ``[num_tokens, topk]`` probabilities and expert ids into the dense
-    ``[num_tokens, num_experts]`` routing probabilities and bool routing map."""
-    num_tokens = logits.shape[0]
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
         routing_probs = torch.zeros_like(logits)
@@ -1000,39 +1001,6 @@ def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) 
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
     return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-
-
-def uses_compact_routes(config) -> bool:
-    """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
-    and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
-
-    Ordinary HybridEP keeps its dense format when compact routing is unsupported, or with fused
-    or Sinkhorn routing, expert bias, token dropping, capacity/uneven padding and expert TP.
-    Virtual-expert planning requires compact support for both native and virtual slots, and uses TE's newer
-    index-output API for fused top-k routing.
-    """
-    if config.moe_virtual_expert_load_balance:
-        assert hybrid_ep_dense_topk_routing(
-            2 * config.num_moe_experts,
-            2 * config.num_moe_experts // config.expert_model_parallel_size,
-        ), "Virtual experts require HybridEP's compact top-k routing API for their runtime experts."
-        return True
-    routing_types = config.moe_router_load_balancing_type
-    if isinstance(routing_types, str):
-        routing_types = [routing_types]
-    return (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "hybridep"
-        and not config.moe_router_fusion
-        and not config.moe_router_enable_expert_bias
-        and "sinkhorn" not in routing_types
-        and config.moe_expert_capacity_factor is None
-        and config.expert_tensor_parallel_size == 1
-        and not config.moe_hybridep_pad_uneven_dispatch_inputs
-        and hybrid_ep_dense_topk_routing(
-            config.num_moe_experts, config.num_moe_experts // config.expert_model_parallel_size
-        )
-    )
 
 
 def compute_routing_scores_for_aux_loss(
