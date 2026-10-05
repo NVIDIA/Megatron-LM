@@ -233,6 +233,7 @@ def test_nvtx_range(msg, suffix):
     util.configure_nvtx_profiling(True)
     _call_nvtx_range()
     assert execution_tracker['ranges']
+    util.configure_nvtx_profiling(False)
 
 
 def test_nvtx_decorator():
