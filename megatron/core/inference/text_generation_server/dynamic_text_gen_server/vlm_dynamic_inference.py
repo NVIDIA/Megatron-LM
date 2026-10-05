@@ -221,7 +221,7 @@ def _enable_checkpoint_expert_bias(args):
         args.moe_router_enable_expert_bias = True
 
 
-# Image token roles a Hugging Face tokenizer_config.json can declare, by the arg they fill.
+# Image token roles a tokenizer_config.json can declare, by the arg they fill.
 _TOKENIZER_IMAGE_TOKENS = {
     'image_token_id': 'image_token',
     'image_break_token_id': 'image_break_token',
