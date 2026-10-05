@@ -1478,9 +1478,14 @@ class LLaVAModel(MegatronModule):
                 if vision_packed_seq_params is not None:
                     vision_kwargs["packed_seq_params"] = vision_packed_seq_params
                 if imgs_sizes is not None:
+                    # The inference engine keeps imgs_sizes on the device; copy them to the host for
+                    # ViTModel there. Training keeps ViTModel's error on device imgs_sizes, which
+                    # guards against unintended host syncs.
                     vision_kwargs["imgs_sizes"] = (
                         imgs_sizes.cpu()
-                        if self._vision_reads_host_imgs_sizes and torch.is_tensor(imgs_sizes)
+                        if self._vision_reads_host_imgs_sizes
+                        and inference_context is not None
+                        and torch.is_tensor(imgs_sizes)
                         else imgs_sizes
                     )
                 image_embeddings = self.vision_model(

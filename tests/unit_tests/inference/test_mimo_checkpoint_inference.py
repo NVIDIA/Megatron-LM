@@ -16,6 +16,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     vlm_dynamic_inference,
 )
 from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 _MODALITY = 'modality_submodules.images.module.module.'
@@ -72,6 +73,8 @@ def test_sharded_state_dict_uses_checkpoint_keys(monkeypatch):
         'language_model.module.module.embedding.weight',
         f'{_MODALITY}encoders.vision_encoder.patch_embed.weight',
     }
+    # The keys are recorded for the post-load check.
+    assert model.sharded_checkpoint_keys == keys
 
 
 def test_resolve_mimo_vision_args():
@@ -109,9 +112,7 @@ def test_check_mimo_checkpoint_fully_loaded(monkeypatch, checkpoint_keys):
         }
     )
     factory_key = 'language_model.module.module.decoder.layers.0.mixer.in_proj.weight'
-    model = SimpleNamespace(
-        sharded_state_dict=lambda: {'a': _sharded(_LANGUAGE_KEY), 'b': _sharded(factory_key)}
-    )
+    model = SimpleNamespace(sharded_checkpoint_keys={_LANGUAGE_KEY, factory_key})
     checkpoint_keys += [
         _LANGUAGE_KEY,
         f'{factory_key}.z',
@@ -150,3 +151,8 @@ def test_mimo_vision_configs():
     assert (projection.hidden_size, projection.ffn_hidden_size) == (32, 32)
     assert projection.activation_func is _unfused_fast_gelu
     assert not projection.add_bias_linear
+
+
+def test_native_vit_image_embeddings_have_no_class_token():
+    # Native mcore ViTs (e.g. pixtral-vit-large) are built without class tokens.
+    assert get_num_image_embeddings(1540, 1540, 14, 'pixtral-vit-large', False, 1, False) == 110**2

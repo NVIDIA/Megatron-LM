@@ -12,6 +12,8 @@ from dataclasses import replace
 
 import torch
 
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
 from megatron.core.models.multimodal.llava_model import LLaVAModel
@@ -57,6 +59,9 @@ class MimoCheckpointLLaVAModel(LLaVAModel):
     def __init__(self, *args, checkpoint_prefix_map: dict, **kwargs):
         super().__init__(*args, **kwargs)
         self.checkpoint_prefix_map = checkpoint_prefix_map
+        # Checkpoint tensor keys of the latest sharded state dict, i.e. the ones the last load
+        # requested (built with that checkpoint's metadata).
+        self.sharded_checkpoint_keys = None
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata=None):
         """Build the sharded state dict with keys renamed to the checkpoint's."""
@@ -65,6 +70,11 @@ class MimoCheckpointLLaVAModel(LLaVAModel):
             sharded_state_dict,
             {f'{prefix}{key}': value for key, value in self.checkpoint_prefix_map.items()},
         )
+        self.sharded_checkpoint_keys = {
+            value.key
+            for value in nested_values(sharded_state_dict)
+            if isinstance(value, (ShardedTensor, ShardedTensorFactory))
+        }
         return sharded_state_dict
 
 

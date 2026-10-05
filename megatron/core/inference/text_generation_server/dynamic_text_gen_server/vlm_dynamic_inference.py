@@ -23,10 +23,9 @@ from functools import partial
 import torch
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.models.vision.encoder_registry import get_spec
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
@@ -232,13 +231,12 @@ def _check_mimo_checkpoint_fully_loaded(args, model):
 
     A MIMO checkpoint also stores modules this model never builds, so the load itself cannot
     reject unused checkpoint tensors; a module the model omits (e.g. from a config default that
-    differs from training) would otherwise be dropped silently.
+    differs from training) would otherwise be dropped silently. Compares against the keys the
+    load requested, which the model records while building its sharded state dict with the
+    checkpoint's metadata.
     """
-    requested = {
-        value.key
-        for value in nested_values(model.sharded_state_dict())
-        if isinstance(value, (ShardedTensor, ShardedTensorFactory))
-    }
+    requested = unwrap_model(model).sharded_checkpoint_keys
+    assert requested is not None, "the model has not built a sharded state dict for the load"
     gathered = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(gathered, sorted(requested))
 
