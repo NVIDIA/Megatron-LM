@@ -259,6 +259,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
         spatial_merge_size=max(getattr(args, 'spatial_merge_size', 1), vision_merge_size),
+        image_break_token_id=getattr(args, 'image_break_token_id', None),
+        image_end_token_id=getattr(args, 'image_end_token_id', None),
         dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
         dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),

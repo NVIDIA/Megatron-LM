@@ -54,6 +54,19 @@ def add_multimodal_extra_args(parser):
         help="Image placeholder token ID. Defaults to the one the checkpoint was trained with.",
     )
     group.add_argument(
+        "--image-break-token-id",
+        type=int,
+        default=None,
+        help="Inference: token placed after each row of a dynamic-resolution image's tokens "
+        "except the last (Pixtral-style layout).",
+    )
+    group.add_argument(
+        "--image-end-token-id",
+        type=int,
+        default=None,
+        help="Inference: token placed after the last row of a dynamic-resolution image's tokens.",
+    )
+    group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
     )
     group.add_argument(
