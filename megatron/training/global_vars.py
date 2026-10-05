@@ -23,6 +23,7 @@ from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
+_GLOBAL_RUN_CONFIG = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
@@ -38,6 +39,12 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+def get_run_config():
+    """Return the full pretrain config container."""
+    _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
+    return _GLOBAL_RUN_CONFIG
 
 
 def get_train_state():
@@ -208,6 +215,7 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
+    global _GLOBAL_RUN_CONFIG
     global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
@@ -221,6 +229,7 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
+    _GLOBAL_RUN_CONFIG = None
     _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
@@ -241,6 +250,12 @@ def set_args(args):
     _GLOBAL_ARGS = args
 
 
+def set_run_config(cfg_container):
+    global _GLOBAL_RUN_CONFIG
+    _ensure_var_is_not_initialized(_GLOBAL_RUN_CONFIG, 'run config')
+    _GLOBAL_RUN_CONFIG = cfg_container
+
+
 def _set_train_state():
     """Create the train state for the current training run."""
     global _GLOBAL_TRAIN_STATE
@@ -253,6 +268,15 @@ def _build_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
+    # Resolve the declared model field once, before any args-to-config conversion.
+    # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
+    if (
+        getattr(args, 'moe_num_hash_layers', 0) > 0
+        and getattr(args, 'hash_moe_vocab_size', None) is None
+    ):
+        args.hash_moe_vocab_size = _GLOBAL_TOKENIZER.vocab_size
+        if getattr(args, 'yaml_cfg', None) is not None:
+            args.language_model.hash_moe_vocab_size = args.hash_moe_vocab_size
     return _GLOBAL_TOKENIZER
 
 
@@ -565,6 +589,9 @@ def _set_telemetry(args):
 def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
+
+    global _GLOBAL_RUN_CONFIG
+    _GLOBAL_RUN_CONFIG = None
 
     global _GLOBAL_TRAIN_STATE
     _GLOBAL_TRAIN_STATE = None

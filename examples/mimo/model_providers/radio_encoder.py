@@ -71,7 +71,7 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
-    """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
+    """Strip language-only architecture and precision settings from the base config."""
     config.activation_func_tanh_clamp_scale = None
     config.activation_func_tanh_clamp_scale_linear = None
     # FP32 residual accumulation is a language-model policy. Preserve the pretrained
@@ -92,13 +92,17 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.use_fused_weighted_squared_relu = False
     if config.recompute_modules is not None:
         config.recompute_modules = [
-            module
-            for module in config.recompute_modules
-            if module != "shortcut_pre_mlp_layernorm"
+            module for module in config.recompute_modules if module != "shortcut_pre_mlp_layernorm"
         ]
     if getattr(config, "offload_modules", None) is not None:
         config.offload_modules = [
             module for module in config.offload_modules if module != "shortcut_post_norm"
+        ]
+    config.wide_residual = None
+    config.residual_stream_recompute_num_layers = None
+    if config.recompute_modules is not None:
+        config.recompute_modules = [
+            module for module in config.recompute_modules if module != "residual_stream"
         ]
 
 

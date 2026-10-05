@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -55,6 +56,12 @@ def set_rounder(value):
     DynamicInferenceContext.ROUNDER = value
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
+def reset_rounder():
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
 
 
 @pytest.mark.internal
@@ -335,7 +342,7 @@ class TestHybridChunkedPrefillIntermediateState:
 
     @classmethod
     def teardown_class(cls):
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     def _create_hybrid_model(self, num_cuda_graphs=None, ssm_mixer="mamba"):
