@@ -273,9 +273,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
-        core_attn_out = self._finish_core_attn(
-            core_attn_out, in_proj_checkpoint, qkv_checkpoint, qkv_offload
-        )
+        core_attn_out = self._finish_core_attn(core_attn_out, qkv_checkpoint, qkv_offload)
 
         if self.recompute_norm_out:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -292,7 +290,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
             )
 
-        return norm_out
+        return self._release_in_proj(norm_out, in_proj_checkpoint)
 
     def forward(
         self,

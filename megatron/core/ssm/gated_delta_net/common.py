@@ -278,6 +278,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.norm_out_checkpoint = None
         self.recompute_in_proj = False
         self.recompute_qkv = False
+        self._in_proj_checkpoint = None
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             self.recompute_in_proj = "gdn_in_proj" in self.config.recompute_modules
@@ -314,6 +315,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
 
+        # The norm recompute hook is on `out` and runs before the hook already
+        # registered on the norm output. Register the projection restore here first,
+        # without discarding again, so backward refills the fused gate view in time.
+        in_proj_checkpoint = self._in_proj_checkpoint
+        self._in_proj_checkpoint = None
+        if in_proj_checkpoint is not None and out.requires_grad:
+            out.register_hook(in_proj_checkpoint._recompute)
         if self.recompute_norm_out:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
@@ -665,23 +673,34 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         return (query, key, value), qkv_checkpoint, qkv_offload
 
     def _finish_core_attn(
-        self, core_attn_out: torch.Tensor, in_proj_checkpoint, qkv_checkpoint, qkv_offload
+        self, core_attn_out: torch.Tensor, qkv_checkpoint, qkv_offload
     ) -> torch.Tensor:
-        """Discard recomputed activations and commit the ``gdn_qkv`` offload group.
+        """Discard the q/k/v recompute outputs and commit the ``gdn_qkv`` offload group.
 
-        The recompute hooks go on the raw gated-delta-rule output, so they run as soon as
-        its gradient is available and before any backward that reads the discarded
-        tensors: the input projection first (it restores the conv input that the q/k/v
-        recompute reads), then q/k/v. The offload group is committed on a tensor
-        downstream of that output, so its reload completes before those hooks run.
+        The q/k/v hook sits on the raw gated-delta-rule output, so it runs before that
+        kernel's backward reads the recomputed tensors. The offload group is committed
+        on a tensor downstream of that output, so its reload completes before the hook.
+        The input projection is released later, on the norm output: the fused pre-GDR
+        path hands the output norm a strided view of the projection, and that view has
+        to stay alive until the norm has read it.
         """
-        if in_proj_checkpoint is not None:
-            in_proj_checkpoint.discard_output_and_register_recompute(core_attn_out)
         if qkv_checkpoint is not None:
             qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
         if qkv_offload is None:
             return core_attn_out
         return qkv_offload.group_offload(core_attn_out, forced_released_tensors=[])
+
+    def _release_in_proj(self, norm_out: torch.Tensor, in_proj_checkpoint) -> torch.Tensor:
+        """Free the input projection after the output norm has consumed its gate view.
+
+        The hook on the norm output covers the unfused norm. When the norm output is
+        itself recomputed, that recompute is hooked later on the output projection, so
+        ``forward_post_core_attn`` registers this same checkpoint there first.
+        """
+        self._in_proj_checkpoint = in_proj_checkpoint
+        if in_proj_checkpoint is not None:
+            in_proj_checkpoint.discard_output_and_register_recompute(norm_out)
+        return norm_out
 
     def _compute_gates(
         self,
