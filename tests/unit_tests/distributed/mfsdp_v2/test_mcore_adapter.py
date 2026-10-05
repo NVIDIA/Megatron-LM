@@ -319,15 +319,14 @@ class TestMcoreAdapterDense:
             4, 16, device=distributed_setup.device, dtype=config.params_dtype, requires_grad=True
         )
 
+        def forward():
+            output = model(x).float()
+            return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+
         def run_backward():
             # Retain the grad views so reduction includes the accumulation kernel.
             model.zero_grad(set_to_none=False)
-            forward_backward(
-                model,
-                [x],
-                lambda model, batch: model(batch).float().square().mean(),
-                delayed_wgrad_compute=model.module.backward_dw,
-            )
+            forward_backward(model, forward, delayed_wgrad_compute=model.module.backward_dw)
 
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
@@ -408,14 +407,17 @@ class TestMcoreAdapterDense:
         def run(model, optimizer) -> torch.Tensor:
             losses = []
             for microbatches in steps:
+                batches = iter(microbatches)
+
+                def forward():
+                    output = model(hidden_states=next(batches), attention_mask=None).float()
+                    return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+
                 optimizer.zero_grad(set_to_none=True)
                 microbatch_losses = forward_backward(
                     model,
-                    microbatches,
-                    lambda model, batch: model(hidden_states=batch, attention_mask=None)
-                    .float()
-                    .square()
-                    .mean(),
+                    forward,
+                    num_microbatches=len(microbatches),
                     loss_scale=1 / len(microbatches),
                 )
                 success, _, _ = optimizer.step()
@@ -467,15 +469,14 @@ class TestMcoreAdapterDense:
         )
         optimizer = get_megatron_optimizer(optimizer_config, [model])
 
+        hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def forward():
+            output = model(hidden_states=hidden, attention_mask=None).float()
+            return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+
         optimizer.zero_grad(set_to_none=True)
-        forward_backward(
-            model,
-            [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
-            lambda model, batch: model(hidden_states=batch, attention_mask=None)
-            .float()
-            .square()
-            .mean(),
-        )
+        forward_backward(model, forward)
 
         success, _, _ = optimizer.step()
         assert success
@@ -537,14 +538,12 @@ class TestMcoreAdapterDense:
         hidden = torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16).view(
             1, 1, -1
         ).expand(8, 2, -1) * (torch.distributed.get_rank() + 1)
-        forward_backward(
-            model,
-            [hidden],
-            lambda model, batch: model(hidden_states=batch, attention_mask=None)
-            .float()
-            .square()
-            .sum(),
-        )
+
+        def forward():
+            output = model(hidden_states=hidden, attention_mask=None).float()
+            return torch.nn.functional.mse_loss(output, torch.zeros_like(output), reduction="sum")
+
+        forward_backward(model, forward)
 
         parameters = [
             parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
@@ -649,14 +648,17 @@ class TestMcoreAdapterCudaGraph:
         def schedule(*, model, data_iterator, num_microbatches, seq_length, forward_only):
             assert seq_length is None
             assert not forward_only
+
+            def forward():
+                hidden = next(data_iterator[0])["hidden_states"]
+                output = model[0](hidden_states=hidden, attention_mask=None).float()
+                return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+
             # Pipeline schedules receive model chunks as a list, including with PP=1.
             losses = forward_backward(
                 model[0],
-                [next(data_iterator[0])["hidden_states"] for _ in range(num_microbatches)],
-                lambda model, batch: model(hidden_states=batch, attention_mask=None)
-                .float()
-                .square()
-                .mean(),
+                forward,
+                num_microbatches=num_microbatches,
                 loss_scale=1 / num_microbatches,
             )
             return [{"loss": loss} for loss in losses]
@@ -844,18 +846,16 @@ class TestMcoreAdapterExpertParallel:
             (torch.distributed.get_rank() + 1) * local_batch_size,
         )
 
-        def forward_step(model, batch):
-            input_ids, position_ids, targets = batch
-            return torch.nn.functional.mse_loss(
-                model(input_ids=input_ids, position_ids=position_ids, attention_mask=None), targets
+        def reference_forward():
+            output = reference_model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=None
             )
+            return torch.nn.functional.mse_loss(output, targets)
 
         reference_losses = []
         for _ in range(5):
             reference_optimizer.zero_grad(set_to_none=True)
-            (reference_loss,) = forward_backward(
-                reference_model, [(input_ids, position_ids, targets)], forward_step
-            )
+            (reference_loss,) = forward_backward(reference_model, reference_forward)
             reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
             assert reference_success
             assert (
@@ -863,14 +863,18 @@ class TestMcoreAdapterExpertParallel:
             ), "Reference gradients must exceed the clipping threshold to exercise clipping."
             reference_losses.append(reference_loss)
 
+        def forward():
+            output = model(
+                input_ids=input_ids[input_slice],
+                position_ids=position_ids[input_slice],
+                attention_mask=None,
+            )
+            return torch.nn.functional.mse_loss(output, targets[input_slice])
+
         losses = []
         for _ in range(5):
             optimizer.zero_grad(set_to_none=True)
-            (loss,) = forward_backward(
-                model,
-                [(input_ids[input_slice], position_ids[input_slice], targets[input_slice])],
-                forward_step,
-            )
+            (loss,) = forward_backward(model, forward)
             success, _, _ = optimizer.step()
             assert success
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
@@ -944,6 +948,7 @@ class TestMcoreAdapterHybrid:
             ),
             [model],
         )
+
         losses = []
         for step in range(steps):
             optimizer.zero_grad(set_to_none=True)
@@ -958,14 +963,13 @@ class TestMcoreAdapterHybrid:
                     torch.distributed.get_rank() + 1 + step + index
                 )
                 batches.append(hidden)
-            step_losses = forward_backward(
-                model,
-                batches,
-                lambda model, batch: model(hidden_states=batch, attention_mask=None)
-                .float()
-                .square()
-                .mean(),
-            )
+            batch_iterator = iter(batches)
+
+            def forward():
+                output = model(hidden_states=next(batch_iterator), attention_mask=None).float()
+                return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+
+            step_losses = forward_backward(model, forward, num_microbatches=microbatches)
             success, _, _ = optimizer.step()
             assert success
             # No update happens until optimizer.step(), so every microbatch in a step sees
@@ -993,14 +997,14 @@ class TestMcoreAdapterHybrid:
             module=_build_block(config),
             pg_collection=pg_collection,
         )
-        forward_backward(
-            model,
-            [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
-            lambda model, batch: model(hidden_states=batch, attention_mask=None)
-            .float()
-            .square()
-            .sum(),
-        )
+
+        hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def forward():
+            output = model(hidden_states=hidden, attention_mask=None).float()
+            return torch.nn.functional.mse_loss(output, torch.zeros_like(output), reduction="sum")
+
+        forward_backward(model, forward)
 
         expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
         graded = [p for p in model.parameters() if p.grad is not None]
@@ -1114,16 +1118,14 @@ class TestMcoreAdapterHybrid:
         optimizer.zero_grad(set_to_none=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
-        forward_backward(
-            model,
-            [(input_ids, position_ids)],
-            lambda model, batch: model(
-                input_ids=batch[0], position_ids=batch[1], attention_mask=None
-            )
-            .float()
-            .square()
-            .mean(),
-        )
+
+        def forward():
+            output = model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=None
+            ).float()
+            return torch.nn.functional.mse_loss(output, torch.zeros_like(output))
+
+        forward_backward(model, forward)
         success, _, _ = optimizer.step()
         assert success
 
