@@ -296,29 +296,28 @@ class FsdpModule:
             context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
-                    cast(IndexedOrder[FsdpModule], context.forward_order),
-                    self._schedule_policy.forward_prefetch_size,
+                    context.forward_order, self._schedule_policy.forward_prefetch_size
                 )
             elif prefetch == "backward":
                 self._prefetch_parameter_groups(
-                    cast(IndexedOrder[FsdpModule], context.backward_order),
-                    self._schedule_policy.backward_prefetch_size,
+                    context.backward_order, self._schedule_policy.backward_prefetch_size
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder[FsdpModule], prefetch_size: int | None
+        self, order: IndexedOrder[nn.Module], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        next_module = order.next_item(self)
+        next_module = order.next_item(cast(nn.Module, self))
         if prefetch_size is None:
             if next_module is not None:
-                next_module._unshard_parameter_groups()
+                cast(FsdpModule, next_module)._unshard_parameter_groups()
             return
 
         prefetched_size = 0
         while next_module is not None and prefetched_size < prefetch_size:
-            next_module._unshard_parameter_groups()
-            prefetched_size += next_module.num_parameter_elements
+            fsdp_module = cast(FsdpModule, next_module)
+            fsdp_module._unshard_parameter_groups()
+            prefetched_size += fsdp_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
     def _unshard_parameter_groups(self) -> None:

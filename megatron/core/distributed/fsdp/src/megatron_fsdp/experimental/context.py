@@ -47,6 +47,10 @@ class FsdpContext:
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder[nn.Module]
     backward_order: IndexedOrder[nn.Module]
+    # Topology metadata must not keep modules alive after construction.
+    _roots: IndexedOrder[nn.Module]
+    # Names are relative to each FSDP root and absent until finalization.
+    _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
@@ -96,10 +100,8 @@ class FsdpContext:
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
-        # Topology metadata must not keep modules alive after construction.
-        self._roots: IndexedOrder[nn.Module] = IndexedOrder()
-        # Names are relative to each FSDP root and absent until finalization.
-        self._module_names: WeakKeyDictionary[nn.Module, str] = WeakKeyDictionary()
+        self._roots = IndexedOrder()
+        self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
