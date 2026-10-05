@@ -34,7 +34,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
-from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import _forward_backward
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import forward_backward
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -323,10 +323,10 @@ class TestMcoreAdapterDense:
             4, 16, device=distributed_setup.device, dtype=config.params_dtype, requires_grad=True
         )
 
-        def forward_backward():
+        def run_backward():
             # Retain the grad views so reduction includes the accumulation kernel.
             model.zero_grad(set_to_none=False)
-            _forward_backward(
+            forward_backward(
                 model,
                 [x],
                 lambda model, batch: model(batch).float().square().mean(),
@@ -337,13 +337,13 @@ class TestMcoreAdapterDense:
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
             for _ in range(3):
-                forward_backward()
+                run_backward()
 
         # Ending capture rejects an unjoined reduction stream if finish_grad_sync
         # fails to wait for the reductions launched by backward_dw.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
-            forward_backward()
+            run_backward()
 
     def test_build_train_and_step(self):
         """Match eager training against an MFSDP v2 train-and-step sequence."""
@@ -413,7 +413,7 @@ class TestMcoreAdapterDense:
             losses = []
             for microbatches in steps:
                 optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = _forward_backward(
+                microbatch_losses = forward_backward(
                     model, microbatches, _block_loss, loss_scale=1 / len(microbatches)
                 )
                 success, _, _ = optimizer.step()
@@ -466,7 +466,7 @@ class TestMcoreAdapterDense:
         optimizer = get_megatron_optimizer(optimizer_config, [model])
 
         optimizer.zero_grad(set_to_none=True)
-        _forward_backward(
+        forward_backward(
             model,
             [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
             _block_loss,
@@ -532,7 +532,7 @@ class TestMcoreAdapterDense:
         hidden = torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16).view(
             1, 1, -1
         ).expand(8, 2, -1) * (torch.distributed.get_rank() + 1)
-        _forward_backward(
+        forward_backward(
             model,
             [hidden],
             lambda model, batch: model(hidden_states=batch, attention_mask=None)
@@ -641,11 +641,11 @@ class TestMcoreAdapterCudaGraph:
             return model, optimizer
 
         # FullCudaGraphWrapper requires this keyword-only schedule callback signature.
-        def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
+        def schedule(*, model, data_iterator, num_microbatches, seq_length, forward_only):
             assert seq_length is None
             assert not forward_only
             # Pipeline schedules receive model chunks as a list, including with PP=1.
-            losses = _forward_backward(
+            losses = forward_backward(
                 model[0],
                 [next(data_iterator[0])["hidden_states"] for _ in range(num_microbatches)],
                 _block_loss,
@@ -661,11 +661,11 @@ class TestMcoreAdapterCudaGraph:
             for _ in range(10)
         ]
 
-        def run(model, optimizer, forward_backward) -> torch.Tensor:
+        def run(model, optimizer, schedule) -> torch.Tensor:
             losses = []
             for microbatches in steps:
                 optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = forward_backward(
+                microbatch_losses = schedule(
                     model=[model],
                     data_iterator=[iter([{"hidden_states": batch} for batch in microbatches])],
                     num_microbatches=len(microbatches),
@@ -686,10 +686,8 @@ class TestMcoreAdapterCudaGraph:
         )
         graph_model.load_state_dict(eager_model.state_dict())
 
-        eager_losses = run(eager_model, eager_optimizer, forward_backward)
-        cuda_graph_forward_backward = FullCudaGraphWrapper(
-            forward_backward, cuda_graph_warmup_steps=1
-        )
+        eager_losses = run(eager_model, eager_optimizer, schedule)
+        cuda_graph_forward_backward = FullCudaGraphWrapper(schedule, cuda_graph_warmup_steps=1)
         with torch.profiler.profile() as prof:
             graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
 
@@ -847,7 +845,7 @@ class TestMcoreAdapterExpertParallel:
         reference_losses = []
         for _ in range(5):
             reference_optimizer.zero_grad(set_to_none=True)
-            (reference_loss,) = _forward_backward(
+            (reference_loss,) = forward_backward(
                 reference_model, [(input_ids, position_ids, targets)], forward_step
             )
             reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
@@ -860,7 +858,7 @@ class TestMcoreAdapterExpertParallel:
         losses = []
         for _ in range(5):
             optimizer.zero_grad(set_to_none=True)
-            (loss,) = _forward_backward(
+            (loss,) = forward_backward(
                 model,
                 [(input_ids[input_slice], position_ids[input_slice], targets[input_slice])],
                 forward_step,
@@ -952,7 +950,7 @@ class TestMcoreAdapterHybrid:
                     torch.distributed.get_rank() + 1 + step + index
                 )
                 batches.append(hidden)
-            step_losses = _forward_backward(model, batches, _block_loss)
+            step_losses = forward_backward(model, batches, _block_loss)
             success, _, _ = optimizer.step()
             assert success
             # No update happens until optimizer.step(), so every microbatch in a step sees
@@ -980,7 +978,7 @@ class TestMcoreAdapterHybrid:
             module=_build_block(config),
             pg_collection=pg_collection,
         )
-        _forward_backward(
+        forward_backward(
             model,
             [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
             lambda model, batch: model(hidden_states=batch, attention_mask=None)
@@ -1101,7 +1099,7 @@ class TestMcoreAdapterHybrid:
         optimizer.zero_grad(set_to_none=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
-        _forward_backward(
+        forward_backward(
             model,
             [(input_ids, position_ids)],
             lambda model, batch: model(
