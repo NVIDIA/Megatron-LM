@@ -2243,6 +2243,7 @@ class TransformerConfig(ModelParallelConfig):
             required_values = {
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_routing_map_mode": "indices",
                 "bf16": True,
                 "params_dtype": torch.bfloat16,
                 "fp4": None,
@@ -2305,8 +2306,7 @@ class TransformerConfig(ModelParallelConfig):
             mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             require(
                 not self.fp8 or mxfp8,
-                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' "
-                "and fp8_param=True",
+                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' " "and fp8_param=True",
             )
             require(
                 not self.moe_router_padding_for_quantization or mxfp8,

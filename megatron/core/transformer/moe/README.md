@@ -348,14 +348,16 @@ full/whole-MoE recomputation. `TransformerConfig` validates these restrictions, 
 layout, and the dispatcher SM budget at construction; the load-balancer initializer checks
 the actual process-group layout before allocating resources.
 
-Virtual experts require HybridEP's compact `topk_idx` API alongside dense probabilities;
-the fused TE router must expose its `topk_indices` output buffer. Ordinary HybridEP retains
-its older-build compatibility. Supported routing includes FP32 sigmoid scores, fusion,
+Virtual experts require `moe_hybridep_routing_map_mode='indices'` (the default) and HybridEP's
+`topk_idx` API alongside dense probabilities. They use the upstream router's index output when
+available; the virtual-expert dispatcher converts boolean routing maps from the unfused or
+fallback path into planner indices and gathers the selected probabilities. Ordinary HybridEP
+retains its older-build compatibility. Supported routing includes FP32 sigmoid scores, fusion,
 `seq_aux_loss` and quantile balancing with its own bias update. To use `micro_batch` quantile balancing,
 set `--moe-router-load-balancing-type quantile_balancing --moe-aux-loss-coeff 0`, omit
 `--moe-router-enable-expert-bias` and `--moe-router-fusion`, and disable
 `--moe-router-force-load-balancing` for real routing. QB uses its existing unfused scorer and dual
-update; virtual experts only change the routing output format. QB requires token-count × top-k
+update; the virtual-expert dispatcher adapts its existing routing output. QB requires token-count × top-k
 divisible by the number of experts and does not support padding masks or group-limited routing.
 
 With expert GTP, virtual experts request GTP's persistent wgrad rings automatically during eager

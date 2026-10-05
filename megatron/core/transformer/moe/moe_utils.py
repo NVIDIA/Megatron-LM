@@ -843,12 +843,7 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        if dense_output:
-            assert (
-                fused_topk_with_score_function_supports_topk_indices
-            ), "Virtual experts require TE's fused top-k index output API."
-            topk_indices = torch.empty((num_tokens, topk), dtype=torch.int64, device=logits.device)
-        probs, routing_map = fused_topk_with_score_function(
+        return fused_topk_with_score_function(
             logits=logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
@@ -863,9 +858,6 @@ def topk_routing_with_score_function(
                 else {}
             ),
         )
-        if dense_output:
-            probs = probs.gather(1, routing_map.long())
-        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,

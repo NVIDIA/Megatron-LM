@@ -22,14 +22,12 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
-    HYBRIDEP_HANDLE_OVERFLOW_FLAG,
     HYBRIDEP_TOKEN_ALIGNMENT,
     alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
-    hybrid_ep_dense_topk_routing,
     hybrid_ep_dispatch,
     is_nccl_ep_bootstrapped,
     nccl_ep_combine,
@@ -1264,7 +1262,7 @@ class _HybridEPManager(_DispatchManager):
         if self.moe_expert_rank_capacity_factor is not None:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
-            over_budget = self.handle[HYBRIDEP_HANDLE_OVERFLOW_FLAG] != 0
+            over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
@@ -1339,13 +1337,20 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
         )
         # MoonEP owns its dropless route budget, but HybridEP still needs static-capacity mode.
         self.moe_expert_rank_capacity_factor = 1.0
-        assert hybrid_ep_dense_topk_routing(
-            self.num_experts, self.num_local_experts
+        assert (
+            self.dense_routing_supported
         ), "Virtual experts require HybridEP's dense top-k routing API for runtime experts."
 
-    def setup_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor, padding_mask=None):
-        """Plan the router's ``[num_tokens, topk]`` routes and start the weight push; HybridEP's
-        own metadata is set up at dispatch, from the planner's runtime routes."""
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor, padding_mask=None):
+        """Adapt upstream routing metadata to the planner and start the weight push."""
+        if routing_map.dtype == torch.bool:
+            # Unfused, hash and quantile routers return a bool map. Select its routes,
+            # including selected experts whose probability is zero.
+            top_indices = routing_map.to(torch.int8).topk(self.router_topk, dim=-1).indices
+        else:
+            # Upstream fused HybridEP routing returns int16 expert IDs.
+            top_indices = routing_map.long()
+        probs = probs.gather(1, top_indices)
         # ``token_probs`` holds the router's probabilities until dispatch, where the dispatcher's
         # preprocessing returns them; HybridEP's ``setup_metadata`` then replaces them with the
         # dense runtime probabilities it transports (a CUDA-graph attribute, so one field).

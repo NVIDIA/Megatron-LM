@@ -454,7 +454,6 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=self.config.moe_router_fusion,
             precomputed_indices=indices,
-            dense_output=self.config.moe_virtual_expert_load_balance,
         )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
@@ -996,9 +995,7 @@ class TopKRouter(Router):
                 "input_ids is required for hash-based routing. Pass token IDs through "
                 "the model, transformer block, and transformer layer."
             )
-            probs, routing_map = self._hash_routing(
-                logits, input_ids, dense_output=self.config.moe_virtual_expert_load_balance
-            )
+            probs, routing_map = self._hash_routing(logits, input_ids)
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "quantile_balancing":
@@ -1027,7 +1024,6 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
                 topk_indices=topk_indices,
-                dense_output=self.config.moe_virtual_expert_load_balance,
             )
 
         # Apply token dropping to probs and routing_map.

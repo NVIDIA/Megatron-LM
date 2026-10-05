@@ -297,12 +297,6 @@ _hybrid_ep_buffer = None
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
-# Position of ``overflow_flag`` in the handle tuple HybridEP's dispatch returns (after
-# sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_dispatched_tokens_tensor,
-# local_expert_routing_map, dense_chunk_layout, dense_to_expert_map, tokens_per_expert,
-# num_of_tokens_per_rank, config). Stable across builds: newer HybridEP appends fields after it
-# (num_of_valid_tokens for ragged dispatch), so the flag is not always the last element.
-HYBRIDEP_HANDLE_OVERFLOW_FLAG = 10
 
 
 def init_hybrid_ep_buffer(
@@ -376,31 +370,6 @@ def reset_hybrid_ep_buffer():
     '''
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
-
-
-def hybrid_ep_dense_topk_routing(num_experts: int, num_local_experts: int) -> bool:
-    '''
-    Whether the installed HybridEP accepts dense top-k routing indices for this expert layout.
-
-    Newer HybridEP builds take int16 ``[num_tokens, topk]`` expert ids instead of the bool
-    ``[num_tokens, num_experts]`` routing map, which shrinks the routing-map all-gather and the
-    metadata scan from ``num_experts`` to ``topk`` entries per token. Older builds also accept
-    ``topk_idx`` but rebuild the dense map from it and drop the caller's ``probs``, so they
-    must keep receiving the routing map.
-    '''
-    if not HAVE_HYBRIDEP or not hasattr(HybridEPBuffer, "_use_dense_topk_routing"):
-        return False
-    if _hybrid_ep_buffer is not None:
-        return _hybrid_ep_buffer._use_dense_topk_routing(num_experts, num_local_experts)
-    # Before the buffer exists, apply the static limits; dispatch checks the full capability
-    # after buffer initialization, including the ranks-per-domain limit.
-    from deep_ep import hybrid_ep_buffer as _hybrid_ep_buffer_module
-
-    return num_experts <= getattr(
-        _hybrid_ep_buffer_module, "INT16_EXPERT_LIMIT", 0
-    ) and num_local_experts <= getattr(
-        _hybrid_ep_buffer_module, "DENSE_ROUTING_EXPERTS_PER_RANK_LIMIT", 0
-    )
 
 
 class HybridEPDispatch(torch.autograd.Function):

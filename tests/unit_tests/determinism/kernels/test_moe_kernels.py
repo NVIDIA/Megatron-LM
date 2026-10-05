@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import plan_virtual_expert_routes
 from megatron.core.transformer.moe.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.spec_utils import get_submodules
@@ -94,6 +95,34 @@ def _routing(num_tokens=NUM_TOKENS, num_experts=NUM_EXPERTS, topk=TOPK):
     routing_map.scatter_(1, idx, True)
     probs = torch.zeros_like(probs_full).scatter(1, idx, probs_full.gather(1, idx))
     return routing_map, probs
+
+
+@pytest.mark.parametrize("index_format", [False, True], ids=["bool-map", "indices"])
+def test_virtual_expert_routing_adapter_replay(index_format):
+    """Selected routes and probability gradients replay exactly under stream contention."""
+    Utils.initialize_distributed()
+    seeded()
+    routing_map, probs = _routing(num_tokens=257, num_experts=512, topk=10)
+    probs[0].zero_()  # Selected zero-probability routes must survive the conversion.
+    if index_format:
+        routing_map = routing_map.to(torch.int8).topk(10, dim=-1).indices.to(torch.int16)
+    manager = object.__new__(_VirtualExpertHybridEPManager)
+    manager.router_topk = 10
+    planned = []
+    manager.plan_dispatch = planned.append
+
+    def adapt(probs):
+        planned.clear()
+        manager.setup_metadata(routing_map, probs)
+        return planned[0], manager.token_probs
+
+    assert_replays_bit_exact(
+        adapt,
+        (probs.requires_grad_(),),
+        replays=3,
+        contention=True,
+        what=f"virtual-expert routing adapter[index_format={index_format}]",
+    )
 
 
 # --- permute / unpermute --------------------------------------------------------------------
