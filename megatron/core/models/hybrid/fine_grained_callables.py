@@ -146,14 +146,6 @@ def _maybe_apply_final_norm(node: ScheduleNode, hidden_states: Tensor):
     return hidden_states
 
 
-def _get_moe_padding_mask(node: ScheduleNode):
-    padding_mask = node.chunk_state.padding_mask
-    if padding_mask is not None:
-        # MoELayer.forward receives [batch, seq] and transposes before routing.
-        padding_mask = padding_mask.transpose(0, 1).bool()
-    return padding_mask
-
-
 def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
     pre_mlp_layernorm_output = layer._forward_pre_mlp_layernorm(hidden_states)
     # A subsequent microbatch can reuse this layer before this node combines.
@@ -173,8 +165,13 @@ def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
         residual = residual.float()
 
     shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-    probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, _get_moe_padding_mask(node))
-    local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+    # Same routing inputs as the eager MoELayer.forward path: route and preprocess take the
+    # batch-first padding mask (dropless HybridEP excludes padded tokens).
+    padding_mask = node.chunk_state.padding_mask
+    probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
+    local_tokens, probs = layer.mlp.preprocess(
+        pre_mlp_layernorm_output, probs, routing_map, padding_mask
+    )
 
     node.layer_state.residual = node.detach(residual)
     node.layer_state.shared_expert_output = None
