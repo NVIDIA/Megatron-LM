@@ -608,15 +608,20 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = None
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
-                if self.next_param_gather_bucket_group.param_gather_dispatched:
-                    warnings.warn(
-                        "The next bucket's parameter all-gather operation has already been "
-                        "dispatched. This may be caused by a mismatch between the order of "
-                        "parameter registration and forward pass execution, which will "
-                        "hurt the communication-computation overlap performance."
-                    )
+                next_group = self.next_param_gather_bucket_group
+                if next_group.param_gather_dispatched:
+                    # A completed synchronous dispatch (force_sync, e.g. the LayerWise
+                    # pre-forward sync under chunked optimizer-state offload) leaves nothing to
+                    # overlap; only an in-flight async gather indicates an ordering mismatch.
+                    if next_group.param_gather_handle is not None:
+                        warnings.warn(
+                            "The next bucket's parameter all-gather operation has already been "
+                            "dispatched. This may be caused by a mismatch between the order of "
+                            "parameter registration and forward pass execution, which will "
+                            "hurt the communication-computation overlap performance."
+                        )
                 else:
-                    self.next_param_gather_bucket_group.start_param_sync()
+                    next_group.start_param_sync()
 
             if not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
