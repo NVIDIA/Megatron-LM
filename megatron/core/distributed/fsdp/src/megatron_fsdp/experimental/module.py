@@ -54,13 +54,9 @@ class FsdpModule:
         FORWARD = enum.auto()
         BACKWARD = enum.auto()
 
-    # Name relative to the root FSDP module from named_modules().
-    # Root uses "" and None means uninitialized.
-    _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
-    _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
     # Event recorded after this FsdpModule's full parameters are materialized.
@@ -88,8 +84,6 @@ class FsdpModule:
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
-        self._is_root = False
-        self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
@@ -161,14 +155,11 @@ class FsdpModule:
     @property
     def name(self) -> str:
         """Return this FsdpModule's name."""
-        name = self._name
-        if name is None:
-            raise RuntimeError("FSDP module name has not been initialized.")
-        return name
+        return self.context.module_name(cast(nn.Module, self))
 
     def is_root(self) -> bool:
         """Return whether this module is an outermost FsdpModule in its context."""
-        return self._is_root
+        return self.context.is_root(cast(nn.Module, self))
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
