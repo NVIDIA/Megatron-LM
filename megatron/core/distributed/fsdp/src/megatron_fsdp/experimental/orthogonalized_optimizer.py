@@ -40,7 +40,7 @@ except (ModuleNotFoundError, ImportError):
 
 from .dbuffer import DBuffer
 from .gather_scatter import gather, scatter, waiting_stream_scope
-from .owner_planning import GroupOwnerLayout, ns_cost_fn
+from .owner_planning import GroupOwnerLayout, ParameterLayout, assign_owner_work, ns_cost_fn
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import RowAtomic
 
@@ -82,7 +82,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     Newton-Schulz work, scatter, and apply run per group on its stream. Because
     no scatter is enqueued before every gather, no scatter's Newton-Schulz
     dependency can head-of-line-block another group's gather on the shared NCCL
-    communicator, so the groups' Newton-Schulz work genuinely overlaps. At the end, the caller's
+    communicator, so the groups' Newton-Schulz work genuinely overlaps. Owner
+    compute is balanced jointly across all active groups. At the end, the caller's
     stream is ordered behind every group stream and the touched groups' model
     weights are synced from their main weights.
 
@@ -113,7 +114,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
         self.dp_mesh = dp_mesh
         self._num_ns_steps: int = num_ns_steps
-        self._owner_layouts: dict[FsdpParameterGroup, GroupOwnerLayout] = {}
+        self._owner_layouts: dict[FsdpParameterGroup, dict[int, ParameterLayout]] = {}
         self._streams: dict[FsdpParameterGroup, torch.cuda.Stream] = {}
 
         # Disable properties while initializing this instance. We'd either have a missing attribute
@@ -389,15 +390,14 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 fsdp_groups[fsdp_group] = None
                 touched[fsdp_group] = None
             for fsdp_group in fsdp_groups:
-                owner_layout = self._owner_layouts.get(fsdp_group)
-                if owner_layout is None:
+                layouts = self._owner_layouts.get(fsdp_group)
+                if layouts is None:
                     # Built once per group — layouts are step-independent. Everything
-                    # participates; dimensionalities are a validation concern.
-                    owner_layout = self._owner_layouts[fsdp_group] = GroupOwnerLayout.from_groups(
-                        [fsdp_group],
-                        cost_fn=ns_cost_fn(self._num_ns_steps),
-                        eligible_fn=lambda _param: True,
-                    )[0]
+                    # participates; dimensionalities are a validation concern. The
+                    # owners are assigned per step by the joint balancing below.
+                    layouts = self._owner_layouts[fsdp_group] = ParameterLayout.from_group(
+                        fsdp_group, eligible_fn=lambda _param: True
+                    )
                 active_indices = [
                     i
                     for i, fp in enumerate(fsdp_group.fsdp_parameters)
@@ -410,20 +410,25 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 # deadlocked in the gather/scatter P2P. Validate rank-uniformly from
                 # the rank-identical layouts before posting any communication.
                 for i in active_indices:
-                    layout = owner_layout.layouts[i]
+                    layout = layouts[i]
                     if len(layout.full_shape) < 2:
                         raise ValueError(
                             f"Only 2D or higher-dimensional parameters can be "
                             f"orthogonalized; parameter {i} of {fsdp_group!r} has "
                             f"shape {tuple(layout.full_shape)}."
                         )
+                # Owners start empty and are assigned by the joint balancing below.
                 active = GroupOwnerLayout(
-                    mesh=fsdp_group.mesh,
-                    layouts={i: owner_layout.layouts[i] for i in active_indices},
-                    owners={i: owner_layout.owners[i] for i in active_indices},
+                    mesh=fsdp_group.mesh, layouts={i: layouts[i] for i in active_indices}, owners={}
                 )
                 if active.layouts:
                     actives.append((fsdp_group, active, torch_group, lr))
+
+        # Balance the owner compute jointly across every active group: per-group
+        # balancing repeats the same one-sided choice in every group of a group set
+        # with a single boundary parameter, compounding the imbalance across the
+        # step. Deterministic and rank-identical for the rank-identical `actives`.
+        self._balance_owners_jointly(actives)
 
         # Post every group's gather before any group's scatter: a scatter's NCCL
         # kernel is stream-ordered behind its group's Newton-Schulz work, so if
@@ -431,15 +436,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         # shared communicator FIFO and serializes the groups' Newton-Schulz work.
         # With every gather ahead of every scatter, group k+1's gather completes
         # while group k orthogonalizes, so the Newton-Schulz work truly overlaps.
-        posted: list[tuple[FsdpParameterGroup, GroupOwnerLayout, dict[str, Any], float, dict[int, torch.Tensor]]] = []
+        posted: list[
+            tuple[
+                FsdpParameterGroup, GroupOwnerLayout, dict[str, Any], float, dict[int, torch.Tensor]
+            ]
+        ] = []
         for fsdp_group, active, torch_group, lr in actives:
             source, destination = self._step_gather(fsdp_group, active, torch_group, lr)
             temporaries.extend((source, destination))
             posted.append((fsdp_group, active, torch_group, lr, destination))
         for fsdp_group, active, torch_group, lr, destination in posted:
-            temporaries.extend(
-                self._step_apply(fsdp_group, active, torch_group, lr, destination)
-            )
+            temporaries.extend(self._step_apply(fsdp_group, active, torch_group, lr, destination))
 
         # Order the caller's stream behind every group stream. All step temporaries stay
         # referenced until after these waits, so their blocks cannot be reused before
@@ -451,6 +458,24 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         for fsdp_group in touched:
             fsdp_group.sync_model_weight_from_main_weight()
         return loss
+
+    def _balance_owners_jointly(
+        self, actives: list[tuple[FsdpParameterGroup, GroupOwnerLayout, dict[str, Any], float]]
+    ) -> None:
+        """Balance the owner compute jointly across the step's active groups.
+
+        Delegates to `assign_owner_work` with the Newton-Schulz cost estimate,
+        so boundary parameters of different groups compensate one another's imbalance instead of
+        repeating the same one-sided per-group choice. `GroupOwnerLayout` is frozen, but its
+        `owners` mapping is updated in place. Deterministic and rank-identical for the
+        rank-identical `actives`.
+        """
+        owner_dicts = assign_owner_work(
+            [active.layouts for _, active, _, _ in actives], ns_cost_fn(self._num_ns_steps)
+        )
+        for (_, active, _, _), owners in zip(actives, owner_dicts, strict=True):
+            active.owners.clear()
+            active.owners.update(owners)
 
     def _step_gather(
         self,
