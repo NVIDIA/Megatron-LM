@@ -53,6 +53,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    RequestPayloadStageDeferred,
     RequestPayloadStageResult,
     RequestPromptPreparationResult,
     Status,
@@ -1959,39 +1960,37 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine.controller._async_sched_logits.clear.assert_called_once_with()
 
 
-def test_drained_reset_rejects_suspended_state_before_context_mutation():
-    """Reset rejects states whose inference storage may be deallocated."""
+@pytest.mark.parametrize(
+    ("state", "leftovers", "match"),
+    [
+        (EngineState.SUSPENDED, {}, "only be reset while RUNNING or PAUSED"),
+        (EngineState.RUNNING, {"requests": {7: object()}}, "must drain all requests before reset"),
+        (
+            EngineState.RUNNING,
+            {"_deferred_finished_requests": [(object(), None)]},
+            "deferred replies before reset",
+        ),
+    ],
+    ids=["suspended", "outstanding-requests", "deferred-replies"],
+)
+def test_drained_reset_refusals(state, leftovers, match):
+    """Reset refuses a state whose storage may be deallocated, outstanding requests, and deferred
+    replies, before touching any engine state."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._state_events = {}
-    engine.state = EngineState.SUSPENDED
+    engine.state = state
+    engine.requests = {}
+    for name, value in leftovers.items():
+        setattr(engine, name, value)
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
         _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
     )
 
-    with pytest.raises(RuntimeError, match="only be reset while RUNNING or PAUSED"):
+    with pytest.raises(RuntimeError, match=match):
         engine.reset()
 
-    engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
-
-
-def test_drained_reset_rejects_outstanding_requests_before_mutation():
-    """Reset rejects a nonempty request table before clearing engine state."""
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine._state_events = {}
-    engine.state = EngineState.RUNNING
-    requests = {7: object()}
-    engine.requests = requests
-    engine.context = types.SimpleNamespace(reset=mock.Mock())
-    engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
-    )
-
-    with pytest.raises(RuntimeError, match="must drain all requests before reset"):
-        engine.reset()
-
-    assert engine.requests is requests
+    assert all(getattr(engine, name) is value for name, value in leftovers.items())
     engine.context.reset.assert_not_called()
     engine.controller._async_sched_logits.clear.assert_not_called()
 
@@ -2474,28 +2473,64 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     assert completed.prompt_tokens.tolist() == [1, 2, 3]
 
 
-def test_finished_request_record_is_built_once_for_ledger_and_stager():
-    """With both the ledger and a stager on, one FinishedRequestRecord per completed request
-    is shared by both; failed requests build none."""
+class _DeferOnceStager(_RecordingStager):
+    """Defers each payload's first offer and accepts the retry."""
+
+    def __init__(self):
+        super().__init__()
+        self.deferred = set()
+
+    def stage(self, uid, payload, **kwargs):
+        if uid in self.deferred:
+            return super().stage(uid, payload, **kwargs)
+        self.deferred.add(uid)
+        return RequestPayloadStageDeferred()
+
+
+@pytest.mark.parametrize("deferred", [False, True], ids=["staged-at-once", "deferred-once"])
+def test_ledger_and_stager_share_record(deferred):
+    """With both the ledger and a stager on, one FinishedRequestRecord per completed request is
+    shared by both, and failed requests build none. A deferred stage sends nothing and indexes
+    nothing while the failed reply still goes out; the retry, which flush_deferred_stages
+    schedules on the engine loop, offers that same record again, then indexes it and sends the
+    reply as offloaded."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.local_metadata_ledger_enabled = True
     engine.local_metadata_ledger = {}
-    engine.payload_stager = _RecordingStager()
+    engine.payload_stager = _DeferOnceStager() if deferred else _RecordingStager()
     engine.socket_for_receiving_requests = mock.Mock()
+    engine.use_coordinator = engine.is_mp_coordinator = True
+    engine._loop = asyncio.new_event_loop()
     completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+
+    def last_sent():
+        frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+        return {wire["uid"]: wire for wire in (msgpack.unpackb(f, raw=False) for f in frames[1:])}
 
     with mock.patch.object(
         FinishedRequestRecord, "from_request", wraps=FinishedRequestRecord.from_request
     ) as from_request:
         engine._send_requests_to_coordinator([completed, failed])
+        held = ["chatcmpl-ok"] if deferred else []
+        assert [request.uid for request, _ in engine._deferred_finished_requests] == held
+        assert list(last_sent()) == (
+            ["chatcmpl-failed"] if deferred else ["chatcmpl-ok", "chatcmpl-failed"]
+        )
+        assert ("chatcmpl-ok" in engine.local_metadata_ledger) is not deferred
+        engine.flush_deferred_stages()  # scheduled, not run inline; a no-op with nothing deferred
+        assert engine.socket_for_receiving_requests.send_multipart.call_count == 1
+        engine._loop.run_until_complete(asyncio.sleep(0))
+    engine._loop.close()
 
     from_request.assert_called_once_with(completed)
     record = engine.local_metadata_ledger["chatcmpl-ok"]
-    assert record is engine.payload_stager.finished_metadata
-    assert record.num_evictions == 0
-    ((uid, _),) = engine.payload_stager.staged
-    assert uid == "chatcmpl-ok"
+    assert record is engine.payload_stager.finished_metadata and record.num_evictions == 0
+    assert engine._deferred_finished_requests == []
+    assert engine.socket_for_receiving_requests.send_multipart.call_count == 1 + deferred
+    assert last_sent()["chatcmpl-ok"]["payload_offloaded"] is True
+    ((uid, payload),) = engine.payload_stager.staged
+    assert uid == "chatcmpl-ok" and payload.generated_token_ids == [10, 11]
 
 
 def _submit_request_message(request_id, sampling_params, prompt, offload_params):

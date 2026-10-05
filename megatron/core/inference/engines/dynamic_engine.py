@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import torch
 from torch import Tensor
@@ -52,7 +52,9 @@ from megatron.core.inference.inference_request import (
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     OffloadedRequestPayload,
+    RequestPayloadStageDeferred,
     RequestPayloadStager,
+    RequestPayloadStageResult,
     RequestPromptPreparer,
     Status,
     compute_media_cache_key,
@@ -479,6 +481,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # Defaults for instances created without __init__ (tests build the engine via __new__).
     payload_stager: Optional[RequestPayloadStager] = None
     prompt_preparer: Optional[RequestPromptPreparer] = None
+    # Replies whose payload stage the stager deferred; reset() gives each instance its own list.
+    _deferred_finished_requests: Sequence[
+        Tuple[DynamicInferenceRequest, FinishedRequestRecord]
+    ] = ()
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -691,6 +697,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 "The engine must drain all requests before reset; "
                 f"got {len(self.requests)} outstanding request(s)."
             )
+        if not initialize_runtime_state and self._deferred_finished_requests:
+            raise RuntimeError(
+                "The engine must send all deferred replies before reset; "
+                f"got {len(self._deferred_finished_requests)} deferred payload stage(s)."
+            )
 
         use_coordinator = getattr(self, "use_coordinator", False)
         self._reset_pending_kv_imports()
@@ -711,6 +722,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
+        self._deferred_finished_requests: List[
+            Tuple[DynamicInferenceRequest, Optional[FinishedRequestRecord]]
+        ] = []
         self._generation_epoch: Optional[int] = None
         # Weight generation counter, bumped on every resume. Used only to salt
         # block hashes so the prefix cache cannot serve KV computed by earlier
@@ -1677,42 +1691,53 @@ class DynamicInferenceEngine(AbstractEngine):
         return finished_request
 
     def _send_requests_to_coordinator(self, requests: List[DynamicInferenceRequest]) -> None:
-        """Send completed or failed flat requests from model-parallel rank 0."""
+        """Send completed or failed flat requests from model-parallel rank 0.
 
-        # Failed requests are sent immediately but remain in the engine until the next
-        # bookkeeping pass; only completed requests are indexed and staged.
-        # A reply is stripped only when its payload was staged.
+        Replies whose payload stage was deferred are offered to the stager again first. A
+        deferred request is neither indexed nor sent until its stage resolves.
+        """
+        pending = self._deferred_finished_requests
+        self._deferred_finished_requests = []
         serialized = []
-        for request in requests:
+        for request, finished_metadata in [*pending, *((request, None) for request in requests)]:
             if request.status == Status.FAILED:
                 serialized.append(request.serialize())
                 continue
             # One metadata record per completed request serves both the ledger and the stager.
-            finished_metadata = None
-            if self.local_metadata_ledger_enabled or self.payload_stager is not None:
+            if finished_metadata is None and (
+                self.local_metadata_ledger_enabled or self.payload_stager is not None
+            ):
                 finished_metadata = FinishedRequestRecord.from_request(request)
+            stage_result = self._stage_finished_request(request, finished_metadata)
+            if isinstance(stage_result, RequestPayloadStageDeferred):
+                self._deferred_finished_requests.append((request, finished_metadata))
+                continue
             if self.local_metadata_ledger_enabled:
                 assert (
                     request.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {request.uid!r}"
                 self.local_metadata_ledger[request.uid] = finished_metadata
-            serialized.append(self._serialize_finished_request(request, finished_metadata))
-        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
+            serialized.append(self._serialize_finished_request(request, stage_result))
+        if serialized:
+            self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
+
+    def _stage_finished_request(
+        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
+    ) -> Union[RequestPayloadStageResult, RequestPayloadStageDeferred, None]:
+        """Offer a non-streaming accepted payload to the stager."""
+        if self.payload_stager is None or getattr(request.sampling_params, "streaming", False):
+            return None
+        return self.payload_stager.stage(
+            request.uid,
+            OffloadedRequestPayload.from_request(request),
+            finished_metadata=finished_metadata,
+            offload_params=request.offload_params,
+        )
 
     def _serialize_finished_request(
-        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
+        self, request: DynamicInferenceRequest, stage_result: Optional[RequestPayloadStageResult]
     ) -> Dict:
-        """Stage a non-streaming accepted payload before constructing its coordinator reply."""
-        stage_result = None
-        if self.payload_stager is not None and not getattr(
-            request.sampling_params, "streaming", False
-        ):
-            stage_result = self.payload_stager.stage(
-                request.uid,
-                OffloadedRequestPayload.from_request(request),
-                finished_metadata=finished_metadata,
-                offload_params=request.offload_params,
-            )
+        """Build the coordinator reply; the payload is stripped only when it was staged."""
         serialized = request.serialize(
             payload_offloaded=stage_result is not None,
             payload_stage_metadata=(
@@ -1734,6 +1759,19 @@ class DynamicInferenceEngine(AbstractEngine):
             ):
                 serialized[key] = None
         return serialized
+
+    def flush_deferred_stages(self) -> None:
+        """Offer deferred payload stages to the stager again, from any thread.
+
+        A stager that returned ``RequestPayloadStageDeferred`` calls this once it can take
+        custody; the retry runs on the engine loop. Bookkeeping also retries every step.
+        """
+
+        def _retry() -> None:
+            if self._deferred_finished_requests and self.use_coordinator and self.is_mp_coordinator:
+                self._send_requests_to_coordinator([])
+
+        self._loop.call_soon_threadsafe(_retry)
 
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
@@ -3873,7 +3911,7 @@ class DynamicInferenceEngine(AbstractEngine):
             requests_to_send = [
                 request for request in finished_requests if request.status != Status.FAILED
             ]
-            if requests_to_send:
+            if requests_to_send or self._deferred_finished_requests:
                 nvtx_range_push("coordinator_communication")
                 self._send_requests_to_coordinator(requests_to_send)
                 nvtx_range_pop("coordinator_communication")

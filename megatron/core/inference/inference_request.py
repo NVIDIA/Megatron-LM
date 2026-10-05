@@ -1435,6 +1435,15 @@ class RequestPayloadStageResult:
     response_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RequestPayloadStageDeferred:
+    """The stager cannot take custody now; the engine holds the reply and offers it again.
+
+    Bookkeeping retries every step and ``DynamicInferenceEngine.flush_deferred_stages()``
+    retries on demand, so a stager that defers must call it once it can stage again.
+    """
+
+
 class RequestPayloadStager(Protocol):
     """Protocol to handle offloading of request payloads to a storage backend."""
 
@@ -1445,8 +1454,8 @@ class RequestPayloadStager(Protocol):
         *,
         finished_metadata: FinishedRequestRecord,
         offload_params: Optional[Dict[str, Any]] = None,
-    ) -> Optional[RequestPayloadStageResult]:
-        """Stage a payload, or return ``None`` to keep it on the normal reply path."""
+    ) -> Union[RequestPayloadStageResult, RequestPayloadStageDeferred, None]:
+        """Stage a payload, return ``None`` to keep it on the normal reply path, or defer."""
         ...
 
 
