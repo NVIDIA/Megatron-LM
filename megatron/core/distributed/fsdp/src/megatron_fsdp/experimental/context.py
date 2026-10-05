@@ -15,7 +15,7 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 from contextvars import ContextVar, Token
-from weakref import WeakKeyDictionary, WeakSet
+from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
@@ -97,7 +97,7 @@ class FsdpContext:
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
         # Topology metadata must not keep modules alive after construction.
-        self._roots: WeakSet[nn.Module] = WeakSet()
+        self._roots: IndexedOrder[nn.Module] = IndexedOrder()
         # Names are relative to each FSDP root and absent until finalization.
         self._module_names: WeakKeyDictionary[nn.Module, str] = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
@@ -148,18 +148,17 @@ class FsdpContext:
         children: set[nn.Module] = set()
         for module in self._registered_modules:
             _collect_fsdp_children(module, registered_modules, children)
-        # FsdpModules that are not descendants of any other FsdpModule.
-        roots = [module for module in self._registered_modules if module not in children]
-
-        self._roots.update(roots)
-        for root in roots:
+        for root in self._registered_modules:
+            if root in children:
+                continue
+            self._roots.append(root)
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
                 self.forward_order.append(module)
 
-        for root in reversed(roots):
+        for root in reversed(self._roots):
             _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
