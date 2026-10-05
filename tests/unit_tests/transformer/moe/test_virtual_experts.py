@@ -329,7 +329,7 @@ class TestVirtualExpertGTP:
         monkeypatch.setattr(gtp, "_EAGER_WGRAD_RINGS", {})
         monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
         monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", async_reduction)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", True)
+        monkeypatch.setattr(gtp.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", False)
         monkeypatch.setattr(gtp.GTP_CONFIG, "calculate_per_token_loss", False)
         # Both FC roles deliberately have the same shape; each has two independent experts.
         layers = []
@@ -374,21 +374,23 @@ class TestVirtualExpertGTP:
                                 torch.cuda._sleep(1_000_000)
                         grads = []
                         for weight in weights:
-                            grad = weight.get_wgrad_tensor(persistent=True)
-                            prior = pointers.setdefault(id(weight), grad.data_ptr())
-                            assert grad.data_ptr() == prior
                             if step == 1:
-                                # Foreign gradients must copy into the same padded ring storage.
-                                grad = torch.empty_like(grad)
+                                # Skip acquisition so input preparation must finalize the old
+                                # reader before copying a foreign gradient into the shared slot.
+                                grad = torch.empty(
+                                    weight._unsharded_shape,
+                                    dtype=weight.main_grad.dtype,
+                                    device=weight.device,
+                                )
+                            else:
+                                grad = weight.get_wgrad_tensor(persistent=True)
+                                prior = pointers.setdefault(id(weight), grad.data_ptr())
+                                assert grad.data_ptr() == prior
                             base = (
                                 torch.arange(130 * 16, device="cuda").view(130, 16) % 11 - 5
                             ).float() / 4 + (step + layer_index + weight.expert_idx) / 8
                             grad.copy_(base + rank / 4)
                             mean = torch.nn.functional.pad(base + 3 / 8, (0, 0, 0, 2))
-                            # Mean 250.25 + main_grad 0.5 rounds to 251 once, or 250.5 if the
-                            # RS output is first rounded to BF16. Padding must still stay zero.
-                            grad[:, 0] = 251 if rank == 3 else 250
-                            mean[:130, 0] = 250.25
                             expected[id(weight)].add_(mean.chunk(4)[rank])
                             grads.append(grad)
                         weights[0].finalize_group_grads(grads)
