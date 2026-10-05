@@ -16,8 +16,6 @@ import warnings
 from functools import partial
 
 _MEDIA_FETCH_TIMEOUT_S = 5.0
-_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
-_MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
 _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
@@ -291,29 +289,20 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
 
 
-def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
-    """Extract size-bounded bytes from an OpenAI-style media URL.
+def _extract_media_url_bytes(url: str, *, max_fetch_bytes: int | None = None) -> bytes:
+    """Extract bytes from an OpenAI-style media URL.
 
     Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
-    plain ``http(s)://`` URLs.
+    plain ``http(s)://`` URLs. Data URLs are already bounded by the server's
+    request-body limit; remote responses bypass it, so ``max_fetch_bytes``
+    bounds them instead.
     """
     if url.startswith("data:"):
-        # Base64 encodes each three input bytes as four characters. Bound the
-        # complete request before splitting or decoding it; 256 characters is
-        # ample for the data-URL metadata preceding the comma.
-        max_encoded_chars = 4 * ((max_bytes + 2) // 3)
-        if len(url) > max_encoded_chars + 256:
-            raise ValueError(f"Media data URL exceeds {max_bytes} byte limit")
         try:
             metadata, b64_data = url.split(",", 1)
         except ValueError as exc:
             raise ValueError(f"Malformed media data URL: {url[:40]!r}") from exc
-        if len(b64_data) > max_encoded_chars:
-            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
-        data = base64.b64decode(b64_data)
-        if len(data) > max_bytes:
-            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
-        return data
+        return base64.b64decode(b64_data)
     if url.startswith(("http://", "https://")):
         parsed = urllib.parse.urlparse(url)
         if not parsed.hostname:
@@ -335,18 +324,22 @@ def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
             raise ValueError(f"Refusing to fetch media from non-public address: {parsed.hostname}")
         req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
         with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
-            data = response.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            raise ValueError(f"Media at {parsed.hostname} exceeds {max_bytes} byte limit")
+            if max_fetch_bytes is None:
+                return response.read()
+            data = response.read(max_fetch_bytes + 1)
+        if len(data) > max_fetch_bytes:
+            raise ValueError(f"Media at {parsed.hostname} exceeds {max_fetch_bytes} byte limit")
         return data
     raise ValueError(f"Unsupported media URL scheme: {url[:40]!r}")
 
 
-def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptConfig):
+def _extract_multimodal_from_messages(
+    messages, prompt_config: MultimodalPromptConfig, max_fetch_bytes: int | None = None
+):
     """Extract media bytes and replace structured blocks with internal slots.
 
     Remote image fetching is blocking, so callers must run this function off
-    the event loop.
+    the event loop. ``max_fetch_bytes`` bounds each remote media response.
     """
     if not isinstance(messages, list):
         return messages, [], [], []
@@ -386,7 +379,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
                     continue
                 try:
                     image_bytes_list.append(
-                        _extract_media_url_bytes(url, max_bytes=_MAX_IMAGE_BYTES)
+                        _extract_media_url_bytes(url, max_fetch_bytes=max_fetch_bytes)
                     )
                 except Exception as e:
                     # Dropping the image would answer the request as if it were
@@ -402,7 +395,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
                     raise ValueError("Megatron chat video inputs must be base64 data URLs.")
                 try:
                     video_bytes_list.append(
-                        _extract_media_url_bytes(url, max_bytes=_MAX_VIDEO_BYTES)
+                        _extract_media_url_bytes(url, max_fetch_bytes=max_fetch_bytes)
                     )
                 except Exception as e:
                     raise ValueError(f"Failed to load video_url: {e}") from e
@@ -435,7 +428,8 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
 def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
-    This only normalizes tool-call argument payloads inside each message:
+    This lowers structured media content according to the model prompt contract
+    and normalizes tool-call argument payloads inside each message:
     - messages[*].tool_calls[*].function.arguments is coerced to a dict.
 
     Example transformation:
@@ -451,8 +445,10 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
         return messages
     sanitized = []
     media_modalities_by_message = {}
+    media_sentinels_by_message = {}
     for _sentinel, modality, message_index in media_slots:
         media_modalities_by_message.setdefault(message_index, set()).add(modality)
+        media_sentinels_by_message.setdefault(message_index, set()).add(_sentinel)
 
     for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -472,6 +468,11 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
+            if prompt_config is not None and prompt_config.content_part_order == "media_first":
+                media_sentinels = media_sentinels_by_message.get(message_index, set())
+                media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
+                non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
+                text_chunks = media_chunks + non_media_chunks
             separator = ""
             message_modalities = media_modalities_by_message.get(message_index, set())
             if message_modalities:
@@ -909,10 +910,14 @@ try:
             return Response("'messages' must be a list", status=400)
         prompt_config = current_app.config['multimodal_prompt_config']
         # Extract structured media before template sanitization. Remote image
-        # fetches block, so keep this work off the event loop.
+        # fetches block, so keep this work off the event loop. Remote responses
+        # bypass Quart's request-body limit, so apply the same bound to them.
         try:
             messages, image_bytes_list, video_bytes_list, media_slots = await asyncio.to_thread(
-                _extract_multimodal_from_messages, messages, prompt_config
+                _extract_multimodal_from_messages,
+                messages,
+                prompt_config,
+                current_app.config.get("MAX_CONTENT_LENGTH"),
             )
         except ValueError as error:
             return Response(str(error), status=400)
@@ -1489,6 +1494,11 @@ try:
             is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
             if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
                 content = ""
+            elif not normalized_tool_calls and not message_text and "reasoning" in metadata:
+                # Match vLLM's reasoning-only response. Some agent clients distinguish
+                # absent final content from an empty assistant message and otherwise
+                # continue the episode after a reasoning-only completion.
+                content = None
             else:
                 content = message_text if message_text is not None else ""
 

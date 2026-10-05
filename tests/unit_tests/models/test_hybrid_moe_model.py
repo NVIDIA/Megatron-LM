@@ -317,6 +317,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "recompute_method": None,
     "recompute_modules": ["core_attn"],
     "recompute_num_layers": None,
+    "residual_stream_recompute_num_layers": None,
     "rotary_interleaved": False,
     "sequence_parallel": True,
     "softmax_scale": None,
@@ -386,6 +387,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "sequence_packing_scheduler": None,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
     "sequence_packing_scheduler": None,
+    "moe_hybridep_routing_map_mode": "indices",
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

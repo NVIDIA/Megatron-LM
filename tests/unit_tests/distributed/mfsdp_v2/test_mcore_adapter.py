@@ -613,7 +613,7 @@ class TestMcoreAdapterCudaGraph:
         cuda_graph_forward_backward = FullCudaGraphWrapper(
             forward_backward, cuda_graph_warmup_steps=1
         )
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        with torch.profiler.profile() as prof:
             graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
 
         graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
@@ -626,6 +626,12 @@ class TestMcoreAdapterCudaGraph:
                 assert state["exp_avg"].dtype == torch.bfloat16
                 assert state["exp_avg_sq"].dtype == torch.bfloat16
         torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
+
+        # The optimizer holds the wrapper as its step attribute. The wrapper saves
+        # the original step method, which keeps a reference to the optimizer it
+        # operates on. Remove the wrapper to break this cycle so the optimizer's
+        # GPU memory can be released when the test returns.
+        del graph_optimizer.step
 
 
 class TestMcoreAdapterExpertParallel:
