@@ -164,14 +164,14 @@ def test_assign_owner_work_balances_by_cost():
     layout0 = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))  # cost 64 * 41
     layout1 = ParameterLayout(torch.Size((4, 4)), (4, 4, 4, 4))  # cost 16 * 21
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
-    owners = assign_owner_work({0: layout0, 1: layout1}, ns_cost_fn(5))
-    assert owners == {0: 0, 1: 1}
+    owners = assign_owner_work([{0: layout0, 1: layout1}], ns_cost_fn(5))
+    assert owners == [{0: 0, 1: 1}]
 
 
 def test_assign_owner_work_keys_pass_through():
     """Keys pass through unchanged. Arbitrary tensor indices, not positions."""
     layout = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))
-    owners = assign_owner_work({7: layout}, ns_cost_fn(5))
+    (owners,) = assign_owner_work([{7: layout}], ns_cost_fn(5))
     assert owners == {7: 0}
 
 
@@ -180,7 +180,7 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
     # Only ranks 0 and 2 hold elements for both params.
     layout0 = ParameterLayout(torch.Size((8, 8)), (32, 0, 32, 0))
     layout1 = ParameterLayout(torch.Size((8, 8)), (32, 0, 32, 0))
-    owners = assign_owner_work({0: layout0, 1: layout1}, ns_cost_fn(5))
+    (owners,) = assign_owner_work([{0: layout0, 1: layout1}], ns_cost_fn(5))
     assert all(owner in (0, 2) for owner in owners.values())
     # Two equal-cost params split across the two eligible ranks.
     assert owners[0] != owners[1]
@@ -196,7 +196,7 @@ def test_assign_owner_work_lpt_sorts_by_descending_cost():
     layout_cheap = ParameterLayout(torch.Size((8, 1)), (2, 2, 2, 2))
     # Expensive param listed SECOND in input order.
     layout_expensive = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))
-    owners = assign_owner_work({0: layout_cheap, 1: layout_expensive}, ns_cost_fn(5))
+    (owners,) = assign_owner_work([{0: layout_cheap, 1: layout_expensive}], ns_cost_fn(5))
     # LPT: expensive (tensor 1) → rank0 first, then cheap (tensor 0) → rank1.
     assert owners == {0: 1, 1: 0}
 
@@ -205,7 +205,7 @@ def test_assign_owner_work_non_boundary_gets_sole_holder():
     """Non-boundary params are assigned their sole holder, not skipped."""
     # All 8 elements on rank 0; rank 1 holds nothing.
     layout = ParameterLayout(torch.Size((4, 2)), (8, 0))
-    owners = assign_owner_work({3: layout}, ns_cost_fn(3))
+    (owners,) = assign_owner_work([{3: layout}], ns_cost_fn(3))
     assert owners == {3: 0}
 
 
@@ -213,7 +213,7 @@ def test_assign_owner_work_non_boundary_cost_counts_toward_balance():
     """Forced non-boundary work biases the greedy balancer away from that rank."""
     non_boundary = ParameterLayout(torch.Size((2, 2)), (4, 0))
     boundary = ParameterLayout(torch.Size((8, 8)), (32, 32))
-    owners = assign_owner_work({0: non_boundary, 1: boundary}, ns_cost_fn(5))
+    (owners,) = assign_owner_work([{0: non_boundary, 1: boundary}], ns_cost_fn(5))
     assert owners == {0: 0, 1: 1}
 
 
@@ -250,7 +250,7 @@ def test_group_owner_layout_from_group_composes_the_steps():
     assert owner_layout.mesh is group.mesh
     # Composition equivalence: the bundle is exactly the two steps composed.
     assert owner_layout.layouts == ParameterLayout.from_group(group)
-    assert owner_layout.owners == assign_owner_work(owner_layout.layouts, ns_cost_fn(5))
+    assert owner_layout.owners == assign_owner_work([owner_layout.layouts], ns_cost_fn(5))[0]
 
 
 def test_group_owner_layout_from_group_respects_eligible_fn():
