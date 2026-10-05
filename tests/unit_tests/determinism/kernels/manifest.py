@@ -198,10 +198,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="kda_recurrence",
-        sources=("megatron/core/ssm/gated_delta_net/kda.py",),
-        tests=(K + "test_dev_sync_kernels.py",),
+        sources=(
+            "megatron/core/ssm/gated_delta_net/kda.py",
+            "megatron/core/ssm/gated_delta_net/packed_cp_metadata.py",
+        ),
+        tests=(
+            K + "test_dev_sync_kernels.py",
+            "tests/unit_tests/ssm/gated_delta_net/test_packed_cp_metadata.py",
+        ),
         kind="dispatch",
         notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1. "
+        "Packed CP metadata tests compare cached partition boundaries with fresh construction "
+        "and exercise mutation invalidation and forward routing; they do not qualify kernel numerics. "
         "Multi-rank convolution and chunkwise CP remain in the existing parity suite.",
     ),
     KernelEntry(
@@ -631,14 +639,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/common.py",
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
+            "megatron/core/ssm/gated_delta_net/packed_cp_metadata.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+            "tests/unit_tests/ssm/gated_delta_net/test_packed_cp_metadata.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
-        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
+        "Packed CP metadata tests separately cover exact cached/fresh boundaries, invalidation, "
+        "and cross-layer forward reuse without claiming numerical CP kernel parity.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",

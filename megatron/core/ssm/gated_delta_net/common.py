@@ -588,7 +588,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         raise NotImplementedError
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        cu_seqlens_cpu=None,
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
@@ -596,7 +602,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
+        validation_offsets = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+        total_cu = validation_offsets[-1].cpu().item()
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
@@ -604,7 +611,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_lengths = validation_offsets[1:] - validation_offsets[:-1]
         if (seq_lengths % cp_size != 0).any():
             raise ValueError(
                 f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
