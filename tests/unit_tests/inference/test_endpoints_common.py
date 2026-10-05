@@ -12,6 +12,7 @@ import json
 import logging
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -19,6 +20,7 @@ from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
+    abort_requests,
     apply_optional_sampling_default,
     generation_config_sampling_defaults,
     resolve_sampling_default,
@@ -95,7 +97,26 @@ def test_generation_config_sampling_defaults(tokenizer, expected):
     assert generation_config_sampling_defaults(tokenizer) == expected
 
 
-# --- HTTP harness, shared with test_completions.py and test_chat_completions.py ---------------
+@pytest.mark.parametrize(
+    ("request_ids", "abort_results"),
+    [
+        pytest.param(
+            [7, 8, 9], [None, RuntimeError("coordinator gone"), None], id="one-abort-fails"
+        ),
+        pytest.param([], None, id="nothing-in-flight"),
+    ],
+)
+def test_abort_requests_is_best_effort(request_ids, abort_results):
+    """One failing abort neither stops the rest nor raises: the caller is already unwinding."""
+    client = MagicMock()
+    client.abort_request.side_effect = abort_results
+
+    abort_requests(client, request_ids, "client disconnected")
+
+    assert [call.args[0] for call in client.abort_request.call_args_list] == request_ids
+
+
+# --- HTTP harness, shared with the other endpoint test modules --------------------------------
 
 CHAT_PATH = "/v1/chat/completions"
 COMPLETIONS_PATH = "/v1/completions"
@@ -162,17 +183,22 @@ def failed_reply(*events):
     return {"uid": "req-failed", "status": "FAILED", "events": list(events)}
 
 
+PENDING = object()  # A reply that never arrives: the request stays in flight.
+
+
 class ReplyingClient:
     """Records each submission and answers it with the next canned reply.
 
-    A reply that is an exception fails that request's future; ``fail_admission_at`` is the
-    zero-based submission that raises instead of being admitted. Without ``replies`` every
-    submission gets a completed reply built from its own prompt tokens.
+    A reply that is an exception fails that request's future and ``PENDING`` leaves it unresolved;
+    ``fail_admission_at`` is the zero-based submission that raises instead of being admitted.
+    Without ``replies`` every submission gets a completed reply built from its own prompt tokens.
+    ``drained`` is set once the last canned reply has been handed out.
     """
 
     def __init__(self, replies=None, *, fail_admission_at=None):
         self.replies = None if replies is None else list(replies)
         self.fail_admission_at = fail_admission_at
+        self.drained = asyncio.Event()
         self.prompt_tokens = []
         self.sampling_params = []
         self.multi_modal_data = []
@@ -195,10 +221,12 @@ class ReplyingClient:
             if self.replies is None
             else self.replies.pop(0)
         )
+        if self.replies is not None and not self.replies:
+            self.drained.set()
         future = asyncio.get_running_loop().create_future()
         if isinstance(reply, Exception):
             future.set_exception(reply)
-        else:
+        elif reply is not PENDING:
             future.set_result(reply)
         return request_id, future
 
@@ -532,6 +560,63 @@ async def test_failures_before_formatting_are_a_500(
     assert response.status_code == 500
     assert await response.get_data(as_text=True) == expected_error
     assert client.aborted == expected_aborted
+
+
+async def _post_then_disconnect(app, path, body, client):
+    """POST over raw ASGI, wait until every request is admitted, then drop the connection.
+
+    Quart's test client runs every request to completion; only an ``http.disconnect`` message
+    makes its ASGI connection cancel the handler, which is the path under test.
+    """
+    payload = json.dumps(body).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.1"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"localhost"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+        "client": ("127.0.0.1", 45678),
+        "server": ("localhost", 80),
+    }
+    incoming = asyncio.Queue()
+    incoming.put_nowait({"type": "http.request", "body": payload, "more_body": False})
+    sent = []
+
+    async def receive():
+        return await incoming.get()
+
+    async def send(message):
+        sent.append(message)
+
+    connection = asyncio.create_task(app(scope, receive, send))
+    # Disconnecting before admission would prove nothing: there would be nothing in flight.
+    await asyncio.wait_for(client.drained.wait(), timeout=10)
+    incoming.put_nowait({"type": "http.disconnect"})
+    await asyncio.wait_for(connection, timeout=10)
+    return sent
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_disconnect_aborts_every_in_flight_request(path):
+    """Every fan-out admission is aborted and nothing is written: the peer is gone."""
+    client = ReplyingClient([PENDING] * 3)
+    app = build_app(path, client)
+
+    sent = await _post_then_disconnect(app, path, FAN_OUT_BODIES[path], client)
+
+    # CancelledError is re-raised rather than turned into a 500; nobody is left to read one.
+    assert client.aborted == [1, 2, 3]
+    assert sent == []
 
 
 @pytest.mark.asyncio

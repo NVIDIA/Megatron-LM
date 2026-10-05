@@ -1962,6 +1962,253 @@ async def test_chat_warns_when_generation_log_probs_are_missing(reply_fields, wa
     assert ("Generation log probs is None" in caplog.text) is warns
 
 
+# The registered parsers end to end: with the model's text fixed, the message is whatever the
+# chain of reasoning and tool parsers makes of it. The table above pins the formatting of a parse
+# result; this one pins what the real parsers produce.
+
+
+class _DecodesTo(Tokenizer):
+    """Detokenizes every generation to one fixed string."""
+
+    def __init__(self, text):
+        self.text = text
+
+    def detokenize(self, token_ids, **kwargs):
+        del token_ids, kwargs
+        return self.text
+
+
+def _qwen_call(name):
+    return f"<tool_call><function={name}><parameter=count>7</parameter></function></tool_call>"
+
+
+_EXECUTE_TOOLS = {
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "execute",
+                "parameters": {"type": "object", "properties": {"count": {"type": "integer"}}},
+            },
+        }
+    ],
+    "tool_choice": "auto",
+}
+_EXECUTE_CALL = [{"name": "execute", "arguments": '{"count": 7}'}]
+_FINISH_TOOLS = {
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "finish",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                },
+            },
+        }
+    ],
+    "tool_choice": "auto",
+}
+_FINISH_CALL = (
+    "</think><tool_call>\n<function=finish>\n<parameter=message>done</parameter>\n</function>\n"
+    "</tool_call>"
+)
+_REASONING_PARSERS = ["nemotron-v3-reasoning", "qwen3-coder-tool"]
+_THINKING = {"chat_template_kwargs": {"enable_thinking": True}}
+# Either opts the request out of reasoning-only replies: the reasoning comes back as content.
+_EXPLICIT_FALLBACKS = {
+    "thinking-disabled": {"chat_template_kwargs": {"enable_thinking": False}},
+    "force-nonempty": {"chat_template_kwargs": {"force_nonempty_content": True}},
+}
+_EMPTY_REASONING = {"empty": "", "close-only": "</think>", "open-close": "<think></think>"}
+# One generated token, and a finish reason whose token budget agrees with it.
+_STOP = {
+    "generated_tokens": [12],
+    "finish_reason": "stop",
+    "sampling_params": {"num_tokens_to_generate": 2},
+}
+_LENGTH = {
+    "generated_tokens": [12],
+    "finish_reason": "length",
+    "sampling_params": {"num_tokens_to_generate": 1},
+}
+_FINISH_REASONS = {"stop": _STOP, "length": _LENGTH}
+
+_REAL_PARSER_ROWS = [
+    # qwen3-coder-tool normalizes the function name before the argument-schema lookup.
+    *(
+        pytest.param(
+            _qwen_call(name),
+            ["qwen3-coder-tool"],
+            _EXECUTE_TOOLS,
+            _STOP,
+            {"content": "", "tool_calls": _EXECUTE_CALL},
+            "tool_calls",
+            id=f"tool-name-{label}",
+        )
+        for label, name in {
+            "plain": "execute",
+            "leading-space": " execute",
+            "trailing-space": "execute ",
+            "surrounding-whitespace": " \texecute\n",
+        }.items()
+    ),
+    # A whitespace-only name, no tools requested, or no parsers: the tool syntax stays text.
+    *(
+        pytest.param(
+            _qwen_call(name), parsers, body, _STOP, {"content": _qwen_call(name)}, "stop", id=label
+        )
+        for label, name, parsers, body in (
+            ("whitespace-only-tool-name", " \t\n", ["qwen3-coder-tool"], _EXECUTE_TOOLS),
+            ("tool-syntax-without-tools", " execute ", ["qwen3-coder-tool"], {}),
+            ("tool-syntax-without-parsers", " execute ", [], _EXECUTE_TOOLS),
+        )
+    ),
+    # Reasoning without a final answer is a null content, as vLLM reports it.
+    *(
+        pytest.param(
+            text,
+            _REASONING_PARSERS,
+            _THINKING,
+            reply,
+            {"content": None, "reasoning_content": reasoning},
+            finish_reason,
+            id=f"reasoning-only-{label}-{finish_reason}",
+        )
+        for label, text, reasoning in (
+            ("unclosed", "still thinking", "still thinking"),
+            ("closed", "thinking</think>", "thinking"),
+        )
+        for finish_reason, reply in _FINISH_REASONS.items()
+    ),
+    *(
+        pytest.param(
+            "still thinking",
+            _REASONING_PARSERS,
+            body,
+            _LENGTH,
+            {"content": "still thinking"},
+            "length",
+            id=f"reasoning-only-{label}-is-content",
+        )
+        for label, body in _EXPLICIT_FALLBACKS.items()
+    ),
+    pytest.param(
+        "thinking</think>answer",
+        _REASONING_PARSERS,
+        _THINKING,
+        _LENGTH,
+        {"content": "answer", "reasoning_content": "thinking"},
+        "length",
+        id="reasoning-then-answer",
+    ),
+    *(
+        pytest.param(
+            reasoning + _FINISH_CALL,
+            _REASONING_PARSERS,
+            {**_THINKING, **_FINISH_TOOLS},
+            _STOP,
+            {
+                "content": "",
+                "reasoning_content": reasoning,
+                "tool_calls": [{"name": "finish", "arguments": '{"message": "done"}'}],
+            },
+            "tool_calls",
+            id=f"{label}-reasoning-then-tool-call",
+        )
+        for label, reasoning in (("some", "thinking"), ("empty", ""))
+    ),
+    # Empty reasoning keeps the parser's marker, so it is reasoning-only too.
+    *(
+        pytest.param(
+            text,
+            _REASONING_PARSERS,
+            _THINKING,
+            reply,
+            {"content": None, "reasoning_content": ""},
+            finish_reason,
+            id=f"empty-reasoning-{label}-{finish_reason}",
+        )
+        for label, text in _EMPTY_REASONING.items()
+        for finish_reason, reply in _FINISH_REASONS.items()
+    ),
+    # Only the EOS token was generated: nothing to decode.
+    pytest.param(
+        "",
+        _REASONING_PARSERS,
+        _THINKING,
+        {**_STOP, "generated_tokens": [2]},
+        {"content": None, "reasoning_content": ""},
+        "stop",
+        id="empty-reasoning-immediate-eos",
+    ),
+    *(
+        pytest.param(
+            text,
+            _REASONING_PARSERS,
+            body,
+            reply,
+            {"content": ""},
+            finish_reason,
+            id=f"empty-reasoning-{label}-{fallback}-{finish_reason}",
+        )
+        for label, text in _EMPTY_REASONING.items()
+        for fallback, body in _EXPLICIT_FALLBACKS.items()
+        for finish_reason, reply in _FINISH_REASONS.items()
+    ),
+    *(
+        pytest.param(
+            text,
+            [],
+            _THINKING,
+            reply,
+            {"content": text},
+            finish_reason,
+            id=f"empty-reasoning-{label}-without-parsers-{finish_reason}",
+        )
+        for label, text in _EMPTY_REASONING.items()
+        for finish_reason, reply in _FINISH_REASONS.items()
+    ),
+    pytest.param(
+        "<think></think>answer",
+        _REASONING_PARSERS,
+        _THINKING,
+        _LENGTH,
+        {"content": "answer", "reasoning_content": ""},
+        "length",
+        id="empty-reasoning-then-answer",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "parsers", "body", "reply", "expected_message", "expected_finish_reason"),
+    _REAL_PARSER_ROWS,
+)
+async def test_chat_real_parsers_shape_the_message(
+    text, parsers, body, reply, expected_message, expected_finish_reason
+):
+    client = ReplyingClient([completed_reply("forced", [10, 11], **reply)])
+    app = build_app(CHAT_PATH, client, parsers=parsers, tokenizer=_DecodesTo(text))
+    budget = reply["sampling_params"]["num_tokens_to_generate"]
+
+    response = await app.test_client().post(
+        CHAT_PATH, json={**CHAT_BODY, "max_completion_tokens": budget, **body}
+    )
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    choice = (await response.get_json())["choices"][0]
+    message = choice["message"]
+    if "tool_calls" in message:
+        # Ids are minted per call; the function is what the parser decided.
+        message["tool_calls"] = [call["function"] for call in message["tool_calls"]]
+    assert message == {"role": "assistant", "generation_log_probs": None, **expected_message}
+    assert choice["finish_reason"] == expected_finish_reason
+
+
 # --- HTTP: streaming ----------------------------------------------------------
 
 
