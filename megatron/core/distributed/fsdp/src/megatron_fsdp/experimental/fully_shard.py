@@ -20,7 +20,6 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
@@ -73,21 +72,19 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 @contextmanager
-def fully_shard_context(device: torch.device | None = None, **kwargs) -> Iterator[FsdpContext]:
+def fully_shard_context(**kwargs) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
     Args:
-        device: CUDA device on which to create communication streams. Defaults to
-            the current CUDA device.
         **kwargs: Options forwarded to :class:`FsdpContext`.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
 
-    context = FsdpContext(device=device, **kwargs)
+    context = FsdpContext(**kwargs)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
