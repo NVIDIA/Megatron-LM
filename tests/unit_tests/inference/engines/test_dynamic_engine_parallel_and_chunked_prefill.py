@@ -44,6 +44,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase,
+    reset_rounder,
     set_rounder,
     skip_if_mamba_sequence_packing_not_available,
 )
@@ -201,8 +202,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
 
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+        Utils.initialize_distributed()
         world_size = torch.distributed.get_world_size()
         min_world_size = tp_size * pp_size * ep_size
         if world_size < min_world_size:
@@ -260,8 +260,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     def test_speculative_decoding_pipeline_parallel(self):
         """Test speculative decoding with pipeline parallelism (pp_size=2)."""
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+        Utils.initialize_distributed()
         world_size = torch.distributed.get_world_size()
         pp_size = 2
         if world_size < pp_size:
@@ -492,8 +491,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     def test_mtp_kv_cache_chunked_prefill(self, transformer_impl, ep_size, dispatcher, monkeypatch):
         """Every backend must consume a carried hidden when a prompt spans multiple steps."""
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+        Utils.initialize_distributed()
         if torch.distributed.get_world_size() < ep_size:
             pytest.skip(f"Test requires at least {ep_size} GPUs")
         skip_if_mamba_sequence_packing_not_available("hybrid")
@@ -1170,8 +1168,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     def test_mtp_kv_cache_inference_optimized(self, num_cuda_graphs):
         """MTP draft KV cache on the inference-optimized transformer (TP=1, dense)."""
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+        Utils.initialize_distributed()
 
         skip_if_mamba_sequence_packing_not_available("hybrid")
 
@@ -1207,8 +1204,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     def test_mtp_kv_cache_inference_optimized_sequence_parallel(self):
         """Same, with TP=2 + SP: the commit pass pads to a TP multiple and scatters."""
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+        Utils.initialize_distributed()
         if torch.distributed.get_world_size() < 2:
             pytest.skip("Test requires at least 2 GPUs")
 
@@ -1398,7 +1394,7 @@ class TestChunkedPrefillCudaGraphs:
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     def _create_model(self, model_provider, num_cuda_graphs, ssm_mixer="mamba"):
