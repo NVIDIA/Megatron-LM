@@ -338,6 +338,11 @@ reducing the affected update difference to 0.0000011%; FP32 addition after BF16
 partial storage cannot recover them. Disabling CPU offload reproduced the same BF16
 update difference.
 
+Planner correctness and CUDA graph replay live in
+`tests/unit_tests/determinism/kernels/test_moe_kernels.py`. Owned-expert checkpoint layout,
+loading across virtual-slot counts, and initialization parity are covered by
+`test_te_grouped_linear_virtual_expert_checkpoint` in the neighboring `test_te_wrappers.py`.
+
 Each layer fixes its local token count on its first forward and rejects later changes.
 The planner specializes on that count, and the layer sizes its transport capacity once.
 

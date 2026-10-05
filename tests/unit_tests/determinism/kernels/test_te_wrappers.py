@@ -45,11 +45,13 @@ pytestmark = pytest.mark.skipif(
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
         TEColumnParallelLinear,
         TEDotProductAttention,
         TEGroupedLinear,
         TELayerNormColumnParallelLinear,
         TENorm,
+        TERowParallelGroupedLinear,
         TERowParallelLinear,
         te_cross_entropy,
     )
@@ -75,6 +77,91 @@ def _config(**overrides):
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize("parallel_mode", ["column", "row"])
+@pytest.mark.parametrize("singleton_local_shards", [False, True])
+def test_te_grouped_linear_virtual_expert_checkpoint(parallel_mode, singleton_local_shards):
+    """Runtime replicas preserve owned initialization and the upstream checkpoint layout."""
+    Utils.initialize_distributed()
+    if torch.distributed.get_world_size() % 2:
+        pytest.skip("requires a world size divisible by EP=2")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    config = _config(
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_grouped_gemm=True,
+        moe_single_grouped_weight=False,
+    )
+    linear = (
+        TEColumnParallelGroupedLinear if parallel_mode == "column" else TERowParallelGroupedLinear
+    )
+
+    def build(num_virtual_experts):
+        return linear(
+            2,
+            128,
+            256,
+            num_virtual_experts=num_virtual_experts,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+            pg_collection=pg,
+        ).cuda()
+
+    try:
+        model_parallel_cuda_manual_seed(123)
+        owned, following_owned = build(0), build(0)
+        model_parallel_cuda_manual_seed(123)
+        virtual, following_virtual = build(2), build(0)
+        assert virtual.num_gemms == 4
+        assert set(dict(virtual.named_parameters())) == {"weight0", "weight1"}
+        assert virtual.state_dict().keys() == owned.state_dict().keys()
+        for index in range(2):
+            assert bytes_equal(getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}"))
+            assert bytes_equal(
+                getattr(following_virtual, f"weight{index}"),
+                getattr(following_owned, f"weight{index}"),
+            )
+
+        metadata = {"dp_cp_group": pg.dp_cp, "singleton_local_shards": singleton_local_shards}
+        expected = owned.sharded_state_dict(prefix="experts.", metadata=metadata)
+        actual = virtual.sharded_state_dict(prefix="experts.", metadata=metadata)
+        assert actual.keys() == expected.keys()
+        for index in range(2):
+            global_expert = torch.distributed.get_rank(pg.ep) * 2 + index
+            shard = actual[f"experts.weight{index}"]
+            reference = expected[f"experts.weight{index}"]
+            assert shard.key == reference.key
+            assert shard.global_shape == reference.global_shape
+            assert shard.global_offset == reference.global_offset
+            assert bytes_equal(shard.data, reference.data)
+            if singleton_local_shards:
+                assert shard.key == f"{global_expert}.experts.weight"
+                assert shard.global_shape == (256, 128)
+                assert shard.global_offset == (0, 0)
+            else:
+                assert shard.global_shape == (4, 256, 128)
+                assert shard.global_offset == (global_expert, 0, 0)
+
+        # Loading in either direction must work regardless of the runtime slot count.
+        with torch.no_grad():
+            for index, parameter in enumerate(virtual.parameters()):
+                parameter.fill_(torch.distributed.get_rank(pg.ep) * 2 + index + 1)
+        owned.load_state_dict(virtual.state_dict(), strict=True)
+        for index in range(2):
+            assert bytes_equal(getattr(owned, f"weight{index}"), getattr(virtual, f"weight{index}"))
+        with torch.no_grad():
+            for parameter in virtual.parameters():
+                parameter.zero_()
+        virtual.load_state_dict(owned.state_dict(), strict=True)
+        for index in range(2):
+            assert bytes_equal(getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}"))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestTEWrappers:

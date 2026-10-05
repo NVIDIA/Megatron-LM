@@ -304,7 +304,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/virtual_expert_triton.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="triton",
-        notes="Alignment-specialized route planning replays bit-exactly in eager and CUDA graphs.",
+        notes="Route planning agrees with an independent CPU oracle for EP=1/2/4/8, skew/ties, "
+        "empty and strided inputs. Cached shapes and alignments replay bit-exactly with changing "
+        "routes in CUDA graphs.",
     ),
     KernelEntry(
         name="moe_utils",
