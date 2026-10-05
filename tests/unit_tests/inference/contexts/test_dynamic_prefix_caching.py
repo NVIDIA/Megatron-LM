@@ -3716,9 +3716,8 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
                     -np.arange(1, len(positions) + 1, dtype=np.float32),
                     expected_block_hash=producer.precomputed_block_hashes[index],
                 )
-            sibling.sampling_params = SamplingParams(
-                return_log_probs=True, skip_prompt_log_probs=False
-            )
+            sibling.sampling_params.return_log_probs = True
+            sibling.sampling_params.skip_prompt_log_probs = False
             sibling._prompt_logprobs_cache_key = key
             match = ctx._compute_prefix_match(sibling, len(s_prompt))
             assert match.backed_off_blocks == match.speculative_reserve_blocks == 1
