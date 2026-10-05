@@ -1070,6 +1070,17 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_cached_recompute_dispatch: bool = False
+    """If True, an activation-recompute re-run of a MoE layer (recompute_granularity 'full', or
+    'selective' with 'moe' in recompute_modules; Megatron's own checkpoint function) dispatches
+    the recomputed tokens through the FORWARD's DeepEP handle -- DeepEP's cached dispatch, the
+    path the combine's backward takes: no get_dispatch_layout, no notify_dispatch, no host wait
+    for the receive counts -- and reuses the forward's dispatched routing and host counts, which
+    the forward keeps for it (moe/cached_recompute.py).  The re-run's rows are bitwise the full
+    dispatch's (the same handle, the same received order).  Requires the flex token dispatcher
+    with the deepep backend; not with fp8/fp4 (the Transformer Engine checkpoint function does
+    not mark the re-run)."""
+
     moe_hybridep_pad_variable_tokens: bool = False
     """Dynamically pad uneven local token counts to the HybridEP group maximum before dispatch.
 
@@ -2676,6 +2687,25 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
+
+        if self.moe_cached_recompute_dispatch:
+            if self.recompute_granularity is None or (
+                self.recompute_granularity == "selective" and "moe" not in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_cached_recompute_dispatch needs the MoE layer to be recomputed: "
+                    "recompute_granularity 'full', or 'selective' with 'moe' in recompute_modules."
+                )
+            if self.fp8 or self.fp4:
+                raise ValueError(
+                    "moe_cached_recompute_dispatch is not supported with fp8/fp4 (the Transformer "
+                    "Engine checkpoint function does not mark the recompute re-run)."
+                )
+            if self.moe_token_dispatcher_type != "flex" or self.moe_flex_dispatcher_backend != "deepep":
+                raise ValueError(
+                    "moe_cached_recompute_dispatch is implemented for the flex token dispatcher "
+                    "with the deepep backend."
+                )
 
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:

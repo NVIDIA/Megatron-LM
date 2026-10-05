@@ -18,9 +18,11 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe import cached_recompute
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
     HYBRIDEP_TOKEN_ALIGNMENT,
+    cached_fused_dispatch,
     deepepv2_combine,
     deepepv2_dispatch,
     ensure_nccl_ep_bootstrapped,
@@ -1434,17 +1436,57 @@ class _DeepepManager(_DispatchManager):
                     "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
-            fused_dispatch(
-                hidden_states,
-                self.token_indices,
-                self.token_probs,
-                self.num_experts,
-                self.group,
-                async_finish=async_finish,
-                allocate_on_comm_stream=allocate_on_comm_stream,
+        # moe_cached_recompute_dispatch (cached_recompute.py): inside a checkpointed forward the
+        # dispatch leaves its bookkeeping for the re-run; the re-run dispatches through it
+        scope = cached_recompute.current() if self.config.moe_cached_recompute_dispatch else None
+        cache = cached_recompute.take(scope[0], self) if scope is not None and scope[1] else None
+        if cache is not None:
+            hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+                cached_fused_dispatch(
+                    hidden_states,
+                    self.token_probs,
+                    self.group,
+                    cache.handle,
+                    cache.dispatched_indices,
+                    cache.dispatched_probs,
+                    cache.tokens_per_expert,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                )
             )
-        )
+        else:
+            if scope is not None and scope[1]:
+                # a re-run whose forward left no bookkeeping under this checkpoint key (a layer
+                # whose forward ran outside the checkpoint that re-runs it, or under another
+                # one): the full dispatch is still correct, only uncached -- say so once per layer
+                if not getattr(self, "_cached_recompute_fallback", False):
+                    self._cached_recompute_fallback = True
+                    logger.warning(
+                        "moe_cached_recompute_dispatch: a MoE layer re-runs without its forward's"
+                        " dispatch bookkeeping (manager %x, %d stashed); falling back to the full"
+                        " dispatch for this layer",
+                        id(self),
+                        cached_recompute.stashed_count(),
+                    )
+            hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+                fused_dispatch(
+                    hidden_states,
+                    self.token_indices,
+                    self.token_probs,
+                    self.num_experts,
+                    self.group,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                )
+            )
+            if scope is not None and not scope[1]:
+                cached_recompute.stash(
+                    scope[0],
+                    self,
+                    cached_recompute.DispatchCache(
+                        handle, num_tokens_per_expert, dispatched_indices, dispatched_probs
+                    ),
+                )
         self.handle = handle
         self.tokens_per_expert = num_tokens_per_expert
         self.dispatched_indices = dispatched_indices
