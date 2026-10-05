@@ -14,21 +14,12 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-# Postpone annotations so FsdpModule references do not require a runtime import
-# back to module.py, which imports this context.
-from __future__ import annotations
-
 from contextvars import ContextVar, Token
-from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
 
 from .indexed_order import IndexedOrder
-
-if TYPE_CHECKING:
-    from .module import FsdpModule
-
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -53,8 +44,8 @@ class FsdpContext:
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder[FsdpModule]
-    backward_order: IndexedOrder[FsdpModule]
+    forward_order: IndexedOrder[nn.Module]
+    backward_order: IndexedOrder[nn.Module]
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
@@ -103,7 +94,7 @@ class FsdpContext:
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
-        self._registered_modules: list[FsdpModule] = []
+        self._registered_modules: list[nn.Module] = []
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
@@ -134,8 +125,8 @@ class FsdpContext:
             _FSDP_CONTEXT.reset(self._context_token)
             self._context_token = None
 
-    def register_module(self, module: FsdpModule) -> None:
-        """Register a module constructed in this context."""
+    def register_module(self, module: nn.Module) -> None:
+        """Register a module after its FSDP initialization completes in this context."""
         if self._is_finalized:
             raise RuntimeError("Cannot register an FSDP module after its context is finalized.")
         self._registered_modules.append(module)
@@ -147,25 +138,24 @@ class FsdpContext:
 
         # Successful FsdpModule initialization registers the module, and fully_shard
         # rejects children from another context. Membership identifies this context's
-        # FSDP modules without importing FsdpModule at runtime.
-        registered_modules = {cast(nn.Module, module) for module in self._registered_modules}
+        # FSDP modules without importing FsdpModule.
+        registered_modules = set(self._registered_modules)
         children: set[nn.Module] = set()
         for module in self._registered_modules:
-            _collect_fsdp_children(cast(nn.Module, module), registered_modules, children)
+            _collect_fsdp_children(module, registered_modules, children)
         # FsdpModules that are not descendants of any other FsdpModule.
         roots = [module for module in self._registered_modules if module not in children]
 
         for root in roots:
             root._is_root = True
-            for name, module in cast(nn.Module, root).named_modules():
+            for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
-                fsdp_module = cast("FsdpModule", module)
-                fsdp_module._name = name
-                self.forward_order.append(fsdp_module)
+                module._name = name
+                self.forward_order.append(module)
 
         for root in reversed(roots):
-            _collect_backward_order(cast(nn.Module, root), registered_modules, self.backward_order)
+            _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -244,11 +234,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: IndexedOrder[FsdpModule]
+    module: nn.Module, registered_modules: set[nn.Module], order: IndexedOrder[nn.Module]
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:
-        order.append(cast("FsdpModule", module))
+        order.append(module)
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)

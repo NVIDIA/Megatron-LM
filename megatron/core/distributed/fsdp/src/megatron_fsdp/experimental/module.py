@@ -133,7 +133,7 @@ class FsdpModule:
         self.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
         if register_hooks:
             self._register_hooks()
-        context.register_module(self)
+        context.register_module(cast(nn.Module, self))
 
     @property
     def context(self) -> FsdpContext:
@@ -305,11 +305,13 @@ class FsdpModule:
             context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+                    cast(IndexedOrder[FsdpModule], context.forward_order),
+                    self._schedule_policy.forward_prefetch_size,
                 )
             elif prefetch == "backward":
                 self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
+                    cast(IndexedOrder[FsdpModule], context.backward_order),
+                    self._schedule_policy.backward_prefetch_size,
                 )
 
     def _prefetch_parameter_groups(
