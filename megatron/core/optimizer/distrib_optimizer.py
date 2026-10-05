@@ -1139,7 +1139,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
-                s["step"] = step
+                s["step"] = step.detach().clone()
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
             # has an extra optimizer state "step".
