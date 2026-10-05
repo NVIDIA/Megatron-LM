@@ -3255,6 +3255,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
+        # Prompt log probs (and prompt top-n log probs) need a logit row for every
+        # prompt position, and the engine files log probs into prompt vs. generated
+        # by counting rows. Skipped positions produce no rows, so compute every
+        # token for such requests. Matched blocks are still shared: writes to them
+        # are redirected to the dummy block in add_request(), as for memory-only
+        # hybrid mode, and no Mamba restore is attempted when the skip is 0.
+        if req.sampling_params.return_log_probs and not req.sampling_params.skip_prompt_log_probs:
+            prefix_skip_tokens = 0
+
         # Clamp so that effective_prefill_chunk_length >= 2 when possible.
         # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
         # which routes the batch into the flash-attention decode kernel and crashes.

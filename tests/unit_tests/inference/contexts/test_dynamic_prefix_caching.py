@@ -1774,7 +1774,11 @@ def test_hybrid_cached_continuation_preserves_recurrent_position(
         if mamba_boundaries is None
         else SimpleNamespace(hash_to_block_id={h: h for h in mamba_boundaries})
     )
-    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    req = SimpleNamespace(
+        finished_chunk_token_count=0,
+        precomputed_block_hashes=hashes,
+        sampling_params=SamplingParams(),
+    )
     bs = ctx.block_size_tokens
     recurrent_position = 0
 
@@ -1811,7 +1815,9 @@ def test_attention_only_cached_continuation_still_skips():
     hashes = list(range(1, 11))
     ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
     req = SimpleNamespace(
-        finished_chunk_token_count=4 * ctx.block_size_tokens, precomputed_block_hashes=hashes
+        finished_chunk_token_count=4 * ctx.block_size_tokens,
+        precomputed_block_hashes=hashes,
+        sampling_params=SamplingParams(),
     )
 
     match = ctx._compute_prefix_match(req, 6 * ctx.block_size_tokens + 2)
@@ -1822,6 +1828,38 @@ def test_attention_only_cached_continuation_still_skips():
     assert match.overall_required_blocks == 11
     assert match.prefix_skip_tokens == 6 * ctx.block_size_tokens
     assert match.effective_prefill_chunk_length == 2
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("skip_prompt_log_probs", [False, True])
+def test_prompt_log_probs_disable_prefix_skip(skip_prompt_log_probs):
+    """Requests needing prompt log probs share matched KV blocks but skip no tokens."""
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = False
+    ctx.mamba_slot_allocator = None
+    hashes = list(range(1, 4))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    req = SimpleNamespace(
+        finished_chunk_token_count=0,
+        precomputed_block_hashes=hashes,
+        sampling_params=SamplingParams(
+            return_log_probs=True, skip_prompt_log_probs=skip_prompt_log_probs
+        ),
+    )
+    prompt_length = 3 * ctx.block_size_tokens + 2
+
+    match = ctx._compute_prefix_match(req, prompt_length)
+
+    assert match.matched_block_ids == hashes
+    assert match.num_blocks_from_pool == 1
+    if skip_prompt_log_probs:
+        assert match.prefix_skip_tokens == 3 * ctx.block_size_tokens
+    else:
+        assert match.prefix_skip_tokens == 0
+    assert match.effective_prefill_chunk_length == prompt_length - match.prefix_skip_tokens
 
 
 def _make_cpu_mamba_slot_allocator(
