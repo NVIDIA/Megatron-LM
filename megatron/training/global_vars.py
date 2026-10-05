@@ -6,7 +6,6 @@ import os
 import signal
 import sys
 from argparse import Namespace
-from dataclasses import asdict
 from datetime import timedelta
 
 import torch
@@ -323,8 +322,7 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        # Keep legacy metadata keys while serializing owned settings directly.
-        wandb_config = {**vars(args), **asdict(cfg.logger), **asdict(cfg.profiling)}
+        wandb_config = vars(args)
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.

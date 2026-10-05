@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Logging services and serialized metadata use their run-owned configuration."""
+"""Logging services use config; argument metadata retains its legacy format."""
 
 import sys
 from argparse import ArgumentParser, Namespace
@@ -114,7 +114,7 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
         factory.assert_not_called()
 
 
-def test_wandb_uses_owned_settings_and_detached_metadata(monkeypatch, tmp_path, run_config):
+def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
     monkeypatch.setattr(global_vars, '_GLOBAL_WANDB_WRITER', None)
@@ -133,8 +133,8 @@ def test_wandb_uses_owned_settings_and_detached_metadata(monkeypatch, tmp_path, 
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)
-    assert kwargs['config']['log_interval'] == 17
-    assert kwargs['config']['run_workload_inspector_server'] is True
+    assert kwargs['config'] is vars(args)
+    assert kwargs['config'] == before
     assert vars(args) == before
 
 
@@ -192,19 +192,18 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
     assert global_vars.get_timers() is timers
 
 
-def test_tensorboard_metadata_uses_config(monkeypatch, run_config):
+def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     from megatron.training import initialize
 
     args = Namespace(iteration=13, log_interval=99, run_workload_inspector_server=False)
     writer = Mock()
     monkeypatch.setattr(initialize, 'get_args', lambda: args)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
-    run_config.logger = LoggerConfig(log_interval=17)
-    run_config.profiling.run_workload_inspector_server = True
+    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
     write_args_to_tensorboard()
-    writer.add_text.assert_any_call('log_interval', '17', global_step=13)
-    writer.add_text.assert_any_call('run_workload_inspector_server', 'True', global_step=13)
-    assert all(call.args != ('log_interval', '99') for call in writer.add_text.call_args_list)
+    assert writer.add_text.call_count == len(vars(args))
+    for name, value in vars(args).items():
+        writer.add_text.assert_any_call(name, str(value), global_step=13)
     assert args.log_interval == 99
     assert args.run_workload_inspector_server is False
 

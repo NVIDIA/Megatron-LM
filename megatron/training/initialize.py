@@ -6,7 +6,6 @@ import os
 import random
 import time
 import warnings
-from dataclasses import asdict
 from datetime import timedelta
 from typing import Optional
 
@@ -507,12 +506,10 @@ def _set_random_seed(
 def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     args = get_args()
-    cfg = get_run_config()
     writer = get_tensorboard_writer()
     if writer:
-        metadata = {**vars(args), **asdict(cfg.logger), **asdict(cfg.profiling)}
-        for name, value in metadata.items():
-            writer.add_text(name, str(value), global_step=args.iteration)
+        for arg in vars(args):
+            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
 
 
 def set_jit_fusion_options(tp_size=None):
