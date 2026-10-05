@@ -9,8 +9,8 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 
 # Avoid the training loop's global state.
 # See https://github.com/NVIDIA/Megatron-LM/issues/7223.
-def forward_backward(
-    model, forward_step, *, num_microbatches=1, loss_scale=1.0, delayed_wgrad_compute=None
+def run_forward_backward_on_microbatches(
+    model, forward_one_microbatch, *, num_microbatches=1, loss_scale=1.0, delayed_wgrad_compute=None
 ):
     """Run a step's microbatches and return detached losses with gradients ready to use.
 
@@ -27,7 +27,7 @@ def forward_backward(
             else contextlib.nullcontext()
         )
         with sync_context:
-            loss = forward_step()
+            loss = forward_one_microbatch()
             (loss * loss_scale).backward()
             if delayed_wgrad_compute is not None:
                 delayed_wgrad_compute()
