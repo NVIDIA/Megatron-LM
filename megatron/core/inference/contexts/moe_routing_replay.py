@@ -9,8 +9,8 @@ import torch
 class MoERoutingReplayCache:
     """Per-block storage for MoE routing replay.
 
-    Stores the expert-routing decisions made during a forward pass so they can be replayed
-    bit-exactly when a paused-and-resumed request continues its prefill.
+    Records the expert choices made during forward passes so a finished request's full routing
+    history may be reconstructed for downstream customers, if so desired.
     The storage is host-only: a Python `dict` keyed by block ID, with ndarray values shaped
     `[block_size_tokens, num_layers, topk]`.
 
