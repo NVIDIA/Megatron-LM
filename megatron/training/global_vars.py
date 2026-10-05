@@ -50,14 +50,11 @@ def get_run_config():
 def get_train_state():
     """Return the mutable state for the current training run.
 
-    Lazily creates a default ``TrainState`` if ``set_global_variables`` was
-    never called (e.g. tests that build args via ``parse_args`` and invoke
-    ``save_checkpoint``/``load_checkpoint`` directly without going through
-    full Megatron initialization).
+    Returns ``None`` if ``set_global_variables`` was never called (e.g. tests that
+    build args via ``parse_args`` and invoke ``save_checkpoint`` directly without
+    going through full Megatron initialization). Checkpointing skips saving the
+    train state in that case; training code always has one.
     """
-    global _GLOBAL_TRAIN_STATE
-    if _GLOBAL_TRAIN_STATE is None:
-        _GLOBAL_TRAIN_STATE = TrainState()
     return _GLOBAL_TRAIN_STATE
 
 

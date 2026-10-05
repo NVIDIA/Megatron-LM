@@ -1134,10 +1134,15 @@ def save_checkpoint(
             gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
             gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
-            train_state_dict = get_train_state().state_dict()
-            train_state_dict["floating_point_operations_so_far"] = torch.tensor(
-                num_floating_point_operations_so_far, dtype=torch.float64
-            )
+            # A missing global train state (e.g. no full Megatron init) means we skip saving
+            # train_state.pt rather than persist a default one that could reset progress on resume.
+            train_state = get_train_state()
+            train_state_dict = None
+            if train_state is not None:
+                train_state_dict = train_state.state_dict()
+                train_state_dict["floating_point_operations_so_far"] = torch.tensor(
+                    num_floating_point_operations_so_far, dtype=torch.float64
+                )
 
             def iter_finalize_fn():
                 prev_iteration = 0
@@ -1178,11 +1183,12 @@ def save_checkpoint(
                 train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
                 train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)
 
-                if MultiStorageClientFeature.is_enabled():
-                    msc = MultiStorageClientFeature.import_package()
-                    msc.torch.save(train_state_dict, train_state_local_filename)
-                else:
-                    torch.save(train_state_dict, train_state_local_filename)
+                if train_state_dict is not None:
+                    if MultiStorageClientFeature.is_enabled():
+                        msc = MultiStorageClientFeature.import_package()
+                        msc.torch.save(train_state_dict, train_state_local_filename)
+                    else:
+                        torch.save(train_state_dict, train_state_local_filename)
 
                 if (
                     args.save_tokenizer_assets
@@ -1196,11 +1202,12 @@ def save_checkpoint(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
 
-                if MultiStorageClientFeature.is_enabled():
-                    msc = MultiStorageClientFeature.import_package()
-                    msc.torch.save(train_state_dict, train_state_global_filename)
-                else:
-                    shutil.copy(train_state_local_filename, train_state_global_filename)
+                if train_state_dict is not None:
+                    if MultiStorageClientFeature.is_enabled():
+                        msc = MultiStorageClientFeature.import_package()
+                        msc.torch.save(train_state_dict, train_state_global_filename)
+                    else:
+                        shutil.copy(train_state_local_filename, train_state_global_filename)
 
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
