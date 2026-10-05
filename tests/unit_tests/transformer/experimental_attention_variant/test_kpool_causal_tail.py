@@ -8,8 +8,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _kpool_compress_keys,
     _kpool_compress_keys_per_seg,
     _kpool_fp8_input,
-    rotate_activation,
     fused_qk_topk_kpool,
+    rotate_activation,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     generate_varlen_mask_params_for_positions,
