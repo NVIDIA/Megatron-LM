@@ -292,11 +292,10 @@ class ImageProcessingConfig:
 
     image_break_token_id: Optional[int] = None
     """Token placed after each row of a dynamic-resolution image's tokens except the last, e.g.
-    Pixtral's [IMG_BREAK]. None lays out each image as one run of image tokens."""
+    [IMG_BREAK]. None lays out each image as one run of image tokens."""
 
     image_end_token_id: Optional[int] = None
-    """Token placed after the last row of a dynamic-resolution image's tokens, e.g. Pixtral's
-    [IMG_END]."""
+    """Token placed after the last row of a dynamic-resolution image's tokens, e.g. [IMG_END]."""
 
     dynamic_resolution_min_patches: int = 1
     """Minimum patches per image; smaller images are upscaled to reach it."""

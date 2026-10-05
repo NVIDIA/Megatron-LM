@@ -2,7 +2,7 @@
 
 """Build a LLaVAModel for inference from a MIMO VLM checkpoint.
 
-The language model is the hybrid model described by the standard model arguments. The vision
+The language model is the hybrid model created with the standard model arguments. The vision
 encoder is the --vision-model-type registry entry, with sizes from the --vision-* arguments where
 given, followed by a two-layer MLP projection at the language model width. The model's sharded
 state dict uses the checkpoint's MIMO key names, so it loads with the standard checkpoint loader.

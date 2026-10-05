@@ -17,6 +17,7 @@ re-exported here for backwards compatibility with older standalone callers.
 """
 
 import json
+import os
 import re
 from functools import partial
 
@@ -85,6 +86,25 @@ def _jsonable_arg_value(value):
 
 def _arg_value_changed(before, after):
     return _jsonable_arg_value(before) != _jsonable_arg_value(after)
+
+
+def _resolution_record(attr, source, parser_value, checkpoint_value, resolved_value, note):
+    """Return the provenance record of one resolved arg, as _print_resolved_args reports it."""
+    return {
+        "attr": attr,
+        "source": source,
+        "parser_value": parser_value,
+        "checkpoint_value": checkpoint_value,
+        "resolved_value": resolved_value,
+        "parser_changed_by_resolution": _arg_value_changed(parser_value, resolved_value),
+        "checkpoint_overridden": (
+            source == "cli"
+            and checkpoint_value is not _MISSING
+            and checkpoint_value is not None
+            and _arg_value_changed(checkpoint_value, resolved_value)
+        ),
+        "note": note,
+    }
 
 
 def _print_resolved_args(title, args):
@@ -201,6 +221,50 @@ def _enable_checkpoint_expert_bias(args):
         args.moe_router_enable_expert_bias = True
 
 
+# Image token roles a Hugging Face tokenizer_config.json can declare, by the arg they fill.
+_TOKENIZER_IMAGE_TOKENS = {
+    'image_token_id': 'image_token',
+    'image_break_token_id': 'image_break_token',
+    'image_end_token_id': 'image_end_token',
+}
+
+
+def _tokenizer_image_token_ids(args):
+    """Return the image token IDs declared by the tokenizer's tokenizer_config.json, by arg name.
+
+    The declarations may be nested (e.g. under a processor section); each declared token is mapped
+    to its ID through added_tokens_decoder.
+    """
+    tokenizer_dir = getattr(args, 'tokenizer_model', None)
+    config_path = os.path.join(tokenizer_dir, 'tokenizer_config.json') if tokenizer_dir else None
+    if config_path is None or not os.path.isfile(config_path):
+        return {}
+    with open(config_path) as f:
+        config = json.load(f)
+    token_ids = {
+        token['content']: int(token_id)
+        for token_id, token in config.get('added_tokens_decoder', {}).items()
+    }
+    declared = {}
+
+    def find(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _TOKENIZER_IMAGE_TOKENS.values() and isinstance(value, str):
+                    declared.setdefault(key, value)
+                find(value)
+        elif isinstance(node, list):
+            for value in node:
+                find(value)
+
+    find(config)
+    return {
+        arg: token_ids[declared[role]]
+        for arg, role in _TOKENIZER_IMAGE_TOKENS.items()
+        if declared.get(role) in token_ids
+    }
+
+
 def _resolve_mimo_vision_args(args, checkpoint_args, user_passed_attrs):
     """Fill the LLaVA vision args of a MIMO checkpoint, recording where each value came from."""
     if 'vision_model_type' not in user_passed_attrs:
@@ -212,12 +276,25 @@ def _resolve_mimo_vision_args(args, checkpoint_args, user_passed_attrs):
     }
     if not spec.dynamic_resolution_max_patches:  # 0 leaves the patch budget to the arguments.
         del sources['dynamic_resolution_max_patches']
-    sources['image_token_id'] = ('checkpoint', getattr(checkpoint_args, 'image_token_id', None))
+    # Image tokens: the tokenizer's declared tokens, else the token the checkpoint recorded.
+    checkpoint_image_token_id = getattr(checkpoint_args, 'image_token_id', None)
+    sources['image_token_id'] = ('checkpoint', checkpoint_image_token_id)
+    tokenizer_ids = _tokenizer_image_token_ids(args)
+    for attr, token_id in tokenizer_ids.items():
+        sources[attr] = ('tokenizer', token_id)
+    tokenizer_image_token_id = tokenizer_ids.get('image_token_id')
+    if None not in (tokenizer_image_token_id, checkpoint_image_token_id) and (
+        tokenizer_image_token_id != checkpoint_image_token_id
+    ):
+        print_rank_0(
+            f"WARNING: the tokenizer declares image token {tokenizer_image_token_id} but the "
+            f"checkpoint recorded {checkpoint_image_token_id}; using the tokenizer's."
+        )
 
     resolution = []
     for attr, (source, value) in sources.items():
         parser_value = getattr(args, attr, _MISSING)
-        checkpoint_value = value if source == 'checkpoint' else _MISSING
+        checkpoint_value = getattr(checkpoint_args, attr, _MISSING)
         if attr in user_passed_attrs:
             source, note = 'cli', 'explicit CLI value preserved'
         else:
@@ -225,20 +302,7 @@ def _resolve_mimo_vision_args(args, checkpoint_args, user_passed_attrs):
             note = f'copied from {source}'
         resolved_value = getattr(args, attr)
         resolution.append(
-            {
-                "attr": attr,
-                "source": source,
-                "parser_value": parser_value,
-                "checkpoint_value": checkpoint_value,
-                "resolved_value": resolved_value,
-                "parser_changed_by_resolution": _arg_value_changed(parser_value, resolved_value),
-                "checkpoint_overridden": (
-                    source == 'cli'
-                    and checkpoint_value not in (_MISSING, None)
-                    and _arg_value_changed(checkpoint_value, resolved_value)
-                ),
-                "note": note,
-            }
+            _resolution_record(attr, source, parser_value, checkpoint_value, resolved_value, note)
         )
     args._vlm_arg_resolution = resolution
 
@@ -374,21 +438,7 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
             note = "not present in checkpoint; kept parser/default value"
 
         resolution.append(
-            {
-                "attr": attr,
-                "source": source,
-                "parser_value": parser_value,
-                "checkpoint_value": checkpoint_value,
-                "resolved_value": resolved_value,
-                "parser_changed_by_resolution": _arg_value_changed(parser_value, resolved_value),
-                "checkpoint_overridden": (
-                    source == "cli"
-                    and checkpoint_value is not _MISSING
-                    and checkpoint_value is not None
-                    and _arg_value_changed(checkpoint_value, resolved_value)
-                ),
-                "note": note,
-            }
+            _resolution_record(attr, source, parser_value, checkpoint_value, resolved_value, note)
         )
 
     args._vlm_arg_resolution = resolution

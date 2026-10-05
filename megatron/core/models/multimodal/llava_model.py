@@ -458,6 +458,9 @@ class LLaVAModel(MegatronModule):
                         pg_collection=self.pg_collection,
                         vp_stage=self.vp_stage,
                     )
+                    # The native 2x2 merger always reduces the image tokens, whatever the
+                    # conv_merging argument says; token accounting must follow it.
+                    self._conv_merging = self._conv_merging or self.vision_model.merger is not None
                 elif vmt == "qwen-vl":
                     num_pos_per_side = int(
                         getattr(vision_transformer_config, 'num_position_embeddings', 2304) ** 0.5

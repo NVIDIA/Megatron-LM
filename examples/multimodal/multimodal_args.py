@@ -51,20 +51,23 @@ def add_multimodal_extra_args(parser):
         "--image-token-id",
         type=int,
         default=None,
-        help="Image placeholder token ID. Defaults to the one the checkpoint was trained with.",
+        help="Image placeholder token ID. For MIMO checkpoints, defaults to the image_token the "
+        "tokenizer's tokenizer_config.json declares, else the ID the checkpoint recorded.",
     )
     group.add_argument(
         "--image-break-token-id",
         type=int,
         default=None,
         help="Inference: token placed after each row of a dynamic-resolution image's tokens "
-        "except the last (Pixtral-style layout).",
+        "except the last (Pixtral-style layout). For MIMO checkpoints, defaults to the "
+        "tokenizer's declared image_break_token.",
     )
     group.add_argument(
         "--image-end-token-id",
         type=int,
         default=None,
-        help="Inference: token placed after the last row of a dynamic-resolution image's tokens.",
+        help="Inference: token placed after the last row of a dynamic-resolution image's tokens. "
+        "For MIMO checkpoints, defaults to the tokenizer's declared image_end_token.",
     )
     group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
