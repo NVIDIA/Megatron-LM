@@ -10,7 +10,8 @@ inference model that may use a different parallelism layout.
 ```
 refit.py            High-level API: swap_model_weights, caching, MXFP8 auto-detection
     |
-planner.py          Centralized plan builder (rank 0 builds, scatters to all)
+planner.py          Local plan builder (every rank all-gathers metadata, replays
+                    the same deterministic schedule, keeps only its own ops)
     |
 execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
@@ -79,6 +80,7 @@ swap_model_weights(None, None, "nccl",
 | `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
+| `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
 
 All backends detect same-rank (local) transfers via `task_id` and
 short-circuit them into direct `tensor.copy_()` instead of going
@@ -87,14 +89,25 @@ through the network stack.
 ## How the Reshard Plan Works
 
 1. Each rank extracts parameter metadata (shape, sharding, TP/EP/PP groups).
-2. Metadata is gathered to rank 0 via `dist.gather_object()`.
-3. Rank 0 builds a complete transfer schedule:
-   - For each destination param, finds the matching source param(s) by name.
-   - Routes to a dimension-specific planner (LCM tiling for standard TP,
+2. Metadata is all-gathered so **every** rank has the full picture
+   (`dist.all_gather_object()`) — no rank-0 bottleneck, no scatter.
+3. Every rank independently replays the **same deterministic schedule**
+   (`_iter_global_transfer_ops`):
+   - Iterate destination ranks, then each rank's destination params in gathered
+     order; for each destination param, find the matching source param(s) by name.
+   - Route to a dimension-specific planner (LCM tiling for standard TP,
      block-interleaved for partitioned params like Mamba `in_proj`).
-   - Produces `TransferOp` pairs with globally unique `task_id` values.
-4. Plans are scattered back; each rank receives only its own send/recv ops.
+   - Assign a monotonic `task_id` per sub-op.  Because the iteration order and
+     counter are a pure function of the gathered metadata, the send op computed
+     on the sender and the recv op computed on the receiver get the **same**
+     `task_id` without any central authority.
+4. Each rank keeps only the ops where it is the sender or receiver.
 5. The plan is cached so repeated refits skip steps 1-4.
+
+The deterministic schedule stays stable when a larger roster is supplied: existing
+transfers keep their `task_id`s and newly appended destination ranks receive new
+ones. Live process-group membership changes and their orchestration remain future
+work; this module does not currently add or remove ranks from a running group.
 
 ## MXFP8 Transform
 
@@ -144,11 +157,12 @@ attribute with the following groups:
 | File | Role |
 |------|------|
 | `refit.py` | Public API, caching, MXFP8 auto-detection |
-| `planner.py` | Centralized plan builder (metadata, LCM/block-interleaved planners) |
+| `planner.py` | Local deterministic plan builder (metadata, LCM/block-interleaved planners) |
 | `execution.py` | Plan executor (send/recv submission, writeback, format conversion) |
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
 | `copy_services/nccl_copy_service.py` | NCCL backend |
 | `copy_services/gloo_copy_service.py` | Gloo backend |
+| `copy_services/nixl_copy_service.py` | NIXL/UCX backend |
 | `copy_services/nvshmem_copy_service.py` | NVSHMEM backend (delegates to `nvshmem_copy_service/`) |
 | `nvshmem_copy_service/` | Full NVSHMEM implementation (planning, memory, kernels, pipeline) |

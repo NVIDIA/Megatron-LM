@@ -87,3 +87,4 @@ MODEL_ARGS:
   --no-rl-persist-cuda-graphs: true
 
 METRICS:
+LAUNCHER: ft_launcher

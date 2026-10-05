@@ -16,6 +16,7 @@ from megatron.core.resharding.copy_services.base import (
     SendOp,
     match_local_ops_by_task_id,
 )
+from megatron.core.resharding.copy_services.nixl_copy_service import NixlCopyService
 
 
 def _t():
@@ -164,3 +165,8 @@ class TestCopyServiceClose:
         assert svc.closed is False
         svc.close()
         assert svc.closed is True
+
+
+def test_nixl_service_skips_redundant_process_group_barrier():
+    """NIXL's ready/data protocol provides its own peer completion."""
+    assert NixlCopyService.requires_process_group_barrier is False

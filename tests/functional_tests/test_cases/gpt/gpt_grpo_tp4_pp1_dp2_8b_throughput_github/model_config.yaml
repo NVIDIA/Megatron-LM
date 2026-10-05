@@ -98,3 +98,4 @@ METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
   - "iteration-time"
+LAUNCHER: ft_launcher

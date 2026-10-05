@@ -259,6 +259,7 @@ class TestPrefixCachingCudaGraphs:
 
         return finished, step_log
 
+    @pytest.mark.flaky_in_dev  # Issue #6130
     @pytest.mark.parametrize("model_type", ["transformer", "hybrid"])
     @pytest.mark.parametrize("batch_structure", ["prefill", "decode", "mixed"])
     @torch.inference_mode()

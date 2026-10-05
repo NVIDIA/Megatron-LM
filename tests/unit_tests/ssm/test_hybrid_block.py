@@ -126,7 +126,7 @@ class TestHybridBlock:
             pg_collection=self.get_pg_collection(),
         )
 
-    def get_dsa_mamba_block(self, layer_pattern, enable_hyper_connections=False):
+    def get_dsa_hybrid_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
         mhc_kwargs = (
             {"enable_hyper_connections": True, "hidden_dropout": 0.0, "mhc_sinkhorn_iterations": 5}
@@ -684,7 +684,7 @@ class TestHybridBlock:
     def test_hyper_connection_dsa_layer_wrappers(self):
         """mHC wraps DeepSeek-style DSA and MLP split layers."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MLP
-        block = self.get_dsa_mamba_block(layer_pattern, enable_hyper_connections=True)
+        block = self.get_dsa_hybrid_block(layer_pattern, enable_hyper_connections=True)
         layers = block.layers
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in layers)
         assert isinstance(layers[0].inner_layer, MambaLayer)
@@ -819,7 +819,7 @@ class TestHybridBlock:
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with absorbed MLA and DSA core attention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
-        block = self.get_dsa_mamba_block(layer_pattern)
+        block = self.get_dsa_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
         assert isinstance(layers[1], TransformerLayer)
@@ -831,7 +831,7 @@ class TestHybridBlock:
         """* and D in the same block fail."""
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
         with pytest.raises(ValueError):
-            block = self.get_dsa_mamba_block(layer_pattern)
+            block = self.get_dsa_hybrid_block(layer_pattern)
 
     def test_mla_layer_types(self):
         """+ builds standard MLA rather than DSA."""

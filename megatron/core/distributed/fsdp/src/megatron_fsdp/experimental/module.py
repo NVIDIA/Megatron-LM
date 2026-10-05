@@ -23,8 +23,8 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
-from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
-from .placement import MeshAxis, Placements
+from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .placement import Placements
 
 
 class FsdpContext:
@@ -104,8 +104,7 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
-        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(
+        assert tuple(placements.dp_axes) == tuple(
             range(mesh.ndim)
         ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         parameter_groups = [
@@ -238,7 +237,7 @@ class FsdpModule:
         if self.is_root():
             allgather_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups(sync_model_weight=True)
+        self._unshard_parameter_groups()
         assert self._unshard_event is not None
         # Compute waits only for this FsdpModule's all-gather (the prefetch below is
         # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -246,9 +245,9 @@ class FsdpModule:
 
         next_module = context.forward_order.next_item(self)
         if next_module is not None:
-            next_module._unshard_parameter_groups(sync_model_weight=True)
+            next_module._unshard_parameter_groups()
 
-    def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
+    def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
@@ -262,10 +261,6 @@ class FsdpModule:
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                if sync_model_weight:
-                    # TODO: After NVIDIA/Megatron-LM#5411 lands, move this sync to the
-                    # optimizer post-step hook instead of running it every microbatch.
-                    group.sync_model_weight_from_main_weight()
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
@@ -308,13 +303,13 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups(sync_model_weight=False)
+        self._unshard_parameter_groups()
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
         next_module = context.backward_order.next_item(self)
         if next_module is not None:
-            next_module._unshard_parameter_groups(sync_model_weight=False)
+            next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -341,7 +336,7 @@ class FsdpModule:
 
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad)
+                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
@@ -362,21 +357,6 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
         _collect_backward_order(child, order)
 
 
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
-
-
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
     parameters: dict[str, nn.Parameter] = {}
 
@@ -387,7 +367,7 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
             parameter_fqn = (
                 f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
             )
-            if contained_in_parameter_group(parameter):
+            if get_containing_parameter_group(parameter) is not None:
                 raise ValueError(
                     f"Parameter {parameter_fqn!r} is already owned by another FsdpModule."
                 )
