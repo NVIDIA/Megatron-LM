@@ -917,6 +917,119 @@ class TestMuonOptimizerMultiRankTP:
         expected = expected_global[tp_rank * local_rows : (tp_rank + 1) * local_rows]
         torch.testing.assert_close(actual, expected)
 
+    def test_optimizer_factory_tags_gtp_remat_sharded_qkv(self):
+        """GTP_remat-sharded QKV weights are tagged from their rows before GTP sharding."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_size = pg_collection.tp.size()
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_query_groups=1,
+            kv_channels=4,
+            tensor_model_parallel_size=tp_size,
+        )
+        model = torch.nn.Module()
+        model.config = transformer_config
+        # [q | k | v] = [8 | 4 | 4] rows: TP shards them, then two GTP_remat ranks shard the
+        # TP-local rows, so this rank holds half of its TP-local rows.
+        tp_local_rows = 16 // tp_size
+        model.linear_qkv = torch.nn.Linear(
+            8, tp_local_rows // 2, bias=False, dtype=torch.float32, device='cuda'
+        )
+        qkv_weight = model.linear_qkv.weight
+        qkv_weight.tensor_model_parallel = True
+        qkv_weight.partition_dim = 0
+        qkv_weight.is_gtp_weight_remat = True
+        qkv_weight._unsharded_shape = torch.Size([tp_local_rows, 8])
+        optimizer_config = OptimizerConfig(
+            optimizer='muon', lr=0.01, use_distributed_optimizer=False, muon_split_qkv=True
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        assert optimizer is not None
+        assert qkv_weight.is_qkv
+        assert qkv_weight.qkv_split_shapes == [8, 4, 4]
+        assert qkv_weight.qkv_split_shapes_global == [8, 4, 4]
+        assert qkv_weight.qkv_split_groups_are_complete == (tp_size == 1)
+
+    @pytest.mark.parametrize("layout", ["projection", "per_head", "global"])
+    def test_muon_optimizer_qkv_split_reconstructs_gtp_remat_shards(self, layout):
+        """QKV splitting runs on the layout rebuilt from padded GTP_remat row shards."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_group = pg_collection.tp
+        tp_size, tp_rank = tp_group.size(), tp_group.rank()
+        # Emulate GTP_remat over the ranks that share this TP rank.
+        gtp_remat_group = pg_collection.dp
+        if gtp_remat_group.size() < 2:
+            pytest.skip("requires at least two ranks per TP rank to emulate GTP_remat")
+        if layout == "global" and tp_size != 2:
+            pytest.skip("requires 2-way tensor parallel")
+        pg_collection.gtp_remat = gtp_remat_group
+        gtp_remat_size, gtp_rank = gtp_remat_group.size(), gtp_remat_group.rank()
+
+        # Seven TP-local rows never divide evenly over GTP_remat ranks, so the shards cut
+        # through projections and heads, and the last shard carries alignment padding.
+        tp_local_rows = 7
+        if layout == "global":
+            # One query group whose q/k/v rows span both TP ranks.
+            split_shapes = [6, 4, 4]
+            global_split_shapes = split_shapes
+        else:
+            # One complete [q | k | v] query group (or three heads) per TP rank.
+            split_shapes = [3, 2, 2]
+            global_split_shapes = split_shapes * tp_size
+
+        def tp_local_grad(rank):
+            grad = torch.arange(tp_local_rows * 4, dtype=torch.float32, device='cuda')
+            return ((grad + rank * grad.numel()) ** 2).view(tp_local_rows, 4)
+
+        pad_rows = (gtp_remat_size - tp_local_rows % gtp_remat_size) % gtp_remat_size
+        shard_rows = (tp_local_rows + pad_rows) // gtp_remat_size
+        shard = slice(gtp_rank * shard_rows, (gtp_rank + 1) * shard_rows)
+        local_grad = F.pad(tp_local_grad(tp_rank), (0, 0, 0, pad_rows))[shard].clone()
+
+        param = torch.nn.Parameter(torch.zeros_like(local_grad))
+        param.partition_dim = 0
+        param.is_gtp_weight_remat = True
+        param.is_qkv = True
+        param.qkv_split_shapes = split_shapes
+        param.qkv_split_shapes_global = global_split_shapes
+        param.qkv_split_heads_are_complete = layout == "per_head"
+        param.qkv_split_groups_are_complete = layout == "projection"
+
+        optimizer = TensorParallelMuon(
+            params=[param],
+            split_qkv=True,
+            split_qkv_per_head=layout == "per_head",
+            is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+            qkv_split_shapes=list(split_shapes),
+            pg_collection=pg_collection,
+            tp_mode="blockwise",
+        )
+
+        def center_rows(x, tp_group=None, partition_dim=None):
+            del tp_group, partition_dim
+            return x - x.mean(dim=-2, keepdim=True)
+
+        optimizer.scaled_orthogonalize_fn = center_rows
+        actual = optimizer.orthogonalize(param, local_grad)
+
+        global_grad = torch.cat([tp_local_grad(rank) for rank in range(tp_size)], dim=0)
+        expected_global = torch.cat(
+            [center_rows(part) for part in torch.split(global_grad, global_split_shapes, dim=0)],
+            dim=0,
+        )
+        expected_tp_local = expected_global[tp_rank * tp_local_rows : (tp_rank + 1) * tp_local_rows]
+        expected = F.pad(expected_tp_local, (0, 0, 0, pad_rows))[shard]
+        torch.testing.assert_close(actual, expected)
+
 
 # All non-custom coefficient types supported by emerging_optimizers.
 _TESTABLE_COEFFICIENT_TYPES = (

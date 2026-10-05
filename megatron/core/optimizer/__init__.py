@@ -820,15 +820,23 @@ def _get_megatron_emerging_optimizer(
                 )
                 tp_size = get_pg_size(tp_group)
                 tp_rank = get_pg_rank(tp_group)
+                # GTP_remat shards dim 0 of the TP-local weight (padded for alignment) without
+                # regard for q/k/v or head boundaries. Muon rebuilds the TP-local rows before
+                # splitting, so check the layout against them rather than this rank's shard.
+                tp_local_rows = (
+                    param._unsharded_shape[0]
+                    if getattr(param, 'is_gtp_weight_remat', False)
+                    else param.shape[0]
+                )
 
-                expected_logical_rows = param.shape[0] * tp_size
+                expected_logical_rows = tp_local_rows * tp_size
                 if expected_logical_rows != sum(logical_split_shapes):
                     log_single_rank(
                         logger,
                         logging.DEBUG,
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"logical_rows={sum(logical_split_shapes)}, "
-                        f"local_rows={param.shape[0]}, tp_size={tp_size}",
+                        f"local_rows={tp_local_rows}, tp_size={tp_size}",
                     )
                     param.is_qkv = False
                     param.qkv_split_shapes = None
@@ -839,17 +847,17 @@ def _get_megatron_emerging_optimizer(
 
                 param.is_qkv = True
                 param.qkv_split_shapes_global = logical_split_shapes
-                local_start = tp_rank * param.shape[0]
+                local_start = tp_rank * tp_local_rows
                 if config.muon_split_qkv_per_head:
                     param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
                         _localize_qkv_split_shapes(
-                            qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
+                            qkv_split_shapes, local_start=local_start, local_rows=tp_local_rows
                         )
                     )
                 else:
                     param.qkv_split_shapes = qkv_split_shapes
                     param.qkv_split_groups_are_complete = _qkv_split_groups_are_complete(
-                        qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
+                        qkv_split_shapes, local_start=local_start, local_rows=tp_local_rows
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).

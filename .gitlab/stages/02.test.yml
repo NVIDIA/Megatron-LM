@@ -82,6 +82,7 @@ test:unit_tests_configure:
         "--dependent-job test:unit_tests_configure"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
+        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)

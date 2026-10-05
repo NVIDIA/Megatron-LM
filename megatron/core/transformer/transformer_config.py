@@ -4262,6 +4262,14 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.ep_overlap_use_scheduled_tensor_release:
+            if self.moe_ncclep_zero_copy:
+                # NCCL-EP zero-copy routes persistent symmetric-memory buffers through the 1F1B
+                # schedule nodes. Scheduled release would take ownership of those shared buffers
+                # and empty their storage, bypassing ScheduleNode's symmetric-memory exemption.
+                raise ValueError(
+                    'moe_ncclep_zero_copy is not supported with '
+                    'ep_overlap_use_scheduled_tensor_release'
+                )
             assert self.overlap_moe_expert_parallel_comm, (
                 'overlap_moe_expert_parallel_comm must be enabled when enabling '
                 'ep_overlap_use_scheduled_tensor_release'

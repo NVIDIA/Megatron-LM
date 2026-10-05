@@ -648,7 +648,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         if hasattr(p, 'clear_high_precision_init_val'):
                             p.clear_high_precision_init_val()
 
-        self.tp_group = self.pg_collection.tp
+        self.tp_group = getattr(self.pg_collection, 'tp', None)
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         for optimizer in optimizers:
             # Child optimizers perform TP duplicate filtering when collecting gradients.

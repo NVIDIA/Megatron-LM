@@ -367,6 +367,7 @@ class TransformerLayerNode(ScheduleNode):
             free_input=free_input,
             name=name,
             tensor_release=tensor_release,
+            ncclep_zero_copy=config.moe_ncclep_zero_copy,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state

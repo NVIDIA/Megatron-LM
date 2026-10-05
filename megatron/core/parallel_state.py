@@ -1353,16 +1353,31 @@ def initialize_model_parallel(
     ), 'Expert generalized tensor parallel group is already initialized'
     # EGTP shard groups are get_ranks('gtp_remat') on the expert generator (singletons when
     # expert_gtp_remat_size == 1). See RankGenerator.get_gtp_ranks.
-    for egtp_ranks in expert_decoder_rank_generator.get_gtp_ranks(expert_gtp_remat_size):
-        group = create_group(
-            egtp_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("expt_gtp_remat", nccl_comm_cfgs),
-            group_desc="EXPERT_GTP_WEIGHT_REMAT_GROUP",
-        )
-        if rank in egtp_ranks:
-            _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
-            _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
+    egtp_rank_lists = expert_decoder_rank_generator.get_gtp_ranks(expert_gtp_remat_size)
+    if gtp_remat_size == 1 and expert_gtp_remat_size == 1:
+        # With GTP_remat and EGTP_remat both inactive, the dense and expert shard groups are the
+        # same singleton {rank}. Reuse the dense group instead of creating a second NCCL process
+        # group: every process group owns watchdog threads until process exit, so redundant
+        # groups accumulate across repeated initialize_model_parallel() calls.
+        for egtp_ranks in egtp_rank_lists:
+            if rank in egtp_ranks:
+                assert list(egtp_ranks) == list(_GTP_WEIGHT_REMAT_GLOBAL_RANKS), (
+                    f"Expected identical singleton GTP/EGTP shard groups, got "
+                    f"{egtp_ranks} and {_GTP_WEIGHT_REMAT_GLOBAL_RANKS}"
+                )
+                _EXPERT_GTP_WEIGHT_REMAT_GROUP = _GTP_WEIGHT_REMAT_GROUP
+                _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
+    else:
+        for egtp_ranks in egtp_rank_lists:
+            group = create_group(
+                egtp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("expt_gtp_remat", nccl_comm_cfgs),
+                group_desc="EXPERT_GTP_WEIGHT_REMAT_GROUP",
+            )
+            if rank in egtp_ranks:
+                _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
+                _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
 
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
@@ -1429,15 +1444,27 @@ def initialize_model_parallel(
     # distinct ranks; see docs/api-guide/core/generalized_tensor_parallel.md §3.3
     # (Optimizer state) for the DCP-collision rationale.
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-gtp_remat-pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_gtp_remat_pp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP",
+    if expert_gtp_remat_size == 1:
+        # Same rank sets as the plain tp-ep-pp groups: alias them rather than creating a
+        # duplicate NCCL process group (see the EGTP shard-group note above).
+        egtp_merged_ranks = expert_decoder_rank_generator.get_ranks('tp-ep-gtp_remat-pp')
+        plain_ranks = expert_decoder_rank_generator.get_ranks('tp-ep-pp')
+        assert sorted(sorted(r) for r in egtp_merged_ranks) == sorted(
+            sorted(r) for r in plain_ranks
+        ), "tp-ep-gtp_remat-pp groups must equal tp-ep-pp groups when expert_gtp_remat_size=1"
+        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = (
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
         )
-        if rank in ranks:
-            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = group
+    else:
+        for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-gtp_remat-pp'):
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_ep_gtp_remat_pp", nccl_comm_cfgs),
+                group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP",
+            )
+            if rank in ranks:
+                _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = group
 
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
@@ -1863,7 +1890,10 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the dynamic context parallel groups the caller rank belongs to."""
-    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+    # Dynamic CP groups are carved from the replicate 'dp-cp' ranks, so compare against the
+    # replicate DP-CP size; the GTP_remat-aware groups are not yet built when this is called
+    # from initialize_model_parallel.
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP

@@ -13,7 +13,7 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
 
     # Checkout latest
     cd /opt

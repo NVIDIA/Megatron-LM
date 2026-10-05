@@ -3297,7 +3297,7 @@ def setup_model_and_optimizer(
 
             # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
             # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
+            if getattr(args, "freeze_all_layers", False):
                 model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
 
             return builder.build_distributed_models(
