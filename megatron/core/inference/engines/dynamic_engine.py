@@ -53,6 +53,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    LiveRequestSnapshot,
     OffloadedRequestPayload,
     RequestPayloadStager,
     RequestPayloadStageResult,
@@ -2329,6 +2330,18 @@ class DynamicInferenceEngine(AbstractEngine):
             ), f"Failed request {failed_request_id} future has not been properly resolved."
             failed_requests.append(failed_entry.future.result())
         return failed_requests
+
+    async def snapshot_live_requests(self) -> List[LiveRequestSnapshot]:
+        """Snapshot every live request for later resumption, on the engine loop while it is live."""
+        if self._loop.is_running() and asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError(
+                "snapshot_live_requests must run on the engine loop while it is running"
+            )
+        return [
+            LiveRequestSnapshot.from_record(entry.record)
+            for entry in self.requests.values()
+            if entry.record[-1].status != Status.FAILED
+        ]
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""

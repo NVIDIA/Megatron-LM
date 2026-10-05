@@ -15,6 +15,7 @@ from megatron.core.inference.inference_request import (
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     InferenceRequest,
+    LiveRequestSnapshot,
     OffloadedRequestPayload,
     Status,
     compute_block_hashes_batched,
@@ -430,6 +431,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     a.generated_text = "foo"
     b.generated_text = "bar"
     a.generated_log_probs = None
+    a.prompt_log_probs = [-1.0, -1.1]
     b.generated_log_probs = [-0.5]
     a.routing_indices = np.array([[1, 2]])
     b.routing_indices = np.array([[3, 4]])
@@ -450,7 +452,14 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     # FinishedRequestRecord mirrors the merged stamps and counts EVICT events.
     finished = FinishedRequestRecord.from_request(merged)
     assert finished.policy_epoch == [(0, 3)] and finished.kv_cache_epoch is None
-    assert finished.num_evictions == 1
+    assert (finished.num_evictions, finished.num_tokens_to_generate) == (1, 8)
+    # A live snapshot is the merged payload and record, keyed like a completion.
+    snapshot = LiveRequestSnapshot.from_record(rec)
+    assert (snapshot.uid, snapshot.request_id, snapshot.record) == (a.uid, 3, finished)
+    payload = snapshot.payload
+    assert (payload.prompt_token_ids, payload.generated_token_ids) == ([1, 2, 3], [10, 11, 12])
+    assert (payload.generated_log_probs, payload.prompt_log_probs) == ([-0.5], [-1.0, -1.1])
+    assert payload.routing_indices.tolist() == [[1, 2], [3, 4]]
 
     class NonComposableTokenizer:
         eod = 0
@@ -864,6 +873,12 @@ def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     request.generated_log_probs = [-0.25]
     record = DynamicInferenceRequestRecord.from_request(request)
     record.checkpoint()
+    # A live snapshot keeps the admission budget and offload params but drops the media; the
+    # record keeps its continuation budget and its media.
+    snapshot = LiveRequestSnapshot.from_record(record)
+    assert (snapshot.uid, snapshot.offload_params) == ("chatcmpl-fixed", {"ng_capture": admission})
+    assert (snapshot.record.num_tokens_to_generate, snapshot.payload.media_tensors) == (5, None)
+    assert record.requests[-1].sampling_params.num_tokens_to_generate == 4
     assert record.requests[-1].media_tensors is media_tensors
     merged = record.merge()
 
