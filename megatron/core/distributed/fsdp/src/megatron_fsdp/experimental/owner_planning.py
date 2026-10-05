@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Owner assignment for MFSDP v2 distributed buffers.
+"""Joint owner assignment across MFSDP v2 distributed buffers.
 
 Tensor shapes and shard ranges come from the buffer's layout and placements.
 Owner assignments use global process ranks.
@@ -43,63 +43,77 @@ def ns_cost_fn(num_ns_steps: int) -> Callable[[torch.Size], int]:
 class _OwnerWork:
     """A tensor's compute cost and eligible owner ranks in buffer order."""
 
+    group_index: int
     tensor_index: int
     cost: float
     candidates: list[int]
 
 
 def assign_owner_work(
-    buffer: DBuffer,
-    tensor_indices: Iterable[int],
+    groups: Iterable[tuple[DBuffer, Iterable[int]]],
     cost_fn: Callable[[torch.Size], float] | None = None,
-) -> dict[int, int]:
-    """Assign each participating tensor to a global rank holding part of it.
+) -> list[dict[int, int]]:
+    """Jointly assign tensors from several buffers to global ranks holding their shards.
 
-    Tensors with a single candidate are assigned first, followed by tensors with
-    multiple candidates in descending cost order. Each tensor is assigned to its
-    least-loaded holder. Ties follow buffer order.
+    Account for single-candidate tensors across all groups first, then assign the remaining
+    tensors in descending cost order across groups. Each tensor goes to its least-loaded
+    holder. Equal-cost tensors follow group order and tensor index; equal-load holders
+    follow buffer offset order. Inputs and cost estimates must be identical across ranks.
 
     Args:
-        buffer: Distributed buffer providing the layout, mesh, and placements.
-        tensor_indices: Indices of participating tensors in `buffer.layout`. The caller
-            selects eligible tensors, for example those with at least two dimensions.
+        groups: Pairs of a DBuffer and its participating tensor indices, in group order.
+            All buffers must share the same DP mesh. Callers select eligible tensors,
+            for example those with at least two dimensions.
         cost_fn: Positive cost estimate from a tensor's full shape. Defaults to
             Newton-Schulz with five iterations.
+
+    Returns:
+        One tensor-index-to-owner mapping per input group, including empty groups.
     """
     if cost_fn is None:
         cost_fn = ns_cost_fn(num_ns_steps=5)
 
-    layout = buffer.layout
-    mesh = buffer.mesh
-    rank_ranges = {
-        rank: layout.get_rank_range(mesh, buffer.placements, rank)
-        for rank in mesh.mesh.flatten().tolist()
-    }
-    # Offset order, rather than global rank order, determines load-balancing ties.
-    ranks_in_buffer_order = sorted(rank_ranges, key=lambda rank: (rank_ranges[rank].start, rank))
-
+    groups = list(groups)
+    if not groups:
+        return []
+    mesh = groups[0][0].mesh
+    ranks = mesh.mesh.flatten().tolist()
+    assignments: list[dict[int, int]] = [{} for _ in groups]
     work_items: list[_OwnerWork] = []
-    for tensor_index in tensor_indices:
-        tensor_range = layout.get_tensor_range(tensor_index)
-        candidates = [
-            rank
-            for rank in ranks_in_buffer_order
-            if intersect_ranges(tensor_range, rank_ranges[rank]).numel > 0
-        ]
-        shape = layout.tensor_shapes[tensor_index]
-        if not candidates:
-            raise RuntimeError(
-                f"No eligible owner for tensor {tensor_index} with shape {shape}; "
-                "no rank owns a shard."
+    for group_index, (buffer, tensor_indices) in enumerate(groups):
+        if buffer.mesh != mesh:
+            raise ValueError(
+                "`assign_owner_work` requires every buffer to share the same DP mesh; "
+                f"group {group_index}'s mesh differs from group 0's. Balance groups per mesh."
             )
-        work_items.append(_OwnerWork(tensor_index, cost_fn(shape), candidates))
+        layout = buffer.layout
+        rank_ranges = {rank: layout.get_rank_range(mesh, buffer.placements, rank) for rank in ranks}
+        # Offset order, rather than global rank order, determines load-balancing ties.
+        ranks_in_buffer_order = sorted(
+            rank_ranges, key=lambda rank: (rank_ranges[rank].start, rank)
+        )
+        for tensor_index in tensor_indices:
+            tensor_range = layout.get_tensor_range(tensor_index)
+            candidates = [
+                rank
+                for rank in ranks_in_buffer_order
+                if intersect_ranges(tensor_range, rank_ranges[rank]).numel > 0
+            ]
+            shape = layout.tensor_shapes[tensor_index]
+            if not candidates:
+                raise RuntimeError(
+                    f"No eligible owner for tensor {tensor_index} with shape {shape}; "
+                    "no rank owns a shard."
+                )
+            work_items.append(_OwnerWork(group_index, tensor_index, cost_fn(shape), candidates))
 
-    work_items.sort(key=lambda item: (len(item.candidates) > 1, -item.cost))
+    work_items.sort(
+        key=lambda item: (len(item.candidates) > 1, -item.cost, item.group_index, item.tensor_index)
+    )
 
-    running_cost: dict[int, float] = {rank: 0.0 for rank in rank_ranges}
-    assignments: dict[int, int] = {}
+    running_cost: dict[int, float] = {rank: 0.0 for rank in ranks}
     for item in work_items:
         owner = min(item.candidates, key=lambda rank: running_cost[rank])
-        assignments[item.tensor_index] = owner
+        assignments[item.group_index][item.tensor_index] = owner
         running_cost[owner] += item.cost
     return assignments

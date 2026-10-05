@@ -57,7 +57,7 @@ def test_assign_owner_work(shapes, offsets, size, ranks, indices, expected, dist
         pytest.skip("Rank is outside the test mesh.")
     layout = _layout(shapes, offsets, size, mesh.size())
     buffer = DBuffer(mesh, [RowAtomic()], layout, torch.float32, distributed_setup.device)
-    assert assign_owner_work(buffer, iter(indices)) == expected
+    assert assign_owner_work([(buffer, iter(indices))]) == [expected]
 
 
 def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
@@ -70,7 +70,7 @@ def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
         distributed_setup.device,
     )
     with pytest.raises(RuntimeError, match="No eligible owner for tensor 0"):
-        assign_owner_work(buffer, [0])
+        assign_owner_work([(buffer, [0])])
 
 
 def test_ns_cost_uses_full_shape():
@@ -85,7 +85,7 @@ def test_assign_owner_work_uses_buffer_placements(distributed_setup):
         mesh, [Replicate(), RowAtomic()], layout, torch.float32, distributed_setup.device
     )
     # Every rank holds the tensor; a hard-coded all-RowAtomic layout picks the last rank.
-    assert assign_owner_work(buffer, [0]) == {0: 0}
+    assert assign_owner_work([(buffer, [0])]) == [{0: 0}]
 
 
 def test_assign_owner_work_custom_selection_and_cost(distributed_setup):
@@ -100,6 +100,6 @@ def test_assign_owner_work_custom_selection_and_cost(distributed_setup):
         return shape.numel()
 
     indices = (i for i, shape in enumerate(buffer.layout.tensor_shapes) if len(shape) >= 2)
-    tensor_to_owner = assign_owner_work(buffer, indices, cost_fn=cost)
+    (tensor_to_owner,) = assign_owner_work([(buffer, indices)], cost_fn=cost)
     assert set(tensor_to_owner) == {0, 2}
     assert seen_shapes == [torch.Size((6, 3)), torch.Size((4, 2))]
