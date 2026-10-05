@@ -226,8 +226,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     assert parameter_group.post_optimizer_model_weight.placements == (RowAtomic(),)
 
     optimizer_state_nbytes = sum(
-        state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
-        for state in optimizer.state.values()
+        state["exp_avg"].nbytes + state["exp_avg_sq"].nbytes for state in optimizer.state.values()
     )
     # Resting memory holds one replicated BF16 model weight, one sharded BF16
     # main gradient, and three sharded FP32 buffers: main weight and two Adam states.
