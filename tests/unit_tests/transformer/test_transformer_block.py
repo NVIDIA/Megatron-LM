@@ -1,8 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
-from dataclasses import replace
 from contextlib import nullcontext
+from dataclasses import replace
 
 import pytest
 import torch
