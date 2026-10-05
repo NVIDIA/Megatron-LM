@@ -14,6 +14,8 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
+# Defer annotation evaluation on Python 3.12/3.13 so FsdpContext can stay under
+# TYPE_CHECKING. Importing it at runtime would cycle: context.py imports FsdpModule.
 from __future__ import annotations
 
 import enum
