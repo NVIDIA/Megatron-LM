@@ -53,7 +53,7 @@ _ZERO2_SHARD = Placements(
 )
 
 
-_FLAT_SHARD = Placements(
+_ZERO3_SHARD = Placements(
     dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
 )
 
@@ -155,12 +155,12 @@ def _train(
 
 @pytest.mark.parametrize(
     "dense_placements",
-    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
+    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _ZERO3_SHARD],
     ids=["no-shard", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize(
     "moe_placements",
-    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
+    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _ZERO3_SHARD],
     ids=["no-shard", "zero1", "zero2", "zero3"],
 )
 def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements, moe_placements):
@@ -260,10 +260,3 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
         torch.stack(reference_losses),
         msg="EP=4 mFSDP model did not reproduce full-batch EP=1 training.",
     )
-
-    # Destroy the groups this test created; leave the default (world) group for later tests.
-    # A mesh dim that spans every rank is backed by the default group rather than a fresh one
-    # (e.g. "ep" here when edp_size == 1).
-    for group in (one, ep_group, expert_dp_group):
-        if group is not dist.group.WORLD:
-            dist.destroy_process_group(group)

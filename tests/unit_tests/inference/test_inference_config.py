@@ -141,14 +141,73 @@ class TestInferenceConfig:
         config = MultimodalPromptConfig.from_dict(
             {
                 "image_spec": {"model_token": "<image>", "prefix": "<img>"},
-                "video_spec": {"model_token": "<video>", "suffix": "</video>"},
+                "video_spec": {
+                    "model_token": "<video>",
+                    "suffix": "</video>",
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                },
+                "content_part_order": "media_first",
             }
         )
 
+        assert config.content_part_order == "media_first"
         assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
-        assert config.get_spec("video") == MediaPromptSpec(model_token="<video>", suffix="</video>")
+        assert config.get_spec("video") == MediaPromptSpec(
+            model_token="<video>",
+            suffix="</video>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
         with pytest.raises(ValueError, match="Unsupported media modality"):
             config.get_spec("audio")
+
+    def test_multimodal_prompt_config_partial_override_preserves_wrapper_defaults(self):
+        defaults = MultimodalPromptConfig(
+            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
+            content_part_order="media_first",
+        )
+
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "video_spec": {
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                }
+            },
+            defaults=defaults,
+        )
+
+        assert config.video_spec == MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+        assert config.content_part_order == "media_first"
+
+    def test_multimodal_prompt_config_rejects_invalid_content_part_order(self):
+        with pytest.raises(ValueError, match="content_part_order"):
+            MultimodalPromptConfig(content_part_order="interleave")
+
+    def test_media_prompt_timestamps_require_temporal_expansion(self):
+        with pytest.raises(ValueError, match="requires"):
+            MediaPromptSpec(include_frame_timestamps_for_nemotron_vl=True)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "error"),
+        [
+            ({"dynamic_resolution_rounding_mode": "floor"}, "rounding_mode"),
+            ({"dynamic_resolution_resize_mode": "nearest"}, "resize_mode"),
+            ({"dynamic_resolution_model_length": 4}, "greater than 4"),
+        ],
+    )
+    def test_image_processing_config_rejects_invalid_dynamic_resolution_options(
+        self, kwargs, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            ImageProcessingConfig(patch_dim=14, **kwargs)
 
     def test_video_processing_config_preserves_image_contract_and_defaults(self):
         image_config = ImageProcessingConfig(
@@ -306,9 +365,11 @@ def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
+    layers = [SimpleNamespace(mixer=mixer) for mixer in mixers]
     decoder = SimpleNamespace(
         layer_type_list=[Symbols.MAMBA] * len(mixers),
-        layers=[SimpleNamespace(mixer=mixer) for mixer in mixers],
+        layers=layers,
+        physical_layers=lambda: tuple(layers),
         mamba_state_shapes_per_request=lambda: ((16, 4), (2, 8, 16)),
     )
     return SimpleNamespace(

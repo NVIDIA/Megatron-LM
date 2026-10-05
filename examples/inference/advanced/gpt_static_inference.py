@@ -33,6 +33,7 @@ from examples.inference.utils import build_requests
 from megatron.inference.utils import add_inference_args, get_model_for_inference
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.initialize import initialize_megatron
+from megatron.training.global_vars import initialize_runtime_services
 
 
 def add_static_inference_args(parser):
@@ -131,6 +132,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     model = get_model_for_inference()

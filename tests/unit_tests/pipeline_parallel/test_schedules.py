@@ -27,9 +27,16 @@ from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.fixture(autouse=True)
+def reset_dsa_loss_scale():
+    yield
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
 
 def test_reset_activation_offload_uses_language_model_group(mocker):
@@ -106,6 +113,15 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert out.nelement() == 6
+
+
+def test_deallocate_output_tensor_rejects_view():
+    """The view guard is back: pseudo-freeing a view reclaims nothing."""
+    base = torch.arange(6.0, requires_grad=True)
+    out = base.view(2, 3)
+    assert out._base is base
+    with pytest.raises(AssertionError, match="counter-productive"):
+        schedule.deallocate_output_tensor(out, deallocate_pipeline_outputs=True)
 
 
 @contextmanager
