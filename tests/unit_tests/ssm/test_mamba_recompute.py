@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
+
 import pytest
 import torch
 
@@ -13,6 +15,111 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 _TP_GROUP = object()
 _INFERENCE_CONTEXT = object()
 _PACKED_SEQ_PARAMS = object()
+
+
+@pytest.mark.internal
+class TestMambaModelRecompute:
+    """Compare real Mamba kernels and parameter gradients with checkpointing enabled."""
+
+    @pytest.mark.parametrize("use_mem_eff_path", [True, False])
+    @pytest.mark.parametrize("tp_size,sequence_parallel", [(1, False), (2, False), (2, True)])
+    def test_forward_backward_parity(self, tp_size, sequence_parallel, use_mem_eff_path):
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+        from megatron.core.ssm.mamba_mixer import MambaMixer
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(tp_size, 1)
+        try:
+            model_parallel_cuda_manual_seed(123)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+            def build_model(recompute):
+                config = TransformerConfig(
+                    hidden_size=256,
+                    num_layers=1,
+                    num_attention_heads=4,
+                    tensor_model_parallel_size=tp_size,
+                    sequence_parallel=sequence_parallel,
+                    use_cpu_initialization=True,
+                    use_mamba_mem_eff_path=use_mem_eff_path,
+                    hidden_dropout=0.0,
+                    attention_dropout=0.0,
+                    recompute_granularity="selective" if recompute else None,
+                    recompute_modules=["mamba"],
+                )
+                return (
+                    HybridModel(
+                        config,
+                        hybrid_stack_spec,
+                        vocab_size=128,
+                        max_sequence_length=32,
+                        hybrid_layer_pattern="M",
+                        parallel_output=False,
+                        pg_collection=pg_collection,
+                    )
+                    .cuda()
+                    .train()
+                )
+
+            baseline = build_model(False)
+            recomputed = build_model(True)
+            recomputed.load_state_dict(baseline.state_dict())
+            mixer = recomputed.decoder.layers[0].mixer
+            assert isinstance(mixer, MambaMixer)
+            mixer_grad_modes = []
+            hook = mixer.register_forward_hook(
+                lambda _module, _inputs, _output: mixer_grad_modes.append(torch.is_grad_enabled())
+            )
+            input_ids = torch.arange(64, device="cuda").reshape(2, 32)
+            position_ids = torch.arange(32, device="cuda").expand(2, -1)
+            baseline_logits = baseline(input_ids, position_ids, attention_mask=None)
+            recomputed_logits = recomputed(input_ids, position_ids, attention_mask=None)
+            torch.testing.assert_close(recomputed_logits, baseline_logits, rtol=0, atol=0)
+            baseline_logits.float().square().mean().backward()
+            recomputed_logits.float().square().mean().backward()
+            hook.remove()
+            assert mixer_grad_modes == [False, True], "The real mixer must run again in backward."
+
+            baseline_parameters = dict(baseline.named_parameters())
+            for name, parameter in recomputed.named_parameters():
+                reference_gradient = baseline_parameters[name].grad
+                assert parameter.grad is not None, f"Missing recomputed gradient: {name}"
+                assert reference_gradient is not None, f"Missing baseline gradient: {name}"
+                assert torch.isfinite(parameter.grad).all(), f"Non-finite gradient: {name}"
+                torch.testing.assert_close(parameter.grad, reference_gradient, rtol=1e-5, atol=1e-6)
+        finally:
+            Utils.destroy_model_parallel()
+
+
+def test_mamba_recompute_warns_with_shortcut_moe():
+    with pytest.warns(UserWarning, match="Mamba mixer recomputation is not supported"):
+        TransformerConfig(
+            hidden_size=256,
+            num_layers=2,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            moe_shortcut_connection=True,
+            recompute_granularity="selective",
+            recompute_modules=["mamba"],
+        )
+
+
+@pytest.mark.parametrize(("shortcut_moe", "modules"), [(False, ["mamba"]), (True, ["layernorm"])])
+def test_mamba_recompute_warning_only_for_shortcut_moe(shortcut_moe, modules):
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        TransformerConfig(
+            hidden_size=256,
+            num_layers=2,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            moe_shortcut_connection=shortcut_moe,
+            recompute_granularity="selective",
+            recompute_modules=modules,
+        )
+    assert not any("Mamba mixer recomputation" in str(w.message) for w in recorded)
 
 
 class _RecordingMixer(torch.nn.Module):
