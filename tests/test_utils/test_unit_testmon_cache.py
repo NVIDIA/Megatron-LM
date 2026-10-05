@@ -340,49 +340,68 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "error",
         "invalid",
         "identity-error",
-        "api-error",
-        "info-error",
+        "artifact-error",
+        "artifact-skipped",
+        "empty-artifact-dir",
+        "artifact-missing",
+        "missing-metadata",
+        "missing-files",
+        "invalid-metadata",
+        "invalid-metadata-type",
+        "string-file-count",
+        "boolean-file-count",
+        "negative-file-count",
+        "fractional-file-count",
         "truncated-files",
         "empty-pr",
         "too-many-files",
-        "changed-pr-before",
-        "changed-pr-during",
-        "recheck-api-error",
+        "wrong-sha",
     ],
 )
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     generation, source_tree, tmp_path, restore
 ):
     directory, identity = generation
-    # Mandatory mappings use only the PR's files. Exercise the actual resolver
-    # with a paginated API fixture, and reject any git baseline-diff commands.
+    # Every bucket consumes the same immutable artifact without querying GitHub
+    # or comparing the PR commit with the Testmon baseline.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    fake_gh = fake_bin / "gh"
-    fake_gh.write_text(
-        "#!/bin/sh\n"
-        'echo "$*" >> "$GH_LOG"\n'
-        '[ "$1" = "api" ] || exit 2\n'
-        'if [ "$2" = "--paginate" ]; then\n'
-        '  [ "$3" = "repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100" ] '
-        '&& [ "$4" = "--jq" ] && [ "$5" = ".[].filename" ] || exit 2\n'
-        '  [ "$GH_FAIL" = "true" ] && exit 1\n'
-        '  if [ "$GH_EMPTY" != "true" ]; then\n'
-        '    printf "megatron/core/a.py\\ntests/unit_tests/test_b.py\\n"\n'
-        "  fi\n"
-        "else\n"
-        '  [ "$2" = "repos/NVIDIA/Megatron-LM/pulls/7824" ] '
-        '&& [ "$3" = "--jq" ] && [ "$4" = ".merge_commit_sha" ] || exit 2\n'
-        '  [ "$GH_RECHECK_FAIL" = "true" ] && exit 1\n'
-        '  printf "%s\\n" "$GH_MERGE_SHA"\n'
-        "fi\n"
+    command_log = tmp_path / "unexpected-commands.log"
+    for name in ("gh", "git"):
+        fake_command = fake_bin / name
+        fake_command.write_text('#!/bin/sh\necho "$0 $*" >> "$COMMAND_LOG"\nexit 99\n')
+        fake_command.chmod(0o755)
+    expected_files = (
+        [] if restore == "empty-pr" else ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
     )
-    fake_gh.chmod(0o755)
-    gh_log = tmp_path / "gh.log"
-    fake_git = fake_bin / "git"
-    fake_git.write_text('#!/bin/sh\necho "git $*" >> "$GIT_LOG"\nexit 99\n')
-    fake_git.chmod(0o755)
-    git_log = tmp_path / "git.log"
+    pr_files_dir = tmp_path / "pr-files"
+    pr_files_dir.mkdir()
+    (pr_files_dir / "changed-files").write_text("".join(f"{path}\n" for path in expected_files))
+    metadata = {
+        "tested_sha": ("d" if restore == "wrong-sha" else "c") * 40,
+        "changed_files": {
+            "empty-pr": 0,
+            "truncated-files": 3,
+            "too-many-files": 3001,
+            "string-file-count": "2",
+            "boolean-file-count": True,
+            "negative-file-count": -1,
+            "fractional-file-count": 1.5,
+        }.get(restore, 2),
+    }
+    metadata_file = pr_files_dir / "metadata.json"
+    metadata_file.write_text(json.dumps(metadata))
+    if restore == "artifact-missing":
+        shutil.rmtree(pr_files_dir)
+    elif restore == "missing-metadata":
+        metadata_file.unlink()
+    elif restore == "missing-files":
+        (pr_files_dir / "changed-files").unlink()
+    elif restore == "invalid-metadata":
+        metadata_file.write_text("{")
+    elif restore == "invalid-metadata-type":
+        metadata_file.write_text("[]")
+    artifact_before = _snapshot(pr_files_dir) if pr_files_dir.exists() else {}
     if restore == "different-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", "sha256:" + "c" * 64)
     elif restore == "missing-image":
@@ -412,23 +431,13 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
             "PATH": os.pathsep.join(
                 (str(fake_bin), str(Path(sys.executable).parent), os.environ["PATH"])
             ),
-            "GIT_LOG": str(git_log),
-            "GH_LOG": str(gh_log),
-            "GH_FAIL": "true" if restore == "api-error" else "false",
-            "GH_EMPTY": "true" if restore == "empty-pr" else "false",
-            "GH_RECHECK_FAIL": "true" if restore == "recheck-api-error" else "false",
-            "GH_MERGE_SHA": ("d" if restore == "changed-pr-during" else "c") * 40,
-            "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
-            "PR_INFO_OUTCOME": "failure" if restore == "info-error" else "success",
-            "PR_NUMBER": "7824",
+            "COMMAND_LOG": str(command_log),
+            "PR_FILES_OUTCOME": {"artifact-error": "failure", "artifact-skipped": "skipped"}.get(
+                restore, "success"
+            ),
+            "PR_FILES_DIR": "" if restore == "empty-artifact-dir" else str(pr_files_dir),
             # The tested PR commit is deliberately independent of baseline b*40.
-            "PR_MERGE_SHA": ("d" if restore == "changed-pr-before" else "c") * 40,
             "TESTED_SHA": "c" * 40,
-            "PR_CHANGED_FILES": {
-                "truncated-files": "3",
-                "empty-pr": "0",
-                "too-many-files": "3001",
-            }.get(restore, "2"),
             "REQUESTED_MODE": "enforce",
             "IDENTITY_OUTCOME": "failure" if restore == "identity-error" else "success",
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
@@ -449,47 +458,16 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     after.pop("summary.md", None)
     changed_files = after.pop("changed-files", None)
     assert after == before
-    assert not git_log.exists()
-    expected_gh = []
-    if valid or restore in {
-        "api-error",
-        "truncated-files",
-        "changed-pr-during",
-        "recheck-api-error",
-    }:
-        expected_gh.append(
-            "api --paginate repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100 "
-            "--jq .[].filename"
-        )
-    if valid or restore in {"changed-pr-during", "recheck-api-error"}:
-        expected_gh.append("api repos/NVIDIA/Megatron-LM/pulls/7824 --jq .merge_commit_sha")
-    if expected_gh:
-        assert gh_log.read_text().splitlines() == expected_gh
-    else:
-        assert not gh_log.exists()
+    assert not command_log.exists()
+    assert (_snapshot(pr_files_dir) if pr_files_dir.exists() else {}) == artifact_before
     if valid:
         assert "b" * 40 in summary.read_text()
-        expected_files = (
-            [] if restore == "empty-pr" else ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
-        )
         assert f"Changed files in PR: {len(expected_files)}" in summary.read_text()
         assert changed_files is not None
         assert changed_files[0].decode().splitlines() == expected_files
     else:
         assert "without recording or saving" in summary.read_text()
-        if restore in {
-            "api-error",
-            "info-error",
-            "truncated-files",
-            "too-many-files",
-            "changed-pr-before",
-            "changed-pr-during",
-            "recheck-api-error",
-        }:
-            assert (
-                "unable to read the complete PR changed-file list for the tested commit; "
-                "running the full bucket without recording or saving"
-            ) in summary.read_text()
+        assert changed_files is None
 
 
 @pytest.mark.parametrize(

@@ -74,6 +74,10 @@ inputs:
     description: "Baseline source branch. Selective unit tests currently support main only."
     required: false
     default: ""
+  unit_test_pr_files_artifact_id:
+    description: "Artifact containing the validated PR file list from the configure job."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -176,11 +180,26 @@ runs:
         key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
 
-    - name: Get PR info for mandatory unit tests
-      id: unit-test-pr-info
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-      uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+    - name: Prepare PR file download
+      id: unit-test-pr-files-directory
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
+      shell: bash -e -u -o pipefail {0}
       continue-on-error: true
+      run: |
+        # Keep the artifact separate from the restored Testmon cache. A fresh
+        # directory also prevents a failed download from reusing stale files.
+        PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/unit-test-pr-files.XXXXXX")
+        echo "path=$PR_FILES_DIR" >> "$GITHUB_OUTPUT"
+
+    - name: Download PR files for mandatory unit tests
+      id: download-unit-test-pr-files
+      if: steps.unit-test-pr-files-directory.outcome == 'success'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      continue-on-error: true
+      with:
+        artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
+        path: ${{ steps.unit-test-pr-files-directory.outputs.path }}
+        merge-multiple: true
 
     - name: Resolve unit Testmon mode
       id: unit-testmon
@@ -191,12 +210,9 @@ runs:
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
-        PR_INFO_OUTCOME: ${{ steps.unit-test-pr-info.outcome }}
-        PR_NUMBER: ${{ fromJSON(steps.unit-test-pr-info.outputs.pr-info || '{}').number }}
-        PR_CHANGED_FILES: ${{ fromJSON(steps.unit-test-pr-info.outputs.pr-info || '{}').changed_files }}
-        PR_MERGE_SHA: ${{ fromJSON(steps.unit-test-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+        PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
+        PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
         TESTED_SHA: ${{ inputs.sha || github.sha }}
-        GH_TOKEN: ${{ github.token }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -212,20 +228,16 @@ runs:
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
-              # Mandatory mappings use only the PR's files, independently of
-              # Testmon's baseline. The PR-files API returns at most 3,000 files.
-              # Check the PR revision before and after fetching its file list.
-              if [[ "$PR_INFO_OUTCOME" == "success" \
-                    && "$PR_MERGE_SHA" == "$TESTED_SHA" \
-                    && "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
-                    && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
-                    && "$PR_CHANGED_FILES" -le 3000 ]] \
-                && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-                  --jq '.[].filename' > assets_dir/testmon/changed-files \
-                && CHANGED_FILES=$(wc -l < assets_dir/testmon/changed-files | tr -d ' ') \
+              # Configure fetches the PR's files once for all buckets. The
+              # artifact is tied to the tested commit, not the Testmon baseline.
+              if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
+                && PR_CHANGED_FILES=$(jq -er --arg sha "$TESTED_SHA" \
+                  'select(.tested_sha == $sha) | .changed_files |
+                   select(type == "number" and . >= 0 and . <= 3000 and floor == .)' \
+                  "$PR_FILES_DIR/metadata.json") \
+                && CHANGED_FILES=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
                 && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
-                && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
-                && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]]; then
+                && cp "$PR_FILES_DIR/changed-files" assets_dir/testmon/changed-files; then
                 EFFECTIVE_MODE=enforce
               else
                 EFFECTIVE_MODE=full

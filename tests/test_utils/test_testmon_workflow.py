@@ -160,6 +160,133 @@ def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> N
     assert (result.returncode == 0) == (source_ref == "refs/heads/main")
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "valid",
+        "empty-pr",
+        "too-many-files",
+        "truncated-files",
+        "api-error",
+        "changed-pr-before",
+        "changed-pr-during",
+        "recheck-api-error",
+        "invalid-pr-number",
+        "invalid-tested-sha",
+        "invalid-file-count",
+    ],
+)
+def test_shared_pr_files_producer_validates_complete_files_for_tested_commit(
+    tmp_path: Path, shell_environment: dict[str, str], scenario: str
+) -> None:
+    gh = tmp_path / "bin/gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'echo "$*" >> "$GH_LOG"\n'
+        '[ "$1" = "api" ] || exit 2\n'
+        'if [ "$2" = "--paginate" ]; then\n'
+        '  [ "$3" = "repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100" ] '
+        '&& [ "$4" = "--jq" ] && [ "$5" = ".[].filename" ] || exit 2\n'
+        '  printf "%s" "$TEST_PR_FILES"\n'
+        '  [ "$TEST_SCENARIO" != "api-error" ]\n'
+        "else\n"
+        '  [ "$2" = "repos/NVIDIA/Megatron-LM/pulls/7824" ] '
+        '&& [ "$3" = "--jq" ] && [ "$4" = ".merge_commit_sha" ] || exit 2\n'
+        '  [ "$TEST_SCENARIO" = "recheck-api-error" ] && exit 1\n'
+        '  printf "%s\\n" "$TEST_CURRENT_PR_SHA"\n'
+        "fi\n"
+    )
+    gh.chmod(0o755)
+    gh_log = tmp_path / "gh.log"
+    runner_temp = tmp_path / "runner"
+    expected_files = (
+        [] if scenario == "empty-pr" else ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
+    )
+    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    result, outputs = _run(
+        step["run"],
+        tmp_path,
+        {
+            **shell_environment,
+            "GH_LOG": str(gh_log),
+            "TEST_SCENARIO": scenario,
+            "TEST_PR_FILES": "".join(f"{path}\n" for path in expected_files),
+            "TEST_CURRENT_PR_SHA": ("d" if scenario == "changed-pr-during" else "c") * 40,
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+            "PR_NUMBER": "invalid" if scenario == "invalid-pr-number" else "7824",
+            "PR_CHANGED_FILES": {
+                "empty-pr": "0",
+                "truncated-files": "3",
+                "too-many-files": "3001",
+                "invalid-file-count": "invalid",
+            }.get(scenario, "2"),
+            "PR_MERGE_SHA": ("d" if scenario == "changed-pr-before" else "c") * 40,
+            "TESTED_SHA": "invalid" if scenario == "invalid-tested-sha" else "c" * 40,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    valid = scenario in {"valid", "empty-pr"}
+    artifact_dir = runner_temp / "unit-test-pr-files"
+    if valid:
+        assert outputs == {"ready": "true"}
+        assert (artifact_dir / "changed-files").read_text().splitlines() == expected_files
+        assert json.loads((artifact_dir / "metadata.json").read_text()) == {
+            "tested_sha": "c" * 40,
+            "changed_files": len(expected_files),
+        }
+    else:
+        assert outputs.get("ready") != "true"
+        assert "::notice::" in result.stdout
+        assert not (artifact_dir / "metadata.json").exists()
+    expected_calls = []
+    if valid or scenario in {
+        "truncated-files",
+        "api-error",
+        "changed-pr-during",
+        "recheck-api-error",
+    }:
+        expected_calls.append(
+            "api --paginate repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100 "
+            "--jq .[].filename"
+        )
+    if valid or scenario in {"changed-pr-during", "recheck-api-error"}:
+        expected_calls.append("api repos/NVIDIA/Megatron-LM/pulls/7824 --jq .merge_commit_sha")
+    assert (gh_log.read_text().splitlines() if gh_log.exists() else []) == expected_calls
+
+
+def test_unit_test_matrices_consume_one_shared_pr_files_artifact() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+    configure = workflow["jobs"]["configure"]
+    producer = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    upload = _step("cicd-main.yml", "configure", "upload-unit-test-pr-files")
+    assert producer["if"] == "steps.configure.outputs.unit_testmon_eligible == 'true'"
+    assert producer["continue-on-error"] is True
+    assert upload["if"] == "steps.unit-test-pr-files.outputs.ready == 'true'"
+    assert upload["continue-on-error"] is True
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert configure["outputs"]["unit_test_pr_files_artifact_id"] == (
+        "${{ steps.upload-unit-test-pr-files.outcome == 'success' "
+        "&& steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}"
+    )
+    for job in ("cicd-unit-tests-latest", "cicd-unit-tests-latest-gb200"):
+        steps = workflow["jobs"][job]["steps"]
+        consumer = next(step for step in steps if step.get("uses") == "./.github/actions")
+        assert consumer["with"]["unit_test_pr_files_artifact_id"] == (
+            "${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}"
+        )
+        assert consumer["with"]["sha"] == "${{ needs.configure.outputs.sha }}"
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    steps = action["runs"]["steps"]
+    download = next(step for step in steps if step.get("id") == "download-unit-test-pr-files")
+    assert download["uses"].startswith("actions/download-artifact@")
+    assert download["with"]["artifact-ids"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
+    assert download["continue-on-error"] is True
+    assert not any(step.get("uses", "").startswith("nv-gha-runners/get-pr-info@") for step in steps)
+    resolver = next(step for step in steps if step.get("id") == "unit-testmon")
+    assert "gh api" not in resolver["run"]
+
+
 @pytest.fixture
 def configure_environment(
     tmp_path: Path, shell_environment: dict[str, str], monkeypatch: pytest.MonkeyPatch
