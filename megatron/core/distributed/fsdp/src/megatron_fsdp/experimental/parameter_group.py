@@ -434,25 +434,26 @@ class FsdpParameterGroup:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
-        grads: list[torch.Tensor] = []
-        for fsdp_parameter in self.fsdp_parameters:
-            if fsdp_parameter.unsharded.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
+        parameter = self.fsdp_parameters[0].unsharded
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=grads[0].dtype,
-                device=grads[0].device,
+                dtype=parameter.dtype,
+                device=parameter.device,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients into an existing reduce-scatter input buffer."""
+        """Pack local gradients, writing zeros for unused parameters."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            grad = fsdp_parameter.unsharded.grad
+            destination = partial_grad.get_tensor_view(index)
+            if grad is None:
+                destination.zero_()
+            else:
+                destination.copy_(grad)
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
