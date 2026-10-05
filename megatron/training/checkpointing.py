@@ -1175,9 +1175,6 @@ def save_checkpoint(
                     else:
                         run_config.to_yaml(run_config_filename)
 
-                checkpoint_name = get_checkpoint_name(
-                    save_dir, iteration=iteration, release=release, return_base_dir=True
-                )
                 train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
                 train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)
 
