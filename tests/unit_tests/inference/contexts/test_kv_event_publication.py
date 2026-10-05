@@ -203,10 +203,10 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
     engine.controller = SimpleNamespace(async_generate_output_tokens_dynamic_batch=forward)
 
     monkeypatch.setattr(
-        "megatron.core.inference.engines.dynamic_engine.nvtx_range_push", lambda *_: None
+        "megatron.core.inference.engines.dynamic_engine_loop.nvtx_range_push", lambda *_: None
     )
     monkeypatch.setattr(
-        "megatron.core.inference.engines.dynamic_engine.nvtx_range_pop", lambda *_: None
+        "megatron.core.inference.engines.dynamic_engine_loop.nvtx_range_pop", lambda *_: None
     )
 
     result, _, _ = await DynamicInferenceEngine.async_forward(engine)
