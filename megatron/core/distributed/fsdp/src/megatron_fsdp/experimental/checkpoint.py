@@ -43,7 +43,7 @@ from .uneven_dtensor import attach_uneven_dtensor_metadata
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
 
-class _CheckpointState:
+class CheckpointState:
     """Translate between local runtime state and DCP state without replacing live tensors.
 
     Each state_dict() call creates new dictionaries and DTensor views sharing the local
@@ -146,7 +146,7 @@ def save_checkpoint(
         optimizer: Optimizer stepping the sharded parameters.
         checkpoint_dir: Destination directory for the DCP checkpoint.
     """
-    checkpoint = _CheckpointState(model, optimizer)
+    checkpoint = CheckpointState(model, optimizer)
     dcp.save(checkpoint.state_dict(), checkpoint_id=checkpoint_dir)
 
 
@@ -171,7 +171,7 @@ def load_checkpoint(
         sync_model_weights: Refresh compute weights from the loaded main weights afterwards.
     """
     _init_optimizer_state(optimizer)
-    checkpoint = _CheckpointState(model, optimizer)
+    checkpoint = CheckpointState(model, optimizer)
     state_dict = checkpoint.state_dict()
     dcp.load(state_dict, checkpoint_id=checkpoint_dir)
     checkpoint.load_state_dict(state_dict)

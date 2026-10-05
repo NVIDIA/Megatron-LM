@@ -19,9 +19,8 @@ from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
 
 
-def _local_grad_and_replication(parameter: torch.nn.Parameter) -> tuple[torch.Tensor, int]:
-    """Read local-gradient layout from its owning MFSDP group without a DTensor wrapper."""
-    grad = parameter.grad
+def count_gradient_replication(parameter: torch.nn.Parameter) -> int:
+    """Compute gradient replication from the owning MFSDP group's optimizer layout."""
     group = get_containing_parameter_group(parameter)
     if group is None:
         raise RuntimeError("Missing MFSDP gradient layout for local optimizer parameter.")
@@ -33,7 +32,7 @@ def _local_grad_and_replication(parameter: torch.nn.Parameter) -> tuple[torch.Te
             replication *= buffer.mesh.size(axis)
         elif placement.is_partial():
             raise RuntimeError("MFSDP gradient reduction must finish before computing statistics.")
-    return grad, replication
+    return replication
 
 
 class FullyShardedOptimizer(MixedPrecisionOptimizer):
@@ -157,9 +156,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             grad = parameter.grad
             if grad is None:
                 continue
-            local_grad, replication = _local_grad_and_replication(parameter)
-            if local_grad.numel() > 0:
-                total_norm_squared += local_grad.float().pow(2).sum() / replication
+            replication = count_gradient_replication(parameter)
+            if grad.numel() > 0:
+                total_norm_squared += grad.float().pow(2).sum() / replication
 
         torch.distributed.all_reduce(
             total_norm_squared,
@@ -181,9 +180,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             grad = parameter.grad
             if grad is None:
                 continue
-            local_grad, replication = _local_grad_and_replication(parameter)
-            if local_grad.numel() > 0:
-                zeros = local_grad.numel() - torch.count_nonzero(local_grad)
+            replication = count_gradient_replication(parameter)
+            if grad.numel() > 0:
+                zeros = grad.numel() - torch.count_nonzero(grad)
                 total_zeros += zeros.float() / replication
 
         torch.distributed.all_reduce(

@@ -18,7 +18,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     save_checkpoint,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
-from megatron.core.optimizer.fully_sharded_optimizer import _local_grad_and_replication
+from megatron.core.optimizer.fully_sharded_optimizer import count_gradient_replication
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 
 
@@ -74,8 +74,7 @@ def test_optimizer_tensors_remain_local(distributed_setup, dtype, placement, def
         for parameter in model.parameters():
             assert not isinstance(parameter, DTensor)
             assert not isinstance(parameter.grad, DTensor)
-            local_grad, replication = _local_grad_and_replication(parameter)
-            assert local_grad is parameter.grad
+            replication = count_gradient_replication(parameter)
             assert replication == (distributed_setup.world_size if placement.is_replicate() else 1)
             for state in optimizer.state[parameter].values():
                 assert not isinstance(state, DTensor)

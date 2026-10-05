@@ -460,6 +460,6 @@ def test_metadata_attach_issues_no_collectives(
     # shard's offset with one all_gather_object per DTensor; this path derives it from the layout.
     for name in ("all_gather", "all_gather_object", "all_gather_into_tensor", "all_reduce"):
         monkeypatch.setattr(dist, name, _fail)
-    state = checkpoint._CheckpointState(model, optimizer).state_dict()
+    state = checkpoint.CheckpointState(model, optimizer).state_dict()
 
     assert state["model"].keys() == expected_shapes.keys()
