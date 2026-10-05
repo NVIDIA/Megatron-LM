@@ -473,6 +473,8 @@ def prime_cuda_rng_states_for_graph_capture() -> None:
     behavior of `capture_begin`. Each primed generator advances by one tiny draw per replay.
     No-op outside a capture and on PyTorch < 2.14.
     """
+    # TODO: Remove once the minimum supported PyTorch includes the upstream fix for lazy RNG
+    # capture-state allocation (pytorch/pytorch#193993 or its successor).
     if cudagraph_needs_generator_registration() or not torch.cuda.is_current_stream_capturing():
         return
     scratch = torch.empty(1, device=torch.cuda.current_device())
