@@ -9,17 +9,27 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
-from megatron.core.tensor_parallel.random import (
-    HAVE_TE,
-    initialize_rng_tracker,
-    model_parallel_cuda_manual_seed,
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    get_shared_capture_stream,
 )
+from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.fixture(autouse=True)
+def reset_full_cuda_graph_state():
+    """The wrapper keeps its graph and static buffers on the class."""
+    yield
+    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
@@ -97,8 +107,8 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
 def test_forward_backward_func_with_full_cuda_graph(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
-    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
 
     def forward_step_func(data_iterator, model):
         import os
