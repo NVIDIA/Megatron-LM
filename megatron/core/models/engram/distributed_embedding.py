@@ -142,8 +142,13 @@ class EPShardedEmbeddingTable(MegatronModule):
             global_num_embeddings, self.ep_rank, self.ep_size
         )
 
+        # Keep the frozen Engram table in pinned CPU memory and gather only the
+        # requested rows. The default remains the existing GPU path.
+        self.cpu_lookup = bool(getattr(config, "engram_cpu_lookup", False))
         device = (
-            torch.device("cpu") if config.use_cpu_initialization else torch.cuda.current_device()
+            torch.device("cpu")
+            if (config.use_cpu_initialization or self.cpu_lookup)
+            else torch.cuda.current_device()
         )
         self.weight = nn.Parameter(
             torch.empty(
@@ -154,6 +159,11 @@ class EPShardedEmbeddingTable(MegatronModule):
         )
         if config.perform_initialization:
             self._initialize_weight(init_method)
+        if self.cpu_lookup and self.weight.device.type == "cpu":
+            # Pin the table for the gather path.
+            pinned = torch.empty_like(self.weight, pin_memory=True)
+            pinned.copy_(self.weight)
+            self.weight = nn.Parameter(pinned)
 
         # The row shard is distinct across EP and synchronized only over expert-DP.
         self.weight.allreduce = False
@@ -192,6 +202,12 @@ class EPShardedEmbeddingTable(MegatronModule):
 
     def forward(self, local_row_ids: Tensor) -> Tensor:
         """Look up owner-local row IDs."""
+        if self.cpu_lookup and self.weight.device.type == "cpu":
+            # Gather only requested rows. The index transfer must complete before
+            # the host-side lookup.
+            ids_cpu = local_row_ids.detach().to("cpu")
+            gathered = self.weight.index_select(0, ids_cpu)
+            return gathered.to(local_row_ids.device, non_blocking=True)
         if self.deterministic_mode:
             return _DeterministicEmbedding.apply(self.weight, local_row_ids)
         return F.embedding(local_row_ids, self.weight)
@@ -260,7 +276,12 @@ class EPShardedMultiTableEmbedding(MegatronModule):
 
         # Per-table balanced-partition constants let forward resolve the owning EP rank of any
         # global row in closed form, without materializing per-request [N, ep_size] boundaries.
-        device = self.tables[0].weight.device
+        # Routing metadata stays on GPU even when the weight table is on CPU.
+        device = (
+            torch.cuda.current_device()
+            if torch.cuda.is_available()
+            else self.tables[0].weight.device
+        )
         bases_and_remainders = [divmod(table_size, self.ep_size) for table_size in self.table_sizes]
         self.register_buffer(
             "table_row_base",
@@ -317,8 +338,11 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         for table, count in zip(self.tables, table_counts):
             values.append(table(sorted_rows.narrow(0, start, count)))
             start += count
-        output = self.tables[0].weight.new_empty((requests.shape[0], self.embedding_dim))
-        output.index_copy_(0, order, torch.cat(values))
+        gathered = torch.cat(values)
+        # Allocate the output where the gathered rows live; the table may be CPU
+        # resident while gathered rows are on GPU.
+        output = gathered.new_empty((requests.shape[0], self.embedding_dim))
+        output.index_copy_(0, order, gathered)
         return output
 
     def forward(self, hash_ids: Tensor) -> Tensor:

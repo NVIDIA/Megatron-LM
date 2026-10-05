@@ -727,6 +727,22 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+def get_cpu_resident_parameter_ids(module: torch.nn.Module) -> set[int]:
+    """Return parameters owned by modules that intentionally keep weights on CPU.
+
+    Modules opt in through their existing ``cpu_lookup`` behavior.  Keeping this
+    policy at the module boundary avoids attaching storage-policy flags to
+    individual parameters and makes generic device-management code consistent.
+    """
+    return {
+        id(parameter)
+        for submodule in module.modules()
+        if getattr(submodule, "cpu_lookup", False)
+        for parameter in submodule.parameters(recurse=False)
+        if parameter.device.type == "cpu"
+    }
+
+
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name
