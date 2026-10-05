@@ -328,6 +328,16 @@ accumulation in subsequent reductions, also enable
 `--ddp-reduce-scatter-with-fp32-accumulation` and, when expert GTP is enabled,
 `--gtp-remat-reduce-scatter-with-fp32-accumulation`.
 
+The HybridModel parity tests in `tests/unit_tests/transformer/moe/test_virtual_experts.py`
+allow 2.5% relative L2 error for optimizer updates while retaining the 1% gradient limit
+and strict fixed-weight BF16 checks. In the 2026-10-05 four-GPU GB300 investigation,
+storing split native/virtual wgrad partials in BF16 zeroed eight of 16,384 gradients in
+one EGTP shard, producing 2.191% update error with 0.260% gradient error. Both steps'
+losses matched bitwise. FP32 gradient storage retained those cancellation residuals,
+reducing the affected update difference to 0.0000011%; FP32 addition after BF16
+partial storage cannot recover them. Disabling CPU offload reproduced the same BF16
+update difference.
+
 Each layer fixes its local token count on its first forward and rejects later changes.
 The planner specializes on that count, and the layer sizes its transport capacity once.
 
