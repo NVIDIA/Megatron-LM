@@ -1134,6 +1134,11 @@ def save_checkpoint(
             gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
             gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
+            train_state_dict = get_train_state().state_dict()
+            train_state_dict["floating_point_operations_so_far"] = torch.tensor(
+                num_floating_point_operations_so_far, dtype=torch.float64
+            )
+
             def iter_finalize_fn():
                 prev_iteration = 0
                 save_retain_interval = getattr(
@@ -1166,13 +1171,6 @@ def save_checkpoint(
                         warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
                     else:
                         run_config.to_yaml(run_config_filename)
-
-                # Save tokenizer files for torch_dist checkpoints (if enabled)
-                train_state = get_train_state()
-                train_state_dict = train_state.state_dict()
-                train_state_dict["floating_point_operations_so_far"] = torch.tensor(
-                    num_floating_point_operations_so_far, dtype=torch.float32
-                )
 
                 checkpoint_name = get_checkpoint_name(
                     save_dir, iteration=iteration, release=release, return_base_dir=True
