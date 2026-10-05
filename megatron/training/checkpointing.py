@@ -1134,8 +1134,6 @@ def save_checkpoint(
             gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
             gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
-            # A missing global train state (e.g. no full Megatron init) means we skip saving
-            # train_state.pt rather than persist a default one that could reset progress on resume.
             train_state = get_train_state()
             train_state_dict = None
             if train_state is not None:
