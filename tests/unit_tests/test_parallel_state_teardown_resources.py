@@ -9,8 +9,11 @@ import torch
 from megatron.core import parallel_state as ps
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+from megatron.core.tensor_parallel import gtp_cuda_graphs, gtp_symmetric_memory
 from megatron.core.transformer import cuda_graphs
 from megatron.core.transformer.moe import fused_a2a, token_dispatcher
+from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
 
@@ -64,6 +67,7 @@ def recorded_teardown(monkeypatch):
     monkeypatch.setattr(
         ps, "_MODEL_PARALLEL_TEARDOWN_CALLBACKS", {stage: [] for stage in ps.TeardownStage}
     )
+    monkeypatch.setattr(ps, "_MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS", {})
     return events
 
 
@@ -115,6 +119,136 @@ def test_resource_owners_register_teardown():
     assert cuda_graphs.release_all_cuda_graphs in graphs
     assert FullCudaGraphWrapper.reset_cuda_graph in graphs
     assert OptimizerCudaGraphWrapper.reset_cuda_graph in graphs
+    release_pools = gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools
+    assert release_pools in communication
+    assert ps._MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS[release_pools] is release_pools
+    assert gtp._destroy_gtp_state in callbacks[ps.TeardownStage.RESET_STATE]
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_gtp_pools_release_before_groups(recorded_teardown, monkeypatch, abort):
+    events = recorded_teardown
+    group = ps._global_process_group_list[1]
+    # A caller-owned group is not aborted by model-parallel teardown. Its pool must
+    # still be deregistered normally, even when the owned group was aborted.
+    external_group = object()
+    pools = {"owned": object(), "external": object()}
+    monkeypatch.setattr(gtp_symmetric_memory, "_pools", pools.copy())
+    monkeypatch.setattr(
+        gtp_symmetric_memory, "_registered", {"owned": group, "external": external_group}
+    )
+    pool_cache = gtp_symmetric_memory.RegisteredLIFOPool()
+    pool_cache._free["buffer"] = [object()]
+    monkeypatch.setattr(gtp_symmetric_memory, "symmetric_wgrad_pool", pool_cache)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+
+    def deregister(pool, registered_group):
+        assert pool_cache._free  # Keep allocations alive until deregistration.
+        assert "destroy" not in events
+        name = "owned" if registered_group is group else "external"
+        assert pool is pools[name]
+        events.append(name)
+
+    monkeypatch.setattr(gtp_symmetric_memory.vmm_symm_allocator, "deregister_mem_pool", deregister)
+    release = gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools
+    ps.register_model_parallel_teardown(
+        ps.TeardownStage.RELEASE_COMMUNICATION, release, on_abort=release
+    )
+    ps.destroy_model_parallel(abort=abort)
+    assert events == [
+        *(["abort"] if abort else []),
+        "synchronize",
+        "external",
+        *([] if abort else ["owned"]),
+        "dtensor",
+        "memory",
+        "destroy",
+    ]
+    assert not gtp_symmetric_memory._registered
+    assert not gtp_symmetric_memory._pools
+    assert not pool_cache._free
+    release()  # Explicit cleanup after teardown must also be harmless.
+    assert events.count("synchronize") == 1
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_gtp_teardown_discards_pending_gradients_and_cache(recorded_teardown, monkeypatch, abort):
+    param = Mock()
+    param._get_cache_key.return_value = ("old_group",)
+    param.flush_accumulated_wgrad.side_effect = AssertionError("used the destroyed group")
+    cache = gtp.GTPWeightCache()
+    cache.reserve(param, torch.float32, fwd=True)
+    monkeypatch.setattr(gtp, "_GTP_CACHE", cache)
+    monkeypatch.setattr(gtp, "_GTP_PARAMS", [param])
+    monkeypatch.setattr(gtp, "_GTP_PENDING_WGRAD_ACCUM", {param})
+    monkeypatch.setattr(gtp, "_inflight_comm_params", {param})
+    monkeypatch.setattr(gtp, "_AG_STREAMS", {"old_group": object()})
+    monkeypatch.setattr(gtp, "_RS_STREAMS", {"old_group": object()})
+    monkeypatch.setattr(gtp, "_wgrad_buf_pool", {"old_group": [object()]})
+    monkeypatch.setattr(gtp.GTPShardedParam, "_chain_state", {"old_group": param})
+    monkeypatch.setattr(gtp.GTPShardedParam, "_recompute_chain_state", {"old_group": param})
+    monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {"old_group": [object()]})
+    monkeypatch.setattr(gtp_cuda_graphs, "_CG_MEMPOOL", object())
+    ps.register_model_parallel_teardown(ps.TeardownStage.RESET_STATE, gtp._destroy_gtp_state)
+
+    ps.destroy_model_parallel(abort=abort)
+
+    # A later non-GTP model can reach this fence without constructing a GTP model
+    # (which would reset the cursors). It must not flush the previous model's gradient.
+    gtp._close_wgrad_accumulation_windows()
+    param.flush_accumulated_wgrad.assert_not_called()
+    assert param._wgrad_accum_buf is None
+    assert not gtp._GTP_PENDING_WGRAD_ACCUM
+    assert not gtp._GTP_PARAMS and not gtp._inflight_comm_params
+    assert not gtp.GTPShardedParam._chain_state
+    assert not gtp.GTPShardedParam._recompute_chain_state
+    assert not gtp._AG_STREAMS and not gtp._RS_STREAMS and not gtp._wgrad_buf_pool
+    assert not gtp_cuda_graphs._GRAPH_WGRAD_RINGS
+    assert gtp_cuda_graphs._CG_MEMPOOL is None
+    assert gtp._GTP_CACHE is None
+    assert gtp.get_global_GTP_cache() is not cache
+    assert not gtp.get_global_GTP_cache()._slots
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="Requires a multi-rank registered pool")
+@pytest.mark.parametrize("abort", [False, True])
+def test_gtp_registered_pool_and_pending_gradient_across_lifetimes(abort):
+    Utils.initialize_distributed()
+    ps.destroy_model_parallel()
+    baseline = set(torch.distributed.distributed_c10d._world.pg_map)
+    try:
+        for _ in range(2):
+            group = ps.create_group(ranks=list(range(Utils.world_size)), backend="nccl")
+            gtp_symmetric_memory.register_gtp_symm_pool(group)
+            with gtp_symmetric_memory.gtp_symm_pool_ctx(group):
+                value = torch.ones(4, device="cuda")
+            torch.distributed.all_reduce(value, group=group)
+            torch.cuda.synchronize()
+
+            # A later model's gradient fence must not reach an old group's pending
+            # accumulation, even if that later model does not construct GTP layers.
+            pending = Mock()
+            pending.flush_accumulated_wgrad.side_effect = AssertionError("used the old group")
+            gtp._GTP_PENDING_WGRAD_ACCUM.add(pending)
+            gtp._GTP_PARAMS.append(pending)
+            ps.destroy_model_parallel(abort=abort)
+            gtp.wait_for_gtp_grad_reduction_on_current_stream()
+            pending.flush_accumulated_wgrad.assert_not_called()
+
+            assert not gtp_symmetric_memory._registered
+            assert not gtp_symmetric_memory._pools
+            assert not gtp._GTP_PARAMS
+            assert set(torch.distributed.distributed_c10d._world.pg_map) == baseline
+            # Caller-owned tensors survive; WORLD still supports collectives.
+            assert torch.equal(value, torch.full_like(value, Utils.world_size))
+            world_value = torch.ones(1, device="cuda")
+            torch.distributed.all_reduce(world_value)
+            assert world_value.item() == Utils.world_size
+            del value, group
+    finally:
+        ps.destroy_model_parallel(abort=abort)
 
 
 def test_release_failure_keeps_groups(recorded_teardown, monkeypatch):
@@ -218,9 +352,10 @@ def test_hybridep_rebuilds_buffer_for_new_group(monkeypatch):
     monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
     monkeypatch.setattr(fused_a2a, "_buffer", None)
     first_group, second_group = object(), object()
+    routing_map = torch.ones(2, 1, dtype=torch.bool)
     for group in (first_group, first_group, second_group):
         fused_a2a.HybridEPDispatch.forward(
-            SimpleNamespace(), torch.ones(2, 4), None, None, group, 1
+            SimpleNamespace(), torch.ones(2, 4), routing_map, None, group, 1
         )
         assert fused_a2a._hybrid_ep_buffer.group is group
     assert [buffer.group for buffer in created] == [first_group, second_group]

@@ -31,6 +31,7 @@ import torch.distributed as dist
 
 import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -230,6 +231,7 @@ class RegisteredLIFOPool:
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""
         self._free.clear()
+        self._warned_unregistered.clear()
 
 
 # The process-wide send-buffer cache, used by generalized_tensor_parallelism. Lives here
@@ -237,10 +239,15 @@ class RegisteredLIFOPool:
 symmetric_wgrad_pool = RegisteredLIFOPool()
 
 
-def deregister_and_clear_gtp_symm_pools() -> None:
+def deregister_and_clear_gtp_symm_pools(aborted_groups=()) -> None:
     """Tear down what this module owns: deregister the pools' windows, then drop the
     recycled send buffers. Allocations owned by others (e.g. graph wgrad ring slots)
-    are not freed here. Call on all ranks before teardown; no-op if never registered."""
+    are not freed here. Model-parallel teardown calls this before destroying groups.
+    ``aborted_groups`` have already released their windows and allocator hooks through
+    NCCL abort; only deregister pools belonging to other, still-live groups.
+    """
+    if not _pools and not _registered and not symmetric_wgrad_pool._free:
+        return
     # Wait for all GPU work to finish first: a kernel or collective still reading
     # pool memory would fault once the windows go away.
     if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -248,9 +255,19 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # Deregister while the recycled send buffers are still alive. Their memory keeps
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
-        vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name])
+        group = _registered[name]
+        if group not in aborted_groups:
+            vmm_symm_allocator.deregister_mem_pool(_pools[name], group)
+        del _registered[name]
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
     symmetric_wgrad_pool.clear()
     _registered.clear()
     _pools.clear()
+
+
+register_model_parallel_teardown(
+    TeardownStage.RELEASE_COMMUNICATION,
+    deregister_and_clear_gtp_symm_pools,
+    on_abort=deregister_and_clear_gtp_symm_pools,
+)
