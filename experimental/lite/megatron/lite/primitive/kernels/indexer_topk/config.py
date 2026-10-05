@@ -113,8 +113,8 @@ _FP8_TIERED_SEED = True
 # start at the HOT prefix, 12288 keys, as in the previous integration) and 1.08-1.10x at 512K.
 _MXFP4_STARTUP_KEYS = 45056
 
-# The candidate slab of the MXFP4 slab route holds, per query row of a tile, one record of
-# SLAB_RECORD_BYTES bytes (a 16-bit score code and a 32-bit key id) per candidate; the plugin
+# MXFP4 candidate slabs store one score/id record per candidate, per query row.
+# SLAB_RECORD_BYTES is the legacy width; a route may declare 8 for raw32 candidates. The plugin
 # accepts slabs of at least SLAB_MIN_CANDIDATES and SLAB_CANDIDATES_PER_TOPK * topk candidates.
 SLAB_RECORD_BYTES = 6
 SLAB_MIN_CANDIDATES = 16384
@@ -737,10 +737,11 @@ def resolve_indexer_topk_tuning(
         )
     if fmt == "mxfp4" and resolved.candidate_capacity is None:
         smallest = max(SLAB_MIN_CANDIDATES, SLAB_CANDIDATES_PER_TOPK * geometry.topk)
-        if candidate_budget // (tile_rows * SLAB_RECORD_BYTES) < smallest:
+        record_bytes = SLAB_RECORD_BYTES if route is None else route.candidate_record_bytes
+        if candidate_budget // (tile_rows * record_bytes) < smallest:
             raise IndexerTopKConfigError(
                 f"tuning.candidate_budget_bytes={candidate_budget} cannot hold the smallest slab "
-                f"of a {tile_rows}-row tile ({smallest} candidates of {SLAB_RECORD_BYTES} bytes "
+                f"of a {tile_rows}-row tile ({smallest} candidates of {record_bytes} bytes "
                 "per row)"
             )
     if resolved.required and route is not None and resolved.startup_position is None:

@@ -39,7 +39,6 @@ from torch import Tensor
 from megatron.lite.primitive.kernels.indexer_topk.config import (
     SLAB_CANDIDATES_PER_TOPK,
     SLAB_MIN_CANDIDATES,
-    SLAB_RECORD_BYTES,
     IndexerTopKFormat,
     ResolvedIndexerTopKTuning,
 )
@@ -122,7 +121,7 @@ class IndexerTopKStats:
         status_rows: Rows whose plugin status was not OK at the status read, by status code.
         candidate_slab_bytes: The largest candidate slab a tile of the slab route was given,
             in bytes (rows of the segment's largest tile, times candidates per row, times
-            6-byte records); 0 without slab tiles. A high-water mark, not a sum.
+            the route's record width); 0 without slab tiles. A high-water mark, not a sum.
         padded_litetopk_rows: The part of ``litetopk_rows`` the plugin scored with zero-padded
             query heads (``IndexerTopKConfig.head_padding``).
         padded_reference_rows: Rows the reference selector scored with zero-padded query heads
@@ -325,7 +324,8 @@ class LiteTopKEngine:
             if state.capacity is not None:
                 rows = max(tile.rows for tile in plan.tiles)
                 stats.candidate_slab_bytes = max(
-                    stats.candidate_slab_bytes, rows * state.capacity * SLAB_RECORD_BYTES
+                    stats.candidate_slab_bytes,
+                    rows * state.capacity * self.route.candidate_record_bytes,
                 )
             if plan.seed == "reference":
                 self._stash(state, operands, out, plan.vote_rows, stats)
@@ -434,7 +434,9 @@ class LiteTopKEngine:
         smallest = max(SLAB_MIN_CANDIDATES, SLAB_CANDIDATES_PER_TOPK * operands.topk)
         if self.tuning.candidate_capacity is not None:
             return min(max(smallest, visible), self.tuning.candidate_capacity)
-        budget = self.tuning.candidate_budget_bytes // (self.tuning.tile_rows * SLAB_RECORD_BYTES)
+        budget = self.tuning.candidate_budget_bytes // (
+            self.tuning.tile_rows * self.route.candidate_record_bytes
+        )
         return max(smallest, min(visible, budget))
 
     def _vote_before(self, plan: SegmentPlan, group: TileGroup) -> tuple[int, int]:

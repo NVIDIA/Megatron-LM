@@ -131,6 +131,8 @@ class RouteCapability:
             first on equal scores).
         tie_policies: The tie policies the route supports.
         score_policies: The score policies the route supports.
+        candidate_record_bytes: Bytes per slab candidate (6 for legacy packed scores,
+            8 for complete FP32 score keys and int32 ids). Optional in ABI v1, default 6.
     """
 
     name: Literal["fp8_paged", "fp4_slab"]
@@ -147,6 +149,7 @@ class RouteCapability:
     exact: bool
     tie_policies: frozenset[str]
     score_policies: frozenset[str]
+    candidate_record_bytes: int = 6
 
     def supports_topk(self, topk: int) -> bool:
         """Return whether the route selects ``topk`` keys per query row."""
@@ -196,6 +199,11 @@ class RouteCapability:
             "exact": self.exact,
             "tie_policies": sorted(self.tie_policies),
             "score_policies": sorted(self.score_policies),
+            **(
+                {"candidate_record_bytes": self.candidate_record_bytes}
+                if self.candidate_record_bytes != 6
+                else {}
+            ),
         }
 
 
@@ -430,7 +438,18 @@ def _exact_keys(origin: str, where: str, raw: object, keys: frozenset[str]) -> M
 
 def _parse_route(origin: str, index: int, raw: object) -> RouteCapability:
     where = f"['routes'][{index}]"
-    route = _exact_keys(origin, where, raw, _ROUTE_KEYS)
+    # Record width is an optional ABI-v1 extension; legacy modules keep their schema.
+    optional = (
+        frozenset({"candidate_record_bytes"})
+        if isinstance(raw, Mapping) and "candidate_record_bytes" in raw
+        else frozenset()
+    )
+    route = _exact_keys(origin, where, raw, _ROUTE_KEYS | optional)
+    record_bytes = _int(
+        origin, f"{where}['candidate_record_bytes']", route.get("candidate_record_bytes", 6), 1
+    )
+    if record_bytes not in (6, 8):
+        raise _fail(origin, f"{where}['candidate_record_bytes']", "must be 6 or 8")
     name = route["name"]
     if name not in _ROUTE_FORMATS:
         raise _fail(origin, f"{where}['name']", f"must be one of {sorted(_ROUTE_FORMATS)}")
@@ -467,6 +486,7 @@ def _parse_route(origin: str, index: int, raw: object) -> RouteCapability:
         exact=route["exact"],
         tie_policies=_str_set(origin, f"{where}['tie_policies']", route["tie_policies"]),
         score_policies=_str_set(origin, f"{where}['score_policies']", route["score_policies"]),
+        candidate_record_bytes=record_bytes,
     )
 
 

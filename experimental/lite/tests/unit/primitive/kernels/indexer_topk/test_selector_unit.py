@@ -724,22 +724,29 @@ def test_slab_capacity_rule(tmp_path, score_kernel):
         assert built.max_tile_keys(key_count, topk) is None
 
 
-def test_slab_capacity_follows_visible_keys_and_budget(tmp_path, score_kernel):
+@pytest.mark.parametrize("record_bytes", (6, 8))
+def test_slab_capacity_follows_visible_keys_and_budget(tmp_path, score_kernel, record_bytes):
     # A context-parallel shard late in a long sequence: its rows see more keys than the smallest
     # slab (16384), so a tile's slab holds as many candidates as the segment's last tile sees
     # keys, bounded by the byte budget of a tile or by an explicit capacity.
-    routes = [dict(_FP8_ROUTE), {**_FP4_ROUTE, "max_keys": 1 << 20}]
+    routes = [
+        dict(_FP8_ROUTE),
+        {**_FP4_ROUTE, "max_keys": 1 << 20, "candidate_record_bytes": record_bytes},
+    ]
     keys, rows, position = 20000, 32, 67440
     q, k, weights = _inputs(rows, keys, seed=6)
     layout = QueryLayout.contiguous(rows, position=position, keys=keys, key_ratio=4)
     (segment,) = layout.segments
     visible = layout.visible_keys(segment, rows - 1)
     assert visible == (position + rows) // 4 == 16868 > 16384
-    budget = 16 * 6 * 16500  # 16500 candidates of 6 bytes per row of a 16-row tile
+    budget = 16 * record_bytes * 16500  # 16500 candidates of 6 bytes per row of a 16-row tile
     cases = {
         "visible": (FP4_TUNING, visible),
         "budget": (dataclasses.replace(FP4_TUNING, candidate_budget_bytes=budget), 16500),
-        "smallest": (dataclasses.replace(FP4_TUNING, candidate_budget_bytes=16 * 6 * 16384), 16384),
+        "smallest": (
+            dataclasses.replace(FP4_TUNING, candidate_budget_bytes=16 * record_bytes * 16384),
+            16384,
+        ),
         "explicit": (dataclasses.replace(FP4_TUNING, candidate_capacity=16600), 16600),
     }
     for label, (tuning, capacity) in cases.items():
@@ -752,7 +759,7 @@ def test_slab_capacity_follows_visible_keys_and_budget(tmp_path, score_kernel):
         tiles = [event for event in fake.events if event[0] == "tile"]
         assert len(tiles) == 2 and {event[5] for event in tiles} == {capacity}, label
         # The slab of a 16-row tile, 6 bytes per candidate.
-        assert binding.stats.candidate_slab_bytes == 16 * capacity * 6
+        assert binding.stats.candidate_slab_bytes == 16 * capacity * record_bytes
         _new_process()
 
 

@@ -1053,3 +1053,16 @@ def test_key_cache_pool_reuse_and_release():
         pool.acquire("mxfp4", 100, cpu, head_dim=64)
     with pytest.raises(ValueError, match="at least one row"):
         pool.acquire("fp8", 0, cpu)
+
+
+@pytest.mark.parametrize("record_bytes", (6, 8, True, 0, 7, "8"))
+def test_optional_slab_record_width(tmp_path, record_bytes):
+    route = {**_FP4_ROUTE, "candidate_record_bytes": record_bytes}
+    root = _make_plugin(tmp_path / "record-width", routes=(route,))
+    if type(record_bytes) is not int or record_bytes not in (6, 8):
+        with pytest.raises(IndexerTopKPluginError, match="candidate_record_bytes"):
+            _load(root, _COMMON)
+        return
+    plugin = _load(root, _COMMON)
+    assert plugin.info.routes[0].candidate_record_bytes == record_bytes
+    assert plugin.info.as_dict()["routes"][0].get("candidate_record_bytes", 6) == record_bytes
