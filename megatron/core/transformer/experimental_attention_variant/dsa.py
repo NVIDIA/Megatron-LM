@@ -1758,7 +1758,8 @@ class DSAIndexer(MegatronModule):
                     self.hidden_size,
                     dtype=torch.bfloat16,
                     device=kpool_param_device,
-                )
+                ),
+                requires_grad=False,
             )
             nn.init.normal_(self.index_kpool_compress_gate, std=0.01)
         else:
@@ -1880,11 +1881,14 @@ class DSAIndexer(MegatronModule):
                 k_dtype = k.dtype
                 # TE LayerNorm casts its input to the parameter dtype, so passing
                 # k.float() to the BF16 module does not guarantee FP32 math.
+                k_norm_weight = self.k_norm.weight.float()
+                if self.config.layernorm_zero_centered_gamma:
+                    k_norm_weight = k_norm_weight + 1.0
                 with torch.autocast(device_type=k.device.type, enabled=False):
                     k = torch.nn.functional.layer_norm(
                         k.float(),
                         (self.index_head_dim,),
-                        self.k_norm.weight.float(),
+                        k_norm_weight,
                         self.k_norm.bias.float(),
                         self.k_norm.eps,
                     ).to(dtype=k_dtype)
@@ -1967,6 +1971,7 @@ class DSAIndexer(MegatronModule):
                 fp8_indexer=self.index_kpool_use_quantization,
                 rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
             )
+            self._kpool_gate_score = None
         else:
             # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
             index_scores, topk_indices = fused_qk_topk_naive(
@@ -2830,6 +2835,7 @@ class DSAttention(MegatronModule):
                         rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                     )
                     del _index_scores
+                    self.indexer._kpool_gate_score = None
             elif fused_bounds is not None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
