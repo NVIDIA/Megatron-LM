@@ -107,7 +107,10 @@ class TestReadRunConfigNonDistributed:
         assert loaded["model"]["timers"] is None
         assert loaded["model"]["nested"][0]["timers"] is None
         assert loaded["model"]["keep"] == {"_target_": "some.other.Component", "value": 1}
-        assert loaded["model"]["nested"][1]["other"] == {"_target_": "another.Component", "value": 2}
+        assert loaded["model"]["nested"][1]["other"] == {
+            "_target_": "another.Component",
+            "value": 2,
+        }
         assert loaded["tokenizer"] == {"type": "sentencepiece"}
 
     def test_removes_init_false_fields_end_to_end(self, tmp_path, _allow_local_targets):
@@ -231,7 +234,10 @@ class TestReadRunConfigDistributed:
 
     def test_non_rank0_raises_rank0_error_message(self, tmp_path):
         missing_path = tmp_path / "does_not_exist.yaml"
-        rank0_error = {"error": True, "msg": f"ERROR: Unable to load config file {missing_path}: boom"}
+        rank0_error = {
+            "error": True,
+            "msg": f"ERROR: Unable to load config file {missing_path}: boom",
+        }
 
         def _fake_broadcast(obj_list, src=0):
             obj_list[0] = rank0_error
