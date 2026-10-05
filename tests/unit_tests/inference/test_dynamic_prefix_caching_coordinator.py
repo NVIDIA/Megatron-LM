@@ -103,6 +103,9 @@ class DummyContext:
     def get_active_request_count(self) -> int:
         return self.active_cnt
 
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        pass
+
 
 class DummyController:
     """Dummy inference controller."""
