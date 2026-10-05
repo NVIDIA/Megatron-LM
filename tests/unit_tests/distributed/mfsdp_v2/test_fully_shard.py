@@ -274,7 +274,7 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_fully_shard_rejects_delayed_te_weight_gradient(distributed_setup):
+def test_rejects_delayed_te_weight_gradient(distributed_setup):
     """Default automatic synchronization rejects weight gradients produced after autograd."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
