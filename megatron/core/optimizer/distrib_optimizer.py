@@ -891,8 +891,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 or USING_APEX_OPTIMIZER
                 or isinstance(self.optimizer, HybridDeviceOptimizer)
             ) and step is not None:
-                # TE FusedAdam will not accumulate step for empty param groups, so we need to
-                # align the step across param groups.
+                # Empty param groups may lack a step (see FUSED_ADAM_SKIPS_EMPTY_GROUPS), and a
+                # group's local ownership can change on resharding, so align the step across
+                # param groups.
                 param_group["step"] = int(step)
 
         # Grad scaler state.
