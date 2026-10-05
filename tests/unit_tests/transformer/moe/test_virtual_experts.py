@@ -54,6 +54,7 @@ from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
     plan_virtual_expert_routes,
@@ -854,6 +855,10 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             def capture_routes(module, args, output):
                 probs, indices = output
                 probs.retain_grad()
+                if indices.dtype == torch.bool:
+                    indices = indices.to(torch.int8).topk(config.moe_router_topk, dim=-1).indices
+                else:
+                    indices = indices.long()
                 routes.append((probs, indices.clone()))
 
             layer.router.register_forward_hook(capture_routes)
@@ -928,17 +933,11 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             torch.cuda.synchronize()
             values = {}
             for use, (x, y, (probs, indices)) in enumerate(zip(inputs, outputs, routes)):
-                # Compare native boolean/full-width routes and virtual compact routes
-                # in expert order, retaining gradients from the actual router outputs.
-                if indices.dtype == torch.bool:
-                    indices = indices.to(torch.int8).topk(config.moe_router_topk, dim=-1).indices
-                    indices = indices.sort(dim=-1).values
-                    route_probs = probs.gather(1, indices)
-                    route_grads = probs.grad.gather(1, indices)
-                else:
-                    indices, order = indices.long().sort(dim=-1)
-                    route_probs = probs.gather(1, order)
-                    route_grads = probs.grad.gather(1, order)
+                # Both paths retain upstream full-width router probabilities. Compare
+                # selected routes in expert order using gradients from the actual outputs.
+                indices = indices.sort(dim=-1).values
+                route_probs = probs.gather(1, indices)
+                route_grads = probs.grad.gather(1, indices)
                 expected_routes = (
                     torch.tensor([0, 1] if use == 0 else [2, 3], device='cuda')
                     .expand(num_tokens, -1)
@@ -1608,6 +1607,7 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     config = _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
 
     assert config.moe_expert_rank_capacity_factor is None
+    assert config.moe_hybridep_routing_map_mode == "indices"
     assert config.moe_single_grouped_weight is False
     assert config.moe_use_grouped_tensor
 
@@ -1642,6 +1642,7 @@ def test_virtual_expert_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
     "overrides,match",
     [
         ({"moe_token_dispatcher_type": "alltoall"}, "moe_token_dispatcher_type='flex'"),
+        ({"moe_hybridep_routing_map_mode": "bool"}, "moe_hybridep_routing_map_mode='indices'"),
         ({"expert_model_parallel_size": 1}, "2<=expert_model_parallel_size<=64"),
         ({"num_moe_experts": 3}, "num_moe_experts divisible"),
         ({"moe_router_topk": 3}, "1<=moe_router_topk"),
@@ -1657,8 +1658,8 @@ def test_virtual_expert_rejects_unsupported_layout(overrides, match):
 @requires_cuda
 @pytest.mark.parametrize(
     "quantile,expert_bias,compact_supported",
-    [(True, False, True), (True, False, False), (False, False, True)],
-    ids=["nt4-compact", "nt4-dense-fallback", "fused-seq-aux"],
+    [(True, False, True), (True, False, False), (False, False, True), (False, False, False)],
+    ids=["nt4-compact", "nt4-dense-fallback", "fused-seq-aux", "fused-map-fallback"],
 )
 def test_nt4_compact_router(monkeypatch, quantile, expert_bias, compact_supported):
     """Recipe-sized expert IDs and scores agree with a dense unfused router and CPU math."""
@@ -1713,15 +1714,25 @@ def test_nt4_compact_router(monkeypatch, quantile, expert_bias, compact_supporte
             ref_map.cpu(),
             torch.zeros_like(logits_cpu, dtype=torch.bool).scatter(1, expected_ids, True),
         )
-        for virtual in ((False, True) if compact_supported and not expert_bias else (False,)):
+        for virtual in ((False, True) if not expert_bias else (False,)):
             router = TopKRouter(replace(config, moe_virtual_expert_load_balance=virtual), pg).cuda()
             router.set_layer_number(1)
             if quantile or expert_bias:
                 (router.qb_beta if quantile else router.expert_bias).copy_(bias)
             logits = logits_cpu.cuda().requires_grad_()
             probs, ids = router.routing(logits.view(256, 1, 512))
-            if not virtual:
-                assert probs.shape == (256, 512)
+            assert probs.shape == (256, 512)
+            if virtual:
+                # Exercise the actual dispatcher adapter without allocating transport
+                # storage; the CPU oracle below checks its IDs, weights and gradients.
+                manager = object.__new__(_VirtualExpertHybridEPManager)
+                manager.router_topk = config.moe_router_topk
+                planned = []
+                monkeypatch.setattr(manager, "plan_dispatch", planned.append)
+                manager.setup_metadata(ids, probs)
+                (ids,) = planned
+                probs = manager.token_probs
+            else:
                 if ids.dtype == torch.bool:
                     ids = ids.to(torch.int8).topk(10, dim=1).indices
                 else:
@@ -1763,12 +1774,11 @@ def test_nt4_compact_router(monkeypatch, quantile, expert_bias, compact_supporte
                     router.local_tokens_per_expert, ref_map.sum(dim=0).float(), rtol=0, atol=0
                 )
         for virtual, shape, index_buffer in calls:
-            if not virtual:
-                assert shape == (256, 512)
-                if index_buffer is not None:
-                    assert index_buffer.shape == (256, 10) and index_buffer.dtype == torch.int16
+            assert shape == (256, 512)
+            if compact_supported:
+                assert index_buffer.shape == (256, 10) and index_buffer.dtype == torch.int16
             else:
-                assert shape == (256, 512) and index_buffer.shape == (256, 10)
+                assert index_buffer is None
         assert bool(calls) == config.moe_router_fusion
     finally:
         destroy_moe_metrics_tracker()
