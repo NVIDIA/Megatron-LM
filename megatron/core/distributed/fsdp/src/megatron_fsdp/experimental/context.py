@@ -169,20 +169,19 @@ class FsdpContext:
 
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""
+        self.ensure_finalized()
         return module in self._roots
 
     def module_name(self, module: nn.Module) -> str:
         """Return ``module``'s name relative to its FSDP root."""
-        name = self._module_names.get(module)
-        if name is None:
-            raise RuntimeError("FSDP module name has not been initialized.")
-        return name
+        self.ensure_finalized()
+        return self._module_names[module]
 
     def ensure_finalized(self) -> None:
         """Raise if construction has not completed for this context."""
         if not self._is_finalized:
             raise RuntimeError(
-                "FSDP context is not finalized. Exit fully_shard_context before running forward."
+                "FSDP context is not finalized. Exit fully_shard_context to complete construction."
             )
 
     def current_stream(self) -> torch.cuda.Stream:

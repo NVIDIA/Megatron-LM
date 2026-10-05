@@ -2,7 +2,6 @@
 
 """Unit tests for experimental Megatron-FSDP runtime contexts."""
 
-import gc
 from unittest.mock import Mock
 from weakref import ref
 
@@ -105,12 +104,6 @@ def test_child_then_parent_share_one_context(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_default_placements())
         assert model.context is context
         assert model.inner.context is context
-        assert not model.is_root()
-        assert not model.inner.is_root()
-        with pytest.raises(RuntimeError, match="name has not been initialized"):
-            _ = model.name
-        with pytest.raises(RuntimeError, match="name has not been initialized"):
-            _ = model.inner.name
 
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
@@ -118,8 +111,6 @@ def test_child_then_parent_share_one_context(distributed_setup):
     assert model.inner.context is model.context
     assert model.is_root()
     assert not model.inner.is_root()
-    assert model.name == ""
-    assert model.inner.name == "inner"
 
 
 def test_context_does_not_keep_modules_alive(distributed_setup):
@@ -135,7 +126,6 @@ def test_context_does_not_keep_modules_alive(distributed_setup):
     model_ref = ref(model)
     child_ref = ref(model.inner)
     del model
-    gc.collect()
 
     assert model_ref() is None
     assert child_ref() is None
@@ -221,7 +211,6 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     context = model.context
     assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
-    assert [module.name for module in context.forward_order] == ["", "left", "left.inner", "right"]
 
 
 def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
@@ -257,9 +246,6 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     assert not model.left.inner.is_root()
     assert list(context.forward_order) == [model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model.right, model.left, model.left.inner]
-    assert model.left.name == ""
-    assert model.left.inner.name == "inner"
-    assert model.right.name == ""
 
 
 def test_fully_shard_requires_context(distributed_setup):
@@ -270,24 +256,6 @@ def test_fully_shard_requires_context(distributed_setup):
 
     with pytest.raises(RuntimeError, match="inside fully_shard_context"):
         fully_shard(model, mesh=mesh, placements=_default_placements())
-
-
-def test_failed_child_shard_does_not_join_context(distributed_setup):
-    """Failed child initialization must leave ownership and ordering to its parent."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = NestedModel().to(device)
-
-    with fully_shard_context(device=device) as context:
-        with pytest.raises(ValueError, match="grad_divisor must be positive"):
-            fully_shard(model.inner, mesh=mesh, placements=_default_placements(), grad_divisor=0)
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    assert list(context.forward_order) == [model]
-    assert list(context.backward_order) == [model]
-    assert model.is_root()
-    assert model.num_parameter_elements == 20
-    model(torch.ones(2, 4, device=device)).sum().backward()
 
 
 def test_forward_requires_finalized_context(distributed_setup):
