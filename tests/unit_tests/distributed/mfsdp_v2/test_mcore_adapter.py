@@ -55,6 +55,36 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
     )
 
 
+def _block_loss(model, hidden_states):
+    return model(hidden_states=hidden_states, attention_mask=None).float().square().mean()
+
+
+def _forward_backward(model, microbatches, forward_step, *, loss_scale=1.0, backward_dw=None):
+    """Run a step's microbatches and return detached losses with gradients ready to use.
+
+    Like MCore's schedules, accumulate all but the last microbatch under no_sync,
+    then finish gradient synchronization after all backward work, including delayed wgrad.
+    Keep the optimizer step separate so tests can inspect gradients or capture it separately.
+    """
+    is_fsdp = isinstance(model, mcore_fsdp_adapter.FullyShardedDataParallelV2)
+    losses = []
+    for index, batch in enumerate(microbatches):
+        sync_context = (
+            model.no_sync()
+            if is_fsdp and index < len(microbatches) - 1
+            else contextlib.nullcontext()
+        )
+        with sync_context:
+            loss = forward_step(model, batch)
+            (loss * loss_scale).backward()
+            if backward_dw is not None:
+                backward_dw()
+        losses.append(loss.detach())
+    if is_fsdp:
+        model.finish_grad_sync()
+    return losses
+
+
 def _destroy_model_parallel():
     """Utils.destroy_model_parallel, plus the groups it leaves behind.
 
@@ -327,11 +357,12 @@ class TestMcoreAdapterDense:
         x = torch.randn(
             4, 16, device=distributed_setup.device, dtype=config.params_dtype, requires_grad=True
         )
-        model(x).float().square().mean().backward()
-        assert model.module.weight.grad is None
-        model.module.backward_dw()
-
-        model.finish_grad_sync()
+        _forward_backward(
+            model,
+            [x],
+            lambda model, batch: model(batch).float().square().mean(),
+            backward_dw=model.module.backward_dw,
+        )
         consumed_gradient = model.module.weight.grad.clone()
         torch.cuda.synchronize()
         torch.testing.assert_close(consumed_gradient, model.module.weight.grad)
@@ -404,14 +435,9 @@ class TestMcoreAdapterDense:
             losses = []
             for microbatches in steps:
                 optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = []
-                for batch in microbatches:
-                    output = model(hidden_states=batch, attention_mask=None)
-                    loss = output.float().square().mean()
-                    (loss / len(microbatches)).backward()
-                    microbatch_losses.append(loss.detach())
-                if isinstance(optimizer, FullyShardedOptimizer):
-                    model.finish_grad_sync()
+                microbatch_losses = _forward_backward(
+                    model, microbatches, _block_loss, loss_scale=1 / len(microbatches)
+                )
                 success, _, _ = optimizer.step()
                 assert success
                 losses.append(torch.stack(microbatch_losses).mean())
@@ -462,14 +488,11 @@ class TestMcoreAdapterDense:
         optimizer = get_megatron_optimizer(optimizer_config, [model])
 
         optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
+        _forward_backward(
+            model,
+            [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
+            _block_loss,
         )
-        output.float().square().mean().backward()
-        model.finish_grad_sync()
 
         success, _, _ = optimizer.step()
         assert success
@@ -528,17 +551,17 @@ class TestMcoreAdapterDense:
             return squared_norm.sqrt().item()
 
         optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=(
-                torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16)
-                .view(1, 1, -1)
-                .expand(8, 2, -1)
-                * (torch.distributed.get_rank() + 1)
-            ),
-            attention_mask=None,
+        hidden = torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16).view(
+            1, 1, -1
+        ).expand(8, 2, -1) * (torch.distributed.get_rank() + 1)
+        _forward_backward(
+            model,
+            [hidden],
+            lambda model, batch: model(hidden_states=batch, attention_mask=None)
+            .float()
+            .square()
+            .sum(),
         )
-        output.float().square().sum().backward()
-        model.finish_grad_sync()
 
         parameters = [
             parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
@@ -643,16 +666,14 @@ class TestMcoreAdapterCudaGraph:
         def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
             assert seq_length is None
             assert not forward_only
-            microbatch_losses = []
-            for _ in range(num_microbatches):
-                batch = next(data_iterator[0])
-                # Pipeline schedules receive model chunks as a list, including with PP=1.
-                output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / num_microbatches).backward()
-                microbatch_losses.append({"loss": loss.detach()})
-            model[0].finish_grad_sync()
-            return microbatch_losses
+            # Pipeline schedules receive model chunks as a list, including with PP=1.
+            losses = _forward_backward(
+                model[0],
+                [next(data_iterator[0])["hidden_states"] for _ in range(num_microbatches)],
+                _block_loss,
+                loss_scale=1 / num_microbatches,
+            )
+            return [{"loss": loss} for loss in losses]
 
         steps = [
             [
@@ -838,39 +859,36 @@ class TestMcoreAdapterExpertParallel:
             torch.distributed.get_rank() * local_batch_size,
             (torch.distributed.get_rank() + 1) * local_batch_size,
         )
+
+        def forward_step(model, batch):
+            input_ids, position_ids, targets = batch
+            return torch.nn.functional.mse_loss(
+                model(input_ids=input_ids, position_ids=position_ids, attention_mask=None), targets
+            )
+
         reference_losses = []
         for _ in range(5):
             reference_optimizer.zero_grad(set_to_none=True)
-            reference_loss = torch.nn.functional.mse_loss(
-                reference_model(
-                    input_ids=input_ids, position_ids=position_ids, attention_mask=None
-                ),
-                targets,
+            (reference_loss,) = _forward_backward(
+                reference_model, [(input_ids, position_ids, targets)], forward_step
             )
-            reference_loss.backward()
             reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
             assert reference_success
             assert (
                 reference_pre_clip_norm > optimizer_config.clip_grad
             ), "Reference gradients must exceed the clipping threshold to exercise clipping."
-            reference_losses.append(reference_loss.detach())
+            reference_losses.append(reference_loss)
 
         losses = []
         for _ in range(5):
             optimizer.zero_grad(set_to_none=True)
-            loss = torch.nn.functional.mse_loss(
-                model(
-                    input_ids=input_ids[input_slice],
-                    position_ids=position_ids[input_slice],
-                    attention_mask=None,
-                ),
-                targets[input_slice],
+            (loss,) = _forward_backward(
+                model,
+                [(input_ids[input_slice], position_ids[input_slice], targets[input_slice])],
+                forward_step,
             )
-            loss.backward()
-            model.finish_grad_sync()
             success, _, _ = optimizer.step()
             assert success
-            loss = loss.detach()
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             losses.append(loss)
 
@@ -945,25 +963,18 @@ class TestMcoreAdapterHybrid:
         losses = []
         for step in range(steps):
             optimizer.zero_grad(set_to_none=True)
-            step_losses = []
+            batches = []
             for index in range(microbatches):
-                # Only the last microbatch finalizes gradients, so it runs outside no_sync.
-                sync_context = (
-                    contextlib.nullcontext() if index == microbatches - 1 else model.no_sync()
+                # Rank-dependent but step-deterministic input, so every configuration
+                # sees the same global batch however the domain is split. Microbatches
+                # differ so that dropping any of them changes the result.
+                hidden = torch.arange(
+                    1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+                ).view(1, 1, -1).expand(8, 2, -1) * (
+                    torch.distributed.get_rank() + 1 + step + index
                 )
-                with sync_context:
-                    # Rank-dependent but step-deterministic input, so every configuration
-                    # sees the same global batch however the domain is split. Microbatches
-                    # differ so that dropping any of them changes the result.
-                    hidden = torch.arange(
-                        1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
-                    ).view(1, 1, -1).expand(8, 2, -1) * (
-                        torch.distributed.get_rank() + 1 + step + index
-                    )
-                    loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
-                    loss.backward()
-                step_losses.append(loss.detach())
-            model.finish_grad_sync()
+                batches.append(hidden)
+            step_losses = _forward_backward(model, batches, _block_loss)
             success, _, _ = optimizer.step()
             assert success
             # No update happens until optimizer.step(), so every microbatch in a step sees
@@ -991,14 +1002,14 @@ class TestMcoreAdapterHybrid:
             module=_build_block(config),
             pg_collection=pg_collection,
         )
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
+        _forward_backward(
+            model,
+            [torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)],
+            lambda model, batch: model(hidden_states=batch, attention_mask=None)
+            .float()
+            .square()
+            .sum(),
         )
-        output.float().square().sum().backward()
-        model.finish_grad_sync()
 
         expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
         graded = [p for p in model.parameters() if p.grad is not None]
@@ -1112,9 +1123,16 @@ class TestMcoreAdapterHybrid:
         optimizer.zero_grad(set_to_none=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
-        output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
-        output.float().square().mean().backward()
-        model.finish_grad_sync()
+        _forward_backward(
+            model,
+            [(input_ids, position_ids)],
+            lambda model, batch: model(
+                input_ids=batch[0], position_ids=batch[1], attention_mask=None
+            )
+            .float()
+            .square()
+            .mean(),
+        )
         success, _, _ = optimizer.step()
         assert success
 
