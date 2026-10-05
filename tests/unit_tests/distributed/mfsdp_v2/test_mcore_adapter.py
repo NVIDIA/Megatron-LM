@@ -2,7 +2,6 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
-import contextlib
 import logging
 import os
 from dataclasses import replace
@@ -35,6 +34,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import _forward_backward
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -57,34 +57,6 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
 
 def _block_loss(model, hidden_states):
     return model(hidden_states=hidden_states, attention_mask=None).float().square().mean()
-
-
-def _forward_backward(
-    model, microbatches, forward_step, *, loss_scale=1.0, delayed_wgrad_compute=None
-):
-    """Run a step's microbatches and return detached losses with gradients ready to use.
-
-    Like MCore's schedules, accumulate all but the last microbatch under no_sync,
-    then finish gradient synchronization after all backward work, including delayed wgrad.
-    Keep the optimizer step separate so tests can inspect gradients or capture it separately.
-    """
-    is_fsdp = isinstance(model, mcore_fsdp_adapter.FullyShardedDataParallelV2)
-    losses = []
-    for index, batch in enumerate(microbatches):
-        sync_context = (
-            model.no_sync()
-            if is_fsdp and index < len(microbatches) - 1
-            else contextlib.nullcontext()
-        )
-        with sync_context:
-            loss = forward_step(model, batch)
-            (loss * loss_scale).backward()
-            if delayed_wgrad_compute is not None:
-                delayed_wgrad_compute()
-        losses.append(loss.detach())
-    if is_fsdp:
-        model.finish_grad_sync()
-    return losses
 
 
 def _destroy_model_parallel():
