@@ -237,6 +237,24 @@ def test_fully_shard_requires_context(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
 
+def test_failed_child_shard_does_not_join_context(distributed_setup):
+    """Failed child initialization must leave ownership and ordering to its parent."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device) as context:
+        with pytest.raises(ValueError, match="grad_divisor must be positive"):
+            fully_shard(model.inner, mesh=mesh, placements=_default_placements(), grad_divisor=0)
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    assert list(context.forward_order) == [model]
+    assert list(context.backward_order) == [model]
+    assert model.is_root()
+    assert model.num_parameter_elements == 20
+    model(torch.ones(2, 4, device=device)).sum().backward()
+
+
 def test_forward_requires_finalized_context(distributed_setup):
     """Forward should be unavailable until construction scope exit."""
     device = distributed_setup.device

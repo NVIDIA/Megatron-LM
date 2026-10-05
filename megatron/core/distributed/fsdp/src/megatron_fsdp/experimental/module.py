@@ -14,14 +14,13 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
-# Defer annotation evaluation on Python 3.12/3.13 so FsdpContext can stay under
-# TYPE_CHECKING. Importing it at runtime would cycle: context.py imports FsdpModule.
+# Postpone annotations so FsdpModule can refer to itself in method signatures.
 from __future__ import annotations
 
 import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 from weakref import ref
 
 import torch
@@ -31,15 +30,13 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
+from .context import FsdpContext
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
-
-if TYPE_CHECKING:
-    from .context import FsdpContext
 
 
 def _is_in_backward() -> bool:

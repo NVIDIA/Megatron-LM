@@ -14,14 +14,21 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+# Postpone annotations so FsdpModule references do not require a runtime import
+# back to module.py, which imports this context.
+from __future__ import annotations
+
 from contextvars import ContextVar, Token
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
 
 from .indexed_order import IndexedOrder
-from .module import FsdpModule
+
+if TYPE_CHECKING:
+    from .module import FsdpModule
+
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -138,22 +145,27 @@ class FsdpContext:
         if self._is_finalized:
             raise RuntimeError("FSDP context is already finalized.")
 
-        children: set[FsdpModule] = set()
+        # Successful FsdpModule initialization registers the module, and fully_shard
+        # rejects children from another context. Membership identifies this context's
+        # FSDP modules without importing FsdpModule at runtime.
+        registered_modules = {cast(nn.Module, module) for module in self._registered_modules}
+        children: set[nn.Module] = set()
         for module in self._registered_modules:
-            _collect_fsdp_children(cast(nn.Module, module), children)
+            _collect_fsdp_children(cast(nn.Module, module), registered_modules, children)
         # FsdpModules that are not descendants of any other FsdpModule.
         roots = [module for module in self._registered_modules if module not in children]
 
         for root in roots:
             root._is_root = True
             for name, module in cast(nn.Module, root).named_modules():
-                if not isinstance(module, FsdpModule):
+                if module not in registered_modules:
                     continue
-                module._name = name
-                self.forward_order.append(module)
+                fsdp_module = cast("FsdpModule", module)
+                fsdp_module._name = name
+                self.forward_order.append(fsdp_module)
 
         for root in reversed(roots):
-            _collect_backward_order(cast(nn.Module, root), self.backward_order)
+            _collect_backward_order(cast(nn.Module, root), registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -231,19 +243,23 @@ def current_fully_shard_context() -> FsdpContext | None:
     return _FSDP_CONTEXT.get()
 
 
-def _collect_backward_order(module: nn.Module, order: IndexedOrder[FsdpModule]) -> None:
+def _collect_backward_order(
+    module: nn.Module, registered_modules: set[nn.Module], order: IndexedOrder[FsdpModule]
+) -> None:
     """Collect one root's static backward prefetch order."""
-    if isinstance(module, FsdpModule):
-        order.append(module)
+    if module in registered_modules:
+        order.append(cast("FsdpModule", module))
 
     for child in reversed(list(module.children())):
-        _collect_backward_order(child, order)
+        _collect_backward_order(child, registered_modules, order)
 
 
-def _collect_fsdp_children(module: nn.Module, children: set[FsdpModule]) -> None:
-    """Collect the nearest FSDP descendants of ``module``."""
+def _collect_fsdp_children(
+    module: nn.Module, registered_modules: set[nn.Module], children: set[nn.Module]
+) -> None:
+    """Collect the nearest registered FSDP descendants of ``module``."""
     for child in module.children():
-        if isinstance(child, FsdpModule):
+        if child in registered_modules:
             children.add(child)
         else:
-            _collect_fsdp_children(child, children)
+            _collect_fsdp_children(child, registered_modules, children)
