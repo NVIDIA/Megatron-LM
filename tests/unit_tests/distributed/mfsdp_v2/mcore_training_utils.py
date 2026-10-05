@@ -7,10 +7,7 @@ import contextlib
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 
 
-# Megatron's full training loop depends on global arguments, the microbatch calculator,
-# and CUDA graph state that are difficult to isolate between unit tests. This helper
-# keeps the relevant backward/synchronization ordering in one place for these tests.
-# Shared test utilities: https://github.com/NVIDIA/Megatron-LM/issues/7223.
+# See https://github.com/NVIDIA/Megatron-LM/issues/7223 for why this helper exists.
 def forward_backward(
     model, microbatches, forward_step, *, loss_scale=1.0, delayed_wgrad_compute=None
 ):
