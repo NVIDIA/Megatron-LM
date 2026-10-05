@@ -289,8 +289,8 @@ class TestMcoreAdapterDense:
             assert not context.caller_managed_grad_sync
             assert not isinstance(layer, FsdpModule)
 
-    def test_finish_grad_sync_waits_for_delayed_wgrad(self, distributed_setup, monkeypatch):
-        """MCore finish_grad_sync waits for gradients produced by backward_dw."""
+    def test_finish_grad_sync_waits_for_delayed_wgrad(self, distributed_setup):
+        """Delayed-wgrad reductions must rejoin the compute stream before capture ends."""
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -319,27 +319,31 @@ class TestMcoreAdapterDense:
             pg_collection=self.pg_collection,
         )
 
-        group = model.module.parameter_groups[0]
-        reduce_partial_gradients = group.reduce_partial_gradients
-
-        def delayed_reduce(*args, **kwargs):
-            torch.cuda._sleep(200_000_000)
-            return reduce_partial_gradients(*args, **kwargs)
-
-        monkeypatch.setattr(group, "reduce_partial_gradients", delayed_reduce)
-        group.main_grad.local_buffer.fill_(float("nan"))
         x = torch.randn(
             4, 16, device=distributed_setup.device, dtype=config.params_dtype, requires_grad=True
         )
-        _forward_backward(
-            model,
-            [x],
-            lambda model, batch: model(batch).float().square().mean(),
-            delayed_wgrad_compute=model.module.backward_dw,
-        )
-        consumed_gradient = model.module.weight.grad.clone()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(consumed_gradient, model.module.weight.grad)
+
+        def forward_backward():
+            # Retain the grad views so reduction includes the accumulation kernel.
+            model.zero_grad(set_to_none=False)
+            _forward_backward(
+                model,
+                [x],
+                lambda model, batch: model(batch).float().square().mean(),
+                delayed_wgrad_compute=model.module.backward_dw,
+            )
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                forward_backward()
+
+        # Ending capture rejects an unjoined reduction stream if finish_grad_sync
+        # fails to wait for the reductions launched by backward_dw.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            forward_backward()
 
     def test_build_train_and_step(self):
         """Match eager training against an MFSDP v2 train-and-step sequence."""
