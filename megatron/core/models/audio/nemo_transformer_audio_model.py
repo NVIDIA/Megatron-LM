@@ -1,12 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 
 from megatron.core.transformer.module import MegatronModule
 
+from .nemo_rope_transformer_encoder import RopeTransformerEncoder, RopeTransformerEncoderConfig
 from .nemo_transformer_encoder import TransformerEncoder
 from .packed_audio import PackedAudioEmbeddings
 
@@ -26,6 +27,9 @@ class NemoTransformerAudioConfig:
     nan_debug: bool = False
     qk_norm: bool = False
     subsampling_factor: int = 4
+    # ``None`` selects the architecture-compatible default: learned padding
+    # for legacy encoders and zero padding for the RoPE encoder.
+    stacking_pad_mode: Literal["learned", "zeros"] | None = None
     # Attention backend: "auto" prefers transformer_engine when importable, else SDPA.
     # Explicit values: "te" | "sdpa" | "fa". Not a structural field — checkpoints
     # trained with one backend load into another.
@@ -37,6 +41,35 @@ class NemoTransformerAudioConfig:
     # original unlimited-left causal attention. Non-negative values require
     # causal_mask=True and limit each token to that many previous positions.
     left_context: Optional[int] = None
+    # Architecture identity for checkpoint compatibility. ``legacy`` is the
+    # original CTC-style tower; ``rope_transformer`` is the 600M non-causal
+    # encoder converted from NeMo's LLM-style AED training stack.
+    architecture: str = "legacy"
+    self_attention_model: str = "rel_pos"
+    rope_base: float = 10000.0
+    rotary_fraction: float = 1.0
+    ff_expansion: float = 4.0
+    pre_block_norm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.pre_encode == "feature_stacking":
+            if self.stacking_pad_mode not in (None, "zeros"):
+                raise ValueError(
+                    "pre_encode='feature_stacking' is a compatibility alias for "
+                    "pre_encode='stacking' with stacking_pad_mode='zeros'"
+                )
+            self.pre_encode = "stacking"
+            self.stacking_pad_mode = "zeros"
+        if self.stacking_pad_mode is None:
+            self.stacking_pad_mode = (
+                "zeros" if self.architecture == "rope_transformer" else "learned"
+            )
+        if self.stacking_pad_mode not in ("learned", "zeros"):
+            raise ValueError(
+                "stacking_pad_mode must be 'learned' or 'zeros', " f"got {self.stacking_pad_mode!r}"
+            )
+        if self.architecture == "rope_transformer" and self.attn_impl == "auto":
+            self.attn_impl = "te"
 
     @property
     def output_embedding_dim(self) -> int:
@@ -66,22 +99,75 @@ class NemoTransformerAudioModel(MegatronModule):
 
     def __init__(self, config: NemoTransformerAudioConfig) -> None:
         super().__init__(config=config)
-        self.encoder = TransformerEncoder(
-            n_mels=config.n_mels,
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_layers=config.n_layers,
-            drop_rate=config.drop_rate,
-            qkv_bias=config.qkv_bias,
-            causal_mask=config.causal_mask,
-            pre_encode=config.pre_encode,
-            nan_debug=config.nan_debug,
-            qk_norm=config.qk_norm,
-            subsampling_factor=config.subsampling_factor,
-            attn_impl=config.attn_impl,
-            recompute_layers=config.recompute_layers,
-            left_context=config.left_context,
-        )
+        stacking_pad_mode = config.stacking_pad_mode
+        if stacking_pad_mode is None:
+            raise ValueError("stacking_pad_mode must be resolved during config initialization")
+        if config.architecture == "rope_transformer":
+            if config.attn_impl != "te":
+                raise ValueError(
+                    "rope_transformer requires Transformer Engine attention; "
+                    f"got attn_impl={config.attn_impl!r}"
+                )
+            if config.pre_encode != "stacking":
+                raise ValueError(
+                    "rope_transformer checkpoints require pre_encode='stacking', got "
+                    f"{config.pre_encode!r}"
+                )
+            if stacking_pad_mode != "zeros":
+                raise ValueError(
+                    "rope_transformer checkpoints require stacking_pad_mode='zeros', got "
+                    f"{stacking_pad_mode!r}"
+                )
+            if config.self_attention_model != "rope":
+                raise ValueError(
+                    "rope_transformer checkpoints require self_attention_model='rope', got "
+                    f"{config.self_attention_model!r}"
+                )
+            self.encoder = RopeTransformerEncoder(
+                RopeTransformerEncoderConfig(
+                    n_mels=config.n_mels,
+                    d_model=config.d_model,
+                    n_heads=config.n_heads,
+                    n_layers=config.n_layers,
+                    drop_rate=config.drop_rate,
+                    qkv_bias=config.qkv_bias,
+                    qk_norm=config.qk_norm,
+                    ff_expansion=config.ff_expansion,
+                    pre_block_norm=config.pre_block_norm,
+                    subsampling_factor=config.subsampling_factor,
+                    stacking_pad_mode=stacking_pad_mode,
+                    rope_base=config.rope_base,
+                    rotary_fraction=config.rotary_fraction,
+                    left_context=config.left_context,
+                    recompute_layers=config.recompute_layers,
+                )
+            )
+            self.supports_dynamic_causal_mask = True
+            self.supports_packed_forward = True
+        elif config.architecture == "legacy":
+            self.encoder = TransformerEncoder(
+                n_mels=config.n_mels,
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                n_layers=config.n_layers,
+                drop_rate=config.drop_rate,
+                qkv_bias=config.qkv_bias,
+                causal_mask=config.causal_mask,
+                pre_encode=config.pre_encode,
+                nan_debug=config.nan_debug,
+                qk_norm=config.qk_norm,
+                subsampling_factor=config.subsampling_factor,
+                stacking_pad_mode=stacking_pad_mode,
+                attn_impl=config.attn_impl,
+                recompute_layers=config.recompute_layers,
+                left_context=config.left_context,
+            )
+            self.supports_dynamic_causal_mask = False
+            self.supports_packed_forward = True
+        else:
+            raise ValueError(
+                f"Unsupported NemoTransformerAudioConfig.architecture={config.architecture!r}"
+            )
 
     @staticmethod
     def _ceil_div(value: int, divisor: int) -> int:
@@ -216,7 +302,11 @@ class NemoTransformerAudioModel(MegatronModule):
         }
 
     def forward(
-        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        causal_mask: bool | None = None,
+        thd_sequence_is_causal: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode mel features into ``(B, T', H)`` embeddings and a validity mask."""
         if input_features.ndim != 3:
@@ -238,14 +328,33 @@ class NemoTransformerAudioModel(MegatronModule):
         audio_bct = input_features.transpose(1, 2).contiguous()
         # Cast inputs to the encoder's parameter dtype before forward.
         # The dataloader emits float32 mels, but under Megatron's bf16/fp16
-        # wrapper the encoder parameters (incl. ``NGPTStackingSubsampling``'s
-        # learnable ``pad_frame``) live in low precision; mismatched dtypes
-        # break ``x[mask] = self.pad_frame`` (index_put requires matching
-        # dtypes), so cast at the audio encoder boundary.
+        # wrapper the encoder parameters (including a learned stacking pad
+        # frame when configured) live in low precision, so cast at the audio
+        # encoder boundary.
         encoder_dtype = next(self.encoder.parameters(), audio_bct).dtype
         if audio_bct.dtype != encoder_dtype:
             audio_bct = audio_bct.to(dtype=encoder_dtype)
-        enc_out, lengths_out = self.encoder(audio_bct, lengths)
+        if causal_mask is not None and not self.supports_dynamic_causal_mask:
+            if bool(causal_mask) != bool(self.config.causal_mask):
+                raise ValueError(
+                    "This audio checkpoint does not support runtime causal-mask changes. "
+                    "Use a rope_transformer checkpoint for mixed causal training."
+                )
+        if self.supports_dynamic_causal_mask:
+            enc_out, lengths_out = self.encoder(
+                audio_bct,
+                lengths,
+                causal_mask=(
+                    bool(causal_mask) if causal_mask is not None else self.config.causal_mask
+                ),
+                thd_sequence_is_causal=thd_sequence_is_causal,
+            )
+        else:
+            if thd_sequence_is_causal is not None:
+                raise ValueError(
+                    "Per-audio causal masking requires a rope_transformer audio checkpoint."
+                )
+            enc_out, lengths_out = self.encoder(audio_bct, lengths)
 
         enc_out = enc_out.transpose(1, 2).contiguous()
         max_len = enc_out.shape[1]
@@ -254,7 +363,11 @@ class NemoTransformerAudioModel(MegatronModule):
         return enc_out, output_mask
 
     def forward_packed(
-        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        causal_mask: bool | None = None,
+        thd_sequence_is_causal: torch.Tensor | None = None,
     ) -> PackedAudioEmbeddings:
         """Encode mel features into packed (padding-free) audio embeddings."""
         if input_features.ndim != 3:
@@ -278,7 +391,26 @@ class NemoTransformerAudioModel(MegatronModule):
         if audio_bct.dtype != encoder_dtype:
             audio_bct = audio_bct.to(dtype=encoder_dtype)
 
-        enc_out, lengths_out = self.encoder(audio_bct, lengths, return_packed=True)
+        if self.supports_dynamic_causal_mask:
+            enc_out, lengths_out = self.encoder.forward_packed(
+                audio_bct,
+                lengths,
+                causal_mask=(
+                    bool(causal_mask) if causal_mask is not None else self.config.causal_mask
+                ),
+                thd_sequence_is_causal=thd_sequence_is_causal,
+            )
+        else:
+            if thd_sequence_is_causal is not None:
+                raise ValueError(
+                    "Per-audio causal masking requires a rope_transformer audio checkpoint."
+                )
+            if causal_mask is not None and bool(causal_mask) != bool(self.config.causal_mask):
+                raise ValueError(
+                    "This audio checkpoint does not support runtime causal-mask changes. "
+                    "Use a rope_transformer checkpoint for mixed causal training."
+                )
+            enc_out, lengths_out = self.encoder(audio_bct, lengths, return_packed=True)
         return PackedAudioEmbeddings(
             embeddings=enc_out, lengths=lengths_out.to(dtype=torch.int32, device=enc_out.device)
         )
