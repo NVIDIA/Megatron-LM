@@ -1350,10 +1350,12 @@ class FinishedRequestRecord:
     policy_epoch: Optional[list[tuple[int, int]]]
     kv_cache_epoch: Optional[list[tuple[int, int]]]
     num_evictions: int
+    num_tokens_to_generate: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
         """Build the request's non-RESTful metadata from a finished request."""
+        params = request.sampling_params
         # Epoch stamps exist only while the engine has a generation epoch set.
         record = cls(
             policy_epoch=(
@@ -1367,6 +1369,7 @@ class FinishedRequestRecord:
             num_evictions=sum(
                 1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
             ),
+            num_tokens_to_generate=None if params is None else params.num_tokens_to_generate,
         )
         return record
 
@@ -1451,6 +1454,30 @@ class RequestPayloadStager(Protocol):
     ) -> Optional[RequestPayloadStageResult]:
         """Stage a payload, or return ``None`` to keep it on the normal reply path."""
         ...
+
+
+@dataclass(frozen=True)
+class LiveRequestSnapshot:
+    """Snapshot of a live request, allowing its later resumption."""
+
+    uid: str
+    request_id: int
+    offload_params: Optional[Dict[str, Any]]
+    payload: OffloadedRequestPayload
+    record: FinishedRequestRecord
+
+    @classmethod
+    def from_record(cls, record: "DynamicInferenceRequestRecord") -> "LiveRequestSnapshot":
+        """Copy a live record's merged state; the record itself is left untouched."""
+        merged = record.merge()
+        merged.media_tensors = None
+        return cls(
+            uid=merged.uid,
+            request_id=merged.request_id,
+            offload_params=merged.offload_params,
+            payload=OffloadedRequestPayload.from_request(merged),
+            record=FinishedRequestRecord.from_request(merged),
+        )
 
 
 # Request-metadata keys written by the chat endpoint when it defers prompt-prefix

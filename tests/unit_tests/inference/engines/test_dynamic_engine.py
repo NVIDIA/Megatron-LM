@@ -6,6 +6,8 @@ import logging
 import math
 import os
 import random
+import threading
+import time
 import types
 from collections import OrderedDict, deque
 from contextlib import nullcontext
@@ -53,6 +55,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    LiveRequestSnapshot,
     RequestPayloadStageResult,
     RequestPromptPreparationResult,
     Status,
@@ -2084,6 +2087,36 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
         assert engine.requests == {}
     finally:
         loop.close()
+
+
+def test_snapshot_live_requests():
+    """Every entry but a failed one is copied. Any loop may run the snapshot while none runs the
+    engine, as between a suspend and a resume driven inline; a live engine loop refuses the others.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._loop, other_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
+    live = _make_request_entry(engine._loop, 1, Status.ACTIVE_AND_GENERATING_TOKENS, resolve=False)
+    failed = _make_request_entry(engine._loop, 2, Status.FAILED, resolve=False)
+    engine.requests = {1: live, 2: failed}
+    expected = [LiveRequestSnapshot.from_record(live.record)]
+    assert engine._loop.run_until_complete(engine.snapshot_live_requests()) == expected
+    assert other_loop.run_until_complete(engine.snapshot_live_requests()) == expected
+
+    thread = threading.Thread(target=engine._loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        for _ in range(1000):
+            if engine._loop.is_running():
+                break
+            time.sleep(0.001)
+        with pytest.raises(RuntimeError, match="engine loop"):
+            other_loop.run_until_complete(engine.snapshot_live_requests())
+        on_loop = asyncio.run_coroutine_threadsafe(engine.snapshot_live_requests(), engine._loop)
+        assert on_loop.result(timeout=5) == expected
+    finally:
+        engine._loop.call_soon_threadsafe(engine._loop.stop)
+        thread.join(timeout=5)
+        other_loop.close()
 
 
 def test_vision_state_invalidation_marks_request_local_embeddings_stale():
