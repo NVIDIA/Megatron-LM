@@ -71,10 +71,41 @@ def _step(optimizer):
     optimizer.zero_grad(set_to_none=True)
 
 
+def test_empty_group_flag_matches_installed_fused_adam():
+    """FUSED_ADAM_SKIPS_EMPTY_GROUPS must describe what the installed FusedAdam does."""
+    optimizer = _optimizer(empty_group=True)
+    _step(optimizer)
+    empty_group = optimizer.param_groups[1]
+    assert empty_group["params"] == []
+    assert ("step" not in empty_group) == distrib_optimizer.FUSED_ADAM_SKIPS_EMPTY_GROUPS
+
+
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_restored_empty_group_step_matches_uninterrupted_run(preallocated):
+    """After a restore, every group carries the step metadata of an uninterrupted run."""
+    source = _optimizer()
+    uninterrupted = _optimizer(empty_group=True, reverse=True)
+    for _ in range(5):
+        _step(source)
+        _step(uninterrupted)
+    checkpoint = _wrapper(source).state_dict()
+
+    restored = _optimizer(empty_group=True, reverse=True)
+    if preallocated:
+        _step(restored)
+    _wrapper(restored).load_state_dict(checkpoint)
+
+    for restored_group, uninterrupted_group in zip(
+        restored.param_groups, uninterrupted.param_groups
+    ):
+        assert ("step" in restored_group) == ("step" in uninterrupted_group)
+        assert restored_group.get("step") == uninterrupted_group.get("step")
+
+
 @pytest.mark.parametrize("empty_step", [None, 0, 7])
 @pytest.mark.parametrize("preallocated", [False, True])
 def test_load_preserves_empty_fused_adam_group_step(empty_step, preallocated):
-    """Global checkpoint steps apply only to groups owning local parameters."""
+    """Global checkpoint steps reach empty groups only if FusedAdam advances them."""
     source = _optimizer()
     for _ in range(5):
         _step(source)
@@ -90,16 +121,16 @@ def test_load_preserves_empty_fused_adam_group_step(empty_step, preallocated):
     if empty_step is not None:
         empty_group["step"] = empty_step
     else:
-        assert "step" not in empty_group
+        empty_group.pop("step", None)
     local_param = populated_group["params"][0]
 
     _wrapper(target).load_state_dict(checkpoint)
 
     empty_group, populated_group = target.param_groups
     assert empty_group["params"] == []
-    assert ("step" in empty_group) == (empty_step is not None)
-    if empty_step is not None:
-        assert empty_group["step"] == empty_step
+    expected_empty_step = empty_step if distrib_optimizer.FUSED_ADAM_SKIPS_EMPTY_GROUPS else 5
+    assert ("step" in empty_group) == (expected_empty_step is not None)
+    assert empty_group.get("step") == expected_empty_step
     assert populated_group["params"][0] is local_param
     assert populated_group["step"] == 5
     assert [group["wd_mult"] for group in target.param_groups] == [1.0, 0.0]

@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -33,6 +33,12 @@ except ImportError:
         from torch.optim import Adam as Adam
 
         HAVE_APEX_OR_TE = False
+
+# Apex FusedAdam and TE FusedAdam before 2.19 skip empty param groups entirely, so their "step"
+# never advances. TE 2.19 and later advance "step" in empty groups like in any other group.
+FUSED_ADAM_SKIPS_EMPTY_GROUPS = USING_APEX_OPTIMIZER or (
+    USING_TE_OPTIMIZER and not is_te_min_version("2.19.0")
+)
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
@@ -982,11 +988,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 "params": inner_param_group['params'],
             }
             if (
-                (USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER)
+                FUSED_ADAM_SKIPS_EMPTY_GROUPS
                 and isinstance(self.optimizer, Adam)
                 and not inner_param_group['params']
             ):
-                # Checkpoints align step across groups for resharding. FusedAdam does
+                # Checkpoints align step across groups for resharding. This FusedAdam does
                 # not advance empty local groups, so retain their live step metadata
                 # instead of introducing the checkpoint's global step on this rank.
                 if "step" in inner_param_group:
