@@ -6,7 +6,7 @@ import math
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
@@ -1492,6 +1492,82 @@ PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 PREFIX_EXPANDED_TOKEN_COUNT_FIELD = "_prefix_expanded_token_count"
 PREFIX_MEDIA_COUNT_FIELD = "_prefix_media_count"
 
+# Reserved field a RequestPromptPreparer writes, as ``ResumedGeneration.to_wire()``,
+# to resume a generation at admission; the engine pops it before the request keeps its params.
+RESUMED_GENERATION_FIELD = "_resumed_generation"
+
+
+@dataclass
+class ResumedGeneration:
+    """Generated tokens a request already holds when it is admitted."""
+
+    token_ids: List[int]
+    num_tokens_to_generate: int
+    log_probs: Optional[List[float]] = None
+    prompt_log_probs: Optional[List[float]] = None
+    policy_epoch: Optional[List[Tuple[int, int]]] = None
+    kv_cache_epoch: Optional[List[Tuple[int, int]]] = None
+    num_evictions: int = 0
+    finished: bool = False
+
+    def with_expanded_prompt(
+        self, prompt_length: int, expanded_prompt_length: int
+    ) -> "ResumedGeneration":
+        """Re-base boundary positions after the engine expanded the prompt the preparer saw."""
+        shift = expanded_prompt_length - prompt_length
+        if shift == 0:
+            return self
+
+        def rebase(boundaries):
+            if boundaries is None:
+                return None
+            return [
+                (position + shift if position >= prompt_length else position, epoch)
+                for position, epoch in boundaries
+            ]
+
+        return replace(
+            self, policy_epoch=rebase(self.policy_epoch), kv_cache_epoch=rebase(self.kv_cache_epoch)
+        )
+
+    def to_wire(self) -> Dict[str, Any]:
+        """The msgpack form MP rank zero broadcasts."""
+        return {
+            "token_ids": list(self.token_ids),
+            "num_tokens_to_generate": self.num_tokens_to_generate,
+            "log_probs": None if self.log_probs is None else [float(v) for v in self.log_probs],
+            "prompt_log_probs": (
+                None if self.prompt_log_probs is None else [float(v) for v in self.prompt_log_probs]
+            ),
+            "policy_epoch": (
+                None if self.policy_epoch is None else [list(b) for b in self.policy_epoch]
+            ),
+            "kv_cache_epoch": (
+                None if self.kv_cache_epoch is None else [list(b) for b in self.kv_cache_epoch]
+            ),
+            "num_evictions": self.num_evictions,
+            "finished": self.finished,
+        }
+
+    @classmethod
+    def from_wire(cls, obj: Dict[str, Any]) -> "ResumedGeneration":
+        """Rebuild the broadcast form."""
+
+        def boundaries(name):
+            value = obj[name]
+            return None if value is None else [tuple(boundary) for boundary in value]
+
+        return cls(
+            token_ids=list(obj["token_ids"]),
+            num_tokens_to_generate=obj["num_tokens_to_generate"],
+            log_probs=obj["log_probs"],
+            prompt_log_probs=obj["prompt_log_probs"],
+            policy_epoch=boundaries("policy_epoch"),
+            kv_cache_epoch=boundaries("kv_cache_epoch"),
+            num_evictions=obj["num_evictions"],
+            finished=obj["finished"],
+        )
+
 
 @dataclass(frozen=True)
 class RequestPromptPreparationResult:
@@ -1499,6 +1575,51 @@ class RequestPromptPreparationResult:
 
     prompt: Union[str, List[int], torch.Tensor]
     offload_params: Optional[Dict[str, Any]] = None
+
+
+def build_resumed_record(
+    first: "DynamicInferenceRequest", resumed: ResumedGeneration, *, generation_epoch: Optional[int]
+) -> "DynamicInferenceRequestRecord":
+    """Build the record the engine admits for a request that resumes a generation."""
+    tokens, budget = resumed.token_ids, resumed.num_tokens_to_generate
+    if not (
+        tokens
+        and all(type(t) is int for t in tokens)
+        and type(budget) is int
+        and type(resumed.num_evictions) is int
+        and type(resumed.finished) is bool
+        and resumed.num_evictions >= 0
+        and (len(tokens) < budget or (resumed.finished and len(tokens) == budget))
+        and (resumed.log_probs is None or len(resumed.log_probs) == len(tokens))
+        and (resumed.log_probs is not None or not first.sampling_params.return_log_probs)
+        and (resumed.policy_epoch is not None or generation_epoch is None)
+        and all(
+            bs is None or (bs and all(len(b) == 2 and all(type(v) is int for v in b) for b in bs))
+            for bs in (resumed.policy_epoch, resumed.kv_cache_epoch)
+        )
+    ):
+        raise ValueError("invalid resumed generation")
+    first.sampling_params.num_tokens_to_generate = budget
+    first.sampling_params.num_tokens_total = None
+    first.generated_tokens = tokens
+    first.generated_length = len(tokens)
+    first.generated_log_probs = resumed.log_probs
+    first.prompt_log_probs = resumed.prompt_log_probs
+    first.policy_epoch = resumed.policy_epoch
+    first.kv_cache_epoch = resumed.kv_cache_epoch
+    for _ in range(resumed.num_evictions):
+        first.add_event_evict()
+    record = DynamicInferenceRequestRecord.from_request(first)
+    if resumed.finished:
+        first.status = Status.COMPLETED
+        return record
+    first.add_event_evict()
+    record.checkpoint()
+    continuation = record[-1]
+    if generation_epoch is not None and continuation.policy_epoch[-1][1] != generation_epoch:
+        cut = len(first.prompt_tokens) + len(tokens) - 1
+        continuation.policy_epoch.append((cut, generation_epoch))
+    return record
 
 
 class RequestPromptPreparer(Protocol):
@@ -1515,7 +1636,8 @@ class RequestPromptPreparer(Protocol):
     prompt_token_ids`` plus ``generated_token_ids``) the same way for text and
     multimodal requests. When ``PREFIX_MEDIA_COUNT_FIELD`` is present, they must also
     return the length of that exact prefix as ``PREFIX_EXPANDED_TOKEN_COUNT_FIELD`` so
-    the engine expands only the tokens after it.
+    the engine expands only the tokens after it. A preparer that resumes a generation
+    puts ``ResumedGeneration.to_wire()`` under ``RESUMED_GENERATION_FIELD``.
     """
 
     def prepare_prompt(
