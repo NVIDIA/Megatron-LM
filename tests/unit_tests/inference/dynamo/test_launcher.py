@@ -105,6 +105,26 @@ def test_disaggregated_role_requires_coordinator_address():
         )
 
 
+def test_external_decode_requires_durable_cleanup_and_unique_owner(tmp_path):
+    argv = _external_argv()
+    argv[1] = "decode"
+    split = argv.index("--")
+    argv[split:split] = ["--coordinator-host", "node-0"]
+    with pytest.raises(SystemExit):
+        parse_args(argv)
+    split = argv.index("--")
+    argv[split:split] = [
+        "--handoff-journal",
+        str(tmp_path / "handoffs.db"),
+        "--handoff-owner",
+        "attempt-1",
+    ]
+    config = parse_args(argv)
+    MegatronLLMEngine(config)
+    with pytest.raises(ValueError, match="already used"):
+        MegatronLLMEngine(config)
+
+
 def test_public_entrypoint_uses_common_runner():
     with patch("megatron.inference.integrations.dynamo.main.run") as run:
         main()

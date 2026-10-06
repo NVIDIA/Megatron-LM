@@ -106,14 +106,66 @@ The script uses the current allocation and `SLURM_NODEID` for node ranks; it
 does not select a node list. Kubernetes and Ray can use the same external mode
 by launching the engine-service ranks with their own rendezvous settings.
 
+### Externally managed decode recovery
+
+External decode workers require `--handoff-journal /persistent/replica.db` and
+`--handoff-owner <unique-launch-attempt-id>`. The Slurm script takes the path
+from `HANDOFF_JOURNAL` and generates a new owner ID on each invocation. Other
+supervisors should generate a UUID for every attempt, including parent-only
+restarts, and retain the mapping from this ID to the parent and its entire
+TP/PP/EP rank group. The ID is also logged and included in `--worker-id-file`.
+Never reuse an owner ID. Existing journal owners are rejected at startup.
+
+Use a persistent journal path shared by a replica's successive workers and
+its supervisor, not node-local temporary storage. The parent directory must
+already exist. The filesystem must support SQLite locking and durable fsync;
+the journal uses DELETE/rollback mode, not WAL. Do not remove the database,
+its rollback journal, or owner records while recovery is outstanding.
+Journal writes run off the request event loop, and must commit successfully
+before the adapter submits any decode import.
+
+On a failed deployment attempt:
+
+1. Stop routing to the old worker, disable its automatic restarts, and stop
+   the old adapter **and every decode rank**. A dead rank zero, failed health
+   probe, removed discovery entry, or healthy replacement is not proof that
+   remote reads have stopped. A node that cannot be contacted must be fenced
+   by the deployment system before confirming termination.
+2. Only after the supervisor has established that termination barrier, run:
+
+   ```bash
+   python -m megatron.inference.integrations.dynamo.handoff_journal \
+     --journal /persistent/replica.db \
+     --confirm-terminated-owner <old-launch-attempt-id>
+   ```
+
+   Controllers can equivalently call `HandoffJournal(path).confirm_terminated(owner)`.
+   This operation is idempotent and rejects unknown owners. The Slurm example
+   prints the command but deliberately does not attest automatically: a local
+   `srun` client exiting alone is not a remote-rank termination barrier.
+3. Launch the replacement using the same journal and a fresh owner ID. It can
+   start before or after step 2; it retries safe source releases every five
+   seconds, removing records only after the source coordinator acknowledges.
+   Source outages preserve the records for subsequent retries.
+
+Successful imports and storage-safe aborts are independently marked safe and
+can be retried without stopping their owner. Interrupted imports remain pinned
+indefinitely until the supervisor confirms termination; there is no time-based
+reclamation. Confirmation affects only the specified attempt, never a live
+replacement's imports. Deploy the supervisor hook as part of restart handling:
+restarting decode alone without that hook intentionally cannot reclaim unsafe
+source memory. This journal covers requests accepted by the decode adapter,
+not a frontend failure before delivery of the prefill result to decode.
+
 ## Tests
 
 Adapter tests require an environment containing both Megatron and Dynamo:
 
 ```bash
-pytest -q tests/unit_tests/inference/dynamo
-pytest -q tests/unit_tests/inference/test_engine_endpoint.py
-pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
+python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest -q \
+  tests/unit_tests/inference/dynamo \
+  tests/unit_tests/inference/test_engine_endpoint.py \
+  tests/unit_tests/inference/test_kv_transfer_backends.py
 ```
 
 ## Runtime contract

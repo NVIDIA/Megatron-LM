@@ -41,6 +41,7 @@ from megatron.core.inference.inference_client import InferenceClient, InferenceR
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
+from megatron.inference.integrations.dynamo.handoff_journal import HandoffJournal, HandoffRelease
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
 logger = logging.getLogger(__name__)
@@ -122,7 +123,16 @@ class MegatronLLMEngine(LLMEngine):
         self._release_sockets: dict[str, zmq.asyncio.Socket] = {}
         self._release_locks: dict[str, asyncio.Lock] = {}
         self._cleanup_tasks: set[asyncio.Task] = set()
-        self._prefill_waiters: dict[str, asyncio.Future] = {}
+        self._handoff_recovery_task: asyncio.Task | None = None
+        self._handoff_journal: HandoffJournal | None = None
+        if config.handoff_journal:
+            if config.role != "decode" or not config.handoff_owner:
+                raise ValueError("Handoff journaling requires a decode role and unique owner")
+            self._handoff_journal = HandoffJournal(config.handoff_journal)
+            self._handoff_journal.start_owner(config.handoff_owner)
+        elif config.role == "decode" and config.engine_launch_mode == "external":
+            raise ValueError("Externally managed decode requires a persistent handoff journal")
+        self._request_waiters: dict[str, asyncio.Future] = {}
         self._engine_progress = 0
         self._request_ids: dict[str, int] = {}
         self.worker_id: Optional[int] = None
@@ -218,6 +228,8 @@ class MegatronLLMEngine(LLMEngine):
             connect_timeout_seconds=min(30.0, self.config.engine_start_timeout),
         )
         self._engine_endpoint = endpoint
+        if self._handoff_journal is not None:
+            self._handoff_recovery_task = asyncio.create_task(self._recover_handoffs())
         if self._process is not None:
             self._process_monitor = asyncio.create_task(self._monitor_process())
         identity = {
@@ -226,6 +238,7 @@ class MegatronLLMEngine(LLMEngine):
             "component": self.config.component,
             "endpoint": self.config.endpoint,
             "role": self.config.role,
+            "handoff_owner": self.config.handoff_owner,
         }
         logger.info("Dynamo worker identity: %s", json.dumps(identity, sort_keys=True))
         if self.config.worker_id_file is not None:
@@ -349,11 +362,11 @@ class MegatronLLMEngine(LLMEngine):
             # prefill finish and retain an owner that can release its KV/SSM state.
             result_task = asyncio.create_task(self._collect_prefill_result(stream))
             waiter = asyncio.shield(result_task)
-            self._prefill_waiters[context_id] = waiter
+            self._request_waiters[context_id] = waiter
             delivered = False
             try:
                 final = await waiter
-                if self._prefill_waiters.get(context_id) is not waiter or self._shutting_down:
+                if self._request_waiters.get(context_id) is not waiter or self._shutting_down:
                     raise asyncio.CancelledError
                 self._validate_final_result(final)
                 if not self.client.coordinator_instance_id:
@@ -367,7 +380,7 @@ class MegatronLLMEngine(LLMEngine):
                     ),
                 }
                 delivered = True
-                self._prefill_waiters.pop(context_id, None)
+                self._request_waiters.pop(context_id, None)
                 self._request_ids.pop(context_id, None)
                 yield {
                     "token_ids": [],
@@ -383,17 +396,39 @@ class MegatronLLMEngine(LLMEngine):
                     "disaggregated_params": disagg,
                 }
             finally:
-                self._prefill_waiters.pop(context_id, None)
+                self._request_waiters.pop(context_id, None)
                 if not delivered:
                     self._schedule_cleanup(self._release_cancelled_prefill(result_task))
                 self._request_ids.pop(context_id, None)
             return
 
         release: dict[str, Any] = {}
+        receipt: str | None = None
         if self.config.role == "decode" and not probe:
             prefill = require_prefill_result(request, DisaggregationMode.DECODE)
             disagg = prefill.get("disaggregated_params") or {}
             release = disagg.get("release") or {}
+            if self._handoff_journal is not None:
+                # Durability must precede submission: the parent may die while
+                # decode ranks still have outstanding NIXL reads.
+                record_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._handoff_journal.record,
+                        self.config.handoff_owner,
+                        HandoffRelease.from_metadata(release),
+                    )
+                )
+                waiter = asyncio.shield(record_task)
+                self._request_waiters[context_id] = waiter
+                try:
+                    receipt = await waiter
+                    if self._request_waiters.get(context_id) is not waiter or self._shutting_down:
+                        raise asyncio.CancelledError
+                except BaseException:
+                    self._schedule_cleanup(self._release_unsubmitted_handoff(record_task, release))
+                    raise
+                finally:
+                    self._request_waiters.pop(context_id, None)
             stream = self.client.add_request_with_kv_handoff_streaming(
                 token_ids, params, disagg.get("kv_meta") or {}, list(disagg.get("block_ids") or [])
             )
@@ -407,7 +442,7 @@ class MegatronLLMEngine(LLMEngine):
             async for chunk in self._stream_chunks(stream, token_ids, params):
                 source_safe = True
                 if not released and self.config.role == "decode":
-                    self._schedule_cleanup(self._release_handoff_from_meta_async(release))
+                    self._schedule_cleanup(self._release_recorded_handoff(release, receipt))
                     released = True
                 yield chunk
         except InferenceRequestError as error:
@@ -423,7 +458,7 @@ class MegatronLLMEngine(LLMEngine):
                             timeout=self.config.drain_timeout,
                         )
                     if source_safe:
-                        self._schedule_cleanup(self._release_handoff_from_meta_async(release))
+                        self._schedule_cleanup(self._release_recorded_handoff(release, receipt))
                 except Exception:
                     logger.exception("Failed to finish cancelled Megatron handoff")
 
@@ -569,6 +604,46 @@ class MegatronLLMEngine(LLMEngine):
                 socket.close(linger=0)
                 raise
 
+    async def _release_recorded_handoff(self, release: dict, receipt: str | None) -> None:
+        if receipt is not None:
+            await asyncio.to_thread(self._handoff_journal.mark_source_safe, receipt)
+        if await self._release_handoff_from_meta_async(release) and receipt is not None:
+            await asyncio.to_thread(self._handoff_journal.acknowledge_release, receipt)
+
+    async def _release_unsubmitted_handoff(self, record_task: asyncio.Task, release: dict) -> None:
+        # No import was submitted. Preserve the write result if the consumer
+        # aborts during fsync, so its journal entry can also be cleaned up.
+        try:
+            receipt = await record_task
+        except Exception:
+            logger.exception("Handoff journal write failed before decode submission")
+            receipt = None
+        await self._release_recorded_handoff(release, receipt)
+
+    async def _replay_handoffs(self) -> None:
+        """Retry safe records, including those owned by a previous deployment."""
+        assert self._handoff_journal is not None
+
+        async def release_one(receipt: str, release: HandoffRelease) -> None:
+            try:
+                await self._release_remote_handoff(
+                    release.coordinator_addr, release.request_id, release.coordinator_instance_id
+                )
+                await asyncio.to_thread(self._handoff_journal.acknowledge_release, receipt)
+            except Exception:
+                logger.exception("Retaining handoff %s for another cleanup attempt", receipt)
+
+        pending = await asyncio.to_thread(self._handoff_journal.releasable)
+        await asyncio.gather(*(release_one(receipt, release) for receipt, release in pending))
+
+    async def _recover_handoffs(self) -> None:
+        while True:
+            try:
+                await self._replay_handoffs()
+            except Exception:
+                logger.exception("Failed to read durable handoff journal; will retry")
+            await asyncio.sleep(5)
+
     async def _release_handoff_from_meta_async(self, release: dict[str, Any]) -> bool:
         """Release source state without blocking Dynamo's request loop."""
 
@@ -592,10 +667,10 @@ class MegatronLLMEngine(LLMEngine):
         return True
 
     async def abort(self, context: Context) -> None:
-        waiter = self._prefill_waiters.pop(str(context.id()), None)
+        waiter = self._request_waiters.pop(str(context.id()), None)
         if waiter is not None:
-            # Cancel only the consumer; the protected result task still owns
-            # the prefill until its retained state can be released.
+            # Cancel only the consumer; the protected prefill/journal task still
+            # owns its result until the retained source state can be released.
             waiter.cancel()
             return
         request_id = self._request_ids.pop(str(context.id()), None)
@@ -606,7 +681,7 @@ class MegatronLLMEngine(LLMEngine):
 
     async def drain(self) -> None:
         deadline = asyncio.get_running_loop().time() + self.config.drain_timeout
-        while self._request_ids or self._cleanup_tasks:
+        while self._request_ids or self._request_waiters or self._cleanup_tasks:
             if asyncio.get_running_loop().time() >= deadline:
                 logger.warning("Timed out draining Megatron requests")
                 return
@@ -614,13 +689,17 @@ class MegatronLLMEngine(LLMEngine):
 
     async def cleanup(self) -> None:
         self._shutting_down = True
-        for waiter in self._prefill_waiters.values():
+        for waiter in self._request_waiters.values():
             waiter.cancel()
         await self.drain()
         tasks = list(self._cleanup_tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self._handoff_recovery_task is not None:
+            self._handoff_recovery_task.cancel()
+            await asyncio.gather(self._handoff_recovery_task, return_exceptions=True)
+            self._handoff_recovery_task = None
         for socket in self._release_sockets.values():
             socket.close(linger=0)
         self._release_sockets.clear()

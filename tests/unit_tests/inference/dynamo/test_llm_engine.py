@@ -592,7 +592,7 @@ async def test_cancelled_prefill_releases_state_after_final_reply(cancellation):
     if cancellation == "completed_abort":
         # The shield can already have a result while its consumer has not yet
         # resumed. Cancelling a done future alone does not cancel that consumer.
-        engine._prefill_waiters["dynamo-request"].set_result(
+        engine._request_waiters["dynamo-request"].set_result(
             {"status": "COMPLETED", "disaggregated_params": {"request_id": 900}}
         )
     if cancellation != "consumer":
@@ -610,7 +610,7 @@ async def test_cancelled_prefill_releases_state_after_final_reply(cancellation):
     stream.finish()
     await asyncio.wait_for(asyncio.gather(*engine._cleanup_tasks), timeout=1)
     engine.client.release_handoff.assert_called_once_with(900)
-    assert not engine._prefill_waiters
+    assert not engine._request_waiters
     assert not engine._request_ids
     assert not engine._cleanup_tasks
 

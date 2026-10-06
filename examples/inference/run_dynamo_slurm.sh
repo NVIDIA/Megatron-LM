@@ -13,6 +13,7 @@ Required environment:
   PARENT_EVENT_HOST    Routable hostname or address of this Dynamo parent
   SLURM_NNODES         Number of nodes in the current allocation
   SLURM_JOB_NODELIST   Nodes in the current allocation
+  HANDOFF_JOURNAL      Persistent SQLite file for decode-role cleanup (decode only)
 
 Optional environment:
   PYTHON_EXECUTABLE    Python executable visible on every node (default: python)
@@ -41,6 +42,8 @@ while [[ $# -gt 0 && "$1" != "--" ]]; do
         --engine-launch-mode|--engine-launch-mode=*|\
         --nproc-per-node|--nproc-per-node=*|\
         --parent-event-host|--parent-event-host=*|\
+        --handoff-journal|--handoff-journal=*|\
+        --handoff-owner|--handoff-owner=*|\
         --parent-event-port|--parent-event-port=*)
             echo "$(basename "$0") owns $1; configure it through the documented environment" >&2
             exit 2
@@ -86,6 +89,13 @@ for ((index = 0; index < ${#backend_args[@]}; index++)); do
 done
 
 python_executable=${PYTHON_EXECUTABLE:-python}
+handoff_owner=
+if [[ "$role" == "decode" ]]; then
+    : "${HANDOFF_JOURNAL:?Decode requires a persistent HANDOFF_JOURNAL path}"
+    handoff_owner=$("$python_executable" -c 'import uuid; print(uuid.uuid4().hex)')
+    backend_args+=(--handoff-journal "$HANDOFF_JOURNAL" --handoff-owner "$handoff_owner")
+    echo "Decode handoff owner: $handoff_owner; journal: $HANDOFF_JOURNAL" >&2
+fi
 master_port=${MASTER_PORT:-29500}
 parent_event_port=${PARENT_EVENT_PORT:-5557}
 parent_event_host=$PARENT_EVENT_HOST
@@ -166,4 +176,12 @@ fi
 terminate_children
 wait "$parent_pid" 2>/dev/null || true
 wait "$engine_step_pid" 2>/dev/null || true
+if [[ -n "$handoff_owner" ]]; then
+    # Reaping the local srun client alone is not proof that remote GPU ranks
+    # have exited. The allocation controller must attest to that separately.
+    echo "After confirming this attempt's parent and ALL decode ranks have exited:" >&2
+    printf '%q ' "$python_executable" -m megatron.inference.integrations.dynamo.handoff_journal \
+        --journal "$HANDOFF_JOURNAL" --confirm-terminated-owner "$handoff_owner" >&2
+    echo >&2
+fi
 exit "$status"
