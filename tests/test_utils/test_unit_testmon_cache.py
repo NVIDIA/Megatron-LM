@@ -40,6 +40,12 @@ def source_tree(tmp_path):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
+    shutil.copyfile(ROOT / cache.PLATFORM_CONFIG, root / cache.PLATFORM_CONFIG)
+    platforms = json.loads((root / cache.PLATFORM_CONFIG).read_text())
+    for definition in platforms.values():
+        recipe = root / definition["recipe"]
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text("recipe fixture")
     return root
 
 
@@ -99,6 +105,28 @@ def test_platform_and_bucket_are_isolated(source_tree):
     assert all(
         identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
+
+
+def test_new_platform_uses_registry_and_tracks_its_recipe(source_tree):
+    config = source_tree / cache.PLATFORM_CONFIG
+    platforms = json.loads(config.read_text())
+    recipe = "tests/test_utils/recipes/gb300/unit-tests.yaml"
+    platforms["dgx_gb300"] = {"cloud": "gb300-test", "recipe": recipe}
+    config.write_text(json.dumps(platforms))
+    (source_tree / recipe).parent.mkdir(parents=True)
+    (source_tree / recipe).write_text("original recipe")
+
+    before = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
+    assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_gb300-")
+    assert cache.PLATFORM_CONFIG in before["compatibility"]["inputs"]
+    assert recipe in before["compatibility"]["inputs"]
+
+    (source_tree / recipe).write_text("changed recipe")
+    after = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
+    assert after["cache_prefix"] == before["cache_prefix"]
+    assert after["compatibility"] != before["compatibility"]
+    with pytest.raises(ValueError, match="unsupported Testmon platform"):
+        cache.cache_identity(source_tree, BUCKET, "dgx_unknown", IMAGE_ID)
 
 
 def test_runtime_tracks_normalized_exact_versions_and_duplicate_distributions(monkeypatch):

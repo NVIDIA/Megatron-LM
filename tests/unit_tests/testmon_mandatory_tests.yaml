@@ -5,8 +5,8 @@
 # A mapping fires when a file in the PR's changed-file list lives under one of
 # its `source_dirs` (prefix match; glob patterns are also accepted). This list
 # is independent of the Testmon baseline. Its `test_buckets` are keyed by the
-# recipe platform (`dgx_h100`, `dgx_gb200`) and list test paths or globs; only
-# the files that belong to the bucket currently being executed are added to that
+# recipe platform (defined in testmon_platforms.json) and list test paths or globs.
+# Only files that belong to the bucket currently being executed are added to that
 # bucket's selection. Naming a whole bucket runs that bucket exhaustively.
 mappings:
   - source_dirs:

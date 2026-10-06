@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -226,6 +228,32 @@ def test_cli_keeps_selection_when_nothing_mapped_changed(project):
     assert "no mapped source changes" in result.stdout
     assert selection.read_text().splitlines() == ["tests/unit_tests/foo/test_a.py::test_case"]
     assert record.read_text() == ""
+
+
+def test_cli_accepts_a_platform_added_to_the_registry(project, monkeypatch):
+    scripts = project / "scripts"
+    scripts.mkdir()
+    for filename in ("testmon_mandatory.py", "find_test_cases.py", "testmon_platforms.json"):
+        shutil.copyfile(SCRIPT_PATH.with_name(filename), scripts / filename)
+    registry = scripts / "testmon_platforms.json"
+    platforms = json.loads(registry.read_text())
+    platforms["dgx_gb300"] = {
+        "cloud": "gb300-test",
+        "recipe": "tests/test_utils/recipes/gb300/unit-tests.yaml",
+    }
+    registry.write_text(json.dumps(platforms))
+    config = project / "config.yaml"
+    mappings = yaml.safe_load(config.read_text())
+    mappings["mappings"][0]["test_buckets"]["dgx_gb300"] = ["tests/unit_tests/foo/test_a.py"]
+    config.write_text(yaml.safe_dump(mappings))
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT_PATH", scripts / "testmon_mandatory.py")
+
+    result, selection, record = _invoke(
+        project, ["megatron/core/foo/x.py"], "tests/unit_tests/**/*.py", "dgx_gb300"
+    )
+    assert result.returncode == 0, result.stderr
+    assert selection.read_text().splitlines() == ["tests/unit_tests/foo/test_a.py"]
+    assert record.read_text().splitlines() == ["tests/unit_tests/foo/test_a.py"]
 
 
 def test_cli_fails_without_changed_files_or_with_invalid_config(project):

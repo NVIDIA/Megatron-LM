@@ -19,6 +19,7 @@ from pathlib import Path
 SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
+PLATFORM_CONFIG = "tests/unit_tests/testmon_platforms.json"
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
@@ -36,11 +37,10 @@ COMPATIBILITY_FILES = (
     "tests/unit_tests/testmon_selector.py",
     "tests/unit_tests/testmon_cache.py",
     "tests/unit_tests/testmon_mandatory.py",
+    PLATFORM_CONFIG,
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-    "tests/test_utils/recipes/h100/unit-tests.yaml",
-    "tests/test_utils/recipes/gb200/unit-tests.yaml",
 )
 COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
 DATABASE_TABLES = {
@@ -104,11 +104,13 @@ def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
-    if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
+    platforms = _read_json(root / PLATFORM_CONFIG)
+    if recipe_platform not in platforms:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
+    paths.update(root / definition["recipe"] for definition in platforms.values())
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )

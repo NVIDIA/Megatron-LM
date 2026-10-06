@@ -30,6 +30,7 @@ on:
       - "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
       - "uv.lock"
       - "tests/unit_tests/testmon*.py"
+      - "tests/unit_tests/testmon_platforms.json"
       - "tests/unit_tests/run_ci_test.sh"
       - "tests/test_utils/recipes/*/unit-tests.yaml"
   schedule:
@@ -95,17 +96,20 @@ jobs:
           BUILDS: ${{ needs.populate-build-cache.outputs.build-matrix }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
-          yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/h100/unit-tests.yaml > h100.json
-          yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/gb200/unit-tests.yaml > gb200.json
-          MATRIX=$(jq -cn --argjson builds "$BUILDS" --arg sha "$SOURCE_SHA" \
-            --slurpfile h100 h100.json --slurpfile gb200 gb200.json '
-            [$builds.include[] as $build
-              | (if $build.cloud == "aws-h100" then {platform: "dgx_h100", buckets: $h100[0]}
-                 elif $build.cloud == "gb-gpu" then {platform: "dgx_gb200", buckets: $gb200[0]}
-                 else error("Unsupported unit-test platform") end) as $suite
-              | $suite.buckets[] as $bucket
-              | {bucket: $bucket, platform: $suite.platform, runner: $build.runner,
-                 image: ($build.registry + "/megatron-lm:" + $sha + "-" + $build.cloud)}]')
+          BUILT_PLATFORMS=$(jq -c '.include[]' <<< "$BUILDS")
+          MATRIX='[]'
+          while IFS= read -r BUILD; do
+            [[ -n "$BUILD" ]] || continue
+            SUITE=$(jq -ce --arg cloud "$(jq -r '.cloud' <<< "$BUILD")" '
+              [to_entries[] | select(.value.cloud == $cloud)]
+              | if length == 1 then .[0] else error("Unsupported or ambiguous unit-test platform") end
+              ' tests/unit_tests/testmon_platforms.json)
+            BUCKETS=$(yq -o json '[.products[].test_case[]]' "$(jq -r '.value.recipe' <<< "$SUITE")")
+            MATRIX=$(jq -cn --argjson matrix "$MATRIX" --argjson build "$BUILD" \
+              --argjson suite "$SUITE" --argjson buckets "$BUCKETS" --arg sha "$SOURCE_SHA" '
+              $matrix + [$buckets[] | {bucket: ., platform: $suite.key, runner: $build.runner,
+                image: ($build.registry + "/megatron-lm:" + $sha + "-" + $build.cloud)}]')
+          done <<< "$BUILT_PLATFORMS"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   populate-testmon-cache:
