@@ -744,8 +744,31 @@ class TestPackedSeqCudagraphs:
             return attention_forward(module, *args, **kwargs)
 
         monkeypatch.setattr(TEDotProductAttention, "forward", recording_forward)
-        # This is the primary function under test.
-        create_cudagraphs()
+
+        # Reproduce the stale AccumulateGrad stream failure without inheriting an override
+        # enabled by an earlier test. Keep the eager graph alive through backward capture.
+        set_override = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
+        if set_override is None:
+            create_cudagraphs()
+        else:
+            override_calls = []
+
+            def tracked_override(enabled):
+                override_calls.append(enabled)
+                return set_override(enabled)
+
+            set_override(False)
+            try:
+                with monkeypatch.context() as capture_patch:
+                    capture_patch.setattr(
+                        torch.autograd.graph, "set_override_stale_capture_stream", tracked_override
+                    )
+                    create_cudagraphs()
+                assert override_calls == [True]
+            finally:
+                # Preserve MCore's enabled policy even if this regression test fails.
+                set_override(True)
+
         assert warmup_offsets
         for cu_seqlens, cu_seqlens_padded in warmup_offsets:
             assert torch.equal(cu_seqlens, packed_seq_params.cu_seqlens_q)
