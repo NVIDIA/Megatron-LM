@@ -731,6 +731,15 @@ class TopKRouter(Router):
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
+            aux_loss_logging_reduce_groups (Sequence[torch.distributed.ProcessGroup], optional):
+                Groups the logged metric is all-reduced over, in order, before it is recorded.
+                Defaults to None (no pre-reduction).
+            aux_loss_scale_reduce_groups (Sequence[torch.distributed.ProcessGroup], optional):
+                Groups the valid-token count is all-reduced over, in order, to form the
+                per-token-loss scale. Defaults to None, which uses (reduce_group,).
+            aux_loss_scale_num_tokens (int or torch.Tensor, optional): Already-reduced token
+                count used directly as the per-token-loss scale, skipping the reduction above.
+                Only used when calculate_per_token_loss is set. Defaults to None.
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
         # To avoid accumulating the load balancing loss multiple times, we scale it by
