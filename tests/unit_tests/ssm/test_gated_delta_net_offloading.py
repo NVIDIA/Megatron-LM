@@ -203,6 +203,125 @@ def test_gdn_offload_replay(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("recompute_norm", [False, True])
+def test_gdn_zero_fraction_with_growing_sequence(
+    gdn_offload_groups: ProcessGroupCollection,
+    monkeypatch: pytest.MonkeyPatch,
+    recompute_norm: bool,
+) -> None:
+    """Zero fraction stays disabled when later saves exceed the warmup threshold."""
+    threshold = 80_000
+    config = _config(
+        activation_offload_fraction=0.0,
+        min_offloaded_tensor_size=threshold,
+        recompute_granularity="selective" if recompute_norm else None,
+        recompute_modules=["gdn_norm_out"] if recompute_norm else [],
+    )
+    baseline_config = copy.deepcopy(config)
+    baseline_config.fine_grained_activation_offloading = False
+    baseline_config.offload_modules = []
+    baseline = _build(baseline_config, gdn_offload_groups)
+    offloaded = _build(config, gdn_offload_groups)
+    offloaded.load_state_dict(baseline.state_dict())
+
+    def unexpected_transfer(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Fraction zero must not copy tensors after an empty warmup.")
+
+    monkeypatch.setattr(ChunkOffloadHandler, "offload", unexpected_transfer)
+    for seq_length in (64, 256, 128):
+        source = torch.randn(seq_length, 1, 256, device="cuda", dtype=torch.bfloat16)
+        reference = _run(baseline, source)
+        result = _run(offloaded, source, offload=True, fraction=0.0, threshold=threshold)
+        assert torch.equal(reference[0], result[0])
+        assert torch.equal(reference[1], result[1])
+        assert reference[2].keys() == result[2].keys()
+        for name in reference[2]:
+            assert torch.equal(reference[2][name], result[2][name]), name
+        off_interface.reset(process_group=torch.distributed.group.WORLD)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("recompute_norm", [False, True])
+def test_gdn_offload_microbatch_accumulation(
+    gdn_offload_groups: ProcessGroupCollection,
+    monkeypatch: pytest.MonkeyPatch,
+    fraction: float,
+    recompute_norm: bool,
+) -> None:
+    """Accumulate changing microbatches without synchronizing transfers between them."""
+    config = _config(
+        activation_offload_fraction=fraction,
+        recompute_granularity="selective" if recompute_norm else None,
+        recompute_modules=["gdn_norm_out"] if recompute_norm else [],
+    )
+    baseline_config = copy.deepcopy(config)
+    baseline_config.fine_grained_activation_offloading = False
+    baseline_config.offload_modules = []
+    baseline = _build(baseline_config, gdn_offload_groups)
+    offloaded = _build(config, gdn_offload_groups)
+    offloaded.load_state_dict(baseline.state_dict())
+    inputs = [torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16) for _ in range(9)]
+
+    def run(model: torch.nn.ModuleList, offload: bool) -> list[dict[str, torch.Tensor]]:
+        snapshots = []
+        for iteration in range(3):
+            model.zero_grad(set_to_none=True)
+            for microbatch in range(3):
+                if offload:
+                    off_interface.init_chunk_handler(0, None, None, 1024, 0, fraction)
+                x = inputs[iteration * 3 + microbatch].detach().clone().requires_grad_()
+                y = x
+                for layer in model:
+                    layer_output, _ = layer(y, None)
+                    y = y + layer_output
+                (y.float().square().mean() / 3).backward()
+                assert x.grad is not None
+                snapshots.append(
+                    {
+                        "output": y.detach().clone(),
+                        "input_grad": x.grad.clone(),
+                        **{
+                            name: p.grad.clone()
+                            for name, p in model.named_parameters()
+                            if p.grad is not None
+                        },
+                    }
+                )
+                if offload:
+                    manager = PipelineOffloadManager.get_instance()
+                    assert (
+                        manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"]
+                        == 0
+                    )
+            if offload:
+                assert len(manager._cached_chunks_forward) == 3
+                assert all(
+                    chunk._offloaded_group_index == len(chunk.offload_groups) == config.num_layers
+                    for chunk in manager._cached_chunks_forward
+                )
+                off_interface.reset(process_group=torch.distributed.group.WORLD)
+        # Keep snapshots on GPU so validation does not join copies between steps.
+        torch.cuda.synchronize()
+        return snapshots
+
+    reference = run(baseline, False)
+    bulk_reload = ChunkOffloadHandler.bulk_reload_group
+
+    def delayed_reload(handler: ChunkOffloadHandler) -> None:
+        with torch.cuda.stream(handler.h2d_stream):
+            torch.cuda._sleep(10_000_000)
+        bulk_reload(handler)
+
+    monkeypatch.setattr(ChunkOffloadHandler, "bulk_reload_group", delayed_reload)
+    result = run(offloaded, True)
+    for expected, actual in zip(reference, result):
+        assert expected.keys() == actual.keys()
+        for name in expected:
+            assert torch.equal(expected[name], actual[name]), name
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_gdn_offload_packed_sequence(gdn_offload_groups: ProcessGroupCollection) -> None:
     """Packed-sequence metadata survives the saved-tensor hooks."""
     config = _config()
