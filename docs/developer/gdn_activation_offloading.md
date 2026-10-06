@@ -264,3 +264,7 @@ The proposed follow-up order is:
 
 Each expansion needs its own correctness and memory/runtime measurements; reuse of
 the manager alone does not establish support.
+
+The prepared complete-model integration cases and multi-rank run commands are
+described in [complete-model GDN offload validation](gdn_activation_offload_training.md).
+Their GPU runs and pretrained Qwen qualification are pending.
