@@ -205,6 +205,12 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         experimental_attention_spec = get_experimental_attention_variant_module_spec(
             config=config, backend=backend
         )
+        if config.experimental_attention_variant == "gdn" and config.linear_cp_mode == "chunkwise":
+            # GPT residuals and softmax attention remain in the attention CP layout.
+            experimental_attention_spec.params = {
+                **(experimental_attention_spec.params or {}),
+                "cp_input_layout": config.attention_cp_layout,
+            }
     else:
         experimental_attention_spec = None
 

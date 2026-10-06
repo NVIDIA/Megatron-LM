@@ -194,7 +194,7 @@ class HybridStack(MegatronModule):
 
         self.layer_config_list = layer_config_list
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
-            type(layer_config) is layer_utils.MambaLayerConfig
+            type(layer_config) in (layer_utils.MambaLayerConfig, layer_utils.GDNLayerConfig)
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
@@ -722,7 +722,8 @@ class HybridStack(MegatronModule):
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
                     layer_cp_metadata = (
                         packed_sequence_cp_metadata
-                        if type(layer_config) is layer_utils.MambaLayerConfig
+                        if type(layer_config)
+                        in (layer_utils.MambaLayerConfig, layer_utils.GDNLayerConfig)
                         and layer_config.linear_cp_mode == "chunkwise"
                         else None
                     )

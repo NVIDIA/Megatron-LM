@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel import build_thd_cp_layout_plan, convert_cp_layout
+from megatron.core.context_parallel.layout import _build_thd_zigzag_metadata
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -19,6 +21,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.causal_conv1d import causal_conv1d_cp
+from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
@@ -69,9 +74,41 @@ def get_parameter_local_cp_headwise(
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
+    _supports_chunkwise_cp = True
+
+    def __init__(self, *args, cp_input_layout: Optional[str] = None, **kwargs) -> None:
+        """Initialize GDN and the optional caller-layout conversion boundary."""
+        # GPT keeps residuals in the attention layout. HybridStack instead converts
+        # complete layers and leaves this unset, avoiding a second redistribution.
+        if cp_input_layout not in (None, "zigzag", "contiguous"):
+            raise ValueError(f"Unsupported GDN input layout: {cp_input_layout}")
+        self.cp_input_layout = cp_input_layout
+        super().__init__(*args, **kwargs)
+
+    def supports_two_stage_attention(self) -> bool:
+        """Disable split execution when GDN owns a CP layout conversion pair."""
+        return super().supports_two_stage_attention() and not (
+            self.chunkwise_context_parallel and self.cp_input_layout == "zigzag"
+        )
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
+        self.chunkwise_cp_backend = None
+        if self.chunkwise_context_parallel:
+            if self.config.linear_cp_layout != "contiguous":
+                raise ValueError("GDN chunkwise CP requires contiguous sequence shards")
+            if self.key_head_dim != self.value_head_dim:
+                raise ValueError(
+                    "GDN chunkwise CP currently requires equal key and value dimensions"
+                )
+            if self.config.deterministic_mode or self.gdn_pre_gated_delta_rule_fusion:
+                raise ValueError(
+                    "GDN chunkwise CP does not support deterministic mode or pre-GDR fusion"
+                )
+            from megatron.core.ssm.context_parallel.gdp import FLAGatedDeltaProductCPBackend
+
+            self.chunkwise_cp_backend = FLAGatedDeltaProductCPBackend()
         if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
             raise ValueError(
                 "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
@@ -94,10 +131,10 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             self.num_value_heads // self.tp_size,  # alpha
         )
         self.feat_dim_split = (
-            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,  # qkv
-            self.v_dim_local_tp // self.cp_size,  # gate (z)
-            self.num_value_heads // self.tp_size // self.cp_size,  # beta
-            self.num_value_heads // self.tp_size // self.cp_size,  # alpha
+            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.head_partition_cp_size,
+            self.v_dim_local_tp // self.head_partition_cp_size,  # gate (z)
+            self.num_value_heads // self.tp_size // self.head_partition_cp_size,  # beta
+            self.num_value_heads // self.tp_size // self.head_partition_cp_size,  # alpha
         )
 
         self.dt_bias_dim = self.num_v_heads_local_tp
@@ -169,9 +206,17 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         Return:
             torch.Tensor: Normalized recurrence output.
         """
-        assert (
-            packed_sequence_cp_metadata is None
-        ), "GDN does not support packed-sequence chunkwise CP metadata."
+        if self.chunkwise_context_parallel:
+            if (
+                inference_context is not None
+                or inference_params is not None
+                or InferenceMode.is_active()
+            ):
+                raise ValueError("GDN chunkwise CP is training-only")
+            return self._forward_chunkwise_cp(
+                hidden_states, packed_seq_params, packed_sequence_cp_metadata
+            )
+        assert packed_sequence_cp_metadata is None, "Chunkwise metadata requires chunkwise CP"
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Training-only. Inference is dispatched by forward() before this stage, because
@@ -331,13 +376,124 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("GDN static-batching inference is not supported.")
 
-        return super().forward(
+        layout_plan = None
+        convert_layout = self.chunkwise_context_parallel and self.cp_input_layout == "zigzag"
+        if convert_layout:
+            if packed_seq_params is not None:
+                cu = packed_seq_params.cu_seqlens_q
+                padded_cu = packed_seq_params.cu_seqlens_q_padded
+                source_cu = cu if padded_cu is None else padded_cu
+                metadata = _build_thd_zigzag_metadata(cu, padded_cu, self.cp_size, self.sp_size)
+                layout_plan = build_thd_cp_layout_plan(
+                    metadata.rank_order_indices,
+                    int(source_cu[-1]),
+                    self.pg_collection.cp,
+                    self.config.sequence_parallel,
+                    self.pg_collection.tp,
+                    self.pg_collection.tp_cp,
+                )
+            hidden_states = self._convert_chunkwise_layout(
+                hidden_states, "zigzag", "contiguous", layout_plan
+            )
+        output, bias = super().forward(
             hidden_states,
             attention_mask,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             **kwargs,
         )
+        if convert_layout:
+            output = self._convert_chunkwise_layout(output, "contiguous", "zigzag", layout_plan)
+        return output, bias
+
+    def _convert_chunkwise_layout(self, tensor, source, target, plan):
+        """Convert a GDN boundary tensor while respecting TP and packed routing."""
+        return convert_cp_layout(
+            tensor,
+            source,
+            target,
+            self.pg_collection.cp,
+            self.config.sequence_parallel,
+            self.pg_collection.tp,
+            self.pg_collection.tp_cp,
+            plan,
+        )
+
+    def _forward_chunkwise_cp(self, hidden_states, packed_seq_params, metadata):
+        """Run GDN on a contiguous shard with the selected CP state-propagation mode."""
+        recurrent_cp = self.config.gdn_chunkwise_cp_state_mode == "recurrent"
+        if recurrent_cp and packed_seq_params is not None:
+            raise ValueError("GDN recurrent CP currently supports unpacked inputs only")
+        projected, _ = self.in_proj(hidden_states)
+        local_length, batch, _ = projected.shape
+        global_seq_idx = None
+        local_cu = None
+        preceding_rank_start, following_rank_stop = 0, self.cp_size
+        if metadata is not None and packed_seq_params is None:
+            raise ValueError("Chunkwise packed metadata requires packed_seq_params")
+        if packed_seq_params is not None:
+            if packed_seq_params.local_cp_size is not None:
+                raise ValueError("GDN chunkwise CP does not support dynamic CP groups")
+            if packed_seq_params.qkv_format != "thd" or batch != 1:
+                raise ValueError("Packed GDN chunkwise CP requires THD with batch size 1")
+            global_seq_idx = packed_seq_params.seq_idx
+            if global_seq_idx is None:
+                raise ValueError("Packed GDN chunkwise CP requires global seq_idx")
+            if metadata is None:
+                metadata = build_packed_sequence_cp_metadata(
+                    global_seq_idx, cp_rank=self.pg_collection.cp.rank(), cp_size=self.cp_size
+                )
+            if metadata.local_seq_idx.shape != (1, local_length):
+                raise ValueError("GDN chunkwise metadata does not match the local shard")
+            local_cu = metadata.local_cu_seqlens
+            preceding_rank_start = metadata.preceding_rank_start
+            following_rank_stop = metadata.following_rank_stop
+
+        qkv, gate, beta, alpha = self._split_projection(
+            projected.transpose(0, 1), batch, local_length
+        )
+        qkv = causal_conv1d_cp(
+            x=qkv,
+            weight=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias if self.conv_bias else None,
+            activation=self.activation,
+            cp_group=self.pg_collection.cp,
+            global_seq_idx=global_seq_idx,
+        )
+        inputs = self._prepare_input_for_gated_delta_rule(
+            qkv, gate, self.A_log, self.dt_bias, batch, local_length, beta, alpha
+        )
+        gate = inputs.pop("gate")
+        if recurrent_cp:
+            from megatron.core.ssm.context_parallel.gdn_recurrent import (
+                gdn_recurrent_context_parallel,
+            )
+
+            core_output = gdn_recurrent_context_parallel(
+                **inputs, scale=self.key_head_dim**-0.5, cp_group=self.pg_collection.cp
+            )
+        else:
+            core_output = gdp_chunkwise_context_parallel(
+                **inputs,
+                cu_seqlens=local_cu,
+                num_householder=1,
+                scale=self.key_head_dim**-0.5,
+                cp_group=self.pg_collection.cp,
+                backend=self.chunkwise_cp_backend,
+                preceding_rank_start=preceding_rank_start,
+                following_rank_stop=following_rank_stop,
+            )
+        norm_func = partial(
+            self._gated_norm_and_a2a,
+            thd_cp_a2a_inv=None,
+            batch=batch,
+            seq_len=local_length,
+            packed_seq_params=packed_seq_params,
+        )
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            return self.norm_out_checkpoint.checkpoint(norm_func, core_output, gate)
+        return norm_func(core_output, gate)
 
     def _split_projection(
         self, projected: torch.Tensor, batch: int, seq_len: int

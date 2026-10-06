@@ -780,6 +780,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
+        packed_sequence_cp_metadata=None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -833,6 +834,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
 
+        extra_attention_kwargs = {}
+        if packed_sequence_cp_metadata is not None:
+            extra_attention_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
             attention_output_with_bias = self.self_attention(
@@ -846,6 +850,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **extra_attention_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 
