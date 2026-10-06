@@ -57,6 +57,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_merge,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.utils import is_using_quantization_scales
 
 
@@ -223,18 +226,15 @@ class SSMDynamicInferenceMixin:
         if decode_req_count > 0:
             seq_len = 1 + context.num_speculative_tokens
             decode_token_count = decode_req_count * seq_len
-            if context.batch_invariant_mode:
-                # Batch-invariant execution may include token-only rows to preserve
-                # model-wide M alignment. Those rows do not represent requests and
-                # must not be passed to the recurrent decode kernels.
-                assert decode_token_count <= zxBCdt.shape[0], (
-                    "Batch-invariant SSM metadata describes more decode tokens "
-                    f"({decode_token_count}) than the input projection contains "
-                    f"({zxBCdt.shape[0]})."
-                )
-                zxBCdt_decode = zxBCdt[:decode_token_count]
-            else:
-                zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
+            # Global batch-invariant graph buckets may pad tokens without adding
+            # requests, even when the context's SSM batch-invariant flag is off.
+            # These token-only rows must stay out of the recurrent kernels.
+            assert decode_token_count <= zxBCdt.shape[0], (
+                "SSM metadata describes more decode tokens "
+                f"({decode_token_count}) than the input projection contains "
+                f"({zxBCdt.shape[0]})."
+            )
+            zxBCdt_decode = zxBCdt[:decode_token_count]
             # Reshape from [N*S, 1, d] to [N, S, d] for the decode kernels.
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
             y_decode = self.ssm_decode(
@@ -246,7 +246,7 @@ class SSMDynamicInferenceMixin:
                 intermediate_ssm_state=int_ssm_state,
             )
             # Flatten back to [N*S, 1, d] to match the merge logic.
-            y_decode = y_decode.view(decode_token_count, 1, -1)
+            y_decode = y_decode.reshape(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
         if prefill_req_count > 0:
@@ -280,16 +280,22 @@ class SSMDynamicInferenceMixin:
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
 
-        if context.batch_invariant_mode:
-            # Restore the projection's token-only padding before the output projection.
-            # Its row count can be TP-local, unlike the context's global token count.
-            padding_token_count = zxBCdt.shape[0] - y.shape[0]
-            assert padding_token_count >= 0, (
-                "Batch-invariant SSM produced more token rows "
-                f"({y.shape[0]}) than the input projection contained ({zxBCdt.shape[0]})."
+        # Restore token-only padding before the output projection regardless of
+        # the context's SSM batch-invariant flag. Use the projection's actual row
+        # count, which can be TP-local rather than the context's global count.
+        padding_token_count = zxBCdt.shape[0] - y.shape[0]
+        assert padding_token_count >= 0, (
+            "SSM produced more token rows "
+            f"({y.shape[0]}) than the input projection contained ({zxBCdt.shape[0]})."
+        )
+        if padding_token_count > 0:
+            # Graph bucket alignment reads the process-global kernel switch;
+            # Mamba's SSM batch-invariant path can also require token padding.
+            assert context.batch_invariant_mode or is_batch_invariant_mode_enabled(), (
+                "Token-only SSM padding requires batch-invariant SSM execution "
+                "or the global batch-invariant kernel mode."
             )
-            if padding_token_count > 0:
-                y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
+            y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
         if is_using_quantization_scales(self.config):
