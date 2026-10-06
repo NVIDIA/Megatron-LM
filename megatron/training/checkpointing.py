@@ -208,9 +208,12 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
-def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
+def check_checkpoint_args(
+    checkpoint_args, skip_args: set[str] | None = None, *, checkpoint_config: dict | None = None
+):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
+    cfg = get_run_config()
     args = get_args()
     skip_args = skip_args or set()
 
@@ -257,8 +260,16 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
         if not args.use_dist_ckpt:
             _compare('padded_vocab_size')
         _compare('tokenizer_type')
-    if args.data_parallel_random_init:
-        _compare('data_parallel_random_init')
+    if cfg.rng.data_parallel_random_init and 'data_parallel_random_init' not in skip_args:
+        saved_rng = checkpoint_config.get('rng', {}) if checkpoint_config is not None else {}
+        if 'data_parallel_random_init' in saved_rng:
+            saved_dp_random_init = saved_rng['data_parallel_random_init']
+        else:
+            # Older checkpoints predate run_config.yaml.
+            saved_dp_random_init = checkpoint_args.data_parallel_random_init
+        assert saved_dp_random_init == cfg.rng.data_parallel_random_init, (
+            'data_parallel_random_init value from checkpoint does not match cfg.rng.'
+        )
     if args.phase_transition_iterations:
         _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
@@ -509,7 +520,7 @@ def get_rng_state(
     dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
-    args = get_args()
+    cfg = get_run_config()
     rng_state = {
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
@@ -522,7 +533,7 @@ def get_rng_state(
         get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
     )
     rng_state_list = None
-    if args.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
+    if cfg.rng.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
         rng_state_list = [None for i in range(dp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
@@ -1024,6 +1035,9 @@ def save_checkpoint(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
             if ckpt_type == CheckpointType.LOCAL:
+                # Local checkpoints have no YAML sidecar; persist the full run config here.
+                cfg = get_run_config()
+                state_dict['run_config'] = cfg.to_dict()
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1158,22 +1172,21 @@ def save_checkpoint(
                     iteration=iteration,
                     return_base_dir=True,
                 )
-                if iteration > 0:
-                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 
-                    run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+                run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
-                    # NOTE(@maanug-nv): this try-except is a temporary safeguard for
-                    # unit tests that do not create a config container.
-                    # in the future, run_config.to_yaml() should always run.
-                    try:
-                        run_config = get_run_config()
-                    except AssertionError as e:
-                        if str(e) != 'run config is not initialized.':
-                            raise
-                        warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
-                    else:
-                        run_config.to_yaml(run_config_filename)
+                # NOTE(@maanug-nv): this try-except is a temporary safeguard for
+                # unit tests that do not create a config container.
+                # in the future, run_config.to_yaml() should always run.
+                try:
+                    run_config = get_run_config()
+                except AssertionError as e:
+                    if str(e) != 'run config is not initialized.':
+                        raise
+                    warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+                else:
+                    run_config.to_yaml(run_config_filename)
 
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
                 if (
@@ -2659,6 +2672,7 @@ def load_checkpoint(
     dp_group: Data parallel group (default: None, falls back to mpu API)
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
+    cfg = get_run_config()
     args = get_args()
     load_dir = getattr(args, load_arg)
     loading_pretrained_checkpoint = False
@@ -3100,7 +3114,25 @@ def load_checkpoint(
         # architecture-preserving load. Keep every other resume-time argument
         # compatibility check.
         skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        check_checkpoint_args(checkpoint_args, skip_args=skip_args)
+        checkpoint_config = None
+        if ckpt_type == CheckpointType.LOCAL:
+            checkpoint_config = state_dict.get('run_config')
+        else:
+            from megatron.training.utils.checkpoint_utils import (
+                get_checkpoint_run_config_filename,
+                read_run_config,
+            )
+
+            checkpoint_dir = (
+                os.path.dirname(os.path.dirname(checkpoint_name))
+                if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+            )
+            config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+            if maybe_msc.os.path.exists(config_filename):
+                checkpoint_config = read_run_config(config_filename)
+        check_checkpoint_args(
+            checkpoint_args, skip_args=skip_args, checkpoint_config=checkpoint_config
+        )
         args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
         args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
@@ -3346,7 +3378,7 @@ def load_checkpoint(
                     rng_state = state_dict['rng_state']
 
                 # access rng_state for data parallel rank
-                if args.data_parallel_random_init:
+                if cfg.rng.data_parallel_random_init:
                     dp_rank = (
                         get_pg_rank(dp_group)
                         if dp_group is not None

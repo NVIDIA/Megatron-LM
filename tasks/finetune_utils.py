@@ -175,7 +175,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
-        train_dataloader.sampler.set_epoch(args.seed + epoch)
+        train_dataloader.sampler.set_epoch(cfg.rng.seed + epoch)
 
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):

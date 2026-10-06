@@ -27,6 +27,7 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.training.global_vars import get_run_config
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
@@ -136,7 +137,11 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
             )  # Useful for cases like QAD
             config_path = None
 
+    cfg = get_run_config()
     args_dict = vars(args).copy()
+    # Inherit current RNG settings before explicit teacher YAML overrides.
+    args_dict.update(seed=cfg.rng.seed,
+                     data_parallel_random_init=cfg.rng.data_parallel_random_init)
 
     if config_path is not None:
         with open(config_path) as f:

@@ -71,6 +71,50 @@ class TestLocalCheckpointing:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("owned_dp_random_init", [False, True])
+    def test_owned_rng_policy_round_trip(
+        self, tmp_path_dist_ckpt, run_config, owned_dp_random_init
+    ):
+        Utils.initialize_model_parallel(1, 1)
+        model, optimizer = setup_model_and_optimizer(1, 1, 1)
+        args = SimpleNamespace()
+        init_basic_mock_args(args, 1, 1)
+        init_checkpointing_mock_args(args, None)
+        args.non_persistent_ckpt_type = "local"
+        args.non_persistent_local_ckpt_algo = "atomic"
+        args.ckpt_fully_parallel_save = True
+        # Deliberately disagree with the config-owned policy.
+        args.data_parallel_random_init = not owned_dp_random_init
+        run_config.rng.data_parallel_random_init = owned_dp_random_init
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "owned_rng_local", sync=True) as checkpoint_dir,
+            mock.patch("megatron.training.checkpointing.get_args", return_value=args),
+            mock.patch("megatron.training.async_utils.get_args", return_value=args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+        ):
+            context = {"local_checkpoint_manager": LocalCheckpointManager(checkpoint_dir)}
+            expected_rng = torch.get_rng_state().clone()
+            manager = context["local_checkpoint_manager"]
+            with mock.patch.object(manager, "save", wraps=manager.save) as save:
+                save_checkpoint(
+                    1,
+                    model,
+                    optimizer,
+                    None,
+                    0,
+                    checkpointing_context=context,
+                    non_persistent_ckpt=True,
+                )
+            saved_config = save.call_args.args[0].common_state_dict["run_config"]
+            assert saved_config == run_config.to_dict()
+            run_config.logger.log_interval += 1
+            torch.manual_seed(999)
+            iteration, _ = load_checkpoint(model, optimizer, None, checkpointing_context=context)
+            assert iteration == 1
+            assert torch.equal(torch.get_rng_state(), expected_rng)
+            assert args.data_parallel_random_init is not owned_dp_random_init
+            assert run_config.logger.log_interval == saved_config["logger"]["log_interval"] + 1
+
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     @pytest.mark.parametrize(('use_torch_fsdp2'), [True, False])
     def test_sharded_tensors(self, tp, pp, use_torch_fsdp2):
