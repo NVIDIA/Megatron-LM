@@ -4434,31 +4434,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_chunked_prefill_avoid_single_token_chunk(self):
-        """
-        Test that chunked prefill scheduling avoids leaving exactly 1 token for the final chunk.
-        This leads to a known bug in the Flash Attention kernel:
-        https://github.com/Dao-AILab/flash-attention/issues/1537
+    def test_chunked_prefill_single_token_final_chunk(self):
+        """Chunked prefill leaves a one-token final chunk rather than reshaping the split.
 
-        Scenario:
-            - Max tokens per step (Chunk Size): 256
-            - Request prompt length: 513
-
-        Default scheduling would do:
-            1. Chunk 256 (Remaining 257)
-            2. Chunk 256 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
-            3. Chunk 1
-
-        Fixed scheduling should do:
-            1. Chunk 256 (Remaining 257) -> 513 - 256 == 257. Schedule full 256.
-            2. Chunk 255 (Remaining 2)   -> 257 tokens left. If we take 256, 1 remains.
-                                            So we reduce chunk to 255.
-            3. Chunk 2   (Remaining 0)
+        Prompt of 513 tokens with a 256-token budget: chunks of 256, 256, then 1. Numerical
+        correctness of one-token chunks is covered by
+        test_single_token_prefill_chunks_match_unchunked_baseline.
         """
         prefill_chunk_size = 256
-        # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
-        # 256 + 255 + 2 = 513
-        prompt_len = 513
+        prompt_len = 2 * prefill_chunk_size + 1
 
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -4476,64 +4460,29 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ctx = env.engine.context
 
         # Mock the model forward function to avoid possible numerics issues
-        # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Create a request with length 513
-        req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
         req = DynamicInferenceRequest(
             request_id=1,
-            prompt_tokens=req_tokens,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=1),
         )
-
         env.engine._add_request(req)
 
-        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
-
-        # --- Step 1 (async primer) ---
-        # Available: 256. Remaining: 513.
-        # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
+        assert ctx.request_query_lengths[0].item() == prefill_chunk_size
+        assert req.finished_chunk_token_count == prefill_chunk_size
 
-        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
-        assert ctx.request_query_lengths[0].item() == 256
-
-        assert (
-            req.finished_chunk_token_count == 256
-        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
-
-        # --- Step 2 ---
-        # Resolve the first chunk and launch the second.
-        # Available: 256. Remaining un-prefilled: 257.
-        # Logic: 257 - 256 = 1. This is the edge case!
-        # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
+        assert ctx.request_query_lengths[0].item() == prefill_chunk_size
+        assert req.finished_chunk_token_count == 2 * prefill_chunk_size
 
-        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
-        assert ctx.request_query_lengths[0].item() == 255
-
-        # 256 (previous) + 255 (this step) = 511
-        assert req.finished_chunk_token_count == 511, (
-            "Step 2: Expected 511 tokens processed (256+255), "
-            f"got {req.finished_chunk_token_count}. "
-        )
-
-        # --- Step 3 ---
-        # Resolve the second chunk and launch the final chunk.
-        # Remaining un-prefilled: 2. Available: 256.
-        # Logic: 2 <= 256. Schedule 2.
         env.engine.step_modern()
-
-        assert ctx.total_request_count == 1
         assert ctx.num_prefill_requests == 1
-        assert ctx.request_query_lengths[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 1
 
-        # --- Step 4 ---
-        # Resolve the final prefill output and complete the request.
         env.engine.step_modern()
-
         assert ctx.num_prefill_requests == 0
         assert req.status == Status.COMPLETED
 
@@ -4542,29 +4491,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_chunked_prefill_delay_scheduling_for_unavoidable_single_token_chunk(self):
-        """
-        Test that chunked prefill scheduling delays execution when the only available
-        option is to schedule a chunk of size 1 that leaves exactly 1 token remaining.
+    def test_chunked_prefill_schedules_single_token_chunk_into_leftover_budget(self):
+        """A one-token leftover budget is used rather than deferring the next request.
 
-        Scenario:
-            - Max tokens per step: 256
-            - Request A: 254 token prompt
-            - Request B: 2 token prompt
-
-        Sequence:
-            1. Step 1 async primer:
-               - Request A is scheduled (255 tokens).
-               - Context has 1 token available (256 - 255).
-               - Request B has 2 tokens remaining.
-               - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
-                 crashing FA3. Since chunk_length is 1, we can't safely reduce it.
-                 The engine MUST delay scheduling Request B.
-            2. Step 2 resolves Request A and schedules Request B.
-               - Request A completes after its prefill sample is resolved.
-               - Context has all 256 tokens available.
-               - Request B is now safely scheduled for its full 2 tokens.
-            3. Step 3 resolves Request B's prefill sample.
+        Max tokens per step is 256. Request A (255 tokens) leaves 1 token of budget, so
+        request B (2 tokens) is split into two one-token chunks instead of waiting a step.
         """
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -4585,51 +4516,34 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Add Request A (Length 255)
-        req_a_tokens = torch.randint(0, test_config.vocab_size, (255,), device='cuda')
         req_a = DynamicInferenceRequest(
             request_id=1,
-            prompt_tokens=req_a_tokens,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (255,), device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (2,), device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=1),
         )
         env.engine._add_request(req_a)
-
-        # Add Request B (Length 2)
-        req_b_tokens = torch.randint(0, test_config.vocab_size, (2,), device='cuda')
-        req_b = DynamicInferenceRequest(
-            request_id=2,
-            prompt_tokens=req_b_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=1),
-        )
         env.engine._add_request(req_b)
 
-        # --- Step 1 (async primer) ---
-        # Schedule and launch Request A fully (255), but delay Request B.
+        # Step 1: A's full prompt plus B's first token fill the 256-token budget.
         env.engine.step_modern()
+        assert ctx.total_request_count == 2
+        assert ctx.active_token_count == 256
+        assert req_b.finished_chunk_token_count == 1
+        assert ctx.request_query_lengths[1].item() == 1
 
-        assert ctx.total_request_count == 1
-        assert ctx.active_token_count == 255
-
-        # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
-        assert (
-            req_b.finished_chunk_token_count == 0
-        ), "Request B should have been delayed to avoid leaving a 1-token chunk"
-        assert len(env.engine.waiting_request_ids) == 1
-        assert env.engine.waiting_request_ids[0] == 2
-
-        # --- Step 2 ---
-        # Resolve Request A, then schedule and launch Request B's full 2-token prompt.
+        # Step 2: B's final one-token chunk.
         env.engine.step_modern()
-
         assert req_a.status == Status.COMPLETED
-        assert ctx.total_request_count == 1
         assert ctx.request_ids[0].item() == 2
-        assert ctx.request_query_lengths[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 1
 
-        # --- Step 3 ---
-        # Resolve Request B's prefill output.
+        # Step 3: resolve B's prefill output.
         env.engine.step_modern()
-
         assert req_b.status == Status.COMPLETED
         assert len(env.engine.waiting_request_ids) == 0
 
@@ -4715,12 +4629,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_prefix_caching_avoid_single_token_effective_chunk(self):
-        """
-        Test that prefix caching combined with chunked prefill avoids leaving exactly
-        1 token for the effective prefill chunk. A 1-token prefill chunk routes to
-        the Flash Attention decode kernel, which crashes due to shape mismatches.
-        """
+    def test_prefix_caching_single_token_effective_chunk(self):
+        """A prefix-cache hit on all but the last prompt token computes only that token."""
         block_size = 16
         prompt_len = 17  # 1 full block (16) + 1 token
 
@@ -4773,13 +4683,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(req_b)
         env.engine.step_modern()
 
-        # Verify that `_compute_prefix_match` successfully clamped the skip.
+        # The cached block is skipped in full, leaving a one-token chunk.
         req_b_idx = ctx.request_ids.tolist().index(2)
-
-        assert ctx.request_query_lengths[req_b_idx].item() == 17, (
-            f"Expected effective chunk length to be backed off to 17, "
-            f"but got {ctx.request_query_lengths[req_b_idx].item()}."
-        )
+        assert ctx.request_query_lengths[req_b_idx].item() == 1
+        assert req_b.num_cached_tokens == block_size
 
     @pytest.mark.internal
     @torch.inference_mode()

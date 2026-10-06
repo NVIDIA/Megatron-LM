@@ -2675,17 +2675,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # NonGraphedMHAMetadata: use actual max values.
             max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
             max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
-            # A batch containing prefill has ragged query lengths, so never advertise
-            # max_seqlen_q == 1: FlashAttention-2 reads that as "one query token per sequence"
-            # and, under GQA, takes its `seqlenq_ngroups_swapped` path, reshaping q to
-            # [num_seqs, num_heads_k, ngroups, head_size]. That assumes total_q == num_seqs,
-            # which a ragged batch breaks. This replaces the old scheduling-side clamp in
-            # `_compute_prefix_match`, which forced effective_prefill_chunk_length >= 2 and so
-            # gave up prefix-cache reuse (and could round the skip down onto a block with no
-            # cached Mamba state). The bound is only a kernel-sizing upper bound, so raising it
-            # is safe. Left alone when prefill_req_count == 0: a pure decode batch is uniform,
-            # total_q == num_seqs genuinely holds, and the swap is a real win on the hot path --
-            # the same distinction the graphed branch below already makes.
+            # Prefill batches take the varlen kernel, where FlashAttention-2 reads
+            # max_seqlen_q == 1 as one query token per sequence and, under GQA, reshapes q
+            # assuming total_q == num_seqs; padding breaks that. Raising the bound is safe.
             if self.num_prefill_requests > 0:
                 max_seqlen_q = max(2, max_seqlen_q)
         else:
@@ -3268,15 +3260,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
-        # NOTE: a single-token prefill chunk (effective == 1) used to be clamped away here,
-        # because it makes max_seqlen_q == 1 and FlashAttention-2 then takes its
-        # `seqlenq_ngroups_swapped` path, which assumes total_q == num_seqs and raises when
-        # padding or zero-length rows break that. That is a kernel-interface constraint, so it
-        # is now enforced where the bound is published (`initialize_attention_state`) rather than
-        # by distorting scheduling. The clamp cost real prefix-cache reuse, and its block-aligned
-        # round-down could land on a block with no cached Mamba state -- `add_request` then
-        # ZEROED the SSM state while still skipping the tokens, resuming mid-prompt from a zero
-        # state and producing a wrong (but internally coherent) first generated token.
+        # A one-token chunk is fine: `initialize_attention_state` keeps max_seqlen_q >= 2
+        # for any batch containing prefill.
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
@@ -3588,9 +3573,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             chunk_end_token = effective_kv_offset + effective_prefill_chunk_length
 
             # 3. The redundant tokens are where those two spans overlap. Non-empty
-            #    whenever we matched more blocks than we skipped tokens for: the
-            #    ">= 2 computed tokens" clamp, the Mamba back-off, or memory-only
-            #    hybrid mode where nothing is skipped but blocks are still shared.
+            #    whenever we matched more blocks than we skipped tokens for: a fully
+            #    cached chunk still computing its last token, the Mamba back-off, or
+            #    memory-only hybrid mode where nothing is skipped but blocks are shared.
             overlap_start_token = max(matched_prefix_start_token, chunk_start_token)
             overlap_end_token = min(matched_prefix_end_token, chunk_end_token)
 

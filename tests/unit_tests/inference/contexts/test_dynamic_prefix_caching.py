@@ -1147,24 +1147,15 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
 
     @pytest.mark.internal
-    def test_mamba_prefill_skip_keeps_full_reuse_without_the_old_clamp(self):
-        # A prompt one token past 3 full blocks: skipping all 3 leaves a 1-token chunk.
-        # That used to trip a clamp forcing effective_prefill_chunk_length >= 2, whose
-        # block-aligned round-down could land on a block with no cached Mamba state --
-        # so it then had to walk back, often all the way to skipping nothing.
-        #
-        # The single-token chunk was only ever a problem because it makes max_seqlen_q == 1,
-        # which FlashAttention-2 reads as a uniform one-token-per-sequence batch. That is now
-        # handled where the bound is published (`initialize_attention_state`), so scheduling is
-        # free to take the full skip -- and the full skip lands exactly on a block boundary
-        # whose state IS cached, which is strictly better than what the clamp produced.
+    def test_mamba_prefill_skip_allows_single_token_chunk(self):
+        # A prompt one token past 3 full blocks: skipping all 3 leaves a 1-token chunk, which
+        # must be allowed so the skip can land on the block whose Mamba state is cached.
         ctx = self._mctx()
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 3 + 1)
         ctx.add_request(self._req(ctx, prompt.clone()))
 
-        # Only the last matched block carries Mamba state. The match count is the farthest
-        # cached block + 1, so all 3 blocks are skipped and the restore targets block 2.
+        # Only block 2 carries Mamba state: all 3 blocks are skipped and restore targets block 2.
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[2:])
         req = self._req(ctx, prompt.clone(), request_id=2)
         _m = ctx._compute_prefix_match(req, len(prompt))
@@ -1172,8 +1163,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert _m.prefix_skip_tokens == bs * 3
         assert _m.effective_prefill_chunk_length == 1
 
-        # No Mamba state cached anywhere: nothing to restore from, so skip nothing. This is
-        # the branch that must still refuse to skip, and it is unaffected by the clamp removal.
+        # No Mamba state cached anywhere: nothing to restore from, so skip nothing.
         ctx2 = self._mctx()
         p2 = self._prompt(bs * 3 + 1)
         ctx2.add_request(self._req(ctx2, p2.clone()))
@@ -1604,7 +1594,7 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_fully_cached_repeat_redirects_recomputed_block(self):
-        """The `>= 2 computed tokens` clamp forces a matched block to be recomputed."""
+        """A fully cached repeat recomputes only its last token, whose write is redirected."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         dummy = ctx.kv_block_allocator.dummy_block_idx
@@ -1613,17 +1603,15 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone()))
         cached_blocks = self._block_ids(ctx, 0, 3)
 
-        # Re-sending the prompt verbatim matches all 3 blocks, but skipping all 96
-        # tokens would leave a 0-token chunk, so the skip is clamped down to 2 blocks
-        # and the third block's 32 tokens are recomputed.
+        # Re-sending the prompt verbatim matches all 3 blocks. The last token is always
+        # computed (it produces the logits), so the skip stops one token short.
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         start, end = self._add_chunk(ctx, req2)
-        assert end - start == bs
-        assert ctx.request_kv_length_offsets[1].item() == bs * 2
+        assert end - start == 1
+        assert ctx.request_kv_length_offsets[1].item() == bs * 3 - 1
 
-        # Every recomputed token lands in the matched third block, so all of the
-        # chunk's writes are redirected.
-        assert self._write_targets(ctx, start, end) == [dummy] * bs
+        # That token lands in the matched third block, so its write is redirected.
+        assert self._write_targets(ctx, start, end) == [dummy]
         # The block table is untouched: attention still reads the cached KV.
         assert self._block_ids(ctx, 1, 3) == cached_blocks
 
@@ -1726,14 +1714,14 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
 
         # Chunk 1 stops at token 40, i.e. 8 tokens into block 1, leaving
         # `finished_chunk_token_count` unaligned for chunk 2. Both blocks it spans
-        # are matched, so its 8 computed tokens redirect.
+        # are matched, so the skip stops one token short and that token redirects.
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         chunk1_length = bs + 8
         start1, end1 = self._add_chunk(ctx, req2, chunk_length=chunk1_length)
-        assert end1 - start1 == 8
+        assert end1 - start1 == 1
         assert req2.finished_chunk_token_count == chunk1_length
         assert req2.num_matched_prefix_blocks == 2
-        assert self._write_targets(ctx, start1, end1) == [dummy] * 8
+        assert self._write_targets(ctx, start1, end1) == [dummy]
 
         # Chunk 2 covers tokens [40, 128). The first 24 complete block 1 -- which
         # chunk 1 obtained by match and still shares with the first request -- so
@@ -2105,7 +2093,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             ),
         )
         ctx.add_request(request)
-        assert request.num_cached_tokens == bs
+        assert request.num_cached_tokens == 2 * bs - 1
         engine = _StubEngine(ctx)
         future = engine._add_request(request)
         engine.waiting_request_ids.clear()
@@ -2643,7 +2631,7 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             skipped = _m.prefix_skip_tokens
             effective = _m.effective_prefill_chunk_length
             assert matched == producer_blocks
-            assert skipped == 2 * block_size and effective == block_size
+            assert skipped == 3 * block_size - 1 and effective == 1
             ctx.add_request(probe)
             assert probe.num_cached_tokens == skipped
 
@@ -2683,9 +2671,9 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             fresh = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=3)
             ctx.add_request(cached)
             ctx.add_request(fresh)
-            assert ctx.request_query_lengths[1].item() == block_size
+            assert ctx.request_query_lengths[1].item() == 1
             assert ctx.request_query_lengths[2].item() == 3 * block_size
-            assert cached.num_cached_tokens == 2 * block_size
+            assert cached.num_cached_tokens == 3 * block_size - 1
             assert fresh.num_cached_tokens == 0
 
         self._apply_local_churn(ctx, producer, producer_blocks)
