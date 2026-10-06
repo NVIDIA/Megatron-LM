@@ -783,7 +783,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py",),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
-        "the replay test covers the selected GEMM and deterministic torch fallback.",
+        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

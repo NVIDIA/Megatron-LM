@@ -143,6 +143,41 @@ def test_dsa_weights_projection_replays():
     assert outputs["out"].dtype == torch.float32
 
 
+def test_dsa_kpool_chunked_selection_replays(monkeypatch):
+    """Replay the fixed-memory KPool score and top-k path across query chunks."""
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    seeded()
+    monkeypatch.setattr(dsa, "_KPOOL_SCORE_CHUNK_BYTES", 128)
+    q = torch.randn(9, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(16, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(9, 1, 2, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(4, 8, device="cuda")
+
+    def run(query, key, head_weights, gate_score, positional_bias):
+        _, topk = dsa.fused_qk_topk_kpool(
+            query,
+            key,
+            head_weights,
+            index_topk=8,
+            pool_size=4,
+            gate_score=gate_score,
+            ape=positional_bias,
+            rotate_activation_enabled=False,
+            return_index_scores=False,
+        )
+        return topk
+
+    assert_replays_bit_exact(
+        run,
+        (q, k, weights, gate, ape),
+        backward=False,
+        contention=True,
+        what="DSA KPool chunked selection",
+    )
+
+
 def _topk_routing_map(num_tokens, num_experts, topk):
     logits = torch.randn(num_tokens, num_experts, device="cuda")
     idx = logits.topk(topk, dim=-1).indices

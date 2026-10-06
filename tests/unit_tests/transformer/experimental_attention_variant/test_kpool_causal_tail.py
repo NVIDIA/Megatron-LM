@@ -243,6 +243,77 @@ def test_kpool_rotation_applies_to_query_and_pooled_key():
     torch.testing.assert_close(scores, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("mask_mode", ["none", "explicit_2d", "explicit_3d", "varlen", "packed"])
+@pytest.mark.parametrize("use_relu", [False, True])
+@pytest.mark.parametrize("always_select_tail", [False, True])
+@pytest.mark.parametrize("input_mode", ["none", "fp8", "rotate"])
+def test_kpool_chunked_topk_matches_full_score_reference(
+    mask_mode, use_relu, always_select_tail, input_mode
+):
+    torch.manual_seed(461)
+    sq, sk, batch, heads, dim, pool_size = 9, 16, 2, 3, 8, 4
+    if mask_mode == "packed":
+        batch = 1
+    q = torch.randn(sq, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sk, batch, dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(sq, batch, heads, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(pool_size, dim, device="cuda")
+    kwargs = {}
+    if mask_mode.startswith("explicit"):
+        mask = torch.full((batch, sq, sk), float("-inf"), device="cuda")
+        for bi in range(batch):
+            for qi in range(sq):
+                start = (qi + bi) % pool_size
+                end = min(sk, start + qi + 1)
+                mask[bi, qi, start:end] = 0
+        kwargs["mask"] = mask[0] if mask_mode == "explicit_2d" else mask
+    elif mask_mode in ("varlen", "packed"):
+        kwargs["varlen_starts"] = torch.tensor([0] * 7 + [7] * 2, device="cuda", dtype=torch.int64)
+        kwargs["varlen_ends"] = torch.arange(1, sq + 1, device="cuda", dtype=torch.int64)
+        if mask_mode == "packed":
+            kwargs["cu_seqlens_kv"] = torch.tensor([0, 7, sk], device="cuda")
+
+    args = (q, k, weights, 8, pool_size, gate, ape)
+    with patch(
+        "megatron.core.transformer.experimental_attention_variant.dsa._KPOOL_SCORE_CHUNK_BYTES", 128
+    ):
+        with torch.no_grad():
+            scores, expected = fused_qk_topk_kpool(
+                *args,
+                use_relu=use_relu,
+                always_select_tail=always_select_tail,
+                fp8_indexer=input_mode == "fp8",
+                rotate_activation_enabled=input_mode == "rotate",
+                return_index_scores=True,
+                **kwargs,
+            )
+            no_scores, actual = fused_qk_topk_kpool(
+                *args,
+                use_relu=use_relu,
+                always_select_tail=always_select_tail,
+                fp8_indexer=input_mode == "fp8",
+                rotate_activation_enabled=input_mode == "rotate",
+                return_index_scores=False,
+                **kwargs,
+            )
+    assert scores is not None and no_scores is None
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_kpool_chunked_topk_with_no_complete_pool():
+    q = torch.randn(3, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(3, 1, 2, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(4, 8, device="cuda")
+    args = (q, k, weights, 4, 4, gate, ape)
+    _, expected = fused_qk_topk_kpool(*args)
+    scores, actual = fused_qk_topk_kpool(*args, return_index_scores=False)
+    assert scores is None
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_compute_index_scores_preserves_autograd_graph():
     torch.manual_seed(460)
     q = torch.randn(3, 1, 2, 4, requires_grad=True)

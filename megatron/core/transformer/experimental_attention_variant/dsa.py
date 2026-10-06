@@ -990,6 +990,71 @@ def _expand_query_bounds_for_batch(bounds: torch.Tensor, batch: int, seqlen: int
     )
 
 
+_KPOOL_SCORE_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+@torch.no_grad()
+def _kpool_topk_from_score_chunks(
+    q: torch.Tensor,
+    k_pooled: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    pool_size: int,
+    pool_exists: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+    pool_token_base: torch.Tensor,
+    sk: int,
+    use_relu: bool,
+) -> torch.Tensor:
+    """Compute KPool scores and selection in query chunks.
+
+    KPool selection is discrete and runs under ``no_grad``. Only the fixed-width pool IDs
+    are retained, not the full ``[batch, query, pool]`` score tensor.
+    """
+    sq, batch, n_heads, _ = q.shape
+    num_pools = k_pooled.size(0)
+    budget = index_topk // pool_size
+    pool_topk = torch.full((batch, sq, budget), -1, dtype=torch.int64, device=q.device)
+    if sq == 0 or budget == 0 or num_pools == 0:
+        return pool_topk
+
+    bytes_per_token = batch * n_heads * num_pools * 4
+    chunk_size = min(sq, max(1, _KPOOL_SCORE_CHUNK_BYTES // max(1, bytes_per_token)))
+    select_k = min(budget, num_pools)
+    k_fp32 = k_pooled.float()
+    pool_exists_mask = pool_exists.view(1, 1, -1) if pool_exists is not None else None
+
+    for start in range(0, sq, chunk_size):
+        end = min(start + chunk_size, sq)
+        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
+        if use_relu:
+            scores.relu_()
+        scores.mul_(weights[start:end].unsqueeze(-1))
+        score_chunk = scores.sum(dim=2).transpose(0, 1)
+        del scores
+
+        if varlen_starts is not None:
+            valid = dsa_masking.build_valid_mask_from_starts_ends(
+                varlen_starts[start:end], varlen_ends[start:end], key_positions
+            )
+            score_chunk.masked_fill_(~valid.unsqueeze(0), float('-inf'))
+        elif mask is not None:
+            mask_chunk = mask[start:end] if mask.ndim == 2 else mask[:, start:end]
+            pool_valid = _pool_validity_from_token_mask(mask_chunk, pool_token_base, pool_size, sk)
+            score_chunk.masked_fill_(~pool_valid, float('-inf'))
+        if pool_exists_mask is not None:
+            score_chunk.masked_fill_(~pool_exists_mask, float('-inf'))
+
+        topk_scores, topk_indices = score_chunk.topk(select_k, dim=-1)
+        topk_indices.masked_fill_(topk_scores == float('-inf'), -1)
+        pool_topk[:, start:end, :select_k] = topk_indices
+
+    return pool_topk
+
+
 def _mask_topk_tokens_with_token_mask(
     topk_indices: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -1021,6 +1086,7 @@ def fused_qk_topk_kpool(
     always_select_tail: bool = True,
     fp8_indexer: bool = False,
     rotate_activation_enabled: bool = False,
+    return_index_scores: bool = True,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -1028,6 +1094,7 @@ def fused_qk_topk_kpool(
     and weights are [queries, batch, heads]. Packed bounds use global token
     coordinates. Output indices are [batch, queries, index_topk + pool_size - 1]
     when always_select_tail is enabled, with -1 for unused slots.
+    Set return_index_scores=False to select in query chunks without retaining scores.
     """
     sk = k.size(0)
 
@@ -1049,8 +1116,6 @@ def fused_qk_topk_kpool(
         q = rotate_activation(q)
         if k_pooled.numel():
             k_pooled = rotate_activation(k_pooled)
-    index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
-
     # A pool is causal only when its final token is within the query's bounds.
     pool_exists = pool_token_base >= 0
     pool_positions = pool_token_base.clamp_min(0) + (pool_size - 1)
@@ -1063,38 +1128,59 @@ def fused_qk_topk_kpool(
         varlen_ends=varlen_ends,
         key_positions=eff_key_positions,
         sk=num_pools,
-        device=index_scores.device,
+        device=q.device,
     )
-    if v_starts is not None:
-        index_scores = dsa_masking.apply_starts_ends_mask_to_scores(
-            index_scores, v_starts, v_ends, k_pos
-        )
-    elif mask is not None:
-        assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
-        pool_exists = pool_exists & _pool_validity_from_token_mask(
-            mask, pool_token_base, pool_size, sk
-        )
-    index_scores = index_scores.masked_fill(~pool_exists, float("-inf"))
+    if return_index_scores:
+        index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
+        if v_starts is not None:
+            index_scores = dsa_masking.apply_starts_ends_mask_to_scores(
+                index_scores, v_starts, v_ends, k_pos
+            )
+        elif mask is not None:
+            assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+            pool_exists = pool_exists & _pool_validity_from_token_mask(
+                mask, pool_token_base, pool_size, sk
+            )
+        index_scores = index_scores.masked_fill(~pool_exists, float("-inf"))
 
-    # Keep the selection width fixed, including when fewer causal pools exist.
-    budget = index_topk // pool_size
-    select_k = min(budget, num_pools)
-    if select_k > 0:
-        topk_scores, pool_topk = index_scores.topk(select_k, dim=-1)
-        # [batch, seqlen_q, select_k] -> mask invalid pools
-        pool_topk = pool_topk.masked_fill(topk_scores == float("-inf"), -1)
+        # Keep the selection width fixed, including when fewer causal pools exist.
+        budget = index_topk // pool_size
+        select_k = min(budget, num_pools)
+        if select_k > 0:
+            topk_scores, pool_topk = index_scores.topk(select_k, dim=-1)
+            # [batch, seqlen_q, select_k] -> mask invalid pools
+            pool_topk = pool_topk.masked_fill(topk_scores == float("-inf"), -1)
+        else:
+            pool_topk = torch.empty(
+                index_scores.shape[:-1] + (0,), dtype=torch.int64, device=index_scores.device
+            )
+        if pool_topk.shape[-1] < budget:
+            pad = torch.full(
+                index_scores.shape[:-1] + (budget - pool_topk.shape[-1],),
+                -1,
+                dtype=torch.int64,
+                device=index_scores.device,
+            )
+            pool_topk = torch.cat([pool_topk, pad], dim=-1)
     else:
-        pool_topk = torch.empty(
-            index_scores.shape[:-1] + (0,), dtype=torch.int64, device=index_scores.device
+        if mask is not None:
+            assert mask.dtype == torch.float32, "mask dtype must be float32"
+        index_scores = None
+        pool_topk = _kpool_topk_from_score_chunks(
+            q=q,
+            k_pooled=k_pooled,
+            weights=weights,
+            index_topk=index_topk,
+            pool_size=pool_size,
+            pool_exists=pool_exists if use_per_seg else None,
+            mask=mask,
+            varlen_starts=v_starts,
+            varlen_ends=v_ends,
+            key_positions=k_pos,
+            pool_token_base=pool_token_base,
+            sk=sk,
+            use_relu=use_relu,
         )
-    if pool_topk.shape[-1] < budget:
-        pad = torch.full(
-            index_scores.shape[:-1] + (budget - pool_topk.shape[-1],),
-            -1,
-            dtype=torch.int64,
-            device=index_scores.device,
-        )
-        pool_topk = torch.cat([pool_topk, pad], dim=-1)
 
     # Expand [batch * queries, pools] to a fixed token budget.
     rows = pool_topk.shape[0] * pool_topk.shape[1]
@@ -2037,7 +2123,8 @@ class DSAIndexer(MegatronModule):
         qr: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_index_scores: bool = True,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """
         Forward pass for DSA Indexer that returns both index scores and top-k indices.
 
@@ -2049,9 +2136,11 @@ class DSAIndexer(MegatronModule):
             mask: Optional additive attention mask [seqlen, seqlen] or
                 [batch, seqlen, seqlen].
             packed_seq_params: Packed sequence parameters for variable length sequences.
+            return_index_scores: Skip materializing KPool scores when only top-k is needed.
 
         Returns:
-            index_scores: Index scores [batch, seqlen, seqlen].
+            index_scores: Index scores [batch, seqlen, seqlen], or None for KPool selection
+                when return_index_scores is False.
             topk_indices: Top-k indices [batch, seqlen, index_topk].
         """
         # [seqlen, batch, index_n_heads * index_head_dim]
@@ -2078,6 +2167,7 @@ class DSAIndexer(MegatronModule):
                 always_select_tail=self.index_kpool_always_select_tail,
                 fp8_indexer=self.index_kpool_use_quantization,
                 rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
+                return_index_scores=return_index_scores,
             )
             self._kpool_gate_score = None
         else:
@@ -2107,7 +2197,9 @@ class DSAIndexer(MegatronModule):
         Returns:
             topk_indices: Top-k indices for sparse attention [batch, seqlen, index_topk].
         """
-        _, topk_indices = self.forward_with_scores(x, qr, mask, packed_seq_params)
+        _, topk_indices = self.forward_with_scores(
+            x, qr, mask, packed_seq_params, return_index_scores=False
+        )
         return topk_indices
 
 
@@ -2941,6 +3033,7 @@ class DSAttention(MegatronModule):
                         always_select_tail=self.indexer.index_kpool_always_select_tail,
                         fp8_indexer=self.indexer.index_kpool_use_quantization,
                         rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
+                        return_index_scores=False,
                     )
                     del _index_scores
                     self.indexer._kpool_gate_score = None
