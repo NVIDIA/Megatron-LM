@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import shutil
 import subprocess
@@ -19,6 +18,7 @@ CONFIG_PATH = ROOT / "tests/unit_tests/testmon_mandatory_tests.yaml"
 
 for name, filename in (
     ("find_test_cases", "find_test_cases.py"),
+    ("testmon_cache", "testmon_cache.py"),
     ("testmon_mandatory", "testmon_mandatory.py"),
 ):
     spec = importlib.util.spec_from_file_location(name, SCRIPT_PATH.with_name(filename))
@@ -233,15 +233,13 @@ def test_cli_keeps_selection_when_nothing_mapped_changed(project):
 def test_cli_accepts_a_platform_added_to_the_registry(project, monkeypatch):
     scripts = project / "scripts"
     scripts.mkdir()
-    for filename in ("testmon_mandatory.py", "find_test_cases.py", "testmon_platforms.json"):
+    for filename in ("testmon_mandatory.py", "find_test_cases.py", "testmon_cache.py"):
         shutil.copyfile(SCRIPT_PATH.with_name(filename), scripts / filename)
-    registry = scripts / "testmon_platforms.json"
-    platforms = json.loads(registry.read_text())
-    platforms["dgx_gb300"] = {
-        "cloud": "gb300-test",
-        "recipe": "tests/test_utils/recipes/gb300/unit-tests.yaml",
-    }
-    registry.write_text(json.dumps(platforms))
+    cache_script = scripts / "testmon_cache.py"
+    cache_script.write_text(
+        cache_script.read_text() + '\nPLATFORMS["dgx_gb300"] = {"cloud": "gb300-test", '
+        '"recipe": "tests/test_utils/recipes/gb300/unit-tests.yaml"}\n'
+    )
     config = project / "config.yaml"
     mappings = yaml.safe_load(config.read_text())
     mappings["mappings"][0]["test_buckets"]["dgx_gb300"] = ["tests/unit_tests/foo/test_a.py"]

@@ -6,15 +6,14 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import json
 import sys
 from pathlib import Path
 
 import yaml
 from find_test_cases import expand_pattern
+from testmon_cache import PLATFORMS
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("testmon_mandatory_tests.yaml")
-PLATFORMS = json.loads(Path(__file__).with_name("testmon_platforms.json").read_text())
 
 
 def load_mappings(config: Path) -> list[dict]:

@@ -30,7 +30,6 @@ on:
       - "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
       - "uv.lock"
       - "tests/unit_tests/testmon*.py"
-      - "tests/unit_tests/testmon_platforms.json"
       - "tests/unit_tests/run_ci_test.sh"
       - "tests/test_utils/recipes/*/unit-tests.yaml"
   schedule:
@@ -96,6 +95,7 @@ jobs:
           BUILDS: ${{ needs.populate-build-cache.outputs.build-matrix }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
+          PLATFORMS=$(python tests/unit_tests/testmon_cache.py platforms)
           BUILT_PLATFORMS=$(jq -c '.include[]' <<< "$BUILDS")
           MATRIX='[]'
           while IFS= read -r BUILD; do
@@ -103,7 +103,7 @@ jobs:
             SUITE=$(jq -ce --arg cloud "$(jq -r '.cloud' <<< "$BUILD")" '
               [to_entries[] | select(.value.cloud == $cloud)]
               | if length == 1 then .[0] else error("Unsupported or ambiguous unit-test platform") end
-              ' tests/unit_tests/testmon_platforms.json)
+              ' <<< "$PLATFORMS")
             BUCKETS=$(yq -o json '[.products[].test_case[]]' "$(jq -r '.value.recipe' <<< "$SUITE")")
             MATRIX=$(jq -cn --argjson matrix "$MATRIX" --argjson build "$BUILD" \
               --argjson suite "$SUITE" --argjson buckets "$BUCKETS" --arg sha "$SOURCE_SHA" '

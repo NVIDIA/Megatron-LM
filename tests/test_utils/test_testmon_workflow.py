@@ -62,10 +62,13 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         "print(json.dumps([case for product in recipe['products'] for case in product['test_case']]))\n"
     )
     yq.chmod(0o755)
-    registry = Path("tests/unit_tests/testmon_platforms.json")
-    (tmp_path / registry).parent.mkdir(parents=True)
-    shutil.copy2(ROOT / registry, tmp_path / registry)
-    for platform in json.loads((tmp_path / registry).read_text()).values():
+    helper = tmp_path / "tests/unit_tests/testmon_cache.py"
+    helper.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "tests/unit_tests/testmon_cache.py", helper)
+    platforms = json.loads(
+        subprocess.check_output([sys.executable, str(helper), "platforms"], text=True)
+    )
+    for platform in platforms.values():
         relative = Path(platform["recipe"])
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
@@ -140,11 +143,15 @@ def test_producer_consumes_the_actual_build_matrix(
 def test_producer_rejects_an_unsupported_or_ambiguous_built_platform(
     tmp_path: Path, shell_environment: dict[str, str], ambiguous: bool
 ) -> None:
-    registry_path = tmp_path / "tests/unit_tests/testmon_platforms.json"
-    registry = json.loads(registry_path.read_text())
     if ambiguous:
-        registry["dgx_duplicate"] = registry["dgx_h100"]
-        registry_path.write_text(json.dumps(registry))
+        helper = tmp_path / "tests/unit_tests/testmon_cache.py"
+        helper.write_text(
+            helper.read_text().replace(
+                '\nif __name__ == "__main__":',
+                '\nPLATFORMS["dgx_duplicate"] = PLATFORMS["dgx_h100"]\n'
+                '\nif __name__ == "__main__":',
+            )
+        )
     step = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
     result, outputs = _run(
         step["run"],
@@ -161,14 +168,18 @@ def test_producer_rejects_an_unsupported_or_ambiguous_built_platform(
     assert "matrix" not in outputs
 
 
-def test_producer_reads_a_new_platform_from_the_registry(
+def test_producer_reads_a_new_platform_from_the_cache_helper(
     tmp_path: Path, shell_environment: dict[str, str]
 ) -> None:
-    registry_path = tmp_path / "tests/unit_tests/testmon_platforms.json"
-    registry = json.loads(registry_path.read_text())
     recipe = "tests/test_utils/recipes/gb300/unit-tests.yaml"
-    registry["dgx_gb300"] = {"cloud": "gb300-gpu", "recipe": recipe}
-    registry_path.write_text(json.dumps(registry))
+    definition = {"cloud": "gb300-gpu", "recipe": recipe}
+    helper = tmp_path / "tests/unit_tests/testmon_cache.py"
+    helper.write_text(
+        helper.read_text().replace(
+            '\nif __name__ == "__main__":',
+            f'\nPLATFORMS["dgx_gb300"] = {definition!r}\n\nif __name__ == "__main__":',
+        )
+    )
     buckets = ["tests/unit_tests/new_arch/**/*.py", "tests/unit_tests/other/**/*.py"]
     recipe_path = tmp_path / recipe
     recipe_path.parent.mkdir(parents=True)
