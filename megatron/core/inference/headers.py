@@ -38,6 +38,7 @@ class Request(IntEnum):
     REQUEST_ERROR = 29  # Terminal request failure.
     KV_TRANSFER_READY = 30  # Decode committed destinations for a two-sided transfer.
     REQUEST_ABORTED = 31  # Engine confirms cancellation is safe to finalize.
+    RELEASE_KV_ACK = 32  # Coordinator accepted a fenced source release.
 
 
 class Control(IntEnum):

@@ -125,12 +125,18 @@ pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
   the ordinary Megatron `InferenceClient` protocol; the coordinator has no
   Dynamo mixins or Dynamo-only management headers.
 - Prefill runs a zero-token request, pins prompt blocks, and returns NIXL
-  metadata in `disaggregated_params`.
+  metadata in `disaggregated_params` with `finish_reason="length"`. Other finish
+  reasons are terminal to Dynamo's prefill router and would skip decode.
 - The frontend forwards the prefill result to the selected decode worker.
 - Decode imports the blocks before generation and releases the source handoff
   in the background after the first post-import output. Source connection and
   release attempts time out after five seconds and log failures without
   interrupting decode output; connections to different sources proceed independently.
+  Each release re-registers with the source coordinator and waits for its
+  acceptance acknowledgement; a transport failure is retried once on a fresh
+  socket. Releases include the source coordinator's instance ID so a delayed
+  release cannot free a reused request ID after prefill replacement. Upgrade
+  prefill and decode together: Dynamo handoff requires this instance-ID protocol.
 - Rank zero queues prefix block events after successful forwards; a dedicated
   thread sends them directly to the Dynamo parent without crossing the request
   coordinator or stalling the forward path.

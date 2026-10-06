@@ -112,6 +112,7 @@ class InferenceClient:
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
+        self.coordinator_instance_id: str | None = None
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
         # Resolves when abort cleanup makes transferred state safe to reuse.
@@ -637,6 +638,7 @@ class InferenceClient:
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
         reply = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
         assert Headers(reply[0]) == Headers.CONNECT_ACK
+        self.coordinator_instance_id = str(reply[1]) if len(reply) > 1 else None
 
     def start(
         self,

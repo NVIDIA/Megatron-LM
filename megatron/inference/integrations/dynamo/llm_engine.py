@@ -356,9 +356,12 @@ class MegatronLLMEngine(LLMEngine):
                 if self._prefill_waiters.get(context_id) is not waiter or self._shutting_down:
                     raise asyncio.CancelledError
                 self._validate_final_result(final)
+                if not self.client.coordinator_instance_id:
+                    raise RuntimeError("Dynamo handoff requires coordinator instance IDs")
                 disagg = dict(final.get("disaggregated_params") or {})
                 disagg["release"] = {
                     "coordinator_addr": endpoint.coordinator_address,
+                    "coordinator_instance_id": self.client.coordinator_instance_id,
                     "request_id": int(
                         disagg.get("request_id", final.get("request_id", stream.request_id))
                     ),
@@ -369,7 +372,9 @@ class MegatronLLMEngine(LLMEngine):
                 yield {
                     "token_ids": [],
                     "index": 0,
-                    "finish_reason": "stop",
+                    # Dynamo treats other finish reasons as terminal before
+                    # inspecting the handoff metadata and never dispatches decode.
+                    "finish_reason": "length",
                     "completion_usage": {
                         "prompt_tokens": len(token_ids),
                         "completion_tokens": 0,
@@ -526,7 +531,9 @@ class MegatronLLMEngine(LLMEngine):
         if not task.cancelled() and (error := task.exception()) is not None:
             logger.error("Megatron handoff cleanup failed", exc_info=error)
 
-    async def _release_remote_handoff(self, address: str, request_id: int) -> None:
+    async def _release_remote_handoff(
+        self, address: str, request_id: int, instance_id: str
+    ) -> None:
         lock = self._release_locks.setdefault(address, asyncio.Lock())
         async with asyncio.timeout(_RELEASE_TIMEOUT), lock:
             socket = self._release_sockets.get(address)
@@ -537,27 +544,51 @@ class MegatronLLMEngine(LLMEngine):
                 socket.setsockopt(zmq.SNDHWM, 0)
                 socket.setsockopt(zmq.RCVHWM, 0)
                 socket.connect(address)
-                try:
-                    await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-                    reply = await socket.recv()
-                    if Headers(msgpack.unpackb(reply, raw=False)[0]) != Headers.CONNECT_ACK:
-                        raise RuntimeError("Unexpected handoff release coordinator reply")
-                except BaseException:
-                    socket.close(linger=0)
-                    raise
                 self._release_sockets[address] = socket
-            await socket.send(
-                msgpack.packb([Headers.RELEASE_KV.value, int(request_id)], use_bin_type=True)
-            )
+            try:
+                # ZMQ reconnects sockets across coordinator replacement, but the
+                # replacement's known-client set is empty. Register on every use.
+                await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+                reply = msgpack.unpackb(await socket.recv(), raw=False)
+                if Headers(reply[0]) != Headers.CONNECT_ACK or len(reply) != 2:
+                    raise RuntimeError("Handoff release requires a coordinator instance ID")
+                if reply[1] != instance_id:
+                    # The old coordinator/engine incarnation is gone. Never
+                    # release a recycled request ID in its replacement.
+                    return
+                await socket.send(
+                    msgpack.packb(
+                        [Headers.RELEASE_KV.value, int(request_id), instance_id], use_bin_type=True
+                    )
+                )
+                reply = msgpack.unpackb(await socket.recv(), raw=False)
+                if reply != [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]:
+                    raise RuntimeError("Unexpected handoff release acknowledgement")
+            except BaseException:
+                self._release_sockets.pop(address, None)
+                socket.close(linger=0)
+                raise
 
     async def _release_handoff_from_meta_async(self, release: dict[str, Any]) -> bool:
         """Release source state without blocking Dynamo's request loop."""
 
         if release.get("coordinator_addr") is None or release.get("request_id") is None:
             return False
-        await self._release_remote_handoff(
-            str(release["coordinator_addr"]), int(release["request_id"])
-        )
+        instance_id = release.get("coordinator_instance_id")
+        if not isinstance(instance_id, str) or not instance_id:
+            raise ValueError("Handoff release metadata is missing the coordinator instance ID")
+        for attempt in range(2):
+            try:
+                await self._release_remote_handoff(
+                    str(release["coordinator_addr"]), int(release["request_id"]), instance_id
+                )
+                break
+            except (TimeoutError, zmq.ZMQError):
+                if attempt == 1:
+                    raise
+                # A timed-out socket is discarded above. Retry registration
+                # and the idempotent fenced release on a fresh connection.
+                await asyncio.sleep(0.05)
         return True
 
     async def abort(self, context: Context) -> None:

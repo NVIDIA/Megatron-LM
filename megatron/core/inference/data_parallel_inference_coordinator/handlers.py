@@ -97,13 +97,12 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
     ``metadata``: ``[header]``.
     ``bodies``: empty.
     """
-    if sender_identity in coordinator.known_clients:
-        logging.info(f"Client {sender_identity} sent a duplicate connect request. Ignoring ..")
-        return
-
     coordinator.known_clients.add(sender_identity)
     coordinator.router_socket.send_multipart(
-        [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+        [
+            sender_identity,
+            msgpack.packb([Headers.CONNECT_ACK.value, coordinator.instance_id], use_bin_type=True),
+        ]
     )
 
 
@@ -338,14 +337,30 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
     Sent by ``InferenceClient.release_handoff``. Broadcast to every engine;
     engines not holding that request id treat it as a no-op.
 
-    ``metadata``: ``[header, client_request_id]``.
+    ``metadata``: ``[header, engine_request_id, optional_coordinator_instance_id]``.
+    Fenced releases receive an acknowledgement; a stale instance never releases
+    a request in a replacement coordinator that may have reused the same ID.
     ``bodies``: empty.
     """
 
     if sender_identity not in coordinator.known_clients:
         logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
         return
-    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, int(metadata[1])])
+    request_id = int(metadata[1])
+    if len(metadata) == 2:
+        coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
+        return
+    instance_id = metadata[2]
+    if instance_id == coordinator.instance_id:
+        coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
+    coordinator.router_socket.send_multipart(
+        [
+            sender_identity,
+            msgpack.packb(
+                [Headers.RELEASE_KV_ACK.value, request_id, instance_id], use_bin_type=True
+            ),
+        ]
+    )
 
 
 @message_handler(

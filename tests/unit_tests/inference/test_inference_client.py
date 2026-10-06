@@ -53,7 +53,7 @@ async def test_inference_client_lifecycle():
     # one. Subsequent recvs raise zmq.Again so the listener yields back to the
     # event loop.
     recv_queue = [
-        [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
+        [msgpack.packb([Headers.CONNECT_ACK.value, "coordinator-instance"], use_bin_type=True)],
         [
             msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
             msgpack.packb({"foo": "bar"}, use_bin_type=True),
@@ -68,6 +68,7 @@ async def test_inference_client_lifecycle():
     fake_socket.recv_multipart.side_effect = fake_recv
 
     client.start()
+    assert client.coordinator_instance_id == "coordinator-instance"
     assert isinstance(client.listener_task, asyncio.Task)
     sent_connect = fake_socket.send.call_args.args[0]
     assert msgpack.unpackb(sent_connect, raw=False)[0] == Headers.CONNECT.value

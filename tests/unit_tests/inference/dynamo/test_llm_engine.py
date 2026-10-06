@@ -8,10 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgpack
 import pytest
+import zmq
+import zmq.asyncio
 
 pytest.importorskip("dynamo")
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceRequestError
@@ -293,13 +296,18 @@ async def test_prefill_release_uses_registered_engine_endpoint():
 
     engine = MegatronLLMEngine(_config("prefill"))
     engine._engine_endpoint = _endpoint("tcp://prefill:5000")
-    engine.client = SimpleNamespace(add_request_streaming=lambda *_args, **_kwargs: Stream())
+    engine.client = SimpleNamespace(
+        add_request_streaming=lambda *_args, **_kwargs: Stream(),
+        coordinator_instance_id="prefill-instance",
+    )
     request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": {"max_tokens": 1}}
 
     chunks = [chunk async for chunk in engine.generate(request, _Context())]
 
+    assert chunks[-1]["finish_reason"] == "length"
     assert chunks[-1]["disaggregated_params"]["release"] == {
         "coordinator_addr": "tcp://prefill:5000",
+        "coordinator_instance_id": "prefill-instance",
         "request_id": 36,
     }
 
@@ -447,12 +455,23 @@ async def test_abort_uses_megatron_request_id_recorded_for_context():
 @pytest.mark.asyncio
 async def test_release_handoff_reuses_async_socket():
     engine = MegatronLLMEngine(_config("decode"))
-    release = {"coordinator_addr": "tcp://prefill:5000", "request_id": 7}
+    release = {
+        "coordinator_addr": "tcp://prefill:5000",
+        "request_id": 7,
+        "coordinator_instance_id": "prefill-instance",
+    }
     socket = SimpleNamespace(
         setsockopt=MagicMock(),
         connect=MagicMock(),
         send=AsyncMock(),
-        recv=AsyncMock(return_value=msgpack.packb([Headers.CONNECT_ACK.value])),
+        recv=AsyncMock(
+            side_effect=[
+                msgpack.packb([Headers.CONNECT_ACK.value, "prefill-instance"]),
+                msgpack.packb([Headers.RELEASE_KV_ACK.value, 7, "prefill-instance"]),
+                msgpack.packb([Headers.CONNECT_ACK.value, "prefill-instance"]),
+                msgpack.packb([Headers.RELEASE_KV_ACK.value, 8, "prefill-instance"]),
+            ]
+        ),
         close=MagicMock(),
     )
     context = SimpleNamespace(socket=MagicMock(return_value=socket), term=MagicMock())
@@ -464,8 +483,97 @@ async def test_release_handoff_reuses_async_socket():
     await engine.cleanup()
 
     context.socket.assert_called_once()
-    assert socket.send.await_count == 3
+    assert socket.send.await_count == 4
     socket.close.assert_called_once_with(linger=0)
+
+
+@pytest.mark.asyncio
+async def test_release_reregisters_after_coordinator_replacement():
+    context = zmq.asyncio.Context()
+    engines = [MegatronLLMEngine(_config("decode")) for _ in range(2)]
+    address = None
+    try:
+        for instance_id in ("original", "replacement"):
+            router = context.socket(zmq.ROUTER)
+            if address is None:
+                port = router.bind_to_random_port("tcp://127.0.0.1")
+                address = f"tcp://127.0.0.1:{port}"
+            else:
+                router.bind(address)
+            coordinator = SimpleNamespace(
+                instance_id=instance_id,
+                known_clients=set(),
+                router_socket=router,
+                _broadcast_to_engines=MagicMock(),
+            )
+
+            async def serve():
+                while True:
+                    identity, payload = await router.recv_multipart()
+                    metadata = msgpack.unpackb(payload, raw=False)
+                    HANDLERS[Headers(metadata[0])](coordinator, identity, metadata, [])
+
+            server = asyncio.create_task(serve())
+            try:
+                for engine in engines:
+                    await engine._release_remote_handoff(address, 7, instance_id)
+                    # Repeated CONNECT is also acknowledged by the same coordinator.
+                    await engine._release_remote_handoff(address, 8, instance_id)
+                assert coordinator._broadcast_to_engines.call_count == 4
+                assert len(coordinator.known_clients) == 2
+                if instance_id == "replacement":
+                    # Request 7 may be reused. An old generation's cleanup must
+                    # not touch it, including a restart between CONNECT and RELEASE.
+                    await engine._release_remote_handoff(address, 7, "original")
+                    await engine._release_sockets[address].send(
+                        msgpack.packb([Headers.RELEASE_KV.value, 7, "original"])
+                    )
+                    reply = msgpack.unpackb(
+                        await engine._release_sockets[address].recv(), raw=False
+                    )
+                    assert reply == [Headers.RELEASE_KV_ACK.value, 7, "original"]
+                    assert coordinator._broadcast_to_engines.call_count == 4
+            finally:
+                server.cancel()
+                await asyncio.gather(server, return_exceptions=True)
+                router.close(linger=0)
+    finally:
+        for engine in engines:
+            await engine.cleanup()
+        context.term()
+
+
+@pytest.mark.asyncio
+async def test_release_requires_acceptance_and_discards_timed_out_socket():
+    engine = MegatronLLMEngine(_config("decode"))
+
+    async def no_ack():
+        await asyncio.Future()
+
+    socket = MagicMock(send=AsyncMock())
+    replies = iter([msgpack.packb([Headers.CONNECT_ACK.value, "instance"]), None])
+
+    async def recv():
+        reply = next(replies)
+        return reply if reply is not None else await no_ack()
+
+    socket.recv = recv
+    engine._release_context = MagicMock(socket=MagicMock(return_value=socket))
+    with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.05):
+        with pytest.raises(TimeoutError):
+            await engine._release_remote_handoff("tcp://prefill:5000", 7, "instance")
+    assert not engine._release_sockets
+    socket.close.assert_called_once_with(linger=0)
+    engine._release_remote_handoff = AsyncMock(side_effect=[TimeoutError, None])
+    assert await engine._release_handoff_from_meta_async(
+        {
+            "coordinator_addr": "tcp://prefill:5000",
+            "request_id": 7,
+            "coordinator_instance_id": "instance",
+        }
+    )
+    assert engine._release_remote_handoff.await_count == 2
+    await engine.cleanup()
 
 
 @pytest.mark.asyncio
@@ -578,7 +686,11 @@ async def test_source_release_failure_does_not_block_or_fail_decode(caplog):
     engine._release_remote_handoff = release
     prefill = {
         "disaggregated_params": {
-            "release": {"coordinator_addr": "tcp://prefill:5000", "request_id": 9}
+            "release": {
+                "coordinator_addr": "tcp://prefill:5000",
+                "request_id": 9,
+                "coordinator_instance_id": "prefill-instance",
+            }
         }
     }
     with patch(
@@ -607,13 +719,21 @@ async def test_unreachable_release_source_does_not_block_other_sources():
 
     stalled = MagicMock(send=AsyncMock(), recv=stalled_recv)
     healthy = MagicMock(
-        send=AsyncMock(), recv=AsyncMock(return_value=msgpack.packb([Headers.CONNECT_ACK.value]))
+        send=AsyncMock(),
+        recv=AsyncMock(
+            side_effect=[
+                msgpack.packb([Headers.CONNECT_ACK.value, "healthy"]),
+                msgpack.packb([Headers.RELEASE_KV_ACK.value, 2, "healthy"]),
+            ]
+        ),
     )
     engine._release_context = MagicMock(socket=MagicMock(side_effect=[stalled, healthy]))
     with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.1):
-        pending = asyncio.create_task(engine._release_remote_handoff("tcp://stalled:1", 1))
+        pending = asyncio.create_task(
+            engine._release_remote_handoff("tcp://stalled:1", 1, "stalled")
+        )
         await asyncio.wait_for(connecting.wait(), timeout=1)
-        await engine._release_remote_handoff("tcp://healthy:2", 2)
+        await engine._release_remote_handoff("tcp://healthy:2", 2, "healthy")
         assert not pending.done()
         with pytest.raises(TimeoutError):
             await pending

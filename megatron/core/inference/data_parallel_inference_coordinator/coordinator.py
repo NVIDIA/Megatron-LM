@@ -7,6 +7,7 @@ import logging
 import signal
 import socket
 import time
+import uuid
 from collections import OrderedDict, deque
 from multiprocessing import Event
 from multiprocessing.connection import Connection
@@ -155,6 +156,7 @@ class DataParallelInferenceCoordinator:
             "pip install msgpack"
         )
         self.pipe_connection = pipe_connection
+        self.instance_id = uuid.uuid4().hex
         self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
 
