@@ -1947,10 +1947,14 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
-            # if self.expert_tensor_parallel_size > 1:
-            #     raise ValueError(
-            #         "Inference-optimized MoE layers does not support expert tensor parallelism."
-            #     )
+            if (
+                self.expert_tensor_parallel_size > 1
+                and self.inference_moe_token_dispatcher_type != "nvls"
+            ):
+                raise ValueError(
+                    "Inference-optimized MoE layers support expert tensor parallelism only "
+                    "with inference_moe_token_dispatcher_type='nvls'."
+                )
             if self.moe_expert_capacity_factor is not None:
                 raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
             if self.moe_router_padding_for_quantization:
