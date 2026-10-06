@@ -457,20 +457,28 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         if pg_collection is not None:
             self.expert_model_parallel_group = pg_collection.ep
-            self.expert_tensor_and_model_parallel_group = pg_collection.tp_ep
         elif parallel_state.get_expert_model_parallel_world_size() > 1:
             self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-            self.expert_tensor_and_model_parallel_group = parallel_state.get_expert_tensor_and_model_parallel_group()
         else:
             self.expert_model_parallel_group = None
-            self.expert_tensor_and_model_parallel_group = None  
 
+        # Expert tensor-and-model-parallel (tp_ep) group: the group the inference MoE
+        # dispatchers gather/scatter tokens over. Equals the EP group when ETP == 1.
+        if pg_collection is not None:
+            # getattr: non-MoE callers may build a pg_collection without tp_ep.
+            self.expert_tensor_and_model_parallel_group = getattr(pg_collection, "tp_ep", None)
+        else:
+            # Migration fallback for callers that do not pass a pg_collection; mirrors
+            # the EP fallback above. None (size 1) when MPU is not initialized.
+            self.expert_tensor_and_model_parallel_group = (
+                parallel_state.get_expert_tensor_and_model_parallel_group(check_initialized=False)
+            )
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
-        self._tp_ep_zmq_communicator = None
+        self._ep_zmq_communicator = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -796,11 +804,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
+            get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        # The NVLS dispatcher gathers over the tp_ep group, so it is also active
+        # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
             get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
@@ -809,7 +819,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
         self._training_ep_dispatcher = (
-            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
+            get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.transformer_impl == "transformer_engine"
         )
 
@@ -882,7 +892,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ):
             ep_size = get_pg_size(self.expert_model_parallel_group)
             tp_ep_size = get_pg_size(self.expert_tensor_and_model_parallel_group)
-            etp_size = tp_ep_size // ep_size
+            etp_size = max(1, tp_ep_size // ep_size)
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
             # (per-rank worst case * tp_ep_size); max_tokens covers the EP=1 / NCCL paths.
@@ -2167,7 +2177,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
         return key
 
-    def set_tp_ep_zmq_communicator(self, communicator) -> None:
+    def set_ep_zmq_communicator(self, communicator) -> None:
         """Attach an EP-group ZMQ communicator for CPU-side sync collectives.
 
         When set, match_graph_config() uses this communicator's
@@ -2179,7 +2189,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         Args:
             communicator: AsyncZMQCommunicator over the EP process group.
         """
-        self._tp_ep_zmq_communicator = communicator
+        self._ep_zmq_communicator = communicator
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
@@ -2530,14 +2540,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        #todo: fix this for nccl dispatcher.
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
-            ep_zmq_communicator=self._tp_ep_zmq_communicator,
+            ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

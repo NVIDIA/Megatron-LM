@@ -404,7 +404,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 computed by the context as round_up_tokens(max_tokens) // tp_size.
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
-            tp_ep_group: Expert tensor and model parallel process group.
+            tp_ep_group: Expert tensor and model parallel process group (the EP
+                group when expert tensor parallelism is 1).
         """
         tp_ep_size = get_pg_size(tp_ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
@@ -488,7 +489,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.tp_size * self.ep_size
+        # self.tp_size is the expert-TP size: the AGV spans the tp_ep group.
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = (
+            local_tokens * self.tp_size * self.ep_size
+        )
 
     def __init__(
         self,
@@ -600,7 +604,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_p = self.__class__._symm_agv_probs
 
         per_rank_max = self._per_rank_worst_case_token_count
-        global_max = per_rank_max * self.ep_size * self.tp_size
+        global_max = per_rank_max * self.tp_size * self.ep_size
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
