@@ -14,7 +14,10 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.experimental_attention_variant.csa_utils import packed_layout
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    packed_layout,
+    packed_sparse_attention,
+)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     HAVE_HADAMARD,
@@ -404,6 +407,105 @@ def test_packed_cp2_full_width_deterministic_replay(ratio):
             assert torch.equal(
                 first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
             ), name
+    finally:
+        Utils.destroy_model_parallel()
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and HAVE_TE and HAVE_HADAMARD),
+    reason="needs CUDA, TE and the real Hadamard kernel",
+)
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("loss_coeff", [0.0, 0.3])
+def test_packed_deterministic_forward_grad_mode_parity(cp_size, loss_coeff, monkeypatch):
+    """Real packed attention preserves key order and output bytes across grad modes."""
+    if Utils.world_size < cp_size:
+        pytest.skip(f"requires {cp_size} ranks")
+    pytest.importorskip("flash_mla")
+    pytest.importorskip("cudnn.deepseek_sparse_attention")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("deterministic cuDNN sparse attention requires SM10x")
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
+    )
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        torch.manual_seed(193)
+        model_parallel_cuda_manual_seed(193)
+        cfg = _make_config(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=128,
+            csa_compress_ratios=[4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=loss_coeff,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_kernel_backend="cudnn",
+            context_parallel_size=cp_size,
+            attention_cp_layout="contiguous",
+            linear_cp_layout="contiguous",
+            qk_layernorm=True,
+            apply_rope_fusion=True,
+            gradient_accumulation_fusion=True,
+            deterministic_mode=True,
+        )
+        model = _build_attention(cfg, 1, pg).cuda().train()
+        # Include an empty document, internal padding and boundaries that split
+        # a document/compression group across CP ranks.
+        physical = torch.tensor([0, 0, 133, 512], dtype=torch.int32, device="cuda")
+        real = torch.tensor([0, 0, 129, 504], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=real,
+            cu_seqlens_kv=real,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            max_seqlen_q=379,
+            max_seqlen_kv=379,
+        )
+        whole = torch.randn(512, 1, 256, dtype=torch.bfloat16, device="cuda")
+        count = whole.shape[0] // cp_size
+        start = pg.cp.rank() * count
+        hidden = whole[start : start + count].detach().requires_grad_()
+        positions = torch.arange(start, start + count, device="cuda")
+        padding = ((positions >= 129) & (positions < 133)) | (positions >= 508)
+        launches = []
+        real_forward = packed_sparse_attention._csa_fwd_flash_mla
+
+        def capture_forward(query, kv, indices, scale, **kwargs):
+            lengths = kwargs["topk_length"]
+            assert lengths is not None
+            launches.append((indices.clone(), lengths.clone()))
+            assert (indices[padding] == -1).all(), "padded rows must be sink-only"
+            assert (lengths[padding] == 0).all(), "padded rows must have no valid keys"
+            return real_forward(query, kv, indices, scale, **kwargs)
+
+        monkeypatch.setattr(packed_sparse_attention, "_csa_fwd_flash_mla", capture_forward)
+        outputs = []
+        for grad_enabled in (False, True, False, True):
+            with torch.set_grad_enabled(grad_enabled):
+                output, _ = model(hidden, attention_mask=None, packed_seq_params=packed)
+            outputs.append(output.detach().clone())
+            assert torch.isfinite(output).all()
+            assert torch.count_nonzero(output[padding]) == 0
+        assert len(launches) == len(outputs)
+        for indices, lengths in launches[1:]:
+            assert torch.equal(indices, launches[0][0]), "grad mode changed packed key order"
+            assert torch.equal(lengths, launches[0][1]), "grad mode changed packed key lengths"
+        for output in outputs[1:]:
+            assert torch.equal(
+                output.contiguous().view(torch.uint8), outputs[0].contiguous().view(torch.uint8)
+            ), "grad mode changed packed forward bytes"
     finally:
         Utils.destroy_model_parallel()
         torch.use_deterministic_algorithms(prior, warn_only=prior_warn)

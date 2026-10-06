@@ -690,10 +690,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+            K + "test_csa_packed_kernels.py",
         ),
         kind="dispatch",
         notes="Packed CP2 strict BF16 full-width attention/indexer replay for ratios 0/4/128; "
-        "uses the shared deterministic attention/indexer helpers. This is not full-model CP qualification.",
+        "CP1/2/4 no-grad/training parity with zero and positive indexer loss; direct-wrapper "
+        "sink-only padding and deterministic compaction regressions. Uses the shared deterministic "
+        "attention/indexer helpers. This is not full-model CP qualification.",
     ),
     KernelEntry(
         name="csa_packed_layout_and_loss",

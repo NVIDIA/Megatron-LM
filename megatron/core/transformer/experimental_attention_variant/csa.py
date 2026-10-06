@@ -1602,6 +1602,11 @@ class CompressedSparseAttention(MegatronModule):
         use_indexer_loss = (
             training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
         )
+        # Match the training reduction order even when no-grad disables the
+        # auxiliary loss. Both paths compact this compressed-first layout.
+        compressed_first = use_indexer_loss or (
+            self.config.deterministic_mode and compressed_topk is not None
+        )
 
         # ---- Step 6: concatenate the raw local KV sources -------------------
         # The fused training path owns both CP reduce-scatters. Detach the
@@ -1647,7 +1652,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_topk,
             cu_seqlens_compressed=cu_seqlens_compressed,
             seq_to_rank_row=seq_to_rank_row,
-            for_indexer_loss=use_indexer_loss,
+            for_indexer_loss=compressed_first,
             compressed_rows=compressed_kv_rank_major.shape[0],
             cu_seqlens_unpadded=cu_seqlens_q_unpadded,
             output_alignment=get_flash_mla_topk_alignment(),
