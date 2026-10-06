@@ -321,7 +321,6 @@ def test_invalid_baseline_falls_back_before_private_copy(project, cache, problem
             'run_full_tests() { echo FULL_BUCKET; }',
             'write_testmon_summary() { printf "%s\\n" "$1"; }',
             "merge_rank_selections() { return 0; }",
-            "apply_mandatory_tests() { return 0; }",
             'run_testmon_phase() { RANK=0 WORLD_SIZE=1 "$TEST_PYTHON" "$WRAPPER" '
             '--mode "$1" --phase "$2" --cache-dir "$UNIT_TESTMON_CACHE_DIR" '
             '-- -q -c "$PROJECT/pytest.ini" "$PROJECT/tests"; }',
@@ -391,7 +390,6 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
                 "run_testmon_phase() { return 0; }",
                 'merge_rank_selections() { mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
                 'echo tests/unit_tests/test_example.py > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
-                'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
                 "run_selected_phase() { return 1; }",
                 "run_full_tests() { echo UNEXPECTED_FULL_BUCKET; }",
                 "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
