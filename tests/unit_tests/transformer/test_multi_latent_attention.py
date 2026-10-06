@@ -1453,7 +1453,7 @@ class TestMLAClipQK:
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, run_config
 ):
     if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
         pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
