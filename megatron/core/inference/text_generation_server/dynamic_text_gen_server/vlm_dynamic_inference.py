@@ -120,6 +120,9 @@ def _print_resolved_args(title, args):
     print_rank_0("------------ end of VLM argument provenance -------------")
 
 
+_MIMO_LANGUAGE_MODEL_PREFIX = 'language_model.module.module.'
+
+
 def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     """Peek at the checkpoint's saved training args to detect VLM vs GPT.
 
@@ -139,6 +142,14 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
         return False
 
     _, checkpoint_args = result
+    # MIMO training records its module-grid layout (--mimo-llm-*), and its checkpoints nest the
+    # language model under language_model.module.module. Run text inference on that language
+    # model alone as a HybridModel, loading only its keys.
+    if hasattr(checkpoint_args, 'mimo_llm_tp'):
+        if 'model_provider' not in user_passed_attrs:
+            args.model_provider = 'hybrid'
+        args.checkpoint_model_prefix = _MIMO_LANGUAGE_MODEL_PREFIX
+        return False
     if not hasattr(checkpoint_args, 'language_model_type'):
         return False
     if checkpoint_args.language_model_type is None:
