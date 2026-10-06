@@ -56,7 +56,7 @@ def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
             offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
         ),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        block_size=data_layout.block_size,
+        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
@@ -71,6 +71,7 @@ def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
             offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
         ),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
+        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
@@ -128,8 +129,6 @@ class QuantizedDBuffer:
         device: torch.device | str,
     ) -> None:
         """Allocate MXFP8 data and scale planes from a shared weight layout."""
-        if layout.block_size != _MXFP8_BLOCK_SIZE:
-            raise ValueError(f"QuantizedDBuffer requires block size {_MXFP8_BLOCK_SIZE}.")
         tensor_shapes = layout.tensor_shapes
         if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
             raise ValueError("QuantizedDBuffer requires one or more 2D MXFP8 tensor shapes.")
@@ -139,6 +138,7 @@ class QuantizedDBuffer:
             raise ValueError(
                 f"QuantizedDBuffer requires dimensions divisible by {_MXFP8_BLOCK_SIZE}."
             )
+        layout.validate_for_row_atomic(block_size=_MXFP8_BLOCK_SIZE)
         placements = tuple(placements)
         self.rowwise_data = DBuffer(mesh, placements, layout, torch.uint8, device)
         self.columnwise_data = DBuffer(mesh, placements, layout, torch.uint8, device)
@@ -162,7 +162,7 @@ class QuantizedDBuffer:
         device: torch.device | str,
     ) -> "QuantizedDBuffer":
         """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
-        layout = GlobalLayout.build(
+        layout = GlobalLayout.build_for_row_atomic(
             tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
         )
         return cls(mesh, placements, layout, device)

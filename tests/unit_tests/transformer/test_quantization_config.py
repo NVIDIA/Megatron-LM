@@ -17,6 +17,7 @@ from megatron.core.quantization.quant_config import (
     RecipeConfig,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.config.instantiate_utils import instantiate
 
 try:
     from megatron.core.extensions.kitchen import (
@@ -59,6 +60,32 @@ def test_recipe_config_matching() -> None:
         recipe_config.match_to_config_key(MatchContext("decoder.1.linear_qkv", layer_number=1))
         == "default"
     )
+
+
+def test_recipe_config_round_trip() -> None:
+    recipe_config = RecipeConfig(
+        [
+            GlobMatcher("*linear_fc2", "fc2_cfg"),
+            GlobMatcher("*linear_fc*", "fc_cfg"),
+            GlobMatcher("*", "default"),
+        ],
+        {
+            "fc2_cfg": {"format": "nvfp4", "block_size": 16},
+            "fc_cfg": {"format": "mxfp8", "enabled": True},
+            "default": {"format": "bf16"},
+        },
+    )
+
+    config_dict = deepcopy(recipe_config.as_dict())
+    deserialized = RecipeConfig.from_config_dict(config_dict["config"])
+
+    assert deserialized.configs == recipe_config.configs
+    assert [type(matcher) for matcher in deserialized.matchers] == [
+        type(matcher) for matcher in recipe_config.matchers
+    ]
+    assert [vars(matcher) for matcher in deserialized.matchers] == [
+        vars(matcher) for matcher in recipe_config.matchers
+    ]
 
 
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")

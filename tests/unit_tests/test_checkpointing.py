@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+from dataclasses import fields
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -8,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed.checkpoint
+import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -25,15 +27,20 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
+    get_checkpoint_version,
     load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
+    set_checkpoint_version,
 )
+from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 
 class MockModel(MegatronModule):
@@ -75,6 +82,35 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "checkpoint_args", "expected_mode"),
+    [
+        ("indices", SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "indices"),
+        (None, SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
+        (None, SimpleNamespace(), None),
+    ],
+)
+def test_load_args_preserves_runtime_hybridep_routing_map_mode(
+    runtime_mode, checkpoint_args, expected_mode
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_hybridep_routing_map_mode=runtime_mode,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_hybridep_routing_map_mode == expected_mode
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
@@ -599,10 +635,20 @@ def test_load_base_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
-def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
+def test_save_checkpoint(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, run_config
+):
     """Test save_checkpoint."""
     args = create_args
     args.ckpt_format = ckpt_format
+    profiling = ProfilingConfig(
+        use_nsys_profiler=True, profile_ranks=[0], memory_snapshot_path="owned.pickle"
+    )
+    run_config.profiling = profiling
+    # Runtime config owns these fields, even if the legacy namespace disagrees.
+    args.profile = False
+    args.profile_ranks = [99]
+    args.memory_snapshot_path = "stale.pickle"
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -659,6 +705,16 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
+        # Legacy args remain unchanged; the run config records the effective policy.
+        assert state["args"].profile is False and state["args"].profile_ranks == [99]
+        assert state["args"].memory_snapshot_path == "stale.pickle"
+        with open(ckpt_dir / "run_config.yaml") as f:
+            saved_config = yaml.safe_load(f)
+        for field in fields(profiling):
+            assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
+        assert args.profile is False and args.profile_ranks == [99]
+        assert args.memory_snapshot_path == "stale.pickle"
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -786,6 +842,29 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert loaded_flops_none == num_floating_point_operations_so_far
 
 
+@pytest.mark.parametrize(
+    ('first', 'second', 'should_raise'),
+    [
+        (3.1, 3.0, False),  # 3.1 student then 3.0 teacher (distillation resume)
+        (3.0, 3.1, False),
+        (3.1, 3.1, False),
+        (3.0, 2.0, True),  # major bump changes QKV layout handling
+        (3.1, None, True),
+    ],
+)
+def test_set_checkpoint_version_allows_minor_mismatch(first, second, should_raise):
+    """Loading checkpoints that differ only in minor version in one process must not fail."""
+    with mock.patch('megatron.training.checkpointing._CHECKPOINT_VERSION', None):
+        set_checkpoint_version(first)
+        assert get_checkpoint_version() == first
+        if should_raise:
+            with pytest.raises(AssertionError, match='checkpoint versions do not match'):
+                set_checkpoint_version(second)
+        else:
+            set_checkpoint_version(second)
+            assert get_checkpoint_version() == second
+
+
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):
     """Test distributed checkpoint versioning."""
     args = create_ckpt_load_args
@@ -817,6 +896,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=first_job_mock_metadata,
         ):
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+        expected_loaded_metadata = {**first_job_mock_metadata, 'checkpoint_version': 3.1}
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -829,7 +909,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
             load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
-            assert optimizer._called_metadata[-1] == first_job_mock_metadata
+            assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
@@ -838,7 +918,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         assert optimizer._called_metadata == model._called_metadata
         assert optimizer._called_metadata == [
             first_job_mock_metadata,
-            first_job_mock_metadata,
+            expected_loaded_metadata,
             second_job_mock_metadata,
         ]
 
