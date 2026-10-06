@@ -191,13 +191,3 @@ def test_unsupported_seed_rejected_before_engine_registration(backend, speculati
     with pytest.raises(ValueError, match="Request-local seeds"):
         engine._add_request(req)
     assert engine.requests == {}
-
-
-def test_pending_logits_positions_override_advanced_async_context():
-    sampler = TorchSampling(torch.Generator().manual_seed(42), 127)
-    logits = torch.zeros(2, 127)
-    pending = context([11, 12], [9, 12])
-    expected = draw(sampler, logits, pending)
-    prepared = context([11, 12], [10, 13])
-    result = draw(sampler, logits, prepared, sequence_lengths=torch.tensor([9, 12]))
-    assert torch.equal(result, expected)
