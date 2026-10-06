@@ -113,11 +113,55 @@ class _DSAExecutionPlan:
     tiled, and so the temporary memory and loop counts, without changing what is computed --
     with one exception noted on ``routing_key_chunk``. They are derived from the shapes and the
     backend rather than configured, so that a model definition does not carry kernel tuning.
+
+    Routing only. The dense indexer-warmup teacher tiles a wider tensor and has its own plan;
+    see _DenseWarmupPlan.
+    """
+
+    query_chunk: int
+    routing_key_chunk: int
+
+
+@dataclass(frozen=True)
+class _DenseWarmupPlan:
+    """Chunk sizes for the dense indexer-warmup teacher.
+
+    Separate from _DSAExecutionPlan because the teacher tiles a different tensor. Routing scores
+    the single simplified indexer head, [batch, query_chunk, key_chunk]; the teacher scores every
+    main-attention head against the same keys, [batch, num_query_heads, query_chunk, key_chunk].
+    At 32 heads that is 32x the routing plan's model of it, so sizing warmup from the routing
+    plan silently understates what it allocates by the head count.
     """
 
     query_chunk: int
     key_chunk: int
-    routing_key_chunk: int
+
+
+def _plan_dense_warmup(
+    batch_size: int,
+    query_length: int,
+    key_length: int,
+    num_query_heads: int,
+    query_chunk_override: Optional[int] = None,
+    key_chunk_override: Optional[int] = None,
+) -> _DenseWarmupPlan:
+    """Choose chunk sizes so the dense teacher's logit tile stays inside the score budget.
+
+    The teacher streams keys on the outside, so the key chunk is capped rather than solved for,
+    and the query chunk absorbs the budget. num_query_heads is the head count the teacher scores
+    -- query.size(2) at the call site -- and enters the tile as a full dimension.
+    """
+    key_chunk = min(key_length, _MAX_KEY_CHUNK)
+    if key_chunk_override is not None and key_chunk_override > 0:
+        key_chunk = min(key_chunk_override, key_length)
+
+    tile_row_bytes = max(1, batch_size * num_query_heads * key_chunk * 4)
+    affordable = max(1, _SCORE_TILE_BUDGET_BYTES // tile_row_bytes)
+    query_chunk = min(query_length, _MAX_QUERY_CHUNK, affordable)
+    if query_chunk_override is not None and query_chunk_override > 0:
+        query_chunk = min(query_chunk_override, query_length)
+
+    return _DenseWarmupPlan(query_chunk=query_chunk, key_chunk=key_chunk)
 
 
 def _plan_execution(
@@ -168,7 +212,7 @@ def _plan_execution(
             query_chunk = min(query_chunk_override, query_length)
 
     return _DSAExecutionPlan(
-        query_chunk=query_chunk, key_chunk=key_chunk, routing_key_chunk=routing_key_chunk
+        query_chunk=query_chunk, routing_key_chunk=routing_key_chunk
     )
 
 
@@ -310,7 +354,9 @@ def _mask_dense_causal_scores(
     invalid = _causal_invalid_mask(q_start, q_end, k_start, k_end, scores.device)
     while invalid.dim() < scores.dim():
         invalid = invalid.unsqueeze(0)
-    return scores.masked_fill(invalid, float("-inf"))
+    # In place: both callers pass a tile they just built and do not read again, and the
+    # out-of-place form doubles the peak by holding the masked copy beside the original.
+    return scores.masked_fill_(invalid, float("-inf"))
 
 
 def _dense_teacher_logits_block(
@@ -329,14 +375,19 @@ def _dense_teacher_logits_block(
         f"num_query_groups ({num_query_groups})."
     )
     repeat_factor = num_query_heads // num_query_groups
-    blocks = []
+    # Write each group into the result rather than collecting the groups and concatenating: a cat
+    # would hold every group and the joined tensor at once, doubling the tile the plan budgets for.
+    scores = query_tile.new_empty(
+        (query_tile.size(1), num_query_heads, q_len, k_len), dtype=torch.float32
+    )
     for group_idx in range(num_query_groups):
         head_start = group_idx * repeat_factor
         head_end = head_start + repeat_factor
         q = query_tile[:, :, head_start:head_end, :].permute(1, 2, 0, 3)
         k = key_block[:, :, group_idx, :].permute(1, 0, 2)
-        blocks.append(torch.einsum("brqd,bkd->brqk", q.float(), k.float()) * softmax_scale)
-    scores = torch.cat(blocks, dim=1)
+        scores[:, head_start:head_end] = torch.einsum(
+            "brqd,bkd->brqk", q.float(), k.float()
+        ).mul_(softmax_scale)
     return _mask_dense_causal_scores(scores, q_start, q_start + q_len, k_start, k_start + k_len)
 
 
@@ -2062,11 +2113,11 @@ def dsa_dense_indexer_loss(
     simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run tiled dense DSA indexer KL for dense-attention warmup."""
-    _plan = _plan_execution(
+    _plan = _plan_dense_warmup(
         query.size(1),
         query.size(0),
         key.size(0),
-        use_triton,
+        query.size(2),
         query_chunk_override=query_chunk_size,
         key_chunk_override=key_chunk_size,
     )

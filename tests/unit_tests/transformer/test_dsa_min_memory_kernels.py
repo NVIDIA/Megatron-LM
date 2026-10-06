@@ -16,9 +16,11 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    _MAX_KEY_CHUNK,
     _MAX_QUERY_CHUNK,
     _SCORE_TILE_BUDGET_BYTES,
     _accumulate_simplified_learned_k_wgrad,
+    _plan_dense_warmup,
     _plan_execution,
     _simplified_topk_index_tile,
     _sparse_attention_backward_torch_fp32,
@@ -740,3 +742,79 @@ def test_simplified_routing_merges_key_blocks_into_the_true_topk():
     # Indices address global positions and stay inside the causal prefix.
     assert int(blocked_indices.max()) < q_end
     assert int(blocked_indices.min()) >= 0
+
+
+@pytest.mark.parametrize("num_query_heads", [8, 32, 64, 128, 256])
+def test_dense_warmup_plan_bounds_the_teacher_tile(num_query_heads):
+    """The teacher scores every main-attention head, so the head count has to enter the budget.
+
+    _plan_execution models routing's [batch, query_chunk, key_chunk]; the teacher allocates
+    [batch, num_query_heads, query_chunk, key_chunk]. Sizing warmup from the routing plan
+    understated it by the head count, which is why the two plans are separate.
+    """
+    for batch_size, seq in [(1, 131072), (2, 131072), (1, 262144), (4, 8192)]:
+        plan = _plan_dense_warmup(batch_size, seq, seq, num_query_heads)
+        tile = batch_size * num_query_heads * plan.query_chunk * plan.key_chunk * 4
+        assert tile <= _SCORE_TILE_BUDGET_BYTES, (batch_size, seq, num_query_heads, tile)
+        assert plan.query_chunk >= 1 and plan.key_chunk >= 1
+        assert plan.key_chunk <= _MAX_KEY_CHUNK
+        assert plan.query_chunk <= _MAX_QUERY_CHUNK
+
+
+def test_dense_warmup_plan_shrinks_the_query_chunk_before_the_key_chunk():
+    """Keys are streamed on the outside here, so the query axis is the one that gives."""
+    wide = _plan_dense_warmup(1, 131072, 131072, 32)
+    wider = _plan_dense_warmup(1, 131072, 131072, 512)
+    assert wide.key_chunk == wider.key_chunk == _MAX_KEY_CHUNK
+    assert wider.query_chunk < wide.query_chunk
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize(
+    "num_query_heads, num_query_groups", [(8, 1), (32, 1), (32, 8), (64, 8), (128, 8)]
+)
+def test_dense_teacher_allocation_stays_within_the_budget(num_query_heads, num_query_groups):
+    """Measure what the teacher actually allocates, not what the plan computes.
+
+    The plan arithmetic is checked above; this pins it to the tensor it is meant to bound, so a
+    change to _dense_teacher_logits_block that reintroduces an extra full-size copy fails here
+    rather than at a user's OOM.
+    """
+    from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+        _dense_teacher_logits_block,
+    )
+
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    batch_size, head_dim, seq = 1, 64, 1024
+    plan = _plan_dense_warmup(batch_size, seq, seq, num_query_heads)
+    q_len = min(plan.query_chunk, seq)
+    k_len = min(plan.key_chunk, seq)
+
+    query_tile = torch.randn(
+        q_len, batch_size, num_query_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    key_block = torch.randn(
+        k_len, batch_size, num_query_groups, head_dim, device=device, dtype=torch.bfloat16
+    )
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    scores = _dense_teacher_logits_block(query_tile, key_block, head_dim**-0.5, 0, 0)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - baseline
+
+    tile = batch_size * num_query_heads * q_len * k_len * 4
+    assert scores.shape == (batch_size, num_query_heads, q_len, k_len)
+    assert scores.dtype == torch.float32
+    assert scores.numel() * scores.element_size() == tile
+    assert tile <= _SCORE_TILE_BUDGET_BYTES
+
+    # The result plus one group's transient. With more than one group that transient is a
+    # fraction of the tile, so a collect-then-concatenate implementation -- which holds every
+    # group and the joined tensor at once -- shows up as roughly twice the tile. At one group
+    # the transient is the whole tile either way, so the two are indistinguishable there.
+    if num_query_groups > 1:
+        assert peak < 1.5 * tile, (num_query_heads, num_query_groups, peak, tile)
+    assert peak <= 2 * _SCORE_TILE_BUDGET_BYTES
