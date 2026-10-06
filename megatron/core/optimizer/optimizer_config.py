@@ -178,6 +178,11 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
+    fp8_param_gather: bool = False
+    """Whether model parameters are stored (and all-gathered) as FP8 tensors. Only quantized
+       parameters need MCore-managed FP32 main params under non-delayed FP8 recipes; with BF16
+       parameters and FP8 compute, the precision-aware optimizer path stays valid."""
+
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
@@ -498,6 +503,9 @@ class OptimizerConfig:
             and (
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                # FP8 compute with BF16 params: TE FusedAdam can still own the masters and write
+                # the BF16 params in-kernel, exactly as in plain BF16 training.
+                or not self.fp8_param_gather
                 or self.optimizer_cpu_offload
             )
         )
