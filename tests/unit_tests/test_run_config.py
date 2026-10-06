@@ -246,9 +246,9 @@ class TestReadRunConfigDistributed:
 
         with (
             mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=1),
+            mock.patch("megatron.training.utils.checkpoint_utils.safe_get_rank", return_value=1),
             mock.patch(
-                "megatron.training.utils.checkpoint_utils.get_world_size_safe", return_value=4
+                "megatron.training.utils.checkpoint_utils.safe_get_world_size", return_value=4
             ),
             mock.patch("torch.distributed.broadcast_object_list", side_effect=_fake_broadcast),
         ):
