@@ -28,7 +28,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import ensure_params_ready, get_pg_size
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -838,9 +838,14 @@ def _append_tail_to_topk(
     seq_lens: torch.Tensor,
     pool_size: int,
     tail_start_override: Optional[torch.Tensor] = None,
+    tail_count_override: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Append each query's incomplete causal pool, in global token coordinates."""
-    tail_count = seq_lens.to(torch.int32).remainder(pool_size)
+    tail_count = (
+        seq_lens.to(torch.int32).remainder(pool_size)
+        if tail_count_override is None
+        else tail_count_override.to(torch.int32)
+    )
     tail_start = (
         seq_lens.to(torch.int32) - tail_count
         if tail_start_override is None
@@ -850,6 +855,43 @@ def _append_tail_to_topk(
     tail = tail_start[:, None] + offsets
     tail = tail.masked_fill(offsets >= tail_count[:, None], -1).to(topk_result.dtype)
     return torch.cat((topk_result, tail), dim=-1)
+
+
+def _fill_kpool_left_boundary(
+    token_topk: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor, pool_size: int
+) -> torch.Tensor:
+    """Use unused expanded-pool slots for a left partial pool from an explicit mask."""
+    rows, width = token_topk.shape
+    complete_start = ((starts + pool_size - 1) // pool_size) * pool_size
+    complete_end = (ends // pool_size) * pool_size
+    has_complete_pool = complete_start < complete_end
+    left_end = torch.where(starts < ends, torch.minimum(complete_start, ends), starts)
+    left_count = (left_end - starts).clamp_min(0)
+    left_count = torch.minimum(
+        left_count,
+        torch.where(
+            has_complete_pool,
+            torch.full_like(left_count, pool_size - 1),
+            torch.full_like(left_count, pool_size),
+        ),
+    )
+
+    offsets = torch.arange(pool_size, device=token_topk.device, dtype=torch.int32)
+    left_tokens = starts[:, None].to(torch.int32) + offsets
+    left_valid = offsets[None, :] < left_count[:, None]
+
+    invalid = token_topk < 0
+    invalid_positions = torch.where(
+        invalid,
+        torch.arange(width, device=token_topk.device, dtype=torch.int32)[None, :],
+        torch.full((rows, width), width, device=token_topk.device, dtype=torch.int32),
+    )
+    fill_positions = invalid_positions.topk(k=min(pool_size, width), dim=-1, largest=False).values
+    fill_positions_safe = fill_positions.clamp_max(width - 1)
+    fill_valid = left_valid[:, : fill_positions.size(1)] & (fill_positions < width)
+    current = token_topk.gather(-1, fill_positions_safe)
+    values = torch.where(fill_valid, left_tokens[:, : fill_positions.size(1)], current)
+    return token_topk.scatter(-1, fill_positions_safe, values.to(token_topk.dtype))
 
 
 def _kpool_compress_keys_per_seg(
@@ -934,6 +976,20 @@ def _query_bounds_from_token_mask(mask: torch.Tensor) -> Tuple[torch.Tensor, tor
     return starts, ends
 
 
+def _expand_query_bounds_for_batch(bounds: torch.Tensor, batch: int, seqlen: int) -> torch.Tensor:
+    """Normalize explicit-mask bounds to [batch, seqlen] without materializing masks."""
+    if bounds.ndim == 1:
+        if bounds.numel() != seqlen:
+            raise ValueError(f"Expected {seqlen} query bounds, got {bounds.numel()}.")
+        return bounds.unsqueeze(0).expand(batch, -1)
+    if bounds.ndim == 2 and bounds.shape == (batch, seqlen):
+        return bounds
+    raise ValueError(
+        f"Expected query bounds with shape [{seqlen}] or [{batch}, {seqlen}], "
+        f"got {tuple(bounds.shape)}."
+    )
+
+
 def _mask_topk_tokens_with_token_mask(
     topk_indices: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -990,7 +1046,9 @@ def fused_qk_topk_kpool(
     if fp8_indexer:
         q, k_pooled = _kpool_fp8_input(q), _kpool_fp8_input(k_pooled)
     elif rotate_activation_enabled:
-        q, k_pooled = rotate_activation(q), rotate_activation(k_pooled)
+        q = rotate_activation(q)
+        if k_pooled.numel():
+            k_pooled = rotate_activation(k_pooled)
     index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
 
     # A pool is causal only when its final token is within the query's bounds.
@@ -1073,12 +1131,33 @@ def fused_qk_topk_kpool(
         else:
             starts = torch.zeros_like(ends)
         lengths = ends - starts
-        tail_starts = ends - lengths.remainder(pool_size)
+        if mask is not None and v_starts is None:
+            # Explicit masks use globally aligned pools. Fill a leading partial pool into
+            # unused expanded-pool slots, then append only the trailing global-grid tail.
+            starts = _expand_query_bounds_for_batch(starts, batch, sq).to(
+                device=token_topk.device, dtype=torch.int64
+            )
+            ends = _expand_query_bounds_for_batch(ends, batch, sq).to(
+                device=token_topk.device, dtype=torch.int64
+            )
+            token_topk = _fill_kpool_left_boundary(
+                token_topk.reshape(rows, -1), starts.reshape(-1), ends.reshape(-1), pool_size
+            ).reshape(batch, sq, -1)
+            complete_end = (ends // pool_size) * pool_size
+            tail_starts = complete_end
+            tail_counts = (ends - tail_starts).clamp_min(0).clamp_max(pool_size - 1)
+        else:
+            starts = _expand_query_bounds_for_batch(starts, batch, sq)
+            ends = _expand_query_bounds_for_batch(ends, batch, sq)
+            lengths = ends - starts
+            tail_starts = ends - lengths.remainder(pool_size)
+            tail_counts = None
         token_topk = _append_tail_to_topk(
             token_topk.reshape(rows, -1),
-            lengths.expand(batch, -1).reshape(-1),
+            lengths.reshape(-1),
             pool_size,
-            tail_start_override=tail_starts.expand(batch, -1).reshape(-1),
+            tail_start_override=tail_starts.reshape(-1),
+            tail_count_override=tail_counts.reshape(-1) if tail_counts is not None else None,
         ).reshape(batch, sq, -1)
 
     if mask is not None:
@@ -1598,6 +1677,33 @@ class DSAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
 
 
+def _validate_dsa_kpool_config(config: TransformerConfig) -> None:
+    """Validate KPool invariants for direct Python API construction as well as config parsing."""
+    pool_size = getattr(config, "dsa_indexer_kpool", 1)
+    if pool_size < 1:
+        raise ValueError(f"dsa_indexer_kpool must be positive, got {pool_size}.")
+    if pool_size == 1:
+        return
+
+    index_topk = getattr(config, "dsa_indexer_topk", None)
+    if index_topk is None:
+        raise ValueError("dsa_indexer_topk must be set when dsa_indexer_kpool is greater than 1.")
+    if index_topk < 1:
+        raise ValueError(
+            "dsa_indexer_topk must be positive when dsa_indexer_kpool is greater than 1."
+        )
+    if index_topk % pool_size != 0:
+        raise ValueError(
+            "dsa_indexer_topk must be divisible by dsa_indexer_kpool for pool selection; "
+            f"got topk={index_topk}, kpool={pool_size}."
+        )
+    if (getattr(config, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        raise ValueError(
+            "DSA indexer loss is not supported with kpool selection; set "
+            "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
+        )
+
+
 class DSAIndexer(MegatronModule):
     """
     DSA Lightning Indexer for DeepSeek Sparse Attention.
@@ -1629,6 +1735,7 @@ class DSAIndexer(MegatronModule):
             pg_collection (ProcessGroupCollection, optional): Process groups for the indexer.
         """
         super().__init__(config=config)
+        _validate_dsa_kpool_config(config)
         self.hidden_size = self.config.hidden_size
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
         self.q_lora_rank = (
@@ -1750,13 +1857,13 @@ class DSAIndexer(MegatronModule):
                     requires_grad=False,
                 )
             )
-            # bf16 [index_head_dim, hidden_size]; gate_score = F.linear(x, gate) = x @ gate^T
+            # [index_head_dim, hidden_size]; gate_score = F.linear(x, gate) = x @ gate^T
             # -> [seqlen, index_head_dim]. Matches vLLM's checkpoint name (no .weight suffix).
             self.index_kpool_compress_gate = torch.nn.Parameter(
                 torch.empty(
                     self.index_head_dim,
                     self.hidden_size,
-                    dtype=torch.bfloat16,
+                    dtype=self.config.params_dtype,
                     device=kpool_param_device,
                 ),
                 requires_grad=False,
@@ -1881,6 +1988,7 @@ class DSAIndexer(MegatronModule):
                 k_dtype = k.dtype
                 # TE LayerNorm casts its input to the parameter dtype, so passing
                 # k.float() to the BF16 module does not guarantee FP32 math.
+                ensure_params_ready([self.k_norm.weight, self.k_norm.bias])
                 k_norm_weight = self.k_norm.weight.float()
                 if self.config.layernorm_zero_centered_gamma:
                     k_norm_weight = k_norm_weight + 1.0

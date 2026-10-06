@@ -123,6 +123,26 @@ def test_csa_teacher_lse_replays():
     assert torch.isfinite(outputs["out"]).all()
 
 
+def test_dsa_weights_projection_replays():
+    """Replay the DSA weights projection GEMM dispatch under stream contention."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        _dsa_weights_proj_forward_gemm,
+    )
+
+    seeded()
+    x = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+
+    outputs, _ = assert_replays_bit_exact(
+        lambda hidden, proj_weight: _dsa_weights_proj_forward_gemm(hidden, proj_weight, None)[0],
+        (x, weight),
+        backward=False,
+        contention=True,
+        what="DSA weights projection",
+    )
+    assert outputs["out"].dtype == torch.float32
+
+
 def _topk_routing_map(num_tokens, num_experts, topk):
     logits = torch.randn(num_tokens, num_experts, device="cuda")
     idx = logits.topk(topk, dim=-1).indices

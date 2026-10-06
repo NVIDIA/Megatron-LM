@@ -777,11 +777,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
     ),
+    KernelEntry(
+        name="dsa_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="dispatch",
+        notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
+        "the replay test covers the selected GEMM and deterministic torch fallback.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/dsa.py",
             "megatron/core/transformer/experimental_attention_variant/ops/indexer.py",
             "megatron/core/transformer/experimental_attention_variant/ops/sparse_mla.py",
             "megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",

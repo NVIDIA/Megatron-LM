@@ -792,8 +792,12 @@ def fused_sparse_mla_absorbed(
     kernel_heads = max(query_heads, 16)
     if not _is_supported_sparse_mla_head_count(kernel_heads, kv_group=key.size(2)):
         return None
-    if topk_indices.size(-1) % 64 != 0:
-        return None
+    topk_width = topk_indices.size(-1)
+    padded_topk_width = (topk_width + 63) // 64 * 64
+    if padded_topk_width != topk_width:
+        topk_indices = torch.nn.functional.pad(
+            topk_indices, (0, padded_topk_width - topk_width), value=-1
+        )
 
     query_bshd = query.permute(1, 0, 2, 3).contiguous()
     if kernel_heads != query_heads:
