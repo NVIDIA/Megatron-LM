@@ -1,6 +1,7 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DSv4 backend, packed-layout and CP parity; run on at least 4 GPUs."""
 
+import inspect
 import json
 from copy import copy
 from dataclasses import replace
@@ -322,3 +323,87 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
         assert not failures, "\n\n".join(failures)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and HAVE_TE and HAVE_HADAMARD),
+    reason="needs CUDA, TE and the real Hadamard kernel",
+)
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+def test_packed_cp2_full_width_deterministic_replay(ratio):
+    """Real CP2 collectives/kernels: replay attention outputs and every gradient exactly."""
+    if Utils.world_size < 2:
+        pytest.skip("requires at least two ranks")
+    pytest.importorskip("flash_mla")
+    dsa = pytest.importorskip("cudnn.deepseek_sparse_attention")
+    backward_parameters = inspect.signature(dsa.DSA.sparse_attention_backward_wrapper).parameters
+    if "deterministic" not in backward_parameters:
+        pytest.skip("deterministic sparse-attention backward needs nvidia-cudnn-frontend >= 1.29")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("deterministic cuDNN sparse attention requires SM10x")
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+    )
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        torch.manual_seed(193)
+        model_parallel_cuda_manual_seed(193)
+        # Full Flash attention projection/indexer geometry; S256 is only a focused probe.
+        cfg = _make_config(
+            num_layers=1,
+            hidden_size=4096,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=1024,
+            output_projection_groups=8,
+            output_projection_lora_rank=1024,
+            csa_compress_ratios=[ratio],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.01 if ratio == 4 else 0.0,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_kernel_backend="cudnn",
+            context_parallel_size=2,
+            attention_cp_layout="contiguous",
+            linear_cp_layout="contiguous",
+            qk_layernorm=True,
+            apply_rope_fusion=True,
+            gradient_accumulation_fusion=True,
+            deterministic_mode=True,
+            recompute_granularity="selective",
+            recompute_modules=["mla_up_proj"],
+        )
+        model = _build_attention(cfg, 1, pg).cuda()
+        cu = torch.tensor([0, 128, 256], dtype=torch.int32, device='cuda')
+        packed = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            max_seqlen_q=128,
+            max_seqlen_kv=128,
+        )
+        whole = torch.randn(256, 1, 4096, dtype=torch.bfloat16, device='cuda')
+        grad = torch.randn_like(whole)
+        rows = slice(pg.cp.rank() * 128, (pg.cp.rank() + 1) * 128)
+        results = []
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            results.append(_run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp))
+        assert results[0].keys() == results[1].keys()
+        for name, first in results[0].items():
+            second = results[1][name]
+            assert torch.isfinite(first).all() and torch.isfinite(second).all(), name
+            assert torch.equal(
+                first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+            ), name
+    finally:
+        Utils.destroy_model_parallel()
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn)

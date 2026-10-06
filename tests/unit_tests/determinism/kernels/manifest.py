@@ -663,6 +663,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
         ),
         kind="dispatch",
         notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
@@ -681,6 +682,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
     ),
     KernelEntry(
+        name="csa_deterministic_packed_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+        ),
+        kind="dispatch",
+        notes="Packed CP2 strict BF16 full-width attention/indexer replay for ratios 0/4/128; "
+        "uses the shared deterministic attention/indexer helpers. This is not full-model CP qualification.",
+    ),
+    KernelEntry(
         name="csa_packed_layout_and_loss",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
@@ -694,8 +709,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
-        "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
-        "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+        "Numerical CP parity and strict attention/indexer replay are covered by "
+        "test_dsv4_packed_cp.py; see the separate packed deterministic dispatch entry.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

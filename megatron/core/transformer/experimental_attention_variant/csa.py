@@ -1587,6 +1587,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.index_topk,
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
+                    deterministic=self.config.deterministic_mode,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
@@ -1695,6 +1696,8 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_rs_state,
                 self.window_size,
                 kv_reconstruction_parts,
+                # Final forward argument; backward returns no gradient for this flag.
+                self.config.deterministic_mode,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
@@ -1715,6 +1718,7 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=topk_length,
             kv_reconstruction_parts=kv_reconstruction_parts,
             q_padding_mask=q_padding_mask,
+            deterministic=self.config.deterministic_mode,
         )
         if training_with_grad and indexer is not None:
             # Zero loss or a pack without compressed keys still needs explicit
