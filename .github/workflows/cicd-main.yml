@@ -199,7 +199,8 @@ jobs:
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
-      unit_test_pr_files_artifact_id: ${{ steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
+      changed_functional_tests: ${{ steps.configure.outputs.changed_functional_tests }}
+      pr_files_artifact_id: ${{ steps.upload-pr-files.outcome == 'success' && steps.upload-pr-files.outputs.artifact-id || '' }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -366,6 +367,14 @@ jobs:
             UNIT_TESTMON_ELIGIBLE=true
           fi
 
+          # Changed functional cases must run even when Testmon is disabled.
+          CHANGED_FUNCTIONAL_TESTS=false
+          if [[ "$EVENT_NAME" == "push" \
+            && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$CADENCE_BYPASS" == "false" ]]; then
+            CHANGED_FUNCTIONAL_TESTS=true
+          fi
+
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -377,6 +386,7 @@ jobs:
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
           echo "unit_testmon_eligible=$UNIT_TESTMON_ELIGIBLE" | tee -a $GITHUB_OUTPUT
+          echo "changed_functional_tests=$CHANGED_FUNCTIONAL_TESTS" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -447,9 +457,9 @@ jobs:
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
 
-      - name: Get changed files for mandatory unit tests
-        id: unit-test-pr-files
-        if: steps.configure.outputs.unit_testmon_eligible == 'true'
+      - name: Get changed files for test selection
+        id: pr-files
+        if: steps.configure.outputs.unit_testmon_eligible == 'true' || steps.configure.outputs.changed_functional_tests == 'true'
         shell: bash -e -u -o pipefail {0}
         continue-on-error: true
         env:
@@ -459,9 +469,9 @@ jobs:
           PR_MERGE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
           TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
         run: |
-          PR_FILES_DIR="$RUNNER_TEMP/unit-test-pr-files"
-          # Fetch once for all buckets. Missing or stale PR data leaves no
-          # artifact ID, so consumers fall back to the full unit-test bucket.
+          PR_FILES_DIR="$RUNNER_TEMP/pr-files"
+          # Fetch once for unit and functional tests. Missing or stale PR data
+          # leaves no artifact ID, so consumers use their full-test fallback.
           if mkdir -p "$PR_FILES_DIR" \
             && [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ \
                   && "$PR_MERGE_SHA" == "$TESTED_SHA" \
@@ -469,7 +479,8 @@ jobs:
                   && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
                   && "$PR_CHANGED_FILES" -le 3000 ]] \
             && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-              --jq '.[].filename' > "$PR_FILES_DIR/changed-files" \
+              --jq 'map({filename, status})' | jq -s 'add' > "$PR_FILES_DIR/files.json" \
+            && jq -r '.[].filename' "$PR_FILES_DIR/files.json" > "$PR_FILES_DIR/changed-files" \
             && CHANGED_FILES=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
             && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
             && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
@@ -478,17 +489,17 @@ jobs:
               '{tested_sha: $tested_sha, changed_files: $changed_files}' > "$PR_FILES_DIR/metadata.json"; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; unit-test buckets will run in full."
+            echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; test selection will use full-test fallbacks."
           fi
 
-      - name: Upload changed files for mandatory unit tests
-        id: upload-unit-test-pr-files
-        if: steps.unit-test-pr-files.outputs.ready == 'true'
+      - name: Upload changed files for test selection
+        id: upload-pr-files
+        if: steps.pr-files.outputs.ready == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         continue-on-error: true
         with:
-          name: unit-test-pr-files-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/unit-test-pr-files/
+          name: pr-files-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr-files/
           if-no-files-found: error
 
   linting:
@@ -888,7 +899,7 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.pr_files_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -979,7 +990,7 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.pr_files_artifact_id }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -1061,39 +1072,94 @@ jobs:
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
+      - name: Prepare PR file download
+        id: pr-files-directory
+        if: needs.configure.outputs.changed_functional_tests == 'true' && needs.configure.outputs.pr_files_artifact_id != ''
+        shell: bash -e -u -o pipefail {0}
+        continue-on-error: true
+        run: |
+          PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/functional-pr-files.XXXXXX")
+          echo "path=$PR_FILES_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Download PR files for functional tests
+        id: download-pr-files
+        if: steps.pr-files-directory.outcome == 'success'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        continue-on-error: true
+        with:
+          artifact-ids: ${{ needs.configure.outputs.pr_files_artifact_id }}
+          path: ${{ steps.pr-files-directory.outputs.path }}
+          merge-multiple: true
+
       - name: Parse functional tests
         id: main
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
+          SELECT_CHANGED_TESTS: ${{ needs.configure.outputs.changed_functional_tests }}
+          PR_FILES_OUTCOME: ${{ steps.download-pr-files.outcome }}
+          PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
+          TESTED_SHA: ${{ needs.configure.outputs.sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope $SCOPE)
-          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
-          # CADENCE is empty when label-based bypass is active; pass through
-          # only when set so generate_jet_trigger_job sees None and skips the filter.
-          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
+          # parse SCOPE TEST_CASES CADENCE OUTPUT: write a matrix fragment to
+          # OUTPUT.json. Each entry carries the scope/cadence it was resolved
+          # with so the test job can re-resolve the same recipe row.
+          parse() {
+            local scope=$1 test_cases=$2 cadence=$3 output=$4
+            ARGS=(--scope "$scope" --test-cases "$test_cases")
+            [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+            # CADENCE is empty when label-based bypass is active; pass through
+            # only when set so generate_jet_trigger_job sees None and skips the filter.
+            [ -n "$cadence" ] && ARGS+=(--cadence "$cadence")
 
-          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-            --n-repeat 5 \
-            --time-limit 2700 \
-            --test-cases all \
-            --container-image mcore_ci_dev \
-            --container-tag latest \
-            --dependent-job functional:configure \
-            --record-checkpoints false \
-            --slurm-account gh \
-            --no-enable-warmup \
-            --environment dev \
-            --platform dgx_h100 \
-            --cluster ghci \
-            ${ARGS[@]} \
-            --output-path integration-tests-h100.yaml
+            python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+              --n-repeat 5 \
+              --time-limit 2700 \
+              --container-image mcore_ci_dev \
+              --container-tag latest \
+              --dependent-job functional:configure \
+              --record-checkpoints false \
+              --slurm-account gh \
+              --no-enable-warmup \
+              --environment dev \
+              --platform dgx_h100 \
+              --cluster ghci \
+              "${ARGS[@]}" \
+              --output-path "$output.yaml"
 
-          cat integration-tests-h100.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-h100.json
+            cat "$output.yaml" | \
+              yq -o json 'del(.default, .stages, .workflow) | to_entries | map(select(.value.stage != "empty-pipeline-placeholder") | {"model": .value.stage, "test_case": .key})' | \
+              jq -c --arg scope "$scope" --arg cadence "$cadence" 'map(. + {scope: $scope, cadence: $cadence})' > "$output.json"
+          }
+
+          parse "$SCOPE" all "$CADENCE" integration-tests-h100-default
+
+          # Unlabelled PR pushes additionally run every L0/L1 test case whose
+          # files the PR touches, regardless of cadence. `Run tests` /
+          # `Run functional tests` already select the full L1 tier.
+          if [ "$SELECT_CHANGED_TESTS" == "true" ]; then
+            if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
+              && CHANGED_TEST_CASES=$(python tests/test_utils/python_scripts/changed_functional_tests.py \
+                --artifact-dir "$PR_FILES_DIR" --tested-sha "$TESTED_SHA"); then
+              echo "Using the validated PR file list for $TESTED_SHA."
+            else
+              CHANGED_TEST_CASES=all
+              echo "::notice::PR file list unavailable or invalid; running all L0/L1 functional tests without cadence filtering."
+            fi
+            echo "Changed functional test cases: ${CHANGED_TEST_CASES:-none}"
+            if [ -n "$CHANGED_TEST_CASES" ]; then
+              for TIER in L0 L1; do
+                parse "$TIER" "$CHANGED_TEST_CASES" "" "integration-tests-h100-changed-$TIER"
+              done
+            fi
+          fi
+
+          shopt -s nullglob
+          jq -c -s 'add | unique_by(.test_case) | sort_by(.model, .test_case)' \
+            integration-tests-h100-default.json integration-tests-h100-changed-*.json > integration-tests-h100.json
 
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1134,10 +1200,10 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
-          scope: ${{ needs.configure.outputs.scope }}
+          scope: ${{ matrix.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
-          cadence: ${{ needs.configure.outputs.cadence }}
+          cadence: ${{ matrix.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-gb200:
@@ -1159,39 +1225,94 @@ jobs:
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
+      - name: Prepare PR file download
+        id: pr-files-directory
+        if: needs.configure.outputs.changed_functional_tests == 'true' && needs.configure.outputs.pr_files_artifact_id != ''
+        shell: bash -e -u -o pipefail {0}
+        continue-on-error: true
+        run: |
+          PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/functional-pr-files.XXXXXX")
+          echo "path=$PR_FILES_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Download PR files for functional tests
+        id: download-pr-files
+        if: steps.pr-files-directory.outcome == 'success'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        continue-on-error: true
+        with:
+          artifact-ids: ${{ needs.configure.outputs.pr_files_artifact_id }}
+          path: ${{ steps.pr-files-directory.outputs.path }}
+          merge-multiple: true
+
       - name: Parse functional tests
         id: main
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
+          SELECT_CHANGED_TESTS: ${{ needs.configure.outputs.changed_functional_tests }}
+          PR_FILES_OUTCOME: ${{ steps.download-pr-files.outcome }}
+          PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
+          TESTED_SHA: ${{ needs.configure.outputs.sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope $SCOPE)
-          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
-          # CADENCE is empty when label-based bypass is active; pass through
-          # only when set so generate_jet_trigger_job sees None and skips the filter.
-          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
+          # parse SCOPE TEST_CASES CADENCE OUTPUT: write a matrix fragment to
+          # OUTPUT.json. Each entry carries the scope/cadence it was resolved
+          # with so the test job can re-resolve the same recipe row.
+          parse() {
+            local scope=$1 test_cases=$2 cadence=$3 output=$4
+            ARGS=(--scope "$scope" --test-cases "$test_cases")
+            [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+            # CADENCE is empty when label-based bypass is active; pass through
+            # only when set so generate_jet_trigger_job sees None and skips the filter.
+            [ -n "$cadence" ] && ARGS+=(--cadence "$cadence")
 
-          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-            --n-repeat 5 \
-            --time-limit 2700 \
-            --test-cases all \
-            --container-image mcore_ci_dev \
-            --container-tag latest \
-            --dependent-job functional:configure \
-            --record-checkpoints false \
-            --slurm-account gh \
-            --no-enable-warmup \
-            --environment dev \
-            --platform dgx_gb200 \
-            --cluster dgxgb200_oci-hsg \
-            ${ARGS[@]} \
-            --output-path integration-tests-gb200.yaml
+            python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+              --n-repeat 5 \
+              --time-limit 2700 \
+              --container-image mcore_ci_dev \
+              --container-tag latest \
+              --dependent-job functional:configure \
+              --record-checkpoints false \
+              --slurm-account gh \
+              --no-enable-warmup \
+              --environment dev \
+              --platform dgx_gb200 \
+              --cluster dgxgb200_oci-hsg \
+              "${ARGS[@]}" \
+              --output-path "$output.yaml"
 
-          cat integration-tests-gb200.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb200.json
+            cat "$output.yaml" | \
+              yq -o json 'del(.default, .stages, .workflow) | to_entries | map(select(.value.stage != "empty-pipeline-placeholder") | {"model": .value.stage, "test_case": .key})' | \
+              jq -c --arg scope "$scope" --arg cadence "$cadence" 'map(. + {scope: $scope, cadence: $cadence})' > "$output.json"
+          }
+
+          parse "$SCOPE" all "$CADENCE" integration-tests-gb200-default
+
+          # Unlabelled PR pushes additionally run every L0/L1 test case whose
+          # files the PR touches, regardless of cadence. `Run tests` /
+          # `Run functional tests` already select the full L1 tier.
+          if [ "$SELECT_CHANGED_TESTS" == "true" ]; then
+            if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
+              && CHANGED_TEST_CASES=$(python tests/test_utils/python_scripts/changed_functional_tests.py \
+                --artifact-dir "$PR_FILES_DIR" --tested-sha "$TESTED_SHA"); then
+              echo "Using the validated PR file list for $TESTED_SHA."
+            else
+              CHANGED_TEST_CASES=all
+              echo "::notice::PR file list unavailable or invalid; running all L0/L1 functional tests without cadence filtering."
+            fi
+            echo "Changed functional test cases: ${CHANGED_TEST_CASES:-none}"
+            if [ -n "$CHANGED_TEST_CASES" ]; then
+              for TIER in L0 L1; do
+                parse "$TIER" "$CHANGED_TEST_CASES" "" "integration-tests-gb200-changed-$TIER"
+              done
+            fi
+          fi
+
+          shopt -s nullglob
+          jq -c -s 'add | unique_by(.test_case) | sort_by(.model, .test_case)' \
+            integration-tests-gb200-default.json integration-tests-gb200-changed-*.json > integration-tests-gb200.json
 
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1234,11 +1355,11 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
-          scope: ${{ needs.configure.outputs.scope }}
+          scope: ${{ matrix.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
-          cadence: ${{ needs.configure.outputs.cadence }}
+          cadence: ${{ matrix.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
