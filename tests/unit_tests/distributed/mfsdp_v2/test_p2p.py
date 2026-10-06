@@ -23,7 +23,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffe
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
     GroupOwnerLayout,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.p2p import gather, scatter
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.p2p import (
+    gather,
+    scatter,
+    waiting_stream_scope,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
@@ -133,7 +137,7 @@ def test_gather_scatter_round_trip():
 
 
 def test_gather_scatter_with_stream():
-    """gather -> scatter on a side stream produces correct plain-tensor results.
+    """gather -> scatter inside `waiting_stream_scope` produces correct results.
 
     The scatter destination is plain flat tensors (not `DBuffer` views), matching
     `scatter`'s caller-owned application contract.
@@ -152,12 +156,10 @@ def test_gather_scatter_with_stream():
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(
-        _local_chunks(dbuffer, owner_layout, this_rank),
-        destination,
-        owner_layout=owner_layout,
-        stream=stream,
-    )
+    with waiting_stream_scope(stream):
+        gather(
+            _local_chunks(dbuffer, owner_layout, this_rank), destination, owner_layout=owner_layout
+        )
     stream.synchronize()
 
     for i in owned:
@@ -173,7 +175,8 @@ def test_gather_scatter_with_stream():
         )
         for i in held_not_owned
     }
-    scatter(destination, scatter_destination, owner_layout=owner_layout, stream=stream)
+    with waiting_stream_scope(stream):
+        scatter(destination, scatter_destination, owner_layout=owner_layout)
     stream.synchronize()
 
     for i in held_not_owned:
