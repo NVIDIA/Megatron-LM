@@ -165,51 +165,43 @@ def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> N
     [
         "valid",
         "empty-pr",
-        "large-pr",
-        "special-characters",
-        "missing-json",
-        "malformed-json",
-        "object-json",
-        "non-string-path",
-        "newline-path",
-        "count-mismatch",
+        "too-many-files",
+        "truncated-files",
+        "api-error",
+        "changed-pr-before",
+        "changed-pr-during",
+        "recheck-api-error",
+        "invalid-pr-number",
         "invalid-tested-sha",
         "invalid-file-count",
     ],
 )
-def test_shared_pr_files_producer_packages_changed_files_output(
+def test_shared_pr_files_producer_validates_complete_files_for_tested_commit(
     tmp_path: Path, shell_environment: dict[str, str], scenario: str
 ) -> None:
     gh = tmp_path / "bin/gh"
-    gh.write_text('#!/bin/sh\necho "$*" >> "$GH_LOG"\nexit 99\n')
+    gh.write_text(
+        "#!/bin/sh\n"
+        'echo "$*" >> "$GH_LOG"\n'
+        '[ "$1" = "api" ] || exit 2\n'
+        'if [ "$2" = "--paginate" ]; then\n'
+        '  [ "$3" = "repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100" ] '
+        '&& [ "$4" = "--jq" ] && [ "$5" = ".[].filename" ] || exit 2\n'
+        '  printf "%s" "$TEST_PR_FILES"\n'
+        '  [ "$TEST_SCENARIO" != "api-error" ]\n'
+        "else\n"
+        '  [ "$2" = "repos/NVIDIA/Megatron-LM/pulls/7824" ] '
+        '&& [ "$3" = "--jq" ] && [ "$4" = ".merge_commit_sha" ] || exit 2\n'
+        '  [ "$TEST_SCENARIO" = "recheck-api-error" ] && exit 1\n'
+        '  printf "%s\\n" "$TEST_CURRENT_PR_SHA"\n'
+        "fi\n"
+    )
     gh.chmod(0o755)
     gh_log = tmp_path / "gh.log"
     runner_temp = tmp_path / "runner"
     expected_files = (
         [] if scenario == "empty-pr" else ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
     )
-    if scenario == "large-pr":
-        expected_files = [f"megatron/core/source_{index}.py" for index in range(3001)]
-    elif scenario == "special-characters":
-        expected_files = [
-            "megatron/core/a b.py",
-            'megatron/core/quoted"file.py',
-            "megatron/core/unicode_é.py",
-            r"megatron/core/back\slash.py",
-        ]
-    elif scenario == "newline-path":
-        expected_files = ["megatron/core/a\nb.py"]
-    output_dir = runner_temp / "unit-test-changed-files"
-    output_dir.mkdir(parents=True)
-    changed_files_json = output_dir / "all_changed_and_modified_files.json"
-    if scenario != "missing-json":
-        changed_files_json.write_text(
-            {
-                "malformed-json": "{",
-                "object-json": "{}",
-                "non-string-path": '["megatron/core/a.py", 1]',
-            }.get(scenario, json.dumps(expected_files))
-        )
     step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
     result, outputs = _run(
         step["run"],
@@ -217,16 +209,24 @@ def test_shared_pr_files_producer_packages_changed_files_output(
         {
             **shell_environment,
             "GH_LOG": str(gh_log),
+            "TEST_SCENARIO": scenario,
+            "TEST_PR_FILES": "".join(f"{path}\n" for path in expected_files),
+            "TEST_CURRENT_PR_SHA": ("d" if scenario == "changed-pr-during" else "c") * 40,
             "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+            "PR_NUMBER": "invalid" if scenario == "invalid-pr-number" else "7824",
             "PR_CHANGED_FILES": {
-                "count-mismatch": str(len(expected_files) + 1),
+                "empty-pr": "0",
+                "truncated-files": "3",
+                "too-many-files": "3001",
                 "invalid-file-count": "invalid",
-            }.get(scenario, str(len(expected_files))),
+            }.get(scenario, "2"),
+            "PR_MERGE_SHA": ("d" if scenario == "changed-pr-before" else "c") * 40,
             "TESTED_SHA": "invalid" if scenario == "invalid-tested-sha" else "c" * 40,
         },
     )
     assert result.returncode == 0, result.stderr
-    valid = scenario in {"valid", "empty-pr", "large-pr", "special-characters"}
+    valid = scenario in {"valid", "empty-pr"}
     artifact_dir = runner_temp / "unit-test-pr-files"
     if valid:
         assert outputs == {"ready": "true"}
@@ -239,44 +239,29 @@ def test_shared_pr_files_producer_packages_changed_files_output(
         assert outputs.get("ready") != "true"
         assert "::notice::" in result.stdout
         assert not (artifact_dir / "metadata.json").exists()
-    assert not gh_log.exists()
+    expected_calls = []
+    if valid or scenario in {
+        "truncated-files",
+        "api-error",
+        "changed-pr-during",
+        "recheck-api-error",
+    }:
+        expected_calls.append(
+            "api --paginate repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100 "
+            "--jq .[].filename"
+        )
+    if valid or scenario in {"changed-pr-during", "recheck-api-error"}:
+        expected_calls.append("api repos/NVIDIA/Megatron-LM/pulls/7824 --jq .merge_commit_sha")
+    assert (gh_log.read_text().splitlines() if gh_log.exists() else []) == expected_calls
 
 
 def test_unit_test_matrices_consume_one_shared_pr_files_artifact() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
     configure = workflow["jobs"]["configure"]
-    checkout = _step("cicd-main.yml", "configure", "unit-test-pr-checkout")
-    changed_files = _step("cicd-main.yml", "configure", "changed-files")
     producer = _step("cicd-main.yml", "configure", "unit-test-pr-files")
     upload = _step("cicd-main.yml", "configure", "upload-unit-test-pr-files")
-    assert checkout["if"] == "steps.configure.outputs.unit_testmon_eligible == 'true'"
-    assert checkout["continue-on-error"] is True
-    assert checkout["with"]["ref"] == "${{ steps.resolve-sha.outputs.sha }}"
-    assert checkout["with"]["fetch-depth"] == 2
-    assert checkout["with"]["persist-credentials"] is False
-    assert changed_files["if"] == "steps.unit-test-pr-checkout.outcome == 'success'"
-    assert changed_files["continue-on-error"] is True
-    assert changed_files["uses"].startswith("step-security/changed-files@")
-    assert len(changed_files["uses"].split("@", 1)[1]) == 40
-    assert changed_files["with"]["base_sha"] == "${{ steps.resolve-sha.outputs.sha }}^1"
-    assert changed_files["with"]["sha"] == "${{ steps.resolve-sha.outputs.sha }}"
-    for option in (
-        "skip_initial_fetch",
-        "fail_on_initial_diff_error",
-        "output_renamed_files_as_deleted_and_added",
-        "json",
-        "write_output_files",
-    ):
-        assert changed_files["with"][option] is True
-    for option in ("escape_json", "safe_output", "quotepath"):
-        assert changed_files["with"][option] is False
-    assert changed_files["with"]["output_dir"] == "${{ runner.temp }}/unit-test-changed-files"
-    assert producer["if"] == "steps.changed-files.outcome == 'success'"
+    assert producer["if"] == "steps.configure.outputs.unit_testmon_eligible == 'true'"
     assert producer["continue-on-error"] is True
-    assert producer["env"]["TESTED_SHA"] == "${{ steps.resolve-sha.outputs.sha }}"
-    assert producer["env"]["PR_CHANGED_FILES"] == (
-        "${{ steps.changed-files.outputs.all_changed_and_modified_files_count }}"
-    )
     assert upload["if"] == "steps.unit-test-pr-files.outputs.ready == 'true'"
     assert upload["continue-on-error"] is True
     assert upload["uses"].startswith("actions/upload-artifact@")
