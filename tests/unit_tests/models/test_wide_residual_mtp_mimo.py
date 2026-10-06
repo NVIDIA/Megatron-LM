@@ -299,7 +299,7 @@ class TestWideResidualMTPAndMIMO:
         for shortcut in shortcuts:
             assert shortcut.shortcut_residual_read is not None
             assert shortcut.shortcut_residual_read.read_map.logit.grad is not None
-            assert shortcut.attn_layer.residual_connection.read_map.logit.grad is not None
+            assert shortcut.compute_layer.residual_connection.read_map.logit.grad is not None
             assert shortcut.moe_layer.residual_connection_mlp.read_map.logit.grad is not None
             assert shortcut.shortcut_post_norm.weight.grad is not None
         assert not mtp_stack.uses_wide_residual_stream
