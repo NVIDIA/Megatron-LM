@@ -1002,7 +1002,7 @@ def _expand_query_bounds_for_batch(bounds: torch.Tensor, batch: int, seqlen: int
     )
 
 
-_KPOOL_SCORE_CHUNK_BYTES = 256 * 1024 * 1024
+_KPOOL_SCORE_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
 
 
 @torch.no_grad()
