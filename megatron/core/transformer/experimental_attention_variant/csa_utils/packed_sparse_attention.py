@@ -130,6 +130,12 @@ class CSASparseAttnFunc(torch.autograd.Function):
         deterministic: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
+        if q_padding_mask is not None:
+            # Enforce sink-only padding even when callers supply valid-looking IDs.
+            # Keep caller-owned indices and prefix lengths unchanged.
+            topk_idxs = topk_idxs.masked_fill(q_padding_mask.unsqueeze(-1), -1)
+            if topk_length is not None:
+                topk_length = topk_length.masked_fill(q_padding_mask, 0)
         topk_idxs = torch.nn.functional.pad(
             topk_idxs, (0, -topk_idxs.shape[-1] % get_flash_mla_topk_alignment()), value=-1
         )
@@ -206,9 +212,9 @@ def csa_sparse_attn(
     """Run fused attention for flat packed Q/KV and physical indices."""
     if query.ndim != 3 or kv.ndim != 2:
         raise ValueError("Packed CSA requires query [tokens, heads, dim] and KV [tokens, dim].")
-    if topk_length is not None:
-        # Short windows can leave holes before valid compressed keys. The backend
-        # interprets topk_length as a valid prefix, so compact those holes first.
+    if topk_length is not None or deterministic:
+        # Either segment order can leave holes before valid keys. Deterministic
+        # no-grad lowering also uses the training path's compact valid prefix.
         topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
     out, _, _ = CSASparseAttnFunc.apply(
         query,
@@ -326,7 +332,10 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         indexer_topk = indexer_topk_idxs.shape[-1]
 
         # Preserve the fixed window suffix for the dense teacher before
-        # compacting the complete attention index set.
+        # compacting the complete attention index set. Padding attends only to
+        # the sink, independently of the caller's physical-index contents.
+        if q_padding_mask is not None:
+            topk_idxs = topk_idxs.masked_fill(q_padding_mask.unsqueeze(-1), -1)
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
         topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
 
