@@ -152,13 +152,15 @@ class TestReadRunConfigNonDistributed:
         # compat step would try to resolve a target that cannot be rebuilt without runtime args.
         assert seen_by_compat == [{"timers": None}]
 
-    def test_strips_legacy_quantization_recipe(self, tmp_path):
+    def test_preserves_serialized_quantization_recipe(self, tmp_path):
         run_config_path = tmp_path / "run_config.yaml"
         data = {
             "_target_": "some.Config",
             "quant_recipe": {
-                "_target_": "megatron.core.quantization.quant_config.RecipeConfig",
-                "_call_": True,
+                "_target_": (
+                    "megatron.core.quantization.quant_config.RecipeConfig.from_config_dict"
+                ),
+                "config": {"matchers": None, "configs": {"default": {"format": "bf16"}}},
             },
         }
         with open(run_config_path, "w") as f:
@@ -166,7 +168,7 @@ class TestReadRunConfigNonDistributed:
 
         loaded = read_run_config(str(run_config_path))
 
-        assert loaded["quant_recipe"] is None
+        assert loaded == data
 
 
 class TestReadRunConfigDistributed:
