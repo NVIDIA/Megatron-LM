@@ -17,7 +17,7 @@ from megatron.core.inference.sampling_params import (
 
 
 def request_token_seed(seed: int, position: int) -> int:
-    """Derive a draw from logical request seed and absolute next-token position."""
+    """Derive the CPU fallback's draw from request seed and absolute position."""
     digest = hashlib.sha256(struct.pack("<QQ", seed, position)).digest()
     return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
@@ -92,6 +92,7 @@ class TorchSampling(Sampling):
         generator: torch.Generator,
         vocab_size: Optional[int] = None,
         row_seeds: Optional[List[Optional[int]]] = None,
+        row_positions: Optional[List[int]] = None,
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
 
@@ -103,8 +104,9 @@ class TorchSampling(Sampling):
             top_k: Top-k filtering value (0 = disabled).
             top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled).
             generator: Shared RNG for requests without an explicit seed.
-            row_seeds: Optional per-row draw seeds. None entries use the shared RNG.
+            row_seeds: Optional per-row request seeds. None entries use the shared RNG.
                 Explicit seeds do not advance that RNG.
+            row_positions: Absolute next-token positions paired with row_seeds.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
 
@@ -132,22 +134,40 @@ class TorchSampling(Sampling):
         # which keeps the two engines' sampling paths aligned; vLLM also uses it to
         # avoid the CPU-GPU sync that `torch.multinomial` incurs.
         q = torch.empty_like(probabilities)
+        if row_seeds is not None:
+            if len(row_seeds) != q.shape[0]:
+                raise ValueError("row_seeds must contain one entry per logits row")
+            if row_positions is not None and len(row_positions) != q.shape[0]:
+                raise ValueError("row_positions must contain one entry per logits row")
+            # Another sampling bucket may contain the batch's only seeded rows.
+            if all(seed is None for seed in row_seeds):
+                row_seeds = None
         if row_seeds is None:
             q.exponential_(generator=generator)
         else:
-            if len(row_seeds) != q.shape[0]:
-                raise ValueError("row_seeds must contain one entry per logits row")
             unseeded = [i for i, seed in enumerate(row_seeds) if seed is None]
             if unseeded:
                 indices = torch.tensor(unseeded, device=q.device, dtype=torch.long)
                 noise = torch.empty((len(unseeded), q.shape[1]), device=q.device, dtype=q.dtype)
                 noise.exponential_(generator=generator)
                 q.index_copy_(0, indices, noise)
-            local_rng = torch.Generator(device=q.device)
-            for row, seed in enumerate(row_seeds):
-                if seed is not None:
-                    local_rng.manual_seed(seed)
-                    q[row].exponential_(generator=local_rng)
+            if q.is_cuda:
+                # Import lazily so CPU sampling does not require Triton.
+                from megatron.core.inference.sampling.request_seed_noise import (
+                    fill_request_seed_noise,
+                )
+
+                fill_request_seed_noise(q, row_seeds, row_positions)
+            else:
+                local_rng = torch.Generator(device=q.device)
+                for row, seed in enumerate(row_seeds):
+                    if seed is not None:
+                        local_rng.manual_seed(
+                            seed
+                            if row_positions is None
+                            else request_token_seed(seed, row_positions[row])
+                        )
+                        q[row].exponential_(generator=local_rng)
         sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
         if vocab_size:
@@ -251,6 +271,7 @@ class TorchSampling(Sampling):
             else seed_metadata[:active_request_count].tolist()
         )
         row_seeds = None
+        positions = None
         if any(seed >= 0 for seed in seeds):
             if token_to_request_index is not None or context.config.num_speculative_tokens:
                 raise ValueError("Request-local seeds do not yet support speculative decoding")
@@ -259,10 +280,7 @@ class TorchSampling(Sampling):
                 if sequence_lengths is None
                 else sequence_lengths
             ).tolist()
-            row_seeds = [
-                request_token_seed(seed, position) if seed >= 0 else None
-                for seed, position in zip(seeds, positions)
-            ]
+            row_seeds = [seed if seed >= 0 else None for seed in seeds]
 
         bucket_map: dict = defaultdict(list)
         temp = md["temperature"][:active_request_count].tolist()
@@ -297,6 +315,7 @@ class TorchSampling(Sampling):
                     generator=self._rng,
                     vocab_size=self._vocab_size,
                     row_seeds=None if row_seeds is None else [row_seeds[i] for i in indices],
+                    row_positions=None if positions is None else [positions[i] for i in indices],
                 )
             )
             indices_list.append(row_indices)

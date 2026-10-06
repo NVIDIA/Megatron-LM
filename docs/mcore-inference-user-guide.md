@@ -411,9 +411,15 @@ seed for each independently sampled rollout and reuse it when retrying that
 logical request. Omitting `seed` retains the shared-generator sampling path.
 
 This requires dynamic inference with `sampling_backend="torch"` and no
-speculative decoding. Unsupported modes reject seeded requests. Seeded draws use
-one noise-generation launch per seeded row while filtering remains batched;
-throughput can therefore decrease. This feature does not make model logits
+speculative decoding. Unsupported modes reject seeded requests. CUDA seeded
+draws require Triton and use one batched noise-generation launch per sampling
+bucket, keyed by request seed, absolute position, and vocabulary index. CPU
+sampling retains the Torch generator implementation. Unseeded rows retain the
+shared-generator path and seeded rows do not consume its random draws. Exact
+seeded CUDA token sequences can differ from the earlier per-row Torch implementation:
+the same seed identifies a different random stream, not a loss of repeatability.
+Replay requires the same implementation and runtime, not different RNG algorithms
+or CPU/CUDA backends. This feature does not make model logits
 batch invariant, freeze policy weights, or snapshot external tool execution.
 Identical generated tokens still require identical logits and sampling settings.
 

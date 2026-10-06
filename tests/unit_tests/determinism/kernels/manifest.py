@@ -672,11 +672,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="inference_request_seed_sampling",
-        sources=("megatron/core/inference/sampling/torch_sampling.py",),
+        sources=(
+            "megatron/core/inference/sampling/torch_sampling.py",
+            "megatron/core/inference/sampling/request_seed_noise.py",
+        ),
         tests=(K + "test_request_seed_sampling.py",),
-        kind="dispatch",
+        kind="triton",
         training_path=False,
-        notes="Request-local exponential draws replay across changing batch layouts.",
+        notes="Request-local Philox exponential draws replay across batch layouts and "
+        "scalar/batched launches, including under side-stream contention.",
     ),
     KernelEntry(
         name="inference_flashinfer_sampling",

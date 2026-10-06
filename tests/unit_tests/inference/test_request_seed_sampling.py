@@ -10,6 +10,13 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 
+_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    ),
+]
+
 
 def context(seeds, positions, temperatures=None):
     n = len(seeds)
@@ -38,15 +45,7 @@ def draw(sampler, logits, ctx, **kwargs):
     )
 
 
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
-        pytest.param(
-            "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-        ),
-    ],
-)
+@pytest.mark.parametrize("device", _DEVICES)
 def test_seeded_sequence_survives_batch_changes(device):
     logits = torch.randn(3, 127, generator=torch.Generator().manual_seed(1)).to(device)
     sampler = TorchSampling(torch.Generator(device=device).manual_seed(22), 127)
@@ -62,12 +61,15 @@ def test_seeded_sequence_survives_batch_changes(device):
     assert torch.equal(before, sampler._rng.get_state())
 
 
-def test_seeded_request_does_not_consume_unseeded_rng():
-    logits = torch.arange(127, dtype=torch.float32).sin().expand(2, -1)
-    mixed = TorchSampling(torch.Generator().manual_seed(2), 127)
-    alone = TorchSampling(torch.Generator().manual_seed(2), 127)
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("separate_buckets", [False, True])
+def test_seeded_request_does_not_consume_unseeded_rng(device, separate_buckets):
+    logits = torch.arange(127, dtype=torch.float32, device=device).sin().expand(2, -1)
+    mixed = TorchSampling(torch.Generator(device=device).manual_seed(2), 127)
+    alone = TorchSampling(torch.Generator(device=device).manual_seed(2), 127)
     for position in range(32):
-        result = draw(mixed, logits, context([14, -1], [position, position]))
+        temperatures = [0.7 if separate_buckets else 1.0, 1.0]
+        result = draw(mixed, logits, context([14, -1], [position, position], temperatures))
         expected = draw(alone, logits[1:], context([-1], [position]))
         assert result[1] == expected[0]
     assert torch.equal(mixed._rng.get_state(), alone._rng.get_state())
@@ -122,9 +124,10 @@ def test_invalid_seed_validation(seed):
 
 
 @pytest.mark.parametrize("top_k,top_p", [(1, 0.0), (8, 0.0), (0, 0.7)])
-def test_filter_buckets_preserve_seeded_draws(top_k, top_p):
-    sampler = TorchSampling(torch.Generator().manual_seed(2), 127)
-    logits = torch.randn(2, 127)
+@pytest.mark.parametrize("device", _DEVICES)
+def test_filter_buckets_preserve_seeded_draws(top_k, top_p, device):
+    sampler = TorchSampling(torch.Generator(device=device).manual_seed(2), 127)
+    logits = torch.randn(2, 127, device=device)
     ctx = context([11, 12], [9, 9])
     ctx.active_request_metadata["top_k"].fill_(top_k)
     ctx.active_request_metadata["top_p"].fill_(top_p)
@@ -136,10 +139,11 @@ def test_filter_buckets_preserve_seeded_draws(top_k, top_p):
         assert full[i] == draw(sampler, logits[i : i + 1], single)[0]
 
 
-def test_unseeded_sampling_keeps_original_shared_generator_path():
-    logits = torch.randn(3, 127)
-    sampler = TorchSampling(torch.Generator().manual_seed(9), 127)
-    generator = torch.Generator().manual_seed(9)
+@pytest.mark.parametrize("device", _DEVICES)
+def test_unseeded_sampling_keeps_original_shared_generator_path(device):
+    logits = torch.randn(3, 127, device=device)
+    sampler = TorchSampling(torch.Generator(device=device).manual_seed(9), 127)
+    generator = torch.Generator(device=device).manual_seed(9)
     ctx = context([-1, -1, -1], [10, 10, 10])
     result = draw(sampler, logits, ctx)
     expected = TorchSampling.sample_from_logits(
@@ -147,6 +151,25 @@ def test_unseeded_sampling_keeps_original_shared_generator_path():
     )
     assert torch.equal(result, expected)
     assert torch.equal(generator.get_state(), sampler._rng.get_state())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_seeded_sampling_distribution():
+    # Distribution smoke test independent of replay: two categories with p=.2/.8,
+    # plus an impossible token which must never win the exponential race.
+    batch = 16384
+    logits = torch.tensor([0.2, 0.8, 0.0], device="cuda").log().expand(batch, -1)
+    sampled = TorchSampling.sample_from_logits(
+        logits,
+        1.0,
+        0,
+        0.0,
+        generator=torch.Generator(device="cuda"),
+        row_seeds=list(range(batch)),
+        row_positions=[19] * batch,
+    )
+    assert not (sampled == 2).any()
+    assert abs((sampled == 1).float().mean().item() - 0.8) < 0.02
 
 
 @pytest.mark.parametrize("backend,speculative", [("flashinfer", 0), ("torch", 2), ("torch", 0)])
