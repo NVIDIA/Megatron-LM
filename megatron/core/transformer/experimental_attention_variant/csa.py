@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 from dataclasses import dataclass
@@ -1001,6 +1001,7 @@ class CompressedSparseAttention(MegatronModule):
                 sparse_loss=self.config.dsa_indexer_use_sparse_loss,
                 kv_offset=compressed_offset,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1022,6 +1023,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.indexer.index_topk,
                 self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
@@ -1039,6 +1041,7 @@ class CompressedSparseAttention(MegatronModule):
                 flat_indices,
                 self.softmax_scale,
                 topk_length=flat_topk_length,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
         else:
@@ -1056,7 +1059,12 @@ class CompressedSparseAttention(MegatronModule):
 
             nvtx_range_push("sparse_attn_kernel")
             output = csa_sparse_attn(
-                query, kv_full, self.attn_sink.float(), flat_indices, self.softmax_scale
+                query,
+                kv_full,
+                self.attn_sink.float(),
+                flat_indices,
+                self.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
