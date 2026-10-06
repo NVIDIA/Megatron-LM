@@ -802,16 +802,6 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
-    disable_ep_consensus: bool = False
-    """If True, the engine skips the EP-group consensus all-reduce in
-    `run_engine_with_coordinator` and decides whether to step based on local
-    state alone. The rank still calls `controller.dummy_forward()` whenever
-    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
-    sync — without this, a peer running a real forward would deadlock waiting
-    on this rank's all-to-all participation. Trades off the consensus
-    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
-    """
-
     ep_consensus_interval: int = 20
     """How many steps to skip between EP-consensus all-reduces when the engine
     has pending work. Consensus is always run immediately when there is no

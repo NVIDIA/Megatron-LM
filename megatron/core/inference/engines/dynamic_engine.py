@@ -526,7 +526,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
-        self.disable_ep_consensus = inference_config.disable_ep_consensus
         self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.vision_embedding_cache_max_bytes = int(
             getattr(inference_config, "vision_embedding_cache_max_bytes", 0)
@@ -4718,37 +4717,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         + int(self.has_admittable_kv_import)
                     )
                     local_pending_imports = self.pending_kv_import_count
-                    if self.disable_ep_consensus:
-                        # Skip the EP consensus all-reduce; act on local state only.
-                        # NOTE: even with no consensus we must still participate in EP
-                        # collectives (NCCL all-to-all, etc.) every iteration. A peer with
-                        # real work will block at its all-to-all kernel waiting for this
-                        # rank, so when there is no local work we run dummy_forward()
-                        # rather than sleeping. Sleeping here would deadlock EP > 1.
-                        if self.state == EngineState.PAUSING:
-                            await self._world_barrier()
-                            self.state = EngineState.PAUSED
-                            self._state_events[EngineState.PAUSED].set()
-                        elif local_schedulable > 0:
-                            await self.async_step()
-                        elif self.ep_world_size == 1 and local_pending_imports > 0:
-                            # No model work is ready; poll the network transfer without
-                            # spending a dummy forward while waiting for decode admission.
-                            await asyncio.sleep(0.001)
-                        else:
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
-                            # The consensus path yields via _ep_establish_consensus;
-                            # without it we must still let other coroutines (signal
-                            # delivery, request scheduling) run between steps.
-                            await asyncio.sleep(0)
-                        continue
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         global_work_from_last_consensus == 0
