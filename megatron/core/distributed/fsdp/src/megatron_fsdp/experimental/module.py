@@ -17,7 +17,7 @@
 import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Literal, cast
+from typing import cast
 from weakref import ref
 
 import torch
@@ -30,7 +30,12 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    ComputePhase,
+    FsdpParameterGroup,
+    effective_dtype,
+    get_containing_parameter_group,
+)
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -405,10 +410,14 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        self.unshard(ComputePhase.FORWARD, prefetch=not is_recomputing)
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(self, compute_phase: ComputePhase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
+
+        Parameters are unsharded for the phase of ``compute_phase``, or for every
+        phase when it is None. With ``prefetch``, successors in that phase's
+        module order are also unsharded for it.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -417,54 +426,67 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
+        if prefetch and compute_phase is None:
+            raise ValueError("prefetch requires a compute_phase.")
         with self._nvtx_range("unshard"):
-            self._unshard_parameter_groups()
+            self._unshard_parameter_groups(compute_phase)
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if prefetch == "forward":
+            if not prefetch:
+                return
+            if compute_phase is ComputePhase.FORWARD:
                 self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+                    context.forward_order,
+                    self._schedule_policy.forward_prefetch_size,
+                    compute_phase,
                 )
-            elif prefetch == "backward":
+            elif compute_phase is ComputePhase.BACKWARD:
                 self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
+                    context.backward_order,
+                    self._schedule_policy.backward_prefetch_size,
+                    compute_phase,
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
+        self,
+        order: IndexedOrder["FsdpModule"],
+        prefetch_size: int | None,
+        compute_phase: ComputePhase,
     ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget."""
+        """Prefetch successors from ``order`` for ``compute_phase`` within this module's budget."""
         next_module = order.next_item(self)
         if prefetch_size is None:
             if next_module is not None:
-                next_module._unshard_parameter_groups()
+                next_module._unshard_parameter_groups(compute_phase)
             return
 
         prefetched_size = 0
         while next_module is not None and prefetched_size < prefetch_size:
-            next_module._unshard_parameter_groups()
+            next_module._unshard_parameter_groups(compute_phase)
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self) -> None:
-        """Unshard this FsdpModule's parameter groups on the all-gather stream.
+    def _unshard_parameter_groups(self, compute_phase: ComputePhase | None) -> None:
+        """Unshard parameter groups for ``compute_phase`` on the all-gather stream.
 
-        If ``_unshard_event`` is already set, this FsdpModule was already
-        unsharded or prefetched and this method is a no-op. Otherwise, this
-        method records ``_unshard_event`` after materialization so compute
-        can wait without depending on later release work.
+        If they were already unsharded or prefetched for that phase, this method
+        is a no-op. Otherwise, it materializes the missing weights and
+        records ``_unshard_event`` so compute can wait without depending on
+        later release work.
         """
-        if self._unshard_event is not None:
+        if self._unshard_event is not None and not any(
+            group.needs_unshard(compute_phase) for group in self._parameter_groups
+        ):
             return
 
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard_parameters(compute_phase)
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -519,7 +541,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        self.unshard(ComputePhase.BACKWARD, prefetch=True)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

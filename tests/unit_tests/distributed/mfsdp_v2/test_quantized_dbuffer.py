@@ -116,6 +116,89 @@ def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
         torch.testing.assert_close(actual.local_buffer, expected.local_buffer)
 
 
+@pytest.mark.parametrize("rowwise", [True, False], ids=["rowwise", "columnwise"])
+def test_quantized_dbuffer_partial_get_tensor_supports_gemm(distributed_setup, rowwise):
+    """Compute tensors carrying only gathered rowwise or columnwise planes support their GEMMs.
+
+    Forward GEMMs (TN) read rowwise planes and backward data-gradient GEMMs (NN)
+    read columnwise planes. The (64, 64) and (32, 64) shapes need padded scales.
+    """
+    columnwise = not rowwise
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    shapes = [(128, 128), (64, 64), (32, 64)]
+    quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
+    main_weight = DBuffer(
+        mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
+    )
+    torch.manual_seed(1234 + distributed_setup.rank)
+    main_weight.local_buffer.normal_()
+    quantized.quantize_(main_weight)
+    # Only the selected planes of ``gathered`` hold data; the others stay uninitialized.
+    gathered = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, device)
+    quantized.redistribute([Replicate()], out=gathered, rowwise=rowwise, columnwise=columnwise)
+    gathered_main = main_weight.redistribute([Replicate()])
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+    for index, shape in enumerate(shapes):
+        compute_tensor = gathered.get_tensor(index, rowwise=rowwise, columnwise=columnwise)
+        reference = quantizer(gathered_main.get_tensor_view(index))
+        layout, inner_dim = ("TN", shape[1]) if rowwise else ("NN", shape[0])
+        activation = quantizer(torch.randn((64, inner_dim), device=device))
+        actual = general_gemm(compute_tensor, activation, out_dtype=torch.bfloat16, layout=layout)
+        expected = general_gemm(reference, activation, out_dtype=torch.bfloat16, layout=layout)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rowwise", [True, False], ids=["rowwise", "columnwise"])
+def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, rowwise):
+    """Selecting rowwise or columnwise planes gathers only those planes.
+
+    Compute tensors built from the selection carry only those planes, with a
+    quantizer advertising the same usages.
+    """
+    columnwise = not rowwise
+    if distributed_setup.world_size < 2:
+        pytest.skip("QuantizedDBuffer redistribution requires at least two ranks.")
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    shapes = [(128, 64), (32, 128)]
+    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
+    for index, plane in enumerate(source.planes):
+        plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
+    expected = source.redistribute([Replicate()])
+    destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, device)
+    sentinel = 255
+    for plane in destination.planes:
+        plane.local_buffer.fill_(sentinel)
+
+    result = source.redistribute(
+        [Replicate()], out=destination, rowwise=rowwise, columnwise=columnwise
+    )
+    assert result is destination
+    selected = destination.planes_for(rowwise=rowwise, columnwise=columnwise)
+    for actual, reference in zip(destination.planes, expected.planes):
+        if any(actual is plane for plane in selected):
+            torch.testing.assert_close(actual.local_buffer, reference.local_buffer)
+        else:
+            assert actual.local_buffer.eq(sentinel).all()
+
+    for index in range(len(shapes)):
+        tensor = destination.get_tensor(index, rowwise=rowwise, columnwise=columnwise)
+        assert tensor.shape == shapes[index]
+        assert (tensor._rowwise_data is not None) == rowwise
+        assert (tensor._rowwise_scale_inv is not None) == rowwise
+        assert (tensor._columnwise_data is not None) == columnwise
+        assert (tensor._columnwise_scale_inv is not None) == columnwise
+        # TE's primary-weight path requests the quantizer's usages from the tensor.
+        assert tensor._quantizer.rowwise_usage == rowwise
+        assert tensor._quantizer.columnwise_usage == columnwise
+
+    with pytest.raises(ValueError, match="requires every plane"):
+        source.redistribute([Replicate()], rowwise=rowwise, columnwise=columnwise)
+
+
 def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     """A sharded view aliases exactly this rank's slice of each replicated plane."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))

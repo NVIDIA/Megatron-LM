@@ -34,9 +34,12 @@ from .layout import GlobalLayout, Shape
 from .placement import BlockAtomic, RowAtomic
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
-# TODO: Support quantizing only rowwise or columnwise data, allocating and
-# communicating only the required planes to save memory and communication.
 _MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
+_COMPUTE_QUANTIZERS = {
+    (True, False): MXFP8Quantizer(_MXFP8_DTYPE, rowwise=True, columnwise=False),
+    (False, True): MXFP8Quantizer(_MXFP8_DTYPE, rowwise=False, columnwise=True),
+    (True, True): _MXFP8_QUANTIZER,
+}
 _MXFP8_BLOCK_SIZE = 32
 
 
@@ -193,36 +196,53 @@ class QuantizedDBuffer:
         result.columnwise_scale = columnwise_scale
         return result
 
-    def get_tensor_view(self, index: int) -> MXFP8Tensor:
-        """Return a compact, unswizzled MXFP8 view that aliases all local planes."""
-        rowwise_data = self.rowwise_data.get_tensor_view(index)
-        rowwise_scale = self.rowwise_scale.get_tensor_view(index)
-        columnwise_scale = self.columnwise_scale.get_tensor_view(index)
+    def get_tensor_view(
+        self, index: int, *, rowwise: bool = True, columnwise: bool = True
+    ) -> MXFP8Tensor:
+        """Return a compact, unswizzled MXFP8 view that aliases the selected local planes.
+
+        Unselected planes are omitted, so the view never reads planes whose storage
+        may be released.
+        """
+        if not (rowwise or columnwise):
+            raise ValueError("Expected rowwise and/or columnwise planes.")
+        rowwise_data = self.rowwise_data.get_tensor_view(index) if rowwise else None
+        columnwise_data = self.columnwise_data.get_tensor_view(index) if columnwise else None
+        data = rowwise_data if rowwise_data is not None else columnwise_data
         return MXFP8Tensor(
-            shape=rowwise_data.shape,
+            shape=data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=rowwise_scale,
-            columnwise_data=self.columnwise_data.get_tensor_view(index),
-            columnwise_scale_inv=columnwise_scale,
+            rowwise_scale_inv=(
+                self.rowwise_scale.get_tensor_view(index) if rowwise else None
+            ),
+            columnwise_data=columnwise_data,
+            columnwise_scale_inv=(
+                self.columnwise_scale.get_tensor_view(index) if columnwise else None
+            ),
             fp8_dtype=_MXFP8_DTYPE,
-            quantizer=_MXFP8_QUANTIZER,
+            quantizer=_COMPUTE_QUANTIZERS[(rowwise, columnwise)],
             with_gemm_swizzled_scales=False,
-            device=rowwise_data.device,
+            device=data.device,
         )
 
-    def get_tensor(self, index: int) -> MXFP8Tensor:
+    def get_tensor(
+        self, index: int, *, rowwise: bool = True, columnwise: bool = True
+    ) -> MXFP8Tensor:
         """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
 
-        Data planes remain views. Scale planes alias storage only when no padding
-        is needed; otherwise they are copied into padded allocations.
+        Only the selected planes are included. Data planes remain views. Scale
+        planes alias storage only when no padding is needed; otherwise they are
+        copied into padded allocations.
         """
-        tensor = self.get_tensor_view(index)
+        tensor = self.get_tensor_view(index, rowwise=rowwise, columnwise=columnwise)
         # GEMM requires padded scales. Pad here until TE fuses padding into its
         # scale-swizzle kernel, avoiding these separate allocations and copies:
         # https://github.com/NVIDIA/TransformerEngine/issues/3518
-        tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
-        tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
+        if tensor._rowwise_scale_inv is not None:
+            tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
+        if tensor._columnwise_scale_inv is not None:
+            tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
         return tensor
 
     def quantize_(self, main_weight: DBuffer) -> None:
@@ -239,6 +259,15 @@ class QuantizedDBuffer:
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
         """Physical planes in TE's rowwise-data-first order."""
         return self.rowwise_data, self.columnwise_data, self.rowwise_scale, self.columnwise_scale
+
+    def planes_for(self, *, rowwise: bool, columnwise: bool) -> tuple[DBuffer, ...]:
+        """Physical data and scale planes of the selected representations."""
+        planes: tuple[DBuffer, ...] = ()
+        if rowwise:
+            planes += (self.rowwise_data, self.rowwise_scale)
+        if columnwise:
+            planes += (self.columnwise_data, self.columnwise_scale)
+        return planes
 
     @property
     def is_symmetric_memory(self) -> bool:
@@ -268,11 +297,22 @@ class QuantizedDBuffer:
         )
 
     def redistribute(
-        self, new_placements: Iterable[Placement], *, out: "QuantizedDBuffer | None" = None
+        self,
+        new_placements: Iterable[Placement],
+        *,
+        out: "QuantizedDBuffer | None" = None,
+        rowwise: bool = True,
+        columnwise: bool = True,
     ) -> "QuantizedDBuffer":
-        """Redistribute every plane, returning ``out`` when supplied or a new wrapper."""
+        """Redistribute the selected planes, returning ``out`` or a new wrapper.
+
+        A new wrapper needs every plane, so selecting only some planes requires
+        ``out``. Unselected planes of ``out`` are left untouched.
+        """
         new_placements = tuple(new_placements)
         if out is None:
+            if not (rowwise and columnwise):
+                raise ValueError("redistribute() without `out` requires every plane.")
             return self._from_planes(
                 self.rowwise_data.redistribute(new_placements),
                 self.columnwise_data.redistribute(new_placements),
@@ -286,7 +326,10 @@ class QuantizedDBuffer:
                 "Expected out rowwise-data placements "
                 f"{new_placements!r}, got {out.rowwise_data.placements!r}."
             )
-        for plane, out_plane in zip(self.planes, out.planes):
+        for plane, out_plane in zip(
+            self.planes_for(rowwise=rowwise, columnwise=columnwise),
+            out.planes_for(rowwise=rowwise, columnwise=columnwise),
+        ):
             plane.redistribute(out_plane.placements, out=out_plane)
         return out
 
