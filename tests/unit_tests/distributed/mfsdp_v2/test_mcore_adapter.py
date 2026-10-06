@@ -327,24 +327,118 @@ class TestMcoreAdapterDense:
                 output.float(), torch.zeros_like(output, dtype=torch.float32)
             )
 
-        def run_backward():
-            # Retain the grad views so reduction includes the accumulation kernel.
-            model.zero_grad(set_to_none=False)
-            run_forward_backward_on_microbatches(
-                model, forward, delayed_wgrad_compute=model.module.backward_dw
-            )
-
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
+        # Warm up on the capture stream so autograd's gradient accumulators do not
+        # create cross-stream memory growth. See test_cuda_graph.py.
         with torch.cuda.stream(capture_stream):
             for _ in range(3):
-                run_backward()
+                # Retain the grad views so reduction includes the accumulation kernel.
+                model.zero_grad(set_to_none=False)
+                run_forward_backward_on_microbatches(
+                    model, forward, delayed_wgrad_compute=model.module.backward_dw
+                )
 
         # Ending capture rejects an unjoined reduction stream if finish_grad_sync
         # fails to wait for the reductions launched by backward_dw.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
-            run_backward()
+            model.zero_grad(set_to_none=False)
+            run_forward_backward_on_microbatches(
+                model, forward, delayed_wgrad_compute=model.module.backward_dw
+            )
+        torch.cuda.current_stream().wait_stream(capture_stream)
+
+        for _ in range(5):
+            graph.replay()
+
+    def test_delayed_wgrad_matches_immediate(self, distributed_setup):
+        """Delaying weight gradients preserves training losses with microbatch accumulation."""
+        num_microbatches = 3
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+
+        def build_layer(delay_wgrad_compute):
+            return te.Linear(
+                16,
+                16,
+                bias=False,
+                params_dtype=config.params_dtype,
+                device=distributed_setup.device,
+                delay_wgrad_compute=delay_wgrad_compute,
+                fuse_wgrad_accumulation=False,
+            )
+
+        immediate_layer = build_layer(delay_wgrad_compute=False)
+        delayed_layer = build_layer(delay_wgrad_compute=True)
+        delayed_layer.load_state_dict(immediate_layer.state_dict())
+        # Both runs see the same inputs, with distinct data on each rank and microbatch.
+        batches = [
+            [
+                torch.randn(4, 16, device=distributed_setup.device, dtype=config.params_dtype)
+                + distributed_setup.rank
+                for _ in range(num_microbatches)
+            ]
+            for _ in range(5)
+        ]
+
+        def train(layer, delayed_wgrad_compute=None):
+            model = FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=False,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                ),
+                module=layer,
+                pg_collection=self.pg_collection,
+            )
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(
+                    optimizer="adam",
+                    lr=1.0e-3,
+                    weight_decay=0.0,
+                    bf16=True,
+                    params_dtype=config.params_dtype,
+                    use_distributed_optimizer=False,
+                    use_precision_aware_optimizer=True,
+                    clip_grad=0.0,
+                ),
+                [model],
+            )
+            optimizer.reload_model_params()
+            losses = []
+            for microbatches in batches:
+                microbatch_iterator = iter(microbatches)
+
+                def forward():
+                    output = model(next(microbatch_iterator).detach().requires_grad_())
+                    return torch.nn.functional.mse_loss(
+                        output.float(), torch.zeros_like(output, dtype=torch.float32)
+                    )
+
+                optimizer.zero_grad()
+                microbatch_losses = run_forward_backward_on_microbatches(
+                    model,
+                    forward,
+                    num_microbatches=num_microbatches,
+                    loss_scale=1 / num_microbatches,
+                    delayed_wgrad_compute=delayed_wgrad_compute,
+                )
+                success, _, _ = optimizer.step()
+                assert success
+                losses.append(torch.stack(microbatch_losses).mean())
+            return torch.stack(losses)
+
+        immediate_losses = train(immediate_layer)
+        delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
+        torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
     def test_build_train_and_step(self):
         """Match eager training against an MFSDP v2 train-and-step sequence."""
