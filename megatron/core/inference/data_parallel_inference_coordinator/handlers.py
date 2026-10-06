@@ -168,9 +168,22 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     disagg_prompt = None
     if coordinator.disagg is not None:
         media_payload = msgpack.unpackb(media_frame, raw=False)
-        assert (
-            not media_meta and not media_payload
-        ), "native disaggregation does not support multimodal requests"
+        if media_meta or media_payload:
+            coordinator.router_socket.send_multipart(
+                [
+                    sender_identity,
+                    msgpack.packb(
+                        [
+                            Headers.REQUEST_ERROR.value,
+                            client_request_id,
+                            "native disaggregation does not support multimodal requests",
+                            True,
+                        ],
+                        use_bin_type=True,
+                    ),
+                ]
+            )
+            return
         disagg_prompt = msgpack.unpackb(prompt_frame, raw=False)
 
     # map client request_id to server request_id

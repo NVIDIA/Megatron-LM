@@ -73,7 +73,7 @@ def test_invalid_role_registration_replies_without_raising():
     assert Headers(reply[0]) == Headers.REQUEST_ERROR
 
 
-def test_native_disaggregation_asserts_on_multimodal_requests():
+def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator():
     coordinator = unittest.mock.MagicMock(
         known_clients={b"client"},
         next_request_id=0,
@@ -82,24 +82,36 @@ def test_native_disaggregation_asserts_on_multimodal_requests():
         client_request_to_request_id={},
     )
 
-    with pytest.raises(
-        AssertionError, match="native disaggregation does not support multimodal requests"
-    ):
-        HANDLERS[Headers.SUBMIT_REQUEST](
-            coordinator,
+    coordinator._handlers = HANDLERS
+    submissions = [
+        [
             b"client",
-            [Headers.SUBMIT_REQUEST.value, 7, {}, None],
-            [
-                msgpack.packb([1], use_bin_type=True),
-                msgpack.packb(None, use_bin_type=True),
-                msgpack.packb({"image": [b"image"]}, use_bin_type=True),
-                msgpack.packb(None, use_bin_type=True),
-            ],
-        )
+            msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, {}, None]),
+            msgpack.packb([1]),
+            msgpack.packb(None),
+            msgpack.packb(media),
+            msgpack.packb(None),
+        ]
+        for request_id, media in [(7, {"image": [b"image"]}), (8, None)]
+    ]
+    coordinator.router_socket.recv_multipart.side_effect = [
+        *submissions,
+        [b"client", msgpack.packb([Headers.SHUTDOWN.value])],
+    ]
 
-    coordinator.disagg.route_submit.assert_not_called()
-    assert coordinator.next_request_id == 0
-    assert not coordinator.request_id_to_client_id
+    DataParallelInferenceCoordinator.start(coordinator)
+
+    coordinator.disagg.route_submit.assert_called_once_with(0, [1], {})
+    assert coordinator.next_request_id == 1
+    assert coordinator.client_request_to_request_id == {(b"client", 8): 0}
+    destination, payload = coordinator.router_socket.send_multipart.call_args.args[0]
+    assert destination == b"client"
+    assert msgpack.unpackb(payload, raw=False) == [
+        Headers.REQUEST_ERROR.value,
+        7,
+        "native disaggregation does not support multimodal requests",
+        True,
+    ]
 
 
 class _StubCoordinator:
