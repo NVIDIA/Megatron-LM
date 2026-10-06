@@ -567,7 +567,7 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         out = q + kv.mean(dim=0) + attn_sink.view(1, -1, 1)
         return out, q.new_zeros(q.shape[:2]), None
 
-    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args):
+    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args, **_kwargs):
         d_kv = d_out.sum(dim=(0, 1)).unsqueeze(0).expand_as(kv) / kv.shape[0]
         return d_out.clone(), d_kv, d_out.sum(dim=(0, 2))
 
@@ -649,6 +649,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
+        deterministic_mode=False,
         num_layers=1,
         mtp_num_layers=0,
     )
@@ -777,9 +778,12 @@ def test_real_fused_sbhd_forward_backward_matches_native_reference(num_heads):
     query = torch.randn(seq, 1, num_heads, 512, device="cuda", dtype=torch.bfloat16) * 0.05
     kv = torch.randn(seq, 1, 512, device="cuda", dtype=torch.bfloat16) * 0.05
     sink = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
-    query_native = query.detach().clone().requires_grad_(True)
+    # Gather backward accumulates repeated-key contributions in the leaf dtype.
+    # Keep the reference leaves FP32 so BF16 indexed accumulation does not obscure
+    # fused-kernel errors; both paths still start from the same BF16 input values.
+    query_native = query.detach().clone().float().requires_grad_(True)
     query_fused = query.detach().clone().requires_grad_(True)
-    kv_native = kv.detach().clone().requires_grad_(True)
+    kv_native = kv.detach().clone().float().requires_grad_(True)
     kv_fused = kv.detach().clone().requires_grad_(True)
     sink_native = sink.detach().clone().requires_grad_(True)
     sink_fused = sink.detach().clone().requires_grad_(True)
