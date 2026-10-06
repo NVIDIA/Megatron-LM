@@ -93,10 +93,8 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            caller_managed_grad_sync: Disable the automatic autograd completion callback,
-                allowing delayed weight gradients or custom backward schedules. The caller must
-                call ``finish_grad_sync()`` after all backward work and before reading or
-                modifying gradients.
+            caller_managed_grad_sync: Leave gradient synchronization to the caller's
+                ``finish_grad_sync()`` while retaining automatic weight cleanup.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -210,8 +208,7 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this backward's gradient reductions."""
-        # No-input module hooks arrive in outer-to-inner order. Finish children
-        # first, and launch any newly ready reductions before joining the stream.
+        # No-input module hooks arrive in outer-to-inner order. Finish children first.
         while self._post_backward_callbacks:
             module, callback = self._post_backward_callbacks.pop()
             callback(module)
@@ -299,7 +296,6 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
-        self._needs_gradient_reduction = False
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
@@ -623,24 +619,14 @@ class FsdpModule:
         ):
             self.reshard()
         self.phase = FsdpModule.Phase.RESTING
-        self._reduce_gradient_groups()
         torch.cuda.nvtx.range_pop()
 
     def post_accumulate_grad(self) -> None:
-        """Record gradient completion independently of module backward completion."""
-        self._needs_gradient_reduction = True
-        self._reduce_gradient_groups()
-
-    def _reduce_gradient_groups(self) -> None:
-        """Launch a pending reduction once both completion events have arrived."""
-        # Avoid allocating the packed gradient buffer while full weights are
-        # still in use, preserving the existing memory bound.
-        if not self._needs_gradient_reduction or self.phase is FsdpModule.Phase.BACKWARD:
-            return
-        # Delayed wgrad may be the last consumer of the full parameter binding.
-        if self._unshard_event is not None:
-            self.reshard()
+        """Pack completed gradients and immediately launch their reductions."""
         self.context.validate_grad_sync()
+        # TE backward_dw() runs after autograd, using bindings retained by post_backward().
+        if self.phase is FsdpModule.Phase.RESTING and self._unshard_event is not None:
+            self.reshard()
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             reduce_scatter_stream = context.reduce_scatter_stream
@@ -661,7 +647,6 @@ class FsdpModule:
                     group.reduce_partial_gradients(
                         partial_grad, is_last_microbatch=self.context.is_last_microbatch
                     )
-        self._needs_gradient_reduction = False
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

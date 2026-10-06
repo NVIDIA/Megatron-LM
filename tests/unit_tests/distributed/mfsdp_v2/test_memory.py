@@ -167,15 +167,20 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     torch.cuda.reset_peak_memory_stats(device)
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
+    logger.info(
+        "Training-step peak above resting memory: rank=%s, unified_stream=%s, peak=%s",
+        rank,
+        unify_communication_stream,
+        _mb(peak_delta),
+    )
 
-    # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input.
-    # With separate streams, their allocation cannot reuse the released full-weight
-    # storage, for a four-buffer peak. With a unified stream, the release precedes the
-    # allocation on that stream, reducing the peak to three. The slack on top covers
+    # Backward keeps the current child and one prefetched child unsharded. Gradient
+    # readiness can precede module completion, so the full wgrad and packed reduce-scatter
+    # input may also coexist before resharding. Both stream configurations therefore
+    # allow four full buffers. The slack on top covers
     # allocator granularity and small temporaries, measured at ~169 KiB.
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    full_buffer_bound = 3 if unify_communication_stream else 4
+    full_buffer_bound = 4
     bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (
