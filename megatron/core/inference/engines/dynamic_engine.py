@@ -60,6 +60,7 @@ from megatron.core.inference.inference_request import (
     resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import get_mtp_model
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
     DynamicBatchControllerStepResult,
@@ -1021,7 +1022,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        unwrapped = get_mtp_model(unwrap_model(controller.inference_wrapped_model.model))
         mtp_warmup_enabled = (
             controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0
