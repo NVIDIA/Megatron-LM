@@ -178,7 +178,7 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-cudnn-frontend==1.29.0",  # for TE
+    "nvidia-cudnn-frontend>=1.29.0",  # for TE
     "nvidia-mathdx",                  # for TE
 ]
 linting = [
@@ -242,7 +242,7 @@ requires-dist = [
     "onnxscript",
     "onnx",
     "nvdlfw-inspect",
-    "nvidia-cudnn-frontend==1.29.0",
+    "nvidia-cudnn-frontend>=1.29.0",
 ]
 
 [[tool.uv.dependency-metadata]]
