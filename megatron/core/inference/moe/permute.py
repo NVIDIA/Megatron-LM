@@ -284,8 +284,8 @@ def _permute_tokens_kernel(
                     o = h + tl.arange(0, BLOCK_H)
                     m = o < hidden_dim
                     tl.store(
-                        out_hidden_ptr + pos * hidden_dim + o,
-                        tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
+                        out_hidden_ptr + pos.to(tl.int64) * hidden_dim + o,
+                        tl.load(hidden_ptr + tok.to(tl.int64) * hidden_dim + o, mask=m),
                         mask=m,
                     )
                 tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
@@ -293,6 +293,30 @@ def _permute_tokens_kernel(
                 tl.store(out_src_idx_ptr + pos, tok)
                 if HAS_INVERSE:
                     tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
+
+
+@triton.jit
+def _zero_permutation_padding_kernel(
+    hidden_ptr,
+    permutation_map_ptr,
+    n_used_ptr,
+    hidden_dim,
+    max_rows,
+    BLOCK_H: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """Zero aligned padding rows without touching the unused buffer suffix."""
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(permutation_map_ptr + row) < 0:
+                for h in tl.range(0, hidden_dim, BLOCK_H):
+                    offsets = h + tl.arange(0, BLOCK_H)
+                    mask = offsets < hidden_dim
+                    tl.store(hidden_ptr + row.to(tl.int64) * hidden_dim + offsets, 0.0, mask=mask)
 
 
 def permute_tokens(
@@ -305,6 +329,7 @@ def permute_tokens(
     alignment: int = 1,
     return_batch_invariant_inverse_map: bool = False,
     row_alignment: int = 1,
+    zero_padding: bool = False,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -324,6 +349,9 @@ def permute_tokens(
         return_batch_invariant_inverse_map: if True, also return the map used by
             batch-invariant unpermute.
         row_alignment: alignment for the fixed output-buffer row count (default 1).
+        zero_padding: explicitly zero alignment-padding rows inside the used prefix.
+            Rows beyond the used prefix remain undefined. This is required by grouped
+            GEMM backends that consume padding values rather than masking them.
 
     Returns:
         By default, returns the original 4-tuple:
@@ -401,6 +429,17 @@ def permute_tokens(
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
     )
+    if zero_padding:
+        zero_blocks = min(output_size, 512)
+        _zero_permutation_padding_kernel[(zero_blocks,)](
+            permuted_hidden,
+            permutation_map,
+            inclusive_expert_offsets[-1:],
+            hidden_dim,
+            output_size,
+            BLOCK_H=BLOCK_H,
+            NUM_BLOCKS=zero_blocks,
+        )
     if return_batch_invariant_inverse_map:
         return (
             permuted_hidden,
@@ -436,7 +475,7 @@ def _zero_output_rows_kernel(
             for h in tl.range(0, hidden_dim, BLOCK_H):
                 o = h + tl.arange(0, BLOCK_H)
                 m = o < hidden_dim
-                tl.store(output_ptr + row * hidden_dim + o, zero, mask=m)
+                tl.store(output_ptr + row.to(tl.int64) * hidden_dim + o, zero, mask=m)
 
 
 @triton.jit
@@ -472,8 +511,14 @@ def _unpermute_tokens_kernel(
                     offsets = h + tl.arange(0, BLOCK_H)
                     m = offsets < hidden_dim
                     # Upcast bf16 expert output to fp32 before multiply + accumulate
-                    v = tl.load(expert_out_ptr + row * hidden_dim + offsets, mask=m).to(tl.float32)
-                    tl.atomic_add(output_ptr + source_idx * hidden_dim + offsets, v * prob, mask=m)
+                    v = tl.load(
+                        expert_out_ptr + row.to(tl.int64) * hidden_dim + offsets, mask=m
+                    ).to(tl.float32)
+                    tl.atomic_add(
+                        output_ptr + source_idx.to(tl.int64) * hidden_dim + offsets,
+                        v * prob,
+                        mask=m,
+                    )
 
 
 def unpermute_tokens(
@@ -556,6 +601,7 @@ def _permute_quantize_mxfp8_kernel(
     out_scale_ptr,
     out_probs_ptr,
     out_src_idx_ptr,
+    inverse_map_ptr,
     counters_ptr,
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     K,
@@ -568,6 +614,7 @@ def _permute_quantize_mxfp8_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    HAS_INVERSE: tl.constexpr,
 ):
     """Fused permute + MXFP8 quantize + swizzle in one kernel.
 
@@ -593,7 +640,9 @@ def _permute_quantize_mxfp8_kernel(
                 # Load full row from source token
                 offs = tl.arange(0, BLOCK_K)
                 mask = offs < K
-                x = tl.load(hidden_ptr + tok * K + offs, mask=mask, other=0.0).to(tl.float32)
+                x = tl.load(hidden_ptr + tok.to(tl.int64) * K + offs, mask=mask, other=0.0).to(
+                    tl.float32
+                )
 
                 # Per-group-of-32 quantization
                 x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
@@ -610,14 +659,14 @@ def _permute_quantize_mxfp8_kernel(
                 out_fp8 = quantized_flat.to(tl.float8e4nv)
 
                 # Store FP8 data at permuted position
-                tl.store(out_fp8_ptr + pos * K + offs, out_fp8, mask=mask)
+                tl.store(out_fp8_ptr + pos.to(tl.int64) * K + offs, out_fp8, mask=mask)
 
                 # Store swizzled scales at permuted position
                 scale_exp = (dequant_exp >> 23).to(tl.uint8)
                 col_offs = tl.arange(0, BLOCK_GROUPS)
                 col_mask = col_offs < REAL_GROUPS
 
-                macro_row_block = pos // 128
+                macro_row_block = pos.to(tl.int64) // 128
                 macro_col_block = col_offs // 4
                 local_row = pos % 128
                 local_col = col_offs % 4
@@ -631,6 +680,8 @@ def _permute_quantize_mxfp8_kernel(
                 # Store prob and source index
                 tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
                 tl.store(out_src_idx_ptr + pos, tok)
+                if HAS_INVERSE:
+                    tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
 
 
 def permute_and_quantize_mxfp8(
@@ -641,6 +692,8 @@ def permute_and_quantize_mxfp8(
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     alignment: int = 128,
+    return_batch_invariant_inverse_map: bool = False,
+    zero_padding: bool = False,
 ) -> tuple:
     """Fused permute + MXFP8 quantize + swizzle.
 
@@ -658,13 +711,22 @@ def permute_and_quantize_mxfp8(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens this
             iteration. Fixed address; value updated each step before graph replay.
         alignment: per-expert token alignment (default 128, required for MXFP8 swizzle).
+        return_batch_invariant_inverse_map: if True, append the map used by
+            batch-invariant unpermute to the returned tuple.
+        zero_padding: initialize alignment-padding rows to MXFP8 zero. This is required
+            by grouped GEMM backends that consume padding values rather than masking them.
 
     Returns:
-        (permuted_mxfp8, permuted_probs, permutation_map, inclusive_offsets)
+        By default, returns the original 4-tuple:
+        (permuted_mxfp8, permuted_probs, permutation_map, inclusive_offsets).
+        If return_batch_invariant_inverse_map=True, appends the inverse map as a
+        fifth return value.
         - permuted_mxfp8: MXFP8Tensor with .data [output_size, K] and .scale (swizzled)
         - permuted_probs: [output_size] routing probs
         - permutation_map: [output_size] int32, original token index or -1 for padding
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for scaled_grouped_mm
+        - inverse map: [max_tokens, num_local_experts] int32 map from token/local-expert
+          to permuted row, only present when requested.
     """
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -695,16 +757,31 @@ def permute_and_quantize_mxfp8(
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
-    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
+    if zero_padding:
+        out_fp8 = torch.zeros(
+            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device
+        )
+    else:
+        out_fp8 = torch.empty(
+            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device
+        )
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)
     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
     permutation_map = torch.empty(output_size, dtype=torch.int32, device=probs.device)
+    batch_invariant_inverse_map = None
+    if return_batch_invariant_inverse_map:
+        batch_invariant_inverse_map = torch.full(
+            (max_tokens, num_local_experts), -1, dtype=torch.int32, device=probs.device
+        )
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
 
     BLOCK_K = triton.next_power_of_2(K)
     BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
+    inverse_map_ptr = (
+        batch_invariant_inverse_map if batch_invariant_inverse_map is not None else permutation_map
+    )
     _permute_quantize_mxfp8_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
@@ -713,6 +790,7 @@ def permute_and_quantize_mxfp8(
         out_scale,
         permuted_probs,
         permutation_map,
+        inverse_map_ptr,
         exclusive_expert_offsets,
         valid_tokens,
         K,
@@ -725,6 +803,7 @@ def permute_and_quantize_mxfp8(
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
         NUM_BLOCKS=NUM_BLOCKS,
+        HAS_INVERSE=batch_invariant_inverse_map is not None,
     )
 
     permuted_mxfp8 = MXFP8Tensor(
@@ -733,4 +812,12 @@ def permute_and_quantize_mxfp8(
         dtype=hidden_states.dtype,
         backend="triton",
     )
+    if return_batch_invariant_inverse_map:
+        return (
+            permuted_mxfp8,
+            permuted_probs,
+            permutation_map,
+            inclusive_expert_offsets,
+            batch_invariant_inverse_map,
+        )
     return permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets

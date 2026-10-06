@@ -51,6 +51,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
+from megatron.training.global_vars import get_run_config
 
 
 def _compute_norm_2(params_list):
@@ -87,6 +88,7 @@ def calc_params_l2_norm(
     *,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
     return_squared_tensor=False,
+    trainable_only=False,
 ):
     """Calculate the parameter L2 norm using global, single-model, or multi-module groups."""
     if not isinstance(model, list):
@@ -109,6 +111,8 @@ def calc_params_l2_norm(
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
+                if trainable_only and not param.requires_grad:
+                    continue
                 if not hasattr(param, "_local_tensor"):
                     raise RuntimeError(
                         f"Megatron FSDP requires parameters are PyTorch DTensor. "
@@ -156,6 +160,9 @@ def calc_params_l2_norm(
 
     for model_chunk in model:
         for param in model_chunk.parameters():
+            if trainable_only and not param.requires_grad:
+                continue
+
             is_gtp = getattr(param, 'is_gtp_weight_remat', False)
 
             # Filter TP duplicates. GTP_remat params are always unique across TP ranks
@@ -276,11 +283,20 @@ def _calc_mimo_params_l2_norm(
         if name not in pg_collection.keys():
             continue
 
+        module_chunks_on_rank = [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks]
+        # With PP > 1, all stages must enter the module collectives even if one stage
+        # owns no trainable parameters. A PP=1 module can be skipped locally.
+        if pg_collection[name].pp.size() == 1 and not any(
+            param.requires_grad for module in module_chunks_on_rank for param in module.parameters()
+        ):
+            continue
+
         module_norm_sq = calc_params_l2_norm(
-            [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks],
+            module_chunks_on_rank,
             force_create_fp32_copy,
             pg_collection=pg_collection[name],
             return_squared_tensor=True,
+            trainable_only=True,
         )
         norm_sq[index].copy_(module_norm_sq.reshape(()))
 
@@ -394,14 +410,14 @@ def report_memory(name, process_group=None):
     process_group: optional data-parallel group to gate the rank-0 print on; None falls back
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
-    args = get_args()
+    cfg = get_run_config()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used:
+    if cfg.logger.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     is_dp_rank_0 = (
         get_pg_rank(process_group) == 0

@@ -51,7 +51,7 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase as _DynamicInferenceEngineTestBase,
 )
-from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -1450,8 +1450,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
-            for record in result["finished_request_records"]:
-                request = record.merge()
+            for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
                 if request.request_id == 1 and any(
                     other.request_id != 1 and other.status not in (Status.COMPLETED, Status.FAILED)
@@ -1943,7 +1942,7 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        _set_rounder(64)
+        _reset_rounder()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("scenario", _ASYNC_PAIR_SCENARIOS, ids=lambda case: case.name)
@@ -2011,7 +2010,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             gc.collect()
             delete_cuda_graphs()
             torch.cuda.empty_cache()
-            _set_rounder(64)
+            _reset_rounder()
             Utils.destroy_model_parallel()
 
 
