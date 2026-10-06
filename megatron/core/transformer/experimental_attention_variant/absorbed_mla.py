@@ -12,6 +12,7 @@ The absorption is mathematically equivalent to standard MLA but enables MQA-styl
 can be more efficient for certain attention variants.
 """
 
+import copy
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -243,18 +244,26 @@ class AbsorbedMLASelfAttention(Attention):
         )
 
         # Output.
+        linear_proj_config = self.config
+        linear_proj_buffer = "proj"
+        if self.config.mla_proj_disable_quantization:
+            # FP8 userbuffers are not registered for this BF16/FP32 projection.  Build the
+            # layer with overlap disabled rather than passing a stale ``proj`` buffer name.
+            linear_proj_config = copy.copy(self.config)
+            linear_proj_config.tp_comm_overlap = False
+            linear_proj_buffer = None
         with self._mla_projection_context(is_init=True):
             self.linear_proj = build_module(
                 submodules.linear_proj,
                 self.query_projection_size,
                 self.config.hidden_size,
-                config=self.config,
+                config=linear_proj_config,
                 init_method=self.config.output_layer_init_method,
                 bias=self.config.add_bias_linear,
                 input_is_parallel=True,
                 skip_bias_add=True,
                 is_expert=False,
-                tp_comm_buffer_name='proj',
+                tp_comm_buffer_name=linear_proj_buffer,
                 tp_group=self.pg_collection.tp,
                 name=(name + ".linear_proj") if name is not None else None,
             )

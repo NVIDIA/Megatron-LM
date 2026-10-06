@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -14,6 +16,30 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     generate_varlen_mask_params_for_positions,
 )
+
+try:
+    from fast_hadamard_transform import hadamard_transform
+
+    HAVE_HADAMARD = True
+except ImportError:
+    hadamard_transform = None
+    HAVE_HADAMARD = False
+
+
+def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    return x * scale
+
+
+@pytest.fixture(autouse=True)
+def patch_hadamard_if_needed():
+    if not HAVE_HADAMARD:
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform",
+            _mock_hadamard_transform,
+        ):
+            yield
+    else:
+        yield
 
 
 @pytest.mark.parametrize("lengths", [(8,), (7,), (3,), (3, 6), (5, 9, 3)])
@@ -112,7 +138,60 @@ def test_kpool_explicit_mask_tail_uses_global_query_positions():
     torch.testing.assert_close(
         indices[0, 2], torch.arange(7, device="cuda", dtype=indices.dtype), rtol=0, atol=0
     )
-    assert not torch.any(indices == 7)
+    assert not torch.any(indices[0, :3] == 7)
+
+
+@pytest.mark.parametrize("valid_range", [(1, 6), (2, 9), (5, 9)])
+def test_kpool_explicit_mask_tail_handles_non_aligned_left_padding(valid_range):
+    start, end = valid_range
+    q = torch.randn(1, 1, 1, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(9, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    mask = torch.full((1, 9), float("-inf"), device="cuda")
+    mask[:, start:end] = 0
+
+    _, indices = fused_qk_topk_kpool(
+        q,
+        k,
+        weights,
+        index_topk=8,
+        pool_size=4,
+        gate_score=torch.zeros_like(k),
+        ape=torch.zeros(4, 8, device="cuda"),
+        mask=mask,
+        always_select_tail=True,
+        rotate_activation_enabled=False,
+    )
+    selected = indices[0, 0]
+    selected = selected[selected >= 0]
+    expected = torch.arange(start, end, device="cuda", dtype=selected.dtype)
+    torch.testing.assert_close(selected.sort().values, expected, rtol=0, atol=0)
+
+
+def test_kpool_explicit_batched_mask_tail_handles_non_aligned_left_padding():
+    q = torch.randn(1, 2, 1, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(9, 2, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(1, 2, 1, device="cuda", dtype=torch.bfloat16)
+    mask = torch.full((2, 1, 9), float("-inf"), device="cuda")
+    mask[0, 0, 2:9] = 0
+    mask[1, 0, 5:9] = 0
+
+    _, indices = fused_qk_topk_kpool(
+        q,
+        k,
+        weights,
+        index_topk=8,
+        pool_size=4,
+        gate_score=torch.zeros_like(k),
+        ape=torch.zeros(4, 8, device="cuda"),
+        mask=mask,
+        always_select_tail=True,
+        rotate_activation_enabled=False,
+    )
+    for row, (start, end) in zip(indices[:, 0], ((2, 9), (5, 9))):
+        selected = row[row >= 0]
+        expected = torch.arange(start, end, device="cuda", dtype=selected.dtype)
+        torch.testing.assert_close(selected.sort().values, expected, rtol=0, atol=0)
 
 
 def test_kpool_explicit_batched_mask_filters_invalid_tokens():
