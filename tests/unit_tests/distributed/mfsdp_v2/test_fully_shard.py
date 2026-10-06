@@ -1268,7 +1268,7 @@ def test_no_input_gradients_preserve_saved_weights(distributed_setup, frozen):
     assert model.phase is FsdpModule.Phase.RESTING
 
 
-def test_shared_units_reshard_before_grads_ready(distributed_setup):
+def test_shared_units_reshard_before_post_accumulate_grad(distributed_setup):
     """Repeated invocations release weights independently of shared gradient accumulation."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))

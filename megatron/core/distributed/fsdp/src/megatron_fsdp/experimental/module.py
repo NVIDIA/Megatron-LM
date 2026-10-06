@@ -401,7 +401,7 @@ class FsdpModule:
             module.post_backward(retain_weights=has_delayed_wgrad)
 
         self.register_post_backward_hook(post_backward_hook)
-        self.register_grads_ready_hook(FsdpModule.grads_ready)
+        self.register_post_accumulate_grad_hook(FsdpModule.post_accumulate_grad)
 
     def register_post_backward_hook(
         self, post_backward_hook: Callable[["FsdpModule"], None]
@@ -428,7 +428,9 @@ class FsdpModule:
 
         cast(nn.Module, self).register_full_backward_hook(grad_checking_post_backward_hook)
 
-    def register_grads_ready_hook(self, grads_ready_hook: Callable[["FsdpModule"], None]) -> None:
+    def register_post_accumulate_grad_hook(
+        self, post_accumulate_grad_hook: Callable[["FsdpModule"], None]
+    ) -> None:
         """Register completion of owned gradients via parameter or delayed TE hooks."""
         module = cast(nn.Module, self)
         module_ref = ref(self)
@@ -438,7 +440,7 @@ class FsdpModule:
             if module is None:
                 return
             if module._trainable_parameter_countdown.decrement():
-                grads_ready_hook(module)
+                post_accumulate_grad_hook(module)
 
         for group in self._parameter_groups:
             if not group.requires_grad:
@@ -634,7 +636,7 @@ class FsdpModule:
         self._reduce_ready_gradients()
         torch.cuda.nvtx.range_pop()
 
-    def grads_ready(self) -> None:
+    def post_accumulate_grad(self) -> None:
         """Record gradient completion independently of module backward completion."""
         self._needs_gradient_reduction = True
         self._reduce_ready_gradients()
