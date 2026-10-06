@@ -39,12 +39,14 @@ from packaging.version import Version
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     GraphWgradRingSlot,
     allocate_graph_wgrad_rings,
+    allocate_wgrad_ring,
     clear_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
     register_capture_wgrad_finalize,
     register_capture_wgrad_ring_slot,
+    wgrad_ring_key,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     is_gtp_symm_pool_registered,
@@ -331,23 +333,31 @@ class _EagerWgradRingSlot(GraphWgradRingSlot):
         self.ready_event.wait()
 
 
-_EAGER_WGRAD_RINGS: dict[tuple, _EagerWgradRingSlot] = {}
+_EAGER_WGRAD_RINGS: dict[tuple, list[_EagerWgradRingSlot]] = {}
 
 
 def _bind_eager_wgrad_ring_slot(param) -> _EagerWgradRingSlot:
-    """Keep eager storage separate from the CUDA-graph allocator and its ring keys."""
-    # Grouped cache domains keep FC1/FC2 separate and alternate layers between two
-    # slots. Include the logical shape so another parameter cannot dirty our padding.
-    key = (
-        param._get_cache_key(param.main_grad.dtype, fwd=False, reduce_scatter=False),
-        param._unsharded_shape,
-    )
-    slot = _EAGER_WGRAD_RINGS.get(key)
-    if slot is None:
-        slot = _EAGER_WGRAD_RINGS[key] = _EagerWgradRingSlot.allocate(param, key=key)
-        slot.ready_event.record()
-    param._gtp_eager_wgrad_ring_slot = slot
-    return slot
+    """Initialize a domain's registered writers together on its first persistent request."""
+    ring_size = GTP_CONFIG.eager_wgrad_ring_size
+    if ring_size < 1:
+        raise ValueError("GTP_CONFIG.eager_wgrad_ring_size must be at least 1")
+    key = wgrad_ring_key(param, _stream_key)
+    if key not in _EAGER_WGRAD_RINGS:
+        matching_params = [
+            weight
+            for weight in _GTP_PARAMS
+            if weight.requires_grad
+            and weight.chain_id == param.chain_id
+            and wgrad_ring_key(weight, _stream_key) == key
+        ]
+        if not any(weight is param for weight in matching_params):
+            raise RuntimeError("Persistent eager wgrad writers must be registered in _GTP_PARAMS")
+        slots = _EAGER_WGRAD_RINGS[key] = allocate_wgrad_ring(
+            matching_params, key=key, ring_size=ring_size, slot_type=_EagerWgradRingSlot
+        )
+        for param_index, weight in enumerate(matching_params):
+            weight._gtp_eager_wgrad_ring_slot = slots[param_index % len(slots)]
+    return param._gtp_eager_wgrad_ring_slot
 
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
@@ -521,11 +531,12 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
-    # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
-    # same-key writers may need more slots to keep all in-flight RS inputs distinct.
+    # Persistent slots per scheduling/shape domain. Two slots cover the usual case of one same-key
+    # writer per graph. A graph containing multiple same-key writers may need more slots to keep
+    # all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
+    eager_wgrad_ring_size: int = 2
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -1985,7 +1996,7 @@ class GTPShardedParam(torch.nn.Parameter):
     def get_wgrad_tensor(self, *, persistent: bool = False):
         """Return writable logical-shape scratch; ``persistent`` keeps eager pointers fixed.
 
-        Persistent buffers share the gather cache's bounded scheduling domains and wait for
+        Persistent buffers use bounded rings within each scheduling/shape domain and wait for
         their previous reduce-scatter reader before reuse. Ordinary callers retain pooled scratch.
         """
         ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)

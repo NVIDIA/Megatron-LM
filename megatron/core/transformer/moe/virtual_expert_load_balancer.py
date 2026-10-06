@@ -257,11 +257,15 @@ class _VirtualExpertStorage:
         return tuple(self._runtime_parameter(w, g) for w, g in zip(weights, grads))
 
     def clear_accumulating_grads(self) -> None:
-        """Zero virtual partials for FC layers that accumulate directly into DDP buffers.
+        """Zero non-GTP virtual-expert gradient slots before the expert backward GEMMs.
 
-        TE uses the first native's accumulate flag for the whole grouped GEMM, but virtual
-        slots have no optimizer history. Call on compute before the next expert backward,
-        after the previous layer's input backward has finished all reads of these slots.
+        TE applies the native weights' gradient accumulation mode to the virtual slots too.
+        These shared slots must start from zero for each backward so stale gradients from
+        a previous use are not added to the new contribution.
+
+        The caller must ensure the previous reduction has finished reading the shared arena
+        before clearing it. The current backward schedule supplies this dependency through
+        the previous layer's input-backward hook; this method does not insert a wait itself.
         """
         gtp = self.config.gtp
         if not any(gtp):
@@ -856,7 +860,7 @@ class VirtualExpertLoadBalancer:
         """Attach the backward weight-push wait before transport combine."""
         return _VirtualExpertHook.apply(hidden_states, self._prepare_expert_backward, ())
 
-    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
         """Close the forward; the layer output's backward hook hands the plan back for its
         backward and starts the backward weight push."""
         plan, self._plan = self._plan, None

@@ -302,11 +302,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="virtual_expert_planner",
         sources=("megatron/core/transformer/moe/virtual_expert_triton.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+            K + "test_virtual_expert_allocator.py",
+        ),
         kind="triton",
         notes="Route planning agrees with an independent CPU oracle for EP=1/2/4/8, skew/ties, "
         "empty and strided inputs. Cached shapes and alignments replay bit-exactly with changing "
-        "routes in CUDA graphs.",
+        "routes in CUDA graphs. Production barrier timeouts cover both peer handshake phases "
+        "and missing grid participants; delayed peers complete in eager and graph replay. "
+        "Transport replay checks BF16/MXFP8 weights and FP32/BF16 gradients with scoped allocators.",
     ),
     KernelEntry(
         name="moe_utils",
@@ -319,8 +325,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_router",
         sources=("megatron/core/transformer/moe/router.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+        ),
         kind="torch.compile",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",

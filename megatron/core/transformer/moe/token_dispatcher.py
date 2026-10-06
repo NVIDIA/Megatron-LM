@@ -1012,7 +1012,7 @@ class _DispatchManager(ABC):
         """Return the layer input unchanged."""
         return hidden_states
 
-    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
         """Return the layer output unchanged."""
         return output
 
@@ -1224,6 +1224,8 @@ class _HybridEPManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        *,
+        rank_capacity: Optional[int] = None,
     ) -> torch.Tensor:
         # HybridEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
@@ -1232,6 +1234,13 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
+        # MoonEP supplies its planner-derived budget; ordinary HybridEP uses setup_metadata's
+        # factor-derived budget. Read the factor each call because overflow retries clear it.
+        has_rank_capacity = (
+            rank_capacity is not None or self.moe_expert_rank_capacity_factor is not None
+        )
+        if rank_capacity is not None:
+            self.num_permuted_tokens = rank_capacity
         align_size = get_align_size_for_quantization(self.config)
         if align_size > 0:
             self.pad_multiple = align_size
@@ -1259,19 +1268,18 @@ class _HybridEPManager(_DispatchManager):
                 num_of_experts=self.num_experts,
             )
         )
-        if self.moe_expert_rank_capacity_factor is not None:
+        if has_rank_capacity:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
-            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
+            # dropped because the receive count exceeded num_permuted_tokens.
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
-        # When capacity factor is None, skip overflow tracking (no token drops). Actual
-        # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
+        # Dynamic dispatch resolves the permuted size from tokens_per_expert.sum().
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.moe_expert_rank_capacity_factor is not None:
+        if has_rank_capacity:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
@@ -1321,10 +1329,11 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
     """Glue virtual-expert load balancing onto the HybridEP transport."""
 
     def __init__(self, group, num_local_experts: int, num_experts: int, config, router_topk=None):
+        router_topk = router_topk if router_topk is not None else config.moe_router_topk
         self.initialize_virtual_expert_load_balancer(
             group=group,
             num_local_experts=num_local_experts,
-            router_topk=config.moe_router_topk,
+            router_topk=router_topk,
             num_experts=num_experts,
             config=config,
         )
@@ -1334,23 +1343,22 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_local_experts=self.num_runtime_experts,
             num_experts=self.ep_size * self.num_runtime_experts,
             config=config,
+            router_topk=router_topk,
         )
-        # MoonEP owns its dropless route budget, but HybridEP still needs static-capacity mode.
-        self.moe_expert_rank_capacity_factor = 1.0
         assert (
             self.dense_routing_supported
         ), "Virtual experts require HybridEP's dense top-k routing API for runtime experts."
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor, padding_mask=None):
-        """Adapt upstream routing metadata to the planner and start the weight push."""
-        if routing_map.dtype == torch.bool:
-            # Unfused, hash and quantile routers return a bool map. Select its routes,
-            # including selected experts whose probability is zero.
-            top_indices = routing_map.to(torch.int8).topk(self.router_topk, dim=-1).indices
-        else:
-            # Upstream fused HybridEP routing returns int16 expert IDs.
-            top_indices = routing_map.long()
-        probs = probs.gather(1, top_indices)
+        """Consume compact router metadata and start the planner and weight push."""
+        if (
+            routing_map.dtype not in (torch.int16, torch.int32, torch.int64)
+            or routing_map.ndim != 2
+            or routing_map.shape[1] != self.router_topk
+            or probs.shape != routing_map.shape
+        ):
+            raise ValueError("MoonEP requires expert IDs and probabilities shaped [tokens, topk].")
+        top_indices = routing_map.long()
         # ``token_probs`` holds the router's probabilities until dispatch, where the dispatcher's
         # preprocessing returns them; HybridEP's ``setup_metadata`` then replaces them with the
         # dense runtime probabilities it transports (a CUDA-graph attribute, so one field).
@@ -1373,12 +1381,12 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
         ).scatter(1, runtime_experts.long(), self.token_probs)
         super().setup_metadata(runtime_experts, runtime_probs)
 
-        # Capacity bounds balanced blocks, including each logical expert's final partial block.
-        self.num_permuted_tokens = self.rank_capacity
         return super().dispatch(
             hidden_states,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
+            # Capacity includes each logical expert's final partial alignment block.
+            rank_capacity=self.rank_capacity,
         )
 
     def combine(
@@ -2079,7 +2087,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
         """Attach virtual-expert backward work to the MoE layer output when enabled."""
-        return self._comm_manager.finalize_output(output)
+        return self._comm_manager.finalize_layer_output(output)
 
     def get_expert_zero_copy_buffers(self):
         """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the

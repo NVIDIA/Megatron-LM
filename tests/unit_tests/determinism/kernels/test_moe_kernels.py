@@ -455,15 +455,22 @@ def _routing(num_tokens=NUM_TOKENS, num_experts=NUM_EXPERTS, topk=TOPK):
     return routing_map, probs
 
 
-@pytest.mark.parametrize("index_format", [False, True], ids=["bool-map", "indices"])
-def test_virtual_expert_routing_adapter_replay(index_format):
-    """Selected routes and probability gradients replay exactly under stream contention."""
+@pytest.mark.parametrize("dtype", [torch.int16, torch.int64])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_virtual_expert_routing_adapter_replay(dtype, compiled):
+    """Compact router outputs retain their pairing, zero scores, padding and gradients."""
     Utils.initialize_distributed()
     seeded()
-    routing_map, probs = _routing(num_tokens=257, num_experts=512, topk=10)
-    probs[0].zero_()  # Selected zero-probability routes must survive the conversion.
-    if index_format:
-        routing_map = routing_map.to(torch.int8).topk(10, dim=-1).indices.to(torch.int16)
+    _, full_probs = _routing(num_tokens=258, num_experts=512, topk=10)
+    ids = full_probs.topk(10, dim=1).indices
+    probs = full_probs.gather(1, ids)
+    probs[0].zero_()
+    # Exercise noncontiguous IDs and scores without changing selected-route order.
+    ids = ids.to(dtype).t().contiguous().t()
+    probs = probs.t().contiguous().t().requires_grad_()
+    padding_mask = torch.zeros((2, 129), dtype=torch.bool, device="cuda")
+    padding_mask[0, 3::7] = True
+    flat_padding = padding_mask.t().reshape(-1)
     manager = object.__new__(_VirtualExpertHybridEPManager)
     manager.router_topk = 10
     planned = []
@@ -471,16 +478,38 @@ def test_virtual_expert_routing_adapter_replay(index_format):
 
     def adapt(probs):
         planned.clear()
-        manager.setup_metadata(routing_map, probs)
+        manager.setup_metadata(ids, probs, padding_mask)
         return planned[0], manager.token_probs
 
+    if compiled:
+        adapt = torch.compile(adapt)
+    indices, selected_probs = adapt(probs)
+    torch.testing.assert_close(indices, ids.long(), rtol=0, atol=0)
+    expected_probs = probs.masked_fill(flat_padding[:, None], 0)
+    torch.testing.assert_close(selected_probs, expected_probs, rtol=0, atol=0)
+    (gradient,) = torch.autograd.grad(selected_probs.sum(), probs)
+    expected_gradient = torch.ones_like(probs).masked_fill(flat_padding[:, None], 0)
+    torch.testing.assert_close(gradient, expected_gradient, rtol=0, atol=0)
     assert_replays_bit_exact(
         adapt,
-        (probs.requires_grad_(),),
+        (probs,),
         replays=3,
         contention=True,
-        what=f"virtual-expert routing adapter[index_format={index_format}]",
+        what=f"virtual-expert routing adapter[{dtype=}, {compiled=}]",
     )
+
+
+@pytest.mark.parametrize("invalid", ["bool-map", "wrong-topk", "full-width-probs"])
+def test_virtual_expert_routing_adapter_rejects_invalid_layout(invalid):
+    """Reject incompatible router metadata before starting the planner."""
+    manager = object.__new__(_VirtualExpertHybridEPManager)
+    manager.router_topk = 2
+    ids = torch.zeros((3, 1 if invalid == "wrong-topk" else 2), dtype=torch.int64)
+    if invalid == "bool-map":
+        ids = ids.bool()
+    probs = torch.zeros((3, 4)) if invalid == "full-width-probs" else torch.zeros_like(ids).float()
+    with pytest.raises(ValueError, match="expert IDs and probabilities"):
+        manager.setup_metadata(ids, probs)
 
 
 # --- permute / unpermute --------------------------------------------------------------------
