@@ -744,7 +744,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         ddp=ddp_config,
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
@@ -794,12 +794,14 @@ def inference_cfg_container_from_args(
             model_cfg = gpt_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+    # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.
+    # Preserve canonical config values or defaults when an alias is absent.
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        if hasattr(args, f"no_{name}"):
+            ckpt_kwargs[name] = not getattr(args, f"no_{name}")
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        if hasattr(args, f"ckpt_{name}"):
+            ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
 
     cfg = InferenceConfigContainer(
         model=model_cfg,
@@ -808,7 +810,7 @@ def inference_cfg_container_from_args(
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )
 
