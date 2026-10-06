@@ -172,8 +172,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Count zero gradient entries from each gradient's recorded layout.
 
         Plain local tensors do not describe dense/expert meshes or replication.
-        Use the owning buffer's metadata, as in ``get_grad_norm``: each rank contributes its own shard,
-        divided by the size of any replicated mesh axis, summed over the grad-stats group.
+        Use the owning buffer's metadata, as in ``get_grad_norm``: each rank contributes
+        its own shard, divided by the size of any replicated mesh axis, summed over the
+        grad-stats group.
         """
         total_zeros = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
         for parameter in self.get_parameters():
