@@ -101,7 +101,9 @@ def _known_full_tensors(
     return full_tensors
 
 
-def _local_chunks(dbuffer, owner_layout, this_rank):
+def _nonempty_local_tensors(
+    dbuffer: DBuffer, owner_layout: GroupOwnerLayout, this_rank: int
+) -> dict[int, torch.Tensor]:
     """The gather source dict: the `DBuffer`'s local views for held parameters."""
     return {
         i: dbuffer.get_tensor_view(i)
@@ -129,7 +131,11 @@ def test_gather_scatter_round_trip():
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(_local_chunks(dbuffer, owner_layout, this_rank), destination, owner_layout=owner_layout)
+    gather(
+        _nonempty_local_tensors(dbuffer, owner_layout, this_rank),
+        destination,
+        owner_layout=owner_layout,
+    )
 
     # Owners got the correct full tensors; nothing else was written.
     for i in owned:
@@ -173,7 +179,9 @@ def test_gather_scatter_with_stream():
     }
     with waiting_stream_scope(stream):
         gather(
-            _local_chunks(dbuffer, owner_layout, this_rank), destination, owner_layout=owner_layout
+            _nonempty_local_tensors(dbuffer, owner_layout, this_rank),
+            destination,
+            owner_layout=owner_layout,
         )
     stream.synchronize()
 
