@@ -1067,9 +1067,15 @@ class ChunkOffloadHandler:
             return tensor_tag
         debug_rank(f"--------tensor_pop {tensor_tag}")
         group_id, idx = tensor_tag
-        tensor = self.offload_groups[group_id - 1].pop_tensor(tensor_tag)
+        group = self.offload_groups[group_id - 1]
+        tensor = group.pop_tensor(tensor_tag)
         # If tensor is offloaded (stored as tuple), reload it
         if isinstance(tensor, tuple):
+            # Warmup and inputs without a group-start gradient can reach this
+            # fallback before prefetch runs. Order H2D after the group's D2H
+            # writes, just as bulk_reload_group does on the prefetch stream.
+            if not is_graph_capturing():
+                group.wait_offload_event(torch.cuda.current_stream())
             tensor = self.reload(tensor)
         debug_rank(f"--------tensor_pop {tensor.shape}")
         return tensor

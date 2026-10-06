@@ -50,8 +50,10 @@ lifetime management. A small tensor-size threshold may copy beta twice without
 freeing its upstream save; the existing manager reports duplicate-transfer bytes.
 
 The profiling tool records all saves in the GDN stack and labels saves inside each
-recurrence. It reports slot bytes, unique storage bytes, and storage held exclusively
-by recurrence saves. Its timestamps are host save/unpack observations, not CUDA
+recurrence. It reports slot bytes, unique storage bytes, and storage referenced only
+by recurrence save sites. It records the first/last unpack and unpack count per slot.
+These identify saved-tensor use, not the time its final storage owner releases it.
+Its timestamps are host save/unpack observations, not CUDA
 execution timestamps. Profiling hooks are not enabled during timed comparisons.
 
 The four-layer stack used below has 32 recurrence heads after Q/K head expansion.
@@ -68,21 +70,39 @@ and therefore realize smaller memory savings.
 ## Offload boundary and policy
 
 The existing `FineGrainedActivationOffloadingInterface` adds the group-start identity
-to Q, captures saved tensors only during `gated_delta_rule`, and commits on the raw
-recurrence output. Backward crosses the commit before reading FLA's saved tensors;
+to the first differentiable recurrence input (normally Q), captures saved tensors
+only during `gated_delta_rule`, and commits on the raw recurrence output.
+Backward crosses the commit before reading FLA's saved tensors;
 the group-start backward lets the existing manager prefetch the preceding group.
 The output norm and its optional `gdn_norm_out` checkpoint remain outside this scope.
 
 The option is disabled by default. It requires BF16 GDN1 and the FLA recurrence;
 configuration rejects GDN2, FP8/FP4, deterministic reference execution, full-layer
-recomputation, and CUDA graphs. Eval and no-grad forwards do not register groups.
+recomputation, and CUDA graphs. Eval, no-grad, and fully frozen recurrence forwards
+do not register groups. A trainable gate is used as the group-start anchor if Q is
+frozen, so the prefetch callback still participates in backward.
 The existing pool, transfer streams, minimum tensor size, group fraction, and
-pipeline lifecycle are reused without modification.
+pipeline lifecycle are reused. The common fallback reload path gains the transfer
+dependency described below.
 
 Warmup offloads every group to learn its size. Steady state retains the final group
 of each name to avoid a reload stall. Fraction is then applied to the eligible
 groups, with integer rounding, rather than to individual tensors or bytes. Report
 the actual number of selected groups alongside the requested fraction.
+
+### Fallback transfer ordering
+
+During warmup, or when no group-start gradient schedules prefetch, unpack can find
+a CPU-backed tensor that was not bulk-reloaded. Previously, `tensor_pop` copied that
+backup to GPU without waiting for the group's D2H event. Delaying D2H reproduced
+unchanged forward outputs with incorrect GDN parameter gradients, including the
+first warmup iteration. A forward-boundary synchronization concealed this race.
+
+The fallback now makes the consumer stream wait for the group's offload event
+before enqueueing H2D, matching the dependency in bulk reload. The existing graph
+capture guard is preserved; this patch does not qualify the GDN CUDA-graph path.
+A sentinel-backed pool test covers the transfer itself, and GDN gradient regressions
+delay D2H through warmup and steady state, with both normal and frozen Q paths.
 
 ## Reproducing the evidence
 
@@ -107,13 +127,20 @@ python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest -q \
 ```
 
 The default stack has four GDN layers, hidden size 2048, 16 key heads, 32 value
-heads, and head dimension 128. Timed steps include forward and backward, with an
-explicit synchronization at the forward boundary in both arms. The tool reports
-end-of-forward allocation, full-step peak allocated/reserved memory, and all step
-durations. It compares outputs, input gradients, and every parameter gradient
-bitwise against an independently initialized baseline. Model construction and
-warmup are excluded from timing. Optimizer updates, MLPs, and distributed training
-communication are not included, so these are GDN-stack results.
+heads, and head dimension 128. Timed steps include forward and backward, with
+synchronization before and after each step, and no default synchronization between
+forward and backward. `--sync-forward` enables that optional phase diagnostic in both
+arms and changes transfer overlap. The default end-of-forward allocation is sampled
+when Python submits forward, with transfers potentially in flight; peak allocation
+is measured over the complete step. The tool records all step durations.
+
+Every warmup/measured step uses a different seeded input shared by all arms. Outputs,
+input gradients, and every parameter gradient are compared bitwise against that
+step's independently initialized baseline. Snapshot copies and comparisons occur
+after timing and can affect inter-step idle/clock behavior. Pinned-buffer usage must
+return to zero after each backward. Model construction, warmup, input copies and
+correctness checks are excluded from timing. Optimizer updates, MLPs, and distributed
+training communication are not included, so these are GDN-stack results.
 
 Use `TORCH_COMPILE_DISABLE=1` for an explicitly eager reproduction. The tool records
 that setting in its JSON. It does not silently disable compilation, Triton autotuning,
@@ -125,8 +152,10 @@ record repeat runs and their raw step samples when dedicated GPUs are unavailabl
 Measurements on 2026-10-06 used the default compilation setting, the stack above,
 batch size 1, seed 123, the 1M-element threshold, three warmup steps and ten measured
 forward/backward steps per arm. Each sequence length has three independent process
-runs. The GPU was not exclusive: another process held 23,304 MiB, with no concurrent
-compute observed during idle checks. The host was shared and clocks were not locked.
+runs. The default forward synchronization is disabled, and all 13 distinct-input
+steps per enabled arm are checked, including warmup. The GPU was not exclusive:
+another process held 23,304 MiB, with no concurrent compute observed during idle checks.
+The host was shared and clocks were not locked.
 These observations establish allocated-memory savings; runtime estimates require
 confirmation on dedicated hardware. The default TE path also has native-op Dynamo
 graph breaks; this is not a claim of full-graph compilation.
@@ -138,14 +167,14 @@ time medians. Peak allocated memory was stable across all 30 measured steps per 
 
 | Sequence | Requested fraction | Selected groups | Peak allocated (MiB) | Step time (ms), median [range] | Paired runtime change, median [range] |
 | ---: | --- | ---: | ---: | --- | --- |
-| 2048 | Disabled | 0 | 1274.80 | 31.67 [30.74, 32.48] | Reference |
-| 2048 | 0 | 0 | 1274.80 | 31.77 [31.41, 38.50] | +2.2% [-2.2%, +21.6%] |
-| 2048 | 0.5 | 2 | 1162.80 | 43.49 [36.61, 44.65] | +37.3% [+12.7%, +45.3%] |
-| 2048 | 1 | 3 | 1106.80 | 41.85 [41.56, 59.44] | +36.1% [+27.9%, +87.7%] |
-| 4096 | Disabled | 0 | 2272.34 | 58.19 [57.87, 58.32] | Reference |
-| 4096 | 0 | 0 | 2272.34 | 58.28 [58.06, 58.99] | +0.3% [+0.2%, +1.2%] |
-| 4096 | 0.5 | 2 | 2048.34 | 69.18 [68.72, 86.45] | +18.9% [+18.7%, +48.2%] |
-| 4096 | 1 | 3 | 1936.34 | 83.97 [82.63, 110.27] | +44.3% [+42.8%, +89.1%] |
+| 2048 | Disabled | 0 | 1274.80 | 32.63 [31.99, 36.30] | Reference |
+| 2048 | 0 | 0 | 1274.80 | 32.68 [31.05, 40.84] | +0.1% [-2.9%, +12.5%] |
+| 2048 | 0.5 | 2 | 1162.80 | 39.75 [36.13, 45.51] | +10.7% [+9.5%, +42.3%] |
+| 2048 | 1 | 3 | 1106.80 | 43.18 [40.74, 45.29] | +24.8% [+19.0%, +41.6%] |
+| 4096 | Disabled | 0 | 2272.34 | 56.90 [56.90, 56.94] | Reference |
+| 4096 | 0 | 0 | 2272.34 | 57.03 [56.88, 57.04] | +0.2% [-0.03%, +0.24%] |
+| 4096 | 0.5 | 2 | 2048.34 | 65.29 [65.20, 69.45] | +14.7% [+14.6%, +22.1%] |
+| 4096 | 1 | 3 | 1936.34 | 77.56 [77.53, 77.56] | +36.3% [+36.2%, +36.3%] |
 
 Fraction 1 reduces peak allocation by approximately **168 MiB (13.2%)** at sequence
 2048 and **336 MiB (14.8%)** at sequence 4096. End-of-forward allocations decrease
@@ -157,18 +186,25 @@ between fractions 0.5 and 1 or a production-training overhead.
 
 [Raw A6000 step samples](gdn_activation_offloading_a6000.csv) include all 240 measured
 steps, peak allocated/reserved memory, end-of-forward allocation, selected groups,
-selected transfer bytes, and each arm's correctness result. The correctness flag is
-the final-step snapshot comparison for that arm; replay unit tests separately check
-warmup and successive steady-state iterations.
+selected transfer bytes, and each arm's correctness result. Each enabled arm checks
+all 13 warmup/measured steps, including gradient coverage and pinned-buffer release.
+The CSV records this checked-step count and the forward synchronization setting.
 
 ## Acceptance and next steps
 
 On one RTX A6000 with Python 3.12.4, PyTorch 2.11.0+cu130, Transformer Engine
-2.20.2, and FLA 0.5.1, all **21 tests passed** both with `TORCH_COMPILE_DISABLE=1`
+2.20.2, and FLA 0.5.1, all **32 tests passed** both with `TORCH_COMPILE_DISABLE=1`
 and with the default compilation setting. This includes exact output, input-gradient
-and parameter-gradient comparisons over one warmup and two steady-state iterations,
-fraction 0/0.5/1, threshold skipping, `gdn_norm_out` recomputation, packed sequences,
-and eval/no-grad bypass. Pinned-buffer usage returned to zero after backward.
+and parameter-gradient comparisons with changing inputs over one warmup and two
+steady-state iterations, fraction 0/0.5/1, threshold skipping, shared and expanded
+Q/K storage, `gdn_norm_out` recomputation, packed sequences, delayed D2H, frozen Q,
+and eval/no-grad/fully frozen bypass. Pinned-buffer usage returned to zero after
+backward.
+
+The common-manager subset passed **12 tests**, including the delayed-transfer
+sentinel regression; one aggregation test requires two ranks and was skipped.
+An existing eight-layer BF16 GPT/MoE `core_attn` offload test also passed its
+output/gradient and peak-memory checks, covering the shared-manager change outside GDN.
 
 Existing single-rank GDN and output-norm recomputation tests passed **7 cases**;
 one fused causal-conv1d case was skipped because its native backward extension is
@@ -177,8 +213,10 @@ runs used `--confcutdir=tests/unit_tests/ssm` to omit root dataset-download fixt
 configuration-only regression tests used `--noconftest`.
 
 `tools/autoformat.sh` passes its Black, isort, Pylint and Ruff gates, and kernel
-determinism coverage passes. Its non-blocking mypy step reports six existing
-diagnostics; checking the original `main` versions reproduces the same six.
+determinism coverage passes. With the common manager and its test file now included,
+the non-blocking mypy step reports 23 existing diagnostics; checking the original
+`main` versions reproduces the same 23. The new tool and GDN offload test file pass
+a separate mypy check.
 
 The measured first slice meets these acceptance criteria: outputs and all gradients
 agree through warmup and multiple steady iterations, pinned buffers return to the

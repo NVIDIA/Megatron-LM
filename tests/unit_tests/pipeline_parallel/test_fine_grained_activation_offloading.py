@@ -195,6 +195,29 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     return handler
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_tensor_pop_waits_for_delayed_offload() -> None:
+    """A non-prefetched tensor cannot read its CPU backup before D2H finishes."""
+    source = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    tag = (1, 0)
+    group = OffloadTensorGroup("gdn_core_attn")
+    group.push_tensor(tag, source)
+    chunk = _make_warmup_chunk([group])
+    # Initialize the pool slot with a sentinel so an early H2D read is observable.
+    backup = chunk.cpu_tensor_pool.allocate(source.shape, dtype=source.dtype)
+    backup.fill_(-100)
+    chunk.cpu_tensor_pool.free(backup)
+    chunk.d2h_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(chunk.d2h_stream):
+        torch.cuda._sleep(150_000_000)
+    chunk.bulk_offload_group(group)
+
+    result = chunk.tensor_pop(tag)
+    torch.cuda.synchronize()
+    assert torch.equal(result, source)
+    assert chunk.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
+
+
 def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     """Drive post_warmup_callback over a single hand-built chunk."""
     manager = PipelineOffloadManager.__new__(PipelineOffloadManager)
