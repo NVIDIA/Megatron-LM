@@ -2690,6 +2690,8 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
+        # Preserve the configured accumulation precision through the collective.
+        grad_output = grad_output.to(weight.main_grad.dtype)
         return weight.wgrad_reduce_scatter(grad_output)
 
 

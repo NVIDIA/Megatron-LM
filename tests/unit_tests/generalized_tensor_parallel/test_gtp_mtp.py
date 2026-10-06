@@ -605,7 +605,65 @@ def _worker_dummy_wgrad_not_leaked(rank, world_size, port, repeated_layer=False)
         )
 
 
+def _worker_embedding_reduction_dtype(rank, world_size, port, grad_dtype, use_async):
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        GTPEmbeddingWeight,
+        update_gtp_config,
+        wrap_module_params_gtp,
+    )
+
+    saved_config = vars(GTP_CONFIG).copy()
+    try:
+        update_gtp_config(
+            weight_prefetch=False, async_reduction=use_async, calculate_per_token_loss=True
+        )
+        full = torch.zeros(128, 8, device="cuda", dtype=torch.bfloat16)
+        ids = torch.arange(128, device="cuda")
+        upstream = torch.full_like(full, [1.0, 1.0 / 256, 0.0, 0.0][rank])
+        ordinary = torch.nn.Parameter(full.clone())
+        ordinary[ids].backward(upstream)
+        reference = ordinary.grad.to(grad_dtype)
+        dist.all_reduce(reference)
+
+        weights = []
+        for _ in range(2):
+            module = torch.nn.Module()
+            module.weight = torch.nn.Parameter(full.clone())
+            wrap_module_params_gtp(module, ["weight"], dist.group.WORLD)
+            weight = module.weight
+            weight.main_grad = torch.zeros(weight.shape, device="cuda", dtype=grad_dtype)
+            weight.grad_added_to_main_grad = False
+            weight.zero_out_wgrad = True
+            weights.append(weight)
+
+        anchor, shared = weights
+        anchor_output = GTPEmbeddingWeight.apply(anchor)[ids]
+        outputs = [GTPEmbeddingWeight.apply(shared)[ids] for _ in range(2)]
+        assert shared.prev_w is anchor
+        # The two consumes model MTP's repeated embedding lookup. The second
+        # backward must retain both gradients when the first RS is still pending.
+        outputs[1].backward(upstream)
+        assert (shared._wgrad_rs_handle is not None) == use_async
+        outputs[0].backward(upstream)
+        anchor_output.backward(torch.zeros_like(anchor_output))
+        torch.cuda.synchronize()
+        expected = reference.chunk(world_size)[rank] * 2
+        torch.testing.assert_close(shared.main_grad, expected, rtol=0, atol=0)
+        assert torch.count_nonzero(anchor.main_grad) == 0
+        # 1 + 1/256 rounds to 1 in BF16, so FP32 must preserve that small term.
+        assert expected.flatten()[0].item() == (2.0078125 if grad_dtype == torch.float32 else 2.0)
+    finally:
+        update_gtp_config(**saved_config)
+
+
 class TestGTPMTP:
+    @pytest.mark.parametrize("grad_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_embedding_reduction_uses_main_grad_dtype(self, grad_dtype, use_async):
+        """Embedding reduction preserves FP32 accumulation and explicit BF16 mode."""
+        _run_distributed(_worker_embedding_reduction_dtype, 4, grad_dtype, use_async)
+
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_gtp_mtp_runs_end_to_end(self, repeated_layer, moe):
