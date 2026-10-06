@@ -1,13 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Distributed tests for the `gather_scatter` module.
+"""
+Distributed tests for the `gather_scatter` module.
 
-These tests require `torchrun` (>=2 ranks and >=1 GPU per rank). They create a `DBuffer`
-with known data, gather full tensors to the owners via P2P, verify correctness, then
-scatter the results back and verify the `DBuffer` is unchanged (identity round-trip).
-
-All dicts are keyed by tensor index; all communicated tensors are flat element ranges,
-matching `owner_planning`.
+These tests require `torchrun` (≥2 ranks and ≥1 GPU per rank). They create a `DBuffer` with known
+data, gather full tensors to the owners via P2P, verify correctness, then scatter the results back
+and verify the `DBuffer` is unchanged (identity round-trip).
 """
 
 import os
@@ -113,9 +111,8 @@ def _nonempty_local_tensors(
 def test_gather_scatter_round_trip():
     """gather -> scatter identity round-trip: `DBuffer` data is unchanged.
 
-    One boundary and one non-boundary parameter: the owners reconstruct the full
-    tensors, and scattering them back into the `DBuffer`'s local views leaves the
-    local buffer unchanged.
+    One boundary and one non-boundary parameter: the owners reconstruct the full tensors, and
+    scattering them back into the `DBuffer`'s local views leaves the local buffer unchanged.
     """
     _, _, device, mesh = _setup()
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
@@ -152,8 +149,8 @@ def test_gather_scatter_round_trip():
 def test_gather_scatter_with_stream():
     """gather -> scatter inside `waiting_stream_scope` produces correct results.
 
-    The scatter destination is plain flat tensors (not `DBuffer` views), matching
-    `scatter`'s caller-owned application contract.
+    The scatter destination is plain flat tensors (not `DBuffer` views), matching `scatter`'s
+    caller-owned application contract.
     """
     _, _, device, mesh = _setup()
     if not torch.cuda.is_available():
