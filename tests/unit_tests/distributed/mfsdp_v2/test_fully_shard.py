@@ -295,7 +295,8 @@ def test_rejects_delayed_te_weight_gradient(distributed_setup):
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.weight.untyped_storage().nbytes() > 0
 
     with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
         model.backward_dw()
@@ -1234,3 +1235,91 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
         torch.stack(baseline_losses),
         msg="TensorAtomic sharded losses did not match baseline losses.",
     )
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_no_input_gradients_preserve_saved_weights(distributed_setup, frozen):
+    """The output-time module hook must not release weights needed inside backward."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    model[1].requires_grad_(not frozen)
+    reference = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    reference.load_state_dict(model.state_dict())
+    reference[1].requires_grad_(not frozen)
+    with fully_shard_context(device=device):
+        fully_shard(model[0], mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    def unpack(tensor):
+        if tensor.untyped_storage().nbytes() == 0:
+            pytest.fail("Backward read released weights", pytrace=False)
+        return tensor
+
+    x = torch.ones(2, 4, device=device)
+    reference(x).sum().backward()
+    # Preserve saved aliases, checking their storage before CUDA can read it.
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook=lambda t: t, unpack_hook=unpack):
+        model(x).sum().backward()
+    for actual, expected in zip(model.parameters(), reference.parameters()):
+        if expected.requires_grad:
+            torch.testing.assert_close(actual.grad.full_tensor(), expected.grad)
+    assert model.phase is FsdpModule.Phase.RESTING
+
+
+def test_shared_units_reshard_before_grads_ready(distributed_setup):
+    """Repeated invocations release weights independently of shared gradient accumulation."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
+    reference = nn.Sequential(*(nn.Linear(4, 4, bias=False) for _ in range(3))).to(device)
+    model = nn.Sequential(*(nn.Linear(4, 4, bias=False) for _ in range(3))).to(device)
+    model.load_state_dict(reference.state_dict())
+    with fully_shard_context(device=device):
+        for layer in model:
+            fully_shard(layer, mesh, _default_placements())
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+
+    def forward(layers, x, repeats):
+        x = layers[0](x)
+        for _ in range(repeats):
+            x = layers[2](layers[1](x).tanh()).tanh()
+        return x.square().sum()
+
+    completions = []
+
+    def check_released(unit):
+        full_weight = unit.parameter_groups[0].fsdp_parameters[0].unsharded
+        assert full_weight.untyped_storage().nbytes() == 0
+        if unit is model[2] and not completions and repeats > 1:
+            assert unit.weight.grad is None
+        completions.append(unit)
+
+    for layer in model:
+        layer.register_post_backward_hook(check_released)
+    torch.manual_seed(4321 + distributed_setup.rank)
+    for repeats in (2, 1, 3):
+        reference_optimizer.zero_grad()
+        optimizer.zero_grad()
+        completions.clear()
+        x = torch.randn(2, 4, device=device, requires_grad=True)
+        actual_x = x.detach().clone().requires_grad_()
+        expected = forward(reference, x, repeats)
+        actual = forward(model, actual_x, repeats)
+        expected.backward()
+        actual.backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_x.grad, x.grad)
+        assert completions == [layer for _ in range(repeats) for layer in (model[2], model[1])] + [
+            model[0]
+        ]
+        for layer, ref_layer in zip(model, reference):
+            dist.all_reduce(ref_layer.weight.grad, op=dist.ReduceOp.AVG)
+            torch.testing.assert_close(layer.weight.grad.full_tensor(), ref_layer.weight.grad)
+        reference_optimizer.step()
+        optimizer.step()
+        for layer, ref_layer in zip(model, reference):
+            torch.testing.assert_close(layer.weight.full_tensor(), ref_layer.weight)

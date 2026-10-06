@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 
 
 class NestedModel(nn.Module):
@@ -284,3 +285,18 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_default_placements())
 
     assert model.inner.context is first_context
+
+
+def test_combined_scheduler_uses_grads_ready(distributed_setup):
+    """The manual scheduler still reduces when parameter gradients become ready."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
+        fully_shard(model, mesh, _default_placements(), register_hooks=False)
+    register_combined_1f1b_hooks(model)
+    model(torch.ones(2, 4, device=device)).sum().backward()
+    context.finish_grad_sync()
+    torch.testing.assert_close(
+        model.weight.grad.full_tensor(), torch.full((4, 4), 2.0, device=device)
+    )

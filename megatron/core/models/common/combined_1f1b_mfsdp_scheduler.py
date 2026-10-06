@@ -26,9 +26,9 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     return hook
 
 
-def _module_post_backward_hook(module: FsdpModule) -> None:
+def _module_grads_ready_hook(module: FsdpModule) -> None:
     module.reshard()
-    module._reduce_gradient_groups()
+    module.grads_ready()
 
 
 def reshard_fsdp_module(module: FsdpModule) -> None:
@@ -56,4 +56,7 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
 
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
-            submodule.register_post_backward_hook(_module_post_backward_hook)
+            if any(group.requires_grad for group in submodule.parameter_groups):
+                submodule.register_grads_ready_hook(_module_grads_ready_hook)
+            else:
+                submodule.register_post_backward_hook(_module_grads_ready_hook)
