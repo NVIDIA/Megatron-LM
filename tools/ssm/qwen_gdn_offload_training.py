@@ -37,7 +37,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_batch_on_this_cp_rank, get_model_config
+from megatron.core.utils import get_attr_wrapped_model, get_batch_on_this_cp_rank, get_model_config
 
 
 def _arguments() -> argparse.Namespace:
@@ -183,6 +183,9 @@ def _forward_step(
     batches: Iterator[dict[str, torch.Tensor]], model: torch.nn.Module
 ) -> tuple[torch.Tensor, Any]:
     batch = next(batches)
+    # Bridge's Qwen forward overrides GPTModel.forward without its offload setup.
+    if get_model_config(model).fine_grained_activation_offloading:
+        get_attr_wrapped_model(model, "preprocess_for_fine_grained_offloading")()
     output = model(batch["tokens"], batch["position_ids"], None, labels=batch["labels"])
 
     def loss_func(

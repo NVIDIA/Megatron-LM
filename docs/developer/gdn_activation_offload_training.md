@@ -88,6 +88,9 @@ embeddings and output head retain their checkpoint dimensions and weights;
 frozen vision modules are released after import and MTP is disabled. MoE models
 are outside this pilot. Bridge's dense VL importer currently rejects
 `text_only=True`; this entry point adds no custom checkpoint mapping.
+The pinned Bridge Qwen forward also omits GPT's offload preprocessing call. The
+tool invokes the existing native preprocessing method before each forward when
+offloading is enabled, so each pipeline chunk uses the native manager lifecycle.
 
 Use a Bridge environment with Qwen3.5 VL mappings. The prepared
 environment uses Bridge revision `c860f8a5bc5fddd78690f32baa0b8696774308b4`,
