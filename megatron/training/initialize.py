@@ -63,7 +63,7 @@ def initialize_megatron(
     skip_random_seed=False,
     skip_dependency_compilation=False,
     *,
-    inference: bool = False,
+    training: bool = False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -72,8 +72,8 @@ def initialize_megatron(
     what you are doing.
     `skip_dependency_compilation` should only be set by workloads that do not
     use the C++ dataset helpers.
-    `inference` initializes distributed execution and RNG without training rerun,
-    checkpoint workers, autoresume or dataset compilation.
+    `training` enables training rerun, checkpoint workers, autoresume and dataset
+    compilation in addition to the shared distributed execution and RNG setup.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -83,7 +83,7 @@ def initialize_megatron(
 
     args = get_args()
 
-    if inference and args.tp_comm_overlap:
+    if not training and args.tp_comm_overlap:
         raise ValueError(
             "--tp-comm-overlap uses fixed training user buffers and is not supported by "
             "inference initialization. Disable it until inference has a validated buffer-sizing "
@@ -93,7 +93,7 @@ def initialize_megatron(
     # set logging level
     setup_logging()
 
-    if not inference and args.async_save and args.use_persistent_ckpt_worker:
+    if training and args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
@@ -105,7 +105,7 @@ def initialize_megatron(
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
-    if not inference:
+    if training:
         initialize_rerun_state_machine(
             state_save_func=state_save_func,
             state_restore_func=state_restore_func,
@@ -186,11 +186,11 @@ def initialize_megatron(
         finish_mpu_init()
 
         # Autoresume.
-        if not inference:
+        if training:
             _init_autoresume()
 
         # Compile dependencies.
-        if not inference and not skip_dependency_compilation:
+        if training and not skip_dependency_compilation:
             _compile_dependencies()
 
         if args.tp_comm_overlap:

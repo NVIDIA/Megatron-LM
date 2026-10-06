@@ -204,8 +204,8 @@ def main():
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, inference=True)
-    initialize_megatron(inference=True)
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     # Set up model and load checkpoint.
     model = get_model(model_provider, wrap_with_ddp=False)

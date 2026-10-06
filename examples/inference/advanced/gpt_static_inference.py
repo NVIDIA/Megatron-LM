@@ -134,8 +134,8 @@ def main():
         },
     )
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, inference=True)
-    initialize_megatron(inference=True)
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     model = get_model_for_inference()
 

@@ -1082,6 +1082,7 @@ class TestMegatronFSDPE2E:
         from megatron.training.arguments import add_megatron_arguments, validate_args
         from megatron.training.global_vars import (
             initialize_runtime_services,
+            initialize_runtime_services_for_training,
             set_args,
             set_run_config,
             unset_global_variables,
@@ -1190,7 +1191,8 @@ class TestMegatronFSDPE2E:
             model_cfg = gpt_config_from_args(args)
             cfg = pretrain_cfg_container_from_args(args, model_cfg)
             set_run_config(cfg)
-            initialize_runtime_services(args)
+            initialize_runtime_services(args, training=True)
+            initialize_runtime_services_for_training(args)
             resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
 
             from gpt_builders import gpt_builder

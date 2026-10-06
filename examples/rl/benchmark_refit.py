@@ -23,7 +23,11 @@ from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import (
+    initialize_runtime_services,
+    initialize_runtime_services_for_training,
+    set_run_config,
+)
 from megatron.training.initialize import initialize_megatron
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -419,8 +423,9 @@ def main():
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args)
-    initialize_megatron(skip_dependency_compilation=True)
+    initialize_runtime_services(args, training=True)
+    initialize_runtime_services_for_training(args)
+    initialize_megatron(training=True, skip_dependency_compilation=True)
 
     args = get_args()
 

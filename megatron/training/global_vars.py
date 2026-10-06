@@ -154,7 +154,7 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct runtime services."""
+    """Register caller-provided args/config and construct training runtime services."""
 
     assert args is not None
     assert cfg_container is not None
@@ -162,17 +162,21 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_run_config(cfg_container)
     set_args(args)
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
+    initialize_runtime_services_for_training(args)
 
 
 def initialize_runtime_services(
-    args: Namespace, *, build_tokenizer: bool = True, inference: bool = False
+    args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
-    """Initialize shared services and, unless inference, training-only services."""
+    """Initialize shared services, optionally including training telemetry metadata.
+
+    Training callers must also call initialize_runtime_services_for_training().
+    """
     if build_tokenizer:
         _build_tokenizer(args)
     _set_wandb_writer(args)
-    _set_telemetry(args, include_training=not inference)
+    _set_telemetry(args, include_training=training)
 
     if args.enable_experimental:
         set_experimental_flag(True)
@@ -180,11 +184,8 @@ def initialize_runtime_services(
     if args.disable_jit_fuser:
         disable_jit_fuser()
 
-    if not inference:
-        initialize_training_runtime_services(args)
 
-
-def initialize_training_runtime_services(args: Namespace) -> None:
+def initialize_runtime_services_for_training(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back

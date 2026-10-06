@@ -85,6 +85,8 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
         args.profile = aliases
     initialize = Mock()
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
+    training_services = Mock()
+    monkeypatch.setattr(global_vars, "initialize_runtime_services_for_training", training_services)
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
     global_vars.set_global_variables(args, cfg)
     assert global_vars.get_args() is args
@@ -97,7 +99,8 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
     assert cfg.checkpoint.fully_parallel_save is (True if aliases is None else aliases)
     assert cfg.checkpoint.fully_parallel_load is bool(aliases)
     assert cfg.profiling.use_nsys_profiler is bool(aliases)
-    initialize.assert_called_once_with(args, build_tokenizer=True)
+    initialize.assert_called_once_with(args, build_tokenizer=True, training=True)
+    training_services.assert_called_once_with(args)
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args, cfg)
 
@@ -111,13 +114,16 @@ def test_explicit_training_bootstrap_preserves_config(monkeypatch, isolated_glob
     initialize = Mock()
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
 
+    training_services = Mock()
+    monkeypatch.setattr(global_vars, "initialize_runtime_services_for_training", training_services)
     global_vars.set_global_variables(args, cfg, build_tokenizer=False)
 
     assert global_vars.get_args() is args
     assert global_vars.get_run_config() is cfg
     assert global_vars.get_run_config().train.train_iters == 7
     assert global_vars.get_run_config().logger.log_interval == 3
-    initialize.assert_called_once_with(args, build_tokenizer=False)
+    initialize.assert_called_once_with(args, build_tokenizer=False, training=True)
+    training_services.assert_called_once_with(args)
 
 
 def test_bootstrap_rejects_registered_config_before_setting_args(monkeypatch, isolated_globals):
@@ -249,7 +255,10 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
     if use_bootstrap:
         global_vars.set_global_variables(args, cfg)
     else:
-        global_vars.initialize_runtime_services(args)
+        global_vars.initialize_runtime_services(args, training=True)
+        assert global_vars._GLOBAL_TRAIN_STATE is None
+        microbatches.assert_not_called()
+        global_vars.initialize_runtime_services_for_training(args)
     assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
     assert calls == [
         "_build_tokenizer",

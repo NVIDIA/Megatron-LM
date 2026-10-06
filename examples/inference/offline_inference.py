@@ -270,8 +270,8 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, inference=True)
-    initialize_megatron(inference=True)
+    initialize_runtime_services(args)
+    initialize_megatron()
     _validate_high_level_api_args(args)
 
     if os.environ.get("NSIGHT_PREFIX"):

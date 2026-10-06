@@ -60,8 +60,9 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
 
 @pytest.mark.parametrize("build_tokenizer", [False, True])
 @pytest.mark.parametrize("enable_runtime_flags", [False, True])
-def test_inference_services_without_training_arguments(
-    monkeypatch, build_tokenizer, enable_runtime_flags
+@pytest.mark.parametrize("training_kwargs", [{}, {"training": False}, {"training": True}])
+def test_shared_services_never_initialize_training_services(
+    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs
 ):
     args = Namespace(
         enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
@@ -75,7 +76,7 @@ def test_inference_services_without_training_arguments(
         services[name] = Mock()
         monkeypatch.setattr(global_vars, name, services[name])
     for name in (
-        "initialize_training_runtime_services",
+        "initialize_runtime_services_for_training",
         "init_num_microbatches_calculator",
         "_set_tensorboard_writer",
         "_set_timers",
@@ -87,11 +88,15 @@ def test_inference_services_without_training_arguments(
     ):
         monkeypatch.setattr(global_vars, name, Mock(side_effect=AssertionError(name)))
 
-    global_vars.initialize_runtime_services(args, build_tokenizer=build_tokenizer, inference=True)
+    global_vars.initialize_runtime_services(
+        args, build_tokenizer=build_tokenizer, **training_kwargs
+    )
 
     assert services["_build_tokenizer"].call_count == int(build_tokenizer)
     services["_set_wandb_writer"].assert_called_once_with(args)
-    services["_set_telemetry"].assert_called_once_with(args, include_training=False)
+    services["_set_telemetry"].assert_called_once_with(
+        args, include_training=training_kwargs.get("training", False)
+    )
     if enable_runtime_flags:
         experimental.assert_called_once_with(True)
         jit.assert_called_once_with()
@@ -120,7 +125,8 @@ def test_inference_telemetry_does_not_read_training_fields(monkeypatch):
     assert "megatron.train_iters" not in attrs
 
 
-def test_inference_distributed_initialization_without_training_fields(monkeypatch):
+@pytest.mark.parametrize("training_kwargs", [{}, {"training": False}])
+def test_inference_distributed_initialization_without_training_fields(monkeypatch, training_kwargs):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
@@ -153,7 +159,7 @@ def test_inference_distributed_initialization_without_training_fields(monkeypatc
     ):
         monkeypatch.setattr(initialize, name, Mock(side_effect=AssertionError(name)))
 
-    initialize.initialize_megatron(allow_no_cuda=True, inference=True)
+    initialize.initialize_megatron(allow_no_cuda=True, **training_kwargs)
 
     distributed.assert_called_once()
     seeds.assert_called_once()
@@ -165,8 +171,49 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
     with pytest.raises(ValueError, match="fixed training user buffers"):
-        initialize.initialize_megatron(allow_no_cuda=True, inference=True)
+        initialize.initialize_megatron(allow_no_cuda=True)
     distributed.assert_not_called()
+
+
+def test_distributed_training_services_require_explicit_opt_in(monkeypatch):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank = 0
+    args.async_save = True
+    args.use_persistent_ckpt_worker = True
+    args.tp_comm_overlap = True
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "setup_logging", Mock())
+    monkeypatch.setattr(initialize, "print_rank_0", Mock())
+    monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
+    events = []
+    for name in (
+        "init_persistent_async_worker",
+        "initialize_rerun_state_machine",
+        "_initialize_distributed",
+        "_set_random_seed",
+        "_init_autoresume",
+        "_compile_dependencies",
+        "_initialize_tp_communicators",
+    ):
+        monkeypatch.setattr(
+            initialize,
+            name,
+            Mock(side_effect=lambda *a, service=name, **kw: events.append(service)),
+        )
+
+    initialize.initialize_megatron(allow_no_cuda=True, training=True)
+
+    assert events == [
+        "init_persistent_async_worker",
+        "initialize_rerun_state_machine",
+        "_initialize_distributed",
+        "_set_random_seed",
+        "_init_autoresume",
+        "_compile_dependencies",
+        "_initialize_tp_communicators",
+    ]
 
 
 @pytest.mark.parametrize("is_vlm", [False, True])
