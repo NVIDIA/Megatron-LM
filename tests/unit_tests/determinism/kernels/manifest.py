@@ -654,6 +654,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
+    KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "real non-CP attention replay exercises deterministic cuDNN backward independently.",
+    ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",
