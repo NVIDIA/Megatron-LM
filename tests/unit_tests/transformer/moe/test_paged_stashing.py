@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -8,24 +10,39 @@ from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.moe.fused_a2a import is_nccl_ep_bootstrapped, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashManager,
+    _stash_buffer_dtype,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
+from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp8_dispatch_available
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+)
 
 # These tests configure mxfp8 + the TE op fuser, so they only run on Blackwell (sm100+). Mark the
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
 pytestmark = pytest.mark.launch_on_gb200
+
+
+@pytest.fixture(autouse=True)
+def reset_paged_stash_manager():
+    """The manager's state machine never returns to 'begin' on its own."""
+    yield
+    PagedStashManager.STASH_MGR = None
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
@@ -54,6 +71,23 @@ def _pad_token_counts_to_align_size(
     """Round each count up to a multiple of ``pad_multiple`` (``n + (-n % m)`` like budget)."""
     t = tokens_per_expert.to(torch.int64)
     return t + (-t % pad_multiple)
+
+
+class TestStashBufferDtype:
+    def test_native_dtypes_are_kept(self):
+        for dtype in (torch.bfloat16, torch.float32, torch.int64, torch.bool):
+            assert _stash_buffer_dtype(dtype) is dtype
+
+    def test_one_byte_dtypes_are_byte_copied(self):
+        dtypes = [torch.float8_e4m3fn, torch.float8_e8m0fnu]
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            dtypes.append(torch.float4_e2m1fn_x2)
+        for dtype in dtypes:
+            assert _stash_buffer_dtype(dtype) is torch.uint8
+
+    def test_multi_byte_dtypes_are_rejected(self):
+        with pytest.raises(ValueError, match="complex64"):
+            _stash_buffer_dtype(torch.complex64)
 
 
 class MoEModelTestContainer:
@@ -195,43 +229,6 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
-def is_nccl_ep_zero_copy_available():
-    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
-    NCCL-EP build."""
-    if not is_nccl_ep_available():
-        return False
-    try:
-        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def is_nccl_ep_available():
-    """NCCL EP built into TE, with the eager/drop-capable ``ep_bootstrap`` signature.
-
-    ``ensure_nccl_ep_bootstrapped`` always passes ``recv_capacity_per_rank`` and
-    ``drop_on_overflow``, so a TE predating that signature raises TypeError on the first
-    bootstrap for every ncclEP path -- static as much as eager. Gate on it here so such builds
-    skip cleanly instead of erroring. ``recv_capacity_per_rank`` must also be *optional*: that
-    is what makes eager (the over-budget replay) expressible.
-    """
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
-
-    if not HAVE_TE_EP:
-        return False
-
-    import inspect
-
-    from transformer_engine.pytorch.ep import ep_bootstrap
-
-    params = inspect.signature(ep_bootstrap).parameters
-    recv_capacity = params.get("recv_capacity_per_rank")
-    return (
-        recv_capacity is not None and recv_capacity.default is None and "drop_on_overflow" in params
-    )
-
-
 def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
     """Cheap gate matching the start of ``TEGroupedMLP._is_fused_impl_supported`` (experts.py)."""
     if not HAVE_TE:
@@ -272,6 +269,7 @@ class TestPagedStashing:
         pass
 
     def teardown_method(self, method):
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -362,6 +360,7 @@ class TestPagedStashingOverBudget:
         pass
 
     def teardown_method(self, method):
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -411,6 +410,15 @@ class TestPagedStashingOverBudget:
         budget = int(num_tokens * capacity_factor)
         budget += -budget % pad_multiple
 
+        # This just captures; needed for setup.
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        _forward_backward_all_layers(container, hidden_states)
+        container.zero_grad()
+        for layer in container.moe_layers:
+            layer.token_dispatcher.reset_over_budget()
+
+        # This does the stashing needed for the test.
         paged_stash_reset(True, config=container.config)
         paged_stash_init_chunk_handler(1, 0)
         _forward_backward_all_layers(container, hidden_states)
@@ -485,13 +493,26 @@ class TestNcclEpPagedStashing:
     """
 
     def setup_method(self, method):
-        pass
+        self.container = None
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+        try:
+            self.container = None
+            gc.collect()
+            nccl_ep_release_context()
+            assert not is_nccl_ep_bootstrapped(), "NCCL EP context survived release"
+        finally:
+            Utils.destroy_model_parallel()
+
+    def _run_step(self, hidden_states):
+        paged_stash_reset(True, config=self.container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        out, _, _, _ = _forward_backward_all_layers(self.container, hidden_states)
+        self.container.zero_grad()
+        torch.cuda.synchronize()
+        return out
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
     def test_over_budget(self, wire_dtype):
@@ -514,7 +535,7 @@ class TestNcclEpPagedStashing:
 
         config.ENABLE_EXPERIMENTAL = True
 
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=1,
             ep_size=4,
             pp_size=1,
@@ -542,34 +563,38 @@ class TestNcclEpPagedStashing:
 
         seq_length = 1024
         batch_size = 1
-        topk = container.config.moe_router_topk
-        capacity_factor = container.config.moe_expert_rank_capacity_factor
+        topk = self.container.config.moe_router_topk
+        capacity_factor = self.container.config.moe_expert_rank_capacity_factor
         hidden_states = torch.randn(
-            (seq_length, batch_size, container.config.hidden_size), dtype=torch.bfloat16
+            (seq_length, batch_size, self.container.config.hidden_size), dtype=torch.bfloat16
         )
 
         num_tokens = seq_length * batch_size * topk
-        pad_multiple = get_align_size_for_quantization(container.config)
+        pad_multiple = get_align_size_for_quantization(self.container.config)
         budget = int(num_tokens * capacity_factor)
         budget += -budget % pad_multiple
 
-        paged_stash_reset(True, config=container.config)
+        paged_stash_reset(True, config=self.container.config)
         paged_stash_init_chunk_handler(1, 0)
-        _forward_backward_all_layers(container, hidden_states)
+        _forward_backward_all_layers(self.container, hidden_states)
 
         # NCCL EP's manager keeps token_probs/token_indices rather than the routing map, and a
         # rank's received load depends on every rank's routing, so the HybridEP map-derived
         # cross-check does not transfer. Check the device-side accounting against the budget
         # instead: required_recv is filled by ep_prepare before any dropping, and over_budget is
         # the same comparison made on device, so the two must agree with config arithmetic.
+        budget_report = [
+            (
+                layer.token_dispatcher._comm_manager._recv_capacity,
+                bool(layer.token_dispatcher.check_over_budget().item()),
+                int(layer.token_dispatcher.check_required_capacity().item()),
+            )
+            for layer in self.container.moe_layers
+        ]
         any_over_budget = False
-        for layer_idx, layer in enumerate(container.moe_layers):
-            comm = layer.token_dispatcher._comm_manager
-            over_budget = layer.token_dispatcher.check_over_budget().item()
-            required = layer.token_dispatcher.check_required_capacity().item()
-
-            assert comm._recv_capacity == budget, (
-                f"layer {layer_idx}: dispatcher budget ({comm._recv_capacity}) != expected "
+        for layer_idx, (recv_capacity, over_budget, required) in enumerate(budget_report):
+            assert recv_capacity == budget, (
+                f"layer {layer_idx}: dispatcher budget ({recv_capacity}) != expected "
                 f"({budget}) for capacity factor {capacity_factor}"
             )
             assert required > 0, f"layer {layer_idx}: required capacity was never recorded"
@@ -584,21 +609,7 @@ class TestNcclEpPagedStashing:
             "the test is not exercising overflow"
         )
 
-        # Leave a clean slate. The EP context is process-wide and ep_bootstrap refuses a second
-        # call, so a later test would otherwise reuse this capacity. Drop the layers before
-        # finalizing and force a collection: this container has no __del__, so its EpBuffers
-        # would otherwise be freed at an arbitrary later point -- inside the next test, against
-        # a context that has since been re-bootstrapped.
-        import gc
-
-        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
-
-        del container
-        gc.collect()
-        nccl_ep_release_context()
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     def test_over_budget_recovery(self, zero_copy):
@@ -608,11 +619,9 @@ class TestNcclEpPagedStashing:
         if zero_copy and not is_nccl_ep_zero_copy_available():
             pytest.skip("NCCL EP zero-copy TE API is not available")
 
-        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
-
         config.ENABLE_EXPERIMENTAL = True
 
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=1,
             ep_size=4,
             pp_size=1,
@@ -640,39 +649,33 @@ class TestNcclEpPagedStashing:
         seq_length = 1024
         batch_size = 1
         hidden_states = torch.randn(
-            (seq_length, batch_size, container.config.hidden_size), dtype=torch.bfloat16
+            (seq_length, batch_size, self.container.config.hidden_size), dtype=torch.bfloat16
         )
 
-        def run():
-            paged_stash_reset(True, config=container.config)
-            paged_stash_init_chunk_handler(1, 0)
-            out, _, _, _ = _forward_backward_all_layers(container, hidden_states)
-            container.zero_grad()
-            torch.cuda.synchronize()
-            return out
-
         # 1. Undersized budget: the step drops tokens and reports it.
-        out_dropped = run()
-        over_1 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
-        req_1 = [l.token_dispatcher.check_required_capacity().item() for l in container.moe_layers]
+        out_dropped = self._run_step(hidden_states)
+        over_1 = [l.token_dispatcher.check_over_budget().item() for l in self.container.moe_layers]
+        req_1 = [
+            l.token_dispatcher.check_required_capacity().item() for l in self.container.moe_layers
+        ]
 
         required_t = torch.tensor([max(req_1)], dtype=torch.int64, device="cuda")
         torch.distributed.all_reduce(required_t, op=torch.distributed.ReduceOp.MAX)
         required = int(required_t.item())
-        budget_before = container.moe_layers[0].token_dispatcher._comm_manager._recv_capacity
+        budget_before = self.container.moe_layers[0].token_dispatcher._comm_manager._recv_capacity
 
         # 2. prepare_for_rerun: clear the capacity factor (-> eager, which has no budget to
         #    exceed), record the peak to grow to, release the EP context, replay dropless.
-        for layer in container.moe_layers:
+        for layer in self.container.moe_layers:
             layer.token_dispatcher.reset_over_budget()
             layer.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
             layer.token_dispatcher.grow_ep_recv_capacity(required)
             layer.token_dispatcher.invalidate_ep_bootstrap()
         nccl_ep_release_context()
 
-        out_replay = run()
-        eager_2 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
-        zc_2 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
+        out_replay = self._run_step(hidden_states)
+        eager_2 = [l.token_dispatcher._comm_manager.eager for l in self.container.moe_layers]
+        zc_2 = [l.token_dispatcher._comm_manager.zero_copy for l in self.container.moe_layers]
 
         dropped_finite = bool(torch.isfinite(out_dropped).all())
         replay_finite = bool(torch.isfinite(out_replay).all())
@@ -682,24 +685,25 @@ class TestNcclEpPagedStashing:
         dropped_differs = not torch.allclose(out_dropped, out_replay, rtol=1e-2, atol=0)
 
         # 3. Success branch: restore the capacity factor -> static returns at the grown budget.
-        for layer in container.moe_layers:
+        for layer in self.container.moe_layers:
             layer.token_dispatcher.reset_over_budget()
             layer.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = (
-                container.config.moe_expert_rank_capacity_factor
+                self.container.config.moe_expert_rank_capacity_factor
             )
             layer.token_dispatcher.invalidate_ep_bootstrap()
         nccl_ep_release_context()
 
-        out_restored = run()
-        eager_3 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
-        zc_3 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
-        caps_3 = [l.token_dispatcher._comm_manager._recv_capacity for l in container.moe_layers]
-        over_3 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
-        nccl_ep_release_context()
+        out_restored = self._run_step(hidden_states)
+        eager_3 = [l.token_dispatcher._comm_manager.eager for l in self.container.moe_layers]
+        zc_3 = [l.token_dispatcher._comm_manager.zero_copy for l in self.container.moe_layers]
+        caps_3 = [
+            l.token_dispatcher._comm_manager._recv_capacity for l in self.container.moe_layers
+        ]
+        over_3 = [l.token_dispatcher.check_over_budget().item() for l in self.container.moe_layers]
 
         assert required > budget_before, (
             f"nothing exceeded budget {budget_before} at capacity factor "
-            f"{container.config.moe_expert_rank_capacity_factor}; not exercising overflow"
+            f"{self.container.config.moe_expert_rank_capacity_factor}; not exercising overflow"
         )
         assert all(eager_2), f"replay did not degrade to eager: {eager_2}"
         assert not any(zc_2), f"replay must drop zero-copy while eager: {zc_2}"
@@ -726,8 +730,6 @@ class TestNcclEpPagedStashing:
         torch.testing.assert_close(out_restored, out_replay, rtol=1e-2, atol=0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
@@ -747,7 +749,7 @@ class TestNcclEpPagedStashing:
 
         config.ENABLE_EXPERIMENTAL = True
 
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=1,
             ep_size=4,
             pp_size=1,
@@ -776,23 +778,24 @@ class TestNcclEpPagedStashing:
 
         seq_length = 1024
         batch_size = 1
-        hidden_size = container.config.hidden_size
-        hidden_states = torch.randn((seq_length, batch_size, hidden_size), dtype=torch.bfloat16)
-
-        # First iteration: capture schedule, capacity, etc.
-        paged_stash_reset(True, config=container.config)
-        paged_stash_init_chunk_handler(1, 0)
-        output_ref, hidden_states_grad_ref, routing_map_ref, tokens_per_expert_ref = (
-            _forward_backward_all_layers(container, hidden_states)
+        hidden_states = torch.randn(
+            (seq_length, batch_size, self.container.config.hidden_size), dtype=torch.bfloat16
         )
 
-        container.zero_grad()
+        # First iteration: capture schedule, capacity, etc.
+        paged_stash_reset(True, config=self.container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        output_ref, hidden_states_grad_ref, routing_map_ref, tokens_per_expert_ref = (
+            _forward_backward_all_layers(self.container, hidden_states)
+        )
+
+        self.container.zero_grad()
 
         # Second iteration: run with paged stash.
-        paged_stash_reset(True, config=container.config)
+        paged_stash_reset(True, config=self.container.config)
         paged_stash_init_chunk_handler(1, 0)
         output, hidden_states_grad, routing_map, tokens_per_expert = _forward_backward_all_layers(
-            container, hidden_states
+            self.container, hidden_states
         )
 
         overflow = check_paged_stash_overflow()

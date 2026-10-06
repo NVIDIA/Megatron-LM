@@ -4,6 +4,13 @@
 
 from __future__ import annotations
 
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
+
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
+
 import argparse
 from functools import partial
 
@@ -29,7 +36,7 @@ from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import set_global_variables
+from megatron.training.global_vars import initialize_runtime_services, set_args, set_run_config
 from megatron.training.training import pretrain
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -45,11 +52,11 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 def _set_stock_parallel_args(args: argparse.Namespace) -> None:
     # validate_args and the stock training loop consume these fields.
-    args.tensor_model_parallel_size = args.llm_tp
-    args.pipeline_model_parallel_size = args.llm_pp
-    args.context_parallel_size = args.llm_cp
-    args.expert_model_parallel_size = args.llm_ep
-    args.expert_tensor_parallel_size = args.llm_expt_tp or 1
+    args.tensor_model_parallel_size = args.mimo_llm_tp
+    args.pipeline_model_parallel_size = args.mimo_llm_pp
+    args.context_parallel_size = args.mimo_llm_cp
+    args.expert_model_parallel_size = args.mimo_llm_ep
+    args.expert_tensor_parallel_size = args.mimo_llm_expt_tp or 1
 
 
 def _parse_and_validate() -> argparse.Namespace:
@@ -72,7 +79,10 @@ def _parse_and_validate() -> argparse.Namespace:
 
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
-            args.vocab_size, args.make_vocab_size_divisible_by, args.llm_tp, logging_enabled=False
+            args.vocab_size,
+            args.make_vocab_size_divisible_by,
+            args.mimo_llm_tp,
+            logging_enabled=False,
         )
     return args
 
@@ -80,7 +90,11 @@ def _parse_and_validate() -> argparse.Namespace:
 def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
-    set_global_variables(args, build_tokenizer=False)
+    set_args(args)
+    model_cfg = MimoBuildConfig()
+    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(cfg)
+    initialize_runtime_services(args, build_tokenizer=False)
     provider = resolve_provider(args)
 
     prefetch_loader = None
@@ -108,8 +122,8 @@ def main() -> None:
             return models
 
         hooks.append(capture_model)
-    model_cfg = MimoBuildConfig(_topology=topology, post_wrap_hooks=hooks)
-    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    model_cfg._topology = topology
+    model_cfg.post_wrap_hooks = hooks
 
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader

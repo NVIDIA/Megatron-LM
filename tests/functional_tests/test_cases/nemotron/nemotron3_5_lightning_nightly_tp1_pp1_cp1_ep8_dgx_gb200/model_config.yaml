@@ -1,4 +1,6 @@
 ENV_VARS:
+  # Keep the recipe's five-repeat default within its 90-minute budget.
+  N_REPEAT: 5
   NCCL_GRAPH_REGISTER: 0
   NCCL_NVLS_ENABLE: 0
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

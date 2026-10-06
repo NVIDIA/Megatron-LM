@@ -19,6 +19,7 @@ from megatron.core.utils import null_decorator
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 
     HAVE_TRITON = True
 except ImportError:
@@ -28,6 +29,7 @@ if not HAVE_TRITON:
     triton = MagicMock()
     triton.jit = null_decorator
     tl = MagicMock()
+    libdevice = MagicMock()
 
 from megatron.core.inference.moe import batch_invariant
 from megatron.core.inference.moe.activations import bounded_silu_mul
@@ -122,9 +124,11 @@ def _fused_moe_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    activation_clamp_scale,
     # Flags / constexprs
     MUL_ROUTED_WEIGHT: tl.constexpr,
     FUSE_SQUARED_RELU: tl.constexpr,
+    CLAMP_ACTIVATION: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -204,6 +208,17 @@ def _fused_moe_kernel(
             # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
             if FUSE_SQUARED_RELU:
                 accumulator = tl.maximum(accumulator, 0.0)
+                if CLAMP_ACTIVATION:
+                    # Tanh soft clamp of the pre-activation (training's
+                    # activation_func_tanh_clamp_scale), bounding the squared-relu output
+                    # by s**2.  Applied after the relu rather than before, which is exact:
+                    # s * tanh(x / s) is non-decreasing and maps 0 to 0, so it commutes
+                    # with the relu.  Kept in fp32 through the square, matching training's
+                    # fused weighted_clamped_squared_relu, which has no intermediate
+                    # downcast between the clamp and the square.
+                    accumulator = activation_clamp_scale * libdevice.tanh(
+                        accumulator / activation_clamp_scale
+                    )
                 accumulator *= accumulator
 
             if MUL_ROUTED_WEIGHT:
@@ -224,6 +239,98 @@ def _fused_moe_kernel(
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+class VllmFusedMoeBuffers:
+    """Class-level persistent intermediate buffers for the vLLM fused-MoE kernels.
+
+    Allocated once at engine init (from DynamicInferenceContext) so the hot
+    path performs no allocations inside CUDA graph capture, and every MoE
+    layer's graph shares this single buffer set. Without this, the
+    intermediates are allocated inside each layer's capture and recycled by
+    the shared graph mempool's free-list reuse — same net memory, but
+    addresses then depend on allocator policy rather than being fixed.
+
+    Sharing one set across all layers/graphs is safe because graph replays are
+    serialized on one stream and each buffer is fully rewritten (gated by the
+    indirection tables) before it is read within a single vllm_fused_moe call.
+
+    Like the dispatcher symmetric-memory buffers, these persist for the process
+    lifetime, including across engine suspend/resume: suspend deletes the CUDA
+    graphs (whose captures bake in these addresses), and resume re-captures
+    against the same live buffers. When not allocated (eager/standalone use,
+    tests), get() falls back to torch.empty.
+    """
+
+    # name -> flat 1D tensor; requests are served as sliced views.
+    _buffers: Optional[dict] = None
+
+    @classmethod
+    def allocate_buffers(
+        cls,
+        max_tokens: int,
+        topk: int,
+        fc1_output_size: int,
+        hidden_size: int,
+        num_local_experts: int,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Allocate worst-case-sized buffers. Must run outside CUDA graph capture.
+
+        Args:
+            max_tokens: max rows of the hidden states entering vllm_fused_moe
+                (for the NVLS dispatcher: per_rank_worst_case_token_count * ep_size).
+            topk: MoE router top-k.
+            fc1_output_size: per-expert FC1 output width (2x ffn size for gated).
+            hidden_size: hidden width at the MoE (moe_latent_size if set).
+            num_local_experts: experts on this rank.
+            device: target device (default: current CUDA device).
+        """
+        if device is None:
+            device = torch.cuda.current_device()
+        num_valid = max_tokens * topk
+        # Worst case over the BLOCK_SIZE_M choices in _get_default_config
+        # ({16, 32, 64, 128}): sorted ids are longest at block_m=128, the
+        # per-block expert table is longest at block_m=16.
+        max_sorted_worst = num_valid + 128 * (num_local_experts + 1)
+        max_blocks_worst = _ceil_div(num_valid, 16) + (num_local_experts + 1)
+        cls._buffers = {
+            'intermediate1': torch.empty(
+                num_valid * fc1_output_size, dtype=torch.bfloat16, device=device
+            ),
+            'intermediate3': torch.empty(
+                num_valid * hidden_size, dtype=torch.bfloat16, device=device
+            ),
+            'sorted_token_ids': torch.empty(max_sorted_worst, dtype=torch.int32, device=device),
+            'expert_ids': torch.empty(max_blocks_worst, dtype=torch.int32, device=device),
+            # _moe_sum output when no external buffer (e.g. RSV) is provided.
+            'moe_sum_out': torch.empty(
+                max_tokens * hidden_size, dtype=torch.float32, device=device
+            ),
+        }
+
+    @classmethod
+    def _delete_buffers(cls) -> None:
+        """Release the buffers (tests / re-init)."""
+        cls._buffers = None
+
+    @classmethod
+    def get(cls, name: str, shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
+        """Return a view of the persistent buffer, or torch.empty when not allocated
+        or the request does not fit (different dtype/device or larger than sized)."""
+        if cls._buffers is not None:
+            buf = cls._buffers.get(name)
+            numel = 1
+            for s in shape:
+                numel *= s
+            if (
+                buf is not None
+                and buf.dtype == dtype
+                and buf.device == torch.device(device)
+                and numel <= buf.numel()
+            ):
+                return buf[:numel].view(shape)
+        return torch.empty(shape, dtype=dtype, device=device)
 
 
 @triton.jit
@@ -331,8 +438,10 @@ def _moe_align_block_size_cuda_graphable(
     max_blocks = _ceil_div(max_sorted, block_size)
     sentinel = max_tokens * topk
 
-    sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
-    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+    sorted_token_ids = VllmFusedMoeBuffers.get(
+        "sorted_token_ids", (max_sorted,), torch.int32, device
+    )
+    expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
 
     INIT_BLOCK = 1024
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
@@ -388,12 +497,14 @@ def _invoke_fused_moe_kernel(
     config: dict,
     grid_size: int,
     fuse_squared_relu: bool = False,
+    activation_clamp_scale: Optional[float] = None,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass.
 
     Body matches upstream vLLM `fused_moe_kernel` (1 CTA per (pid_m, pid_n)
     tile, raw pointer arithmetic with `% N` on the N axis), apart from the
-    optional fused squared-relu activation in fp32.
+    optional fused squared-relu activation in fp32 and its optional tanh
+    soft clamp.
 
     `grid_size` is sized host-side from `num_tokens_hint` so launch overhead
     at decode is small.  When the actual padded length exceeds the hinted
@@ -422,8 +533,10 @@ def _invoke_fused_moe_kernel(
         B.stride(1),
         C.stride(0),
         C.stride(1),
+        activation_clamp_scale if activation_clamp_scale is not None else 0.0,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
+        CLAMP_ACTIVATION=fuse_squared_relu and activation_clamp_scale is not None,
         top_k=top_k,
         BLOCK_SIZE_M=config['BLOCK_SIZE_M'],
         BLOCK_SIZE_N=config['BLOCK_SIZE_N'],
@@ -541,7 +654,7 @@ def _moe_sum(
             order-independent by precision.
     """
     if out is None:
-        out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
+        out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
     BLOCK_M = _get_num_sms(input.device)
@@ -581,6 +694,7 @@ def vllm_fused_moe(
     routing_map: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
+    activation_clamp_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -604,6 +718,10 @@ def vllm_fused_moe(
         num_tokens_hint: optional host-side int with the expected number of
             valid tokens (e.g. batch_size * ep_size). Used to select a better
             BLOCK_SIZE_M instead of using the worst-case buffer size.
+        activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
+            squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
+            the square, bounding the activation output by ``s ** 2``. Only supported for
+            SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -656,14 +774,24 @@ def vllm_fused_moe(
 
     topk_weights_flat = probs.reshape(-1).contiguous()
 
-    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column c
-    # with c+N/2 across tiles and cannot, so FC1 runs unfused to the 2N-wide
-    # intermediate and gate/up is applied separately below.
+    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]. Outside
+    # batch-invariant mode, SQUARED_RELU fuses into the GEMM epilogue while
+    # SwiGLU runs separately. Batch-invariant mode runs both activations
+    # separately so their probability application and BF16 rounding match the
+    # training TEGroupedMLP path exactly.
     assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
     is_swiglu = activation_type == ActivationType.SWIGLU
-    intermediate1 = torch.empty(
-        num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
+    assert not (is_swiglu and activation_clamp_scale is not None), (
+        "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; the "
+        "gated form (SiTU-GLU) has no inference kernel yet."
+    )
+    fuse_squared_relu = not is_swiglu
+    if batch_invariant_mode:
+        # Apply the activation separately below to match training-side rounding.
+        fuse_squared_relu = False
+
+    intermediate1 = VllmFusedMoeBuffers.get(
+        "intermediate1", (num_valid, N), hidden_states.dtype, hidden_states.device
     )
     _invoke_fused_moe_kernel(
         hidden_states,
@@ -677,10 +805,12 @@ def vllm_fused_moe(
         top_k=topk,
         config=config,
         grid_size=grid_size_fc1,
-        fuse_squared_relu=not is_swiglu,
+        fuse_squared_relu=fuse_squared_relu,
+        activation_clamp_scale=activation_clamp_scale,
     )
-    if is_swiglu:
-        if batch_invariant_mode:
+    if batch_invariant_mode:
+        live_rows = (valid_tokens * topk).to(torch.int32)
+        if is_swiglu:
             # Match training: routing probabilities multiply at the activation
             # (before FC2), with the training kernel's exact rounding sequence
             # (single bf16 round of fp32 silu(gate)*up*prob). The reduction
@@ -691,18 +821,29 @@ def vllm_fused_moe(
                 intermediate1, topk_weights_flat, bound_elems
             )
         else:
-            # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
-            # SiLU(gate) * up over the valid_tokens*topk live rows only.
-            n_rows = (valid_tokens * topk).to(torch.int32)
-            intermediate1 = bounded_silu_mul(intermediate1, n_rows)
+            # Nemotron-style weighted squared-ReLU rounds the squared BF16
+            # activation before its FP32 probability multiply, then rounds to
+            # BF16 again. Reuse the training-parity kernel with the flattened
+            # routing map as the live-row mask.
+            intermediate1 = batch_invariant.squared_relu_with_probs(
+                intermediate1,
+                routing_map.reshape(-1),
+                live_rows,
+                topk_weights_flat,
+                activation_clamp_scale,
+            )
+    elif is_swiglu:
+        # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
+        # SiLU(gate) * up over the valid_tokens*topk live rows only.
+        intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
-    # Routing weights are applied in the reduction kernel to avoid an extra
-    # bf16 truncation of prob-scaled values before the topk summation.
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
+    # already applied routing weights at the activation to match training;
+    # ordinary inference applies them in the reduction kernel.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
-    intermediate3 = torch.empty(
-        num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
+    intermediate3 = VllmFusedMoeBuffers.get(
+        "intermediate3", (num_valid, K), hidden_states.dtype, hidden_states.device
     )
     _invoke_fused_moe_kernel(
         intermediate1,
@@ -722,6 +863,14 @@ def vllm_fused_moe(
     # Applies routing weights and accumulates in fp32, writes directly to
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
     # expert slots.
+    apply_routing_weights = True
+    accumulate_in_fp64 = False
+    if batch_invariant_mode:
+        # Probabilities were applied at the activation to mirror training. Use
+        # training's invariant within-rank accumulation for the unweighted sum.
+        apply_routing_weights = False
+        accumulate_in_fp64 = True
+
     return _moe_sum(
         intermediate3,
         probs,
@@ -733,9 +882,6 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
-        # Batch-invariant mode: probs were already applied at the activation
-        # for SwiGLU (training parity), so the reduction uses unit weights;
-        # fp64 accumulation makes the topk sum order-independent by precision.
-        apply_weights=not (batch_invariant_mode and is_swiglu),
-        acc_fp64=batch_invariant_mode and is_swiglu,
+        apply_weights=apply_routing_weights,
+        acc_fp64=accumulate_in_fp64,
     )

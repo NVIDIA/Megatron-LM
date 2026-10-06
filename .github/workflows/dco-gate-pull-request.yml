@@ -1,0 +1,64 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: DCO gate pull request
+
+# Reports the required `DCO gate` context the same way `Nemo_CICD_Test` and
+# `multi-approval-bot-summary` report theirs: as a job on the `pull-request/<n>` mirror push,
+# so the check run lands in a check suite keyed to a real branch of this repository.
+#
+# It replaces a publisher that mirrored the same verdict through the Checks API. GitHub pins
+# such a check run to the *first* check suite for its head SHA — for a fork pull request that
+# suite is keyed to the contributor's branch name, which does not exist here. When a merge box
+# fails to bind that suite it reports the gate as "Expected — waiting for status to be
+# reported" forever: a check run cannot move between suites, so neither updating the run in
+# place nor creating a replacement repairs it. A job has no such failure mode.
+#
+# This job is deliberately the only producer of the context for a pull-request head. Leaving
+# the publisher alongside it would race: branch protection reads whichever check run is newer,
+# so an API-published gate landing last would put the unbindable run back in front of the
+# merge box and reintroduce the bug. `dco-gate-merge-group.yml` still owns the merge queue,
+# where the head is a `gh-readonly-queue/**` ref this job does not run for.
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  checks: read
+  contents: read
+
+jobs:
+  DCO_gate:
+    name: DCO gate
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    steps:
+      # The pushed ref, not the default branch. The publisher this replaces ran from `main`
+      # on a `check_run` event, so pinning its scripts to the default branch was a real
+      # boundary; here the workflow file itself already comes from the mirror ref, so a
+      # change to the ref can neuter the job whatever the script says, and pinning buys
+      # nothing. It does cost: the script and the workflow that invokes it have to be the
+      # same revision, or the gate cannot be introduced or changed in a pull request at all.
+      - name: Checkout the mirrored pull-request scripts
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Verify the trusted DCO result
+        env:
+          DCO_GATE_MODE: verify
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/dco_gate.py

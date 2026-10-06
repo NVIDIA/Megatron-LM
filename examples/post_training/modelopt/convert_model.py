@@ -24,6 +24,8 @@ from megatron.post_training.utils import report_current_memory_info, to_empty_if
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
@@ -38,7 +40,10 @@ def add_convert_args(parser):
     """Add additional arguments for ModelOpt checkpoint convertion."""
     group = parser.add_argument_group(title='ModelOpt MCore checkpoint convertion')
     group.add_argument(
-        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
+        "--pretrained-model-path",
+        type=str,
+        default=None,
+        help="Deprecated: Hugging Face pretrained model. Use Megatron-Bridge to import checkpoints.",
     )
     group.add_argument(
         "--extra-model-path", type=str, default=None, help="Extra module weights to load"
@@ -100,11 +105,15 @@ def check_arguments():
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_convert_args, args_defaults={
+    args = parse_and_validate_args(extra_args_provider=add_convert_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
         })
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
     initialize_megatron()
     check_arguments()
 
@@ -132,6 +141,14 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
 
     if args.pretrained_model_path is not None:
+        warnings.warn(
+            "Importing Hugging Face checkpoints with --pretrained-model-path is deprecated. "
+            "Use Megatron-Bridge to create a Megatron-Core checkpoint, then load it with --load. "
+            "For Hugging Face quantization workflows, see "
+            "https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization.",
+            FutureWarning,
+            stacklevel=2,
+        )
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")

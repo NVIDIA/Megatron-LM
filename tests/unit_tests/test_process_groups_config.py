@@ -3,7 +3,11 @@
 import pytest
 import torch.distributed as dist
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -48,6 +52,24 @@ class TestProcessGroupsConfig:
         # Test attribute existence
         assert hasattr(grad_pgs, 'dp')
         assert grad_pgs.dp_cp is None  # Not set yet
+
+    def test_dp_fields_split_replicate_and_data_distribution_axes(self, mocker):
+        """``dp`` is the replicate group; ``dp_gtp_remat`` spans the gtp_remat data axis."""
+        replicate_pg = mocker.Mock(spec=dist.ProcessGroup)
+        data_pg = mocker.Mock(spec=dist.ProcessGroup)
+
+        def fake_get_data_parallel_group(*args, with_gtp_remat=True, **kwargs):
+            return data_pg if with_gtp_remat else replicate_pg
+
+        mocker.patch(
+            'megatron.core.process_groups_config.parallel_state.get_data_parallel_group',
+            side_effect=fake_get_data_parallel_group,
+        )
+
+        pgs = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['dp', 'dp_gtp_remat'])
+
+        assert pgs.dp is replicate_pg
+        assert pgs.dp_gtp_remat is data_pg
 
     def test_hierarchical_context_parallel_groups(self, mocker):
         """Test setting and accessing the hierarchical context parallel list."""
@@ -103,6 +125,58 @@ class TestProcessGroupsConfig:
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
         assert "hcp([2, 4])" in repr_str
+
+
+class TestResolveGtpRematGroup:
+    """resolve_gtp_remat_group must see through the multi-module wrapper.
+
+    Only the per-module collections carry gtp_remat / expt_gtp_remat. A MIMO run hands the
+    top-level MultiModuleProcessGroupCollection to callers such as
+    setup_model_and_optimizer's register_gtp_symm_pool, and without the unwrap the vars()
+    check misses and the MPU fallback answers None, because pretrain_mimo never initializes
+    the MPU globals. The visible symptom was --gtp-remat-nccl-ub registering nothing, so the
+    wgrad reduce-scatter never became symmetric and NCCL never chose an NVLS kernel.
+
+    These run without torch.distributed: the collections only need to carry sentinels.
+    """
+
+    def _llm_collection(self, mocker):
+        pgs = ProcessGroupCollection()
+        pgs.gtp_remat = mocker.Mock(spec=dist.ProcessGroup)
+        pgs.expt_gtp_remat = mocker.Mock(spec=dist.ProcessGroup)
+        return pgs
+
+    def test_plain_collection_is_returned_directly(self, mocker):
+        """The non-MIMO path is unchanged."""
+        pgs = self._llm_collection(mocker)
+
+        assert resolve_gtp_remat_group(pgs, is_expert=False) is pgs.gtp_remat
+        assert resolve_gtp_remat_group(pgs, is_expert=True) is pgs.expt_gtp_remat
+
+    def test_multi_module_unwraps_to_language_model(self, mocker):
+        """A colocated encoder + LLM rank resolves to the LLM's groups, not the encoder's."""
+        llm = self._llm_collection(mocker)
+        encoder = ProcessGroupCollection()
+        encoder.gtp_remat = mocker.Mock(spec=dist.ProcessGroup)
+        wrapper = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": encoder, "llm": llm}, language_model_module_name="llm"
+        )
+
+        assert resolve_gtp_remat_group(wrapper, is_expert=False) is llm.gtp_remat
+        assert resolve_gtp_remat_group(wrapper, is_expert=True) is llm.expt_gtp_remat
+        # Guards against unwrapping to whichever module happens to be first.
+        assert resolve_gtp_remat_group(wrapper, is_expert=False) is not encoder.gtp_remat
+
+    def test_multi_module_without_language_model_is_none(self, mocker):
+        """Encoder-only ranks own no GTP axis, and must not raise from the unwrap."""
+        encoder = ProcessGroupCollection()
+        encoder.gtp_remat = mocker.Mock(spec=dist.ProcessGroup)
+        wrapper = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": encoder}, language_model_module_name=None
+        )
+
+        assert resolve_gtp_remat_group(wrapper, is_expert=False) is None
+        assert resolve_gtp_remat_group(wrapper, is_expert=True) is None
 
 
 class TestPGConfigDefaultInitialization:

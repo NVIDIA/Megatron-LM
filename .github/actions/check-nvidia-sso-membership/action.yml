@@ -44,43 +44,13 @@ runs:
   steps:
     - name: Download NVIDIA SSO users from github-audits
       id: download-sso
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github_token }}
-      run: |
-        echo "Downloading ${{ inputs.sso_users_filename }} from ${{ inputs.github_audits_repo }} ${{ inputs.github_audits_version }} release..."
-
-        # Download the release asset using gh CLI
-        gh release download ${{ inputs.github_audits_version }} \
-          --repo ${{ inputs.github_audits_repo }} \
-          --pattern ${{ inputs.sso_users_filename }} \
-          --clobber 2>&1 || {
-            echo "ERROR: Failed to download ${{ inputs.sso_users_filename }} from github-audits release"
-            echo "sso_file_available=false" >> $GITHUB_OUTPUT
-            echo "user_count=0" >> $GITHUB_OUTPUT
-            exit 1
-          }
-
-        # Verify file was downloaded and is valid JSON
-        if [ ! -f ${{ inputs.sso_users_filename }} ]; then
-          echo "ERROR: ${{ inputs.sso_users_filename }} file not found after download"
-          echo "sso_file_available=false" >> $GITHUB_OUTPUT
-          echo "user_count=0" >> $GITHUB_OUTPUT
-          exit 1
-        fi
-
-        # Validate JSON structure
-        if ! jq -e 'type == "object"' ${{ inputs.sso_users_filename }} > /dev/null 2>&1; then
-          echo "ERROR: ${{ inputs.sso_users_filename }} is not a valid JSON object"
-          echo "sso_file_available=false" >> $GITHUB_OUTPUT
-          echo "user_count=0" >> $GITHUB_OUTPUT
-          exit 1
-        fi
-
-        USER_COUNT=$(jq 'length' ${{ inputs.sso_users_filename }})
-        echo "Successfully downloaded ${{ inputs.sso_users_filename }} with $USER_COUNT NVIDIA SSO users"
-        echo "sso_file_available=true" >> $GITHUB_OUTPUT
-        echo "user_count=$USER_COUNT" >> $GITHUB_OUTPUT
+      uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/check-nvidia-sso@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+      with:
+        username: ${{ inputs.username }}
+        github_audits_repo: ${{ inputs.github_audits_repo }}
+        github_audits_version: ${{ inputs.github_audits_version }}
+        sso_users_filename: ${{ inputs.sso_users_filename }}
+        github_token: ${{ inputs.github_token }}
 
     - name: Check if user is in SSO list
       id: check-membership

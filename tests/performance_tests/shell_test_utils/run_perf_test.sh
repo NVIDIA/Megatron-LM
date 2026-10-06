@@ -82,17 +82,15 @@ EP=$("$YQ" '.EP // 1' "$CONFIG_PATH")
 NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS // 512' "$CONFIG_PATH")
 NUM_OUTPUT_TOKENS=$("$YQ" '.NUM_OUTPUT_TOKENS' "$CONFIG_PATH")
 NUM_WARMUP_ITERS=$("$YQ" '.NUM_WARMUP_ITERS // 2' "$CONFIG_PATH")
-NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
+NUM_TIMED_ITERS=$(PLATFORM="$PLATFORM" "$YQ" '.NUM_TIMED_ITERS_BY_PLATFORM[strenv(PLATFORM)] // .NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 # Prompt source: 'synthetic' (default, fixed-length "hello "*N) or 'gsm8k'
 # (real prompts from the vendored client/data/gsm8k_prompts.jsonl). MoE and
 # hybrid models should use 'gsm8k' — synthetic input gives misleading
 # perf because every token is identical (uniform expert routing, hot KV).
 DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
-# Async prefill scheduling for dynamic batching. When true, the server is
-# launched with --inference-dynamic-batching-async-sched-mode async (overlaps
-# the prefill scheduler with GPU compute). Requires greedy sampling / no
-# logprobs / no stop words — the static benchmark client already satisfies
-# these (temperature 0.0, ignore_eos, no stop tokens, no logprobs requested).
+# Scheduler selection for the performance A/B baselines. True pins the async
+# scheduler; false (and a missing value) pins the legacy scheduler so changes to
+# the application default do not silently change an existing benchmark case.
 ASYNC_SCHED=$("$YQ" '.ASYNC_SCHED // false' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
@@ -114,6 +112,7 @@ echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WOR
 echo "[run_perf_test] coordinator workers: $COORDINATOR_WORKERS"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
+echo "[run_perf_test] warmup iterations=$NUM_WARMUP_ITERS  timed iterations=$NUM_TIMED_ITERS"
 
 # ── Build model args (substituting ${CHECKPOINT_LOAD_PATH}) ───────────────────
 
@@ -200,19 +199,28 @@ SERVER_COMMON_ARGS=(
     --host 0.0.0.0
 )
 
-# Enable async prefill scheduling when the test case opts in. Async scheduling
-# requires materialize_only_last_token_logits=True. run_dynamic_text_generation_server
-# force-sets return_log_probs=True (for echo/loglikelihood support), which would
-# flip materialize_only_last_token_logits to False; passing --skip-prompt-log-probs
-# keeps it True (materialize = not(return_log_probs and not skip_prompt_log_probs)).
-# The perf client never requests prompt logprobs, so this is a no-op for the metrics.
-if [[ "$ASYNC_SCHED" == "true" ]]; then
-    echo "[run_perf_test] async scheduling enabled (--inference-dynamic-batching-async-sched-mode async --skip-prompt-log-probs)"
-    SERVER_COMMON_ARGS+=(
-        --inference-dynamic-batching-async-sched-mode async
-        --skip-prompt-log-probs
-    )
-fi
+# Pin both sides of the scheduler A/B comparison instead of inheriting the
+# application default. Async cases retain their established prompt-log-prob
+# setting so the benchmark invocation remains stable.
+case "$ASYNC_SCHED" in
+    true)
+        echo "[run_perf_test] pinning async scheduling (--inference-dynamic-batching-async-sched-mode async --skip-prompt-log-probs)"
+        SERVER_COMMON_ARGS+=(
+            --inference-dynamic-batching-async-sched-mode async
+            --skip-prompt-log-probs
+        )
+        ;;
+    false)
+        echo "[run_perf_test] pinning legacy scheduling (--inference-dynamic-batching-async-sched-mode legacy)"
+        SERVER_COMMON_ARGS+=(
+            --inference-dynamic-batching-async-sched-mode legacy
+        )
+        ;;
+    *)
+        echo "[run_perf_test] error: ASYNC_SCHED must be true or false; got '$ASYNC_SCHED' from $CONFIG_PATH" >&2
+        exit 2
+        ;;
+esac
 
 (
     cd "$ROOT_DIR"

@@ -42,6 +42,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -55,9 +56,10 @@ else:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, False, None, None)
 
 
 def switch_load_balancing_loss_func(
@@ -280,8 +282,8 @@ def get_tokens_per_expert_and_token_count(
         local_tokens_per_expert, reduce_group
     )
     if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
+        local_num_tokens = local_tokens_per_expert.sum() // topk
+        total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
         total_num_tokens = local_num_tokens * reduce_group.size()
@@ -744,8 +746,10 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
     """
-    # Transpose to [num_experts, num_tokens] for easier row-wise operations
-    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+    # Work on a copy because fused router autograd saves the returned routing
+    # map for backward. Padding a transposed view in place would increment the
+    # saved tensor's version counter and make backward fail.
+    routing_map = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
 
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
@@ -776,6 +780,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -804,6 +809,8 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices (e.g. for quantile balancing). Defaults to None.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -813,7 +820,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -844,6 +852,11 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
+            **(
+                {"topk_indices": topk_indices}
+                if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None
+                else {}
+            ),
         )
 
     def _compute_topk(
@@ -957,6 +970,31 @@ def topk_routing_with_score_function(
     return routing_probs, routing_map
 
 
+def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Compute the normalized score distribution over all experts.
+
+    Args:
+        logits: Router logits with experts in the final dimension.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`.
+
+    Returns:
+        Float32 normalized router scores with the same shape as `logits`.
+
+    Raises:
+        ValueError: If `score_function` is unsupported.
+    """
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1, dtype=torch.float32)
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
+    return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
+
 def compute_routing_scores_for_aux_loss(
     logits: torch.Tensor,
     topk: int,
@@ -972,9 +1010,9 @@ def compute_routing_scores_for_aux_loss(
         score_function (str): The score function to use. Can be "softmax", "sigmoid"
                               or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
@@ -993,16 +1031,7 @@ def compute_routing_scores_for_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
     else:
-        if score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float())
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        elif score_function == "sqrtsoftplus":
-            scores = torch.nn.functional.softplus(logits.float()).sqrt()
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        else:
-            raise ValueError(f"Invalid score_function: {score_function}")
+        scores = compute_normalized_router_scores(logits, score_function)
 
         _, top_indices = torch.topk(scores, k=topk, dim=1)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
@@ -1223,9 +1252,15 @@ def get_updated_expert_bias(
 
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
-        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
-        offset = average_tokens - tokens_per_expert
-        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
+        num_experts = tokens_per_expert.shape[-1]
+        total_tokens = tokens_per_expert.sum(dim=-1, keepdim=True)
+        # Compare each tokens_per_expert value with the row average without converting the integer
+        # counts to floating point: tokens_per_expert < total / num_experts iff
+        # tokens_per_expert * num_experts < total.
+        update_direction = torch.sign(total_tokens - tokens_per_expert * num_experts)
+        updated_expert_bias = (
+            expert_bias + update_direction.to(dtype=expert_bias.dtype) * expert_bias_update_rate
+        )
         return updated_expert_bias
 
 

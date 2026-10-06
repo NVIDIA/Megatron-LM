@@ -80,6 +80,58 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     assert not torch.equal(old_inference_output, training_output)
 
 
+def test_padded_squared_relu_applies_tanh_soft_clamp():
+    """config.activation_func_tanh_clamp_scale bounds the activation by ``s ** 2``.
+
+    The reference keeps the clamped pre-activation in FP32 to match training's fused
+    ``weighted_clamped_squared_relu``, rather than composing
+    ``squared_relu(tanh_soft_clamp(x, s))`` — ``tanh_soft_clamp`` downcasts on return, so
+    that composition squares a BF16 value instead.
+    """
+    from megatron.core.activations import squared_relu
+    from megatron.core.inference.moe.activations import padded_squared_relu
+
+    torch.manual_seed(23)
+    rows, hidden, clamp_scale = 37, 512, 16.0
+    # Scaled past the clamp so the tanh saturates; inside the linear region a dropped
+    # clamp would be indistinguishable.
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 50.0
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    clamped = padded_squared_relu(x, permutation_map, _vt(rows), clamp_scale=clamp_scale)
+    c = clamp_scale * torch.tanh(torch.clamp(x.float(), min=0.0) / clamp_scale)
+    expected = (c**2).to(torch.bfloat16)
+
+    # Bit-exact: no GEMM is involved, so the only op that could differ from the reference
+    # is libdevice.tanh vs torch.tanh, and those agree in fp32.
+    assert torch.equal(clamped, expected)
+    assert clamped.max().item() <= clamp_scale**2
+    # clamp_scale=None must leave the existing unclamped path bit-identical.
+    assert torch.equal(padded_squared_relu(x, permutation_map, _vt(rows)), squared_relu(x))
+
+
+def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
+    """The clamped batch-invariant kernel reproduces training's rounding sequence exactly.
+
+    Compares against the fused training kernel itself, so a change to its rounding order
+    surfaces here rather than silently diverging.
+    """
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_clamped_squared_relu
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    torch.manual_seed(29)
+    rows, hidden, clamp_scale = 37, 512, 16.0
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 50.0
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs, clamp_scale)
+    # Training applies the routing probability as a [rows, 1] weight broadcast over hidden.
+    expected = weighted_clamped_squared_relu(x, probs.unsqueeze(1), clamp_scale)
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 
@@ -286,6 +338,56 @@ class TestPermuteTokens:
         real_mask = perm_map_used >= 0
         assert padding_mask.sum() > 0, "Expected some padding rows with large alignment"
         assert real_mask.sum() > 0, "Expected some real rows"
+
+    def test_zero_padding_rows_for_grouped_gemm(self):
+        """The MXFP8 path materializes zeros while empty experts stay at zero rows."""
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        num_tokens, hidden_dim, num_experts = 19, 64, 4
+        hidden = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(num_tokens, 2, device="cuda", dtype=torch.float32)
+        # Expert 3 is deliberately absent; the other counts are not 128-aligned.
+        routing_map = torch.tensor(
+            [[token % 3, (token + 1) % 3] for token in range(num_tokens)],
+            device="cuda",
+            dtype=torch.int64,
+        )
+
+        permuted, _, permutation_map, offsets = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(num_tokens),
+            alignment=128,
+            row_alignment=128,
+            zero_padding=True,
+        )
+
+        n_used = offsets[-1].item()
+        padding_mask = permutation_map[:n_used] == -1
+        assert padding_mask.any()
+        assert torch.count_nonzero(permuted[:n_used][padding_mask]) == 0
+
+        splits = torch.cat((offsets[:1], offsets[1:] - offsets[:-1]))
+        assert splits.tolist() == [128, 128, 128, 0]
+
+    @pytest.mark.parametrize("activation", ["squared_relu", "swiglu"])
+    def test_activation_zeroes_grouped_gemm_padding(self, activation):
+        """FC2 quantization sees zeros for every aligned padding row."""
+        from megatron.core.inference.moe.activations import padded_squared_relu, padded_swiglu
+
+        rows, width, real_rows = 256, 64, 13
+        permutation_map = torch.full((rows,), -1, device="cuda", dtype=torch.int32)
+        permutation_map[:real_rows] = torch.arange(real_rows, device="cuda", dtype=torch.int32)
+        input_width = 2 * width if activation == "swiglu" else width
+        x = torch.randn(rows, input_width, device="cuda", dtype=torch.bfloat16)
+        func = padded_swiglu if activation == "swiglu" else padded_squared_relu
+
+        output = func(x, permutation_map, _vt(rows), zero_padding=True)
+
+        assert torch.count_nonzero(output[real_rows:]) == 0
 
     @pytest.mark.parametrize(
         "num_tokens,topk,num_experts", [(16, 2, 4), (32, 4, 8), (64, 6, 16), (128, 8, 128)]
