@@ -381,9 +381,17 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "boolean-file-count",
         "negative-file-count",
         "fractional-file-count",
+        "string-path-count",
+        "boolean-path-count",
+        "negative-path-count",
+        "fractional-path-count",
+        "missing-path-count",
         "truncated-files",
         "empty-pr",
+        "renamed-files",
+        "maximum-renames",
         "too-many-files",
+        "too-many-paths",
         "wrong-sha",
     ],
 )
@@ -400,9 +408,15 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         fake_command = fake_bin / name
         fake_command.write_text('#!/bin/sh\necho "$0 $*" >> "$COMMAND_LOG"\nexit 99\n')
         fake_command.chmod(0o755)
-    expected_files = (
-        [] if restore == "empty-pr" else ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
-    )
+    if restore == "empty-pr":
+        expected_files = []
+    elif restore in {"maximum-renames", "too-many-files", "too-many-paths"}:
+        count = {"maximum-renames": 6000, "too-many-files": 3001, "too-many-paths": 6001}[restore]
+        expected_files = [f"megatron/core/file_{index}.py" for index in range(count)]
+    else:
+        expected_files = ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
+        if restore == "renamed-files":
+            expected_files.append("megatron/core/old_a.py")
     pr_files_dir = tmp_path / "pr-files"
     pr_files_dir.mkdir()
     (pr_files_dir / "changed-files").write_text("".join(f"{path}\n" for path in expected_files))
@@ -410,14 +424,24 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         "tested_sha": ("d" if restore == "wrong-sha" else "c") * 40,
         "changed_files": {
             "empty-pr": 0,
-            "truncated-files": 3,
             "too-many-files": 3001,
+            "maximum-renames": 3000,
+            "too-many-paths": 3000,
             "string-file-count": "2",
             "boolean-file-count": True,
             "negative-file-count": -1,
             "fractional-file-count": 1.5,
         }.get(restore, 2),
+        "changed_paths": {
+            "truncated-files": 3,
+            "string-path-count": "2",
+            "boolean-path-count": True,
+            "negative-path-count": -1,
+            "fractional-path-count": 1.5,
+        }.get(restore, len(expected_files)),
     }
+    if restore == "missing-path-count":
+        metadata.pop("changed_paths")
     metadata_file = pr_files_dir / "metadata.json"
     metadata_file.write_text(json.dumps(metadata))
     if restore == "artifact-missing":
@@ -481,7 +505,14 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    valid = restore in {"valid", "different-image", "missing-image", "empty-pr"}
+    valid = restore in {
+        "valid",
+        "different-image",
+        "missing-image",
+        "empty-pr",
+        "renamed-files",
+        "maximum-renames",
+    }
     assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
@@ -491,7 +522,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     assert (_snapshot(pr_files_dir) if pr_files_dir.exists() else {}) == artifact_before
     if valid:
         assert "b" * 40 in summary.read_text()
-        assert f"Changed files in PR: {len(expected_files)}" in summary.read_text()
+        assert f"Changed paths in PR: {len(expected_files)}" in summary.read_text()
         assert changed_files is not None
         assert changed_files[0].decode().splitlines() == expected_files
     else:

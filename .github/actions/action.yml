@@ -231,12 +231,13 @@ runs:
               # Configure fetches the PR's files once for all buckets. The
               # artifact is tied to the tested commit, not the Testmon baseline.
               if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
-                && PR_CHANGED_FILES=$(jq -er --arg sha "$TESTED_SHA" \
-                  'select(.tested_sha == $sha) | .changed_files |
-                   select(type == "number" and . >= 0 and . <= 3000 and floor == .)' \
+                && PR_CHANGED_PATHS=$(jq -er --arg sha "$TESTED_SHA" \
+                  'select(.tested_sha == $sha) |
+                   select(.changed_files | type == "number" and . >= 0 and . <= 3000 and floor == .) |
+                   .changed_paths | select(type == "number" and . >= 0 and . <= 6000 and floor == .)' \
                   "$PR_FILES_DIR/metadata.json") \
-                && CHANGED_FILES=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
-                && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
+                && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
+                && [[ "$CHANGED_PATHS" == "$PR_CHANGED_PATHS" ]] \
                 && cp "$PR_FILES_DIR/changed-files" assets_dir/testmon/changed-files; then
                 EFFECTIVE_MODE=enforce
               else
@@ -267,7 +268,7 @@ runs:
             echo "- Restored cache key: ${MATCHED_KEY:-none}"
           fi
           if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
-            echo "- Changed files in PR: ${CHANGED_FILES}"
+            echo "- Changed paths in PR: ${CHANGED_PATHS}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
             echo "- Fallback: $FALLBACK_REASON"

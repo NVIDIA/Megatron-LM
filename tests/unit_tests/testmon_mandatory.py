@@ -67,8 +67,12 @@ def triggered_patterns(
 
 
 def mandatory_files(patterns: list[str], bucket: str, ignored: set[str]) -> list[str]:
-    """Expand test patterns to the pytest files that belong to the current bucket."""
+    """Expand mapped files, directories, and globs within the current bucket."""
     bucket_files = set(expand_pattern(bucket)) - ignored
+    patterns = [
+        pattern.rstrip("/") + "/**/*.py" if Path(pattern).is_dir() else pattern
+        for pattern in patterns
+    ]
     return sorted(
         {
             test_file

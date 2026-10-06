@@ -460,6 +460,7 @@ jobs:
           TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
         run: |
           PR_FILES_DIR="$RUNNER_TEMP/unit-test-pr-files"
+          PR_FILES_RESPONSE="$RUNNER_TEMP/unit-test-pr-files-response.json"
           # Fetch once for all buckets. Missing or stale PR data leaves no
           # artifact ID, so consumers fall back to the full unit-test bucket.
           if mkdir -p "$PR_FILES_DIR" \
@@ -469,13 +470,26 @@ jobs:
                   && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
                   && "$PR_CHANGED_FILES" -le 3000 ]] \
             && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-              --jq '.[].filename' > "$PR_FILES_DIR/changed-files" \
-            && CHANGED_FILES=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
+              > "$PR_FILES_RESPONSE" \
+            && CHANGED_FILES=$(jq -se '
+              def valid_path: type == "string" and length > 0 and (test("[\r\n]") | not);
+              if length > 0 and all(.[]; type == "array") then add
+              else error("Expected PR file pages") end
+              | if all(.[]; (.filename | valid_path)
+                  and (if .status == "renamed" or has("previous_filename")
+                       then (.previous_filename | valid_path) else true end))
+                then length else error("Invalid PR file record") end
+              ' "$PR_FILES_RESPONSE") \
             && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
+            && jq -sr '[.[][] | .filename, (.previous_filename // empty)] | unique[]' \
+              "$PR_FILES_RESPONSE" > "$PR_FILES_DIR/changed-files" \
+            && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
             && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
             && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]] \
             && jq -n --arg tested_sha "$TESTED_SHA" --argjson changed_files "$CHANGED_FILES" \
-              '{tested_sha: $tested_sha, changed_files: $changed_files}' > "$PR_FILES_DIR/metadata.json"; then
+              --argjson changed_paths "$CHANGED_PATHS" \
+              '{tested_sha: $tested_sha, changed_files: $changed_files, changed_paths: $changed_paths}' \
+              > "$PR_FILES_DIR/metadata.json"; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; unit-test buckets will run in full."

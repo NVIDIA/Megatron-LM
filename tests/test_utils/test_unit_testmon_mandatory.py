@@ -47,6 +47,10 @@ def project(tmp_path, monkeypatch):
         "tests/unit_tests/foo/nested/test_b.py",
         "tests/unit_tests/foo/conftest.py",
         "tests/unit_tests/foo/helpers.py",
+        "tests/unit_tests/baz/test_a.py",
+        "tests/unit_tests/baz/nested/test_b.py",
+        "tests/unit_tests/baz/conftest.py",
+        "tests/unit_tests/baz/helpers.py",
         "tests/unit_tests/test_bar.py",
         "tests/unit_tests/test_other.py",
     ):
@@ -68,6 +72,30 @@ def test_repository_config_is_valid():
             for pattern in patterns:
                 base = pattern.split("/**")[0].rsplit("/", 1)[0] if "*" in pattern else pattern
                 assert (ROOT / base).exists(), pattern
+
+
+def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypatch, capsys):
+    monkeypatch.chdir(ROOT)
+    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/gb200/unit-tests.yaml").read_text())
+    buckets = [case for product in recipe["products"] for case in product["test_case"]]
+    bucket = "tests/unit_tests/**/*.py"
+    assert bucket in buckets
+    finder = sys.modules["find_test_cases"]
+    monkeypatch.setattr(finder, "get_test_cases", lambda _: buckets)
+    monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, "gb200"])
+    finder.main()
+    ignored = {line.removeprefix("--ignore=") for line in capsys.readouterr().out.splitlines()}
+
+    _, patterns = mandatory.triggered_patterns(
+        mandatory.load_mappings(CONFIG_PATH),
+        ["megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/__init__.py"],
+        "dgx_gb200",
+    )
+    assert mandatory.mandatory_files(patterns, bucket, ignored) == [
+        "tests/unit_tests/distributed/mfsdp_v2/test_mcore_adapter.py",
+        "tests/unit_tests/distributed/mfsdp_v2/test_quantization.py",
+        "tests/unit_tests/distributed/mfsdp_v2/test_quantized_dbuffer.py",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -156,6 +184,19 @@ def test_mandatory_files_are_restricted_to_the_bucket_and_test_modules(project):
         "tests/unit_tests/test_bar.py"
     ]
     assert mandatory.mandatory_files(patterns, "tests/unit_tests/test_other.py", set()) == []
+
+
+@pytest.mark.parametrize("directory", ["tests/unit_tests/baz", "tests/unit_tests/baz/"])
+def test_mandatory_directory_mapping_expands_recursively(project, directory):
+    bucket = "tests/unit_tests/baz/**/*.py"
+    assert mandatory.mandatory_files([directory], bucket, set()) == [
+        "tests/unit_tests/baz/nested/test_b.py",
+        "tests/unit_tests/baz/test_a.py",
+    ]
+    assert mandatory.mandatory_files([directory], bucket, {"tests/unit_tests/baz/test_a.py"}) == [
+        "tests/unit_tests/baz/nested/test_b.py"
+    ]
+    assert mandatory.mandatory_files([directory], "tests/unit_tests/foo/**/*.py", set()) == []
 
 
 def test_merge_selection_replaces_node_ids_of_mandatory_files(tmp_path):
