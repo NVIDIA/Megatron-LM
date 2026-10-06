@@ -112,6 +112,28 @@ def test_qb_rejects_nonzero_aux_loss():
         _config(moe_aux_loss_coeff=0.01)
 
 
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(8, 8), (1, 1), (8, 9), (8, 0), (8, -1)])
+def test_qb_rejects_invalid_topk(scope, num_experts, topk):
+    with pytest.raises(ValueError, match="0 < moe_router_topk < num_moe_experts"):
+        _config(
+            moe_router_quantile_balancing_estimation_scope=scope,
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+        )
+
+
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(2, 1), (8, 1), (8, 7)])
+def test_qb_accepts_valid_topk(scope, num_experts, topk):
+    config = _config(
+        moe_router_quantile_balancing_estimation_scope=scope,
+        num_moe_experts=num_experts,
+        moe_router_topk=topk,
+    )
+    assert config.moe_router_topk == topk
+
+
 def test_qb_treats_negative_capacity_as_disabled():
     config = _config(moe_expert_capacity_factor=-1.0)
     assert config.moe_expert_capacity_factor is None
@@ -135,7 +157,6 @@ def test_qb_rejects_active_expert_capacity():
         ({"moe_router_num_groups": 2, "moe_router_group_topk": 1}, "does not support group"),
         ({"moe_enable_routing_replay": True}, "does not support routing replay"),
         ({"moe_expert_rank_capacity_factor": 1.0}, "expert-rank capacity requires"),
-        ({"moe_router_topk": 4}, "requires.*0 < moe_router_topk"),
         ({"moe_router_qb_num_bins": 1}, "must be greater than one"),
     ],
 )
