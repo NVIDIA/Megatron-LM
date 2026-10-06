@@ -39,6 +39,11 @@ class Request(IntEnum):
     KV_TRANSFER_READY = 30  # Decode committed destinations for a two-sided transfer.
     REQUEST_ABORTED = 31  # Engine confirms cancellation is safe to finalize.
     RELEASE_KV_ACK = 32  # Coordinator accepted a fenced source release.
+    REGISTER_KV = 33  # Source engine retained a handoff.
+    CLAIM_KV = 34  # Decode attempt claims source state before importing it.
+    CLAIM_KV_ACK = 35
+    RELEASE_KV_OWNER = 36  # Supervisor confirms all ranks of an attempt exited.
+    RELEASE_KV_OWNER_ACK = 37
 
 
 class Control(IntEnum):

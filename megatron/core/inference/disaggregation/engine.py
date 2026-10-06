@@ -10,6 +10,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_request import DynamicInferenceRequest, FinishedRequestRecord
 from megatron.core.utils import internal_api
 
 
@@ -21,6 +22,19 @@ class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInfe
     install the coordinator-native registration protocol below.
     """
 
+    def _send_requests_to_coordinator(self, requests: list[DynamicInferenceRequest]) -> None:
+        """Register external handoffs before publishing their source descriptors."""
+        if self._get_disaggregation_config() is None:
+            # External control planes need ownership at the source before the
+            # adapter can publish metadata to a decode worker. Same-socket ordering
+            # guarantees REGISTER_KV is processed before ENGINE_REPLY.
+            for request in requests:
+                if request.disaggregated_params:
+                    self.socket_for_receiving_requests.send(
+                        msgpack.packb([Headers.REGISTER_KV.value, request.request_id])
+                    )
+        super()._send_requests_to_coordinator(requests)
+
 
 class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     """Dynamic inference engine with prefill/decode state hand-off support.
@@ -28,6 +42,17 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     This subclass adds the coordinator-native registration callbacks. External
     control planes should use :class:`StateHandoffDynamicInferenceEngine`.
     """
+
+    def _serialize_finished_request(
+        self, request: DynamicInferenceRequest, finished_metadata: FinishedRequestRecord | None
+    ) -> dict:
+        """Send only handoff metadata on the internal prefill-to-decode hop."""
+        if self._is_disaggregated_role("prefill") and request.disaggregated_params:
+            return {
+                "request_id": request.request_id,
+                "disaggregated_params": request.disaggregated_params,
+            }
+        return super()._serialize_finished_request(request, finished_metadata)
 
     @internal_api
     def set_disaggregation_config(

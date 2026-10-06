@@ -76,6 +76,7 @@ def test_invalid_role_registration_replies_without_raising():
 def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator():
     coordinator = unittest.mock.MagicMock(
         known_clients={b"client"},
+        enable_prefix_caching=False,
         next_request_id=0,
         request_id_to_client_id={},
         request_id_to_client_request_id={},
@@ -101,7 +102,9 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
 
     DataParallelInferenceCoordinator.start(coordinator)
 
-    coordinator.disagg.route_submit.assert_called_once_with(0, [1], {})
+    coordinator.disagg.route_submit.assert_called_once_with(
+        0, msgpack.packb([1]), {}, [], msgpack.packb(None)
+    )
     assert coordinator.next_request_id == 1
     assert coordinator.client_request_to_request_id == {(b"client", 8): 0}
     destination, payload = coordinator.router_socket.send_multipart.call_args.args[0]

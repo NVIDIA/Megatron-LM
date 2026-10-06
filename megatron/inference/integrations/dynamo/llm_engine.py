@@ -11,6 +11,7 @@ import queue
 import signal
 import sys
 import threading
+import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Optional
@@ -41,7 +42,7 @@ from megatron.core.inference.inference_client import InferenceClient, InferenceR
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
-from megatron.inference.integrations.dynamo.handoff_journal import HandoffJournal, HandoffRelease
+from megatron.inference.integrations.dynamo.handoff_recovery import HandoffRelease
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
 logger = logging.getLogger(__name__)
@@ -124,14 +125,8 @@ class MegatronLLMEngine(LLMEngine):
         self._release_locks: dict[str, asyncio.Lock] = {}
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._handoff_recovery_task: asyncio.Task | None = None
-        self._handoff_journal: HandoffJournal | None = None
-        if config.handoff_journal:
-            if config.role != "decode" or not config.handoff_owner:
-                raise ValueError("Handoff journaling requires a decode role and unique owner")
-            self._handoff_journal = HandoffJournal(config.handoff_journal)
-            self._handoff_journal.start_owner(config.handoff_owner)
-        elif config.role == "decode" and config.engine_launch_mode == "external":
-            raise ValueError("Externally managed decode requires a persistent handoff journal")
+        self._handoff_owner = config.handoff_owner or uuid.uuid4().hex
+        self._pending_releases: set[HandoffRelease] = set()
         self._request_waiters: dict[str, asyncio.Future] = {}
         self._engine_progress = 0
         self._request_ids: dict[str, int] = {}
@@ -222,13 +217,21 @@ class MegatronLLMEngine(LLMEngine):
 
         readiness = await self._wait_for_readiness()
         endpoint = InferenceEngineEndpoint.from_dict(readiness)
-        self.client = InferenceClient(endpoint.coordinator_address, deserialize=False)
+        capabilities = endpoint.capabilities
+        self.client = InferenceClient(
+            endpoint.coordinator_address,
+            deserialize=False,
+            block_size_tokens=(
+                capabilities.kv_cache_block_size if capabilities.enable_prefix_caching else None
+            ),
+            prefix_caching_coordinator_policy=capabilities.prefix_caching_coordinator_policy,
+        )
         self.client.start(
             loop=asyncio.get_running_loop(),
             connect_timeout_seconds=min(30.0, self.config.engine_start_timeout),
         )
         self._engine_endpoint = endpoint
-        if self._handoff_journal is not None:
+        if self.config.role == "decode":
             self._handoff_recovery_task = asyncio.create_task(self._recover_handoffs())
         if self._process is not None:
             self._process_monitor = asyncio.create_task(self._monitor_process())
@@ -238,7 +241,7 @@ class MegatronLLMEngine(LLMEngine):
             "component": self.config.component,
             "endpoint": self.config.endpoint,
             "role": self.config.role,
-            "handoff_owner": self.config.handoff_owner,
+            "handoff_owner": self._handoff_owner,
         }
         logger.info("Dynamo worker identity: %s", json.dumps(identity, sort_keys=True))
         if self.config.worker_id_file is not None:
@@ -403,32 +406,24 @@ class MegatronLLMEngine(LLMEngine):
             return
 
         release: dict[str, Any] = {}
-        receipt: str | None = None
         if self.config.role == "decode" and not probe:
             prefill = require_prefill_result(request, DisaggregationMode.DECODE)
             disagg = prefill.get("disaggregated_params") or {}
             release = disagg.get("release") or {}
-            if self._handoff_journal is not None:
-                # Durability must precede submission: the parent may die while
-                # decode ranks still have outstanding NIXL reads.
-                record_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        self._handoff_journal.record,
-                        self.config.handoff_owner,
-                        HandoffRelease.from_metadata(release),
-                    )
-                )
-                waiter = asyncio.shield(record_task)
-                self._request_waiters[context_id] = waiter
-                try:
-                    receipt = await waiter
-                    if self._request_waiters.get(context_id) is not waiter or self._shutting_down:
-                        raise asyncio.CancelledError
-                except BaseException:
-                    self._schedule_cleanup(self._release_unsubmitted_handoff(record_task, release))
-                    raise
-                finally:
-                    self._request_waiters.pop(context_id, None)
+            # The source keeps ownership independently of this adapter. Claim it
+            # before submitting reads; cancellation must not discard the claim ACK.
+            claim_task = asyncio.create_task(self._claim_remote_handoff(release))
+            waiter = asyncio.shield(claim_task)
+            self._request_waiters[context_id] = waiter
+            try:
+                await waiter
+                if self._request_waiters.get(context_id) is not waiter or self._shutting_down:
+                    raise asyncio.CancelledError
+            except BaseException:
+                self._schedule_cleanup(self._release_unsubmitted_handoff(claim_task, release))
+                raise
+            finally:
+                self._request_waiters.pop(context_id, None)
             stream = self.client.add_request_with_kv_handoff_streaming(
                 token_ids, params, disagg.get("kv_meta") or {}, list(disagg.get("block_ids") or [])
             )
@@ -442,7 +437,7 @@ class MegatronLLMEngine(LLMEngine):
             async for chunk in self._stream_chunks(stream, token_ids, params):
                 source_safe = True
                 if not released and self.config.role == "decode":
-                    self._schedule_cleanup(self._release_recorded_handoff(release, receipt))
+                    self._schedule_cleanup(self._release_completed_handoff(release))
                     released = True
                 yield chunk
         except InferenceRequestError as error:
@@ -458,7 +453,7 @@ class MegatronLLMEngine(LLMEngine):
                             timeout=self.config.drain_timeout,
                         )
                     if source_safe:
-                        self._schedule_cleanup(self._release_recorded_handoff(release, receipt))
+                        self._schedule_cleanup(self._release_completed_handoff(release))
                 except Exception:
                     logger.exception("Failed to finish cancelled Megatron handoff")
 
@@ -569,6 +564,20 @@ class MegatronLLMEngine(LLMEngine):
     async def _release_remote_handoff(
         self, address: str, request_id: int, instance_id: str
     ) -> None:
+        await self._remote_handoff_command(address, request_id, instance_id)
+
+    async def _claim_remote_handoff(self, metadata: dict) -> None:
+        release = HandoffRelease.from_metadata(metadata)
+        await self._remote_handoff_command(
+            release.coordinator_addr,
+            release.request_id,
+            release.coordinator_instance_id,
+            owner=self._handoff_owner,
+        )
+
+    async def _remote_handoff_command(
+        self, address: str, request_id: int, instance_id: str, *, owner: str | None = None
+    ) -> None:
         lock = self._release_locks.setdefault(address, asyncio.Lock())
         async with asyncio.timeout(_RELEASE_TIMEOUT), lock:
             socket = self._release_sockets.get(address)
@@ -585,63 +594,69 @@ class MegatronLLMEngine(LLMEngine):
                 # replacement's known-client set is empty. Register on every use.
                 await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
                 reply = msgpack.unpackb(await socket.recv(), raw=False)
-                if Headers(reply[0]) != Headers.CONNECT_ACK or len(reply) != 2:
-                    raise RuntimeError("Handoff release requires a coordinator instance ID")
+                if len(reply) != 2 or reply[0] != Headers.CONNECT_ACK.value:
+                    raise RuntimeError("Handoff control requires a coordinator instance ID")
                 if reply[1] != instance_id:
+                    if owner is not None:
+                        raise RuntimeError("Cannot claim a handoff from a replaced source")
                     # The old coordinator/engine incarnation is gone. Never
                     # release a recycled request ID in its replacement.
                     return
-                await socket.send(
-                    msgpack.packb(
-                        [Headers.RELEASE_KV.value, int(request_id), instance_id], use_bin_type=True
-                    )
+                command = (
+                    [Headers.CLAIM_KV.value, int(request_id), instance_id, owner]
+                    if owner is not None
+                    else [Headers.RELEASE_KV.value, int(request_id), instance_id]
                 )
+                await socket.send(msgpack.packb(command, use_bin_type=True))
                 reply = msgpack.unpackb(await socket.recv(), raw=False)
-                if reply != [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]:
-                    raise RuntimeError("Unexpected handoff release acknowledgement")
+                expected = (
+                    [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id, True]
+                    if owner is not None
+                    else [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]
+                )
+                if reply != expected:
+                    raise RuntimeError("Unexpected or rejected handoff acknowledgement")
             except BaseException:
                 self._release_sockets.pop(address, None)
                 socket.close(linger=0)
                 raise
 
-    async def _release_recorded_handoff(self, release: dict, receipt: str | None) -> None:
-        if receipt is not None:
-            await asyncio.to_thread(self._handoff_journal.mark_source_safe, receipt)
-        if await self._release_handoff_from_meta_async(release) and receipt is not None:
-            await asyncio.to_thread(self._handoff_journal.acknowledge_release, receipt)
+    async def _release_completed_handoff(self, metadata: dict) -> None:
+        release = HandoffRelease.from_metadata(metadata)
+        self._pending_releases.add(release)
+        if await self._release_handoff_from_meta_async(metadata):
+            self._pending_releases.discard(release)
 
-    async def _release_unsubmitted_handoff(self, record_task: asyncio.Task, release: dict) -> None:
-        # No import was submitted. Preserve the write result if the consumer
-        # aborts during fsync, so its journal entry can also be cleaned up.
+    async def _release_unsubmitted_handoff(self, claim_task: asyncio.Task, release: dict) -> None:
+        # No import was submitted. Only a successful claim proves this attempt
+        # owns the source: rejection could mean another decode still reads it.
         try:
-            receipt = await record_task
+            await claim_task
         except Exception:
-            logger.exception("Handoff journal write failed before decode submission")
-            receipt = None
-        await self._release_recorded_handoff(release, receipt)
+            logger.exception("Handoff claim failed before decode submission")
+            return
+        await self._release_completed_handoff(release)
 
     async def _replay_handoffs(self) -> None:
-        """Retry safe records, including those owned by a previous deployment."""
-        assert self._handoff_journal is not None
+        """Retry source-safe releases while this adapter is alive."""
 
-        async def release_one(receipt: str, release: HandoffRelease) -> None:
+        async def release_one(release: HandoffRelease) -> None:
             try:
                 await self._release_remote_handoff(
                     release.coordinator_addr, release.request_id, release.coordinator_instance_id
                 )
-                await asyncio.to_thread(self._handoff_journal.acknowledge_release, receipt)
+                self._pending_releases.discard(release)
             except Exception:
-                logger.exception("Retaining handoff %s for another cleanup attempt", receipt)
+                logger.exception("Retaining handoff %s for another cleanup attempt", release)
 
-        pending = await asyncio.to_thread(self._handoff_journal.releasable)
-        await asyncio.gather(*(release_one(receipt, release) for receipt, release in pending))
+        await asyncio.gather(*(release_one(release) for release in list(self._pending_releases)))
 
     async def _recover_handoffs(self) -> None:
         while True:
             try:
                 await self._replay_handoffs()
             except Exception:
-                logger.exception("Failed to read durable handoff journal; will retry")
+                logger.exception("Failed to release completed handoffs; will retry")
             await asyncio.sleep(5)
 
     async def _release_handoff_from_meta_async(self, release: dict[str, Any]) -> bool:
@@ -669,7 +684,7 @@ class MegatronLLMEngine(LLMEngine):
     async def abort(self, context: Context) -> None:
         waiter = self._request_waiters.pop(str(context.id()), None)
         if waiter is not None:
-            # Cancel only the consumer; the protected prefill/journal task still
+            # Cancel only the consumer; the protected prefill/claim task still
             # owns its result until the retained source state can be released.
             waiter.cancel()
             return

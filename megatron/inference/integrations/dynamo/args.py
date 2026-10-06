@@ -34,7 +34,6 @@ class Config:
     parent_event_host: str = "127.0.0.1"
     parent_event_port: int | None = None
     endpoint_types: str = "chat,completions"
-    handoff_journal: str | None = None
     handoff_owner: str | None = None
 
 
@@ -98,10 +97,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--engine-start-timeout", type=float, default=1800.0)
     parser.add_argument("--engine-shutdown-timeout", type=float, default=30.0)
     parser.add_argument(
-        "--handoff-journal",
-        help="Persistent SQLite cleanup journal; required for externally managed decode.",
-    )
-    parser.add_argument(
         "--handoff-owner",
         help="Supervisor-assigned unique launch-attempt ID; never reuse across restarts.",
     )
@@ -124,12 +119,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--engine-launch-mode local requires --nproc-per-node")
     if args.engine_launch_mode == "external" and args.parent_event_port is None:
         parser.error("--engine-launch-mode external requires --parent-event-port")
-    if bool(args.handoff_journal) != bool(args.handoff_owner):
-        parser.error("--handoff-journal and --handoff-owner must be supplied together")
-    if args.handoff_journal and args.role != "decode":
-        parser.error("--handoff-journal is only supported for decode workers")
-    if args.role == "decode" and args.engine_launch_mode == "external" and not args.handoff_journal:
-        parser.error("externally managed decode requires --handoff-journal and --handoff-owner")
+    if args.handoff_owner and args.role != "decode":
+        parser.error("--handoff-owner is only supported for decode workers")
     if args.parent_event_port is not None and not 1 <= args.parent_event_port <= 65535:
         parser.error("--parent-event-port must be between 1 and 65535")
     if args.engine_start_timeout <= 0:
@@ -167,6 +158,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parent_event_host=args.parent_event_host,
         parent_event_port=args.parent_event_port,
         endpoint_types=args.endpoint_types,
-        handoff_journal=args.handoff_journal,
         handoff_owner=args.handoff_owner,
     )

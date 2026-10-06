@@ -179,7 +179,18 @@ class _CoordinatorRuntime:
 
             # deserialize=True returns DynamicInferenceRequest objects from
             # add_request futures, matching the high-level API contract.
-            client = InferenceClient(coord_addr, deserialize=True)
+            client = InferenceClient(
+                coord_addr,
+                deserialize=True,
+                block_size_tokens=(
+                    self._engine.context.block_size_tokens
+                    if self._engine.context.enable_prefix_caching
+                    else None
+                ),
+                prefix_caching_coordinator_policy=(
+                    self._engine.context.config.prefix_caching_coordinator_policy
+                ),
+            )
             client.start(loop=loop)
             self._client = client
 

@@ -14,7 +14,9 @@ import zmq.asyncio
 pytest.importorskip("dynamo")
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceRequestError
@@ -59,6 +61,7 @@ def _endpoint(address="tcp://127.0.0.1:5555"):
                 "bos_token_id": 1,
                 "enable_prefix_caching": True,
                 "logical_data_parallel_size": 1,
+                "prefix_caching_coordinator_policy": "first_prefix_block",
             },
         }
     )
@@ -132,7 +135,12 @@ async def test_start_uses_parent_event_socket_and_base_client(tmp_path):
         ):
             engine_config = await engine.start(worker_id=0)
 
-        client_class.assert_called_once_with("tcp://127.0.0.1:5555", deserialize=False)
+        client_class.assert_called_once_with(
+            "tcp://127.0.0.1:5555",
+            deserialize=False,
+            block_size_tokens=64,
+            prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        )
         client.start.assert_called_once()
         receiver_class.assert_called_once_with(engine._on_engine_event, "127.0.0.1", bind_port=None)
         event_receiver.start.assert_called_once()
@@ -306,6 +314,8 @@ async def test_prefill_release_uses_registered_engine_endpoint():
 async def test_decode_uses_streaming_kv_handoff():
     handoff = MagicMock(return_value=_stream({"final": {"generated_tokens": [9]}}))
     engine = MegatronLLMEngine(_config("decode"))
+    engine._claim_remote_handoff = AsyncMock()
+    engine._release_completed_handoff = AsyncMock()
     engine.client = SimpleNamespace(add_request_with_kv_handoff_streaming=handoff)
     request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": {"max_tokens": 1}}
     prefill = {"disaggregated_params": {"kv_meta": {"peer": "prefill"}, "block_ids": [4, 5]}}
@@ -402,6 +412,7 @@ async def test_release_reregisters_after_coordinator_replacement():
                 known_clients=set(),
                 router_socket=router,
                 _broadcast_to_engines=MagicMock(),
+                handoff_ownership=HandoffOwnership(),
             )
 
             async def serve():
@@ -539,6 +550,8 @@ async def test_failed_final_reply_propagates_engine_error(role):
     stream.finish()
     engine = MegatronLLMEngine(_config(role))
     engine._engine_endpoint = _endpoint()
+    engine._claim_remote_handoff = AsyncMock()
+    engine._release_completed_handoff = AsyncMock()
     engine.client = SimpleNamespace(
         add_request_streaming=MagicMock(return_value=stream),
         add_request_with_kv_handoff_streaming=MagicMock(return_value=stream),
@@ -575,6 +588,7 @@ async def test_source_release_failure_does_not_block_or_fail_decode(caplog):
     stream.put({"final": {"status": "COMPLETED", "generated_tokens": [2, 3]}})
     stream.finish()
     engine = MegatronLLMEngine(_config("decode"))
+    engine._claim_remote_handoff = AsyncMock()
     engine.client = SimpleNamespace(add_request_with_kv_handoff_streaming=lambda *args: stream)
     release_started = asyncio.Event()
     release_failed = asyncio.Event()

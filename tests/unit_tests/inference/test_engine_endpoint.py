@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.engine_endpoint import (
     InferenceEngineCapabilities,
     InferenceEngineEndpoint,
@@ -19,6 +20,9 @@ def _engine(tokenizer):
             max_requests=8,
             max_tokens=1024,
             enable_prefix_caching=True,
+            config=SimpleNamespace(
+                prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            ),
         ),
         controller=SimpleNamespace(tokenizer=tokenizer),
     )
@@ -33,6 +37,15 @@ def test_endpoint_round_trip_describes_running_engine():
     assert endpoint.capabilities.bos_token_id == 2
     assert endpoint.capabilities.logical_data_parallel_size == 3
     assert InferenceEngineEndpoint.from_dict(endpoint.to_dict()) == endpoint
+    assert endpoint.capabilities.prefix_caching_coordinator_policy == (
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    )
+    legacy = endpoint.to_dict()
+    del legacy["capabilities"]["prefix_caching_coordinator_policy"]
+    assert (
+        InferenceEngineEndpoint.from_dict(legacy).capabilities.prefix_caching_coordinator_policy
+        is None
+    )
 
 
 def test_capabilities_validate_registration_limits():

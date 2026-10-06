@@ -20,6 +20,7 @@ from megatron.core.inference.config import (
     PrefixCachingCoordinatorPolicy,
 )
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.utils import detokenize_tokens
@@ -266,6 +267,7 @@ class DataParallelInferenceCoordinator:
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
+        self.handoff_ownership = HandoffOwnership()
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
@@ -336,6 +338,7 @@ class DataParallelInferenceCoordinator:
             for media_key, assigned_identity in self._media_cache_affinity.items()
             if assigned_identity != identity
         )
+        self.handoff_ownership.remove_engine(identity)
         idx = self.identity_to_rank_index.pop(identity, None)
         if idx is None:
             return

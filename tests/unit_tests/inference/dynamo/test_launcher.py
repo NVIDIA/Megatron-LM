@@ -94,24 +94,17 @@ def test_disaggregated_role_requires_coordinator_address():
         parse_args(argv)
 
 
-def test_external_decode_requires_durable_cleanup_and_unique_owner(tmp_path):
+def test_external_decode_has_unique_attempt_owners_without_storage():
     argv = _external_argv()
     argv[1] = "decode"
     split = argv.index("--")
     argv[split:split] = ["--coordinator-host", "node-0"]
-    with pytest.raises(SystemExit):
-        parse_args(argv)
-    split = argv.index("--")
-    argv[split:split] = [
-        "--handoff-journal",
-        str(tmp_path / "handoffs.db"),
-        "--handoff-owner",
-        "attempt-1",
-    ]
     config = parse_args(argv)
-    MegatronLLMEngine(config)
-    with pytest.raises(ValueError, match="already used"):
-        MegatronLLMEngine(config)
+    assert MegatronLLMEngine(config)._handoff_owner != MegatronLLMEngine(config)._handoff_owner
+    split = argv.index("--")
+    argv[split:split] = ["--handoff-owner", "attempt-1"]
+    config = parse_args(argv)
+    assert MegatronLLMEngine(config)._handoff_owner == "attempt-1"
 
 
 def test_owned_engine_command_targets_megatron_only_service():

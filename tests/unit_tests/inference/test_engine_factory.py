@@ -5,10 +5,17 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgpack
 import pytest
 
 import megatron.core.inference.engine_factory as factory_module
 from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.disaggregation.engine import (
+    DisaggDynamicInferenceEngine,
+    StateHandoffDynamicInferenceEngine,
+)
+from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_request import Status
 
 
 class _DynamicEngine:
@@ -17,6 +24,37 @@ class _DynamicEngine:
     def __init__(self, *, controller, context):
         self.controller = controller
         self.context = context
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_prefill_reply_registers_external_ownership_or_sends_compact_native_metadata(native):
+    cls = DisaggDynamicInferenceEngine if native else StateHandoffDynamicInferenceEngine
+    engine = object.__new__(cls)
+    engine._disagg_config = object() if native else None
+    engine._kv_transfer_role = "prefill"
+    engine.local_metadata_ledger_enabled = False
+    engine.payload_stager = None
+    engine.socket_for_receiving_requests = MagicMock()
+    handoff = {"request_id": 7, "block_ids": [1], "kv_meta": {"agent": "prefill"}}
+    serialized = {"request_id": 7, "prompt_tokens": [1] * 16384, "disaggregated_params": handoff}
+    request = SimpleNamespace(
+        request_id=7,
+        status=Status.COMPLETED,
+        disaggregated_params=handoff,
+        serialize=MagicMock(return_value=serialized),
+    )
+    engine._send_requests_to_coordinator([request])
+    calls = engine.socket_for_receiving_requests.mock_calls
+    if native:
+        assert len(calls) == 1
+        request.serialize.assert_not_called()
+        expected = {"request_id": 7, "disaggregated_params": handoff}
+    else:
+        assert msgpack.unpackb(calls[0].args[0]) == [Headers.REGISTER_KV.value, 7]
+        expected = serialized
+    reply = calls[-1].args[0]
+    assert msgpack.unpackb(reply[0]) == [Headers.ENGINE_REPLY.value, [[7, False]]]
+    assert msgpack.unpackb(reply[1]) == expected
 
 
 class _DisaggEngine(_DynamicEngine):

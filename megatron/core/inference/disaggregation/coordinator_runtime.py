@@ -24,9 +24,10 @@ from megatron.core.inference.headers import Headers
 
 @dataclass
 class _RequestState:
-    prompt: Any
+    prompt_frame: bytes | None
     sampling_params: dict
     block_hashes: list[int]
+    offload_frame: bytes
 
 
 def _instance_transfer_signature(instance_meta: Any) -> tuple:
@@ -151,15 +152,6 @@ class DisaggCoordinatorRuntime:
         if not self.engine_role:
             self._transfer_signature = None
 
-    def _request_hashes(self, prompt: Any) -> list[int]:
-        hashes = self.coordinator.compute_request_hashes(prompt)
-        if (
-            self.coordinator.prefix_caching_coordinator_policy
-            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-        ):
-            return hashes[:1]
-        return hashes
-
     def _make_routing_score(self, block_hashes: list[int], role: str):
         """Build a role-local routing score, computing prefix affinity once.
 
@@ -169,27 +161,35 @@ class DisaggCoordinatorRuntime:
 
         policy = self.coordinator.prefix_caching_coordinator_policy
         if block_hashes and policy != PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
-            matches, recencies = self.coordinator._match_vector(block_hashes)
+            matches = self.coordinator._prefix_depth_vector(block_hashes) / len(block_hashes)
         else:
-            matches = recencies = None
+            matches = None
+
+        load_for_role = (
+            self.scheduler.prefill_load if role == PREFILL else self.scheduler.decode_load
+        )
+        loads = {
+            identity: load_for_role(identity)
+            for identity, engine_role in self.engine_role.items()
+            if engine_role == role
+        }
+        mean_load = sum(queued + active for queued, active, _ in loads.values()) / max(
+            1, len(loads)
+        )
 
         def score(identity) -> tuple:
-            free_capacity = self.scheduler.available_fraction(identity, role)
-            recency = 0.0
+            load = loads[identity]
             if matches is None:
-                combined = free_capacity
+                combined = self.scheduler.available_fraction(identity, role)
             else:
                 rank_index = self.coordinator.identity_to_rank_index[identity]
                 match = float(matches[rank_index])
-                recency = float(recencies[rank_index])
                 alpha = self.coordinator.prefix_caching_routing_alpha
-                combined = alpha * match + (1.0 - alpha) * free_capacity
-            load = (
-                self.scheduler.prefill_load(identity)
-                if role == PREFILL
-                else self.scheduler.decode_load(identity)
-            )
-            return (-combined, -recency, *load)
+                # Match the coordinator's public alpha contract: zero is pure
+                # affinity, and larger values penalize imbalance within this role.
+                relative_load = (load[0] + load[1] - mean_load) / max(1.0, mean_load)
+                combined = match - alpha * relative_load
+            return (-combined, *load)
 
         return score
 
@@ -197,11 +197,19 @@ class DisaggCoordinatorRuntime:
         if block_hashes:
             self.coordinator._update_rank_hashes(identity, block_hashes)
 
-    def route_submit(self, request_id: int, prompt: Any, sampling_params: dict) -> None:
+    def route_submit(
+        self,
+        request_id: int,
+        prompt_frame: bytes,
+        sampling_params: dict,
+        block_hashes: list[int],
+        offload_frame: bytes,
+    ) -> None:
         """Reserve capacity and send a client request to a prefill instance."""
 
-        block_hashes = self._request_hashes(prompt)
-        self.requests[request_id] = _RequestState(prompt, sampling_params, block_hashes)
+        self.requests[request_id] = _RequestState(
+            prompt_frame, sampling_params, block_hashes, offload_frame
+        )
         if sampling_params.get("return_log_probs") and not sampling_params.get(
             "skip_prompt_log_probs", True
         ):
@@ -234,15 +242,14 @@ class DisaggCoordinatorRuntime:
         ):
             self.scheduler.enqueue_prefill(prefill_id, request_id, slot_cost)
             return
-        self._submit_prefill(prefill_id, request_id, prompt, sampling_params)
+        self._submit_prefill(prefill_id, request_id)
 
-    def _submit_prefill(
-        self, prefill_id, request_id: int, prompt: Any, sampling_params: dict
-    ) -> None:
+    def _submit_prefill(self, prefill_id, request_id: int) -> None:
         """Submit a request whose prefill capacity has already been reserved."""
 
         self.hop1_request_ids.add(request_id)
-        prefill_params = dict(sampling_params)
+        state = self.requests[request_id]
+        prefill_params = dict(state.sampling_params)
         prefill_params["do_kv_handoff"] = True
         prefill_params["num_tokens_to_generate"] = 0
         prefill_params["skip_prompt_log_probs"] = True
@@ -252,9 +259,9 @@ class DisaggCoordinatorRuntime:
             msgpack.packb(
                 [Headers.SUBMIT_REQUEST.value, request_id, prefill_params, None], use_bin_type=True
             ),
-            msgpack.packb(prompt, use_bin_type=True),
+            state.prompt_frame,
             msgpack.packb(None, use_bin_type=True),
-            msgpack.packb(None, use_bin_type=True),
+            state.offload_frame,
         ]
         if self.coordinator._send_to_engine(prefill_id, frames):
             self._record_hash_assignment(prefill_id, self.requests[request_id].block_hashes)
@@ -265,10 +272,8 @@ class DisaggCoordinatorRuntime:
             if request is None:
                 return
             state = self.requests[request.request_id]
-            assert state.prompt is not None, "completed request remained in the prefill queue"
-            self._submit_prefill(
-                prefill_id, request.request_id, state.prompt, state.sampling_params
-            )
+            assert state.prompt_frame is not None, "completed request remained in the prefill queue"
+            self._submit_prefill(prefill_id, request.request_id)
 
     def handle_prefill_done(self, request_id: int, finished_request: dict) -> None:
         """Route a completed prefill handoff to a decode instance."""
@@ -325,11 +330,12 @@ class DisaggCoordinatorRuntime:
                 ],
                 use_bin_type=True,
             ),
-            msgpack.packb(request_state.prompt, use_bin_type=True),
+            request_state.prompt_frame,
             msgpack.packb(block_ids, use_bin_type=True),
         ]
         # The serialized handoff owns these values until decode receives it.
-        request_state.prompt = None
+        request_state.prompt_frame = None
+        request_state.offload_frame = b"\xc0"
         request_state.sampling_params = {}
         slot_cost = self.scheduler.slot_cost_from_handoff(handoff)
         capacity = self.scheduler.capacity(decode_id)

@@ -165,10 +165,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     media_frame = bodies[2]
     offload_frame = bodies[3]
 
-    disagg_prompt = None
     if coordinator.disagg is not None:
-        media_payload = msgpack.unpackb(media_frame, raw=False)
-        if media_meta or media_payload:
+        if media_meta or media_frame != b"\xc0":
             coordinator.router_socket.send_multipart(
                 [
                     sender_identity,
@@ -184,7 +182,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
                 ]
             )
             return
-        disagg_prompt = msgpack.unpackb(prompt_frame, raw=False)
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -193,10 +190,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
-
-    if coordinator.disagg is not None:
-        coordinator.disagg.route_submit(request_id, disagg_prompt, sampling_params)
-        return
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
@@ -245,6 +238,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
     ):
         request_hashes = request_hashes[:1]
+
+    if coordinator.disagg is not None:
+        coordinator.disagg.route_submit(
+            request_id, prompt_frame, sampling_params, request_hashes, offload_frame
+        )
+        return
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
@@ -361,10 +360,12 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
         return
     request_id = int(metadata[1])
     if len(metadata) == 2:
+        coordinator.handoff_ownership.release(request_id)
         coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
         return
     instance_id = metadata[2]
     if instance_id == coordinator.instance_id:
+        coordinator.handoff_ownership.release(request_id)
         coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
     coordinator.router_socket.send_multipart(
         [
@@ -373,6 +374,52 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
                 [Headers.RELEASE_KV_ACK.value, request_id, instance_id], use_bin_type=True
             ),
         ]
+    )
+
+
+@message_handler(Headers.REGISTER_KV)
+def handle_register_kv(coordinator, sender_identity, metadata, bodies):
+    """Register source state before its engine publishes handoff metadata."""
+    if sender_identity in coordinator.identities_of_data_parallel_ranks and len(metadata) == 2:
+        coordinator.handoff_ownership.offer(int(metadata[1]), sender_identity)
+
+
+@message_handler(Headers.CLAIM_KV, Headers.RELEASE_KV_OWNER)
+def handle_handoff_owner(coordinator, sender_identity, metadata, bodies):
+    """Claim a handoff or accept a supervisor's explicit termination barrier.
+
+    This trusted control-plane operation must not be exposed to public clients.
+    RELEASE_KV_OWNER is an attestation, not a failure detector.
+    """
+    if sender_identity not in coordinator.known_clients:
+        return
+    header = Headers(metadata[0])
+    if header == Headers.CLAIM_KV:
+        if len(metadata) != 4:
+            return
+        _, request_id, instance_id, owner = metadata
+        accepted = (
+            instance_id == coordinator.instance_id
+            and isinstance(owner, str)
+            and isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+        )
+        accepted = accepted and coordinator.handoff_ownership.claim(request_id, owner)
+        reply = [Headers.CLAIM_KV_ACK.value, request_id, instance_id, bool(accepted)]
+    else:
+        if len(metadata) != 3:
+            return
+        _, instance_id, owner = metadata
+        if not isinstance(owner, str) or not owner:
+            return
+        if instance_id == coordinator.instance_id:
+            for request_id, engine in coordinator.handoff_ownership.confirm_terminated(owner):
+                coordinator._send_to_engine(
+                    engine, [msgpack.packb([Headers.RELEASE_KV.value, request_id])]
+                )
+        reply = [Headers.RELEASE_KV_OWNER_ACK.value, instance_id, owner]
+    coordinator.router_socket.send_multipart(
+        [sender_identity, msgpack.packb(reply, use_bin_type=True)]
     )
 
 

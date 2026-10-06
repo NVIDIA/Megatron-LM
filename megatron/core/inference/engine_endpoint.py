@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.utils import experimental_api
 
 if TYPE_CHECKING:
@@ -32,6 +33,8 @@ class InferenceEngineCapabilities:
     bos_token_id: int
     enable_prefix_caching: bool
     logical_data_parallel_size: int = 1
+    prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy | None = None
+    """Routing policy for client-side hashing; None supports older endpoint records."""
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -49,6 +52,10 @@ class InferenceEngineCapabilities:
                 raise TypeError(f"{field_name} must be an integer")
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a boolean")
+        if self.prefix_caching_coordinator_policy is not None and not isinstance(
+            self.prefix_caching_coordinator_policy, PrefixCachingCoordinatorPolicy
+        ):
+            raise TypeError("prefix_caching_coordinator_policy must be a routing policy")
 
         positive_fields = (
             "context_length",
@@ -89,12 +96,16 @@ class InferenceEngineCapabilities:
             bos_token_id=bos_token_id,
             enable_prefix_caching=bool(engine.context.enable_prefix_caching),
             logical_data_parallel_size=int(logical_data_parallel_size),
+            prefix_caching_coordinator_policy=(
+                engine.context.config.prefix_caching_coordinator_policy
+            ),
         )
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "InferenceEngineCapabilities":
         """Deserialize a capabilities mapping received across a process boundary."""
 
+        policy = value.get("prefix_caching_coordinator_policy")
         return cls(
             context_length=value["context_length"],
             kv_cache_block_size=value["kv_cache_block_size"],
@@ -104,9 +115,12 @@ class InferenceEngineCapabilities:
             bos_token_id=value["bos_token_id"],
             enable_prefix_caching=value["enable_prefix_caching"],
             logical_data_parallel_size=value.get("logical_data_parallel_size", 1),
+            prefix_caching_coordinator_policy=(
+                PrefixCachingCoordinatorPolicy(policy) if policy is not None else None
+            ),
         )
 
-    def to_dict(self) -> dict[str, int | bool]:
+    def to_dict(self) -> dict[str, int | bool | str | None]:
         """Return a serialization-friendly representation."""
 
         return asdict(self)
