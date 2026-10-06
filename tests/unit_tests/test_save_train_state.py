@@ -33,6 +33,8 @@ from megatron.training.utils.checkpoint_utils import (
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 # All keys `TrainState.state_dict()` / `TrainState.load_state_dict()` operate on.
 TRAIN_STATE_KEYS = {
     "step",
