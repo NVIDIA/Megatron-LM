@@ -9,7 +9,7 @@ import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
-from megatron.training.global_vars import set_args, _set_train_state, destroy_global_vars
+from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
