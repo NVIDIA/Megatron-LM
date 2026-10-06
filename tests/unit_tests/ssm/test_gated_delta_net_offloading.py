@@ -121,6 +121,26 @@ def _build(config: TransformerConfig, groups: ProcessGroupCollection) -> torch.n
     )
 
 
+def _build_pair(
+    config: TransformerConfig, groups: ProcessGroupCollection
+) -> tuple[torch.nn.ModuleList, torch.nn.ModuleList]:
+    """Build baseline/offloaded models with identical weights."""
+    baseline_config = copy.deepcopy(config)
+    baseline_config.fine_grained_activation_offloading = False
+    baseline_config.offload_modules = []
+    baseline = _build(baseline_config, groups)
+    offloaded = _build(config, groups)
+    offloaded.load_state_dict(baseline.state_dict())
+    return baseline, offloaded
+
+
+def _assert_step_equal(reference: dict[str, torch.Tensor], result: dict[str, torch.Tensor]) -> None:
+    """Compare outputs, input gradients and the complete parameter-gradient set."""
+    assert result.keys() == reference.keys()
+    for name in reference:
+        assert torch.equal(reference[name], result[name]), name
+
+
 def _run(
     model: torch.nn.ModuleList,
     source: torch.Tensor,
@@ -129,7 +149,7 @@ def _run(
     fraction: float = 1.0,
     threshold: int = 1024,
     detached_inputs: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+) -> dict[str, torch.Tensor]:
     model.zero_grad(set_to_none=True)
     x = source.detach().clone().requires_grad_()
     if offload:
@@ -141,9 +161,16 @@ def _run(
         output = output + y
     output.float().square().mean().backward()
     torch.cuda.synchronize()
-    grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
     assert x.grad is not None
-    return output.detach(), x.grad, grads
+    return {
+        "output": output.detach(),
+        "input_grad": x.grad,
+        **{
+            f"grad.{name}": p.grad.clone()
+            for name, p in model.named_parameters()
+            if p.grad is not None
+        },
+    }
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -168,12 +195,7 @@ def test_gdn_offload_replay(
     if recompute_norm:
         config.recompute_granularity = "selective"
         config.recompute_modules = ["gdn_norm_out"]
-    baseline_config = copy.deepcopy(config)
-    baseline_config.fine_grained_activation_offloading = False
-    baseline_config.offload_modules = []
-    baseline = _build(baseline_config, gdn_offload_groups)
-    offloaded = _build(config, gdn_offload_groups)
-    offloaded.load_state_dict(baseline.state_dict())
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
     torch.manual_seed(19)
     manager = PipelineOffloadManager.get_instance()
     for iteration in range(3):
@@ -181,11 +203,7 @@ def test_gdn_offload_replay(
         source = torch.randn(128, 2, 256, device="cuda", dtype=torch.bfloat16)
         reference = _run(baseline, source)
         result = _run(offloaded, source, offload=True, fraction=fraction, threshold=threshold)
-        assert torch.equal(reference[0], result[0])
-        assert torch.equal(reference[1], result[1])
-        assert result[2].keys() == reference[2].keys()
-        for name in reference[2]:
-            assert torch.equal(reference[2][name], result[2][name]), name
+        _assert_step_equal(reference, result)
         assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
         off_interface.reset(process_group=torch.distributed.group.WORLD)
         if iteration == 0:
@@ -217,12 +235,7 @@ def test_gdn_zero_fraction_with_growing_sequence(
         recompute_granularity="selective" if recompute_norm else None,
         recompute_modules=["gdn_norm_out"] if recompute_norm else [],
     )
-    baseline_config = copy.deepcopy(config)
-    baseline_config.fine_grained_activation_offloading = False
-    baseline_config.offload_modules = []
-    baseline = _build(baseline_config, gdn_offload_groups)
-    offloaded = _build(config, gdn_offload_groups)
-    offloaded.load_state_dict(baseline.state_dict())
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
 
     def unexpected_transfer(*args: Any, **kwargs: Any) -> None:
         pytest.fail("Fraction zero must not copy tensors after an empty warmup.")
@@ -232,11 +245,7 @@ def test_gdn_zero_fraction_with_growing_sequence(
         source = torch.randn(seq_length, 1, 256, device="cuda", dtype=torch.bfloat16)
         reference = _run(baseline, source)
         result = _run(offloaded, source, offload=True, fraction=0.0, threshold=threshold)
-        assert torch.equal(reference[0], result[0])
-        assert torch.equal(reference[1], result[1])
-        assert reference[2].keys() == result[2].keys()
-        for name in reference[2]:
-            assert torch.equal(reference[2][name], result[2][name]), name
+        _assert_step_equal(reference, result)
         off_interface.reset(process_group=torch.distributed.group.WORLD)
 
 
@@ -255,12 +264,7 @@ def test_gdn_offload_microbatch_accumulation(
         recompute_granularity="selective" if recompute_norm else None,
         recompute_modules=["gdn_norm_out"] if recompute_norm else [],
     )
-    baseline_config = copy.deepcopy(config)
-    baseline_config.fine_grained_activation_offloading = False
-    baseline_config.offload_modules = []
-    baseline = _build(baseline_config, gdn_offload_groups)
-    offloaded = _build(config, gdn_offload_groups)
-    offloaded.load_state_dict(baseline.state_dict())
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
     inputs = [torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16) for _ in range(9)]
 
     def run(model: torch.nn.ModuleList, offload: bool) -> list[dict[str, torch.Tensor]]:
@@ -282,7 +286,7 @@ def test_gdn_offload_microbatch_accumulation(
                         "output": y.detach().clone(),
                         "input_grad": x.grad.clone(),
                         **{
-                            name: p.grad.clone()
+                            f"grad.{name}": p.grad.clone()
                             for name, p in model.named_parameters()
                             if p.grad is not None
                         },
@@ -316,32 +320,21 @@ def test_gdn_offload_microbatch_accumulation(
     monkeypatch.setattr(ChunkOffloadHandler, "bulk_reload_group", delayed_reload)
     result = run(offloaded, True)
     for expected, actual in zip(reference, result):
-        assert expected.keys() == actual.keys()
-        for name in expected:
-            assert torch.equal(expected[name], actual[name]), name
+        _assert_step_equal(expected, actual)
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_gdn_offload_packed_sequence(gdn_offload_groups: ProcessGroupCollection) -> None:
     """Packed-sequence metadata survives the saved-tensor hooks."""
     config = _config()
-    baseline_config = copy.deepcopy(config)
-    baseline_config.fine_grained_activation_offloading = False
-    baseline_config.offload_modules = []
-    baseline = _build(baseline_config, gdn_offload_groups)
-    offloaded = _build(config, gdn_offload_groups)
-    offloaded.load_state_dict(baseline.state_dict())
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
     cu = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
     for _ in range(3):
         source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
         reference = _run(baseline, source, packed)
         result = _run(offloaded, source, packed, offload=True)
-        assert torch.equal(reference[0], result[0])
-        assert torch.equal(reference[1], result[1])
-        assert reference[2].keys() == result[2].keys()
-        for name in reference[2]:
-            assert torch.equal(reference[2][name], result[2][name]), name
+        _assert_step_equal(reference, result)
         off_interface.reset(process_group=torch.distributed.group.WORLD)
 
 
@@ -352,12 +345,7 @@ def test_gdn_offload_delayed_d2h(
 ) -> None:
     """Warmup and missing query gradients still order fallback H2D after delayed D2H."""
     config = _config()
-    baseline_config = copy.deepcopy(config)
-    baseline_config.fine_grained_activation_offloading = False
-    baseline_config.offload_modules = []
-    baseline = _build(baseline_config, gdn_offload_groups)
-    offloaded = _build(config, gdn_offload_groups)
-    offloaded.load_state_dict(baseline.state_dict())
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
     if frozen_query:
         for model in (baseline, offloaded):
             for layer in model:
@@ -377,11 +365,7 @@ def test_gdn_offload_delayed_d2h(
         # Detach recurrence inputs to exercise trainable gates without query gradients.
         reference = _run(baseline, source, detached_inputs=frozen_query)
         result = _run(offloaded, source, offload=True, detached_inputs=frozen_query)
-        assert torch.equal(reference[0], result[0])
-        assert torch.equal(reference[1], result[1])
-        assert reference[2].keys() == result[2].keys()
-        for name in reference[2]:
-            assert torch.equal(reference[2][name], result[2][name]), name
+        _assert_step_equal(reference, result)
         manager = PipelineOffloadManager.get_instance()
         assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
         off_interface.reset(process_group=torch.distributed.group.WORLD)
@@ -401,12 +385,8 @@ def test_gdn_offload_training_after_initial_eval(
         recompute_granularity="selective" if recompute_norm else None,
         recompute_modules=["gdn_norm_out"] if recompute_norm else [],
     )
-    baseline_config = copy.deepcopy(config)
-    baseline_config.fine_grained_activation_offloading = False
-    baseline_config.offload_modules = []
-    baseline = _build(baseline_config, gdn_offload_groups)
-    offloaded = _build(config, gdn_offload_groups).train(training)
-    offloaded.load_state_dict(baseline.state_dict())
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
+    offloaded.train(training)
     source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
     # Model wrappers preprocess the chunk even when the GDN scopes bypass eval.
     off_interface.init_chunk_handler(0, None, None, 1024, 0, 1.0)
@@ -425,11 +405,7 @@ def test_gdn_offload_training_after_initial_eval(
     offloaded.train()
     reference = _run(baseline, source)
     result = _run(offloaded, source, offload=True)
-    assert torch.equal(reference[0], result[0])
-    assert torch.equal(reference[1], result[1])
-    assert reference[2].keys() == result[2].keys()
-    for name in reference[2]:
-        assert torch.equal(reference[2][name], result[2][name]), name
+    _assert_step_equal(reference, result)
     assert len(manager._cached_chunks_forward[0].offload_groups) == config.num_layers
     off_interface.reset(process_group=torch.distributed.group.WORLD)
     assert not manager._is_warmup
