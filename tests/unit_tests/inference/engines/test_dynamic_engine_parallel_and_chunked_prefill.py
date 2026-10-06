@@ -1534,13 +1534,14 @@ class TestChunkedPrefillCudaGraphs:
         conv_snapshots=None,
         generated_log_probs=None,
         enable_prefix_caching=False,
+        ssm_snapshots=None,
     ):
         """Add all prompts and run to completion, returning {req_id: generated_tokens}.
 
-        `conv_snapshots`, if given, is appended one clone of request 0's conv
-        state per step, so a caller can inspect the state at a chosen step
-        instead of only the generated tokens. `generated_log_probs`, if given, is
-        filled with {req_id: log probs of the generated tokens}.
+        `conv_snapshots` and `ssm_snapshots`, if given, are appended one clone of
+        request 0's conv / SSM state per step, so a caller can inspect the state at
+        a chosen step instead of only the generated tokens. `generated_log_probs`,
+        if given, is filled with {req_id: log probs of the generated tokens}.
         """
         for i, prompt in enumerate(prompts):
             request = DynamicInferenceRequest(
@@ -1567,11 +1568,14 @@ class TestChunkedPrefillCudaGraphs:
         while engine.has_unfinished_requests():
             result = engine.step_modern()
             step_count += 1
-            if conv_snapshots is not None:
+            if conv_snapshots is not None or ssm_snapshots is not None:
                 if mamba_idx is None:
                     mamba_idx = engine.context.mamba_metadata.request_to_mamba_state_idx[0].item()
                     assert mamba_idx >= 0, "request 0 has no mamba slot after its first step"
-                conv_snapshots.append(engine.context.mamba_conv_states[:, mamba_idx].clone())
+                if conv_snapshots is not None:
+                    conv_snapshots.append(engine.context.mamba_conv_states[:, mamba_idx].clone())
+                if ssm_snapshots is not None:
+                    ssm_snapshots.append(engine.context.mamba_ssm_states[:, mamba_idx].clone())
             for request in result["finished_requests"]:
                 finished[request.request_id] = list(request.generated_tokens)
                 if generated_log_probs is not None:
@@ -1652,13 +1656,13 @@ class TestChunkedPrefillCudaGraphs:
                 f"({test_steps} <= {baseline_steps})"
             )
 
-    # d_conv is 4 for both mixers, so a final chunk of 2 or 3 tokens is shorter
+    # d_conv is 4 for both mixers, so a final chunk of 1, 2 or 3 tokens is shorter
     # than the conv window. Deriving the conv state from that slice alone
     # zero-fills the columns that predate it, and the first decode step then
     # convolves against zeros instead of the previous chunk's tail.
     @pytest.mark.internal
     @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
-    @pytest.mark.parametrize("final_chunk_len", [2, 3])
+    @pytest.mark.parametrize("final_chunk_len", [1, 2, 3])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
     def test_short_final_prefill_chunk_carries_conv_state(
@@ -1701,8 +1705,13 @@ class TestChunkedPrefillCudaGraphs:
         baseline_engine = self._build_engine(
             model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
         )
+        baseline_ssm_snapshots = []
         baseline_outputs, _ = self._run_to_completion(
-            baseline_engine, prompts, num_tokens_to_generate, conv_snapshots=baseline_snapshots
+            baseline_engine,
+            prompts,
+            num_tokens_to_generate,
+            conv_snapshots=baseline_snapshots,
+            ssm_snapshots=baseline_ssm_snapshots,
         )
 
         chunked_snapshots = []
@@ -1712,8 +1721,13 @@ class TestChunkedPrefillCudaGraphs:
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,
         )
+        chunked_ssm_snapshots = []
         chunked_outputs, _ = self._run_to_completion(
-            chunked_engine, prompts, num_tokens_to_generate, conv_snapshots=chunked_snapshots
+            chunked_engine,
+            prompts,
+            num_tokens_to_generate,
+            conv_snapshots=chunked_snapshots,
+            ssm_snapshots=chunked_ssm_snapshots,
         )
 
         assert baseline_outputs[0] == chunked_outputs[0], (
@@ -1763,6 +1777,22 @@ class TestChunkedPrefillCudaGraphs:
                 f"chunk does not match the unchunked baseline "
                 f"(num_cuda_graphs={num_cuda_graphs}). The leading columns are the ones "
                 f"the carry restores.\n{default}"
+            ),
+        )
+
+        # The recurrent state must also match: the final chunk resumes the scan from the
+        # state the previous chunk left, however short that final chunk is. The mamba state
+        # here peaks around 5e-2, so its tolerance is tighter than the conv state's; losing
+        # the carried state moves it by about that much.
+        torch.testing.assert_close(
+            baseline_ssm_snapshots[baseline_prefill_steps - 1],
+            chunked_ssm_snapshots[chunked_prefill_steps - 1],
+            rtol=1e-2,
+            atol=5e-3,
+            msg=lambda default: (
+                f"{ssm_mixer}: SSM state after a {final_chunk_len}-token final prefill "
+                f"chunk does not match the unchunked baseline "
+                f"(num_cuda_graphs={num_cuda_graphs}).\n{default}"
             ),
         )
 
