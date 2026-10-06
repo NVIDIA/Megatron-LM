@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Distributed tests for the `p2p` owner-compute gather/scatter module.
+"""Distributed tests for the `gather_scatter` module.
 
 These tests require `torchrun` (>=2 ranks and >=1 GPU per rank). They create a `DBuffer`
 with known data, gather full tensors to the owners via P2P, verify correctness, then
@@ -23,7 +23,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffe
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
     GroupOwnerLayout,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.p2p import (
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.gather_scatter import (
     gather,
     scatter,
     waiting_stream_scope,
