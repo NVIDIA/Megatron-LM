@@ -294,13 +294,23 @@ def modelopt_gpt_hybrid_builder(
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
 
+    # Passed to LanguageModelEmbedding and HybridModel. GPTModel uses this argument
+    # for the embedding table and config.position_embedding_type for YaRN.
+    position_embedding_type = args.position_embedding_type
+
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
         print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
 
+        # The GPT-OSS recipe leaves --position-embedding-type at its default,
+        # learned_absolute. Setting only the config attribute enables YaRN in
+        # GPTModel while LanguageModelEmbedding still allocates a position table
+        # and adds it to every token. HybridModel reads the constructor argument
+        # and would not enable YaRN at all. Use YaRN for both.
+        config.position_embedding_type = "yarn"
+        position_embedding_type = "yarn"
         # Set GPT-OSS YaRN values directly on the config
         # These defaults are based on Huggingface GPT-OSS configurations
-        config.position_embedding_type = "yarn"
         config.yarn_rotary_scaling_factor = 32.0
         config.yarn_original_max_position_embeddings = 131072
         config.yarn_beta_fast = 32.0
@@ -389,7 +399,7 @@ def modelopt_gpt_hybrid_builder(
             "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-            "position_embedding_type": args.position_embedding_type,
+            "position_embedding_type": position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
@@ -436,7 +446,7 @@ def modelopt_gpt_hybrid_builder(
             "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-            "position_embedding_type": args.position_embedding_type,
+            "position_embedding_type": position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "pg_collection": pg_collection,
