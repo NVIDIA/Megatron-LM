@@ -712,13 +712,15 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
 
 def _reset_activation_offload(
     pg_collection: Union[ProcessGroupCollection, MultiModuleProcessGroupCollection],
+    *,
+    forward_only: bool = False,
 ) -> None:
-    """Reset activation offload state for single-model and MIMO language ranks."""
+    """Reset offload state for the scheduler phase on participating language ranks."""
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         if not pg_collection.has_language_model():
             return
         pg_collection = pg_collection.get_language_model_collection()
-    off_interface.reset(process_group=pg_collection.tp_dp_cp)
+    off_interface.reset(process_group=pg_collection.tp_dp_cp, forward_only=forward_only)
 
 
 def forward_backward_no_pipelining(
@@ -872,7 +874,7 @@ def forward_backward_no_pipelining(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        _reset_activation_offload(pg_collection)
+        _reset_activation_offload(pg_collection, forward_only=forward_only)
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
@@ -2098,7 +2100,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        _reset_activation_offload(pg_collection)
+        _reset_activation_offload(pg_collection, forward_only=forward_only)
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2525,7 +2527,7 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        _reset_activation_offload(pg_collection)
+        _reset_activation_offload(pg_collection, forward_only=forward_only)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

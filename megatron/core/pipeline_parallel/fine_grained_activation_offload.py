@@ -548,8 +548,13 @@ class PipelineOffloadManager:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
 
-    def reset(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
-        """Reset manager state for a new training iteration."""
+    def reset(
+        self,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+        *,
+        forward_only: bool = False,
+    ):
+        """Reset iteration state, preserving training warmup after forward-only passes."""
         self._inside_context = False
         self._cur_forward_chunk = None
         self._cur_backward_chunk = None
@@ -557,9 +562,21 @@ class PipelineOffloadManager:
         if hasattr(self, '_cpu_tensor_pool'):
             self._cpu_tensor_pool.reset()
 
-        # Call post_warmup_callback after warmup to collect the offload information.
+        # Forward-only evaluation cannot establish the training offload policy.
+        # Initial evaluation creates chunks in model preprocessing, but GDN
+        # bypasses its scopes; caching those chunks would disable later training.
+        # Use the scheduler's phase flag so every rank makes the same decision
+        # about entering the post-warmup reporting collective.
         if self._is_warmup and len(self._cached_chunks_forward) > 0:
-            self.post_warmup_callback(process_group=process_group)
+            if forward_only:
+                self._cached_chunks_forward.clear()
+                self._cached_chunks_backward.clear()
+                self._queue.clear()
+                if self._stages is not None:
+                    for stage in self._stages:
+                        stage.clear()
+            else:
+                self.post_warmup_callback(process_group=process_group)
         self._cached_chunks_index_backward = 0
         self._cached_chunks_index_forward = 0
 
@@ -1588,9 +1605,15 @@ class FineGrainedActivationOffloadingInterface:
         return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
 
     @staticmethod
-    def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
-        """Reset the chunk handler."""
-        PipelineOffloadManager.get_instance().reset(process_group=process_group)
+    def reset(
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+        *,
+        forward_only: bool = False,
+    ):
+        """Reset iteration state; pass forward_only=True for evaluation passes."""
+        PipelineOffloadManager.get_instance().reset(
+            process_group=process_group, forward_only=forward_only
+        )
 
     @staticmethod
     def reset_instance():

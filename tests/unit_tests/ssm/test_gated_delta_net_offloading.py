@@ -388,6 +388,55 @@ def test_gdn_offload_delayed_d2h(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("training,grad_enabled", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("recompute_norm", [False, True])
+def test_gdn_offload_training_after_initial_eval(
+    gdn_offload_groups: ProcessGroupCollection,
+    training: bool,
+    grad_enabled: bool,
+    recompute_norm: bool,
+) -> None:
+    """An initial forward-only pass must not consume the training warmup."""
+    config = _config(
+        recompute_granularity="selective" if recompute_norm else None,
+        recompute_modules=["gdn_norm_out"] if recompute_norm else [],
+    )
+    baseline_config = copy.deepcopy(config)
+    baseline_config.fine_grained_activation_offloading = False
+    baseline_config.offload_modules = []
+    baseline = _build(baseline_config, gdn_offload_groups)
+    offloaded = _build(config, gdn_offload_groups).train(training)
+    offloaded.load_state_dict(baseline.state_dict())
+    source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    # Model wrappers preprocess the chunk even when the GDN scopes bypass eval.
+    off_interface.init_chunk_handler(0, None, None, 1024, 0, 1.0)
+    with torch.set_grad_enabled(grad_enabled):
+        output = source
+        for layer in offloaded:
+            y, _ = layer(output, None)
+            output = output + y
+    del output, y
+    off_interface.reset(process_group=torch.distributed.group.WORLD, forward_only=True)
+    manager = PipelineOffloadManager.get_instance()
+    assert manager._is_warmup
+    assert not manager._cached_chunks_forward
+    assert not manager._cached_chunks_backward
+
+    offloaded.train()
+    reference = _run(baseline, source)
+    result = _run(offloaded, source, offload=True)
+    assert torch.equal(reference[0], result[0])
+    assert torch.equal(reference[1], result[1])
+    assert reference[2].keys() == result[2].keys()
+    for name in reference[2]:
+        assert torch.equal(reference[2][name], result[2][name]), name
+    assert len(manager._cached_chunks_forward[0].offload_groups) == config.num_layers
+    off_interface.reset(process_group=torch.distributed.group.WORLD)
+    assert not manager._is_warmup
+    assert manager.offload_summary_total_bytes > 0
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("training,grad_enabled", [(False, True), (True, False), (False, False)])
 def test_gdn_offload_no_grad_bypass(
     gdn_offload_groups: ProcessGroupCollection,
