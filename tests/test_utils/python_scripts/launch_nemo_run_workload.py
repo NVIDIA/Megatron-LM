@@ -254,9 +254,13 @@ def main(
         and tag == "latest"
         and platform == "dgx_h100"
     ):
-        # Preserve test selection and cleanup while diagnosing the stall in #7744.
+        # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
+        # PyTorch start every communicator's finalization before waiting, avoiding
+        # cyclic waits between the CP group's P2P and collective communicators (#7744).
+        executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
         executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
         executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
+        executor.env_vars["NCCL_DEBUG_SUBSYS"] = "INIT,BOOTSTRAP,ENV,DESTROY"
         executor.env_vars["NCCL_DEBUG_FILE"] = (
             "/opt/megatron-lm/assets_dir/logs/nccl_debug.%h.%p.log"
         )
