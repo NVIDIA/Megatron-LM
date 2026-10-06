@@ -393,8 +393,8 @@ class TransformerConfig(ModelParallelConfig):
     ``none``            yes          no           no fused kernels; PyTorch fallback
     ``tilelang``        yes          no           fused TileLang kernels
     ``cudnn``           yes          no           fused cuDNN kernels
-    ``min-memory-triton`` no         yes          streamed min-memory, Triton kernels
-    ``min-memory-torch``  no         yes          streamed min-memory, Triton dispatch off
+    ``min-memory-triton`` no         yes          chunked min-memory, Triton kernels
+    ``min-memory-torch``  no         yes          chunked min-memory, Triton dispatch off
     ``reference``       no           yes          dense-mask reference the kernels are A/B'd against
     =================== ============ ============ =========================================
 
@@ -3841,7 +3841,7 @@ class TransformerConfig(ModelParallelConfig):
             # DSAttention with one query group, which has none of them.
             if not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified':
                 # 'none' is the field default and means "no fused kernels" on the MLA path.
-                # The GQA path has no such mode, so resolve it to the streamed min-memory
+                # The GQA path has no such mode, so resolve it to the chunked min-memory
                 # backend -- the one intended for production -- rather than failing. Note this
                 # is not a literal reading of "none": that backend does use Triton kernels.
                 if self.dsa_kernel_backend == 'none':
