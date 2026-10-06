@@ -8,8 +8,6 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-import msgpack
-
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.disaggregation.coordinator_scheduler import (
     DECODE,
@@ -20,6 +18,11 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     restore_registered_nixl_agent_metadata,
 )
 from megatron.core.inference.headers import Headers
+
+try:
+    import msgpack
+except ImportError:
+    msgpack = None
 
 
 @dataclass
@@ -82,6 +85,8 @@ class DisaggCoordinatorRuntime:
     """Own the state and two-hop routing used only by a disaggregated coordinator."""
 
     def __init__(self, coordinator: Any) -> None:
+        if msgpack is None:
+            raise ImportError("msgpack is required for disaggregated inference")
         self.coordinator = coordinator
         self.scheduler = DisaggCoordinatorScheduler()
         self.hop1_request_ids: set[int] = set()

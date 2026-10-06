@@ -143,6 +143,8 @@ On a failed deployment attempt:
    Controllers can also await `confirm_terminated(address, owner)` from that
    module. Retry unreachable sources. The operation is idempotent and fences
    delayed claims by the terminated attempt, even at sources it never used.
+   A source engine's control connection failing does not discard ownership or
+   acknowledge cleanup; retry after connectivity is restored.
    Run it only on the trusted control network; it accepts the supervisor's
    attestation rather than independently verifying rank termination.
 3. A replacement can start before or after cleanup, with a fresh owner ID.

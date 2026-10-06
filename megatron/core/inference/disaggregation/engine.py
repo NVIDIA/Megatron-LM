@@ -2,8 +2,6 @@
 
 """Dynamic inference engine composed with the KV/state hand-off behavior."""
 
-import msgpack
-
 from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
@@ -12,6 +10,11 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest, FinishedRequestRecord
 from megatron.core.utils import internal_api
+
+try:
+    import msgpack
+except ImportError:
+    msgpack = None
 
 
 class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceEngine):

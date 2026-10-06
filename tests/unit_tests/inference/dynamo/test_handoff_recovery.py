@@ -43,11 +43,13 @@ async def test_killed_owner_recovery_restores_prefill_capacity_and_fences_replac
         ).tolist()
         source._pinned_handoff_ssm_slots[7] = 3
 
-    def send(identity, frames):
+    def send(identity, frames, *, remove_unreachable):
+        assert not remove_unreachable
         assert identity == b"prefill-engine"
         assert msgpack.unpackb(frames[0]) == [Headers.RELEASE_KV.value, 7]
         for source in sources:
             source.release_handoff_blocks(7)
+        return True
 
     ownership = HandoffOwnership()
     coordinator = SimpleNamespace(

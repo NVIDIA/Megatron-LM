@@ -338,7 +338,8 @@ class DataParallelInferenceCoordinator:
             for media_key, assigned_identity in self._media_cache_affinity.items()
             if assigned_identity != identity
         )
-        self.handoff_ownership.remove_engine(identity)
+        # Losing the control connection does not prove source allocations are gone.
+        # Keep handoff ownership so cleanup can retry if the engine reconnects.
         idx = self.identity_to_rank_index.pop(identity, None)
         if idx is None:
             return

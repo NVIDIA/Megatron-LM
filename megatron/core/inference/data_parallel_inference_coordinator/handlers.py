@@ -342,12 +342,22 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
 
 
+def _release_owned_handoff(coordinator, request_id, engine):
+    """Forget ownership only after the release is queued to its source."""
+    if not coordinator._send_to_engine(
+        engine, [msgpack.packb([Headers.RELEASE_KV.value, request_id])], remove_unreachable=False
+    ):
+        return False
+    coordinator.handoff_ownership.release(request_id)
+    return True
+
+
 @message_handler(Headers.RELEASE_KV)
 def handle_release_kv(coordinator, sender_identity, metadata, bodies):
-    """Broadcast release of prefill blocks retained for a completed handoff.
+    """Release prefill blocks retained for a completed handoff.
 
-    Sent by ``InferenceClient.release_handoff``. Broadcast to every engine;
-    engines not holding that request id treat it as a no-op.
+    Sent by ``InferenceClient.release_handoff``. Target the registered source,
+    falling back to broadcast for handoffs without ownership bookkeeping.
 
     ``metadata``: ``[header, engine_request_id, optional_coordinator_instance_id]``.
     Fenced releases receive an acknowledgement; a stale instance never releases
@@ -359,14 +369,15 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
         return
     request_id = int(metadata[1])
+    instance_id = metadata[2] if len(metadata) > 2 else None
+    if len(metadata) == 2 or instance_id == coordinator.instance_id:
+        engine = coordinator.handoff_ownership.source_engine(request_id)
+        if engine is None:
+            coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
+        elif not _release_owned_handoff(coordinator, request_id, engine):
+            return  # No ACK: the caller must retry delivery.
     if len(metadata) == 2:
-        coordinator.handoff_ownership.release(request_id)
-        coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
         return
-    instance_id = metadata[2]
-    if instance_id == coordinator.instance_id:
-        coordinator.handoff_ownership.release(request_id)
-        coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
     coordinator.router_socket.send_multipart(
         [
             sender_identity,
@@ -413,10 +424,12 @@ def handle_handoff_owner(coordinator, sender_identity, metadata, bodies):
         if not isinstance(owner, str) or not owner:
             return
         if instance_id == coordinator.instance_id:
+            delivered = True
             for request_id, engine in coordinator.handoff_ownership.confirm_terminated(owner):
-                coordinator._send_to_engine(
-                    engine, [msgpack.packb([Headers.RELEASE_KV.value, request_id])]
-                )
+                if not _release_owned_handoff(coordinator, request_id, engine):
+                    delivered = False
+            if not delivered:
+                return  # Keep failed releases indexed by owner for supervisor retry.
         reply = [Headers.RELEASE_KV_OWNER_ACK.value, instance_id, owner]
     coordinator.router_socket.send_multipart(
         [sender_identity, msgpack.packb(reply, use_bin_type=True)]

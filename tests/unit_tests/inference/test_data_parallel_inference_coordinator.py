@@ -964,6 +964,41 @@ def _make_routing_coordinator(
 class TestRoutingPolicies:
     """Unit tests for routing behavior under different policies and load conditions."""
 
+    @pytest.mark.parametrize("header", [Headers.RELEASE_KV, Headers.RELEASE_KV_OWNER])
+    def test_handoff_release_retries_after_source_disconnect(self, header):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.instance_id = "source-instance"
+        coord.known_clients = {b"client"}
+        for request_id, owner in ((7, "old"), (8, "replacement")):
+            coord.handoff_ownership.offer(request_id, b"rank-0")
+            assert coord.handoff_ownership.claim(request_id, owner)
+        # Routing eviction is not evidence that the source freed its allocations.
+        coord._remove_engine(b"rank-0")
+        metadata = (
+            [header.value, 7, coord.instance_id]
+            if header == Headers.RELEASE_KV
+            else [header.value, coord.instance_id, "old"]
+        )
+        coord.router_socket = unittest.mock.MagicMock(
+            send_multipart=unittest.mock.MagicMock(side_effect=zmq.ZMQError(zmq.EHOSTUNREACH))
+        )
+        HANDLERS[header](coord, b"client", metadata, [])
+        # Only delivery to the source was attempted; no successful ACK to the client.
+        assert coord.router_socket.send_multipart.call_count == 1
+        assert coord.router_socket.send_multipart.call_args.args[0][0] == b"rank-0"
+        assert coord.handoff_ownership.source_engine(7) == b"rank-0"
+        assert not coord.handoff_ownership.claim(7, "other")
+
+        coord._handle_rank_registration(b"rank-0")
+        coord.router_socket.send_multipart.reset_mock(side_effect=True)
+        HANDLERS[header](coord, b"client", metadata, [])
+        release, ack = coord.router_socket.send_multipart.call_args_list
+        assert release.args[0][0] == b"rank-0"
+        assert msgpack.unpackb(release.args[0][1]) == [Headers.RELEASE_KV.value, 7]
+        assert ack.args[0][0] == b"client"
+        assert coord.handoff_ownership.source_engine(7) is None
+        assert coord.handoff_ownership.source_engine(8) == b"rank-0"
+
     def test_no_prefix_caching_uses_load_balanced(self):
         """When prefix caching is off, routing goes to the least-loaded rank."""
         coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)

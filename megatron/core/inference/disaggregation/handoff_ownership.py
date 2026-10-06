@@ -38,6 +38,11 @@ class HandoffOwnership:
         self._owners.setdefault(owner, set()).add(request_id)
         return True
 
+    def source_engine(self, request_id: int) -> bytes | None:
+        """Return the source without forgetting a release that may need retrying."""
+        handoff = self._handoffs.get(request_id)
+        return handoff.engine if handoff is not None else None
+
     def release(self, request_id: int) -> bytes | None:
         """Forget a completed handoff and return its source engine."""
         handoff = self._handoffs.pop(request_id, None)
@@ -51,19 +56,11 @@ class HandoffOwnership:
         return handoff.engine
 
     def confirm_terminated(self, owner: str) -> list[tuple[int, bytes]]:
-        """Fence delayed claims and reclaim only this terminated attempt's state."""
+        """Fence delayed claims and list state to release after successful delivery."""
         if not owner:
             raise ValueError("A nonempty handoff owner is required")
         self._terminated.add(owner)
-        released = []
-        for request_id in list(self._owners.get(owner, ())):
-            engine = self.release(request_id)
-            assert engine is not None
-            released.append((request_id, engine))
-        return released
-
-    def remove_engine(self, engine: bytes) -> None:
-        """Discard bookkeeping when the source engine is removed."""
-        for request_id, handoff in list(self._handoffs.items()):
-            if handoff.engine == engine:
-                self.release(request_id)
+        return [
+            (request_id, self._handoffs[request_id].engine)
+            for request_id in self._owners.get(owner, ())
+        ]
