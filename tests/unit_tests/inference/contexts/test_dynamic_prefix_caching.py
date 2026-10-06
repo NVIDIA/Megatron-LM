@@ -1808,12 +1808,16 @@ def test_hybrid_cached_continuation_preserves_recurrent_position(
     ctx.enable_mtp_kv_cache = False
     ctx.is_hybrid_model = True
     hashes = list(range(1, 11))
-    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
-    ctx.mamba_slot_allocator = (
-        None
-        if mamba_boundaries is None
-        else SimpleNamespace(hash_to_block_id={h: h for h in mamba_boundaries})
-    )
+    # Both hash maps live on the registry; the match path only tests the
+    # allocators for presence.
+    ctx.prefix_cache_registry = PrefixCacheRegistry()
+    ctx.prefix_cache_registry.kv_hash_to_block_id = {h: h for h in hashes}
+    ctx.kv_block_allocator = SimpleNamespace()
+    if mamba_boundaries is None:
+        ctx.mamba_slot_allocator = None
+    else:
+        ctx.prefix_cache_registry.mamba_hash_to_block_id = {h: h for h in mamba_boundaries}
+        ctx.mamba_slot_allocator = SimpleNamespace()
     req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
     bs = ctx.block_size_tokens
     recurrent_position = 0
@@ -1849,7 +1853,9 @@ def test_attention_only_cached_continuation_still_skips():
     ctx.is_hybrid_model = False
     ctx.mamba_slot_allocator = None
     hashes = list(range(1, 11))
-    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    ctx.prefix_cache_registry = PrefixCacheRegistry()
+    ctx.prefix_cache_registry.kv_hash_to_block_id = {h: h for h in hashes}
+    ctx.kv_block_allocator = SimpleNamespace()
     req = SimpleNamespace(
         finished_chunk_token_count=4 * ctx.block_size_tokens, precomputed_block_hashes=hashes
     )
