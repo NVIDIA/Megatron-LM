@@ -94,9 +94,10 @@ groups alongside the requested fraction.
 
 Fraction zero disables all groups after warmup, including groups whose initial
 tensors were below the threshold. Otherwise a later, longer sequence can enable
-copies despite requesting zero offload. Empty transfer queues also do not mark a
-chunk complete until all its scheduled groups have run: advancing early can assign
-later layers to another microbatch and fail backward with a chunk mismatch. Tests
+copies despite requesting zero offload. Chunk advancement depends on whether any
+forward group with the requested name remains, independently of pending transfers.
+Treating empty transfer queues as completed forward can assign later layers to
+another microbatch and fail backward with a chunk mismatch. Tests
 cover growing sequences and consecutive microbatches, with delayed reloads and no
 transfer synchronization between microbatches.
 
@@ -224,8 +225,9 @@ The common-manager subset passed **13 tests**, including the delayed-transfer
 sentinel regression and a fraction-zero growing-microbatch lifecycle test that
 does not require FLA; one aggregation test requires two ranks and was skipped.
 Four schedule-helper cases cover phase forwarding for single-model and MIMO groups.
-An existing eight-layer BF16 GPT/MoE `core_attn` offload test also passed its
-output/gradient and peak-memory checks, covering the shared-manager change outside GDN.
+Two existing eight-layer BF16 GPT/MoE cases (`core_attn`, and MLA with
+`core_attn` + `attn_proj`) passed their output/gradient and peak-memory checks,
+covering the shared-manager change outside GDN with both one and two group names.
 
 Existing single-rank GDN and output-norm recomputation tests passed **7 cases**;
 one fused causal-conv1d case was skipped because its native backward extension is

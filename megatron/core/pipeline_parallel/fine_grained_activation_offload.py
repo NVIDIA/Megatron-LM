@@ -572,9 +572,8 @@ class PipelineOffloadManager:
                 self._cached_chunks_forward.clear()
                 self._cached_chunks_backward.clear()
                 self._queue.clear()
-                if self._stages is not None:
-                    for stage in self._stages:
-                        stage.clear()
+                for stage in self._stages:
+                    stage.clear()
             else:
                 self.post_warmup_callback(process_group=process_group)
         self._cached_chunks_index_backward = 0
@@ -1031,21 +1030,13 @@ class ChunkOffloadHandler:
             return self.find_group_with_name(self.offload_groups, name) is None
         return self._max_group_size == 0
 
-    def finish_all_groups(self, name=None) -> bool:
-        """Finish all groups."""
+    def finish_all_groups(self, name: str) -> bool:
+        """Return whether this chunk has no remaining forward group of this name."""
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # Empty transfer queues do not imply forward is complete: fraction zero
-        # can keep every group on GPU while later layers still need this chunk.
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-            and self._offloaded_group_index >= self._max_group_size
-        ):
-            return True
-        assert name is not None, "Name is required"
+        # Forward progress depends on scheduled groups, not pending transfers:
+        # fraction zero can keep every group on GPU before the chunk is complete.
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
             is None
