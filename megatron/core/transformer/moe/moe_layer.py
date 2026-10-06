@@ -206,7 +206,8 @@ class BaseMoELayer(MegatronModule, ABC):
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-        self.run_shared_experts_before_router = (
+        # MoonEP starts its planner in preprocess, then overlaps it with shared-expert compute.
+        self.run_shared_experts_after_router = self.config.moe_virtual_expert_load_balance and not (
             self.config.cuda_graph_impl == "transformer_engine"
             and bool(
                 {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
@@ -743,7 +744,7 @@ class MoELayer(BaseMoELayer):
                     # preprocess rebinds hidden_states to the dispatch input (latent, flattened);
                     # the shared experts always consume the layer input.
                     layer_input = hidden_states
-                    if self.run_shared_experts_before_router:
+                    if not self.run_shared_experts_after_router:
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
                     probs, routing_map = self.route(
@@ -753,7 +754,7 @@ class MoELayer(BaseMoELayer):
                         layer_input, probs, routing_map, padding_mask
                     )
 
-                    if not self.run_shared_experts_before_router:
+                    if self.run_shared_experts_after_router:
                         shared_expert_output = self.shared_experts_compute(layer_input)
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output

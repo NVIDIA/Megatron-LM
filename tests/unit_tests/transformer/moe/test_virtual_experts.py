@@ -14,12 +14,17 @@ synthetic; no dataset or custom launcher is required.
 
 import gc
 import os
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from functools import partialmethod
 
 import pytest
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 from torch.nn import functional as F
 from transformer_engine.pytorch import cpu_offload as te_cpu_offload
 from transformer_engine.pytorch.attention.dot_product_attention import (
@@ -51,6 +56,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.moe import fused_a2a, moe_utils
 from megatron.core.transformer.moe import router as router_module
+from megatron.core.transformer.moe import virtual_expert_triton as vt
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.core.transformer.moe.router import TopKRouter
@@ -58,6 +64,7 @@ from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridE
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.internal
@@ -268,6 +275,7 @@ class TestVirtualExpertGTP:
         monkeypatch.setattr(gtp, "_FULL_ITERATION", False)
         monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp.GTP_CONFIG, "graph_wgrad_ring_size", 2)
+        monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", 4)
         weights = [gtp.GTPShardedParam(torch.zeros(3, 4, device="cuda")) for _ in range(5)]
         for weight in weights:
             weight.group = four_rank_gtp_group
@@ -276,9 +284,13 @@ class TestVirtualExpertGTP:
             weight.main_grad = torch.zeros_like(weight)
         graphed, eager = weights[:4], weights[-1]
         eager.chain_id = gtp.GTPChain.UNGRAPHED.value
+        # Frozen weights are registered too, but DDP does not create their main_grad.
+        frozen = gtp.GTPShardedParam(torch.zeros_like(eager), requires_grad=False)
+        frozen.group = eager.group
+        frozen.chain_id = eager.chain_id
         for previous, current in zip(graphed, graphed[1:]):
             previous.next_w, current.prev_w = current, previous
-        monkeypatch.setattr(gtp, "_GTP_PARAMS", weights)
+        monkeypatch.setattr(gtp, "_GTP_PARAMS", [*weights, frozen])
 
         old_slots = []
         for _ in range(2):
@@ -296,6 +308,7 @@ class TestVirtualExpertGTP:
             assert graphed[2]._gtp_graph_wgrad_ring_slot is slots[1]
             assert graphed[3]._gtp_graph_wgrad_ring_slot is slots[0]
             assert len(gtp._EAGER_WGRAD_RINGS) == 1
+            assert not hasattr(frozen, "_gtp_eager_wgrad_ring_slot")
             assert eager_view.shape == (10, 4)
             eager_view.fill_(7)
             for slot in slots:
@@ -315,22 +328,24 @@ class TestVirtualExpertGTP:
                 assert not hasattr(weight, "_gtp_graph_wgrad_ring_slot")
                 assert not hasattr(weight, "_gtp_eager_wgrad_ring_slot")
 
+    @pytest.mark.parametrize("ring_size", [1, 2, 4, 8])
     @pytest.mark.parametrize("async_reduction", [False, True], ids=["sync", "async"])
     def test_persistent_wgrad_reuse_preserves_every_reduction(
-        self, monkeypatch, four_rank_gtp_group, async_reduction
+        self, monkeypatch, four_rank_gtp_group, async_reduction, ring_size
     ):
         """Full gradients, padding and exactly-once completion survive shared/repeated writers."""
         group = four_rank_gtp_group
         rank = dist.get_rank(group)
         monkeypatch.setattr(gtp, "_EAGER_WGRAD_RINGS", {})
         monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
+        monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", ring_size)
         monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", async_reduction)
         monkeypatch.setattr(gtp.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", False)
         monkeypatch.setattr(gtp.GTP_CONFIG, "calculate_per_token_loss", False)
         # Both FC roles deliberately have the same shape; each has two independent experts.
         layers = []
         expected, completions = {}, {}
-        for layer in range(3):
+        for layer in range(5):
             roles = []
             for role in ("fc1", "fc2"):
                 weights = [
@@ -357,12 +372,17 @@ class TestVirtualExpertGTP:
         for previous, current in zip(layers, layers[1:]):
             for prev_weights, weights in zip(previous, current):
                 prev_weights[0].next_w, weights[0].prev_w = weights[0], prev_weights[0]
+        monkeypatch.setattr(
+            gtp,
+            "_GTP_PARAMS",
+            [weight for layer in layers for weights in layer for weight in weights],
+        )
 
         pointers = {}
         try:
             # Repeating the tail before the cascade drains its first RS exercises early reuse.
             for step in range(3):
-                for layer_index in (2, 2, 1, 0):
+                for layer_index in (4, 4, 3, 2, 1, 0):
                     for role_index in (1, 0):
                         weights = layers[layer_index][role_index]
                         if async_reduction:
@@ -402,14 +422,25 @@ class TestVirtualExpertGTP:
                             )
                             calls_per_step = 2 if layer is layers[-1] else 1
                             assert completions[id(weight)] == (step + 1) * calls_per_step
-                # Two buffers per role/expert, independent of the three-layer model depth.
-                assert len(set(pointers.values())) == 8
-                assert len(gtp._EAGER_WGRAD_RINGS) == 8
+                # Allocate only the configured depth (or the number of writers if smaller).
+                expected_slots = min(ring_size, len(layers)) * 2 * 2
+                assert len(set(pointers.values())) == expected_slots
         finally:
             torch.cuda.synchronize()
             for layer in layers:
                 for weights in layer:
                     weights[0]._wait_reduce_scatter(finalize_grad=True)
+
+    @pytest.mark.parametrize("ring_size", [0, -1])
+    def test_eager_wgrad_rejects_invalid_ring_size(
+        self, monkeypatch, four_rank_gtp_group, ring_size
+    ):
+        monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", ring_size)
+        weight = gtp.GTPShardedParam(torch.zeros(3, 4, device="cuda"))
+        weight.group = four_rank_gtp_group
+        weight.main_grad = torch.zeros_like(weight)
+        with pytest.raises(ValueError, match="eager_wgrad_ring_size must be at least 1"):
+            weight.get_wgrad_tensor(persistent=True)
 
 
 def _assert_numerical_parity(actual, expected, tolerance, name, peak_tolerance=None):
@@ -846,7 +877,7 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
                 layer.router.weight.zero_()
                 layer.router.weight[:, 0].copy_(torch.tensor([1, 0.5, -0.5, -1], device='cuda'))
                 layer.router.weight[2, 1] = 2
-            routes, inputs, outputs, upstreams, plans = [], [], [], [], []
+            routes, inputs, outputs, upstreams, plans, planned_routes = [], [], [], [], [], []
 
             def capture_routes(module, args, output):
                 probs, indices = output
@@ -860,13 +891,12 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             layer.router.register_forward_hook(capture_routes)
             if virtual:
                 manager = layer.token_dispatcher._comm_manager
-                assert manager.moe_expert_rank_capacity_factor == 1.0
-                assert manager.config.moe_expert_rank_capacity_factor is None
                 dispatch = manager.plan_dispatch
 
                 def record(*args):
                     dispatch(*args)
                     plans.append(manager._plan)
+                    planned_routes.append(args[0].clone())
 
                 monkeypatch.setattr(manager, 'plan_dispatch', record)
             weights = {
@@ -916,7 +946,9 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
                 for use, plan in enumerate(plans):
                     # The hot expert must run on both its owner and a virtual copy, so the
                     # comparison exercises split/reduced wgrads, not just whole-expert moves.
-                    hot_routes = routes[use][1] == (0 if use == 0 else 3)
+                    # Runtime destinations use the adapter's route order, which can differ
+                    # from the router hook's top-k tie order for boolean maps.
+                    hot_routes = planned_routes[use] == (0 if use == 0 else 3)
                     destinations = (plan.virtual_experts[hot_routes] // 4).long()
                     counts = torch.bincount(destinations, minlength=2)
                     torch.distributed.all_reduce(counts, group=pg.ep)
@@ -929,11 +961,11 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
             torch.cuda.synchronize()
             values = {}
             for use, (x, y, (probs, indices)) in enumerate(zip(inputs, outputs, routes)):
-                # Both paths retain upstream full-width router probabilities. Compare
-                # selected routes in expert order using gradients from the actual outputs.
-                indices = indices.sort(dim=-1).values
-                route_probs = probs.gather(1, indices)
-                route_grads = probs.grad.gather(1, indices)
+                # Compare in expert order; MoonEP returns compact scores directly.
+                indices, order = indices.sort(dim=-1)
+                gather_indices = order if virtual else indices
+                route_probs = probs.gather(1, gather_indices)
+                route_grads = probs.grad.gather(1, gather_indices)
                 expected_routes = (
                     torch.tensor([0, 1] if use == 0 else [2, 3], device='cuda')
                     .expand(num_tokens, -1)
@@ -1294,33 +1326,18 @@ def test_virtual_expert_recompute_offload_scopes(
             check.cache_clear()
 
 
-def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
-    """The backend is dropless by construction and allows the whole-layer moe graph."""
-    config = _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
-
-    assert config.moe_expert_rank_capacity_factor is None
-    assert config.moe_hybridep_routing_map_mode == "indices"
-    assert config.moe_single_grouped_weight is False
-    assert config.moe_use_grouped_tensor
-
-
-def test_virtual_expert_hybridep_accepts_native_mxfp8_with_router_padding():
-    """Native MXFP8 parameters are the only quantized storage the push understands."""
-    config = _virtual_expert_hybridep_config(
-        fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, moe_router_padding_for_quantization=True
-    )
-
-    assert (config.fp8, config.fp8_recipe, config.fp8_param) == ("e4m3", "mxfp8", True)
-    assert config.moe_router_padding_for_quantization
-
-
-def test_virtual_expert_mxfp8_accepts_ddp_gather_flags():
-    config = _virtual_expert_hybridep_config(fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True)
-    ddp_config = DistributedDataParallelConfig(
-        fp8_param_gather=True, reuse_grad_buf_for_mxfp8_param_ag=True
-    )
-
-    DDP._validate_config(config, ddp_config)
+@requires_hybridep
+def test_virtual_expert_manager_rejects_mismatched_topk():
+    """A supplied transport top-k must satisfy the planner's fixed-layout contract."""
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    try:
+        config = _virtual_expert_hybridep_config(moe_router_topk=1, moe_router_pre_softmax=True)
+        with pytest.raises(ValueError, match="topk=2"):
+            _VirtualExpertHybridEPManager(
+                ps.get_expert_model_parallel_group(), 1, 2, config, router_topk=2
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
@@ -1349,13 +1366,32 @@ def test_virtual_expert_rejects_unsupported_layout(overrides, match):
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "quantile,compact_supported",
-    [(True, False), (False, True), (False, False)],
-    ids=["quantile-bool-map", "fused-indices", "fused-bool-fallback"],
+    "mode,compact_supported",
+    [
+        ("quantile", False),
+        ("unfused", False),
+        ("fused", True),
+        ("fused", False),
+        ("hash", False),
+        ("hash-fused", True),
+    ],
+    ids=[
+        "quantile-dense",
+        "unfused-dense",
+        "fused-indices",
+        "fused-fallback",
+        "hash-dense",
+        "hash-fusion-enabled",
+    ],
 )
-def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_supported):
+def test_virtual_expert_upstream_router_formats(monkeypatch, mode, compact_supported):
     """Recipe-sized expert IDs and scores agree with a dense unfused router and CPU math."""
-    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", compact_supported)
+    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr(
+        router_module, "fused_topk_with_score_function_supports_topk_indices", compact_supported
+    )
+    quantile = mode == "quantile"
+    hash_routing = mode in ("hash", "hash-fused")
     Utils.initialize_model_parallel(1, 1)
     _set_random_seed(seed_=123, data_parallel_random_init=False)
     config = _virtual_expert_hybridep_config(
@@ -1367,16 +1403,23 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_s
         moe_router_topk_scaling_factor=3.16,
         moe_router_load_balancing_type="quantile_balancing" if quantile else "seq_aux_loss",
         moe_aux_loss_coeff=0 if quantile else 1e-4,
-        moe_router_fusion=not quantile,
+        moe_router_fusion=mode in ("fused", "hash-fused"),
+        moe_num_hash_layers=int(hash_routing),
+        hash_moe_vocab_size=512 if hash_routing else None,
     )
     torch.manual_seed(321)
     logits_cpu = torch.randn(256, 512)
-    if quantile:
-        logits_cpu[0] = -100  # Bias resolves ties between selected zero-probability routes.
+    if quantile or hash_routing:
+        logits_cpu[0] = -100  # Selected routes must survive score underflow to zero.
     bias = torch.randn(512) * 0.3 if quantile else torch.zeros(512)
     scores = logits_cpu.sigmoid()
     selection = logits_cpu - bias if quantile else scores + bias
     expected_ids = selection.argsort(dim=1, descending=True)[:, :10].sort(dim=1).values
+    routing_kwargs = {}
+    if hash_routing:
+        input_ids = torch.arange(256).reshape(2, 128)
+        expected_ids = ((input_ids.t().reshape(-1, 1) + torch.arange(10)) % 512).sort(dim=1).values
+        routing_kwargs["input_ids"] = input_ids.cuda()
     selected = scores.gather(1, expected_ids)
     expected_probs = 3.16 * selected / (selected.sum(dim=1, keepdim=True) + 1e-20)
     dy = torch.randn(256, 512, device="cuda")
@@ -1399,7 +1442,7 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_s
         if quantile:
             reference.qb_beta.copy_(bias)
         ref_logits = logits_cpu.cuda().requires_grad_()
-        ref_probs, ref_map = reference.routing(ref_logits.view(256, 1, 512))
+        ref_probs, ref_map = reference.routing(ref_logits.view(128, 2, 512), **routing_kwargs)
         (ref_probs * dy).sum().backward()
         torch.testing.assert_close(
             ref_map.cpu(),
@@ -1411,9 +1454,10 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_s
             if quantile:
                 router.qb_beta.copy_(bias)
             logits = logits_cpu.cuda().requires_grad_()
-            probs, ids = router.routing(logits.view(256, 1, 512))
-            assert probs.shape == (256, 512)
+            probs, ids = router.routing(logits.view(128, 2, 512), **routing_kwargs)
             if virtual:
+                assert probs.shape == ids.shape == (256, 10)
+                assert ids.dtype == torch.int64
                 # Exercise the actual dispatcher adapter without allocating transport
                 # storage; the CPU oracle below checks its IDs, weights and gradients.
                 manager = object.__new__(_VirtualExpertHybridEPManager)
@@ -1424,6 +1468,7 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_s
                 (ids,) = planned
                 probs = manager.token_probs
             else:
+                assert probs.shape == (256, 512)
                 if ids.dtype == torch.bool:
                     ids = ids.to(torch.int8).topk(10, dim=1).indices
                 else:
@@ -1438,11 +1483,43 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_s
                 probs.gather(1, order).cpu(), expected_probs, rtol=1e-5, atol=1e-7
             )
             assert ids.max() > 64
-            if quantile:
+            if quantile or hash_routing:
                 assert not probs[0].any()
             (probs * dy.gather(1, ids)).sum().backward()
             torch.testing.assert_close(logits.grad, ref_logits.grad, rtol=2e-4, atol=1e-6)
             assert logits.grad[1:].norm() > 0
+            if virtual:
+                # Exercise the actual router plus metadata path, including probability
+                # gradients. Quantile beta accumulation is checked separately below.
+                def route(logits):
+                    scores, indices = router.routing(logits, **routing_kwargs)
+                    manager.setup_metadata(indices, scores)
+                    return manager.token_probs, indices
+
+                router.eval()
+                assert_replays_bit_exact(
+                    route,
+                    (logits.detach().view(128, 2, 512).requires_grad_(),),
+                    grad_outputs={"out[0]": dy.gather(1, ids)},
+                    replays=3,
+                    contention=True,
+                    what=f"MoonEP direct routing[{mode}]",
+                )
+                with torch.no_grad():
+                    static_logits = logits.detach().view(128, 2, 512).clone()
+                    # Warm up before capture; replay must read new scores, not cached IDs.
+                    route(static_logits)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        captured_scores, captured_ids = route(static_logits)
+                    changed_logits = static_logits.flip(0).contiguous()
+                    expected_scores, expected_indices = route(changed_logits)
+                    static_logits.copy_(changed_logits)
+                    graph.replay()
+                    torch.testing.assert_close(captured_ids, expected_indices, rtol=0, atol=0)
+                    torch.testing.assert_close(captured_scores, expected_scores, rtol=0, atol=0)
+                router.train()
             if quantile:
                 alpha = selection.sort(dim=1, descending=True).values[:, 10:11]
                 expected_beta = (logits_cpu - alpha).sort(dim=0, descending=True).values[5]
@@ -1463,10 +1540,110 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, quantile, compact_s
         for virtual, shape, index_buffer in calls:
             assert shape == (256, 512)
             if compact_supported:
-                assert index_buffer.shape == (256, 10) and index_buffer.dtype == torch.int16
+                assert index_buffer.shape == (256, 10)
+                assert index_buffer.dtype == (torch.int64 if virtual else torch.int16)
             else:
                 assert index_buffer is None
-        assert bool(calls) == config.moe_router_fusion
+                assert not virtual  # MoonEP uses the unfused dense helper in this case.
+        assert bool(calls) == (mode == "fused")
     finally:
         destroy_moe_metrics_tracker()
         Utils.destroy_model_parallel()
+
+
+@triton.jit
+def _barrier_wait_probe(signal, scratch, output, MODE: tl.constexpr, DELAY_NS: tl.constexpr):
+    block = tl.program_id(0)
+    if MODE == "grid":
+        # Block 1 deliberately never arrives; block 0 must abort the whole grid.
+        if block == 0:
+            vt._grid_sync(scratch, vt._GRID_SYNC_TAG, 2)
+    else:
+        if block == 0:
+            peers = tl.arange(0, 4)
+            # Two live lanes: one ready and one delayed/missing, plus masked lanes.
+            address = (signal + peers).to(tl.int64)
+            vt._handshake(
+                address,
+                peers < 2,
+                scratch,
+                COMPARE=0 if MODE == "release" else 1,
+                VALUE=1 if MODE == "release" else 0,
+                SEM="release" if MODE == "release" else "acquire",
+                LABEL="test missing peer",
+            )
+        elif DELAY_NS > 0:
+            start = tl.extra.cuda.globaltimer()
+            while tl.extra.cuda.globaltimer() - start < DELAY_NS:
+                pass
+            tl.atomic_xchg(signal + 1, 0 if MODE == "release" else 1, sem="release")
+        # On failure this also checks that another block spinning in a different
+        # wait cannot prevent the trap from reaching the host.
+        vt._grid_sync(scratch + 1, vt._GRID_SYNC_TAG, 2)
+    tl.store(output + block, 17)
+
+
+def _barrier_timeout_worker(mode, graph, delayed):
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    # Shorten only the deadline; keep the production sampling interval so these
+    # cases also catch watchdogs that sample too infrequently to fail promptly.
+    vt._BARRIER_TIMEOUT_NS = tl.constexpr(500_000_000 if delayed else 20_000_000)
+    signal = torch.tensor(
+        [0, 1, 0, 0] if mode == "release" else [1, 0, 0, 0], device="cuda", dtype=torch.int32
+    )
+    scratch = torch.zeros(2, device="cuda", dtype=torch.int32)
+    output = torch.zeros(2, device="cuda", dtype=torch.int32)
+    args = (signal, scratch, output)
+    kwargs = dict(
+        MODE=mode, DELAY_NS=250_000_000 if delayed else 0, num_warps=4, launch_cooperative_grid=True
+    )
+    _barrier_wait_probe.warmup(*args, **kwargs, grid=(2,))
+    torch.cuda.synchronize()
+    if graph:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            _barrier_wait_probe[(2,)](*args, **kwargs)
+        launch = g.replay
+    else:
+        launch = lambda: _barrier_wait_probe[(2,)](*args, **kwargs)
+    start = time.monotonic()
+    try:
+        for _ in range(3 if delayed else 1):
+            output.zero_()
+            signal.copy_(torch.tensor([0, 1, 0, 0] if mode == "release" else [1, 0, 0, 0]))
+            launch()
+            torch.cuda.synchronize()
+            if delayed:
+                assert output.tolist() == [17, 17]
+        assert delayed, "missing participant unexpectedly completed"
+    except RuntimeError as exc:
+        assert not delayed, str(exc)
+        assert "launch failure" in str(exc), str(exc)
+        assert time.monotonic() - start < 10
+        print("EXPECTED_TIMEOUT_TRAP", flush=True)
+        return
+    print("DELAYED_PEER_REPLAY_OK", flush=True)
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize(
+    "mode,delayed",
+    [("release", False), ("acquire", False), ("grid", False), ("release", True), ("acquire", True)],
+)
+def test_virtual_expert_barrier_timeout(mode, delayed, graph):
+    """Both handshake phases and grid waits fail with debugging explicitly off."""
+    # A timeout trap poisons the CUDA context, so each case needs a fresh process.
+    result = subprocess.run(
+        [sys.executable, __file__, mode, str(int(graph)), str(int(delayed))],
+        env={**os.environ, "TRITON_DEBUG": "0"},
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("DELAYED_PEER_REPLAY_OK" if delayed else "EXPECTED_TIMEOUT_TRAP") in result.stdout
+
+
+if __name__ == "__main__":
+    _barrier_timeout_worker(sys.argv[1], bool(int(sys.argv[2])), bool(int(sys.argv[3])))

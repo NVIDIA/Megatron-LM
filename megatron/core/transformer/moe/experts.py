@@ -446,8 +446,8 @@ class TEGroupedMLP(MegatronModule):
             if len(runtime_weights) != linear.num_gemms:
                 raise ValueError("Runtime weight count must match grouped-linear GEMMs.")
             # TE's unfused path reads weight{i} with getattr(); the fused op copies these
-            # same references below. Avoid registering virtual expertsas parameters so DDP
-            # and checkpointing dont pick them up.
+            # same references below. Avoid registering virtual experts as parameters so DDP
+            # and checkpointing don't pick them up.
             for index, weight in enumerate(runtime_weights):
                 object.__setattr__(linear, f"weight{index}", weight)
         # For non GTP, trigger the virtual expert reduce scatter on TE's 'wgrad_store'

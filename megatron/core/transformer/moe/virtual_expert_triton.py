@@ -17,14 +17,23 @@ use overwrite semantics for their staging buffers.
 
 import functools
 import math
+from contextvars import copy_context
 
 import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+from packaging.version import Version
 
 MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
 MAX_VIRTUAL_EXPERT_EP_SIZE = 64
+
+
+@functools.lru_cache(maxsize=1)
+def _check_triton_version() -> None:
+    """MoonEP style load balancing requires Triton's context local allocator introduced in 3.5."""
+    if Version(triton.__version__) < Version("3.5.0"):
+        raise RuntimeError(f"MoonEP requires Triton >= 3.5.0; found {triton.__version__}.")
 
 
 # Constants a kernel reads must be ``tl.constexpr`` objects (``.value`` on the host).
@@ -45,6 +54,8 @@ _GRID_SYNC_TAG = tl.constexpr(0x40000000)
 # One int32 word per ordered rank pair inside the symmetric-memory signal pad.
 _SIGNAL_STRIDE = tl.constexpr(4)
 _BARRIER_TIMEOUT_NS = tl.constexpr(100_000_000_000)
+# 2**18 polls is about 0.05--0.75, allow roughly 1--2 s of timeout sampling slack.
+_BARRIER_CLOCK_INTERVAL = tl.constexpr(1 << 18)
 # Fixed planner grid, leaving compute resources for the overlapping attention/shared MLP.
 PLANNER_PROGRAMS = 32
 _PLANNER_PROGRAMS = tl.constexpr(PLANNER_PROGRAMS)
@@ -54,15 +65,50 @@ _FLAG_STRIDE = tl.constexpr(32)
 
 
 @triton.jit
+def _check_barrier_timeout(start, polls, LABEL: tl.constexpr):
+    """Advance the poll count and sample elapsed time from the wait's fixed start.
+
+    Expiry can overshoot by one sampling interval of polling.
+    A PTX trap is enabled even with TRITON_DEBUG=0 and aborts
+    the kernel, including blocks waiting at another grid barrier. CUDA reports an
+    asynchronous launch failure to the caller; the process must be restarted.
+    Other ranks still in these waits expire independently. This does not time out
+    unrelated collectives or a GPU instruction that itself stops making progress.
+    """
+    polls += 1
+    if polls % _BARRIER_CLOCK_INTERVAL == 0:
+        now = tl.extra.cuda.globaltimer()
+        # Compare elapsed nanoseconds ($1) with the timeout ($2) as unsigned 64-bit
+        # values, then execute trap only if elapsed >= timeout. Write an unused zero
+        # to $0 to satisfy the inline-asm output contract. This avoids assert/printf
+        # call overhead; LABEL identifies the wait in PTX, not a host message.
+        tl.inline_asm_elementwise(
+            "{ .reg .pred expired;\n"
+            "setp.ge.u64 expired, $1, $2;\n"
+            f"@expired trap; // {LABEL}\n"
+            "mov.u32 $0, 0; }",
+            "=r,l,l",
+            [now - start, _BARRIER_TIMEOUT_NS],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    return polls
+
+
+@triton.jit
 def _grid_sync(grid_barrier, TAG: tl.constexpr, NUM_SMS: tl.constexpr):
     """Self-resetting cooperative-grid barrier."""
     tl.debug_barrier()
     increment = tl.where(tl.program_id(0) == 0, TAG - (NUM_SMS - 1), 1)
     previous = tl.atomic_add(grid_barrier, increment, sem="release", scope="gpu")
     complete = False
+    start = tl.extra.cuda.globaltimer()
+    polls = 0
     while not complete:
         current = tl.atomic_add(grid_barrier, 0, sem="acquire", scope="gpu")
         complete = ((current ^ previous) & TAG) != 0
+        polls = _check_barrier_timeout(start, polls, "virtual-expert grid barrier stalled")
     tl.debug_barrier()
 
 
@@ -85,8 +131,7 @@ def _prefix_maximum(a, b):
     return tl.maximum(a, b)
 
 
-# The route-count, exchange-timeout and slot asserts compile in only under ``TRITON_DEBUG=1``;
-# production runs without them.
+# Route-count and slot asserts require TRITON_DEBUG=1; barrier timeouts are always enabled.
 @triton.jit(do_not_specialize=["source_rank"])
 def _plan_virtual_expert_routes_kernel(
     top_indices,
@@ -413,6 +458,7 @@ class VirtualExpertPlannerWorkspace:
     :func:`_scratch_layout`; :meth:`field` views one field for inspection."""
 
     def __init__(self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup) -> None:
+        _check_triton_version()
         import torch.distributed._symmetric_memory as symm_mem
 
         ep_size = dist.get_world_size(group=group)
@@ -524,13 +570,12 @@ def _handshake(
     compare = tl.full(address.shape, COMPARE, tl.int32)
     flipped = tl.full(address.shape, VALUE, tl.int32)
     start = tl.extra.cuda.globaltimer()
+    polls = 0
     while tl.sum(pending.to(tl.int32), 0) > 0:
         target = tl.where(pending, address, dummy.to(tl.int64)).to(tl.pointer_type(tl.int32))
         previous = tl.atomic_cas(target, compare, flipped, sem=SEM, scope="sys")
         pending = pending & (previous != compare)
-        # Compiled out unless ``TRITON_DEBUG=1``: the assert's call site alone slows these
-        # kernels about 2x, so in production a peer that never arrives hangs here.
-        tl.device_assert(tl.extra.cuda.globaltimer() - start < _BARRIER_TIMEOUT_NS, LABEL)
+        polls = _check_barrier_timeout(start, polls, LABEL)
 
 
 @triton.jit
@@ -890,9 +935,15 @@ def _source_scratch(device_index: int, entries: int) -> torch.Tensor:
     return torch.empty(entries, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 
-def _allocate_descriptor_scratch(size: int, alignment: int, stream) -> torch.Tensor:
-    """Triton's device-descriptor allocator: the per-launch ``torch.empty`` Inductor installs."""
-    return torch.empty(size, dtype=torch.int8, device="cuda")
+def _launch_with_descriptor_allocator(kernel, *args, **kwargs):
+    """Scope Triton's allocator override to this launch, including exception paths."""
+    def launch():
+        triton.set_allocator(
+            lambda size, alignment, stream: torch.empty(size, dtype=torch.int8, device="cuda")
+        )
+        return kernel(*args, **kwargs)
+
+    return copy_context().run(launch)
 
 
 def launch_virtual_expert_weight_prefetch(
@@ -927,8 +978,8 @@ def launch_virtual_expert_weight_prefetch(
     # either orientation, so the arena layout depends only on the member shapes.
     member_bytes = tuple(numel if mxfp8 else 2 * numel for numel in member_numels)
     scale_bytes = tuple(numel // 32 for numel in member_numels) if mxfp8 else (0, 0)
-    triton.set_allocator(_allocate_descriptor_scratch)
-    _virtual_expert_weight_push_kernel[(num_sms,)](
+    _launch_with_descriptor_allocator(
+        _virtual_expert_weight_push_kernel[(num_sms,)],
         *tables,
         int(workspace.weight_handle.buffer_ptrs_dev),
         int(workspace.weight_handle.signal_pad_ptrs_dev),
@@ -976,8 +1027,8 @@ def launch_virtual_expert_grad_reduce(
     device_index = arena.device.index
     tile = _transport_tile(_MAX_TILE_BYTES // arena.dtype.itemsize, *member_numels)
     fc1_tiles, fc2_tiles = (numel // tile for numel in member_numels)
-    triton.set_allocator(_allocate_descriptor_scratch)
-    _virtual_expert_grad_reduce_kernel[(num_sms,)](
+    _launch_with_descriptor_allocator(
+        _virtual_expert_grad_reduce_kernel[(num_sms,)],
         arena,
         *(
             _check_table(table, torch.int64, (num_local_experts,), "pointer tables")

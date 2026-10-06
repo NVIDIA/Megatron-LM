@@ -2591,8 +2591,8 @@ def destroy_model_parallel():
         )
 
         VirtualExpertLoadBalancer.finalize()
-    except Exception:  # finalize must never block teardown
-        pass
+    except Exception:
+        logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
 
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would

@@ -256,6 +256,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `async_reduction` | `True` | Async wgrad reduce-scatter; disable for easier debugging. |
 | `calculate_per_token_loss` | `False` | Must mirror `config.calculate_per_token_loss` (SUM vs MEAN RS). |
 | `graph_wgrad_ring_size` | `2` | Persistent wgrad ring slots per scheduling domain (§3.6). Increase if capture rejects same-key writers. |
+| `eager_wgrad_ring_size` | `2` | Persistent eager wgrad slots per scheduling/shape domain. Increase to delay buffer reuse at the cost of memory; set before the first backward. |
 
 ### 2.2 Required flags
 
@@ -324,7 +325,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=1, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
-  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
+  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2,
+  eager_wgrad_ring_size=2)
 ```
 
 (`pad_for_alignment=1` here because this example is BF16 with no quantization-tile
@@ -342,6 +344,7 @@ update_gtp_config(
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
     reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.6)
     graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
+    eager_wgrad_ring_size=2,      # Persistent eager wgrad slots; independent of gather buffers
 )
 ```
 
@@ -816,6 +819,19 @@ The two modes differ only in release timing and the storage required to make ear
 *Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero (§3.7 covers why that permanent zero has to be excluded from `num_zeros`), and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient when each graph has one same-key writer: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only when one graph contains multiple same-key writers whose reduce-scatter inputs can be live together. Capture rejects unsafe same-slot reuse instead of silently aliasing it.
 
 The feature applies only to **local/partial CUDA graphs** and is enabled automatically. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
+
+Eager callers that request persistent wgrad storage use a separate ring controlled by
+`eager_wgrad_ring_size` (default 2, minimum 1). On the first persistent-buffer request
+in a domain, all matching registered parameters are bound to fixed slots in registration
+order using the shared allocator and the same round-robin rule as CUDA graphs. Domains keep
+communication, shape, dtype, and expert index separate; grouped FC1 and FC2 have separate
+rings. Each domain allocates the smaller of the configured depth and its writer count.
+Before reuse, the previous owner finalizes any pending reduction and the compute stream
+waits on the slot's completion event. A deeper ring delays reuse and may improve overlap,
+at the cost of additional unsharded gradient buffers. It does not change gather-buffer
+double buffering, and a repeated backward for the same parameter still reuses its bound
+slot. Configure the depth before the first backward; `reset_gtp_state()` clears both the
+slots and their assignments.
 
 ### 3.7 Per-parameter alignment padding
 
