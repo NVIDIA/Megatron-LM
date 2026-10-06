@@ -210,7 +210,11 @@ class _FakeSSM(SSMDynamicInferenceMixin):
         intermediate_ssm_state=None,
     ):
         self.decode_inputs.append((zxBCdt.clone(), batch_indices.clone()))
-        return zxBCdt[..., :2]
+        output = zxBCdt[..., :2]
+        if zxBCdt.shape[1] > 1:
+            # GDP returns batch-first speculative output via a transpose.
+            output = output.transpose(0, 1).contiguous().transpose(0, 1)
+        return output
 
     def out_proj(self, y):
         return y, None
