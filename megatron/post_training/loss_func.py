@@ -6,8 +6,8 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
+from megatron.core.utils import unwrap_model
 from megatron.training import get_args
-from megatron.training.utils import unwrap_model
 
 
 def _mask_loss(output_tensor, loss_mask):

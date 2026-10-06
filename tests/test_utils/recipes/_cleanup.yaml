@@ -1,0 +1,58 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{platforms}'
+  model: cleanup
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 0
+  n_repeat: 1
+  platforms: dgx_h100
+  script_setup: |
+    echo "Cleanup workload — no setup required."
+  script: |-
+    set -euo pipefail
+
+    WEEKLY_THRESHOLD_DAYS=14
+    RELEASE_THRESHOLD_DAYS=28
+
+    # CLEANUP_PATHS: newline-separated base directories. For each base dir,
+    # the recipe deletes immediate child directories whose names match
+    # `weekly-*` and whose mtime is at least WEEKLY_THRESHOLD_DAYS old.
+    # Preserve the existing release-* retention. The pattern match is the
+    # safety boundary — nothing outside those two name prefixes is touched.
+    if [[ -z "${{CLEANUP_PATHS:-}}" ]]; then
+        echo "CLEANUP_PATHS env var not set; nothing to do."
+        exit 0
+    fi
+
+    echo "Base dirs (top-level only):"
+    printf '%s\n' "$CLEANUP_PATHS" | sed 's/^/  - /'
+    echo "Match patterns: weekly-* release-*"
+    echo "Weekly retention: $WEEKLY_THRESHOLD_DAYS days"
+    echo "Release retention: -mtime +$RELEASE_THRESHOLD_DAYS"
+
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        if [[ "$path" == "/" || ! -d "$path" ]]; then
+            echo "Skipping unsafe or missing path: $path"
+            continue
+        fi
+        echo "--- Deleting expired weekly-*/release-* dirs under $path ---"
+        # find rounds -mtime down to whole days, so +13 includes age 14 days.
+        find "$path" -mindepth 1 -maxdepth 1 -type d \
+            \( \( -name 'weekly-*' -mtime +$((WEEKLY_THRESHOLD_DAYS - 1)) \) \
+               -o \( -name 'release-*' -mtime +$RELEASE_THRESHOLD_DAYS \) \) -print0 \
+          | xargs -0 -r rm -rf
+    done <<<"$CLEANUP_PATHS"
+
+    echo "Cleanup complete."
+
+products:
+  - test_case: [cleanup_old_artifacts]
+    products:
+      - environment: [dev]
+        scope: [cleanup]
+        platforms: [dgx_a100, dgx_h100, dgx_gb200]

@@ -21,6 +21,7 @@ from megatron.training.training import training_log
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.utils import calc_params_l2_norm
 from megatron.training.utils import check_adlr_autoresume_termination
+from megatron.training.global_vars import get_run_config
 
 
 def process_batch(batch):
@@ -147,6 +148,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
 def _train(model, optimizer, opt_param_scheduler, forward_step,
            train_dataloader, valid_dataloader, end_of_epoch_callback):
     """Train the model."""
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
@@ -192,7 +194,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
 
             # Logging.
             params_norm = None
-            if args.log_params_norm:
+            if cfg.logger.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
@@ -267,7 +269,7 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer', log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider, model_type)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for

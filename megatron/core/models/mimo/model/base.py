@@ -1,23 +1,40 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import warnings
-from typing import Any, Dict, Optional
+from contextlib import ExitStack, contextmanager
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
+from megatron.core._rank_utils import warn_single_rank
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import make_viewless_tensor, unwrap_model
+
+if TYPE_CHECKING:
+    from megatron.core.process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
+
+_LANGUAGE_INPUT_PROJECTIONS_ATTR = "mimo_input_projections"
+
+
+class MimoEncoderFloat16Module(Float16Module):
+    """Float16Module that keeps encoder outputs in model precision for the bridge."""
+
+    def forward(self, *inputs, fp32_output=False, **kwargs):
+        """Run forward while keeping encoder outputs in model precision by default."""
+        return super().forward(*inputs, fp32_output=fp32_output, **kwargs)
 
 
 class MimoModel(MegatronModule):
@@ -51,11 +68,9 @@ class MimoModel(MegatronModule):
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
 
-        warnings.warn(
+        warn_single_rank(
             "MimoModel is experimental and still under active development. "
-            "The API may change without notice in future releases.",
-            category=UserWarning,
-            stacklevel=2,
+            "The API may change without notice in future releases."
         )
 
         self.mimo_config = mimo_config
@@ -77,8 +92,11 @@ class MimoModel(MegatronModule):
         max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
 
         self.partition_adapter: Optional[PartitionAdapter] = None
-        # Create partition adapter only if parallelism is enabled
-        if language_config.context_parallel_size > 1 or language_config.sequence_parallel:
+        # Only on language-module ranks: encoder-only ranks never shard and would read
+        # process groups they do not own.
+        if self.role.has_language_module and (
+            language_config.context_parallel_size > 1 or language_config.sequence_parallel
+        ):
             partition_config = PartitionConfig.from_mp_config(
                 mp=language_config,
                 max_seq_len=max_seq_len,
@@ -92,6 +110,65 @@ class MimoModel(MegatronModule):
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+        self._initialize_language_input_projections()
+        self._finish_init_quantization()
+
+    def refit_modules(self) -> list[tuple[str, torch.nn.Module, "ProcessGroupCollection"]]:
+        """Declare local LLaVA matching labels, modules, and their owning groups.
+
+        Native module registration and checkpoint names remain unchanged.
+        """
+        components = []
+        if self.language_model is not None:
+            language = unwrap_model(self.language_model)
+            components.append(
+                ("language_model", language, getattr(language, "pg_collection", None))
+            )
+        for modality, wrapped_tower in self.modality_submodules.items():
+            tower = unwrap_model(wrapped_tower)
+            if (
+                modality != "images"
+                or len(tower.encoders) != 1
+                or len(tower.input_projections) > 1
+                or tower.decoders
+                or tower.output_projections
+            ):
+                raise ValueError("Refit requires one image encoder and at most one input projector")
+            vision = unwrap_model(next(iter(tower.encoders.values())))
+            components.append(("vision_model", vision, getattr(vision, "pg_collection", None)))
+            for wrapped_projector in tower.input_projections:
+                projector = unwrap_model(wrapped_projector)
+                components.append(
+                    (
+                        "vision_projection",
+                        projector,
+                        getattr(projector, "pg_collection", None) or tower.pg_collection,
+                    )
+                )
+
+        for label, module, pg in components:
+            if pg is None or any(getattr(pg, axis, None) is None for axis in ("tp", "pp", "dp")):
+                raise ValueError(
+                    f"Refit component {label!r} requires explicit tp, pp and dp groups"
+                )
+            config = getattr(module, "config", None)
+            if (
+                getattr(config, "fp8", None)
+                or getattr(config, "fp4", None)
+                or getattr(config, "use_kitchen", False)
+                or getattr(config, "quant_recipe", None) is not None
+            ):
+                raise ValueError("Quantized component refit is not supported")
+            # Check legacy TP-only constructors (notably projectors); encoders
+            # such as CLIP pass their full collection directly to the decoder.
+            tp = getattr(module, "tp_group", None)
+            if tp is not None and torch.distributed.get_process_group_ranks(
+                tp
+            ) != torch.distributed.get_process_group_ranks(pg.tp):
+                raise ValueError(
+                    f"Refit component {label!r}: TP group disagrees with its declaration"
+                )
+        return components
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -102,40 +179,113 @@ class MimoModel(MegatronModule):
         sharded_sd = {}
         for name, module in self.named_children():
             if name == 'modality_submodules':
-                # Unwrap DDP, call ModalitySubmodules.sharded_state_dict directly
-                # (which injects dp_cp_group from its pg_collection)
+                # Unwrap DDP/Float16Module (each forwards sharded_state_dict without adding
+                # its own 'module.') and add the prefix per level, then call the submodule
+                # directly (which injects dp_cp_group from its pg_collection).
                 for mod_name, mod in module.items():
-                    is_ddp = isinstance(mod, DistributedDataParallel)
-                    inner = mod.module if is_ddp else mod
+                    inner = mod
                     child_prefix = f'{prefix}{name}.{mod_name}.'
-                    if is_ddp:
+                    while isinstance(inner, (DistributedDataParallel, Float16Module)):
+                        inner = inner.module
                         child_prefix += 'module.'
                     sharded_sd.update(
                         inner.sharded_state_dict(child_prefix, sharded_offsets, metadata)
                     )
             else:
                 # Inject dp_cp_group from pg_collection for language_model
-                inner = module.module if isinstance(module, DistributedDataParallel) else module
-                pg = getattr(inner, 'pg_collection', None)
+                pg_src = module.module if isinstance(module, DistributedDataParallel) else module
+                pg = getattr(pg_src, 'pg_collection', None)
                 mod_metadata = metadata
                 if pg is not None:
                     assert (
                         hasattr(pg, 'dp_cp') and pg.dp_cp is not None
                     ), f"pg_collection on '{name}' is missing dp_cp group"
                     mod_metadata = dict(metadata) if metadata else {}
-                    mod_metadata['dp_cp_group'] = pg.dp_cp
-                sharded_sd.update(
-                    sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, mod_metadata
-                    )
+                    mod_metadata['dp_cp_group'] = getattr(pg, 'dp_cp_gtp_remat', None) or pg.dp_cp
+                # Unwrap wrappers so the sharded keys match the raw load_state_dict keys.
+                inner = module
+                child_prefix = f'{prefix}{name}.'
+                while isinstance(inner, (DistributedDataParallel, Float16Module)):
+                    inner = inner.module
+                    child_prefix += 'module.'
+                module_sd = sharded_state_dict_default(
+                    inner, child_prefix, sharded_offsets, mod_metadata
                 )
+                if (
+                    name == 'language_model'
+                    and self.mimo_config.language_model_input_projections_spec
+                ):
+                    projection_specs = self.mimo_config.language_model_input_projections_spec
+                    runtime_root = f'{child_prefix}{_LANGUAGE_INPUT_PROJECTIONS_ATTR}.'
+                    input_projections = self.language_model_input_projections
+                    assert input_projections is not None
+                    for modality_name, projection in input_projections.items():
+                        module_sd.update(
+                            sharded_state_dict_default(
+                                projection,
+                                f'{runtime_root}{modality_name}.',
+                                sharded_offsets,
+                                mod_metadata,
+                            )
+                        )
+
+                    root_prefix, separator, wrapper_suffix = child_prefix.rpartition(
+                        'language_model.'
+                    )
+                    if not separator:
+                        raise ValueError(
+                            "language model prefix must contain 'language_model.', "
+                            f"got {child_prefix!r}"
+                        )
+                    apply_prefix_mapping(
+                        module_sd,
+                        {
+                            f'{runtime_root}{modality_name}.': (
+                                f'{root_prefix}modality_submodules.{modality_name}.'
+                                f'{wrapper_suffix}input_projections.0.'
+                            )
+                            for modality_name in projection_specs
+                        },
+                    )
+                sharded_sd.update(module_sd)
         return sharded_sd
+
+    @staticmethod
+    def _validate_precomputed_token_indices(
+        modality_embeddings: Dict[str, torch.Tensor],
+        modality_token_indices: Dict[str, torch.Tensor],
+        num_positions: int,
+    ) -> None:
+        """Validate the metadata-only contract for precomputed token positions."""
+        if modality_token_indices.keys() != modality_embeddings.keys():
+            raise ValueError(
+                "Precomputed token indices must have the same modalities as the embeddings"
+            )
+
+        total_indices = 0
+        for name, embeddings in modality_embeddings.items():
+            indices = modality_token_indices[name]
+            if indices.ndim != 1:
+                raise ValueError(f"{name} token indices must be one-dimensional")
+            if indices.numel() != embeddings.size(0):
+                raise ValueError(
+                    f"Number of {name} token indices ({indices.numel()}) does not match "
+                    f"number of embeddings ({embeddings.size(0)})"
+                )
+            total_indices += indices.numel()
+
+        if total_indices != num_positions:
+            raise ValueError(
+                f"Precomputed token indices must cover {num_positions} positions, "
+                f"got {total_indices}"
+            )
 
     def align_embeddings_by_token_positions(
         self,
         modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
         input_ids: torch.Tensor,  # [bs, seq_len]
         special_token_ids: Dict[str, int],
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Align embeddings from different modalities based on special token positions in input_ids.
 
@@ -148,6 +298,15 @@ class MimoModel(MegatronModule):
                 The number of special tokens for each modality should exactly match the number
                 of embeddings for that modality.
             special_token_ids: Dictionary mapping modality names to their special token IDs
+            modality_token_indices: Optional complete mapping from modality names to flat,
+                batch-major ``torch.long`` token indices on the embedding device. Each tensor must
+                contain the same positions, in the same order, that the corresponding
+                ``special_token_ids`` mask would select; ``text`` contains the complement of all
+                special-token positions. When provided, the keys must exactly match
+                ``modality_embeddings`` and their lengths must sum to ``B * S``. Index values are a
+                trusted producer contract and are not revalidated because doing so would add device
+                reductions and host synchronization to the forward hot path. Pass ``None`` to use
+                the mask-based path for every modality.
 
         Returns:
             Combined embeddings tensor. Shape: (S, B, H)
@@ -174,6 +333,20 @@ class MimoModel(MegatronModule):
         combined_embeddings = torch.zeros(
             (batch_size, seq_length, hidden_dim), dtype=dtype, device=device
         )
+        flat_combined_embeddings = combined_embeddings.view(-1, hidden_dim)
+
+        if modality_token_indices is not None:
+            self._validate_precomputed_token_indices(
+                modality_embeddings, modality_token_indices, batch_size * seq_length
+            )
+            for modality_name, modality_emb in modality_embeddings.items():
+                # Bridges keep modality activations in parameter dtype; promote only when
+                # they join a higher-precision language-model residual stream.
+                modality_emb = modality_emb.to(dtype=dtype)
+                flat_combined_embeddings.index_copy_(
+                    0, modality_token_indices[modality_name], modality_emb
+                )
+            return combined_embeddings.transpose(0, 1).contiguous()
 
         # Process each modality in modality_embeddings
         for modality_name, modality_emb in modality_embeddings.items():
@@ -194,6 +367,7 @@ class MimoModel(MegatronModule):
                     f"number of {modality_name} embeddings ({modality_emb.size(0)})"
                 )
 
+            modality_emb = modality_emb.to(dtype=dtype)
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)
             combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
 
@@ -226,6 +400,43 @@ class MimoModel(MegatronModule):
             )
 
             self.modality_submodules[modality_name] = submodule
+
+    def _finish_init_quantization(self) -> None:
+        """Apply per-module quantization recipes to initialized projections and encoders."""
+        roots = [("modality_submodules", self.modality_submodules)]
+        input_projections = self.language_model_input_projections
+        if input_projections is not None:
+            roots.extend(
+                (f"modality_submodules.{name}.input_projections.0", projection)
+                for name, projection in input_projections.items()
+            )
+        for prefix, root in roots:
+            for name, module in root.named_modules(prefix=prefix):
+                if hasattr(module, 'finish_init'):
+                    quant_config = get_quant_config_or_none(name, module.config.quant_recipe)
+                    module.finish_init(quant_config)
+
+    def _initialize_language_input_projections(self) -> None:
+        """Install modality input projections on the first language stage."""
+        specs = self.mimo_config.language_model_input_projections_spec
+        if specs and self.role.mode is not ModuleLayout.NON_COLOCATED:
+            raise ValueError("Language-owned input projections require non-colocated MIMO modules")
+        if not self.role.has_language_module:
+            return
+
+        input_projections = torch.nn.ModuleDict()
+        if self.role.is_first_stage(MIMO_LANGUAGE_MODULE_KEY):
+            input_projections.update({name: build_module(spec) for name, spec in specs.items()})
+        setattr(
+            unwrap_model(self.language_model), _LANGUAGE_INPUT_PROJECTIONS_ATTR, input_projections
+        )
+
+    @property
+    def language_model_input_projections(self) -> Optional[torch.nn.ModuleDict]:
+        """Return the input projections installed on the language model."""
+        if self.language_model is None:
+            return None
+        return getattr(unwrap_model(self.language_model), _LANGUAGE_INPUT_PROJECTIONS_ATTR)
 
     def _initialize_language_model(self) -> None:
         """Initialize the language model.
@@ -275,8 +486,78 @@ class MimoModel(MegatronModule):
         if self.language_model is not None and hasattr(self.language_model, 'set_input_tensor'):
             self.language_model.set_input_tensor(input_tensor)
 
+    def _active_submodules(self):
+        """Yield this rank's present submodules."""
+        if self.language_model is not None:
+            yield self.language_model
+        for submodule in self.modality_submodules.values():
+            if submodule is not None:
+                yield submodule
+
+    def _active_ddp_modules(self):
+        """Yield this rank's active DDP-wrapped submodules."""
+        for module in self._active_submodules():
+            if isinstance(module, DistributedDataParallel):
+                yield module
+
+    @property
+    def remove_forward_pre_hook_handles(self) -> Dict[torch.nn.Module, Any]:
+        """Expose the active inner DDP parameter-gather hooks to the stock train loop."""
+        handles = {}
+        for module in self._active_ddp_modules():
+            handles.update(module.remove_forward_pre_hook_handles)
+        return handles
+
+    @contextmanager
+    def no_sync(self):
+        """Disable grad-ready registration on overlapped inner DDP modules."""
+        with ExitStack() as stack:
+            for module in self._active_ddp_modules():
+                if module.ddp_config.overlap_grad_reduce:
+                    stack.enter_context(module.no_sync())
+            yield
+
+    def enable_forward_pre_hook(self):
+        """Enable parameter-gather pre-hooks on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.enable_forward_pre_hook()
+
+    def disable_forward_pre_hook(self, param_sync: bool = True):
+        """Disable parameter-gather pre-hooks on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.disable_forward_pre_hook(param_sync=param_sync)
+
+    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+        """Start parameter synchronization on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.start_param_sync(force_sync=force_sync, force_dispatch=force_dispatch)
+
+    def start_grad_sync(self, *unused):
+        """Start gradient synchronization on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_grad_reduce:
+                module.start_grad_sync()
+
+    def free_overlap_buffers(self):
+        """Release parameter-gather buffers owned by overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.free_overlap_buffers()
+
+    def zero_grad_buffer(self):
+        """Zero each active submodule's DDP grad buffer."""
+        for module in self._active_submodules():
+            module.zero_grad_buffer()
+
     def get_text_embeddings(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor, special_token_ids: Dict[str, int]
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        special_token_ids: Dict[str, int],
+        text_token_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Get embeddings for text tokens in the input.
         Args:
@@ -286,26 +567,57 @@ class MimoModel(MegatronModule):
                 Shape: (B, S)
             special_token_ids: Dictionary mapping modality names to their special token IDs.
                 Used to identify non-text tokens in the input_ids.
+            text_token_indices: Optional flat, logical row-major ``torch.long`` indices of text
+                tokens in the ``[B, S]`` input grid.
 
         Returns:
             torch.Tensor: Embeddings for text tokens.
             Shape: (N, H), where N is the number of text tokens.
         """
-        text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
-        for special_token_id in special_token_ids.values():
-            text_mask &= input_ids != special_token_id
+        if text_token_indices is None:
+            text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
+            for special_token_id in special_token_ids.values():
+                text_mask &= input_ids != special_token_id
 
-        batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
-        input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
+            batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
+            text_token_indices = batch_idx * input_ids.size(1) + seq_idx
+        else:
+            if text_token_indices.ndim != 1:
+                raise ValueError("Text token indices must be a flat one-dimensional tensor")
 
-        position_ids_text = (
-            position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
-        )
+        input_ids_text = input_ids.reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
 
-        text_embeddings = (
-            unwrap_model(self.language_model)
-            .embedding(input_ids=input_ids_text, position_ids=position_ids_text)
-            .squeeze(1)
+        if position_ids is None:
+            position_ids_text = None
+        elif position_ids.dim() == 3:
+            # Multimodal RoPE can carry [rope_dim, batch, seq] ids. Text
+            # embedding lookup only needs a single absolute position channel.
+            position_ids_text = (
+                position_ids[0].reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
+            )
+        else:
+            position_ids_text = (
+                position_ids.reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
+            )
+
+        embedding_layer = unwrap_model(self.language_model).embedding
+        # Combined embeddings are SP-scattered later in PartitionAdapter; a second scatter
+        # here would split the flat text tokens across TP ranks before alignment.
+        if (
+            self.partition_adapter is not None
+            and self.partition_adapter.cfg.seq_parallel
+            and getattr(embedding_layer, 'scatter_to_sequence_parallel', False)
+        ):
+            raise RuntimeError(
+                "MIMO sequence parallelism requires the language embedding scatter to be "
+                "disabled; pass scatter_embedding_sequence_parallel=False when constructing "
+                "the language model."
+            )
+
+        text_embeddings = embedding_layer(
+            input_ids=input_ids_text, position_ids=position_ids_text
+        ).squeeze(
+            1
         )  # Shape: [num_text_tokens, hidden_dim]
         return text_embeddings
 
@@ -318,6 +630,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         packing_kwargs: Optional[dict] = None,
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass through the multimodal model.
 
@@ -351,6 +664,11 @@ class MimoModel(MegatronModule):
                                         max(seqlens_padded), dtype=torch.int32
                                     ),
                                 }
+            modality_token_indices: Optional complete mapping from every active modality name,
+                including ``text``, to flat logical row-major ``torch.long`` indices in the
+                ``[B, S]`` input grid. Encoder-only ranks ignore this argument. Pass ``None`` to
+                derive every position from ``input_ids``. See
+                ``align_embeddings_by_token_positions`` for the trusted-producer contract.
 
         Returns:
             tuple: (output, loss_mask) where output semantics depend on role:
@@ -369,19 +687,25 @@ class MimoModel(MegatronModule):
                 loss_mask,
                 labels,
                 modality_inputs,
-                packing_kwargs,
+                packing_kwargs=packing_kwargs,
+                modality_token_indices=modality_token_indices,
             )
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
-                return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+                # Token indices are consumed only when language embeddings are assembled.
+                return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
-                return (
-                    self._forward_language_module(
-                        input_ids, position_ids, attention_mask, labels, input_tensors
-                    ),
+                return self._forward_language_module(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
                     loss_mask,
+                    labels,
+                    input_tensors,
+                    packing_kwargs=packing_kwargs,
+                    modality_token_indices=modality_token_indices,
                 )
 
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -390,6 +714,7 @@ class MimoModel(MegatronModule):
 
     def _forward_encoders(
         self,
+        input_ids: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         input_tensors: Optional[Dict[str, torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
@@ -409,69 +734,342 @@ class MimoModel(MegatronModule):
                 continue
 
             submodule = self.modality_submodules[encoder_name]
-            output = submodule.forward(
-                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
-                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
-            )
+            encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
+            hidden_states = input_tensors.get(encoder_name) if input_tensors else None
+            output = submodule.forward(encoder_inputs=encoder_inputs, hidden_states=hidden_states)
+            if output is None and encoder_inputs is None and hidden_states is None:
+                if self._has_encoder_tokens(input_ids, encoder_name):
+                    raise RuntimeError(
+                        f"{encoder_name} inputs are missing, but matching special tokens exist"
+                    )
+                output = self._empty_encoder_output(encoder_name)
 
             if output is not None:
+                if encoder_name in self.mimo_config.language_model_input_projections_spec:
+                    # Pipeline schedules pseudo-deallocate sent outputs, which must be viewless.
+                    output = make_viewless_tensor(
+                        output, requires_grad=output.requires_grad, keep_graph=True
+                    )
+                self._attach_modality_split_sizes(output, input_ids, encoder_name)
                 outputs[encoder_name] = output
 
         return outputs
+
+    def _attach_modality_split_sizes(
+        self, output: torch.Tensor, input_ids: Optional[torch.Tensor], encoder_name: str
+    ) -> None:
+        """Annotate flat modality outputs with per-sample split sizes for bridge fan-out.
+
+        Only attaches when per-sample token counts are non-uniform. Uniform counts
+        give equal splits, which the bridge's ``torch.tensor_split`` fallback
+        already produces, so the metadata would be a no-op.
+
+        TODO(mimo): non-uniform per-sample counts in fan-in (encoder DP > LM DP)
+        are not supported. Multiple encoder ranks contribute slices to a single
+        LM peer, and the receiver-side ``torch.cat`` path in BridgeCommunicator
+        has no metadata channel today, so per-sample boundaries are lost on the
+        LM rank. Lift this by routing per-sample sizes through the bridge
+        alongside the activations and adding a sample-aligned concat path.
+        """
+        token_id = self.special_token_ids.get(encoder_name)
+        if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
+            return
+
+        split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
+        if sum(split_sizes) != output.size(0):
+            return
+        if len(set(split_sizes)) <= 1:
+            # Uniform counts — tensor_split fallback gives the same result.
+            return
+
+        if self.role.mode is ModuleLayout.NON_COLOCATED:
+            grid_map = self.mimo_config.module_to_grid_map
+            encoder_grid = grid_map[encoder_name]
+            language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
+            encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
+            language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            if "gtp_remat" in language_grid.dim_names:
+                language_dp *= language_grid.shape[language_grid.dim_names.index("gtp_remat")]
+            assert encoder_dp <= language_dp, (
+                f"Bridge fan-out split metadata with non-uniform per-sample sizes "
+                f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "
+                f"DP={encoder_dp}, LM DP={language_dp}). Fan-in with variable "
+                f"modality token counts is not supported yet — see TODO in "
+                f"_attach_modality_split_sizes."
+            )
+
+        output._mimo_bridge_split_sizes = split_sizes
+
+    def _has_encoder_tokens(self, input_ids: Optional[torch.Tensor], encoder_name: str) -> bool:
+        """Return whether the batch contains tokens for an encoder module."""
+        if input_ids is None or encoder_name not in self.special_token_ids:
+            return False
+        return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
+
+    def _empty_encoder_output(self, encoder_name: str) -> torch.Tensor:
+        """Return the bridge payload for text-only non-colocated batches."""
+        language_config = self.mimo_config.language_model_spec.params['config']
+        projection_spec = self.mimo_config.language_model_input_projections_spec.get(encoder_name)
+        hidden_size = (
+            projection_spec.params['input_size']
+            if projection_spec is not None
+            else language_config.hidden_size
+        )
+
+        return torch.empty(
+            (0, hidden_size), device=torch.cuda.current_device(), dtype=language_config.params_dtype
+        )
+
+    def _build_packed_seq_params(self, packing_kwargs: Optional[dict]) -> Optional[PackedSeqParams]:
+        """Build THD ``PackedSeqParams`` from ``packing_kwargs`` (None if not packing)."""
+        if packing_kwargs is None:
+            return None
+        for key in packing_kwargs:
+            if 'cu_seqlens' in key and packing_kwargs[key] is not None:
+                packing_kwargs[key] = packing_kwargs[key].to(dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(**packing_kwargs)
+        packed_seq_params.qkv_format = 'thd'
+        return packed_seq_params
+
+    def _shard_language_inputs(
+        self,
+        embeddings: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[PackedSeqParams],
+    ]:
+        """Apply CP/SP sharding via the partition adapter, or pass through if inactive.
+
+        ``embeddings`` are sequence-first ``(S, B, H)`` (``None`` on non-first PP stages)
+        and come back in ``(S/(cp*tp), B, H)``; labels/loss_mask are ``(B, S)``.
+        """
+        if self.partition_adapter is None:
+            return embeddings, labels, loss_mask, packed_seq_params
+
+        return self.partition_adapter.shard(
+            embeddings=embeddings,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def _language_model_owns_mtp(self) -> bool:
+        """Return whether this rank executes the language model's MTP block."""
+        if self.language_model is None:
+            return False
+        return bool(getattr(unwrap_model(self.language_model), 'mtp_process', False))
+
+    @staticmethod
+    def _materialize_mtp_input_mask(
+        input_ids: torch.Tensor,
+        special_token_ids: Dict[str, int],
+        text_token_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return positions backed by the language model's token embedding table."""
+        if text_token_indices is not None:
+            mtp_input_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            mtp_input_mask.reshape(-1).index_fill_(0, text_token_indices, True)
+            return mtp_input_mask
+
+        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in special_token_ids.values():
+            mtp_input_mask &= input_ids != special_token_id
+        return mtp_input_mask
+
+    def _prepare_mtp_inputs(
+        self,
+        input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        owns_mtp: bool,
+        text_token_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Prepare CP-local position IDs and optional MTP token metadata.
+
+        MTP consumes token IDs only on the stage that owns its prediction block. Under
+        context parallelism, those IDs, their validity mask, and position IDs must all
+        use the same local sequence partition as the language-model hidden states.
+        """
+        if owns_mtp and input_ids is None:
+            raise RuntimeError("A language stage that owns MTP requires input_ids.")
+
+        mtp_input_ids = input_ids if owns_mtp else None
+        mtp_input_mask = None
+        if owns_mtp and self.special_token_ids:
+            assert input_ids is not None
+            mtp_input_mask = self._materialize_mtp_input_mask(
+                input_ids, self.special_token_ids, text_token_indices=text_token_indices
+            )
+
+        if self.partition_adapter is None or not self.partition_adapter.cfg.use_cp:
+            return mtp_input_ids, position_ids, mtp_input_mask
+
+        # PartitionAdapter shards batch-first [B, S, ...] metadata along dimension 1.
+        # Multidimensional RoPE positions arrive as [rope_dim, B, S], so expose their
+        # sequence dimension in the adapter's expected layout and restore it afterward.
+        is_multiaxis_position_ids = position_ids is not None and position_ids.dim() == 3
+        position_metadata = (
+            position_ids.movedim(0, -1).contiguous() if is_multiaxis_position_ids else position_ids
+        )
+
+        packed_mtp_metadata = mtp_input_ids
+        if mtp_input_mask is not None:
+            assert mtp_input_ids is not None
+            packed_mtp_metadata = torch.cat(
+                (mtp_input_ids, mtp_input_mask.to(dtype=mtp_input_ids.dtype)), dim=0
+            )
+
+        _, local_position_ids, packed_mtp_metadata, _ = self.partition_adapter.shard(
+            embeddings=None,
+            labels=position_metadata,
+            loss_mask=packed_mtp_metadata,
+            packed_seq_params=packed_seq_params,
+        )
+
+        if mtp_input_mask is not None:
+            assert packed_mtp_metadata is not None
+            mtp_input_ids, mtp_input_mask = packed_mtp_metadata.chunk(2, dim=0)
+            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+        else:
+            mtp_input_ids = packed_mtp_metadata
+
+        if is_multiaxis_position_ids:
+            assert local_position_ids is not None
+            local_position_ids = local_position_ids.movedim(-1, 0).contiguous()
+
+        return mtp_input_ids, local_position_ids, mtp_input_mask
 
     def _forward_language_module(
         self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
-    ) -> torch.Tensor:
+        packing_kwargs: Optional[dict] = None,
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[Any, Optional[torch.Tensor]]:
         """Forward pass for language module on this rank.
 
         Args:
             input_ids: Token IDs
             position_ids: Position IDs
-            attention_mask: Attention mask
+            attention_mask: Attention mask. Must be ``None`` under context parallelism
+                (CP-local hidden states cannot line up with a dense mask); mask via a
+                causal ``attn_mask_type`` or ``packed_seq_params`` instead.
+            loss_mask: Loss mask for per-token loss normalization
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
+            packing_kwargs: Optional kwargs to construct packed (THD) sequence params.
+            modality_token_indices: Optional complete mapping of trusted flat logical row-major
+                token indices. See ``align_embeddings_by_token_positions``.
 
         Returns:
-            Language model output (hidden states, logits, or loss depending on stage)
+            Tuple of (language model output, possibly CP-sharded loss mask). The
+            output is hidden states, logits, or loss depending on the stage.
         """
         lang_name = MIMO_LANGUAGE_MODULE_KEY
+
+        if (
+            self.partition_adapter is not None
+            and self.partition_adapter.cfg.use_cp
+            and attention_mask is not None
+        ):
+            raise RuntimeError(
+                "MIMO context parallelism requires attention_mask=None; mask via a causal "
+                "attn_mask_type or packed_seq_params (a dense mask cannot line up with the "
+                "CP-sharded sequence)."
+            )
+
+        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
+        owns_mtp = self._language_model_owns_mtp()
 
         if self.role.is_first_stage(lang_name):
             # First stage: receive encoder embeddings, combine with text, pass to LM
             # Build modality embeddings dict from encoder outputs
             modality_embeddings = {}
+            input_projections = self.language_model_input_projections
+            assert input_projections is not None
+            missing_inputs = set(input_projections) - (set(input_tensors or {}) - {lang_name})
+            if missing_inputs:
+                raise RuntimeError(
+                    f"Missing inputs for language input projections: {sorted(missing_inputs)}"
+                )
             if input_tensors:
                 for name, tensor in input_tensors.items():
                     if name != lang_name:
+                        if name in input_projections:
+                            tensor = input_projections[name](tensor)
                         modality_embeddings[name] = tensor
 
             # Get text embeddings
             text_embeddings = self.get_text_embeddings(
-                input_ids, position_ids, self.special_token_ids
+                input_ids,
+                position_ids,
+                self.special_token_ids,
+                text_token_indices=(modality_token_indices or {}).get("text"),
             )
             modality_embeddings["text"] = text_embeddings
 
-            # Combine all embeddings
+            # Combine all embeddings ([S, B, H])
             combined_embeddings = self.align_embeddings_by_token_positions(
                 modality_embeddings=modality_embeddings,
                 input_ids=input_ids,
                 special_token_ids=self.special_token_ids,
+                modality_token_indices=modality_token_indices,
+            )
+
+            # Apply CP/SP sharding; combined_embeddings returns in [S/(cp*tp), B, H].
+            combined_embeddings, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+                embeddings=combined_embeddings,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+            mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                owns_mtp=owns_mtp,
+                text_token_indices=(modality_token_indices or {}).get("text"),
             )
 
             lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
+                # decoder_input replaces the main embedding lookup, but MTP still
+                # needs token IDs to construct its shifted-token embeddings.
+                input_ids=mtp_input_ids,
+                position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
                 attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
         else:
-            # Non-first stage: receive hidden states from previous LM stage
+            # Non-first stage: receive hidden states from previous LM stage.
+            # Labels/loss_mask still need CP sharding so the loss on the last stage
+            # lines up with the CP-local hidden states.
+            _, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+                embeddings=None,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+            mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                owns_mtp=owns_mtp,
+                text_token_indices=(modality_token_indices or {}).get("text"),
+            )
+
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
@@ -481,18 +1079,23 @@ class MimoModel(MegatronModule):
                     underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
+                # Hidden states arrive via set_input_tensor; position_ids is
+                # still consumed by mRoPE on non-first PP stages.
+                input_ids=mtp_input_ids,
+                position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
                 attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
 
         # Key output for non-last stages so schedule can route to next LM stage
         if not self.role.is_last_stage(lang_name):
-            return {lang_name: lm_output}
+            return {lang_name: lm_output}, loss_mask
 
-        return lm_output
+        return lm_output, loss_mask
 
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map
@@ -544,21 +1147,14 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         packing_kwargs: Optional[dict] = None,
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass when all modules are on all ranks (no multi-module PP).
 
         This is the original behavior, preserved for backward compatibility.
         """
-        # If packing_kwargs is provided, construct PackedSeqParams
-        packed_seq_params = None
-        if packing_kwargs is not None:
-            # Ensure correct dtype for seqlens tensors
-            for key in packing_kwargs:
-                if 'cu_seqlens' in key and packing_kwargs[key] is not None:
-                    packing_kwargs[key] = packing_kwargs[key].to(dtype=torch.int32)
-            packed_seq_params = PackedSeqParams(**packing_kwargs)
-            packed_seq_params.qkv_format = 'thd'
-            logger.debug(f"Packed sequence parameters: {packed_seq_params}")
+        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
+        owns_mtp = self._language_model_owns_mtp()
 
         # 1. Process each modality to get embeddings
         modality_embeddings = {}
@@ -582,7 +1178,12 @@ class MimoModel(MegatronModule):
             modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        text_embeddings = self.get_text_embeddings(
+            input_ids,
+            position_ids,
+            self.special_token_ids,
+            text_token_indices=(modality_token_indices or {}).get("text"),
+        )
         logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
         modality_embeddings["text"] = text_embeddings
@@ -593,35 +1194,36 @@ class MimoModel(MegatronModule):
             modality_embeddings=modality_embeddings,
             input_ids=input_ids,
             special_token_ids=self.special_token_ids,
+            modality_token_indices=modality_token_indices,
         )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        # 3. If sharding is needed, apply PartitionAdapter.
-        # combined_embeddings is [S, B, H]; transpose to [B, S, H] for shard() which expects
-        # batch-first layout (required by get_batch_on_this_cp_rank). After CP sharding each
-        # rank holds [B, S/cp, H]; transpose back to [S/cp, B, H] for the language model.
-        if self.partition_adapter is not None:
-            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [B, S, H]
-            combined_embeddings, labels, loss_mask, _, packed_seq_params = (
-                self.partition_adapter.shard(
-                    embeddings=combined_embeddings,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                    attention_mask=attention_mask,
-                    packed_seq_params=packed_seq_params,
-                )
-            )
-            # shard() returns embeddings in [B, S/cp, H]; transpose to [S/cp, B, H]
-            # which is what the language model expects.
-            if combined_embeddings is not None:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+        # 3. Apply CP/SP sharding. combined_embeddings is [S, B, H] and returns
+        # [S/(cp*tp), B, H] for the LM (the adapter handles the CP batch-first transpose).
+        combined_embeddings, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+            embeddings=combined_embeddings,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+        mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            owns_mtp=owns_mtp,
+            text_token_indices=(modality_token_indices or {}).get("text"),
+        )
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
-            input_ids=None,
-            position_ids=None,
+            # decoder_input replaces the main embedding lookup, but MTP still
+            # needs token IDs to construct its shifted-token embeddings.
+            input_ids=mtp_input_ids,
+            position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )

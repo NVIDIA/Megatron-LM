@@ -8,9 +8,9 @@ import torch.nn as nn
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import Router
+from megatron.core.utils import unwrap_model
 
 from .checkpointing import save_grads
-from .utils import unwrap_model
 
 
 def _get_linear_types():

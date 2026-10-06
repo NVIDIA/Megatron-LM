@@ -1,9 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.vision.radio import RADIOViTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -59,3 +63,777 @@ class TestRADIOViTModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+
+class TestRADIOStateDictPreHooks:
+    """Unit tests for the 2D↔3D embedder state-dict pre-hooks.
+
+    These hooks only touch ``self.patch_dim`` and ``self.temporal_patch_dim``,
+    so we exercise them via a ``SimpleNamespace`` stub instead of constructing
+    a full ``RADIOViTModel`` (which would require a parallel-state init and a
+    TransformerBlock we don't need).
+    """
+
+    PATCH_DIM = 14
+    TEMPORAL_PATCH_DIM = 2
+    HIDDEN = 32
+
+    def _stub(self):
+        return SimpleNamespace(patch_dim=self.PATCH_DIM, temporal_patch_dim=self.TEMPORAL_PATCH_DIM)
+
+    def _expected_2d_in(self):
+        return 3 * self.PATCH_DIM * self.PATCH_DIM
+
+    def _expected_3d_in(self):
+        return 3 * self.TEMPORAL_PATCH_DIM * self.PATCH_DIM * self.PATCH_DIM
+
+    @pytest.mark.internal
+    def test_init_embedder_expands_2d_to_3d_and_rescales(self):
+        weight_2d = torch.ones((self.HIDDEN, self._expected_2d_in())) * 3.0
+        state_dict = {"embedder.weight": weight_2d.clone()}
+
+        RADIOViTModel._state_dict_pre_hook_init_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+
+        new_weight = state_dict["embedder.weight"]
+        assert new_weight.shape == (self.HIDDEN, self._expected_3d_in())
+        # Each 2D tile is repeated ``temporal_patch_dim`` times then divided by
+        # the same factor ⇒ each entry equals the original value.
+        assert torch.allclose(new_weight, weight_2d.repeat(1, self.TEMPORAL_PATCH_DIM) / 2)
+        assert torch.allclose(new_weight, torch.full_like(new_weight, 1.5))
+
+    @pytest.mark.internal
+    def test_init_embedder_noop_when_already_3d(self):
+        weight_3d = torch.full((self.HIDDEN, self._expected_3d_in()), 0.25)
+        state_dict = {"embedder.weight": weight_3d.clone()}
+
+        RADIOViTModel._state_dict_pre_hook_init_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+
+        assert torch.equal(state_dict["embedder.weight"], weight_3d)
+
+    @pytest.mark.internal
+    def test_init_embedder_noop_when_key_missing(self):
+        state_dict = {"unrelated": torch.zeros(1)}
+        RADIOViTModel._state_dict_pre_hook_init_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+        assert list(state_dict.keys()) == ["unrelated"]
+
+    @pytest.mark.internal
+    def test_init_embedder_respects_prefix(self):
+        weight_2d = torch.full((self.HIDDEN, self._expected_2d_in()), 2.0)
+        state_dict = {"vision.embedder.weight": weight_2d.clone()}
+
+        RADIOViTModel._state_dict_pre_hook_init_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix="vision."
+        )
+
+        assert state_dict["vision.embedder.weight"].shape == (self.HIDDEN, self._expected_3d_in())
+
+    @pytest.mark.internal
+    def test_init_video_embedder_creates_from_2d_image_weights(self):
+        """When the checkpoint has only a 2D embedder, the hook populates
+        video_embedder with the 3D-expanded (and rescaled) copy and leaves
+        the image embedder untouched."""
+        weight_2d = torch.full((self.HIDDEN, self._expected_2d_in()), 4.0)
+        state_dict = {"embedder.weight": weight_2d.clone()}
+
+        RADIOViTModel._state_dict_pre_hook_init_video_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+
+        assert torch.equal(state_dict["embedder.weight"], weight_2d)
+        video_weight = state_dict["video_embedder.weight"]
+        assert video_weight.shape == (self.HIDDEN, self._expected_3d_in())
+        assert torch.allclose(video_weight, torch.full_like(video_weight, 2.0))
+
+    @pytest.mark.internal
+    def test_init_video_embedder_splits_existing_3d_embedder(self):
+        """When the checkpoint has a 3D embedder but no video_embedder, the
+        hook clones the 3D weight into video_embedder and compresses the
+        image embedder back to 2D by averaging across the temporal axis."""
+        # Build a 3D weight where the temporal slices have different values
+        # so averaging is distinguishable from simple truncation.
+        out = self.HIDDEN
+        two_d = self._expected_2d_in()
+        # Shape: [out, 3*T*P*P] = [out, T, 3*P*P] after a reshape view.
+        slice_a = torch.full((out, two_d), 1.0)
+        slice_b = torch.full((out, two_d), 3.0)
+        weight_3d = torch.cat([slice_a, slice_b], dim=1)  # temporal patch dim = 2
+        assert weight_3d.shape == (out, self._expected_3d_in())
+        state_dict = {"embedder.weight": weight_3d.clone()}
+
+        RADIOViTModel._state_dict_pre_hook_init_video_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+
+        # video_embedder is an exact copy of the original 3D weight.
+        assert state_dict["video_embedder.weight"].shape == (out, self._expected_3d_in())
+        assert torch.equal(state_dict["video_embedder.weight"], weight_3d)
+
+        # Image embedder is the per-temporal-slice mean ⇒ (1+3)/2 = 2.0.
+        image_weight = state_dict["embedder.weight"]
+        assert image_weight.shape == (out, two_d)
+        assert torch.allclose(image_weight, torch.full_like(image_weight, 2.0))
+
+    @pytest.mark.internal
+    def test_init_video_embedder_copies_bias_when_missing(self):
+        weight_2d = torch.full((self.HIDDEN, self._expected_2d_in()), 1.0)
+        bias = torch.arange(self.HIDDEN, dtype=torch.float32)
+        state_dict = {"embedder.weight": weight_2d.clone(), "embedder.bias": bias.clone()}
+
+        RADIOViTModel._state_dict_pre_hook_init_video_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+
+        assert "video_embedder.bias" in state_dict
+        assert torch.equal(state_dict["video_embedder.bias"], bias)
+        # Ensure it's a copy, not an alias (mutating one must not affect the other).
+        state_dict["video_embedder.bias"][0] = -999.0
+        assert state_dict["embedder.bias"][0] == 0.0
+
+    @pytest.mark.internal
+    def test_init_video_embedder_preserves_existing_video_embedder(self):
+        weight_2d = torch.full((self.HIDDEN, self._expected_2d_in()), 1.0)
+        existing_video = torch.full((self.HIDDEN, self._expected_3d_in()), 7.0)
+        state_dict = {
+            "embedder.weight": weight_2d.clone(),
+            "video_embedder.weight": existing_video.clone(),
+        }
+
+        RADIOViTModel._state_dict_pre_hook_init_video_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+
+        # Hook must not overwrite an already-present video_embedder.
+        assert torch.equal(state_dict["video_embedder.weight"], existing_video)
+        assert torch.equal(state_dict["embedder.weight"], weight_2d)
+
+    @pytest.mark.internal
+    def test_init_video_embedder_noop_when_embedder_missing(self):
+        state_dict = {"unrelated": torch.zeros(1)}
+        RADIOViTModel._state_dict_pre_hook_init_video_embedder(
+            self._stub(), module=None, state_dict=state_dict, prefix=""
+        )
+        assert list(state_dict.keys()) == ["unrelated"]
+
+
+class TestRADIOTrainOverride:
+    """``RADIOViTModel.train()`` must respect ``force_eval_mode``."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.layer_spec = get_gpt_layer_with_transformer_engine_spec()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_force_eval_mode_keeps_model_in_eval_after_train(self):
+        # Construct with force_eval_mode=True; calling .train() must not flip
+        # back to training mode.
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            force_eval_mode=True,
+        )
+        # eval() was called by the constructor.
+        assert model.training is False
+
+        returned = model.train(True)
+
+        # The override returns ``self`` so chaining still works.
+        assert returned is model
+        # And the model is still in eval mode.
+        assert model.training is False
+
+    @pytest.mark.internal
+    def test_train_normally_when_force_eval_mode_off(self):
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            force_eval_mode=False,
+        )
+        model.eval()
+        assert model.training is False
+        model.train(True)
+        assert model.training is True
+
+
+class TestPixelShuffleNonSquare:
+    """``llava_model.pixel_shuffle`` extended to take ``h`` / ``w`` for
+    non-square (dynamic-res) patch grids."""
+
+    @pytest.mark.internal
+    def test_square_default_path(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
+        # 16 patches ⇒ default sq=4. scale=0.5 ⇒ output = 4 patches × 4× hidden.
+        x = torch.randn(2, 16, 8)
+        out = pixel_shuffle(x)
+        assert out.shape == (2, 4, 32)
+
+    @pytest.mark.internal
+    def test_non_square_h_w_required_for_dynamic_res(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
+        # Pixel shuffle must group spatial 2x2 neighborhoods rather than four
+        # consecutive entries in the flattened non-square grid.
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        out = pixel_shuffle(x, h=4, w=6)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_non_square_image_golden_values(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle_dynamic_res
+
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        imgs_sizes = torch.tensor([[4, 6]], dtype=torch.int32)
+
+        out = pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim=1)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_non_square_h_w_must_be_even(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
+        x = torch.randn(1, 12, 4)
+        with pytest.raises(AssertionError, match="must both be divisible"):
+            pixel_shuffle(x, h=3, w=4)
+
+    @pytest.mark.internal
+    def test_h_w_mismatch_raises(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
+        x = torch.randn(1, 12, 4)
+        # Mismatch: h*w != patches.
+        with pytest.raises(AssertionError):
+            pixel_shuffle(x, h=2, w=2)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_video_chunks_use_real_non_square_grids(self):
+        from megatron.core.models.multimodal.llava_model import (
+            _pixel_shuffle_dynamic_resolution_chunks,
+        )
+
+        # The temporal encoder returns one 2D chunk per tubelet. The shared
+        # helper must also continue accepting packed 3D image chunks.
+        video_chunks = [torch.randn(1008, 8) for _ in range(8)]
+        shuffled_video = _pixel_shuffle_dynamic_resolution_chunks(
+            video_chunks, [(448, 576)] * 8, patch_dim=16
+        )
+        assert all(chunk.shape == (252, 32) for chunk in shuffled_video)
+
+        packed_image_chunks = [torch.randn(1, 1008, 8)]
+        shuffled_images = _pixel_shuffle_dynamic_resolution_chunks(
+            packed_image_chunks, [(448, 576)], patch_dim=16
+        )
+        assert shuffled_images[0].shape == (1, 252, 32)
+
+    @pytest.mark.internal
+    def test_temporal_token_counts_group_one_placeholder_per_media(self):
+        from megatron.core.models.multimodal.llava_model import (
+            _align_temporal_token_counts_to_placeholders,
+            _group_temporal_token_counts_tensor,
+        )
+
+        tubelet_counts = torch.tensor([252, 252, 128], dtype=torch.int32, device="cuda")
+        media_tubelet_counts = [2, 1]
+        grouped_counts = _group_temporal_token_counts_tensor(tubelet_counts, media_tubelet_counts)
+        assert torch.equal(
+            grouped_counts, torch.tensor([504, 128], dtype=torch.int32, device="cuda")
+        )
+
+        compact_input_ids = torch.tensor([[-200, 1, -200]], device="cuda")
+        aligned_counts = _align_temporal_token_counts_to_placeholders(
+            tubelet_counts, media_tubelet_counts, compact_input_ids, -200
+        )
+        assert torch.equal(aligned_counts, grouped_counts)
+
+        expanded_input_ids = torch.tensor([[-200, -200, 1, -200]], device="cuda")
+        aligned_counts = _align_temporal_token_counts_to_placeholders(
+            tubelet_counts, media_tubelet_counts, expanded_input_ids, -200
+        )
+        assert torch.equal(aligned_counts, tubelet_counts)
+
+        invalid_input_ids = torch.tensor([[-200]], device="cuda")
+        with pytest.raises(ValueError, match="must align"):
+            _align_temporal_token_counts_to_placeholders(
+                tubelet_counts, media_tubelet_counts, invalid_input_ids, -200
+            )
+
+        # temporal_patch_dim=1 makes every frame one tubelet. A per-video
+        # placeholder therefore receives the sum of all frame embeddings.
+        device_counts = torch.tensor([64, 64, 32], dtype=torch.int32, device="cuda")
+        grouped_counts = _group_temporal_token_counts_tensor(device_counts, [2, 1])
+        assert torch.equal(
+            grouped_counts, torch.tensor([128, 32], dtype=torch.int32, device="cuda")
+        )
+
+        with pytest.raises(ValueError, match="must partition"):
+            _group_temporal_token_counts_tensor(tubelet_counts, [1, 1])
+
+
+class TestRADIODynamicResAndTemporal:
+    """Forward-path coverage for the new dynamic-resolution and temporal
+    compression code paths.
+
+    These exercise model construction with the new flags and the lighter
+    branches in ``forward`` / ``_apply_temporal_grouping`` that don't require
+    a real image + valid PackedSeqParams round-trip.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.layer_spec = get_gpt_layer_with_transformer_engine_spec()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_constructor_with_temporal_patch_dim_uses_3d_embedder(self):
+        """``temporal_patch_dim > 1`` makes the embedder accept 3*T*P*P inputs."""
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            temporal_patch_dim=2,
+        )
+        # Embedder input dim = 3 * temporal_patch_dim * patch_dim * patch_dim.
+        expected_in = 3 * 2 * 14 * 14
+        assert model.embedder.input_size == expected_in
+        assert not hasattr(model, "video_embedder")
+
+    @pytest.mark.internal
+    def test_constructor_with_separate_video_embedder_creates_both(self):
+        """``separate_video_embedder=True`` must construct an extra ``video_embedder``."""
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            temporal_patch_dim=2,
+            separate_video_embedder=True,
+        )
+        # Image embedder is 2D (P*P*3); video embedder is 3D (T*P*P*3).
+        assert model.embedder.input_size == 3 * 14 * 14
+        assert model.video_embedder.input_size == 3 * 2 * 14 * 14
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize(
+        "num_frames", [[1, 4, 1, 3], [4], [1, 1]], ids=["mixed", "video_only", "image_only"]
+    )
+    def test_separate_video_embedder_forward_gathers_once(self, num_frames, tp_size):
+        """Chunks are embedded without a gather and gathered together once, which
+        must match gathering every chunk's embedding separately."""
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires at least {tp_size} GPUs")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tp_size, 1)
+        model_parallel_cuda_manual_seed(123)
+        patch_dim = 14
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=patch_dim,
+            add_class_token=False,
+            dynamic_resolution=True,
+            temporal_patch_dim=2,
+            separate_video_embedder=True,
+        ).cuda()
+        model.eval()
+
+        # Give images and videos different grids so a misplaced chunk changes shapes.
+        frame_sizes = []
+        for nf in num_frames:
+            size = (28, 56) if nf == 1 else (56, 42)
+            frame_sizes.extend([size] * nf)
+        imgs_sizes = torch.tensor(frame_sizes, dtype=torch.int32)
+        total_patches = sum((h // patch_dim) * (w // patch_dim) for h, w in frame_sizes)
+        # Every TP rank must see the same input.
+        generator = torch.Generator().manual_seed(0)
+        x = torch.randn(1, total_patches, 3 * patch_dim * patch_dim, generator=generator).cuda()
+
+        with (
+            torch.no_grad(),
+            mock.patch.object(model, "apply_pos_enc", wraps=model.apply_pos_enc) as pos_enc_spy,
+            mock.patch.object(
+                type(model.embedder),
+                "gather_tensor_parallel_output",
+                autospec=True,
+                side_effect=type(model.embedder).gather_tensor_parallel_output,
+            ) as gather_spy,
+        ):
+            out, out_sizes, out_num_frames = model(x, imgs_sizes=imgs_sizes, num_frames=num_frames)
+
+        assert gather_spy.call_count == 1
+
+        with torch.no_grad():
+            grouped, _sizes, _nf, _packed, is_image = model._apply_temporal_grouping(
+                x, imgs_sizes, num_frames, None, skip_image_duplication=True
+            )
+            expected = torch.cat(
+                [
+                    (model.embedder if img else model.video_embedder)(chunk)[0]
+                    for chunk, img in zip(grouped, is_image)
+                ],
+                dim=1,
+            )
+        embedded = torch.cat([call.args[0] for call in pos_enc_spy.call_args_list], dim=1)
+        torch.testing.assert_close(embedded, expected, rtol=0, atol=0)
+
+        expected_num_frames = [1 if nf == 1 else -(-nf // 2) for nf in num_frames]
+        assert out_num_frames == expected_num_frames
+        assert out_sizes.shape[0] == len(is_image)
+        assert out.shape == (1, expected.shape[1], self.transformer_config.hidden_size)
+
+    @pytest.mark.internal
+    def test_constructor_with_temporal_ckpt_compat_registers_pre_hook(self):
+        """``temporal_ckpt_compat=True`` registers the 2D→3D state-dict pre-hook."""
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            temporal_patch_dim=2,
+            temporal_ckpt_compat=True,
+        )
+        # PyTorch stores load-state-dict pre-hooks on _load_state_dict_pre_hooks
+        # (an OrderedDict). Verify at least one hook was registered.
+        assert len(model._load_state_dict_pre_hooks) >= 1
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_constructor(self):
+        """``dynamic_resolution=True`` toggles the corresponding attribute."""
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            dynamic_resolution=True,
+        )
+        assert model.dynamic_resolution is True
+
+    @pytest.mark.internal
+    def test_align_corners_parameterization_sets_attributes(self):
+        """The new align_corners knobs must be stored on the model."""
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            interpolate_align_corners=True,
+            grid_sample_align_corners=False,
+        )
+        assert model.interpolate_align_corners is True
+        assert model.grid_sample_align_corners is False
+
+    @pytest.mark.internal
+    def test_pg_collection_and_vp_stage_propagate_to_decoder(self):
+        """Trintamaki review fix: pg_collection + vp_stage must reach the inner
+        TransformerBlock so VP/PP awareness is preserved."""
+        model = RADIOViTModel(
+            self.transformer_config,
+            self.layer_spec,
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            add_class_token=False,
+            vp_stage=0,
+        )
+        # Both attrs are set on the RADIO model itself...
+        assert hasattr(model, "pg_collection")
+        assert model.vp_stage == 0
+        # ...and the inner TransformerBlock.vp_stage matches.
+        assert getattr(model.decoder, "vp_stage", None) == 0
+
+
+class TestApplyTemporalGrouping:
+    """Direct unit tests for ``RADIOViTModel._apply_temporal_grouping``.
+
+    Like the state-dict pre-hook tests, we use a ``SimpleNamespace`` stub
+    instead of constructing a full RADIO model.
+    """
+
+    PATCH_DIM = 14
+    TEMPORAL_PATCH_DIM = 2
+
+    def _stub(self):
+        return SimpleNamespace(patch_dim=self.PATCH_DIM, temporal_patch_dim=self.TEMPORAL_PATCH_DIM)
+
+    def _make_global(self, num_frames_list, hidden=8):
+        """Build an [1, total_patches, hidden] tensor and matching imgs_sizes.
+
+        imgs_sizes stores pixel dimensions so that dividing by PATCH_DIM gives
+        PATCH_DIM patches per spatial dimension (i.e. PATCH_DIM**2 patches total).
+        """
+        per_img = self.PATCH_DIM * self.PATCH_DIM
+        chunks = []
+        for i, _ in enumerate(num_frames_list):
+            for f in range(num_frames_list[i]):
+                chunks.append(torch.full((per_img, hidden), float(i * 100 + f)))
+        global_t = torch.cat(chunks, dim=0).unsqueeze(0)
+        total_frames = sum(num_frames_list)
+        pixel_dim = (
+            self.PATCH_DIM * self.PATCH_DIM
+        )  # pixel size = PATCH_DIM patches × PATCH_DIM px/patch
+        imgs_sizes = torch.tensor([[pixel_dim, pixel_dim]] * total_frames)
+        return global_t, imgs_sizes
+
+    @pytest.mark.internal
+    def test_image_only_replicates_or_skips_per_flag(self):
+        """A single-frame "video" (i.e. an image): tubelet collapses to a copy."""
+        global_t, imgs_sizes = self._make_global([1])
+        # skip_image_duplication=False ⇒ the single frame is replicated T times along last dim.
+        x_grouped, new_sizes, new_nf, _packed, is_image = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            x=global_t,
+            imgs_sizes=imgs_sizes,
+            num_frames=[1],
+            packed_seq_params=None,
+            skip_image_duplication=False,
+        )
+        assert is_image == [True]
+        assert new_nf == [1]
+        # x_grouped is a tensor (concat), shape: [1, per_img, hidden * T].
+        per_img = self.PATCH_DIM * self.PATCH_DIM
+        assert x_grouped.shape == (1, per_img, 8 * self.TEMPORAL_PATCH_DIM)
+        # The single image "size" entry survives.
+        assert new_sizes.shape == (1, 2)
+
+    @pytest.mark.internal
+    def test_video_groups_consecutive_frames_into_tubelets(self):
+        """A 4-frame video at T=2 yields 2 tubelets, each concatenating 2 frames."""
+        global_t, imgs_sizes = self._make_global([4])
+        x_grouped, new_sizes, new_nf, _packed, is_image = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            x=global_t,
+            imgs_sizes=imgs_sizes,
+            num_frames=[4],
+            packed_seq_params=None,
+            skip_image_duplication=False,
+        )
+        assert is_image == [False, False]
+        assert new_nf == [2]  # padded_nf // T = 4 // 2 = 2
+        per_img = self.PATCH_DIM * self.PATCH_DIM
+        # Two tubelets, each of width hidden*T.
+        assert x_grouped.shape == (1, 2 * per_img, 8 * self.TEMPORAL_PATCH_DIM)
+
+    @pytest.mark.internal
+    def test_partial_tubelet_replicates_last_frame(self):
+        """A 3-frame video at T=2 needs the last frame replicated to fill the
+        2nd tubelet. Verify the replicated frame's value matches the original."""
+        global_t, imgs_sizes = self._make_global([3])
+        x_grouped, _new_sizes, new_nf, _packed, is_image = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            x=global_t,
+            imgs_sizes=imgs_sizes,
+            num_frames=[3],
+            packed_seq_params=None,
+            skip_image_duplication=False,
+        )
+        # padded_nf = 4 ⇒ 2 tubelets.
+        assert new_nf == [2]
+        assert is_image == [False, False]
+        # Second tubelet (positions [per_img:2*per_img]) was built from frames
+        # [2, 2] (last frame replicated). The chunk values per frame were
+        # 0, 1, 2 (from _make_global with i=0). After concat along hidden,
+        # the second half (last 8 of the 16-wide hidden) equals frame index 2.
+        per_img = self.PATCH_DIM * self.PATCH_DIM
+        second_tubelet = x_grouped[0, per_img : 2 * per_img]  # [per_img, 16]
+        # Both halves of the hidden dim should equal 2.0 (the last frame value).
+        assert torch.all(second_tubelet[:, :8] == 2.0)
+        assert torch.all(second_tubelet[:, 8:] == 2.0)
+
+    @pytest.mark.internal
+    def test_assert_on_imgs_sizes_count_mismatch(self):
+        """``imgs_sizes`` must have one entry per (ungrouped) frame."""
+        global_t, _imgs_sizes = self._make_global([4])
+        # Provide a wrong-shape imgs_sizes (only 2 entries instead of 4).
+        wrong_sizes = torch.tensor([[self.PATCH_DIM, self.PATCH_DIM]] * 2)
+        with pytest.raises(AssertionError, match="one entry per frame"):
+            RADIOViTModel._apply_temporal_grouping(
+                self._stub(),
+                x=global_t,
+                imgs_sizes=wrong_sizes,
+                num_frames=[4],
+                packed_seq_params=None,
+                skip_image_duplication=False,
+            )
+
+    @pytest.mark.internal
+    def test_mixed_video_lengths_first_clean_second_with_last_frame_dup(self):
+        """Two videos: first has 4 frames (evenly divisible by T=2, no duplication),
+        second has 3 frames (last frame duplicated to fill the 2nd tubelet).
+
+        Verifies that both videos independently produce new_num_frames[i]=2 and that
+        the duplication only affects the final tubelet of the second video.
+        """
+        global_t, imgs_sizes = self._make_global([4, 3])
+        x_grouped, _new_sizes, new_nf, _packed, is_image = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            x=global_t,
+            imgs_sizes=imgs_sizes,
+            num_frames=[4, 3],
+            packed_seq_params=None,
+            skip_image_duplication=False,
+        )
+
+        assert new_nf == [2, 2]
+        assert is_image == [False, False, False, False]
+        per_img = self.PATCH_DIM * self.PATCH_DIM
+        assert x_grouped.shape == (1, 4 * per_img, 8 * self.TEMPORAL_PATCH_DIM)
+
+        h = 8  # default hidden from _make_global
+        # Video 0, tubelet 0: [frame 0.0, frame 1.0] — clean, no duplication.
+        t0 = x_grouped[0, :per_img]
+        assert torch.all(t0[:, :h] == 0.0)
+        assert torch.all(t0[:, h:] == 1.0)
+        # Video 0, tubelet 1: [frame 2.0, frame 3.0] — clean, no duplication.
+        t1 = x_grouped[0, per_img : 2 * per_img]
+        assert torch.all(t1[:, :h] == 2.0)
+        assert torch.all(t1[:, h:] == 3.0)
+        # Video 1, tubelet 0: [frame 100.0, frame 101.0] — clean.
+        t2 = x_grouped[0, 2 * per_img : 3 * per_img]
+        assert torch.all(t2[:, :h] == 100.0)
+        assert torch.all(t2[:, h:] == 101.0)
+        # Video 1, tubelet 1: [frame 102.0, frame 102.0] — last frame duplicated.
+        t3 = x_grouped[0, 3 * per_img : 4 * per_img]
+        assert torch.all(t3[:, :h] == 102.0)
+        assert torch.all(t3[:, h:] == 102.0)
+
+    @pytest.mark.internal
+    def test_skip_image_duplication_returns_list_of_chunks(self):
+        """``skip_image_duplication=True`` returns a list (not a concat tensor)
+        so ``separate_video_embedder`` can route image chunks to a different embedder."""
+        global_t, imgs_sizes = self._make_global([1])
+        x_grouped, _new_sizes, _new_nf, _packed, is_image = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            x=global_t,
+            imgs_sizes=imgs_sizes,
+            num_frames=[1],
+            packed_seq_params=None,
+            skip_image_duplication=True,
+        )
+        assert is_image == [True]
+        assert isinstance(x_grouped, list)
+        assert len(x_grouped) == 1
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("sizes_device", [None, "cpu", "cuda"], ids=["list", "cpu", "cuda"])
+    @pytest.mark.parametrize("skip_image_duplication", [False, True])
+    def test_mixed_media_with_host_or_tensor_sizes(self, sizes_device, skip_image_duplication):
+        """List and tensor geometry preserve pixels and packed boundaries after grouping."""
+        sizes = [(4, 4)] + [(4, 8)] * 4
+        if sizes_device is not None:
+            sizes = torch.tensor(sizes, dtype=torch.int32, device=sizes_device)
+        pixels = torch.arange(36 * 12, dtype=torch.float32, device="cuda").reshape(1, 36, 12)
+        cumulative = torch.tensor([0, 4, 12, 20, 28, 36], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cumulative,
+            cu_seqlens_kv=cumulative,
+            max_seqlen_q=8,
+            max_seqlen_kv=8,
+        )
+
+        grouped, grouped_sizes, frames, grouped_packed, is_image = (
+            RADIOViTModel._apply_temporal_grouping(
+                SimpleNamespace(temporal_patch_dim=2, patch_dim=2),
+                pixels,
+                sizes,
+                [1, 4],
+                packed,
+                skip_image_duplication=skip_image_duplication,
+            )
+        )
+
+        image = pixels[:, :4]
+        expected_chunks = [
+            image if skip_image_duplication else torch.cat([image, image], dim=-1),
+            torch.cat([pixels[:, 4:12], pixels[:, 12:20]], dim=-1),
+            torch.cat([pixels[:, 20:28], pixels[:, 28:36]], dim=-1),
+        ]
+        if skip_image_duplication:
+            assert isinstance(grouped, list)
+            assert len(grouped) == len(expected_chunks)
+            for actual, expected in zip(grouped, expected_chunks):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(grouped, torch.cat(expected_chunks, dim=1), rtol=0, atol=0)
+
+        if sizes_device is None:
+            assert isinstance(grouped_sizes, list)
+            assert grouped_sizes == [(4, 4), (4, 8), (4, 8)]
+        else:
+            assert grouped_sizes.dtype == sizes.dtype
+            assert grouped_sizes.device == sizes.device
+            assert grouped_sizes.tolist() == [[4, 4], [4, 8], [4, 8]]
+        assert frames == [1, 2]
+        assert is_image == [True, False, False]
+        expected_cumulative = cumulative.new_tensor([0, 4, 12, 20])
+        torch.testing.assert_close(grouped_packed.cu_seqlens_q, expected_cumulative)
+        torch.testing.assert_close(grouped_packed.cu_seqlens_kv, expected_cumulative)
+        assert grouped_packed.max_seqlen_q == grouped_packed.max_seqlen_kv == 8
+        assert grouped_packed.qkv_format == packed.qkv_format

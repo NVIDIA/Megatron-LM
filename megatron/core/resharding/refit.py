@@ -8,29 +8,46 @@ High-level refit/reshard orchestration:
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
 
+import hashlib
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, Literal, NamedTuple, Optional, Union
+from weakref import WeakKeyDictionary
 
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
-    _should_quantize_param,
     quantize_params_to_mxfp8,
+    resolve_mxfp8_backend,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.utils import unwrap_model
 
-from . import build_centralized_reshard_plan, execute_reshard_plan
+from . import build_local_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
+from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
+from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from .planner import _extract_module_metadata
 from .transforms import MXFP8ReshardTransform, ReshardTransform
-from .utils import named_persistent_buffers
+from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
-RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
+RefitBackendName = Literal["nccl", "nccl_m2n", "gloo", "nvshmem", "nixl"]
+
+
+class _ParallelConfig(NamedTuple):
+    """Parallel group sizes that determine a refit plan."""
+
+    tp_size: int
+    pp_size: int
+    ep_size: int
+    dp_size: int
+    expert_tp_size: int
+    gtp_remat_size: int
+    expert_gtp_remat_size: int
 
 
 @dataclass(frozen=True)
@@ -40,90 +57,136 @@ class _PlanCacheKey:
     """
 
     rank: int
-    # Parallelism configuration: (TP, PP, EP, DP, expt_tp) or None for non-collocated ranks
-    src_config: Optional[Tuple[int, int, int, int, int]]
-    dst_config: Optional[Tuple[int, int, int, int, int]]
+    src_config: _ParallelConfig | bytes | None
+    dst_config: _ParallelConfig | bytes | None
     num_experts: Optional[int]
+    # Adding inference nodes leaves the configs and offsets unchanged, so without
+    # world_size the stale pre-growth plan would be reused.
+    world_size: int = 0
+    # Rank offsets distinguish non-collocated configurations that would otherwise
+    # share the same (rank, sizes, num_experts) tuple but route to different
+    # global ranks.
+    src_rank_offset: int = 0
+    dst_rank_offset: int = 0
+    # Multi-pool refit: keep each destination pool's plan distinct so source-only
+    # ranks (dst_config=None on every pool) don't alias them. See swap_model_weights.
+    pool_index: int = 0
+    # Execution batches are part of the plan, so a different memory limit must
+    # not reuse a cached schedule built with another limit.
+    execution_batch_bytes: int | None = None
 
 
-def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
-    """Extract (TP, PP, EP, DP, expt_tp) sizes from a model core.
+def _get_parallel_config(core) -> _ParallelConfig | bytes | None:
+    """Return memoized single-model group sizes or a composite metadata fingerprint.
 
-    Returns:
-        Tuple of (TP, PP, EP, DP, expt_tp) sizes, or None if core is None.
-        - TP: Tensor parallelism
-        - PP: Pipeline parallelism
-        - EP: Expert parallelism
-        - DP: Data parallelism
-        - expt_tp: Expert tensor parallelism
+    Equivalent composite models reuse plans without retaining model identities.
+    Metadata includes native/matching names, tensor layouts and ordered group ranks.
     """
     if core is None:
         return None
+    if getattr(core, "refit_modules", None) is not None:
+        fingerprint = _model_fingerprints.get(core)
+        if fingerprint is None:
+            # Reuse the planner's description, in the model's native rank space.
+            # Refit's rank offsets are already part of the outer cache key.
+            metadata = _extract_module_metadata(core, torch.distributed.get_rank(), None, 0, {})
+            metadata.sort(key=lambda entry: entry.name)
+            fingerprint = hashlib.sha256(repr(metadata).encode()).digest()
+            _model_fingerprints[core] = fingerprint
+        return fingerprint
+    cached = getattr(core, "_refit_parallel_config", None)
+    if cached is not None:
+        return cached
     pg = core.pg_collection
-    return (
-        len(torch.distributed.get_process_group_ranks(pg.tp)) if pg.tp else 1,
-        len(torch.distributed.get_process_group_ranks(pg.pp)) if pg.pp else 1,
-        len(torch.distributed.get_process_group_ranks(pg.ep)) if pg.ep else 1,
-        len(torch.distributed.get_process_group_ranks(pg.dp)) if pg.dp else 1,
-        (
-            len(torch.distributed.get_process_group_ranks(pg.expt_tp))
-            if hasattr(pg, 'expt_tp') and pg.expt_tp
-            else 1
-        ),
+    expt_tp = getattr(pg, 'expt_tp', None)
+    gtp_remat = getattr(pg, 'gtp_remat', None)
+    expt_gtp_remat = getattr(pg, 'expt_gtp_remat', None)
+    result = _ParallelConfig(
+        tp_size=pg.tp.size() if pg.tp else 1,
+        pp_size=pg.pp.size() if pg.pp else 1,
+        ep_size=pg.ep.size() if pg.ep else 1,
+        dp_size=pg.dp.size() if pg.dp else 1,
+        expert_tp_size=expt_tp.size() if expt_tp else 1,
+        gtp_remat_size=gtp_remat.size() if gtp_remat else 1,
+        expert_gtp_remat_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
     )
+    core._refit_parallel_config = result
+    return result
 
 
 def _build_plan_cache_key(
-    src_core, tgt_core, num_experts: Optional[int], group=None
+    src_core,
+    tgt_core,
+    num_experts: Optional[int],
+    group=None,
+    src_rank_offset: int = 0,
+    dst_rank_offset: int = 0,
+    pool_index: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> _PlanCacheKey:
-    """Build cache key for reshard plan.
-
-    Args:
-        src_core: Source model core (or None for non-collocated destination/idle ranks)
-        tgt_core: Target model core (or None for non-collocated source/idle ranks)
-        num_experts: Number of MoE experts (or None for non-MoE models)
-        group: Optional process group for rank query
-
-    Returns:
-        Cache key that uniquely identifies this reshard configuration for this rank
-    """
-    # Use group.rank() to support cross-cluster ProcessGroups
+    """Build cache key for reshard plan."""
+    # group.rank()/size() support cross-cluster ProcessGroups where members
+    # have independent default PGs.
     rank = group.rank() if group is not None else torch.distributed.get_rank()
-    src_config = _get_config_tuple(src_core)
-    dst_config = _get_config_tuple(tgt_core)
+    world_size = group.size() if group is not None else torch.distributed.get_world_size()
     return _PlanCacheKey(
-        rank=rank, src_config=src_config, dst_config=dst_config, num_experts=num_experts
+        rank=rank,
+        src_config=_get_parallel_config(src_core),
+        dst_config=_get_parallel_config(tgt_core),
+        num_experts=num_experts,
+        world_size=world_size,
+        src_rank_offset=src_rank_offset,
+        dst_rank_offset=dst_rank_offset,
+        pool_index=pool_index,
+        execution_batch_bytes=execution_batch_bytes,
     )
 
 
-# Module-level cache for refit services to avoid repeated allocations
-_service_cache: dict[str, CopyService] = {}
+# Module-level cache for refit services to avoid repeated allocations. Services
+# own process-group-specific communicators, so the group identity is part of the
+# key; M2N's immutable grouped-submission limit is included as well. ``id(group)``
+# is safe because the cached service retains the group object, preventing its
+# address from being reused while the cache entry exists.
+_service_cache: dict[tuple[str, int | None, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
+# Memoize only live models; clearing plans also refreshes their structural keys.
+_model_fingerprints: WeakKeyDictionary[torch.nn.Module, bytes] = WeakKeyDictionary()
 
 
-def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
+def get_or_create_service(
+    backend: RefitBackendName, group=None, execution_batch_bytes: int | None = None
+) -> CopyService:
     """Get or create a cached CopyService instance for the given backend.
 
     This avoids expensive repeated allocations (especially for NVSHMEM buffers)
     when swap_model_weights is called multiple times with the same backend.
 
     Args:
-        backend: Backend name ("nccl", "gloo", or "nvshmem").
-        group: Optional process group for NCCL backend.
+        backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
+        group: Optional process group for the backend.
+        execution_batch_bytes: Optional soft byte limit for execution staging.
+            For NCCL M2N, this overrides its grouped-submission limit. None
+            preserves M2N's existing environment setting or 256 MiB default.
     """
-    if backend in _service_cache:
-        return _service_cache[backend]
+    service_batch_bytes = execution_batch_bytes if backend == "nccl_m2n" else None
+    cache_key = (backend, id(group) if group is not None else None, service_batch_bytes)
+    if cache_key in _service_cache:
+        return _service_cache[cache_key]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
+    elif backend == "nccl_m2n":
+        service = NCCLM2NCopyService(group=group, max_group_bytes=execution_batch_bytes)
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
         service = NVSHMEMCopyService(group=group)
+    elif backend == "nixl":
+        service = NixlCopyService(group=group)
     else:
         raise ValueError(f"Unknown backend '{backend}'")
 
-    _service_cache[backend] = service
+    _service_cache[cache_key] = service
     return service
 
 
@@ -131,19 +194,12 @@ def clear_service_cache():
     """Clear the cached refit services.
 
     Call this if you need to invalidate the cache, for example when
-    reinitializing distributed state.
-
-    This properly finalizes services to free GPU buffers
-    before clearing the cache.
+    reinitializing distributed state.  Services are ``close()``-d first so
+    backends owning GPU buffers (NVSHMEM) release them cleanly.
     """
     global _service_cache
-
-    # Finalize services to free resources for NVSHMEM backend
-    # NCCL/Gloo services have no cleanup needed
-    for backend_name, service in _service_cache.items():
-        if hasattr(service, '_remote') and hasattr(service._remote, 'finalize'):
-            service._remote.finalize()
-
+    for service in _service_cache.values():
+        service.close()
     _service_cache.clear()
 
 
@@ -153,6 +209,7 @@ def clear_plan_cache():
     """
     global _plan_cache
     _plan_cache.clear()
+    _model_fingerprints.clear()
 
 
 def clear_all_caches():
@@ -167,7 +224,7 @@ def _unwrap_model_cores(src_model, target_model):
     """Extract (src_core, tgt_core, num_experts) from model arguments.
 
     Handles list-wrapped modules and None (non-collocated) models.
-    Fills in missing DP groups from Megatron's parallel state on the source.
+    Fills in missing source DP groups for legacy single-mesh models.
 
     Returns:
         (src_core, tgt_core, num_experts)
@@ -178,53 +235,80 @@ def _unwrap_model_cores(src_model, target_model):
 
     if src_model is not None:
         src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-        num_experts = src_lm.config.num_moe_experts
         src_core = unwrap_model(src_lm)
-        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-            raise RuntimeError("Source model missing pg_collection required for reshard")
-        # Fill missing DP group on the source using Megatron's parallel state if not provided
-        if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+        num_experts = getattr(getattr(src_core, "config", None), "num_moe_experts", None)
+        pg = getattr(src_core, "pg_collection", None)
+        # Preserve the legacy single-model fallback; module providers own
+        # their groups independently of any root collection.
+        if getattr(src_core, "refit_modules", None) is None:
+            if pg is None:
+                raise RuntimeError("Source model missing pg_collection required for reshard")
+            if getattr(pg, "dp", None) is None:
+                pg.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
-        if num_experts is None:
-            num_experts = tgt_lm.config.num_moe_experts
         tgt_core = unwrap_model(tgt_lm)
-        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
+        if num_experts is None:
+            num_experts = getattr(getattr(tgt_core, "config", None), "num_moe_experts", None)
+        if (
+            getattr(tgt_core, "refit_modules", None) is None
+            and getattr(tgt_core, "pg_collection", None) is None
+        ):
             raise RuntimeError("Target model missing pg_collection required for reshard")
 
     return src_core, tgt_core, num_experts
 
 
-def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset):
+def _build_or_get_plan(
+    src_core,
+    tgt_core,
+    num_experts,
+    group,
+    src_rank_offset,
+    dst_rank_offset,
+    pool_index=0,
+    execution_batch_bytes: int | None = None,
+):
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
     All participating ranks must call this simultaneously when the plan is not
-    yet cached, because build_centralized_reshard_plan uses collective communication.
+    yet cached, because build_local_reshard_plan uses collective communication
+    (an all_gather of parameter metadata).
     """
     global _plan_cache
-    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
+    cache_key = _build_plan_cache_key(
+        src_core,
+        tgt_core,
+        num_experts,
+        group=group,
+        src_rank_offset=src_rank_offset,
+        dst_rank_offset=dst_rank_offset,
+        pool_index=pool_index,
+        execution_batch_bytes=execution_batch_bytes,
+    )
     if cache_key not in _plan_cache:
-        _plan_cache[cache_key] = build_centralized_reshard_plan(
+        _plan_cache[cache_key] = build_local_reshard_plan(
             src_core,
             tgt_core,
             num_experts=num_experts,
             group=group,
             src_rank_offset=src_rank_offset,
             dst_rank_offset=dst_rank_offset,
+            execution_batch_bytes=execution_batch_bytes,
         )
     return _plan_cache[cache_key]
 
 
 def _needs_mxfp8_conversion(model) -> bool:
-    """Check if a model uses FlashInfer MXFP8 inference and needs weight conversion."""
+    """Check if a model uses optimized MXFP8 inference and needs weight conversion."""
     if model is None:
         return False
     lm = model[0] if isinstance(model, (list, tuple)) else model
     config = lm.config
     return (
         getattr(config, 'transformer_impl', None) == 'inference_optimized'
+        and bool(getattr(config, 'fp8', None))
         and getattr(config, 'fp8_recipe', None) == 'mxfp8'
     )
 
@@ -234,42 +318,40 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
 
     If the *target_model* uses an inference-optimized layer spec with MXFP8,
     this function:
-      1. Computes which params are eligible for MXFP8 conversion.
-      2. Quantizes the target model's decoder weights to FlashInfer MXFP8Tensor
+      1. Quantizes eligible target decoder weights to MXFP8Tensor
          (creating persistent buffers whose addresses are later captured by
          CUDA graphs).
-      3. Builds an ``MXFP8ReshardTransform`` and attaches it to the plan as
-         ``plan.transform``.
+      2. Derives the converted parameter set from those buffers.
+      3. Attaches an ``MXFP8ReshardTransform`` to ``plan.transform``.
 
-    If the model doesn't need MXFP8, ``plan.transform`` is set to None.
-    Subsequent calls are no-ops if the plan already has a transform attribute.
+    Idempotent: skips re-setup if ``plan.transform`` is already populated.
     """
-    if hasattr(plan, 'transform'):
-        return  # Already set up
+    if plan.transform is not None:
+        return
 
     if not _needs_mxfp8_conversion(target_model):
-        plan.transform = None
         return
 
     lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
-    # 1. Compute which parameters are eligible for MXFP8 conversion.
-    #    Must be done while params are still visible as nn.Parameter (BF16).
-    convertible: set[str] = set()
-    for name, param in decoder.named_parameters():
-        if _should_quantize_param(param):
-            convertible.add(f"decoder.{name}")
+    # 1. Quantize selected decoder weights -> persistent MXFP8Tensor buffers.
+    # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
+    # representation. The reshard transform updates those canonical buffers, then
+    # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
+    backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
+    persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
-    # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
-    persistent_buffers = quantize_params_to_mxfp8(decoder)
+    # 2. Derive the transform set from the buffers that were actually quantized.
+    convertible = {f"decoder.{name}" for name in persistent_buffers}
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
         convertible_params=convertible,
         persistent_buffers=persistent_buffers,
         buffer_key_prefix="decoder.",
+        backend=backend,
     )
 
 
@@ -279,6 +361,7 @@ def prepare_swap_model_weights(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ):
     """Pre-build and cache the reshard plan and any format-conversion transforms.
 
@@ -287,17 +370,16 @@ def prepare_swap_model_weights(
     same module-level cache as swap_model_weights, so subsequent calls reuse it
     without needing to inspect named_parameters() again.
 
-    If the *target_model* uses an inference-optimized layer spec with MXFP8
-    (``config.transformer_impl == 'inference_optimized'`` and
-    ``config.fp8_recipe == 'mxfp8'``), this function also:
-      - computes which parameters are eligible for MXFP8 conversion,
-      - quantizes the target decoder weights to persistent FlashInfer
-        MXFP8Tensor buffers (whose addresses are later baked into CUDA graphs),
-      - creates an ``MXFP8ReshardTransform`` that subsequent
-        ``swap_model_weights`` calls use automatically.
+    If the target_model uses an inference-optimized layer spec with MXFP8
+    (config.transformer_impl == 'inference_optimized' and
+    config.fp8 is not None and config.fp8_recipe == 'mxfp8'), this function also:
+      - quantizes eligible target decoder weights to persistent MXFP8Tensor buffers
+        (whose addresses are later baked into CUDA graphs),
+      - derives the converted parameter set from those buffers,
+      - creates an MXFP8ReshardTransform that subsequent
+        swap_model_weights calls use automatically.
 
-    Callers do **not** need to know about MXFP8 — the transform is created and
-    cached transparently.
+    Callers do not need to know about MXFP8; the transform is created and cached transparently.
 
     All participating ranks must call this simultaneously — the plan builder uses
     collective communication internally.
@@ -308,10 +390,19 @@ def prepare_swap_model_weights(
         group: Optional process group for collective communication.
         src_rank_offset: Rank offset for source (training) workers.
         dst_rank_offset: Rank offset for destination (inference) workers.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core,
+        tgt_core,
+        num_experts,
+        group,
+        src_rank_offset,
+        dst_rank_offset,
+        execution_batch_bytes=execution_batch_bytes,
     )
 
     # Auto-detect and set up MXFP8 transform on the plan for the target model.
@@ -328,6 +419,9 @@ def swap_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    num_dst_pools: int = 1,
+    dst_pool_index: int = 0,
+    execution_batch_bytes: int | None = None,
 ):
     """
     Orchestrate weight swap/refit.
@@ -347,37 +441,72 @@ def swap_model_weights(
         transform: Optional ReshardTransform for custom format conversion.
             If None, the cached transform (from prepare_swap_model_weights)
             is used automatically when the receiver needs MXFP8 conversion.
+        num_dst_pools / dst_pool_index: refit into ``num_dst_pools`` disjoint
+            destination pools (e.g. disaggregated prefill/decode instances on
+            separate rank windows), one collective pass per pool. This rank
+            receives into ``target_model`` only on its own pool's pass
+            (``pool == dst_pool_index``) and is a pure source otherwise.
+            Defaults ``(1, 0)`` reproduce the single-destination behavior.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            execution staging. A single complete parameter may exceed this
+            value. With a string ``nccl_m2n`` backend, this overrides M2N's
+            grouped-submission limit; None preserves its existing environment
+            setting or 256 MiB default. Other backends keep the model-wide
+            submission behavior when this is None.
     """
     if isinstance(refit_method, str):
-        service = get_or_create_service(refit_method, group=group)
-    elif hasattr(refit_method, 'submit_send') and hasattr(refit_method, 'run'):
+        service = get_or_create_service(
+            refit_method, group=group, execution_batch_bytes=execution_batch_bytes
+        )
+    elif isinstance(refit_method, CopyService):
         service = refit_method
     else:
-        raise TypeError(
-            "refit_method must be a str backend name or a CopyService-compatible instance"
+        raise TypeError("refit_method must be a str backend name or a CopyService instance")
+
+    if num_dst_pools > 1 and not service.supports_idle_ranks:
+        raise ValueError(
+            f"{type(service).__name__} does not support num_dst_pools > 1 because each pool "
+            "pass leaves the other destination ranks idle"
         )
 
-    # Auto-resolve MXFP8 transform from the cached plan when no
-    # explicit transform was provided.
-    if transform is None:
-        src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-        plan = _build_or_get_plan(
-            src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+    for pool in range(num_dst_pools):
+        target = target_model if pool == dst_pool_index else None
+
+        # The plan-build is collective. Pass ``pool`` so a source-only rank
+        # (target=None, same cache key every pool) doesn't cache-hit and skip the
+        # collective on a later pass while target ranks run it -> deadlock. Each
+        # pool's plan is then built once and reused across refits in lockstep.
+        # Auto-resolve MXFP8 transform from the cached plan when no explicit
+        # transform was provided (re-resolved per pool: the target differs).
+        pass_transform = transform
+        if pass_transform is None:
+            src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target)
+            plan = _build_or_get_plan(
+                src_core,
+                tgt_core,
+                num_experts,
+                group,
+                src_rank_offset,
+                dst_rank_offset,
+                pool_index=pool,
+                execution_batch_bytes=execution_batch_bytes,
+            )
+            pass_transform = plan.transform
+
+        reshard_model_weights(
+            src_model,
+            target,
+            service=service,
+            group=group,
+            src_rank_offset=src_rank_offset,
+            dst_rank_offset=dst_rank_offset,
+            transform=pass_transform,
+            pool_index=pool,
+            execution_batch_bytes=execution_batch_bytes,
         )
-        transform = getattr(plan, 'transform', None)
-
-    reshard_model_weights(
-        src_model,
-        target_model,
-        service=service,
-        group=group,
-        src_rank_offset=src_rank_offset,
-        dst_rank_offset=dst_rank_offset,
-        transform=transform,
-    )
 
 
-def _harmonize_buffer_dtypes(src_core, tgt_core, group=None):
+def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
     """Bring destination persistent-buffer dtypes into agreement with source.
 
     Some buffers (notably the MoE router ``expert_bias``) are upcast to fp32
@@ -387,40 +516,65 @@ def _harmonize_buffer_dtypes(src_core, tgt_core, group=None):
     sending fp32 bytes into a bf16 receive buffer corrupts the data — so dst's
     buffer must match src's dtype before the transfer.
 
-    Works for both collocated and non-collocated transfers: every rank reports
-    its source-side persistent-buffer dtypes via a single
-    ``all_gather_object`` on ``group``.  Destination-side ranks then look up
-    each of their own buffers in the gathered map and replace the tensor with
-    one in src's dtype.  Source-only and idle ranks contribute empty dicts and
-    skip the apply step, but still participate in the collective so it is
-    well-formed across every rank.
-
-    Buffer matching is by raw module path (e.g. ``decoder.layers.0.…``); the
-    planner's PP-aware ``resolved_name`` is intentionally not used here because
-    we only need the dtype, which is uniform for a given buffer kind across
-    layers in practice.
+    Source dtypes are collected once via ``all_gather_object``, matched by
+    transfer ID, and cached under local destination buffer names on the plan.
+    Subsequent refits reuse the cached map and only do the per-buffer dtype
+    check / replacement (no collective).
     """
-    # Build local map of source-side persistent buffer dtypes.
-    local_src_dtypes: dict[str, torch.dtype] = {}
-    if src_core is not None:
-        for full_name, _sub, _buf_name, buf in named_persistent_buffers(src_core):
-            local_src_dtypes[full_name] = buf.dtype
-
-    world_size = group.size() if group is not None else torch.distributed.get_world_size()
-    gathered: list = [None] * world_size
-    torch.distributed.all_gather_object(gathered, local_src_dtypes, group=group)
-
-    canonical: dict[str, torch.dtype] = {}
-    for d in gathered:
-        if not d:
-            continue
-        for name, dtype in d.items():
-            # Replicated buffers agree across ranks; first writer wins.
-            canonical.setdefault(name, dtype)
+    if plan.buffer_dtypes is None:
+        source_buffers = {}
+        if src_core is not None:
+            source_buffers = {
+                name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_core)
+            }
+        # Transfer IDs already pair source and destination tensors, even when
+        # their storage names or local pipeline indices differ.
+        local_src_dtypes = {
+            op.task_id: source_buffers[op.param_name]
+            for op in plan.send_ops
+            if op.param_name in source_buffers
+        }
+        destination_buffers = (
+            {name for name, _, _, _ in named_persistent_buffers(tgt_core)}
+            if tgt_core is not None
+            else set()
+        )
+        local_dst_names = {
+            op.task_id: op.param_name
+            for op in plan.recv_ops
+            if op.param_name in destination_buffers
+        }
+        world_size = group.size() if group is not None else torch.distributed.get_world_size()
+        gathered: list = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered, (local_src_dtypes, local_dst_names), group=group
+        )
+        transfer_dtypes = {
+            task_id: dtype for src_dtypes, _ in gathered for task_id, dtype in src_dtypes.items()
+        }
+        # Every rank validates every destination before any rank enters transfers.
+        # Different task IDs may contribute shards to the same destination buffer.
+        destination_dtypes = []
+        for rank, (_, dst_names) in enumerate(gathered):
+            dtypes = {}
+            for task_id, name in dst_names.items():
+                if task_id not in transfer_dtypes:
+                    continue
+                dtype = transfer_dtypes[task_id]
+                previous = dtypes.setdefault(name, dtype)
+                if previous != dtype:
+                    raise ValueError(
+                        f"Source shards disagree on buffer dtype for {name} on rank {rank}"
+                    )
+            destination_dtypes.append(dtypes)
+        rank = group.rank() if group is not None else torch.distributed.get_rank()
+        plan.buffer_dtypes = destination_dtypes[rank]
 
     if tgt_core is None:
         return
 
+    canonical = plan.buffer_dtypes
+    invalidated = False
     for full_name, sub, buf_name, dst_buf in named_persistent_buffers(tgt_core):
         expected = canonical.get(full_name)
         if expected is not None and dst_buf.dtype != expected:
@@ -428,6 +582,9 @@ def _harmonize_buffer_dtypes(src_core, tgt_core, group=None):
             # recvs write the right number of bytes and the in-model lookup
             # (``self.expert_bias``) sees the new storage.
             sub._buffers[buf_name] = dst_buf.to(expected)
+            invalidated = True
+    if invalidated:
+        invalidate_refit_tensor_cache(tgt_core)
 
 
 def reshard_model_weights(
@@ -438,6 +595,8 @@ def reshard_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    pool_index: int = 0,
+    execution_batch_bytes: int | None = None,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -452,12 +611,33 @@ def reshard_model_weights(
         src_rank_offset / dst_rank_offset: Offsets for mapping local ranks to global ranks
             in independent torch.distributed worlds.
         transform: Optional ReshardTransform for custom format conversion.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-    _harmonize_buffer_dtypes(src_core, tgt_core, group=group)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core,
+        tgt_core,
+        num_experts,
+        group,
+        src_rank_offset,
+        dst_rank_offset,
+        pool_index=pool_index,
+        execution_batch_bytes=execution_batch_bytes,
     )
+    _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
+    service.set_model_roles(is_source=src_core is not None, is_destination=tgt_core is not None)
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
+    if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
+        refreshed = False
+        for module in tgt_core.modules():
+            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
+            if refresh is not None:
+                refreshed = bool(refresh()) or refreshed
+        if refreshed:
+            # Repacking is asynchronous. Synchronize before another stream replays graphs
+            # that read these derived weight buffers.
+            torch.cuda.synchronize()

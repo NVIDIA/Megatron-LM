@@ -1,0 +1,26 @@
+# Model-specific args for the 583M mcore mistral checkpoint.
+# Sourced from tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq/model_config.yaml
+# CHECKPOINT_LOAD_PATH must be set to the mcore_ci data root.
+--tiktoken-pattern v2
+--use-mcore-models
+--tokenizer-type TikTokenizer
+--tokenizer-model ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+--auto-detect-ckpt-format
+--use-checkpoint-args
+--load ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
+--no-use-tokenizer-model-from-checkpoint-args
+--no-load-optim
+--ckpt-format torch_dist
+--dist-ckpt-strictness log_unexpected
+--inference-ckpt-non-strict
+--tensor-model-parallel-size 1
+--pipeline-model-parallel-size 1
+--transformer-impl transformer_engine
+--bf16
+--attention-backend flash
+--num-layers 24
+--hidden-size 1152
+--num-attention-heads 16
+--max-position-embeddings 4096
+--seq-length 4096
+--inference-max-seq-length 4096

@@ -120,6 +120,7 @@ def _make_dsa_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransforme
         hidden_dropout=0.0,
         attention_dropout=0.0,
         tensor_model_parallel_size=tp,
+        sequence_parallel=tp > 1,
         pipeline_model_parallel_size=pp,
     )
 
@@ -195,9 +196,10 @@ def _build_mamba_model(
     post_process: bool = True,
 ) -> HybridModel:
     """Build a HybridModel with the given hybrid layer pattern."""
-    layer_type_list = validate_segment_layers(layer_pattern)
     mamba_config = copy.deepcopy(config)
-    mamba_config.num_layers = len(layer_type_list)
+    mamba_config.num_layers = len(layer_pattern)
+    layer_config_list = validate_segment_layers(layer_pattern, mamba_config)
+    assert len(layer_config_list) == mamba_config.num_layers
     assert mamba_config.num_layers == _NUM_GPT_LAYERS * 2
     model = HybridModel(
         config=mamba_config,

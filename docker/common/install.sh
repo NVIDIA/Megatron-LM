@@ -55,6 +55,19 @@ if [[ "$ENVIRONMENT" != "dev" && "$ENVIRONMENT" != "lts" ]]; then
     exit 1
 fi
 
+# AUT-479: LTS Python dependencies were moved out of pyproject.toml into
+# docker/Dockerfile.ci.lts. This script targets the floating dev stack and no
+# longer builds a working LTS environment by itself.
+if [[ "$ENVIRONMENT" == "lts" ]]; then
+    echo "Error: --environment lts is no longer supported by install.sh."
+    echo "       LTS dependencies are pinned in docker/Dockerfile.ci.lts."
+    echo "       Build the LTS image directly with:"
+    echo "         docker build --target main \\"
+    echo "           --build-arg FROM_IMAGE_NAME=\$(cat docker/.ngc_version.lts) \\"
+    echo "           -f docker/Dockerfile.ci.lts -t megatron-lm:local-lts ."
+    exit 1
+fi
+
 main() {
     if [[ -n "${PAT:-}" ]]; then
         echo -e "machine github.com\n  login token\n  password $PAT" >~/.netrc
@@ -90,6 +103,13 @@ main() {
     apt-get clean
 
     unset PIP_CONSTRAINT
+
+    # torch-memory-saver builds CUDA-suffixed extensions and requires the CUDA major.
+    export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [[ -z "$TMS_CUDA_MAJOR" ]]; then
+        echo "Error: failed to determine CUDA major from nvcc" >&2
+        exit 1
+    fi
 
     if [[ "$USE_UV" == "true" ]]; then
         if [[ "$BASE_IMAGE" == "pytorch" ]]; then

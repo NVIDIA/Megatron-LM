@@ -20,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
+    common_test_pg_distribution_cache_e2e,
     common_test_simple_sharded_state_dict_save_load,
     common_test_state_dict_comparison,
     common_test_vocab_size_padding_change,
@@ -155,6 +156,24 @@ class TestGPTModelReconfiguration:
             load_order,
             store_order,
             metadata={'singleton_local_shards': singleton_local_shards},
+        )
+
+    @pytest.mark.parametrize(('tp', 'pp'), [(1, 1), (2, 1), (1, 2), (2, 2)])
+    def test_pg_distribution_cache_e2e(self, tmp_path_dist_ckpt, tp, pp):
+        """A real sharded GPT checkpoint must round-trip identically through the
+        PG-distribution cache (--ckpt-pg-tensors-cache-path).
+
+        Covers tensor and pipeline parallelism: each pipeline stage has its own
+        data-parallel group, hence its own cache file, so the cached distribution
+        must stay stage-local.
+        """
+        Utils.initialize_model_parallel(tp, pp)
+        common_test_pg_distribution_cache_e2e(
+            lambda seed: initialize_gpt_model(
+                seed, gpt_te_spec, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
+            ),
+            tmp_path_dist_ckpt,
+            ps.get_data_parallel_group(with_context_parallel=True),
         )
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
