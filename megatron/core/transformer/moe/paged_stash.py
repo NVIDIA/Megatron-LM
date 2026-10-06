@@ -951,20 +951,31 @@ def paged_stash_reset(enabled=True, config=None):
 
     config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu,
     moe_paged_stash_page_size and moe_paged_stash_copy_block_size/max_blocks are read from it.
-    Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
+    Otherwise defaults to 1.10 (CUDA), 0.0 (CPU). Unset copy launch options resolve on the
+    current device: 4096/8192 on Rubin (SM107), 1024/2048 elsewhere.
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
     stash_manager.iteration += 1
     if config is not None:
         stash_manager.page_size = config.moe_paged_stash_page_size
-        stash_manager.copy_block_size = config.moe_paged_stash_copy_block_size
-        stash_manager.copy_max_blocks = config.moe_paged_stash_copy_max_blocks
     # current layer and microbatch for each vp stage for forward pass
     stash_manager.current_schedule_index = 0
 
     if not enabled:
         return
+
+    block_size = config.moe_paged_stash_copy_block_size if config is not None else None
+    max_blocks = config.moe_paged_stash_copy_max_blocks if config is not None else None
+    if block_size is None or max_blocks is None:
+        # Resolve after device selection, rather than during config construction.
+        is_rubin = torch.cuda.get_device_capability() == (10, 7)
+        if block_size is None:
+            block_size = 4096 if is_rubin else GLOBAL_BLOCK_SIZE
+        if max_blocks is None:
+            max_blocks = 8192 if is_rubin else GLOBAL_MAX_BLOCKS
+    stash_manager.copy_block_size = block_size
+    stash_manager.copy_max_blocks = max_blocks
 
     if stash_manager.status == 'begin':
         stash_manager.status = 'capture'

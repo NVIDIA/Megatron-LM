@@ -1559,13 +1559,15 @@ class TransformerConfig(ModelParallelConfig):
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
 
-    moe_paged_stash_copy_block_size: int = 1024
+    moe_paged_stash_copy_block_size: Optional[int] = None
     """Elements each program of the paged stash copy/pop kernels moves per inner-loop iteration.
     Must be a power of two. Larger values (e.g. 4096) keep more bytes in flight per program and
-    speed up stashing of wide activations."""
+    speed up stashing of wide activations. None selects 4096 on Rubin and 1024 elsewhere
+    when paged stashing is enabled."""
 
-    moe_paged_stash_copy_max_blocks: int = 2048
-    """Maximum number of programs (CTAs) per paged stash copy/pop kernel launch."""
+    moe_paged_stash_copy_max_blocks: Optional[int] = None
+    """Maximum number of programs (CTAs) per paged stash copy/pop kernel launch.
+    None selects 8192 on Rubin and 2048 elsewhere when paged stashing is enabled."""
 
     fine_grained_offloading_max_inflight_offloads: Optional[int] = None
     """Per fine-grained offloading group name, max number of inflight offloads for that name not
@@ -2699,12 +2701,15 @@ class TransformerConfig(ModelParallelConfig):
                     "there is no need to use paged stashing without it."
                 )
             block_size = self.moe_paged_stash_copy_block_size
-            if block_size <= 0 or block_size & (block_size - 1):
+            if block_size is not None and (block_size <= 0 or block_size & (block_size - 1)):
                 raise ValueError(
                     "moe_paged_stash_copy_block_size must be a positive power of two, "
                     f"got {block_size}."
                 )
-            if self.moe_paged_stash_copy_max_blocks <= 0:
+            if (
+                self.moe_paged_stash_copy_max_blocks is not None
+                and self.moe_paged_stash_copy_max_blocks <= 0
+            ):
                 raise ValueError(
                     "moe_paged_stash_copy_max_blocks must be positive, "
                     f"got {self.moe_paged_stash_copy_max_blocks}."
