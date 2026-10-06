@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -387,6 +388,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "sequence_packing_scheduler": None,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
     "sequence_packing_scheduler": None,
+    "moe_hybridep_routing_map_mode": "indices",
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
@@ -578,7 +580,7 @@ class TestHybridMoEModel:
         args.vocab_size = 131072
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def setup_method(self, method):

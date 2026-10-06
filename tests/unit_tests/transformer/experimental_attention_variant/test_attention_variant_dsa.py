@@ -1969,6 +1969,11 @@ class TestDSAIndexerLossAutoScaler:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.fixture(autouse=True)
+    def reset_loss_scale(self):
+        yield
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_pass(self):
         """Test that forward pass preserves output."""
