@@ -631,22 +631,26 @@ class FsdpModule:
             self.reshard()
 
         self.phase = FsdpModule.Phase.RESTING
-        if self._needs_gradient_reduction:
-            self.grads_ready()
+        self._reduce_ready_gradients()
         torch.cuda.nvtx.range_pop()
 
     def grads_ready(self) -> None:
-        """Reduce completed gradients once full weights have been released."""
-        # Either completion can arrive first. Avoid allocating the packed gradient
-        # buffer while full weights are still live, preserving the memory bound.
-        self._needs_gradient_reduction = self.phase is FsdpModule.Phase.BACKWARD
-        if self._needs_gradient_reduction:
+        """Record gradient completion independently of module backward completion."""
+        self._needs_gradient_reduction = True
+        self._reduce_ready_gradients()
+
+    def _reduce_ready_gradients(self) -> None:
+        """Launch a pending reduction once both completion events have arrived."""
+        # Avoid allocating the packed gradient buffer while full weights are
+        # still in use, preserving the existing memory bound.
+        if not self._needs_gradient_reduction or self.phase is FsdpModule.Phase.BACKWARD:
             return
         # Delayed wgrad may be the last consumer of the full parameter binding.
         if self._unshard_event is not None:
             self.reshard()
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
+        self._needs_gradient_reduction = False
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
