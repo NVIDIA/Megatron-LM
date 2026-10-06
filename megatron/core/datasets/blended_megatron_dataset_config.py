@@ -2,7 +2,7 @@
 
 import functools
 import logging
-import re
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -161,15 +161,17 @@ def parse_and_normalize_split(split: str) -> List[float]:
     Returns:
         List[float]: The trian valid test split ratios e.g. [0.99, 0.01, 0.0]
     """
-    split = list(map(float, re.findall(r"[.0-9]+", split)))
-    split = split + [0.0 for _ in range(len(Split) - len(split))]
+    weights = list(map(float, split.split(",")))
+    if not 1 <= len(weights) <= len(Split):
+        raise ValueError(f"Expected one to {len(Split)} dataset split proportions")
+    if not all(math.isfinite(weight) and weight >= 0.0 for weight in weights):
+        raise ValueError("Dataset split proportions must be finite and non-negative")
+    total = sum(weights)
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("Dataset split proportions must have a finite, positive sum")
+    weights = weights + [0.0 for _ in range(len(Split) - len(weights))]
 
-    assert len(split) == len(Split)
-    assert all(map(lambda _: _ >= 0.0, split))
-
-    split = normalize(split)
-
-    return split
+    return normalize(weights)
 
 
 def convert_split_vector_to_split_matrix(
