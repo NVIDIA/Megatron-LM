@@ -1028,8 +1028,16 @@ class CompressedSparseAttention(MegatronModule):
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
             )
+            # Match the training forward's key order: FlashMLA's online softmax
+            # accumulates in slot order, even when the selected key set is equal.
+            # Preserve the existing window-first order outside deterministic mode.
+            index_groups = (
+                (compressed_indices, window_indices)
+                if self.config.deterministic_mode
+                else (window_indices, compressed_indices)
+            )
             flat_indices, flat_topk_length = build_flat_topk_idxs(
-                window_indices, compressed_indices, batch_size=batch, compact=True
+                *index_groups, batch_size=batch, compact=True
             )
             nvtx_range_pop("compressed_indices")
 
