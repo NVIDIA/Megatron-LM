@@ -2349,9 +2349,11 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if "mamba" in self.recompute_modules and self.moe_shortcut_connection:
-            warnings.warn(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "Mamba mixer recomputation is not supported with moe_shortcut_connection; "
-                "the shortcut MoE path does not recompute the Mamba mixer."
+                "the shortcut MoE path does not recompute the Mamba mixer.",
             )
 
         if self.recompute_granularity == "selective":

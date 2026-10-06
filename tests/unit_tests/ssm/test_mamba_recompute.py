@@ -1,11 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
+import logging
 
 import pytest
 import torch
 
-from megatron.core import tensor_parallel
+from megatron.core import _rank_utils, tensor_parallel
 from megatron.core.extensions import transformer_engine
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -93,8 +93,10 @@ class TestMambaModelRecompute:
             Utils.destroy_model_parallel()
 
 
-def test_mamba_recompute_warns_with_shortcut_moe():
-    with pytest.warns(UserWarning, match="Mamba mixer recomputation is not supported"):
+@pytest.mark.parametrize("rank", [0, 1])
+def test_mamba_recompute_warns_with_shortcut_moe(caplog, monkeypatch, rank):
+    monkeypatch.setattr(_rank_utils, "safe_get_rank", lambda: rank)
+    with caplog.at_level(logging.WARNING, logger="megatron.core.transformer.transformer_config"):
         TransformerConfig(
             hidden_size=256,
             num_layers=2,
@@ -104,12 +106,13 @@ def test_mamba_recompute_warns_with_shortcut_moe():
             recompute_granularity="selective",
             recompute_modules=["mamba"],
         )
+    warnings = [r for r in caplog.records if "Mamba mixer recomputation" in r.message]
+    assert len(warnings) == int(rank in _rank_utils.get_default_log_ranks())
 
 
 @pytest.mark.parametrize(("shortcut_moe", "modules"), [(False, ["mamba"]), (True, ["layernorm"])])
-def test_mamba_recompute_warning_only_for_shortcut_moe(shortcut_moe, modules):
-    with warnings.catch_warnings(record=True) as recorded:
-        warnings.simplefilter("always")
+def test_mamba_recompute_warning_only_for_shortcut_moe(caplog, shortcut_moe, modules):
+    with caplog.at_level(logging.WARNING, logger="megatron.core.transformer.transformer_config"):
         TransformerConfig(
             hidden_size=256,
             num_layers=2,
@@ -119,7 +122,7 @@ def test_mamba_recompute_warning_only_for_shortcut_moe(shortcut_moe, modules):
             recompute_granularity="selective",
             recompute_modules=modules,
         )
-    assert not any("Mamba mixer recomputation" in str(w.message) for w in recorded)
+    assert not any("Mamba mixer recomputation" in r.message for r in caplog.records)
 
 
 class _RecordingMixer(torch.nn.Module):
