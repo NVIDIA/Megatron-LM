@@ -42,8 +42,8 @@ from megatron.training import (
     inprocess_restart,
 )
 from megatron.training.async_utils import init_persistent_async_worker
+from megatron.training.global_vars import get_run_config, get_train_state
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.global_vars import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -509,7 +509,7 @@ def write_args_to_tensorboard():
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+            writer.add_text(arg, str(getattr(args, arg)), global_step=get_train_state().iteration)
 
 
 def set_jit_fusion_options(tp_size=None):

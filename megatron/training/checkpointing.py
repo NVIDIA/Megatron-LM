@@ -2422,7 +2422,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     checkpoint_args = state_dict['args']
     checkpoint_version = state_dict.get('checkpoint_version', 0)
-    args.iteration = state_dict['iteration']
 
     # One-off conversion for foundation models
     if hasattr(checkpoint_args, 'disable_bias_linear'):
@@ -3209,7 +3208,7 @@ def load_checkpoint(
             current_train_state.skipped_train_samples = 0
         update_num_microbatches(consumed_samples=current_train_state.consumed_train_samples, verbose=True)
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
-                     f'(consumed_train_samples {args.consumed_train_samples})')
+                     f'(consumed_train_samples {current_train_state.consumed_train_samples})')
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
@@ -3337,13 +3336,13 @@ def load_checkpoint(
                             param_group["min_lr"] = min_lr
                     # Synchronize scheduler num_steps with consumed_train_samples
                     # to ensure lr calculation is based on current training progress
-                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                    if opt_param_scheduler.num_steps != current_train_state.consumed_train_samples:
                         print_rank_0(
                             f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
-                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                            f"differs from consumed_train_samples ({current_train_state.consumed_train_samples}). "
                             f"Resetting scheduler num_steps to match consumed_train_samples."
                         )
-                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                        opt_param_scheduler.num_steps = current_train_state.consumed_train_samples
                     opt_param_scheduler.step(increment=0)
                     print_rank_0(
                         " > restored optimizer param_group max_lr/min_lr from runtime config "
@@ -3521,7 +3520,7 @@ def load_checkpoint(
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg='After loading checkpoint')
 
-    return iteration, num_floating_point_operations_so_far
+    return current_train_state.iteration, current_train_state.num_floating_point_operations_so_far
 
 
 def _to_dtensor(wrapped_model, model_state_dict):

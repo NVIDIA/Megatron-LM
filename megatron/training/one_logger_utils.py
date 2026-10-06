@@ -313,7 +313,7 @@ def track_config_flags(train_iters, skip_train, do_train, do_valid, do_test, dat
     one_logger = get_one_logger()
     if one_logger:
         with one_logger.get_context_manager():
-            # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+            # Track if training is enabled. Can only be done once train_state.do_train is assigned after dataloader is built.
             train_enabled = train_iters and (not skip_train) and do_train and train_iters > 0
             one_logger.log_metrics({
                 'is_train_iterations_enabled': train_enabled,
