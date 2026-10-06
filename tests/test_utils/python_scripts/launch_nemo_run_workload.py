@@ -247,6 +247,20 @@ def main(
         volumes=artifacts,
     )
 
+    if (
+        scope == "unit-tests"
+        and test_case == "tests/unit_tests/transformer/**/*.py"
+        and environment == "dev"
+        and tag == "latest"
+        and platform == "dgx_h100"
+    ):
+        # Preserve test selection and cleanup while diagnosing the stall in #7744.
+        executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
+        executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
+        executor.env_vars["NCCL_DEBUG_FILE"] = (
+            "/opt/megatron-lm/assets_dir/logs/nccl_debug.%h.%p.log"
+        )
+
     n_attempts = 0
     while n_attempts < 3:
         tee_buffer = _ThreadSafeBuffer()
