@@ -580,6 +580,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
+    _te_capture_started = False
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -630,10 +631,9 @@ class _CudagraphGlobalRecord:
             if is_graph_capturing():
                 _set_warmup_end()
                 _set_capture_end()
-                if HAVE_TE_GRAPHS:
+                if cls._te_capture_started:
                     te_set_capture_end()
-                if FREEZE_GC:
-                    gc.unfreeze()
+                    cls._te_capture_started = False
             cls._disable_saved_tensors_observer()
 
     @classmethod
@@ -698,6 +698,7 @@ class _CudagraphGlobalRecord:
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()
+            cls._te_capture_started = True
 
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
@@ -769,6 +770,7 @@ class _CudagraphGlobalRecord:
         _set_capture_end()
         if has_te_modules:
             te_set_capture_end()
+            cls._te_capture_started = False
 
         torch.cuda.set_stream(torch.cuda.default_stream())
 
