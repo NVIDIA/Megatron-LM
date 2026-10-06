@@ -28,6 +28,22 @@ _RUNTIME_ONLY_TARGETS = frozenset({"megatron.core.timers.Timers"})
 logger = logging.getLogger(__name__)
 
 
+def file_exists(path: str) -> bool:
+    """Check if a file exists.
+
+    Args:
+        path: The path to the file. Can be a local path or an MSC URL.
+
+    Returns:
+        True if the file exists, False otherwise.
+    """
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.os.path.exists(path)
+    else:
+        return os.path.exists(path)
+
+
 def join_paths(*paths: str) -> str:
     """Join paths, using MultiStorageClient when needed"""
     if not paths:
