@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable
+from contextvars import copy_context
 from typing import Any, Optional, TypeVar, Union
 
 import torch
@@ -104,6 +105,14 @@ _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 # registered only when the axis is active (see model_parallel_cuda_manual_seed).
 _GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
 _EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
+
+
+def _run_recompute_with_observation_suspended(function, *args):
+    """Suppress observations inside the restored forward context, not outside it."""
+    # Tensor-observation suspension is itself a ContextVar. Entering the copied
+    # forward context after suspending would restore its old unsuspended value.
+    with suspend_tensor_observations():
+        return function(*args)
 
 
 def _get_cuda_rng_state(
@@ -652,6 +661,10 @@ class CheckpointFunction(torch.autograd.Function):
         _set_checkpointing()
 
         ctx.run_function = run_function
+        # CUDA autograd can recompute on an engine thread whose Python context
+        # differs from the caller. Preserve forward execution scopes (including
+        # router GEMM row blocks) instead of inheriting that thread's defaults.
+        ctx.forward_context = copy_context()
         ctx.distribute_saved_activations = distribute_saved_activations
 
         # Copy the rng states.
@@ -699,8 +712,10 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad(), suspend_tensor_observations():
-                outputs = ctx.run_function(*detached_inputs)
+            with torch.enable_grad():
+                outputs = ctx.forward_context.copy().run(
+                    _run_recompute_with_observation_suspended, ctx.run_function, *detached_inputs
+                )
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -928,6 +943,7 @@ class CheckpointWithoutOutput(object):
         self.ckpt_manager = ckpt_manager
         self.retain_input_tensors = retain_input_tensors
         self.run_function = None
+        self.forward_context = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
         self.fwd_cuda_rng_state_tracker = None
@@ -950,6 +966,7 @@ class CheckpointWithoutOutput(object):
             return run_function(*args)
 
         self.run_function = run_function
+        self.forward_context = copy_context()
 
         self.rng_states = _get_all_rng_states()
 
@@ -999,10 +1016,13 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
-                outputs = self.run_function(*inputs)
+            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+                outputs = self.forward_context.copy().run(
+                    _run_recompute_with_observation_suspended, self.run_function, *inputs
+                )
 
         self.run_function = None
+        self.forward_context = None
         self.rng_states = None
 
         if isinstance(outputs, torch.Tensor):

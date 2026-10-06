@@ -2,6 +2,9 @@
 
 import functools
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -1389,6 +1392,59 @@ def apply_biased_logits(logits, std, layer_number=None):
     return RandomSTEShared.apply(logits, std, layer_number)
 
 
+_ROUTER_GATING_TOKEN_BLOCK_SIZE: ContextVar[int | None] = ContextVar(
+    "router_gating_token_block_size", default=None
+)
+
+
+@contextmanager
+def router_gating_token_blocks(block_size: int = 1024) -> Iterator[None]:
+    """Keep router GEMM row shapes fixed within a shared-prefix layer execution.
+
+    A short independent star and a larger forest can select different GEMM reduction
+    algorithms. Even FP32 router differences below 2e-6 can change subsequent BF16
+    activations and expert choices. Fixed rows make this reduction independent of
+    packing. Padding is removed before routing, so it never dispatches extra tokens.
+
+    The caller must enter this scope inside any activation-checkpoint callable so
+    backward recomputation uses the same router arithmetic as the original forward.
+    """
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
+        raise ValueError("router gating token block size must be a positive integer")
+    token = _ROUTER_GATING_TOKEN_BLOCK_SIZE.set(block_size)
+    try:
+        yield
+    finally:
+        _ROUTER_GATING_TOKEN_BLOCK_SIZE.reset(token)
+
+
+def _router_gating_gemm(
+    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+) -> torch.Tensor:
+    """Run the existing router GEMM, optionally in fixed, padded row blocks."""
+
+    def gemm(rows: torch.Tensor) -> torch.Tensor:
+        if te_general_gemm is not None and router_dtype != torch.float64:
+            # Preserve the baseline TE bias/output dtype contract.
+            gemm_bias = bias.to(router_dtype) if bias is not None else None
+            return te_general_gemm(weight, rows, router_dtype, layout="TN", bias=gemm_bias)[0]
+        if bias is None:
+            return torch.mm(rows.to(router_dtype), weight.to(router_dtype).t())
+        return torch.addmm(
+            bias.to(router_dtype), rows.to(router_dtype), weight.to(router_dtype).t()
+        )
+
+    block_size = _ROUTER_GATING_TOKEN_BLOCK_SIZE.get()
+    if block_size is None or inp.shape[0] == 0:
+        return gemm(inp)
+    outputs = []
+    for start in range(0, inp.shape[0], block_size):
+        rows = inp[start : start + block_size]
+        padded = torch.nn.functional.pad(rows, (0, 0, 0, block_size - rows.shape[0]))
+        outputs.append(gemm(padded)[: rows.shape[0]])
+    return torch.cat(outputs, dim=0)
+
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1421,26 +1477,14 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
-            # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
-            # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
-            # small bias vector before passing it to TE.
-            gemm_bias = bias.to(router_dtype) if bias is not None else None
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
-        elif bias is None:
-            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
-        else:
-            output = torch.addmm(
-                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
-            )
-
+        output = _router_gating_gemm(inp, weight, bias, router_dtype)
         output = output.view(*inp_shape[:-1], -1)
         return output
 
     @staticmethod
     def backward(
         ctx, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], None]:
         """
         Backward pass of the RouterGatingLinearFunction function.
 
@@ -1448,7 +1492,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_output (torch.Tensor): The gradient output.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], None]:
                 The gradient input, gradient weight, gradient bias, and None.
         """
         inp, weight, bias = ctx.saved_tensors
@@ -1457,21 +1501,33 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-            grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
-            )
-            grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
-            )
-            grad_input = grad_input[0].to(ctx.input_dtype)
-            grad_weight = grad_weight[0].to(ctx.weight_dtype)
-        else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
-
-        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
-        grad_input = grad_input.view(*inp_shape)
+        grad_input = grad_weight = grad_bias = None
+        use_te = te_general_gemm is not None and ctx.router_dtype != torch.float64
+        # A frozen router still needs dX to train the hidden states, but has no
+        # consumer for dW. Autograd's requirements, not router configuration,
+        # also cover weight-only and bias-only uses of this helper.
+        if ctx.needs_input_grad[0]:
+            if use_te:
+                grad_input = te_general_gemm(
+                    weight.to(ctx.router_dtype),
+                    grad_output,
+                    ctx.router_dtype,
+                    layout="NN",
+                    grad=True,
+                )[0]
+            else:
+                grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype))
+            grad_input = grad_input.to(ctx.input_dtype).view(*inp_shape)
+        if ctx.needs_input_grad[1]:
+            if use_te:
+                grad_weight = te_general_gemm(
+                    inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                )[0]
+            else:
+                grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype))
+            grad_weight = grad_weight.to(ctx.weight_dtype)
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype)
         return grad_input, grad_weight, grad_bias, None
 
 

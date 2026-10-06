@@ -497,6 +497,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
 
@@ -506,9 +507,10 @@ class MoELayer(BaseMoELayer):
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids=input_ids
-        )
+        router_kwargs = {"input_ids": input_ids}
+        if token_multiplicities is not None:
+            router_kwargs["token_multiplicities"] = token_multiplicities
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, **router_kwargs)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -717,12 +719,21 @@ class MoELayer(BaseMoELayer):
             )
         self.select_token_dispatcher()
 
+        # Keep the tensor in the checkpoint closure: the shared-prefix caller
+        # removes the scoped attribute before selective recomputation in backward.
+        token_multiplicities = getattr(self, "_shared_prefix_token_multiplicities", None)
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
+                    probs, routing_map = self.route(
+                        hidden_states,
+                        padding_mask,
+                        input_ids=input_ids,
+                        token_multiplicities=token_multiplicities,
+                    )
                     hidden_states, probs = self.preprocess(
                         hidden_states, probs, routing_map, padding_mask
                     )
