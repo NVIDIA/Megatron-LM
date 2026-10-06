@@ -4,6 +4,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -106,18 +107,21 @@ def test_stop_ids_round_trip_and_normalize_without_mutating_input():
 
 
 @pytest.mark.parametrize(
-    "tokens,budget,expected,kept",
+    "tokens,budget,expected,kept,resume",
     [
-        ([7], 3, "stop", [7]),
-        ([5, 7, 9], 3, "stop", [5, 7]),
-        ([5, 7, 9], 1, "length", [5]),
-        ([7], 1, "stop", [7]),
-        ([11], 1, "stop", [11]),
-        ([2], 1, "stop", [2]),
-        ([5], 1, "length", [5]),
+        ([7], 3, "stop", [7], False),
+        ([5, 7, 9], 3, "stop", [5, 7], False),
+        ([5, 7, 9], 1, "length", [5], False),
+        ([7], 1, "stop", [7], False),
+        ([11], 1, "stop", [11], False),
+        ([2], 1, "stop", [2], False),
+        ([5], 1, "length", [5], False),
+        pytest.param([8], 3, "stop", [], True, id="checkpoint-chunked-stop"),
+        pytest.param([7], 1, None, [7], False, id="handoff-token-stop"),
+        pytest.param([8], 1, None, [], False, id="handoff-stripped-stop"),
     ],
 )
-def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept):
+def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept, resume):
     async def run():
         engine = _engine()
         engine.finished_request_count = 0
@@ -127,9 +131,16 @@ def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept
         engine._spec_steps = 0
         engine.stop_word_finished_request_ids = set()
         engine.context = SimpleNamespace(
-            kv_block_allocator=object(), remove_vlm_request_data=lambda _: None
+            kv_block_allocator=object(),
+            remove_vlm_request_data=lambda _: None,
+            chunked_prefill_request_id=-1,
         )
         request = _request([], stop_ids=[7])
+        request.stop_word_ids = [[8]]
+        if expected is None:
+            request.sampling_params.do_kv_handoff = True
+            engine._prepare_handoff_metadata_batch = mock.Mock(return_value={})
+            engine._capture_handoff_meta = mock.Mock()
         request.status = Status.ACTIVE_AND_GENERATING_TOKENS
         request.sampling_params.num_tokens_to_generate = budget
         request.sampling_params.return_log_probs = True
@@ -156,6 +167,16 @@ def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept
         )
         if active:
             assert not future.done()
+            if resume:
+                # Eviction and recompute-suspend both checkpoint before re-admission.
+                engine.requests[0].record.checkpoint()
+                assert engine.get_request(0).generated_tokens == []
+                assert engine.get_request(0).finish_reason is None
+                engine.context.chunked_prefill_request_id = 0
+                for _ in range(2):
+                    assert engine._get_and_clear_stop_word_finished_ids(active) == set()
+                    assert engine.stop_word_finished_request_ids == {0}
+                engine.context.chunked_prefill_request_id = -1
             assert engine._get_and_clear_stop_word_finished_ids(active) == {0}
             # A speculative next step must not append its tokens or overwrite stop.
             engine.num_speculative_tokens = 0

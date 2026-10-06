@@ -1014,10 +1014,13 @@ class InferenceStateHandoffMixin:
                 # termination_id, so an imported prefill that already produced e.g.
                 # `<|im_end|>` stops here instead of resuming decode past it.
                 if first_token in self._terminating_token_ids(request) or stop_word_hit:
-                    request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
+                    # Preserve the cause even when the matched string was stripped.
+                    request.finish_reason = "stop"
 
             request.num_cached_tokens = len(pending.prompt)
-            if len(request.generated_tokens) >= request.sampling_params.num_tokens_to_generate:
+            if request.finish_reason == "stop" or (
+                len(request.generated_tokens) >= request.sampling_params.num_tokens_to_generate
+            ):
                 self._release_pending_kv_import(pending)
                 self._complete_handoff_request_without_forward(pending.request_id)
             else:
@@ -1056,6 +1059,7 @@ class InferenceStateHandoffMixin:
 
         request_entry = self.requests.pop(request_id)
         request = request_entry.record[-1]
+        self._set_finish_reason(request)
         request.generated_length = len(request.generated_tokens)
         request.status = Status.COMPLETED
         request.add_event_finish()

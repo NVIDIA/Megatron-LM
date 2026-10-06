@@ -78,12 +78,14 @@ class _ReplyingClient:
     def __init__(self, replies):
         self.replies = list(replies)
         self.offload_params = []
+        self.sampling_params = []
         self.aborted = []
 
     def add_request_with_id(
         self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
     ):
-        del prompt_tokens, sampling_params, multi_modal_data
+        del prompt_tokens, multi_modal_data
+        self.sampling_params.append(sampling_params)
         self.offload_params.append(offload_params)
         request_id = len(self.offload_params)
         future = asyncio.get_running_loop().create_future()
@@ -306,3 +308,33 @@ async def test_engine_finish_reason_wins_at_token_budget(
     assert response.status_code == 200, await response.get_data(as_text=True)
     payload = await response.get_json()
     assert payload["choices"][0]["finish_reason"] == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("blueprint", "path", "body"), _ENDPOINTS)
+async def test_stop_token_ids_reach_each_request(blueprint, path, body):
+    client = _ReplyingClient([_reply("a", [10], [12]), _reply("b", [10], [12])])
+    payload = {**body, "stop_token_ids": [0, 7, 7], "ignore_eos": True}
+    if path == _CHAT_PATH:
+        payload["n"] = 2
+    else:
+        payload["prompt"] = ["hello", "hello"]
+    response = await _build_app(blueprint, client).test_client().post(path, json=payload)
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert len(client.sampling_params) == 2
+    for params in client.sampling_params:
+        assert params.stop_token_ids == [0, 7]
+        assert params.termination_id == -1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("blueprint", "path", "body"), _ENDPOINTS)
+async def test_invalid_stop_token_ids_rejected_before_submission(blueprint, path, body):
+    client = _ReplyingClient([])
+    response = (
+        await _build_app(blueprint, client)
+        .test_client()
+        .post(path, json={**body, "stop_token_ids": [-1]})
+    )
+    assert response.status_code == 400
+    assert client.sampling_params == []

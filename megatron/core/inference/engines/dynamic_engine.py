@@ -2712,7 +2712,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         accepted_t != -1
                     ).long()
 
-                if stop_word_hit or eos_mid_block_hit:
+                if (
+                    stop_word_hit or eos_mid_block_hit
+                ) and not request.sampling_params.do_kv_handoff:
                     request.finish_reason = "stop"
 
                 if request_id in finished_request_ids:
@@ -2905,6 +2907,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find which stop word finished IDs are in the current active requests
         result = self.stop_word_finished_request_ids & set(active_request_ids)
+        # Partial prefill cannot finish; preserve its stop until the final chunk.
+        result.discard(self.context.chunked_prefill_request_id)
         # Move to "being finished" set so post_process_requests can skip the extra token
         self.stop_word_being_finished_ids = result
         # Clear the IDs that we're returning (they'll be marked as finished)
@@ -2915,10 +2919,11 @@ class DynamicInferenceEngine(AbstractEngine):
         """Record final termination semantics without re-inferring them in clients."""
         if request.finish_reason is not None or request.sampling_params.do_kv_handoff:
             return
-        is_token_stop = bool(request.generated_tokens) and (
-            request.generated_tokens[-1] in self._terminating_token_ids(request)
+        is_stop = request.request_id in self.stop_word_being_finished_ids or (
+            bool(request.generated_tokens)
+            and request.generated_tokens[-1] in self._terminating_token_ids(request)
         )
-        request.finish_reason = "stop" if is_token_stop else "length"
+        request.finish_reason = "stop" if is_stop else "length"
 
     def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
         """Token ids that end generation for this request.
