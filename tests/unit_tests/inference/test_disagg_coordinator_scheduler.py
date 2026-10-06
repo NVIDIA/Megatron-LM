@@ -124,33 +124,19 @@ def test_available_fraction_uses_binding_request_or_state_capacity():
     assert flow.available_fraction(b"decode", "decode") == 0.25
 
 
-def test_engine_selection_is_role_aware_and_round_robins():
+def test_assignments_are_role_aware_and_reject_removed_engines():
     scheduler = DisaggCoordinatorScheduler()
     scheduler.register_engine("p0", PREFILL, [_meta()])
     scheduler.register_engine("p1", PREFILL, [_meta()])
     scheduler.register_engine("d0", DECODE, [_meta()])
     scheduler.register_engine("d1", DECODE, [_meta()])
 
-    assert [scheduler.select_engine(PREFILL, request_id) for request_id in range(3)] == [
-        "p0",
-        "p1",
-        "p0",
-    ]
-    assert [scheduler.select_engine(DECODE, request_id) for request_id in range(3)] == [
-        "d0",
-        "d1",
-        "d0",
-    ]
-
-
-def test_engine_selection_uses_score_and_ignores_removed_engines():
-    scheduler = DisaggCoordinatorScheduler()
-    scheduler.register_engine("p0", PREFILL, [_meta()])
-    scheduler.register_engine("p1", PREFILL, [_meta()])
-
-    assert scheduler.select_engine(PREFILL, 0, {"p0": (2,), "p1": (1,)}.get) == "p1"
+    scheduler.assign_engine(PREFILL, 0, "p1")
+    scheduler.assign_engine(DECODE, 0, "d0")
+    assert scheduler.assigned_engine(PREFILL, 0) == "p1"
+    assert scheduler.assigned_engine(DECODE, 0) == "d0"
+    with pytest.raises(ValueError, match="not registered for prefill"):
+        scheduler.assign_engine(PREFILL, 1, "d0")
     scheduler.remove_engine("p1")
-    assert scheduler.select_engine(PREFILL, 1) == "p0"
-    scheduler.remove_engine("p0")
-    with pytest.raises(RuntimeError, match="no prefill engines"):
-        scheduler.select_engine(PREFILL, 2)
+    with pytest.raises(ValueError, match="not registered for prefill"):
+        scheduler.assign_engine(PREFILL, 1, "p1")

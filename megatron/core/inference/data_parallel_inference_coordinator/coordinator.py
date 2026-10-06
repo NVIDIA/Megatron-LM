@@ -282,10 +282,21 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the least-loaded data parallel rank.
         """
-        if not self._identities_list:
+        return self._least_loaded_rank(self._identities_list, self._pending_counts)
+
+    @staticmethod
+    def _least_loaded_rank(identities, counts, available_fractions=None):
+        """Prefer free capacity when supplied, then request count and rank order."""
+        if not identities:
             raise RuntimeError("No engines connected")
-        best_idx = int(np.argmin(self._pending_counts))
-        return self._identities_list[best_idx]
+        if available_fractions is None:
+            best_idx = int(np.argmin(counts))
+        else:
+            free = np.fromiter(
+                (available_fractions[identity] for identity in identities), dtype=np.float64
+            )
+            best_idx = int(np.lexsort((np.arange(len(identities)), counts, -free))[0])
+        return identities[best_idx]
 
     def _update_media_affinity(self, media_cache_key: str, identity: bytes) -> None:
         """Record the rank most recently assigned a generated media key."""
@@ -430,7 +441,14 @@ class DataParallelInferenceCoordinator:
             token_tensor, self.block_size_tokens, cache_salt=cache_salt
         )
 
-    def get_best_data_parallel_rank(self, request_hashes, media_cache_key: str | None = None):
+    def get_best_data_parallel_rank(
+        self,
+        request_hashes,
+        media_cache_key: str | None = None,
+        *,
+        candidate_loads: dict[bytes, int] | None = None,
+        available_fractions: dict[bytes, float] | None = None,
+    ):
         """Select the best DP rank based on media affinity, prefix affinity, and load.
 
         Uses ``score = cache_score - alpha * relative_load``, where
@@ -441,10 +459,23 @@ class DataParallelInferenceCoordinator:
         Args:
             request_hashes: List of block hashes for the request.
             media_cache_key: Internally generated content key for request media.
+            candidate_loads: Optional eligible identities and queued + active counts.
+                Affinity and mean load are evaluated only within this pool.
+            available_fractions: Optional free-capacity fractions used by load
+                balancing when the eligible pool has no affinity hits.
 
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
+        if candidate_loads is None:
+            identities, counts = self._identities_list, self._pending_counts
+        else:
+            identities = sorted(candidate_loads, key=self.identity_to_rank_index.__getitem__)
+            counts = np.fromiter(
+                (candidate_loads[identity] for identity in identities), dtype=np.int64
+            )
+        if not identities:
+            raise RuntimeError("No engines connected")
         # Use load-balancing if text or multimodal coordination affinity is deactivated.
         has_media = isinstance(media_cache_key, str) and bool(media_cache_key)
         use_prefix_affinity = (
@@ -459,28 +490,34 @@ class DataParallelInferenceCoordinator:
             and self.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
         if not use_prefix_affinity and not use_media_affinity:
-            return self.get_least_loaded_data_parallel_rank()
+            return self._least_loaded_rank(identities, counts, available_fractions)
 
         # Compute text affinity.
-        n_ranks = len(self._identities_list)
+        n_ranks = len(identities)
         prefix_blocks = np.zeros(n_ranks, dtype=np.float64)
         if use_prefix_affinity:
             prefix_blocks = self._prefix_depth_vector(request_hashes)
+            if candidate_loads is not None:
+                prefix_blocks = prefix_blocks[
+                    [self.identity_to_rank_index[identity] for identity in identities]
+                ]
 
         # Compute multimodal affinity.
         media_hit = np.zeros(n_ranks, dtype=np.float64)
         if use_media_affinity:
             media_identity = self._media_cache_affinity.get(media_cache_key)
-            media_rank_idx = self.identity_to_rank_index.get(media_identity)
-            if (
-                media_rank_idx is not None
-                and self._pending_counts[media_rank_idx] < self.max_requests
-            ):
+            if candidate_loads is None:
+                media_rank_idx = self.identity_to_rank_index.get(media_identity)
+            else:
+                media_rank_idx = (
+                    identities.index(media_identity) if media_identity in identities else None
+                )
+            if media_rank_idx is not None and counts[media_rank_idx] < self.max_requests:
                 media_hit[media_rank_idx] = 1.0
 
         # If there are no hits anywhere, just fall-back to load balancing.
         if not prefix_blocks.any() and not media_hit.any():
-            return self.get_least_loaded_data_parallel_rank()
+            return self._least_loaded_rank(identities, counts, available_fractions)
 
         # Fraction of this request's reusable work that each rank already holds,
         # combining prompt blocks with a weighted media hit. Normalized by the most
@@ -510,13 +547,13 @@ class DataParallelInferenceCoordinator:
         #
         # The mean is floored at 1 so a near-idle fleet does not turn a single
         # in-flight request into a large relative load and thrash on noise.
-        mean_load = float(self._pending_counts.mean()) if n_ranks else 0.0
-        relative_load = (self._pending_counts - mean_load) / max(1.0, mean_load)
+        mean_load = float(counts.mean())
+        relative_load = (counts - mean_load) / max(1.0, mean_load)
         scores = cache_score - self.prefix_caching_routing_alpha * relative_load
 
         # Tiebreak: highest score, then least loaded, then lowest rank index.
-        order = np.lexsort((np.arange(n_ranks), self._pending_counts, -scores))
-        return self._identities_list[int(order[0])]
+        order = np.lexsort((np.arange(n_ranks), counts, -scores))
+        return identities[int(order[0])]
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.

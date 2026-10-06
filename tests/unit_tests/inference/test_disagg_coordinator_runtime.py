@@ -1,17 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import msgpack
-import numpy as np
 import pytest
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.data_parallel_inference_coordinator.coordinator import (
-    DataParallelInferenceCoordinator,
-)
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers
@@ -40,35 +35,17 @@ def _decode_engine_frames(frames):
 
 def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     sent = []
-    coordinator = SimpleNamespace(
-        identities_of_data_parallel_ranks=deque(),
-        request_id_to_client_id={5: b"client", 6: b"client"},
-        request_id_to_client_request_id={5: 50, 6: 60},
-        client_request_to_request_id={(b"client", 50): 5, (b"client", 60): 6},
-        router_socket=SimpleNamespace(
-            send_multipart=lambda message: sent.append((b"client", message))
-        ),
-        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
-        prefix_caching_routing_alpha=0.5,
-        identity_to_rank_index={},
-        hash_updates=[],
+    coordinator = make_coordinator_direct(data_parallel_size=0)
+    coordinator.request_id_to_client_id = {5: b"client", 6: b"client"}
+    coordinator.request_id_to_client_request_id = {5: 50, 6: 60}
+    coordinator.client_request_to_request_id = {(b"client", 50): 5, (b"client", 60): 6}
+    coordinator.router_socket = SimpleNamespace(
+        send_multipart=lambda message: sent.append((b"client", message))
     )
-
-    def register_identity(identity):
-        coordinator.identity_to_rank_index.setdefault(
-            identity, len(coordinator.identity_to_rank_index)
-        )
-
-    coordinator._register_rank_identity = register_identity
-    coordinator._forget_client_request = (
-        DataParallelInferenceCoordinator._forget_client_request.__get__(coordinator)
-    )
+    coordinator.hash_updates = []
     coordinator.compute_request_hashes = Mock(side_effect=AssertionError("frontend must hash"))
     coordinator._update_rank_hashes = lambda identity, hashes: coordinator.hash_updates.append(
         (identity, hashes)
-    )
-    coordinator._prefix_depth_vector = lambda _hashes: np.zeros(
-        len(coordinator.identity_to_rank_index)
     )
     coordinator._send_to_engine = lambda identity, frames, **_kwargs: (
         sent.append((identity, _decode_engine_frames(frames))) or True
@@ -403,26 +380,36 @@ def test_late_source_safety_releases_prefill_after_request_failure():
     )
 
 
-def test_load_balanced_routing_uses_free_capacity_independent_of_prefix_alpha():
-    runtime, sent = _runtime()
-    runtime.register_engine(b"prefill-2", "prefill", "nixl", runtime.engine_metadata[b"prefill"])
-    runtime.coordinator.prefix_caching_coordinator_policy = (
-        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-    )
+@pytest.mark.parametrize("policy", list(PrefixCachingCoordinatorPolicy))
+def test_routing_without_cache_hits_uses_free_capacity_independent_of_prefix_alpha(policy):
+    runtime, sent = _runtime(ssm_capacity=4)
+    metadata = [{**runtime.engine_metadata[b"prefill"][0], "ssm_slot_capacity": 8}]
+    runtime.register_engine(b"prefill-2", "prefill", "nixl", metadata)
+    runtime.coordinator.prefix_caching_coordinator_policy = policy
     runtime.coordinator.prefix_caching_routing_alpha = 1.0
-    assert runtime.scheduler.try_reserve_prefill(b"prefill", 99, 0)
+    # Equal request counts, but the second engine has more free recurrent state.
+    assert runtime.scheduler.try_reserve_prefill(b"prefill", 99, 3)
+    assert runtime.scheduler.try_reserve_prefill(b"prefill-2", 98, 1)
+    # A cache hit outside the eligible role must not disable load balancing.
+    decode_index = runtime.coordinator.identity_to_rank_index[b"decode"]
+    runtime.coordinator._hash_table = {1: {decode_index: 0.0}}
 
     _submit(runtime, 5, [1], {})
 
     assert sent[-1][0] == b"prefill-2"
+    runtime.remove_engine(b"prefill-2")
+    assert runtime._select_engine("prefill", 7, [1]) == b"prefill"
+    runtime.remove_engine(b"prefill")
+    with pytest.raises(RuntimeError, match="no prefill engines"):
+        runtime._select_engine("prefill", 8, [1])
 
 
 def test_prefix_affinity_routes_and_is_computed_once():
     runtime, sent = _runtime()
     runtime.register_engine(b"prefill-2", "prefill", "nixl", runtime.engine_metadata[b"prefill"])
-    real = make_coordinator_direct(data_parallel_size=3)
-    real._hash_table = {1: {2: 0.0}}
-    depth = Mock(wraps=real._prefix_depth_vector)
+    rank_index = runtime.coordinator.identity_to_rank_index[b"prefill-2"]
+    runtime.coordinator._hash_table = {1: {rank_index: 0.0}}
+    depth = Mock(wraps=runtime.coordinator._prefix_depth_vector)
     runtime.coordinator._prefix_depth_vector = depth
     _submit(runtime, 5, [1], {})
     depth.assert_called_once_with([1])
@@ -436,9 +423,8 @@ def test_prefix_alpha_penalizes_role_local_load(role, alpha):
     busy = role.encode()
     idle = busy + b"-2"
     runtime.register_engine(idle, role, "nixl", runtime.engine_metadata[busy])
-    real = make_coordinator_direct(data_parallel_size=3)
-    real._hash_table = {1: {runtime.coordinator.identity_to_rank_index[busy]: 0.0}}
-    runtime.coordinator._prefix_depth_vector = real._prefix_depth_vector
+    rank_index = runtime.coordinator.identity_to_rank_index[busy]
+    runtime.coordinator._hash_table = {1: {rank_index: 0.0}}
     runtime.coordinator.prefix_caching_routing_alpha = alpha
     reserve = (
         runtime.scheduler.try_reserve_prefill
@@ -447,9 +433,14 @@ def test_prefix_alpha_penalizes_role_local_load(role, alpha):
     )
     assert reserve(busy, 99, 0)
 
-    score = runtime._make_routing_score([1], role)
-    selected = runtime.scheduler.select_engine(role, 5, score)
+    shared_selector = Mock(wraps=runtime.coordinator.get_best_data_parallel_rank)
+    runtime.coordinator.get_best_data_parallel_rank = shared_selector
+    selected = runtime._select_engine(role, 5, [1])
     assert selected == (busy if alpha == 0 else idle)
+    assert runtime.scheduler.assigned_engine(role, 5) == selected
+    shared_selector.assert_called_once_with(
+        [1], candidate_loads={busy: 1, idle: 0}, available_fractions={busy: 31 / 32, idle: 1.0}
+    )
 
 
 def test_native_routing_forwards_prompt_frames_and_frontend_hashes(monkeypatch):

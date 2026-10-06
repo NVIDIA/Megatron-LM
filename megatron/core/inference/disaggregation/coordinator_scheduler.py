@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 PREFILL = "prefill"
 DECODE = "decode"
@@ -32,8 +32,6 @@ class QueuedDecodeHandoff:
 @dataclass
 class _RoleState:
     role: str
-    engines: List[Any] = field(default_factory=list)
-    round_robin_offset: int = 0
     assignments: Dict[int, Any] = field(default_factory=dict)  # request_id -> selected engine
     usage: Dict[Any, int] = field(default_factory=dict)
     counts: Dict[Any, int] = field(default_factory=dict)
@@ -44,7 +42,10 @@ class _RoleState:
 
 
 class DisaggCoordinatorScheduler:
-    """Select engines and reserve capacity for prefill and decode work."""
+    """Track assignments, FIFO admission, and capacity for both handoff stages.
+
+    Engine selection belongs to the shared data-parallel coordinator.
+    """
 
     def __init__(self) -> None:
         self._capacity: Dict[Any, int] = {}
@@ -147,7 +148,6 @@ class DisaggCoordinatorScheduler:
             self._capacity[identity] = capacity
         if prefill_slot_cost is not None:
             self._prefill_slot_cost[identity] = prefill_slot_cost
-        state.engines.append(identity)
         state.usage[identity] = 0
         state.counts[identity] = 0
         return capacity
@@ -159,8 +159,6 @@ class DisaggCoordinatorScheduler:
         self._request_capacity.pop(identity, None)
         self._prefill_slot_cost.pop(identity, None)
         for state in (self._prefill, self._decode):
-            if identity in state.engines:
-                state.engines.remove(identity)
             state.usage.pop(identity, None)
             state.counts.pop(identity, None)
             state.queues.pop(identity, None)
@@ -168,27 +166,12 @@ class DisaggCoordinatorScheduler:
                 if reserved_identity == identity:
                     state.reservations.pop(request_id)
 
-    def select_engine(
-        self, role: str, request_id: int, score: Callable[[Any], tuple] | None = None
-    ) -> Any:
-        """Select an engine using load-aware routing and round-robin tie breaking."""
-
+    def assign_engine(self, role: str, request_id: int, identity: Any) -> None:
+        """Record the shared coordinator's selection for one handoff stage."""
         state = self._state(role)
-        if not state.engines:
-            raise RuntimeError(f"no {role} engines registered")
-        offset = state.round_robin_offset
-        state.round_robin_offset += 1
-        if score is None:
-            identity = state.engines[offset % len(state.engines)]
-        else:
-            # Rotate the pool so min() breaks equal-score ties round-robin.
-            candidates = (
-                state.engines[(offset + index) % len(state.engines)]
-                for index in range(len(state.engines))
-            )
-            identity = min(candidates, key=score)
+        if identity not in state.counts:
+            raise ValueError(f"engine {identity!r} is not registered for {role}")
         state.assignments[request_id] = identity
-        return identity
 
     def assigned_engine(self, role: str, request_id: int) -> Any | None:
         """Return the engine assigned to a request, if any."""

@@ -8,7 +8,6 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.disaggregation.coordinator_scheduler import (
     DECODE,
     PREFILL,
@@ -157,19 +156,8 @@ class DisaggCoordinatorRuntime:
         if not self.engine_role:
             self._transfer_signature = None
 
-    def _make_routing_score(self, block_hashes: list[int], role: str):
-        """Build a role-local routing score, computing prefix affinity once.
-
-        Decode affinity avoids allocating and transferring prefix blocks that
-        are already cached on the selected decode engine.
-        """
-
-        policy = self.coordinator.prefix_caching_coordinator_policy
-        if block_hashes and policy != PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
-            matches = self.coordinator._prefix_depth_vector(block_hashes) / len(block_hashes)
-        else:
-            matches = None
-
+    def _select_engine(self, role: str, request_id: int, block_hashes: list[int]):
+        """Use shared affinity/load routing within one role's admission pool."""
         load_for_role = (
             self.scheduler.prefill_load if role == PREFILL else self.scheduler.decode_load
         )
@@ -178,25 +166,19 @@ class DisaggCoordinatorRuntime:
             for identity, engine_role in self.engine_role.items()
             if engine_role == role
         }
-        mean_load = sum(queued + active for queued, active, _ in loads.values()) / max(
-            1, len(loads)
+        if not loads:
+            raise RuntimeError(f"no {role} engines registered")
+        identity = self.coordinator.get_best_data_parallel_rank(
+            block_hashes,
+            candidate_loads={
+                engine: queued + active for engine, (queued, active, _) in loads.items()
+            },
+            available_fractions={
+                engine: self.scheduler.available_fraction(engine, role) for engine in loads
+            },
         )
-
-        def score(identity) -> tuple:
-            load = loads[identity]
-            if matches is None:
-                combined = self.scheduler.available_fraction(identity, role)
-            else:
-                rank_index = self.coordinator.identity_to_rank_index[identity]
-                match = float(matches[rank_index])
-                alpha = self.coordinator.prefix_caching_routing_alpha
-                # Match the coordinator's public alpha contract: zero is pure
-                # affinity, and larger values penalize imbalance within this role.
-                relative_load = (load[0] + load[1] - mean_load) / max(1.0, mean_load)
-                combined = match - alpha * relative_load
-            return (-combined, *load)
-
-        return score
+        self.scheduler.assign_engine(role, request_id, identity)
+        return identity
 
     def _record_hash_assignment(self, identity, block_hashes: list[int]) -> None:
         if block_hashes:
@@ -225,9 +207,7 @@ class DisaggCoordinatorRuntime:
             )
             return
         try:
-            prefill_id = self.scheduler.select_engine(
-                PREFILL, request_id, self._make_routing_score(block_hashes, PREFILL)
-            )
+            prefill_id = self._select_engine(PREFILL, request_id, block_hashes)
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to prefill: {error}", source_safe=True)
             return
@@ -306,9 +286,7 @@ class DisaggCoordinatorRuntime:
             )
             return
         try:
-            decode_id = self.scheduler.select_engine(
-                DECODE, request_id, self._make_routing_score(request_state.block_hashes, DECODE)
-            )
+            decode_id = self._select_engine(DECODE, request_id, request_state.block_hashes)
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to decode: {error}", source_safe=True)
             return
