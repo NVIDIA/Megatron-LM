@@ -2202,9 +2202,15 @@ def _load_base_checkpoint(
     iteration, release = -1, False
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if maybe_msc.os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
+        latest_state_filename = get_checkpoint_train_state_filename(load_dir, prefix="latest")
+        if file_exists(latest_state_filename):
+            latest_ckpt_state = read_train_state(latest_state_filename)
+            iteration = latest_ckpt_state.iteration
+            release = latest_ckpt_state.release
+        else:
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if maybe_msc.os.path.isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
     if getattr(args, 'ckpt_step', None):
