@@ -781,19 +781,6 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
     return _default_config_from_args(InferenceSetupConfig, args)
 
 
-def prepare_router_for_inference(
-    config: Namespace | TransformerConfig, *, global_batch_qb: bool
-) -> None:
-    """Use the saved global-batch QB expert bias for inference.
-
-    Call only during inference preparation, before router construction and weight loading.
-    """
-    if global_batch_qb:
-        config.moe_router_enable_expert_bias = True
-        config.moe_router_load_balancing_type = "none"
-        config.moe_aux_loss_coeff = 0.0
-
-
 def inference_cfg_container_from_args(
     args: Namespace, model_cfg=None, *, build_model_config: bool = True
 ) -> InferenceConfigContainer:
@@ -811,11 +798,6 @@ def inference_cfg_container_from_args(
         build_model_config: If False, retain model_cfg (including None) for legacy callers
             that still construct the model through a model provider.
     """
-    global_batch_qb = getattr(args, "_checkpoint_global_batch_qb", False)
-    prepare_router_for_inference(args, global_batch_qb=global_batch_qb)
-    if model_cfg is not None:
-        prepare_router_for_inference(model_cfg.transformer, global_batch_qb=global_batch_qb)
-
     if model_cfg is None and build_model_config:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
             model_cfg = hybrid_config_from_args(args)

@@ -59,8 +59,8 @@ from megatron.core.utils import (
     resolve_gtp_pad_for_alignment,
     unwrap_model,
 )
-from megatron.training.argument_utils import _default_config_from_args, prepare_router_for_inference
-from megatron.training.config import InferenceConfigContainer, TokenizerConfig
+from megatron.training.argument_utils import _default_config_from_args
+from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils.checkpoint_utils import get_checkpoint_train_state_filename
 
@@ -2571,24 +2571,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
             _set_arg('virtual_pipeline_model_parallel_size', force=True)
             _set_arg('num_layers_per_virtual_pipeline_stage')
             _set_arg('expert_model_parallel_size', force=True)
-
-    # Retain the saved QB settings even when checkpoint args precede inference config creation.
-    args._checkpoint_global_batch_qb = (
-        getattr(checkpoint_args, "moe_router_load_balancing_type", None) == "quantile_balancing"
-        and getattr(checkpoint_args, "moe_router_quantile_balancing_estimation_scope", None)
-        == "global_batch"
-    )
-    try:
-        run_config = get_run_config()
-    except AssertionError:
-        # Checkpoint arguments may be loaded before the run config is registered.
-        run_config = None
-    if isinstance(run_config, InferenceConfigContainer):
-        prepare_router_for_inference(args, global_batch_qb=args._checkpoint_global_batch_qb)
-        if run_config.model is not None:
-            prepare_router_for_inference(
-                run_config.model.transformer, global_batch_qb=args._checkpoint_global_batch_qb
-            )
 
     return args, checkpoint_args
 

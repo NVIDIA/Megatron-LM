@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""MIMO text extraction must not own shared checkpoint router preparation."""
+"""MIMO checkpoints select the text backbone and its checkpoint prefix."""
 
 from argparse import Namespace
 
@@ -12,28 +12,11 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 
 
 @pytest.mark.parametrize("provider", ["nemotron-moe-vlm", "nemotron-moe-mistral-vit"])
-@pytest.mark.parametrize("scope", ["global_batch", "micro_batch", None])
-@pytest.mark.parametrize("routing_type", ["quantile_balancing", "none"])
-@pytest.mark.parametrize("enable_expert_bias", [False, True])
-def test_mimo_text_detection_leaves_router_settings_unchanged(
-    monkeypatch, provider, scope, routing_type, enable_expert_bias
-):
-    """Model detection selects the text backbone without translating router settings."""
-    args = Namespace(
-        model_provider="gpt",
-        moe_router_enable_expert_bias=enable_expert_bias,
-        moe_router_load_balancing_type="none",
-        moe_aux_loss_coeff=0.0,
-    )
-    saved = Namespace(
-        model_provider=provider,
-        mimo_llm_tp=1,
-        moe_router_load_balancing_type=routing_type,
-        moe_router_quantile_balancing_estimation_scope=scope,
-    )
+def test_mimo_text_detection_selects_text_backbone(monkeypatch, provider):
+    """Model detection selects the text backbone without constructing a VLM."""
+    args = Namespace(model_provider="gpt")
+    saved = Namespace(model_provider=provider, mimo_llm_tp=1)
     monkeypatch.setattr(vlm_dynamic_inference, "load_args_from_checkpoint", lambda _: (args, saved))
     assert not vlm_dynamic_inference._detect_vlm_from_checkpoint(args)
     assert args.model_provider == "hybrid"
     assert args.checkpoint_model_prefix == "language_model.module.module."
-    assert args.moe_router_enable_expert_bias == enable_expert_bias
-    assert args.moe_router_load_balancing_type == "none"
