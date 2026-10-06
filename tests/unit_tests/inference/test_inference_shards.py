@@ -2,6 +2,7 @@
 
 """Shard spec parsing/validation (CPU; no torch.distributed)."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -40,6 +41,32 @@ def test_shard_builder_keeps_replica_process_group(monkeypatch):
     assert shards[1].pg_collection is None
     assert shards[1].process_group is None
     assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 1], [2, 3]]
+
+
+def test_checkpoint_prefix_warning_uses_replica_group(monkeypatch, caplog):
+    from megatron.inference import utils
+
+    group = Mock(name="checkpoint_group")
+    args = SimpleNamespace(ckpt_step=1, load="checkpoint", checkpoint_model_prefix="model.")
+    world_size = Mock(return_value=1)
+    rank = Mock(return_value=0)
+    gather = Mock(side_effect=lambda output, keys, **kwargs: output.__setitem__(0, keys))
+    monkeypatch.setattr(utils.torch.distributed, "get_world_size", world_size)
+    monkeypatch.setattr(utils.torch.distributed, "get_rank", rank)
+    monkeypatch.setattr(utils.torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(utils, "get_loaded_iteration", lambda: 1)
+    monkeypatch.setattr(
+        utils.dist_checkpointing,
+        "load_tensors_metadata",
+        lambda path: {"model.weight": None, "model.unused": None},
+    )
+
+    utils._warn_on_unloaded_checkpoint_tensors(args, {"model.weight"}, group)
+
+    world_size.assert_called_once_with(group)
+    rank.assert_called_once_with(group)
+    gather.assert_called_once_with([["model.weight"]], ["model.weight"], group=group)
+    assert "model.unused" in caplog.text
 
 
 def test_shard_spec_objects_match_string_parsing():

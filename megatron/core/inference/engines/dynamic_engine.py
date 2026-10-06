@@ -1649,13 +1649,16 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         # A suspend/resume cycle is how a weight refit is staged, so treat resume
-        # as a new weight generation and re-salt the prefix cache. Bumped while
-        # still suspended, before anything can be admitted, so there is no window
-        # in which a post-refit request is admitted under the old salt. Requests
-        # re-added below keep the salt they were constructed with, so a request
-        # that spans the refit republishes under its original generation and is
-        # unmatchable by new arrivals.
+        # as a new weight generation and re-salt the prefix cache. Requests can
+        # be constructed before this bump -- those still waiting at suspend, and
+        # those submitted while paused or suspended, since the coordinator loop
+        # keeps admitting SUBMITs -- so re-salt every request that holds no KV
+        # yet: all of its blocks will be computed by the new weights. A request
+        # already part-way through prefill or decode keeps its original salt, so
+        # it republishes under its original generation and is unmatchable by
+        # new arrivals.
         self._weight_epoch += 1
+        self._resalt_unprefilled_requests()
 
         InferenceMode.set_active()
 
@@ -1731,6 +1734,31 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
+
+    def _resalt_unprefilled_requests(self) -> None:
+        """Re-salt requests that hold no KV yet under the current weight epoch.
+
+        Such a request has its whole prompt computed by the weights that serve
+        it after resume, so it must hash like a request admitted now. A request
+        with any prefill or decode progress keeps its salt: its leading blocks
+        were computed by the previous weights.
+        """
+        for entry in self.requests.values():
+            request = entry.record[-1]
+            if (
+                request.finished_chunk_token_count > 0
+                or request.generated_tokens
+                or request.num_cached_tokens > 0
+                or request.num_matched_prefix_blocks > 0
+                or request.request_id == self.context.chunked_prefill_request_id
+            ):
+                continue
+            # Same scoping as add_request: VLM requests are image-bearing, so
+            # they are salted by their media identity as well.
+            media_cache_key = (
+                request.media_cache_key if isinstance(request, DynamicVLMInferenceRequest) else None
+            )
+            request.resalt_block_hashes(_weight_scoped_salt(self._weight_epoch, media_cache_key))
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):

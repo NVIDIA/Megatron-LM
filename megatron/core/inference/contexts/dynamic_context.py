@@ -3261,9 +3261,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         else:
             prefix_skip_tokens = 0
 
-        # Hybrid models with Mamba caching: skip based on Mamba match count.
-        # Only applies to the first chunk (finished == 0); continuation chunks
-        # already had Mamba state restored during the first chunk.
+        # Hybrid models can skip tokens only when the first chunk restores a
+        # matching Mamba state. Continuation chunks carry live state from the
+        # previous chunk and must compute every subsequent recurrent transition,
+        # even when their attention KV blocks are already cached.
         if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = self._find_mamba_match_count(
                 req=req,
@@ -3287,7 +3288,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model and finished == 0:
+        elif self.is_hybrid_model:
             if record_mamba_match:
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0

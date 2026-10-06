@@ -70,6 +70,9 @@ class ProfilingConfig:
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
 
+    run_workload_inspector_server: bool = False
+    """Run the optional workload-inspector web server for on-demand profiling."""
+
     def validate(self) -> None:
         """Validate profiler settings before training runtime initialization."""
         # Match torch.profiler.schedule's active-window requirement. Inactive

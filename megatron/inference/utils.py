@@ -7,6 +7,10 @@ from typing import Literal, Optional
 
 import torch
 
+from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.quantization.utils import (
@@ -20,9 +24,15 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import get_tokenizer, get_wandb_writer
+from megatron.training import get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.checkpointing import load_checkpoint
+from megatron.training.checkpointing import (
+    get_checkpoint_name,
+    get_checkpoint_tracker_filename,
+    get_loaded_iteration,
+    load_checkpoint,
+    read_metadata,
+)
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
 try:
@@ -70,6 +80,67 @@ def get_model_builder(
     raise ValueError(f"Invalid model provider {provider}")
 
 
+def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
+    """Map model sharded keys onto a checkpoint that nests the model under a prefix.
+
+    Records the resulting keys in `requested_keys` so unloaded checkpoint tensors can be
+    reported after the load.
+    """
+    prefix = getattr(args, 'checkpoint_model_prefix', '')
+    if not prefix:
+        return None
+
+    def modifier(sharded_state_dict):
+        apply_prefix_mapping(sharded_state_dict, {'': prefix})
+        requested_keys.update(
+            value.key
+            for value in nested_values(sharded_state_dict)
+            if isinstance(value, (ShardedTensor, ShardedTensorFactory))
+        )
+
+    return modifier
+
+
+def _warn_on_unloaded_checkpoint_tensors(
+    args: Namespace,
+    requested_keys: set,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
+    """Warn about checkpoint tensors under the model prefix that no rank loaded.
+
+    Loading one model out of a larger checkpoint cannot use strict key checking (the other
+    submodules' tensors are always unused), so a module this build omits, e.g. because of a
+    config default that differs from the one the checkpoint was trained with, would otherwise
+    be dropped silently.
+    """
+    gathered = [None] * torch.distributed.get_world_size(checkpoint_group)
+    torch.distributed.all_gather_object(gathered, sorted(requested_keys), group=checkpoint_group)
+    if args.ckpt_step is not None:
+        release = False
+    else:
+        _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+    if torch.distributed.get_rank(checkpoint_group) != 0:
+        return
+
+    requested = set().union(*gathered)
+    checkpoint_dir = get_checkpoint_name(
+        args.load, get_loaded_iteration(), release, return_base_dir=True
+    )
+    unloaded = sorted(
+        key
+        for key in dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+        if key.startswith(args.checkpoint_model_prefix)
+        # Factories (e.g. fused in_proj) expand into sub-keys of the requested key.
+        and key not in requested
+        and not any(key.startswith(f"{requested_key}.") for requested_key in requested)
+    )
+    if unloaded:
+        logger.warning(
+            f"{len(unloaded)} checkpoint tensors under '{args.checkpoint_model_prefix}' were not "
+            f"loaded; check that the model config matches the checkpoint: {unloaded[:20]}"
+        )
+
+
 def get_model_for_inference(
     pg_collection: Optional[ProcessGroupCollection] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -99,12 +170,11 @@ def get_model_for_inference(
         builder = get_model_builder(args)
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False
-        )
+        model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
     # Load checkpoint.
     assert args.load is not None
+    requested_keys = set()
     args.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
@@ -117,7 +187,10 @@ def get_model_for_inference(
         dp_group=pg_collection.dp if pg_collection is not None else None,
         expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
         checkpoint_group=checkpoint_group,
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
     )
+    if requested_keys:
+        _warn_on_unloaded_checkpoint_tensors(args, requested_keys, checkpoint_group)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -332,7 +405,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of decode steps to trace (inference). Default is unlimited. "
-             "Training uses --moe-routing-trace-max-training-iters instead.",
+        "Training uses --moe-routing-trace-max-training-iters instead.",
     )
 
     return parser
@@ -375,8 +448,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 
 def get_dynamic_inference_engine(
-    model: MegatronModule | None = None,
-    engine_class: type[DynamicInferenceEngine] | None = None,
+    model: MegatronModule | None = None, engine_class: type[DynamicInferenceEngine] | None = None
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 

@@ -120,6 +120,7 @@ from megatron.rl.server.inference.inference_interface_server import InferenceInt
 from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
 from megatron.training.global_vars import (
     get_args,
+    get_run_config,
     get_tensorboard_writer,
     get_tokenizer,
     get_wandb_writer,
@@ -144,7 +145,7 @@ def inference_model_alloc_context(args):
     """Return the allocation context for a separate RL inference model."""
     uvm_level = args.rl_inference_model_unified_memory_level
     if (
-        args.rl_offload_inference_model_weights_when_idle
+        args.rl_offload_inference_model_weights
         and uvm_level == 0
         and HAVE_TORCH_MEMORY_SAVER
     ):
@@ -222,7 +223,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     with UVM or torch_memory_saver when enabled.
     """
     args = get_args()
-    if not args.rl_offload_inference_model_weights_when_idle:
+    if not args.rl_offload_inference_model_weights:
         return
 
     # Check for torch_memory_saver path (when offloading is enabled but UVM is not)
@@ -456,6 +457,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     Also logs metrics to wandb and stores them on RLRuntimeState for
     downstream consumers (e.g. RLProfiler).
     """
+    cfg = get_run_config()
     log_string = ''
     tokens_per_sec = None
     tokens_per_sec_per_gpu = None
@@ -536,7 +538,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
-    elif args.log_throughput:
+    elif cfg.logger.log_throughput:
         log_string += f' avg_seq_len: {args.seq_length} |'
 
     return log_string

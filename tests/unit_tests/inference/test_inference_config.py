@@ -392,9 +392,11 @@ def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
+    layers = [SimpleNamespace(mixer=mixer) for mixer in mixers]
     decoder = SimpleNamespace(
         layer_type_list=[Symbols.MAMBA] * len(mixers),
-        layers=[SimpleNamespace(mixer=mixer) for mixer in mixers],
+        layers=layers,
+        physical_layers=lambda: tuple(layers),
         mamba_state_shapes_per_request=lambda: ((16, 4), (2, 8, 16)),
     )
     return SimpleNamespace(

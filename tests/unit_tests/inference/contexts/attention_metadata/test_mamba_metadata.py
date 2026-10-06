@@ -697,3 +697,66 @@ class TestGDPIntermediateChunkIndices:
         )
         assert metadata.gdp_intermediate_chunk_indices is None
         assert metadata.gdp_chunk_offsets is None
+
+
+class TestMambaIntermediateChunkLayout:
+    @pytest.mark.parametrize(
+        "cu_seqlens,last_chunks,real_count,padded_count,expected_index",
+        [
+            # A two-token continuation straddles an original SSD boundary.
+            ([0, 2, 515], [1, 6], 2, 2, 5),
+            # Native aligned chunking retains its existing index.
+            ([0, 2, 515], [0, 5], 2, 2, 4),
+            # An empty sequence still occupies one zero-length chunk.
+            ([0, 0, 513], [0, 5], 2, 2, 4),
+            # No preceding request: the chunk range starts at zero.
+            ([0, 513], [4], 1, 1, 3),
+            # Padding adds empty chunks but must not shift real requests.
+            ([0, 2, 515, 515, 515], [1, 6, 7, 8], 2, 4, 5),
+        ],
+        ids=["partial-first", "aligned", "empty-first", "single", "padded"],
+    )
+    def test_snapshot_uses_actual_chunk_layout(
+        self, cu_seqlens, last_chunks, real_count, padded_count, expected_index
+    ):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=1024, max_intermediate_count=12, d_conv=4
+        )
+        # Supply the descriptors produced by the prefill chunk builder. The
+        # two-token partial-first case has two chunks, although ceil(2/128)=1.
+        metadata.last_chunk_indices = torch.tensor(
+            last_chunks, dtype=torch.int32, device=metadata.device
+        )
+        cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=metadata.device)
+        offsets = torch.zeros((real_count, 3), dtype=torch.int32)
+        counts = torch.zeros(real_count, dtype=torch.int32)
+        offsets[-1, 0] = 512
+        counts[-1] = 1
+
+        metadata._update_intermediate_metadata(
+            offsets, counts, real_count, padded_count, cu_seqlens_gpu=cu
+        )
+
+        assert metadata.intermediate_count == 1
+        assert metadata.intermediate_chunk_indices[0].item() == expected_index
+        assert metadata.intermediate_abs_positions[0].item() == cu_seqlens[real_count - 1] + 512
+        extent = padded_count * 3
+        assert metadata.intermediate_chunk_indices.numel() == extent
+        assert torch.all(metadata.intermediate_chunk_indices[1:] == 0)
+        assert torch.all(metadata.intermediate_abs_positions[1:] == 4)
+        chunk_ptr = metadata.intermediate_chunk_indices.data_ptr()
+        count_ptr = metadata.intermediate_real_count.data_ptr()
+
+        # The graph-facing scratch extent and addresses stay fixed when the
+        # next step has no snapshots; stale valid indices must be cleared.
+        counts.zero_()
+        metadata._update_intermediate_metadata(
+            offsets, counts, real_count, padded_count, cu_seqlens_gpu=cu
+        )
+        assert metadata.intermediate_count == 0
+        assert metadata.intermediate_real_count.item() == 0
+        assert metadata.intermediate_chunk_indices.numel() == extent
+        assert metadata.intermediate_chunk_indices.data_ptr() == chunk_ptr
+        assert metadata.intermediate_real_count.data_ptr() == count_ptr
+        assert torch.all(metadata.intermediate_chunk_indices == 0)
+        assert torch.all(metadata.intermediate_abs_positions == 4)
