@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal, Sequence
 
 import torch.distributed as dist
 
@@ -17,6 +18,16 @@ from megatron.core.utils import get_pg_rank
 
 PREFILL = "prefill"
 DECODE = "decode"
+
+
+@dataclass(frozen=True)
+class NativeDisaggregationConfig:
+    """One engine's role and connection to the native coordinator."""
+
+    role: Literal["prefill", "decode"]
+    identity: str
+    spawn_coordinator: bool
+    coordinator_group: dist.ProcessGroup
 
 
 def validate_disaggregation_shards(

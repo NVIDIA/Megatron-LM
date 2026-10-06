@@ -4,6 +4,7 @@
 
 import msgpack
 
+from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
@@ -36,12 +37,12 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
 
         if role not in ("prefill", "decode"):
             raise ValueError(f"invalid disaggregation role {role!r}")
-        self._disagg_config = {
-            "role": role,
-            "identity": identity,
-            "spawn_coordinator": spawn_coordinator,
-            "coordinator_group": coordinator_group,
-        }
+        self._disagg_config = NativeDisaggregationConfig(
+            role=role,
+            identity=identity,
+            spawn_coordinator=spawn_coordinator,
+            coordinator_group=coordinator_group,
+        )
         self.setup_kv_transfer(role)
         self._instance_transfer_meta = self._build_instance_transfer_meta()
 

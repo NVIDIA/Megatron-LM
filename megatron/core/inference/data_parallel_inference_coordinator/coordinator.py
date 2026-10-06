@@ -312,6 +312,14 @@ class DataParallelInferenceCoordinator:
             len(self._identities_list),
         )
 
+    def _forget_client_request(self, request_id):
+        """Remove both directions of client routing and return the former client IDs."""
+        client_identity = self.request_id_to_client_id.pop(request_id, None)
+        client_request_id = self.request_id_to_client_request_id.pop(request_id, None)
+        if client_identity is not None and client_request_id is not None:
+            self.client_request_to_request_id.pop((client_identity, client_request_id), None)
+        return client_identity, client_request_id
+
     def _remove_engine(self, identity):
         """Remove a disconnected engine from all routing bookkeeping.
         Called both during shutdown and when an engine becomes unreachable mid-operation

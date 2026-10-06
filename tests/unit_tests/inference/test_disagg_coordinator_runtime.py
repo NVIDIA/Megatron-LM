@@ -7,6 +7,9 @@ import msgpack
 import pytest
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.data_parallel_inference_coordinator.coordinator import (
+    DataParallelInferenceCoordinator,
+)
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers
 
@@ -53,6 +56,9 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
         )
 
     coordinator._register_rank_identity = register_identity
+    coordinator._forget_client_request = (
+        DataParallelInferenceCoordinator._forget_client_request.__get__(coordinator)
+    )
     coordinator.compute_request_hashes = lambda prompt: list(prompt)
     coordinator._update_rank_hashes = lambda identity, hashes: coordinator.hash_updates.append(
         (identity, hashes)

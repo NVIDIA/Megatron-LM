@@ -38,6 +38,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -596,7 +597,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
-    def _get_disaggregation_config(self):
+    def _get_disaggregation_config(self) -> NativeDisaggregationConfig | None:
         """Return native disaggregation setup, if configured."""
 
         return None
@@ -1309,7 +1310,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Spawn a DP coordinator process and get the connection info.
         if disagg_config is not None:
-            spawn_coordinator = disagg_config["spawn_coordinator"] and self.is_mp_coordinator
+            spawn_coordinator = disagg_config.spawn_coordinator and self.is_mp_coordinator
         else:
             spawn_coordinator = launch_inference_coordinator and self.is_dp_coordinator
         if spawn_coordinator:
@@ -1372,7 +1373,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # address across the world before each shard broadcasts it locally.
             bcast = [dp_addr]
             torch.distributed.broadcast_object_list(
-                bcast, src=0, group=disagg_config["coordinator_group"]
+                bcast, src=0, group=disagg_config.coordinator_group
             )
             [dp_addr] = bcast
 
@@ -1392,7 +1393,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = disagg_config["identity"] if disagg_config is not None else f'mp-coord-{dp_rank}'
+        identity = disagg_config.identity if disagg_config is not None else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -1406,7 +1407,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     msgpack.packb(
                         [
                             Headers.REGISTER_ROLE.value,
-                            disagg_config["role"],
+                            disagg_config.role,
                             self.context.config.kv_transport_backend,
                             self._instance_transfer_meta,
                         ],

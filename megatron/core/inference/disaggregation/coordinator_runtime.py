@@ -462,12 +462,7 @@ class DisaggCoordinatorRuntime:
             self.terminating_request_ids.discard(request_id)
             self._release_prefill(request_id)
             self.scheduler.forget_request(request_id)
-            coordinator.request_id_to_client_id.pop(request_id, None)
-            client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
-            if client_identity is not None and client_request_id is not None:
-                coordinator.client_request_to_request_id.pop(
-                    (client_identity, client_request_id), None
-                )
+            coordinator._forget_client_request(request_id)
         else:
             self.terminating_request_ids.add(request_id)
 
@@ -513,10 +508,8 @@ class DisaggCoordinatorRuntime:
         self.requests.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
         self.terminating_request_ids.discard(request_id)
-        coordinator.request_id_to_client_id.pop(request_id, None)
-        coordinator.request_id_to_client_request_id.pop(request_id, None)
+        coordinator._forget_client_request(request_id)
         if client_identity is not None and client_request_id is not None:
-            coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
             coordinator.router_socket.send_multipart(
                 [
                     client_identity,

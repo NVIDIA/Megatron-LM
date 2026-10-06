@@ -472,11 +472,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
                 sender_identity,
             )
             continue
-        client_identity = coordinator.request_id_to_client_id[fid]
-        client_request_id = coordinator.request_id_to_client_request_id[fid]
-        del coordinator.request_id_to_client_id[fid]
-        del coordinator.request_id_to_client_request_id[fid]
-        del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
+        client_identity, client_request_id = coordinator._forget_client_request(fid)
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
             idx = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -543,9 +539,7 @@ def handle_request_error(coordinator, sender_identity, metadata, bodies):
         ]
     )
     if source_safe:
-        coordinator.request_id_to_client_id.pop(request_id, None)
-        coordinator.request_id_to_client_request_id.pop(request_id, None)
-        coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+        coordinator._forget_client_request(request_id)
         assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
         if assigned_rank is not None:
             index = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -563,8 +557,7 @@ def handle_request_aborted(coordinator, sender_identity, metadata, bodies):
         return
     if not source_safe:
         return
-    client_identity = coordinator.request_id_to_client_id.pop(request_id, None)
-    client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
+    client_identity, client_request_id = coordinator._forget_client_request(request_id)
     assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
     if assigned_rank is not None:
         index = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -572,7 +565,6 @@ def handle_request_aborted(coordinator, sender_identity, metadata, bodies):
             coordinator._pending_counts[index] -= 1
     if client_identity is None or client_request_id is None:
         return
-    coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
     coordinator.router_socket.send_multipart(
         [
             client_identity,

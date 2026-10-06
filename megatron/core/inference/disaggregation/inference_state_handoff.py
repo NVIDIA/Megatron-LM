@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
@@ -73,7 +74,7 @@ class InferenceStateHandoffMixin:
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
 
-        self._disagg_config = None
+        self._disagg_config: NativeDisaggregationConfig | None = None
         self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
         self._pinned_handoff_ssm_slots: Dict[int, int] = {}  # Request ID -> detached live slot.
         self._kv_transfer_agent = None
@@ -93,7 +94,7 @@ class InferenceStateHandoffMixin:
         self._deferred_handoff_releases: set[int] = set()
         self._kv_transfer_role: str | None = None
 
-    def _get_disaggregation_config(self):
+    def _get_disaggregation_config(self) -> NativeDisaggregationConfig | None:
         return self._disagg_config
 
     def _is_disaggregated_role(self, role: str) -> bool:
