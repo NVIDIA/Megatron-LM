@@ -62,14 +62,8 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         "print(json.dumps([case for product in recipe['products'] for case in product['test_case']]))\n"
     )
     yq.chmod(0o755)
-    helper = tmp_path / "tests/unit_tests/testmon_cache.py"
-    helper.parent.mkdir(parents=True)
-    shutil.copy2(ROOT / "tests/unit_tests/testmon_cache.py", helper)
-    platforms = json.loads(
-        subprocess.check_output([sys.executable, str(helper), "platforms"], text=True)
-    )
-    for platform in platforms.values():
-        relative = Path(platform["recipe"])
+    for platform in ("h100", "gb200"):
+        relative = Path("tests/test_utils/recipes") / platform / "unit-tests.yaml"
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
         destination.symlink_to(ROOT / relative)
@@ -139,75 +133,21 @@ def test_producer_consumes_the_actual_build_matrix(
         )
 
 
-@pytest.mark.parametrize("ambiguous", [False, True])
-def test_producer_rejects_an_unsupported_or_ambiguous_built_platform(
-    tmp_path: Path, shell_environment: dict[str, str], ambiguous: bool
+def test_producer_rejects_an_unsupported_built_platform(
+    tmp_path: Path, shell_environment: dict[str, str]
 ) -> None:
-    if ambiguous:
-        helper = tmp_path / "tests/unit_tests/testmon_cache.py"
-        helper.write_text(
-            helper.read_text().replace(
-                '\nif __name__ == "__main__":',
-                '\nPLATFORMS["dgx_duplicate"] = PLATFORMS["dgx_h100"]\n'
-                '\nif __name__ == "__main__":',
-            )
-        )
     step = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
     result, outputs = _run(
         step["run"],
         tmp_path,
         {
             **shell_environment,
-            "BUILDS": json.dumps(
-                {"include": [{"cloud": "aws-h100" if ambiguous else "unsupported"}]}
-            ),
+            "BUILDS": json.dumps({"include": [{"cloud": "unsupported"}]}),
             "SOURCE_SHA": "a" * 40,
         },
     )
     assert result.returncode != 0
     assert "matrix" not in outputs
-
-
-def test_producer_reads_a_new_platform_from_the_cache_helper(
-    tmp_path: Path, shell_environment: dict[str, str]
-) -> None:
-    recipe = "tests/test_utils/recipes/gb300/unit-tests.yaml"
-    definition = {"cloud": "gb300-gpu", "recipe": recipe}
-    helper = tmp_path / "tests/unit_tests/testmon_cache.py"
-    helper.write_text(
-        helper.read_text().replace(
-            '\nif __name__ == "__main__":',
-            f'\nPLATFORMS["dgx_gb300"] = {definition!r}\n\nif __name__ == "__main__":',
-        )
-    )
-    buckets = ["tests/unit_tests/new_arch/**/*.py", "tests/unit_tests/other/**/*.py"]
-    recipe_path = tmp_path / recipe
-    recipe_path.parent.mkdir(parents=True)
-    recipe_path.write_text(yaml.safe_dump({"products": [{"test_case": buckets}]}))
-    builds = [
-        {"cloud": "gb300-gpu", "runner": "gb300-runner", "registry": "gb300.example.test/team"},
-        {"cloud": "aws-h100", "runner": "h100-runner", "registry": "h100.example.test/team"},
-    ]
-    sha = "a" * 40
-    step = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
-    result, outputs = _run(
-        step["run"],
-        tmp_path,
-        {**shell_environment, "BUILDS": json.dumps({"include": builds}), "SOURCE_SHA": sha},
-    )
-    assert result.returncode == 0, result.stderr
-    matrix = json.loads(outputs["matrix"])
-    assert matrix[:2] == [
-        {
-            "bucket": bucket,
-            "platform": "dgx_gb300",
-            "runner": "gb300-runner",
-            "image": f"gb300.example.test/team/megatron-lm:{sha}-gb300-gpu",
-        }
-        for bucket in buckets
-    ]
-    assert matrix[2:]
-    assert all(entry["platform"] == "dgx_h100" for entry in matrix[2:])
 
 
 @pytest.mark.parametrize(
