@@ -125,13 +125,15 @@ python pretrain_gpt.py                \
 
 **Notes:** Only the `torch_dist` checkpoint format is currently supported when saving to or loading from MSC URLs.
 
-## Disable MSC
+## Enable MSC
 
-By default, MSC integration is automatically enabled when the `multi-storage-client` library is installed. MSC is also used for regular filesystem paths (like `/filesystem_mountpoint/path` in `--data-path`, `--save`, or `--load`) even when not using explicit MSC URLs. MSC functions as a very thin abstraction layer with negligible performance impact when used with regular paths, so there's typically no need to disable it. If you need to disable MSC, you can do so using the `--disable-msc` flag:
+MSC integration is opt-in: even when the `multi-storage-client` library is installed, MSC is **disabled by default**. To opt in, pass the `--enable-msc` flag. Once enabled, MSC is also used for regular filesystem paths (like `/filesystem_mountpoint/path` in `--data-path`, `--save`, or `--load`), not just explicit `msc://` URLs.
 
 ```bash
-python pretrain_gpt.py --disable-msc
+python pretrain_gpt.py --enable-msc
 ```
+
+> **Note:** When MSC is enabled, the dist-checkpointing loader uses `msc.torch.MultiStorageFileSystemReader` instead of `CachedMetadataFileSystemReader`. This means `ckpt_assume_constant_structure=True` (and any other path that requests `cache_metadata=True`) will be silently overridden — metadata is re-read on every load. A warning is emitted in this case.
 
 ## Performance Considerations
 

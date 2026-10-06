@@ -1,20 +1,120 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
 import torch
 
-from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.utils import get_model_config
+from megatron.core.utils import accepts_parameter, get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+def detokenize_tokens(
+    tokenizer: Any, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+) -> str:
+    """Convert token IDs to text using the inference detokenization policy.
+
+    Args:
+        tokenizer: Tokenizer that supplies ``detokenize`` and optionally ``eod``.
+        tokens: Token IDs to detokenize.
+        remove_EOD: Remove trailing EOD tokens before detokenization.
+        skip_special_tokens: Pass special-token removal through when supported.
+
+    Returns:
+        The decoded text.
+    """
+    if not tokens:
+        return ""
+
+    if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+        while tokens and tokens[-1] == tokenizer.eod:
+            tokens = tokens[:-1]
+    if not tokens:
+        return ""
+
+    if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+        return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+    return tokenizer.detokenize(tokens)
+
+
+def model_eos_token_ids(tokenizer: Any) -> frozenset:
+    """Return the model-level EOS token IDs.
+
+    Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+    `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+    read off the tokenizer if present (HF tokenizers attach it; other tokenizers
+    won't).
+    """
+    ids = set()
+    eod = getattr(tokenizer, "eod", None)
+    if eod is not None:
+        ids.add(int(eod))
+    gen_cfg = getattr(tokenizer, "generation_config", None)
+    if isinstance(gen_cfg, dict):
+        eos = gen_cfg.get("eos_token_id")
+        if isinstance(eos, int) and not isinstance(eos, bool):
+            ids.add(eos)
+        elif isinstance(eos, (list, tuple)):
+            ids.update(int(e) for e in eos if isinstance(e, int) and not isinstance(e, bool))
+    return frozenset(ids)
+
+
+class InferenceMode:
+    """Process-wide flag indicating whether an inference engine is currently using the model.
+
+    Modules that need to distinguish between inference and non-inference (e.g. training,
+    RL logprobs) paths should read `InferenceMode.is_active()` rather than relying on
+    `self.training`, `torch.is_grad_enabled()`, or `inference_context is not None`.
+    """
+
+    _is_active: bool = False
+    _use_bounded_mxfp8_rows: bool = False
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Return True while an inference engine is currently using the model."""
+        return cls._is_active
+
+    @classmethod
+    def set_active(cls) -> None:
+        """Mark the inference engine active and reset its phase to the safe default."""
+        cls._is_active = True
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    def set_bounded_mxfp8_rows(cls, enabled: bool) -> None:
+        """Select bounded FlashInfer MXFP8 rows for the current inference step."""
+        cls._use_bounded_mxfp8_rows = enabled
+
+    @classmethod
+    def use_bounded_mxfp8_rows(cls) -> bool:
+        """Return whether the current step may use the configured bounded row prefix."""
+        return cls._use_bounded_mxfp8_rows
+
+    @classmethod
+    def unset_active(cls) -> None:
+        """Mark the inference engine as inactive. Idempotent."""
+        cls._is_active = False
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def active(cls):
+        """Context manager: set the flag for the duration of the `with` block."""
+        cls.set_active()
+        try:
+            yield
+        finally:
+            cls.unset_active()
 
 
 def device_memory_summary() -> str:
@@ -80,6 +180,8 @@ def _init_moe_expert_cache(model):
     """
     Initialize the cache of MoE layers once
     """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
     global moe_layer_cache
     if moe_layer_cache is not None:
         return  # already initialized

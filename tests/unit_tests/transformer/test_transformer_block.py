@@ -13,14 +13,28 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+class _ResidualObservationLayer(torch.nn.Module, BaseTransformerLayer):
+    """Minimal layer for testing TransformerBlock residual observation plumbing."""
+
+    def __init__(self, config, layer_number, **kwargs):
+        super().__init__()
+        self.config = config
+        self.layer_number = layer_number
+
+    def forward(self, hidden_states, **kwargs):
+        return hidden_states + 1, None
 
 
 class TestParallelTransformerBlock:
@@ -77,13 +91,101 @@ class TestParallelTransformerBlock:
     def test_gpu_forward_full_checkpoint_fp8(self):
         self._run_full_checkpoint_test(fp8="e4m3")
 
+    def test_gpu_forward_full_checkpoint_dual_rope(self):
+        kv_channels = self.transformer_config.kv_channels
+        sequence_length = 32
+        rotary_pos_emb = (
+            torch.ones(sequence_length, 1, 1, kv_channels, device='cuda'),
+            torch.ones(sequence_length, 1, 1, kv_channels, device='cuda'),
+        )
+
+        def modify_arg_and_forward(
+            target_func, args, kwargs, target_name, target_index, arg_modifier_func
+        ):
+            args_list = list(args)
+
+            if target_name in kwargs:
+                kwargs[target_name] = arg_modifier_func(kwargs[target_name])
+            elif len(args_list) > target_index:
+                args_list[target_index] = arg_modifier_func(args_list[target_index])
+            else:
+                raise RuntimeError(
+                    f"Argument '{target_name}' at index {target_index} was not provided in args or kwargs."
+                )
+
+            return target_func(*args_list, **kwargs)
+
+        class MockSelfAttentionWithDualRope(SelfAttention):
+            def forward(self, *args, **kwargs):
+                """Switch to either local or global RoPE embedding before forward."""
+
+                def arg_modifier_func(rotary_pos_emb):
+                    assert isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2
+
+                    if self.dual_rope_kind == "local_and_global":
+                        assert rotary_pos_emb[0] is not None
+                        assert rotary_pos_emb[1] is not None
+
+                        if self.layer_number % 2 == 0:
+                            final_rotary_pos_emb = rotary_pos_emb[0]
+                        else:
+                            final_rotary_pos_emb = rotary_pos_emb[1]
+                    elif self.dual_rope_kind == "local_only":
+                        assert rotary_pos_emb[0] is not None
+                        assert rotary_pos_emb[1] is None
+
+                        final_rotary_pos_emb = rotary_pos_emb[0]
+                    elif self.dual_rope_kind == "global_only":
+                        assert rotary_pos_emb[0] is None
+                        assert rotary_pos_emb[1] is not None
+
+                        final_rotary_pos_emb = rotary_pos_emb[1]
+                    else:
+                        assert False, f"Unknown dual_rope_kind: {self.dual_rope_kind}"
+
+                    return final_rotary_pos_emb
+
+                return modify_arg_and_forward(
+                    super().forward, args, kwargs, "rotary_pos_emb", 5, arg_modifier_func
+                )
+
+        # Test non-Dual RoPE
+        self._run_full_checkpoint_test(
+            fp8=None, seq_len=sequence_length, rotary_pos_emb=rotary_pos_emb[0]
+        )
+
+        # Test Dual RoPE
+        self._run_full_checkpoint_test(
+            fp8=None,
+            seq_len=sequence_length,
+            attn_class=MockSelfAttentionWithDualRope,
+            rotary_pos_emb=rotary_pos_emb,
+            dual_rope_kind="local_and_global",
+        )
+        self._run_full_checkpoint_test(
+            fp8=None,
+            seq_len=sequence_length,
+            attn_class=MockSelfAttentionWithDualRope,
+            rotary_pos_emb=(rotary_pos_emb[0], None),
+            dual_rope_kind="local_only",
+        )
+        self._run_full_checkpoint_test(
+            fp8=None,
+            seq_len=sequence_length,
+            attn_class=MockSelfAttentionWithDualRope,
+            rotary_pos_emb=(None, rotary_pos_emb[1]),
+            dual_rope_kind="global_only",
+        )
+
     def test_gpu_forward_selective_checkpoint(self):
         self._run_selective_checkpoint_test(fp8=None)
 
     def test_gpu_forward_selective_checkpoint_fp8(self):
         self._run_selective_checkpoint_test(fp8="e4m3")
 
-    def _run_full_checkpoint_test(self, fp8):
+    def _run_full_checkpoint_test(
+        self, fp8, seq_len=None, attn_class=None, rotary_pos_emb=None, dual_rope_kind=None
+    ):
         transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'full'
@@ -93,11 +195,17 @@ class TestParallelTransformerBlock:
         full_transformer_block = TransformerBlock(
             config, get_gpt_layer_with_transformer_engine_spec()
         )
+        if attn_class is not None:
+            for layer in full_transformer_block.layers:
+                layer.self_attention.__class__ = attn_class
+                assert not hasattr(layer.self_attention, "dual_rope_kind")
+                layer.self_attention.dual_rope_kind = dual_rope_kind
+
         assert full_transformer_block.config.recompute_granularity == 'full'
         assert full_transformer_block.config.recompute_method == 'block'
         assert full_transformer_block.config.fp8 == fp8
 
-        sequence_length = 32
+        sequence_length = 32 if seq_len is None else seq_len
         micro_batch_size = 2
         full_transformer_block.cuda()
 
@@ -108,7 +216,9 @@ class TestParallelTransformerBlock:
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         hidden_states = full_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
         )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
@@ -459,6 +569,52 @@ class TestProcessGroupTransformerBlock:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ("sequence_parallel", "expected_tp_shard_dim"), ((False, None), (True, 0))
+    )
+    def test_residual_observations_with_tensor_and_context_parallelism(
+        self, sequence_parallel, expected_tp_shard_dim
+    ):
+        if Utils.world_size % 4 != 0:
+            pytest.skip("Test requires a world size divisible by TP=2 and CP=2")
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+        )
+        block = TransformerBlock(
+            config, ModuleSpec(module=_ResidualObservationLayer), post_process=False
+        ).cuda()
+        assert block.pg_collection.tp.size() == 2
+        assert block.pg_collection.cp.size() == 2
+
+        cp_rank = block.pg_collection.cp.rank()
+        hidden_states = torch.full((8, 1, config.hidden_size), cp_rank + 1.0, device="cuda")
+        observed = []
+        with capture_tensor_observations(
+            lambda *args: observed.append(args),
+            frozenset({"residual_accumulator", "residual_contribution"}),
+        ):
+            output = block(hidden_states=hidden_states, attention_mask=None)
+
+        torch.testing.assert_close(output, hidden_states + 1)
+        assert [(value[1], value[2]) for value in observed] == [
+            ("residual_accumulator", "residual_accumulator"),
+            ("residual_contribution", "residual_contribution"),
+        ]
+        assert all(value[0] is block.layers[0] for value in observed)
+        assert [value[4] for value in observed] == [expected_tp_shard_dim, expected_tp_shard_dim]
+        assert [value[5:] for value in observed] == [(0, 1), (0, 1)]
+        torch.testing.assert_close(observed[0][3], hidden_states)
+        torch.testing.assert_close(observed[1][3], torch.ones_like(hidden_states))
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),

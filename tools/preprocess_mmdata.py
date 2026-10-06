@@ -112,6 +112,8 @@ def get_args():
                        help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument("--pad-vocab-size", action="store_true", default=False,
+                       help='Whether to pad vocab size of the model automatically if padded_vocab_size is not provided.')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
@@ -130,6 +132,7 @@ def get_args():
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
     args.vocab_extra_ids = 0
+    args.use_gigatoken = False
 
     return args
 

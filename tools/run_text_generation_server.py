@@ -4,7 +4,6 @@
 import os
 import sys
 import warnings
-from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
@@ -14,8 +13,6 @@ from contextlib import nullcontext
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -28,10 +25,19 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from model_provider import model_provider
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
+
+try:
+    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+
+    HAS_NVIDIA_MODELOPT = True
+except ImportError:
+    HAS_NVIDIA_MODELOPT = False
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -39,9 +45,10 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
@@ -114,7 +121,7 @@ def add_text_generate_args(parser):
 @torch.inference_mode()
 def main(model_type: str = "gpt"):
     """Runs the text generation server with the specified model type."""
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_text_generate_args,
         args_defaults={
             'no_load_rng': True,
@@ -122,6 +129,8 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
     initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
@@ -137,22 +146,18 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        # Set up model and load checkpoint
-        if model_type == "gpt":
-            model_builder = gpt_builder
-        elif model_type in ("hybrid", "mamba"):
-            if model_type == "mamba":
-                import warnings
-
-                warnings.warn(
-                    'model_type="mamba" is deprecated. Use model_type="hybrid" instead.',
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            model_builder = hybrid_builder
+        if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+            # ModelOpt path keeps the legacy callable-based builder because the
+            # modelopt hooks have not been ported to the new ``ModelBuilder``
+            # API yet. ``get_model`` also handles the modelopt-checkpoint
+            # auto-detection side effect.
+            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
         else:
-            raise ValueError(f"Invalid model provider {model_type}")
-        model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+            builder = get_model_builder(args, provider=model_type)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
+            )
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)

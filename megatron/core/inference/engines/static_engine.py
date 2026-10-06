@@ -18,6 +18,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import get_asyncio_loop
 
 try:
@@ -129,6 +130,8 @@ class StaticInferenceEngine(AbstractEngine):
             self.controller.inference_wrapped_model.inference_context = original_context
             self.legacy = True
 
+        InferenceMode.set_active()
+
     def get_new_request_id(self) -> str:
         """Gets a new request id from the scheduler"""
         return self.scheduler.get_new_request_id()
@@ -232,7 +235,7 @@ class StaticInferenceEngine(AbstractEngine):
         if prompts:
             if add_BOS:
                 sampling_params.add_BOS = True
-            request_records = self.dynamic_engine.generate(
+            requests = self.dynamic_engine.generate(
                 prompts=prompts, sampling_params=sampling_params
             )
         elif inference_requests:
@@ -240,12 +243,11 @@ class StaticInferenceEngine(AbstractEngine):
             sampling_params = inference_requests[0].sampling_params
             if add_BOS:
                 sampling_params.add_BOS = True
-            request_records = self.dynamic_engine.generate(
+            requests = self.dynamic_engine.generate(
                 prompts=prompts, sampling_params=sampling_params
             )
 
-        # Return the underlying `InferenceRequest` objects from the `DynamicInferenceRequestRecord`s.
-        return [record.merge() for record in request_records]
+        return [request.finalize_text(self.controller.tokenizer) for request in requests]
 
     def generate_using_legacy_static_engine(
         self,

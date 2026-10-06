@@ -18,6 +18,8 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+from megatron.training.config.inference_config import InferenceSetupConfig
+from megatron.training.config.rl_config import RLConfig
 
-from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.container import InferenceConfigContainer, PretrainConfigContainer
 from megatron.training.config.instantiate_utils import TargetAllowlist, target_allowlist

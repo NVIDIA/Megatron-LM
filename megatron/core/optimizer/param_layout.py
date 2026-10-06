@@ -11,7 +11,7 @@ buffers consume the resulting layouts without any optimizer-specific knowledge.
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -26,15 +26,20 @@ def pad_param_start(param_start_index: int) -> int:
     return pad_to_divisor(param_start_index, 64)
 
 
+def bucket_end_divisor(data_parallel_world_size: int, pad_for_high_nccl_busbw: bool) -> int:
+    """Divisor used to pad bucket ends for DP-divisibility (and optional NCCL busbw)."""
+    if pad_for_high_nccl_busbw:
+        return math.lcm(data_parallel_world_size, 128, 2**16)
+    return math.lcm(data_parallel_world_size, 128)
+
+
 def pad_bucket_end(
     bucket_end_index: int, data_parallel_world_size: int, pad_for_high_nccl_busbw: bool
 ) -> int:
     """Pad bucket end for DP-divisibility (and optionally high NCCL bus bandwidth)."""
-    if pad_for_high_nccl_busbw:
-        divisor = math.lcm(data_parallel_world_size, 128, 2**16)
-    else:
-        divisor = math.lcm(data_parallel_world_size, 128)
-    return pad_to_divisor(bucket_end_index, divisor)
+    return pad_to_divisor(
+        bucket_end_index, bucket_end_divisor(data_parallel_world_size, pad_for_high_nccl_busbw)
+    )
 
 
 @dataclass(frozen=True)
@@ -49,11 +54,16 @@ class BufferKey:
         grad_dtype: Gradient reduction dtype.
         is_expert_parallel: Whether the buffer holds expert-parallel parameters,
             which use a separate data-parallel group.
+        is_managed_by_layer_wise_optimizer: Whether parameters in this buffer are
+            managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
+            so each whole param lives in one shard). Non-LayerWise params get
+            :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
+    is_managed_by_layer_wise_optimizer: bool = False
 
 
 @dataclass
@@ -69,12 +79,16 @@ class PerBufferParamLayout:
         param_indices: The index of each param among same-dtype params (using the "fake"
             high-precision dtype for FP8/NVFP4 params). Needed for loading non-native-fp8
             checkpoints in native-fp8 mode. Order matches param_index_map iteration order.
+        num_optimizer_shards: Number of optimizer shards. Set by the distributed optimizer
+            that computes the layout so that shard assignment at runtime uses the same
+            value. ``None`` for non-distributed-optimizer layouts.
     """
 
     param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
     bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
     per_bucket_numel_unpadded: List[int] = field(default_factory=list)
     param_indices: List[int] = field(default_factory=list)
+    num_optimizer_shards: Optional[int] = None
 
 
 @dataclass

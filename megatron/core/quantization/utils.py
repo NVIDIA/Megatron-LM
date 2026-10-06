@@ -7,10 +7,10 @@ from .quant_config import GlobMatcher, MatchContext, QuantizationConfig, RecipeC
 
 
 def get_quant_config_or_none(
-    module_path: str, recipe: Optional[RecipeConfig] = None
+    module_path: Optional[str], recipe: Optional[RecipeConfig] = None
 ) -> Union[QuantizationConfig, None]:
     """Resolve quantization config for a layer."""
-    if recipe is None:
+    if recipe is None or module_path is None:
         return None
     re_match = re.search(r'layers\.(\d+)', module_path)
     if re_match:

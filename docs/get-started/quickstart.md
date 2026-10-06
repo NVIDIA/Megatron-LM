@@ -9,11 +9,11 @@
 
 # Your First Training Run
 
-This guide walks you through running your first training jobs with Megatron Core. Make sure you have completed [installation](install.md) before proceeding.
+This guide walks you through two training examples and then covers data preparation for your own datasets. You start with a minimal distributed loop to validate your environment, then run a full LLaMA-3 training job. Make sure you have completed [installation](install.md) before proceeding.
 
 ## Minimal Training Example
 
-Run a minimal distributed training loop with mock data on 2 GPUs:
+Start with the simplest possible setup, a distributed training loop using mock data on two GPUs. This verifies that your environment is configured correctly before moving to real models.
 
 ```bash
 torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
@@ -21,7 +21,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ## LLaMA-3 Training Example
 
-Train an LLaMA-3 8B model with FP8 precision on 8 GPUs using mock data:
+With the environment validated, run a production-scale example. The following script trains a LLaMA-3 8B model with FP8 mixed precision on eight GPUs using mock data, demonstrating tensor parallelism and optimized kernels.
 
 ```bash
 ./examples/llama/train_llama3_8b_h100_fp8.sh
@@ -42,6 +42,8 @@ Each line should contain a `text` field:
 
 ### 2. Preprocess the Data
 
+Run the preprocessing script to tokenize and convert your data into binary format:
+
 ```bash
 python tools/preprocess_data.py \
     --input data.jsonl \
@@ -55,7 +57,7 @@ python tools/preprocess_data.py \
 ### Key Arguments
 
 - `--input`: Path to input JSON/JSONL file
-- `--output-prefix`: Prefix for output binary files (.bin and .idx)
+- `--output-prefix`: Prefix for output binary files (`.bin` and `.idx`)
 - `--tokenizer-type`: Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, and so on)
 - `--tokenizer-model`: Path to tokenizer model file
 - `--workers`: Number of parallel workers for processing
@@ -65,4 +67,4 @@ python tools/preprocess_data.py \
 
 - Explore [Parallelism Strategies](../user-guide/parallelism-guide.md) to scale your training
 - Learn about [Data Preparation](../user-guide/data-preparation.md) best practices
-- Check out [Advanced Features](../user-guide/features/index.md)
+- Explore [Advanced Features](../user-guide/features/index.md) for FP8 training, context parallelism, and more

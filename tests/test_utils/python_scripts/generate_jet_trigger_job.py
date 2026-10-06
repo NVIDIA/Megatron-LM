@@ -9,6 +9,26 @@ import yaml
 from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+TRIAGE_LOG_PATH = "jet_workload.log"
+TRIAGE_REPORT_PATH = "error_report.json"
+
+
+def build_test_script(command: str) -> str:
+    """Wrap a workload command with non-blocking error extraction."""
+    return "\n".join(
+        [
+            "set +e",
+            "set -o pipefail",
+            f"{command} 2>&1 | tee {TRIAGE_LOG_PATH}",
+            'exit_code=${PIPESTATUS[0]}',
+            "set -e",
+            (
+                f"extract-errors {TRIAGE_LOG_PATH} --output {TRIAGE_REPORT_PATH} "
+                '--exit-code "$exit_code" || true'
+            ),
+            'exit "$exit_code"',
+        ]
+    )
 
 
 @click.command()
@@ -70,6 +90,11 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
         "Empty/unset disables the cadence filter."
     ),
 )
+@click.option(
+    "--enable-error-extraction/--no-enable-error-extraction",
+    default=False,
+    help="Extract a structured error report from GitLab child-job output.",
+)
 def main(
     scope: str,
     environment: str,
@@ -91,10 +116,12 @@ def main(
     enable_lightweight_mode: bool = False,
     enable_warmup: Optional[bool] = None,
     cadence: Optional[str] = None,
-):
+    enable_error_extraction: bool = False,
+) -> None:
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
     cadence_arg = cadence or None
+    job_timeout = "24 hours" if platform == "dgx_gb300" else "7 days"
 
     list_of_test_cases = [
         test_case
@@ -106,6 +133,7 @@ def main(
             platform=platform,
             tag=tag,
             cadence=cadence_arg,
+            time_limit=time_limit,
         )
         if test_case.type != "build"
     ]
@@ -133,7 +161,7 @@ def main(
                 "stage": "empty-pipeline-placeholder",
                 "image": f"{container_image}:{container_tag}",
                 "tags": tags,
-                "timeout": "7 days",
+                "timeout": job_timeout,
                 "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
@@ -176,7 +204,9 @@ def main(
 
         for test_idx, test_case in enumerate(list_of_test_cases):
             job_tags = list(tags)
-            job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
+            # JHB has no cluster-tagged submission runner; JET selects its GPU runner.
+            if cluster != "dgxgb300_oci-jhb":
+                job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "
@@ -184,7 +214,7 @@ def main(
                 f"--model {test_case['spec']['model']}",
                 f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
-                f"--time-limit {time_limit}",
+                f"--time-limit {test_case['spec'].get('time_limit', time_limit)}",
                 f"--scope {scope}",
                 f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",
@@ -217,15 +247,22 @@ def main(
                 elif warmup_job != "":
                     needs.append({"job": warmup_job})
 
+            test_script = " ".join(script)
+            artifact_paths = ["results/"]
+            if enable_error_extraction:
+                test_script = build_test_script(test_script)
+                artifact_paths.extend([TRIAGE_LOG_PATH, TRIAGE_REPORT_PATH])
+
             gitlab_pipeline[test_case['spec']['test_case']] = {
                 "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
-                "timeout": "7 days",
+                "timeout": job_timeout,
                 "needs": needs,
-                "script": [" ".join(script)],
-                "artifacts": {"paths": ["results/"], "when": "always"},
-                "allow_failure": test_case["spec"]["model"] == "gpt-nemo",
+                "script": [test_script],
+                "artifacts": {"paths": artifact_paths, "when": "always"},
+                "allow_failure": test_case["spec"].get("allow_failure", False)
+                or test_case["spec"]["model"] == "gpt-nemo",
                 "retry": {
                     "max": 2,
                     "when": [

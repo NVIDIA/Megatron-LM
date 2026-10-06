@@ -6,9 +6,6 @@ from unittest import mock
 
 import torch
 
-from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-    CachedMetadataFileSystemReader,
-)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -18,9 +15,19 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+        CachedMetadataFileSystemReader,
+    )
+
+    HAVE_NVRX = True
+except ModuleNotFoundError:
+    HAVE_NVRX = False
+
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
@@ -59,6 +66,67 @@ def initialize_gpt_model(
     with torch.no_grad():
         for p in model.parameters():
             p.random_()
+    return model
+
+
+def initialize_quantized_gpt_model(
+    pre_process=True, post_process=True, seed=0, precision='fp8', recipe='delayed', **config_kwargs
+):
+    """Small Transformer Engine GPT model whose GEMM weights keep quantized storage.
+
+    ``precision='fp8'`` uses ``fp8_param`` (Float8Tensor / MXFP8Tensor depending on ``recipe``),
+    ``precision='fp4'`` uses ``fp4_param`` (NVFP4Tensor). Both are stored as torch.uint8 by the
+    DDP buffers, next to the bf16 buffer holding embeddings, norms and other non-GEMM params.
+    Quantized params are left at their init values: an in-place ``random_`` would replace the
+    quantized storage. Dims are multiples of 64 so every quantized block constraint holds.
+    """
+    from megatron.core.fp8_utils import is_float8tensor
+
+    try:
+        from megatron.core.fp4_utils import is_nvfp4tensor
+    except ImportError:  # pragma: no cover - older trees without NVFP4 support
+
+        def is_nvfp4tensor(tensor):
+            return False
+
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    if precision == 'fp8':
+        quantization_kwargs = dict(fp8='e4m3', fp8_recipe=recipe, fp8_param=True)
+    elif precision == 'fp4':
+        quantization_kwargs = dict(fp4='e2m1', fp4_recipe=recipe, fp4_param=True)
+    else:
+        raise ValueError(f'Unsupported precision {precision!r}')
+    default_config_kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=8,
+        kv_channels=16,
+        ffn_hidden_size=256,
+        use_cpu_initialization=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        add_bias_linear=False,
+        **quantization_kwargs,
+    )
+    default_config_kwargs.update(**config_kwargs)
+    transformer_config = TransformerConfig(**default_config_kwargs, gated_linear_unit=True)
+    model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+    )
+    with torch.no_grad():
+        for p in model.parameters():
+            if not (is_float8tensor(p) or is_nvfp4tensor(p)):
+                p.random_()
     return model
 
 
@@ -173,26 +241,33 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.phase_transition_iterations = None
     # Clear the metadata cache to avoid contamination between tests
 
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
 
 
 def setup_model_and_optimizer(
-    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True, optimizer='adam'
+    seed,
+    tp,
+    pp,
+    initialize_fn=initialize_gpt_model,
+    bf16=True,
+    dist_opt=True,
+    optimizer='adam',
+    use_param_layout=False,
+    muon_scalar_optimizer='adam',
+    cp=1,
+    ep=1,
+    etp=1,
+    use_megatron_fsdp=False,
+    ddp_num_buckets=None,
+    ddp_pad_buckets_for_high_nccl_busbw=False,
+    grad_reduce_in_fp32=False,
+    fp8_param_gather=False,
+    fp4_param_gather=False,
+    reuse_grad_buf_for_mxfp8_param_ag=False,
 ):
-    mock_args = parse_args(ignore_unknown_args=True)
-    with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
-        init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
-        model = get_model(
-            partial(
-                initialize_fn,
-                seed=seed,
-                tensor_model_parallel_size=tp,
-                pipeline_model_parallel_size=pp,
-                pipeline_dtype=torch.bfloat16,
-                bf16=bf16,
-            )
-        )
-
     optimizer_type = optimizer
     use_layer_wise = False
     if optimizer_type == 'dist_muon':
@@ -200,38 +275,122 @@ def setup_model_and_optimizer(
         use_layer_wise = True
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
-        dist_opt = False
+
+    # When use_layer_wise is True and use_param_layout is False, route DDP
+    # construction through the legacy path (no precomputed param layout, no
+    # ``use_distributed_optimizer=True`` flip). LayerWiseDistributedOptimizer
+    # then syncs via its legacy ``allgather_params()`` codepath rather than
+    # ``start_param_sync``.
+    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
+    ddp_use_layer_wise = use_layer_wise and use_param_layout
+
+    mock_args = parse_args(ignore_unknown_args=True)
+    with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
+        init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
+        mock_args.fp8_param_gather = fp8_param_gather
+        mock_args.fp4_param_gather = fp4_param_gather
+        # MXFP8 params cannot be re-pointed into the grad buffer (TE has no replace_raw_data for
+        # MXFP8Tensor); production keeps them out of it with this flag.
+        mock_args.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buf_for_mxfp8_param_ag
+        if ddp_num_buckets is not None:
+            # resolve_ddp_bucket_size() forces a single bucket unless grad reduction
+            # overlaps, so both knobs are needed to actually split the grad buffer.
+            mock_args.ddp_num_buckets = ddp_num_buckets
+            mock_args.overlap_grad_reduce = True
+        mock_args.ddp_pad_buckets_for_high_nccl_busbw = ddp_pad_buckets_for_high_nccl_busbw
+        mock_args.context_parallel_size = cp
+        mock_args.expert_model_parallel_size = ep
+        mock_args.expert_tensor_parallel_size = etp
+        mock_args.use_megatron_fsdp = use_megatron_fsdp
+        mock_args.data_parallel_sharding_strategy = (
+            'optim_grads_params' if use_megatron_fsdp else 'no_shard'
+        )
+        if use_megatron_fsdp:
+            # parse_args() leaves these as CLI strings until validate_args()
+            # maps them to the torch.dtype values expected by Megatron-FSDP.
+            mock_args.megatron_fsdp_main_params_dtype = torch.float32
+            mock_args.megatron_fsdp_main_grads_dtype = None
+            mock_args.megatron_fsdp_grad_comm_dtype = None
+        mock_args.gradient_accumulation_fusion = False
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if ddp_use_layer_wise:
+            mock_args.optimizer = optimizer
+        model = get_model(
+            partial(
+                initialize_fn,
+                seed=seed,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.bfloat16,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
+                bf16=bf16,
+            )
+        )
 
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
+        muon_scalar_optimizer=muon_scalar_optimizer,
     )
+    if use_megatron_fsdp:
+        # The FSDP DTensor sharded-state path may materialize missing optimizer
+        # slots with a dummy step, which requires a concrete learning rate.
+        config.lr = 1.0e-3
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    elif optimizer_type == 'lion':
+        config.lr = 1e-4
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
+    def _init_states(optimizer):
+        # In hybrid LayerWise + DistOpt mode the top-level ChainedOptimizer
+        # wraps another ChainedOptimizer (LayerWise) alongside DistOpt; recurse
+        # so the Muon Float16 sub-optimizers inside LayerWise still get their
+        # state seeded. Optimizers without ``init_state_fn`` (DistOpt) seed
+        # their state elsewhere and are skipped here.
+        if isinstance(optimizer, ChainedOptimizer):
+            for child_optimizer in optimizer.chained_optimizers:
+                _init_states(child_optimizer)
+            return
+        if not hasattr(optimizer, 'init_state_fn'):
+            return
+        if not hasattr(optimizer, 'optimizer'):
+            optimizer.init_state_fn(optimizer)
+        else:
+            optimizer.init_state_fn(optimizer.optimizer)
+
     if isinstance(optimizer, ChainedOptimizer):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+        _init_states(optimizer)
     else:
+        if hasattr(optimizer, 'optimizer_state_keys'):
+            state_keys = optimizer.optimizer_state_keys
+        else:
+            state_keys = ("exp_avg", "exp_avg_sq")
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
                 if len(optimizer.optimizer.state[p]) == 0:
-                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+                    for key in state_keys:
+                        optimizer.optimizer.state[p][key] = torch.rand_like(p.data)
 
-    optimizer.reload_model_params()
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    # Megatron-FSDP owns the model/main-parameter synchronization and its
+    # DistributedOptimizer intentionally does not implement this legacy copy.
+    if not use_megatron_fsdp:
+        optimizer.reload_model_params()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
     return unwrap_model(model), optimizer
 
 
@@ -272,10 +431,27 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
     optimizer='adam',
+    use_param_layout=False,
 ):
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+
+    # See setup_model_and_optimizer for the use_param_layout semantics.
+    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
+    ddp_use_layer_wise = use_layer_wise and use_param_layout
+
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if ddp_use_layer_wise:
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,
@@ -292,19 +468,10 @@ def setup_moe_model_and_optimizer(
             )
         )
 
-    optimizer_type = optimizer
-    use_layer_wise = False
-    if optimizer_type == 'dist_muon':
-        optimizer = 'muon'
-        use_layer_wise = True
-    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
-        use_layer_wise = True
-        dist_opt = False
-
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
     )
@@ -331,5 +498,8 @@ def setup_moe_model_and_optimizer(
                         opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
     return unwrap_model(model), optimizer

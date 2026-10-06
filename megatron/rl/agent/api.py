@@ -1,27 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
-import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable
-from typing import Generic, TypeVar
-
-import numpy as np
-from pydantic import BaseModel
-
-from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
-from megatron.core.utils import trace_async_exceptions
+from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 from ..__init__ import Request, TypeLookupable
-from ..inference import (
-    InferenceInterface,
-    LLMChatMessage,
-    ReturnsRaw,
-)
-
-
-class AgentBaseModel(BaseModel, extra='allow'):
-    pass
+from ..inference import InferenceInterface, InferenceRequest, InferenceResponse, LLMChatMessage
+from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
+from ..types import AgentBaseModel, GroupedRollouts, Rollout, RolloutGroup, Rollouts, TokenRollout
 
 
 class RolloutRequest(Request):
@@ -40,58 +25,27 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
-    streaming: bool = False
-    enforce_order: bool = False
+    submission_granularity: SubmissionGranularity = "B"
+    consumption_granularity: ConsumptionGranularity = "B"
 
 
-class Rollout(AgentBaseModel):
-    """Data for language-based Rollout."""
+class EpisodeResult(NamedTuple):
+    """All per-turn responses of one (possibly multi-turn) episode plus the final conversation."""
 
-    trajectory: list[str]
-    prompt_length: list[int] | None = None
-    reward: float = None
-    env_id: str = ''
-    problem_id: str | None = None
-    policy_epoch: list[list[tuple[int, int]]]
-    kv_cache_epoch: list[list[tuple[int, int]]]
-    num_evictions: list[int]
+    responses: list[InferenceResponse]
+    conversation: list[LLMChatMessage]
 
 
-class TokenRollout(AgentBaseModel):
-    """Tokenized representation of a language-based Rollout."""
+class GroupRolloutParams(NamedTuple):
+    """Returned by agent.prepare_group_rollout.
 
-    trajectory: list[list[int]]
-    reward: list[float] | float
-    generation_mask: list[list[bool]] | None = None
-    logprobs: list[list[float]] | None = None
-    env_id: str = ''
-    problem_id: str | None = None
-    policy_epoch: list[list[tuple[int, int]]]
-    kv_cache_epoch: list[list[tuple[int, int]]]
-    num_evictions: list[int]
+    One instance is created per group call and reused for all rollouts in that group.
+    Every rollout is an episode: run_episode generates it (one or more turns), while
+    build_rollout turns the completed episode into a Rollout.
+    """
 
-
-Rollouts = list[TokenRollout | Rollout]
-
-
-class RolloutGroup(AgentBaseModel):
-    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
-
-    rollouts: Rollouts
-    batch_id: int = 0
-    index_in_batch: int = 0
-
-    def __iter__(self):
-        return iter(self.rollouts)
-
-    def __len__(self):
-        return len(self.rollouts)
-
-    def __getitem__(self, idx):
-        return self.rollouts[idx]
-
-
-GroupedRollouts = list[RolloutGroup]
+    run_episode: Callable[[], Awaitable[EpisodeResult]]
+    build_rollout: Callable[[EpisodeResult], Awaitable[Rollout]]
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -140,23 +94,22 @@ class EvaluationResponse(AgentBaseModel, TypeLookupable, Generic[T]):
 
 
 class Agent(ABC, AgentBaseModel):
-    pass
+
+    @abstractmethod
+    async def get_rollout_response(
+        self,
+        request: "RolloutRequest | GroupedRolloutRequest | EvaluationRequest",
+        inference_request: InferenceRequest,
+    ) -> InferenceResponse:
+        """Obtain the model response for a single rollout. Subclasses implement how."""
+        ...
 
 
 class RolloutGenerator(Agent, ABC):
     """An agent that produces Rollout objects containing rollout string and associated reward."""
 
     @abstractmethod
-    async def rollout(self, request: RolloutRequest) -> Rollout: ...
-
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
-
-        return await asyncio.gather(
-            *[self.rollout(request=request) for _ in range(request.num_rollouts)]
-        )
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]: ...
 
 
 class ContrastiveRolloutGenerator(Agent, ABC):
@@ -176,127 +129,38 @@ class TokenizedRolloutGenerator(Agent, ABC):
     """
 
     @abstractmethod
-    async def rollout(self, request: RolloutRequest) -> TokenRollout: ...
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]: ...
 
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        return await asyncio.gather(
-            *[self.rollout(request=request) for _ in range(request.num_rollouts)]
-        )
+class EnvAllocation(NamedTuple):
+    """One env's constant share of every trainer batch."""
+
+    agent: "GroupedRolloutGenerator"
+    env_id: str
+    num_groups: int
 
 
 class GroupedRolloutGenerator(Agent, ABC):
-    """An interface to return grouped Rollout objects to support algorithms like GRPO."""
-
-    parallel_generation_tasks: int = 512
-    buffer_size: int = 10
-
-    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
-        super().__init__(**kwargs)
-        if parallel_generation_tasks is not None:
-            self.parallel_generation_tasks = parallel_generation_tasks
+    """Agent contract consumed by RolloutPipeline to generate grouped rollouts (e.g. GRPO)."""
 
     @abstractmethod
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
+    async def prepare_group_rollout(self, request: GroupedRolloutRequest) -> GroupRolloutParams:
+        """Return the params for one group's rollouts."""
+        ...
 
-    async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
-
-        # When streaming, use buffer_size to create backpressure
-        # for balanced generation in a multi-task setting.
-        grouped_rollouts: asyncio_Queue[RolloutGroup] = asyncio_Queue(
-            maxsize=self.buffer_size if request.streaming else 0
-        )
-        submitted_groups = 0
-
-        # num_groups controls how many groups each worker generates and yields together.
-        # When it's 1, the semaphore is a no-op.
-        groups_per_worker = request.num_groups
-        if groups_per_worker > 1:
-            assert not request.filter_groups_with_same_reward, \
-                "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        assert self.parallel_generation_tasks >= groups_per_worker, \
-            f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
-        num_workers = self.parallel_generation_tasks // groups_per_worker
-        unused = self.parallel_generation_tasks % groups_per_worker
-        if unused:
-            logging.warning(
-                f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
-                f"divisible by num_groups ({groups_per_worker}); "
-                f"{unused} generation task(s) will be unused."
+    def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:
+        """Returns each env's per-trainer-batch allocation, in env order."""
+        return [
+            EnvAllocation(
+                agent=self,
+                env_id=getattr(self, "env_id", None) or "rollout",
+                num_groups=num_groups,
             )
-        submission_gate = asyncio.Semaphore(num_workers)
+        ]
 
-        async def generate_and_enqueue(batch_id, index_in_batch):
-            group = await self.group_rollout(request=request)
-            if (
-                not request.filter_groups_with_same_reward
-                or np.std([r.reward for r in group]) > 1e-6
-            ):
-                await grouped_rollouts.put(
-                    RolloutGroup(rollouts=group, batch_id=batch_id, index_in_batch=index_in_batch)
-                )
-                return True
-            return False
-
-        @trace_async_exceptions(verbose=True)
-        async def generate_task():
-            nonlocal submitted_groups
-            while request.streaming or submitted_groups < request.num_groups:
-                await submission_gate.acquire()
-                batch_id = submitted_groups // groups_per_worker
-                submitted_groups += groups_per_worker
-                if groups_per_worker > 1:
-                    await asyncio.gather(*[
-                        generate_and_enqueue(batch_id, i)
-                        for i in range(groups_per_worker)
-                    ])
-                else:
-                    if not await generate_and_enqueue(batch_id, 0):
-                        submitted_groups -= groups_per_worker
-                        submission_gate.release()
-
-        tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
-
-        async def shutdown_queue_when_done():
-            """Wait for all workers to finish, then shut down the queue."""
-            await asyncio.gather(*tasks)
-            grouped_rollouts.shutdown()
-
-        shutdown_task = asyncio.create_task(shutdown_queue_when_done())
-
-        try:
-            next_batch_id = 0
-            pending: dict[int, GroupedRollouts] = {}
-            while True:
-                try:
-                    group = await grouped_rollouts.get()
-                except asyncio_QueueShutDown:
-                    break
-                if request.enforce_order:
-                    # Accumulate groups and enforce submission order across batches.
-                    pending.setdefault(group.batch_id, []).append(group)
-                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
-                        assert l == groups_per_worker
-                        batch = pending.pop(next_batch_id)
-                        batch.sort(key=lambda g: g.index_in_batch)
-                        next_batch_id += 1
-                        for g in batch:
-                            yield g
-                        submission_gate.release()
-                else:
-                    # Yield groups as soon as they're completed.
-                    yield group
-                    submission_gate.release()
-        finally:
-            shutdown_task.cancel()
-            for task in tasks:
-                task.cancel()
+    def take_restored_group(self, env_id: str) -> RolloutGroup | None:
+        """Return one recovered group for ``env_id``, if one is available."""
+        return None
 
 
 class EvaluationAgent(Agent, ABC):

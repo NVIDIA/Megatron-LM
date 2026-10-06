@@ -40,5 +40,13 @@ def clip_qk(model, log_max_only=False) -> float:
                     )
                     if not log_max_only:
                         transformer_layer.self_attention.clip_qk()
+                    else:
+                        # When qk-clip is disabled, clip_qk() is not called and
+                        # would otherwise never reset current_max_attn_logits.
+                        # Reset it here so the logged value reflects the current
+                        # step and stale references are not retained.
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits = (
+                            None
+                        )
 
     return log_max_attention_logit

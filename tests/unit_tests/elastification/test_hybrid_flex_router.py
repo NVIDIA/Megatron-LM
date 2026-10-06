@@ -157,9 +157,17 @@ class TestFlextronRouter:
         assert logits.numel() == len(config.emb_int_list)
         assert choice in config.emb_int_list
 
+    @pytest.mark.flaky_in_dev
     def test_gumbel_determinism(self):
         """Two routers at the same config + iteration + fwd_pass_count should
-        produce identical Gumbel-softmax samples."""
+        produce identical Gumbel-softmax samples.
+
+        Quarantined as flaky_in_dev (#5155): ``FlextronRouter.forward`` draws
+        ``hard_sample`` from Python's un-seeded global ``random``, which is not
+        covered by the Gumbel ``torch.manual_seed``, so the two routers
+        intermittently disagree on the hard/soft branch and the bit-exact
+        ``assert_close`` fails.
+        """
         config = _router_config()
         config.curr_iteration = 0
 

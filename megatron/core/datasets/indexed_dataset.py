@@ -39,8 +39,15 @@ from megatron.core.datasets.object_storage_utils import (
     is_object_storage_path,
     parse_s3_path,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.utils import log_single_rank
+
+try:
+    import awkward as ak
+
+    HAVE_AWKWARD = True
+except ModuleNotFoundError:
+    HAVE_AWKWARD = False
 
 logger = logging.getLogger(__name__)
 
@@ -138,11 +145,7 @@ class _IndexWriter(object):
         Returns:
             _IndexWriter: The instance
         """
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            self.idx_writer = msc.open(self.idx_path, "wb")
-        else:
-            self.idx_writer = open(self.idx_path, "wb")
+        self.idx_writer = maybe_msc.open(self.idx_path, "wb")
         # fixed, vestigial practice
         self.idx_writer.write(_INDEX_HEADER)
         # fixed, vestigial practice
@@ -394,11 +397,7 @@ class _MMapBinReader(_BinReader):
     """
 
     def __init__(self, bin_path: str) -> None:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            self._bin_file_reader = msc.open(bin_path, mode="rb")
-        else:
-            self._bin_file_reader = open(bin_path, mode="rb")
+        self._bin_file_reader = maybe_msc.open(bin_path, mode="rb")
         self._bin_buffer_mmap = numpy.memmap(self._bin_file_reader, mode="r", order="C")
         self._bin_buffer = memoryview(self._bin_buffer_mmap.data)
 
@@ -462,15 +461,9 @@ class _FileBinReader(_BinReader):
         def _read():
             """Helper method to read `count` bytes from self._bin_path at provided offset."""
             sequence = numpy.empty(count, dtype=dtype)
-            if MultiStorageClientFeature.is_enabled():
-                msc = MultiStorageClientFeature.import_package()
-                with msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
-                    bin_buffer_file.seek(offset)
-                    bin_buffer_file.readinto(sequence)
-            else:
-                with open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
-                    bin_buffer_file.seek(offset)
-                    bin_buffer_file.readinto(sequence)
+            with maybe_msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
+                bin_buffer_file.seek(offset)
+                bin_buffer_file.readinto(sequence)
             return sequence
 
         sleep_duration = self.sleep_duration_start
@@ -948,13 +941,7 @@ class IndexedDatasetBuilder(object):
     def __init__(
         self, bin_path: str, dtype: Type[numpy.number] = numpy.int32, multimodal: bool = False
     ) -> None:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            self._open = msc.open
-        else:
-            self._open = open
-
-        self.data_file = self._open(bin_path, "wb")
+        self.data_file = maybe_msc.open(bin_path, "wb")
         self.dtype = dtype
         self.multimodal = multimodal
 
@@ -994,7 +981,64 @@ class IndexedDatasetBuilder(object):
         self.sequence_lengths.extend(lengths)
         self.document_indices.append(len(self.sequence_lengths))
         if self.multimodal:
-            self.sequence_modes.extend(modes if modes is not None else [0] * lengths)
+            self.sequence_modes.extend(modes if modes is not None else [0] * len(lengths))
+
+    def add_documents(
+        self,
+        documents: "ak.Array",
+        modes: Optional[List[int]] = None,
+        eod_token: Optional[int] = None,
+        chunk_size: int = 1_000_000,
+    ) -> None:
+        """Add a list of documents to the dataset in a single batched write
+
+        Each document is treated as a single item; per-item lengths are derived
+        from the document lengths themselves.
+
+        Args:
+            documents (ak.Array): A jagged array of documents, where each element holds
+                the token ids for that document
+
+            modes (Optional[List[int]], optional): The mode for each document. Defaults to None.
+
+            eod_token (Optional[int], optional): The end-of-document token to insert between
+                documents. Defaults to None.
+
+            chunk_size (int, optional): The number of documents to process in a single batch.
+                Defaults to 1_000_000.
+        """
+        if not HAVE_AWKWARD:
+            raise ModuleNotFoundError(
+                "The add_documents method requires the awkward library. "
+                "Please install it with `pip install awkward`."
+            )
+
+        n_docs = len(documents)
+        for start in range(0, n_docs, chunk_size):
+            chunk = documents[start : start + chunk_size]  # cheap view, no copy
+
+            flat = numpy.asarray(ak.flatten(chunk), dtype=self.dtype)
+            doc_lengths = numpy.asarray(ak.num(chunk, axis=1))
+
+            if eod_token is not None:
+                insert_at = numpy.cumsum(doc_lengths)  # one insertion point per doc boundary
+                flat = numpy.insert(flat, insert_at, eod_token).astype(self.dtype, copy=False)
+                doc_lengths = doc_lengths + 1
+
+            self.data_file.write(flat.tobytes(order="C"))
+            del flat  # release chunk before next iteration
+
+            offset = len(self.sequence_lengths)
+            self.sequence_lengths.extend(doc_lengths.tolist())
+            self.document_indices.extend((offset + numpy.arange(1, len(doc_lengths) + 1)).tolist())
+
+            if self.multimodal:
+                chunk_modes = (
+                    modes[start : start + chunk_size]
+                    if modes is not None
+                    else [0] * len(doc_lengths)
+                )
+                self.sequence_modes.extend(chunk_modes)
 
     def end_document(self) -> None:
         """Finalize the document, for use with IndexedDatasetBuilder.add_item"""
@@ -1023,7 +1067,7 @@ class IndexedDatasetBuilder(object):
         gc.collect()
 
         # Concatenate data
-        with self._open(get_bin_path(path_prefix), "rb") as f:
+        with maybe_msc.open(get_bin_path(path_prefix), "rb") as f:
             shutil.copyfileobj(f, self.data_file)
 
     def finalize(self, idx_path: str) -> None:

@@ -373,8 +373,8 @@ class BertEmbedder:
         assert args.output_bert_embeddings
 
         self.models, optimizer, opt_param_scheduler = \
-            setup_model_and_optimizer(model_provider,
-                                      ModelType.encoder_or_decoder)
+            setup_model_and_optimizer(ModelType.encoder_or_decoder,
+                                      model_provider)
         self.batch_size = batch_size
         self.max_bert_seq_length = max_bert_seq_length
 
