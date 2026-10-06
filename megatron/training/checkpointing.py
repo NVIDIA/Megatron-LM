@@ -1146,6 +1146,7 @@ def save_checkpoint(
             train_state = get_train_state()
             train_state_dict = None
             if train_state is not None:
+                train_state.release = release
                 train_state_dict = train_state.state_dict()
                 train_state_dict["floating_point_operations_so_far"] = torch.tensor(
                     num_floating_point_operations_so_far, dtype=torch.float64

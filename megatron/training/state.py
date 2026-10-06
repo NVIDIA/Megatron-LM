@@ -23,6 +23,7 @@ class TrainState(Stateful):
     do_train: bool = False
     do_valid: bool = False
     do_test: bool = False
+    release: bool = False
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Serializes the training state into a dictionary of tensors.
@@ -51,6 +52,7 @@ class TrainState(Stateful):
             "do_train": torch.tensor(self.do_train, dtype=torch.bool),
             "do_valid": torch.tensor(self.do_valid, dtype=torch.bool),
             "do_test": torch.tensor(self.do_test, dtype=torch.bool),
+            "release": torch.tensor(self.release, dtype=torch.bool),
         }
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -69,3 +71,4 @@ class TrainState(Stateful):
         self.do_train = state_dict["do_train"].item()
         self.do_valid = state_dict["do_valid"].item()
         self.do_test = state_dict["do_test"].item()
+        self.release = state_dict["release"].item()
