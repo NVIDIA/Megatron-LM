@@ -968,3 +968,351 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
 
     finally:
         Utils.destroy_model_parallel()
+
+
+# =============================================================================
+# Local Graph Lazy-Release D2H Offload Tests (CPU-only, mocked streams/events)
+# =============================================================================
+
+
+class _RecordingEvent:
+    def __init__(self, log, name):
+        self._log = log
+        self.name = name
+
+    def record(self, stream):
+        self._log.append((f"{self.name}.record", stream))
+
+    def synchronize(self):
+        self._log.append((f"{self.name}.synchronize",))
+
+    def query(self):
+        self._log.append((f"{self.name}.query",))
+        return False
+
+
+class _RecordingStream:
+    def __init__(self, name, log):
+        self.name = name
+        self._log = log
+
+    def wait_stream(self, other):
+        self._log.append((f"{self.name}.wait_stream", other))
+
+    def wait_event(self, event):
+        self._log.append((f"{self.name}.wait_event", event))
+
+
+class _RecordingGraphGroup:
+    """Stand-in for LocalCudaGraphOffloadGroup in replay orchestration tests."""
+
+    def __init__(self, name, log, num_tensors=1, tensor_bytes=1024):
+        self.name = name
+        self._log = log
+        self.device_tensors = [object()] * num_tensors
+        self.allocations = [(name, "allocation", index) for index in range(num_tensors)]
+        self.host_tensors = [(name, "host", index) for index in range(num_tensors)]
+        self._logical_bytes = num_tensors * tensor_bytes
+        self.state = "mapped"
+
+    @property
+    def logical_bytes(self):
+        return self._logical_bytes
+
+    def enqueue_d2h(self, d2h_stream, compute_stream):
+        self._log.append(("group.enqueue_d2h", self.name))
+
+    def enqueue_resident_d2h(self, d2h_stream, compute_stream):
+        self._log.append(("group.enqueue_resident_d2h", self.name, d2h_stream.name, compute_stream))
+        self.state = "resident_d2h_pending"
+
+    def enqueue_resident_h2d(self, h2d_stream):
+        self._log.append(("group.enqueue_resident_h2d", self.name, h2d_stream.name))
+        self.state = "resident_reload_pending"
+
+    def adopt_resident_reload(self):
+        self._log.append(("group.adopt_resident_reload", self.name))
+        self.state = "mapped"
+
+    def try_release(self):
+        self._log.append(("group.try_release", self.name))
+        return False
+
+    def prepare_remap(self, control_stream):
+        self._log.append(("group.prepare_remap", self.name))
+        return True
+
+    def adopt_reload_submission(self):
+        self._log.append(("group.adopt_reload_submission", self.name))
+
+
+class _RecordingRunner:
+    def __init__(self, groups, slot_bank=None):
+        self.local_graph_offload_groups = groups
+        self.local_graph_reload_state = None
+        self.local_graph_slot_bank = slot_bank
+        self.local_graph_reload_event = None
+
+
+def _configure_ping_pong_manager(mgr, log):
+    mgr._local_graph_bank_d2h_events = [
+        _RecordingEvent(log, "bank0_d2h"),
+        _RecordingEvent(log, "bank1_d2h"),
+    ]
+    mgr._local_graph_bank_d2h_recorded = [False, False]
+    mgr._local_graph_bank_consumed_events = [None, None]
+
+
+def _make_local_graph_batch_manager(log):
+    """Build a PipelineOffloadManager with recording streams/events, bypassing __init__."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+    )
+
+    mgr = PipelineOffloadManager.__new__(PipelineOffloadManager)
+    mgr._d2h_stream = _RecordingStream("d2h", log)
+    mgr._h2d_stream = _RecordingStream("h2d", log)
+    mgr._local_graph_d2h_bytes = 0
+    mgr._local_graph_h2d_bytes = 0
+    return mgr
+
+
+def _record_remap_batch(monkeypatch, log):
+    """Replace native reload submission and stream wait with recording stubs."""
+    import megatron.core.pipeline_parallel.fine_grained_activation_offload as offload
+
+    def remap_batch(allocations, host_tensors, stream):
+        log.append(
+            (
+                "runner.remap_and_copy_after",
+                tuple(allocation[0] for allocation in allocations),
+                tuple(host_tensor[0] for host_tensor in host_tensors),
+                stream.name,
+            )
+        )
+        return object()
+
+    def wait_on_stream(context, stream):
+        log.append(("runner.wait_remap_copy_on_stream", stream.name))
+
+    monkeypatch.setattr(offload, "remap_and_copy_after", remap_batch)
+    monkeypatch.setattr(offload, "wait_remap_copy_on_stream", wait_on_stream)
+
+
+def test_local_graph_forward_replay_enqueues_without_blocking(monkeypatch):
+    """Forward replay only enqueues D2H on the shared stream; no wait, no release."""
+    log = []
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "compute")
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+
+    groups = [
+        _RecordingGraphGroup("expert_fc1", log),
+        _RecordingGraphGroup("moe_act", log),
+        _RecordingGraphGroup("empty_group", log, num_tensors=0),
+    ]
+    mgr = _make_local_graph_batch_manager(log)
+
+    mgr.local_graph_forward_replay(_RecordingRunner(groups))
+
+    events = [entry[0] for entry in log]
+    # Every non-empty group enqueues in order; the empty group participates in nothing.
+    enqueue_names = [entry[1] for entry in log if entry[0] == "group.enqueue_d2h"]
+    assert enqueue_names == ["expert_fc1", "moe_act"]
+    # No event synchronize at forward time: the sync belongs to backward.
+    assert not any(e.endswith(".synchronize") for e in events)
+    assert "group.wait_and_release" not in events
+    # Byte accounting covers all groups (the empty one contributes zero).
+    assert mgr._local_graph_d2h_bytes == sum(g.logical_bytes for g in groups)
+
+
+def test_local_graph_backward_prepare_finish_wait_pipeline(monkeypatch):
+    """Reload phases preserve reverse order and consume via one stream event wait."""
+    log = []
+    _record_remap_batch(monkeypatch, log)
+    compute_stream = _RecordingStream("compute", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda *args, **kwargs: _RecordingEvent(log, "reload_ready")
+    )
+
+    names = ["expert_fc1", "core_attn", "moe_act", "attn_proj"]
+    groups = [_RecordingGraphGroup(name, log) for name in names]
+    mgr = _make_local_graph_batch_manager(log)
+    runner = _RecordingRunner(groups)
+
+    assert mgr.local_graph_backward_prepare(runner)
+    assert runner.local_graph_reload_state == "reload_pending"
+    assert mgr.local_graph_backward_finish_prepare(runner)
+    assert runner.local_graph_reload_state == "reload_pending"
+    expected_reload_event = runner.local_graph_reload_event
+    assert mgr.local_graph_backward_wait_ready(runner, compute_stream)
+
+    reverse_names = list(reversed(names))
+    assert [e for e in log if e[0] == "runner.remap_and_copy_after"] == [
+        (
+            "runner.remap_and_copy_after",
+            tuple(reverse_names),
+            tuple(reverse_names),
+            "h2d",
+        )
+    ]
+    assert [e[1] for e in log if e[0] == "group.prepare_remap"] == reverse_names
+    assert [e[1] for e in log if e[0] == "group.adopt_reload_submission"] == reverse_names
+    assert [e for e in log if e[0] == "runner.wait_remap_copy_on_stream"] == [
+        ("runner.wait_remap_copy_on_stream", "h2d"),
+    ]
+    assert ("compute.wait_event", expected_reload_event) in log
+    assert runner.local_graph_reload_state is None
+    assert mgr._local_graph_h2d_bytes == sum(g.logical_bytes for g in groups)
+
+
+def test_local_graph_backward_wait_ready_primes_unprefetched_runner(monkeypatch):
+    """The unprefetched fallback path synchronously submits and waits its own reload.
+
+    prepare() blocks until the worker submitted the H2D (wait before
+    prepare_remap bookkeeping); wait_ready then only installs the
+    compute-stream dependency on the completed context.
+    """
+    log = []
+    _record_remap_batch(monkeypatch, log)
+    compute_stream = _RecordingStream("compute", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda *args, **kwargs: _RecordingEvent(log, "reload_ready")
+    )
+    runner = _RecordingRunner([_RecordingGraphGroup("first", log)])
+    mgr = _make_local_graph_batch_manager(log)
+
+    assert mgr.local_graph_backward_wait_ready(runner, compute_stream)
+
+    assert [e[0] for e in log] == [
+        "runner.remap_and_copy_after",
+        "runner.wait_remap_copy_on_stream",
+        "reload_ready.record",
+        "group.prepare_remap",
+        "compute.wait_event",
+        "group.adopt_reload_submission",
+    ]
+
+
+def test_local_graph_forward_replay_primes_first_backward_runner(monkeypatch):
+    """The backward-chain head dispatches its reload at forward-D2H time.
+
+    Without this, the runner consumed first in backward has no predecessor
+    replay to look ahead from, so its own backward() would submit the remap
+    and immediately host-wait for it (absorbing the RemapWorker latency,
+    including the muMemSetAccess in-flight-DMA drain) on the critical path.
+    """
+    log = []
+    _record_remap_batch(monkeypatch, log)
+    compute_stream = _RecordingStream("compute", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda *args, **kwargs: _RecordingEvent(log, "reload_ready")
+    )
+    first = _RecordingRunner([_RecordingGraphGroup("first", log)])
+    first.is_first_bwd_runner = True
+    later = _RecordingRunner([_RecordingGraphGroup("later", log)])
+    mgr = _make_local_graph_batch_manager(log)
+
+    # Forward replay of the chain head submits its reload immediately after
+    # the D2H burst; later runners are not touched here.
+    mgr.local_graph_forward_replay(first)
+    assert first.local_graph_reload_state == "reload_pending"
+    assert [e[0] for e in log if e[0] == "runner.remap_and_copy_after"] == [
+        "runner.remap_and_copy_after"
+    ]
+    assert not any(e[1] == "later" for e in log if e[0] == "group.prepare_remap")
+
+    mgr.local_graph_forward_replay(later)
+    assert later.local_graph_reload_state is None
+    assert [e[0] for e in log if e[0] == "runner.remap_and_copy_after"] == [
+        "runner.remap_and_copy_after"
+    ]
+
+    # Backward consumption of the head no longer submits anything; it only
+    # installs the stream wait and adopts the already-submitted reload.
+    # (`later`'s D2H entries sit between because its forward replay ran too.)
+    assert mgr.local_graph_backward_wait_ready(first, compute_stream)
+    assert [entry[0] for entry in log] == [
+        "group.enqueue_d2h",
+        "group.try_release",
+        "runner.remap_and_copy_after",
+        "group.prepare_remap",
+        "group.enqueue_d2h",
+        "group.try_release",
+        "runner.wait_remap_copy_on_stream",
+        "reload_ready.record",
+        "compute.wait_event",
+        "group.adopt_reload_submission",
+    ]
+
+
+def test_local_graph_ping_pong_forward_fences_bank_reuse(monkeypatch):
+    """A reused resident bank waits for its previous D2H before graph replay."""
+    log = []
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _RecordingStream("compute", log))
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    mgr = _make_local_graph_batch_manager(log)
+    _configure_ping_pong_manager(mgr, log)
+    groups = [_RecordingGraphGroup("expert_fc1", log)]
+    first = _RecordingRunner(groups, slot_bank=0)
+    second = _RecordingRunner([_RecordingGraphGroup("expert_fc1", log)], slot_bank=0)
+
+    # Simulate the first replay completing its D2H, then reuse the same bank.
+    mgr.local_graph_forward_replay(first)
+    assert mgr.local_graph_forward_wait_ready(second, _RecordingStream("replay", log))
+    assert ("replay.wait_event", mgr._local_graph_bank_d2h_events[0]) in log
+    assert not any(entry[0] == "group.try_release" for entry in log)
+
+
+def test_local_graph_ping_pong_backward_uses_two_banks_and_consumed_fence(monkeypatch):
+    """Adjacent reloads use different banks; a later same-bank reload fences consumption."""
+    log = []
+    compute_stream = _RecordingStream("compute", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: _RecordingEvent(log, "reload_ready"))
+    monkeypatch.setattr("megatron.core.pipeline_parallel.fine_grained_activation_offload.remap_and_copy_after", lambda *args: pytest.fail("VMM remap used in resident mode"))
+    mgr = _make_local_graph_batch_manager(log)
+    _configure_ping_pong_manager(mgr, log)
+    mgr._local_graph_bank_d2h_recorded = [True, True]
+    runners = [
+        _RecordingRunner([_RecordingGraphGroup("g0", log)], 0),
+        _RecordingRunner([_RecordingGraphGroup("g1", log)], 1),
+        _RecordingRunner([_RecordingGraphGroup("g2", log)], 0),
+    ]
+    consumed = _RecordingEvent(log, "consumed0")
+
+    assert mgr.local_graph_backward_prepare(runners[0])
+    assert mgr.local_graph_backward_wait_ready(runners[0], compute_stream)
+    mgr.local_graph_backward_mark_consumed(runners[0], consumed)
+    assert mgr.local_graph_backward_prepare(runners[1])
+    assert mgr.local_graph_backward_wait_ready(runners[1], compute_stream)
+    assert mgr.local_graph_backward_prepare(runners[2])
+
+    h2d_waits = [entry for entry in log if entry[0] == "h2d.wait_event"]
+    # Runner 2 reuses bank 0 and must wait for runner 0's consumed event.
+    assert any(entry[1] is consumed for entry in h2d_waits)
+    assert [entry[1] for entry in log if entry[0] == "group.enqueue_resident_h2d"] == ["g0", "g1", "g2"]
+    assert not any(entry[0] == "runner.remap_and_copy_after" for entry in log)
+
+
+    """With no active groups, neither replay path touches streams or groups."""
+    log = []
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "compute")
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+
+    groups = [_RecordingGraphGroup("empty", log, num_tensors=0)]
+    mgr = _make_local_graph_batch_manager(log)
+    runner = _RecordingRunner(groups)
+
+    mgr.local_graph_forward_replay(runner)
+    mgr.local_graph_backward_replay(runner)
+
+    assert log == []
+    assert mgr._local_graph_d2h_bytes == 0
+    assert mgr._local_graph_h2d_bytes == 0

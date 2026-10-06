@@ -270,7 +270,14 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             cp_rank,
             cp_size,
         )
-        ctx.save_for_backward(cos, sin)
+        # Clone cos/sin before saving: the rotary_pos_emb table is shared across
+        # the Q and KV RoPE autograd functions (same tensor passed to both), and
+        # an in-place op elsewhere in the captured layer bumps the table's
+        # autograd version after this save, making backward raise "variable
+        # needed for gradient computation has been modified by an inplace
+        # operation". Saving a private clone detaches our saved copy from any
+        # later in-place mutation of the shared table.
+        ctx.save_for_backward(cos.clone(), sin.clone())
         ctx.qk_head_dim = qk_head_dim
         ctx.emb_dim = emb_dim
         ctx.cu_seqlens_q = cu_seqlens_q
@@ -658,7 +665,11 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             cp_rank,
             cp_size,
         )
-        ctx.save_for_backward(cos, sin)
+        # Clone cos/sin before saving -- see the same note in
+        # ApplyMLARotaryEmbQ.forward. The KV path and the Q path share one
+        # rotary_pos_emb table; without a clone a later in-place op on the
+        # shared table breaks this backward too.
+        ctx.save_for_backward(cos.clone(), sin.clone())
         ctx.rotary_interleaved = rotary_interleaved
         ctx.emb_dim = emb_dim
         ctx.k_dim = k_dim

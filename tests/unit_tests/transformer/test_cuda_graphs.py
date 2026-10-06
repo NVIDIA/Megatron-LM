@@ -35,6 +35,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _CudaGraphRunner,
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import (
@@ -65,8 +66,83 @@ from tests.unit_tests.test_utilities import Utils
 fp8_available, _ = check_fp8_support()
 
 
+def test_backward_runner_links_follow_recorded_order():
+    """Backward prefetch links use recorded schedule order and include empty runners."""
+
+    class Runner:
+        next_bwd_runner = None
+
+    first, empty, last = Runner(), Runner(), Runner()
+    old_record = _CudagraphGlobalRecord.cudagraph_record
+    old_runners = _CudagraphGlobalRecord.backward_runners
+    try:
+        _CudagraphGlobalRecord.cudagraph_record = [
+            (first, "fwd", (), {}, None),
+            (first, "bwd"),
+            (empty, "bwd"),
+            (last, "bwd"),
+        ]
+        _CudagraphGlobalRecord._link_backward_runners()
+
+        assert first.next_bwd_runner is empty
+        assert empty.next_bwd_runner is last
+        assert last.next_bwd_runner is None
+    finally:
+        _CudagraphGlobalRecord.cudagraph_record = old_record
+        _CudagraphGlobalRecord.backward_runners = old_runners
+
+
+def test_backward_runner_links_assign_ping_pong_banks():
+    """Resident local-graph slots follow the recorded backward consumption order."""
+
+    class Runner:
+        next_bwd_runner = None
+
+        def __init__(self, uses_local_offload):
+            self.uses_local_offload = uses_local_offload
+
+        def _uses_local_graph_activation_offload(self):
+            return self.uses_local_offload
+
+    runners = [Runner(True), Runner(False), Runner(True)]
+    old_record = _CudagraphGlobalRecord.cudagraph_record
+    old_runners = _CudagraphGlobalRecord.backward_runners
+    try:
+        _CudagraphGlobalRecord.cudagraph_record = [(runner, "bwd") for runner in runners]
+        _CudagraphGlobalRecord._link_backward_runners()
+        assert [runner.local_graph_slot_bank for runner in runners] == [0, None, 1]
+        assert runners[0].next_bwd_runner is runners[1]
+        assert runners[1].next_bwd_runner is runners[2]
+        assert runners[2].next_bwd_runner is None
+        # Only the first backward-consumed runner is marked; its reload is
+        # dispatched at forward-D2H time instead of inside its own backward().
+        assert runners[0].is_first_bwd_runner is True
+        assert runners[1].is_first_bwd_runner is False
+        assert runners[2].is_first_bwd_runner is False
+        assert all(runner.local_graph_forward_runner is runner for runner in runners)
+    finally:
+        _CudagraphGlobalRecord.cudagraph_record = old_record
+        _CudagraphGlobalRecord.backward_runners = old_runners
+
+
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def test_runner_recognizes_attention_norm_local_graph_offload():
+    """Whole-layer local graphs treat attention norm as a resident activation group."""
+
+    class Module:
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[],
+            fine_grained_activation_offloading=True,
+            offload_modules=['attn_norm'],
+        )
+
+    runner = object.__new__(_CudaGraphRunner)
+    runner.base_module = Module()
+    assert runner._uses_local_graph_activation_offload()
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
@@ -134,16 +210,15 @@ class TestCudaGraphConfigAndArguments:
                 offload_modules=['qkv_linear'],
             )
 
-    def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
-        with pytest.raises(
-            AssertionError, match="not supported with whole-layer CUDA graph capture"
-        ):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                fine_grained_activation_offloading=True,
-                offload_modules=['expert_fc1'],
-            )
+    def test_local_impl_allows_full_layer_graph_with_activation_offload(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[],
+            fine_grained_activation_offloading=True,
+            offload_modules=['attn_norm'],
+        )
+        assert cfg.cuda_graph_impl == 'local'
+        assert cfg.offload_modules == ['attn_norm']
 
     def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
         with pytest.raises(
