@@ -384,7 +384,11 @@ class TestNVLSAllGatherVDispatcher:
     @classmethod
     def teardown_class(cls):
         from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
 
+        NVLSAllGatherVDispatcher._delete_buffers()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
