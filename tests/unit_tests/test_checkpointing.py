@@ -520,7 +520,7 @@ def create_checkpoint(load_path, ckpt_format):
 
 
 @pytest.fixture
-def create_args():
+def create_args(run_config):
     """Setup dummy args."""
     args = SimpleNamespace()
     args.finetune = False
