@@ -7,7 +7,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from megatron.core.context_parallel_layout import ThdCpRoute
+    from megatron.core.context_parallel import ThdCpRoute
 
 
 @dataclass

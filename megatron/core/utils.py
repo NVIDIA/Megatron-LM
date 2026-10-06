@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
 
@@ -56,15 +56,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -2597,30 +2588,24 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
         partitioned to this CP rank.
     """
+    from megatron.core.context_parallel.partition import get_cp_partition_indices, partition_batch
+
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
     if cp_size > 1:
-        # cu_seqlens / cu_seqlens_padded carry a leading batch dim (1, n).
-        # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze
-        # the batch dim inline without mutating the batch dict.
-        cu_seqlens_for_te = (
-            batch["cu_seqlens_padded"]
-            if batch["cu_seqlens_padded"] is not None
-            else batch["cu_seqlens"]
-        )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+        # Ordinary batches carry a leading batch dimension; scheduler batches use the
+        # same partition helper on flattened tensors.
+        cu_seqlens = batch.get("cu_seqlens_padded")
+        if cu_seqlens is None:
+            cu_seqlens = batch["cu_seqlens"]
+        sequence_tensor = batch["tokens"] if batch["tokens"] is not None else batch["labels"]
+        partition = get_cp_partition_indices(
+            cu_seqlens[0], sequence_tensor.size(1), cp_size, cp_rank, "zigzag"
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
-        for key in SEQUENCE_KEYS:
-            if batch.get(key) is not None:
-                batch[key] = batch[key].index_select(1, index)
+        partition_batch(
+            batch, ('tokens', 'labels', 'loss_mask', 'position_ids'), partition, seq_dim=1
+        )
     return batch
 
 

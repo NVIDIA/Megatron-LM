@@ -7,10 +7,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
-from megatron.core.context_parallel_layout.utils import (
-    get_packed_seq_params_cp_partition_cu_seqlens,
-)
+from megatron.core.context_parallel.metadata import get_packed_seq_params_cp_partition_cu_seqlens
+from megatron.core.context_parallel.types import CpPartitionMode, ThdCpRoute
 from megatron.core.utils import nvtx_range
 
 if TYPE_CHECKING:

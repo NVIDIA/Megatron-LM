@@ -30,7 +30,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.core import parallel_state
-from megatron.core.context_parallel_layout import CpPartitionMode, prebuild_thd_cp_partition_routes
+from megatron.core.context_parallel import CpPartitionMode, prebuild_thd_cp_partition_routes
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,

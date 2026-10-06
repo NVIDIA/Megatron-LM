@@ -23,7 +23,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
+from megatron.core.context_parallel import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset

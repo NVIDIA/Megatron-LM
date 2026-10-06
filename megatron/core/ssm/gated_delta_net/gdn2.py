@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -13,8 +13,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
-from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
+from megatron.core.context_parallel import (
+    CpPartitionModeConverter,
+    convert_module_input_tensors_cp_partition_mode,
+)
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams

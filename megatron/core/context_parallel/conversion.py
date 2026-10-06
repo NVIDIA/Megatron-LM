@@ -3,20 +3,17 @@
 """Tensor operations for converting between CP partition modes."""
 
 import warnings
-from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Union, cast
 
 import torch
 
-from megatron.core.context_parallel_layout.routes import (
+from megatron.core.context_parallel.layout import _redistribute_layout
+from megatron.core.context_parallel.metadata import get_packed_seq_params_cp_partition_cu_seqlens
+from megatron.core.context_parallel.routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
-from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
-from megatron.core.context_parallel_layout.utils import (
-    get_packed_seq_params_cp_partition_cu_seqlens,
-)
+from megatron.core.context_parallel.types import CpPartitionMode, ThdCpRoute
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import nvtx_range
 
@@ -272,7 +269,7 @@ def convert_cp_partition_mode(
 
     if cu_seqlens is None:
         moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
-        converted = _redistribute_sbhd_layout(
+        converted = _redistribute_layout(
             input_=moved,
             cp_group=cp_group,
             source_layout=source_layout,
@@ -433,261 +430,3 @@ def _redistribute_thd_layout(
         if seq_dim != 0:
             out = out.movedim(0, seq_dim)
         return out.contiguous()
-
-
-@dataclass(frozen=True)
-class _SbhdLayoutRedistributionPlan:
-    """Rank-local SBHD all-to-all plan expressed in sequence-segment counts."""
-
-    send_slots: tuple[int, ...]
-    input_segment_counts: tuple[int, ...]
-    output_segment_counts: tuple[int, ...]
-    receive_permutation: tuple[int, ...]
-
-
-def _sbhd_segments_per_rank(tp_size: int) -> int:
-    """Return two SBHD segments for CP-only conversion and one for even-TP SP conversion."""
-    if tp_size == 1:
-        return 2
-    if tp_size % 2 != 0:
-        raise ValueError(
-            "Sequence-parallel SBHD CP layout conversion requires an even tensor-parallel size, "
-            f"got {tp_size}"
-        )
-    return 1
-
-
-def _local_sbhd_segment_ids(
-    layout: CpPartitionMode, cp_size: int, cp_rank: int, tp_size: int = 1, tp_rank: int = 0
-) -> tuple[int, ...]:
-    """Return the atomic SBHD sequence segments owned by one TP×CP rank."""
-    segments_per_rank = _sbhd_segments_per_rank(tp_size=tp_size)
-    if layout == "contiguous":
-        first_segment = segments_per_rank * (cp_rank * tp_size + tp_rank)
-        return tuple(range(first_segment, first_segment + segments_per_rank))
-    if layout == "zigzag":
-        segments_per_cp_half = tp_size * segments_per_rank // 2
-        front_start = cp_rank * segments_per_cp_half
-        back_start = (2 * cp_size - cp_rank - 1) * segments_per_cp_half
-        cp_segments = tuple(range(front_start, front_start + segments_per_cp_half)) + tuple(
-            range(back_start, back_start + segments_per_cp_half)
-        )
-        sp_start = segments_per_rank * tp_rank
-        return cp_segments[sp_start : sp_start + segments_per_rank]
-    raise ValueError(f"Unsupported CP layout: {layout}")
-
-
-@lru_cache(maxsize=None)
-def _sbhd_segment_owner(
-    segment_id: int, layout: CpPartitionMode, cp_size: int, tp_size: int
-) -> tuple[int, int]:
-    for cp_rank in range(cp_size):
-        for tp_rank in range(tp_size):
-            if segment_id in _local_sbhd_segment_ids(
-                layout=layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
-            ):
-                return cp_rank, tp_rank
-    raise ValueError(
-        f"SBHD segment {segment_id} is not present in the {layout} layout for "
-        f"{cp_size=} and {tp_size=}"
-    )
-
-
-@lru_cache(maxsize=None)
-def _build_sbhd_group_rank_by_logical_rank(
-    cp_global_ranks: tuple[int, ...],
-    tp_global_ranks: tuple[int, ...],
-    tp_cp_global_ranks: tuple[int, ...],
-    current_global_rank: int,
-) -> tuple[int, ...]:
-    """Map logical ``cp_rank * tp_size + tp_rank`` coordinates to group ranks for SBHD."""
-    group_rank_by_global_rank = {
-        global_rank: group_rank for group_rank, global_rank in enumerate(tp_cp_global_ranks)
-    }
-    group_rank_by_logical_rank = []
-    for cp_global_rank in cp_global_ranks:
-        for tp_global_rank in tp_global_ranks:
-            target_global_rank = cp_global_rank + tp_global_rank - current_global_rank
-            if target_global_rank not in group_rank_by_global_rank:
-                raise RuntimeError(
-                    "TP and CP process groups do not form the expected Cartesian product"
-                )
-            group_rank_by_logical_rank.append(group_rank_by_global_rank[target_global_rank])
-    return tuple(group_rank_by_logical_rank)
-
-
-def _get_sbhd_group_rank_by_logical_rank(
-    cp_group: torch.distributed.ProcessGroup,
-    tp_group: torch.distributed.ProcessGroup,
-    tp_cp_group: torch.distributed.ProcessGroup,
-) -> tuple[int, ...]:
-    return _build_sbhd_group_rank_by_logical_rank(
-        cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(cp_group)),
-        tp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_group)),
-        tp_cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_cp_group)),
-        current_global_rank=torch.distributed.get_rank(),
-    )
-
-
-@lru_cache(maxsize=None)
-def _build_sbhd_layout_redistribution_plan(
-    source_layout: CpPartitionMode,
-    target_layout: CpPartitionMode,
-    cp_size: int,
-    cp_rank: int,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    group_rank_by_logical_rank: tuple[int, ...] | None = None,
-) -> _SbhdLayoutRedistributionPlan:
-    """Build the SBHD all-to-all-v plan for one rank of a CP layout conversion."""
-    if cp_size < 1:
-        raise ValueError(f"cp_size must be positive, got {cp_size}")
-    if tp_size < 1:
-        raise ValueError(f"tp_size must be positive, got {tp_size}")
-    if not 0 <= cp_rank < cp_size:
-        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
-    if not 0 <= tp_rank < tp_size:
-        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
-
-    group_size = cp_size * tp_size
-    if group_rank_by_logical_rank is None:
-        group_rank_by_logical_rank = tuple(range(group_size))
-    if sorted(group_rank_by_logical_rank) != list(range(group_size)):
-        raise ValueError("group_rank_by_logical_rank must be a permutation of the group ranks")
-
-    source_ids = _local_sbhd_segment_ids(
-        layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
-    )
-    target_ids = _local_sbhd_segment_ids(
-        layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
-    )
-
-    def destination_group_rank(segment_id: int) -> int:
-        destination_cp_rank, destination_tp_rank = _sbhd_segment_owner(
-            segment_id=segment_id, layout=target_layout, cp_size=cp_size, tp_size=tp_size
-        )
-        destination_logical_rank = destination_cp_rank * tp_size + destination_tp_rank
-        return group_rank_by_logical_rank[destination_logical_rank]
-
-    send_entries = sorted(
-        (destination_group_rank(segment_id=segment_id), slot)
-        for slot, segment_id in enumerate(source_ids)
-    )
-    send_slots = tuple(slot for _, slot in send_entries)
-    input_segment_counts = tuple(
-        sum(destination == rank for destination, _ in send_entries) for rank in range(group_size)
-    )
-
-    received_ids = []
-    output_segment_counts = []
-    source_logical_ranks = sorted(
-        range(group_size), key=lambda logical_rank: group_rank_by_logical_rank[logical_rank]
-    )
-    for source_logical_rank in source_logical_ranks:
-        source_cp_rank, source_tp_rank = divmod(source_logical_rank, tp_size)
-        rank_source_ids = _local_sbhd_segment_ids(
-            layout=source_layout,
-            cp_size=cp_size,
-            cp_rank=source_cp_rank,
-            tp_size=tp_size,
-            tp_rank=source_tp_rank,
-        )
-        ids_from_source = [
-            segment_id
-            for segment_id in rank_source_ids
-            if _sbhd_segment_owner(
-                segment_id=segment_id, layout=target_layout, cp_size=cp_size, tp_size=tp_size
-            )
-            == (cp_rank, tp_rank)
-        ]
-        received_ids.extend(ids_from_source)
-        output_segment_counts.append(len(ids_from_source))
-
-    if sorted(received_ids) != sorted(target_ids):
-        raise RuntimeError(
-            f"Invalid {source_layout}-to-{target_layout} SBHD redistribution plan for "
-            f"CP rank {cp_rank}, TP rank {tp_rank}: received {received_ids}, "
-            f"expected {target_ids}"
-        )
-    receive_permutation = tuple(received_ids.index(segment_id) for segment_id in target_ids)
-
-    return _SbhdLayoutRedistributionPlan(
-        send_slots=send_slots,
-        input_segment_counts=input_segment_counts,
-        output_segment_counts=tuple(output_segment_counts),
-        receive_permutation=receive_permutation,
-    )
-
-
-def _redistribute_sbhd_layout(
-    input_: torch.Tensor,
-    cp_group: torch.distributed.ProcessGroup,
-    source_layout: CpPartitionMode,
-    target_layout: CpPartitionMode,
-    sequence_parallel: bool,
-    tp_group: Optional[torch.distributed.ProcessGroup],
-    tp_cp_group: Optional[torch.distributed.ProcessGroup],
-) -> torch.Tensor:
-    """Redistribute local SBHD sequence segments with a differentiable all-to-all-v."""
-    cp_size = cp_group.size()
-    if cp_size == 1 or source_layout == target_layout:
-        return input_
-
-    cp_rank = cp_group.rank()
-    tp_size, tp_rank = 1, 0
-    communication_group = cp_group
-    group_rank_by_logical_rank = None
-    if sequence_parallel and tp_group is not None and tp_group.size() > 1:
-        if tp_cp_group is None:
-            raise ValueError(
-                "tp_cp_group is required for direct sequence-parallel SBHD layout conversion"
-            )
-        tp_size, tp_rank = tp_group.size(), tp_group.rank()
-        communication_group = tp_cp_group
-        group_rank_by_logical_rank = _get_sbhd_group_rank_by_logical_rank(
-            cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
-        )
-
-    plan = _build_sbhd_layout_redistribution_plan(
-        source_layout=source_layout,
-        target_layout=target_layout,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        group_rank_by_logical_rank=group_rank_by_logical_rank,
-    )
-
-    input_contiguous = input_.contiguous()
-    local_seq_len = input_contiguous.shape[0]
-    local_segment_count = _sbhd_segments_per_rank(tp_size=tp_size)
-    if local_seq_len % local_segment_count != 0:
-        raise ValueError(
-            "SBHD CP layout conversion requires the sequence length local to each TP×CP rank to "
-            f"be divisible by {local_segment_count}, got {local_seq_len}"
-        )
-    segment_len = local_seq_len // local_segment_count
-    segment_shape = (local_segment_count, segment_len, *input_contiguous.shape[1:])
-    segments = input_contiguous.reshape(segment_shape)
-
-    if plan.send_slots == tuple(range(local_segment_count)):
-        send_buffer = input_contiguous
-    else:
-        send_buffer = segments.flip(0).reshape(input_contiguous.shape)
-    input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
-    output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
-    conversion_name = f"{source_layout}_to_{target_layout}"
-    with nvtx_range(f"cp_layout/sbhd/all_to_all/{conversion_name}"):
-        received = all_to_all(
-            group=communication_group,
-            input_=send_buffer,
-            output_split_sizes_=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-        )
-
-    received_segments = received.reshape(segment_shape)
-    if plan.receive_permutation == tuple(range(local_segment_count)):
-        output = received
-    else:
-        output = received_segments.flip(0).reshape(input_contiguous.shape)
-    return output.contiguous()

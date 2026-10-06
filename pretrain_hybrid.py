@@ -23,8 +23,11 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
-from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
+from megatron.core.context_parallel import (
+    ContextParallelBatch,
+    finalize_packed_seq_params,
+    get_batches_on_this_cp_rank,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -123,6 +126,11 @@ def get_batch(data_iterator, vp_stage=None):
             ),
             vp_stage=vp_stage,
             config=config,
+        )
+        # Scheduler batches have one physical view, so module adapters own conversion.
+        # Managed batches below already prebuild their layout plan in the batch builder.
+        finalize_packed_seq_params(
+            packed_seq_params=packed_seq_params, cp_group=get_context_parallel_group()
         )
         return ContextParallelBatch.from_single_layout(
             layout=config.cp_partition_mode,
@@ -341,17 +349,6 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        seen_packed_seq_params = set()
-        for layout_packed_seq_params in cp_batch.packed_seq_params_by_layout.values():
-            if (
-                layout_packed_seq_params is None
-                or id(layout_packed_seq_params) in seen_packed_seq_params
-            ):
-                continue
-            seen_packed_seq_params.add(id(layout_packed_seq_params))
-            finalize_packed_seq_params(
-                packed_seq_params=layout_packed_seq_params, cp_group=get_context_parallel_group()
-            )
         if cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 

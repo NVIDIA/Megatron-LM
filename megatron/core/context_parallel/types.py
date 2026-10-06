@@ -7,7 +7,9 @@ from typing import List, Literal, Optional
 
 import torch
 
-CpPartitionMode = Literal["zigzag", "contiguous"]
+CPLayout = Literal["contiguous", "zigzag"]
+# Compatibility spelling used by module-boundary conversion callers.
+CpPartitionMode = CPLayout
 
 
 @dataclass

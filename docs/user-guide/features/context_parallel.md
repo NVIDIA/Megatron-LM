@@ -38,3 +38,44 @@ CP addresses these tradeoffs. With CP, each GPU computes on part of the sequence
 CP support is included on the GPT code path. Other models that share that path, such as LLaMA, can use CP as well. CP works with TP (tensor model parallelism), PP (pipeline model parallelism), and DP (data parallelism). The total GPU count is TP × CP × PP × DP. CP also works with different attention variants, including MHA, MQA, and GQA, with unidirectional or bidirectional masking.
 
 Enable CP by setting `context_parallel_size=<CP_SIZE>` on the command line. The default `context_parallel_size` is 1, which disables CP. Running with CP requires Megatron Core (>=0.5.0) and Transformer Engine (>=1.1).
+
+
+## Physical layouts and conversion ownership
+
+`megatron.core.context_parallel` owns layout conversion, route preparation and batch
+partitioning. `megatron.core.context_parallel_layout` retains compatibility exports
+for its public APIs; new code should use `context_parallel`.
+
+The `zigzag` layout assigns two chunks of each sequence to a CP rank to balance
+causal attention. The `contiguous` layout assigns a contiguous interval of the
+packed token stream. `cp_partition_mode` describes the module-boundary layout;
+`linear_cp_layout` and `attention_cp_layout` describe Hybrid layer preferences.
+These settings have different roles and are not aliases.
+
+Both Hybrid's cross-layer layout manager and module-boundary adapters use the
+same SBHD redistribution primitive. With sequence parallelism it communicates
+directly over TP×CP; without sequence parallelism it uses the CP group. Module
+adapters also handle alternate sequence dimensions and restore the caller's layout.
+
+THD plans are prepared with the batch that owns their physical token ordering:
+
+- Managed Hybrid batches prepare layout-specific metadata and a `THDCPLayoutPlan`
+  in `get_batches_on_this_cp_rank`. The plan may connect different local token counts
+  when zigzag attention requires extra padding. Forward reuses that plan without
+  also building equal-length module routes for those metadata views.
+- Sequence-packing scheduler batches have one physical layout. Hybrid batch
+  preparation finalizes their `PackedSeqParams.cp_partition_route` for module-local
+  conversion before entering the model. GPT prepares its module route before model
+  forward as well.
+
+The two THD contracts remain distinct: module routes require packed sequence
+lengths divisible by `2 * CP` and preserve local token count, while managed plans
+can insert zigzag padding. Module THD conversion with sequence parallelism retains
+its TP gather, CP all-to-all, TP scatter path. Batch metadata and route geometry
+must match the active process group and the actual physical layout.
+
+Scheduler `[T]` tensors and ordinary `[B, T]` tensors share CP row selection with an
+explicit sequence dimension. Their adapters retain padding policy and mask handling;
+in particular, dense attention-mask query rows remain zigzag. Per-document zigzag
+selection uses a shared Transformer Engine wrapper after the adapter has prepared
+aligned sequence boundaries.

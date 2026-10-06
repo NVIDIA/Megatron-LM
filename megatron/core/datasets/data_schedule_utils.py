@@ -1,10 +1,10 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from typing import Dict, List, Literal, Optional, Sequence
 
 import torch
 
-from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
+from megatron.core.context_parallel.partition import get_cp_partition_indices, partition_batch
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
@@ -56,29 +56,10 @@ def get_cp_slice_for_thd(
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
     if cp_size <= 1:
         return
-    if cp_partition_mode == "contiguous":
-        if total_tokens % cp_size != 0:
-            raise RuntimeError(
-                f"Contiguous CP slicing requires total_tokens={total_tokens} to be divisible by "
-                f"cp_size={cp_size}."
-            )
-        local_rows = total_tokens // cp_size
-        row_slice = slice(cp_rank * local_rows, (cp_rank + 1) * local_rows)
-        for key in keys:
-            if key in batch and batch[key] is not None:
-                batch[key] = batch[key][row_slice]
-        return
-
-    if cp_partition_mode != "zigzag":
-        raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode}")
-
-    cu_seqlens_for_index = (
-        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(dtype=torch.int32)
+    partition = get_cp_partition_indices(
+        cu_seqlens, total_tokens, cp_size, cp_rank, cp_partition_mode
     )
-    index = get_thd_partitioned_indices(cu_seqlens_for_index, total_tokens, cp_size, cp_rank)
-    for key in keys:
-        if key in batch and batch[key] is not None:
-            batch[key] = batch[key].index_select(0, index)
+    partition_batch(batch, keys, partition, seq_dim=0)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:

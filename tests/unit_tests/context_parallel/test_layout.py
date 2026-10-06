@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
 
@@ -23,6 +23,7 @@ from megatron.core.context_parallel.layout import (
     _build_thd_zigzag_metadata,
     _get_layout_parallel_context,
     _local_segment_ids,
+    _segments_per_rank,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
@@ -261,59 +262,64 @@ def test_group_rank_mapping_handles_parallel_rank_order(
 
 
 @pytest.mark.parametrize(
-    ("cp_size", "tp_size"), [(2, 1), (3, 2), (4, 4)], ids=["cp2", "cp3-tp2", "cp4-tp4"]
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
 )
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("contiguous", "zigzag"), ("zigzag", "contiguous")]
+    ("cp_size", "tp_size", "group_rank_by_logical_rank"),
+    [
+        (2, 1, (0, 1)),
+        (3, 1, (0, 1, 2)),
+        (2, 2, (0, 2, 1, 3)),
+        (2, 4, tuple(range(8))),
+        (3, 2, tuple(range(6))),
+        (4, 4, tuple(range(16))),
+    ],
 )
-def test_layout_redistribution_plan_restores_target_segments(
-    cp_size, tp_size, source_layout, target_layout
+def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
+    source_layout, target_layout, cp_size, tp_size, group_rank_by_logical_rank
 ):
     group_size = cp_size * tp_size
-    sent_by_rank = []
-    for source_logical_rank in range(group_size):
-        source_cp_rank, source_tp_rank = divmod(source_logical_rank, tp_size)
-        plan = _build_layout_redistribution_plan(
-            source_layout,
-            target_layout,
-            cp_size,
-            source_cp_rank,
-            tp_size=tp_size,
-            tp_rank=source_tp_rank,
-        )
-        source_ids = _local_segment_ids(
-            source_layout, cp_size, source_cp_rank, tp_size=tp_size, tp_rank=source_tp_rank
-        )
-        send_ids = [source_ids[slot] for slot in plan.send_slots]
-        offset = 0
-        destinations = []
-        for target_rank, count in enumerate(plan.input_segment_counts):
-            destinations.extend(
-                (target_rank, segment_id) for segment_id in send_ids[offset : offset + count]
-            )
-            offset += count
-        sent_by_rank.append(destinations)
+    plans = [None] * group_size
+    sends = [[None] * group_size for _ in range(group_size)]
 
-    for target_logical_rank in range(group_size):
-        target_cp_rank, target_tp_rank = divmod(target_logical_rank, tp_size)
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        cp_rank, tp_rank = divmod(logical_rank, tp_size)
+        source_ids = _local_segment_ids(
+            layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+        )
         plan = _build_layout_redistribution_plan(
-            source_layout,
-            target_layout,
-            cp_size,
-            target_cp_rank,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
             tp_size=tp_size,
-            tp_rank=target_tp_rank,
+            tp_rank=tp_rank,
+            group_rank_by_logical_rank=group_rank_by_logical_rank,
         )
-        received = [
+        plans[group_rank] = plan
+        packed_ids = tuple(source_ids[slot] for slot in plan.send_slots)
+        offset = 0
+        for destination, count in enumerate(plan.input_segment_counts):
+            sends[group_rank][destination] = packed_ids[offset : offset + count]
+            offset += count
+
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        cp_rank, tp_rank = divmod(logical_rank, tp_size)
+        plan = plans[group_rank]
+        received_ids = tuple(
             segment_id
-            for source_entries in sent_by_rank
-            for destination, segment_id in source_entries
-            if destination == target_logical_rank
-        ]
-        actual = tuple(received[index] for index in plan.receive_permutation)
-        assert actual == _local_segment_ids(
-            target_layout, cp_size, target_cp_rank, tp_size=tp_size, tp_rank=target_tp_rank
+            for source_group_rank in range(group_size)
+            for segment_id in sends[source_group_rank][group_rank]
         )
+        output_ids = tuple(received_ids[index] for index in plan.receive_permutation)
+        assert output_ids == _local_segment_ids(
+            layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+        )
+
+
+def test_sbhd_layout_redistribution_rejects_odd_tensor_parallel_size():
+    with pytest.raises(ValueError, match="even tensor-parallel size"):
+        _segments_per_rank(tp_size=3)
 
 
 def test_thd_zigzag_layout_pads_uneven_sequences():

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Context-parallel batch partitioning helpers."""
 
@@ -10,6 +10,7 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
+from .partition import get_cp_partition_indices, partition_batch
 
 
 @dataclass(eq=False)
@@ -91,8 +92,11 @@ def _get_batch_on_this_cp_rank_contiguous(
                 "can be redistributed to zigzag attention, "
                 f"got {val.shape[seq_dim]} and CP size {cp_size} for {key!r}."
             )
-        local_seq_len = val.shape[seq_dim] // cp_size
-        batch[key] = val.narrow(seq_dim, cp_rank * local_seq_len, local_seq_len).contiguous()
+        partition = get_cp_partition_indices(
+            None, val.shape[seq_dim], cp_size, cp_rank, "contiguous"
+        )
+        partition_batch(batch, (key,), partition, seq_dim=seq_dim)
+        batch[key] = batch[key].contiguous()
 
     return batch
 

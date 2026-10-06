@@ -5,16 +5,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import megatron.core.context_parallel_layout.conversion as context_parallel_layout_conversion
+import megatron.core.context_parallel.conversion as context_parallel_layout_conversion
 from megatron.core import parallel_state
-from megatron.core.context_parallel_layout import (
+from megatron.core.context_parallel import (
     CpPartitionModeConverter,
     ThdCpRoute,
     convert_module_input_tensors_cp_partition_mode,
     finalize_packed_seq_params,
     prebuild_thd_cp_partition_routes,
 )
-from megatron.core.context_parallel_layout.routes import (
+from megatron.core.context_parallel.routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
@@ -91,60 +91,6 @@ def _get_test_thd_token_indices(cu_seqlens, cp_size, cp_rank, cp_partition_mode)
         token_indices.extend(range(first_start, first_start + chunk_len))
         token_indices.extend(range(second_start, second_start + chunk_len))
     return torch.tensor(token_indices, dtype=torch.long)
-
-
-@pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
-)
-@pytest.mark.parametrize(
-    ("cp_size", "tp_size", "group_rank_by_logical_rank"),
-    [(3, 1, (0, 1, 2)), (2, 2, (0, 2, 1, 3)), (2, 4, tuple(range(8)))],
-)
-def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
-    source_layout, target_layout, cp_size, tp_size, group_rank_by_logical_rank
-):
-    group_size = cp_size * tp_size
-    plans = [None] * group_size
-    sends = [[None] * group_size for _ in range(group_size)]
-
-    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
-        cp_rank, tp_rank = divmod(logical_rank, tp_size)
-        source_ids = context_parallel_layout_conversion._local_sbhd_segment_ids(
-            layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
-        )
-        plan = context_parallel_layout_conversion._build_sbhd_layout_redistribution_plan(
-            source_layout=source_layout,
-            target_layout=target_layout,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            group_rank_by_logical_rank=group_rank_by_logical_rank,
-        )
-        plans[group_rank] = plan
-        packed_ids = tuple(source_ids[slot] for slot in plan.send_slots)
-        offset = 0
-        for destination, count in enumerate(plan.input_segment_counts):
-            sends[group_rank][destination] = packed_ids[offset : offset + count]
-            offset += count
-
-    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
-        cp_rank, tp_rank = divmod(logical_rank, tp_size)
-        plan = plans[group_rank]
-        received_ids = tuple(
-            segment_id
-            for source_group_rank in range(group_size)
-            for segment_id in sends[source_group_rank][group_rank]
-        )
-        output_ids = tuple(received_ids[index] for index in plan.receive_permutation)
-        assert output_ids == context_parallel_layout_conversion._local_sbhd_segment_ids(
-            layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
-        )
-
-
-def test_sbhd_layout_redistribution_rejects_odd_tensor_parallel_size():
-    with pytest.raises(ValueError, match="even tensor-parallel size"):
-        context_parallel_layout_conversion._sbhd_segments_per_rank(tp_size=3)
 
 
 @pytest.mark.parametrize(
@@ -413,8 +359,7 @@ def test_finalize_packed_seq_params_uses_caller_group_with_dynamic_override(monk
         calls.append((packed_seq_params, cp_group))
 
     monkeypatch.setattr(
-        "megatron.core.context_parallel_layout.routes.prebuild_thd_cp_partition_routes",
-        fake_prebuild,
+        "megatron.core.context_parallel.routes.prebuild_thd_cp_partition_routes", fake_prebuild
     )
 
     static_packed_seq_params = SimpleNamespace(cp_group=None)
@@ -664,7 +609,7 @@ def test_sbhd_conversion_uses_one_redistribution_path(monkeypatch, sequence_para
         return kwargs["input_"] + 1
 
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "_redistribute_sbhd_layout", fake_redistribute
+        context_parallel_layout_conversion, "_redistribute_layout", fake_redistribute
     )
 
     converted = context_parallel_layout_conversion.convert_cp_partition_mode(

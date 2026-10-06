@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
+from megatron.core.context_parallel import CpPartitionModeConverter
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser

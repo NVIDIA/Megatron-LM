@@ -11,8 +11,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
-from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
+from megatron.core.context_parallel import (
+    CpPartitionModeConverter,
+    convert_module_input_tensors_cp_partition_mode,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode

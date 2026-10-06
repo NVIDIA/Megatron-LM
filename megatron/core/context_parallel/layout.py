@@ -1,17 +1,16 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Context-parallel sequence-layout conversion."""
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Literal
 
 import torch
 
+from megatron.core.context_parallel.types import CPLayout
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all
-
-CPLayout = Literal["contiguous", "zigzag"]
+from megatron.core.utils import nvtx_range
 
 
 @dataclass(frozen=True)
@@ -194,6 +193,15 @@ def _build_layout_redistribution_plan(
     group_rank_by_logical_rank: tuple[int, ...] | None = None,
 ) -> _LayoutRedistributionPlan:
     """Build the all-to-all-v plan for one rank of a CP layout conversion."""
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+
     group_size = cp_size * tp_size
     if group_rank_by_logical_rank is None:
         group_rank_by_logical_rank = tuple(range(group_size))
@@ -518,12 +526,14 @@ def _redistribute_layout(
         send_buffer = segments.flip(0).reshape(input_contiguous.shape)
     input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
     output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
-    received = all_to_all(
-        group=context.communication_group,
-        input_=send_buffer,
-        output_split_sizes_=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-    )
+    conversion_name = f"{source_layout}_to_{target_layout}"
+    with nvtx_range(f"cp_layout/sbhd/all_to_all/{conversion_name}"):
+        received = all_to_all(
+            group=context.communication_group,
+            input_=send_buffer,
+            output_split_sizes_=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
 
     received_segments = received.reshape(segment_shape)
     if plan.receive_permutation == tuple(range(local_segment_count)):
