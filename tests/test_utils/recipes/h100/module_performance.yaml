@@ -56,5 +56,6 @@ products:
   - test_case: [moe_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # https://github.com/NVIDIA/Megatron-LM/issues/7739
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
