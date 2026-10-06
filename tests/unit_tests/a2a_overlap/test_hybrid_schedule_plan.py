@@ -25,6 +25,7 @@ def _hybrid_stack_stub(cp_layout_manager=None):
     stack = HybridStack.__new__(HybridStack)
     torch.nn.Module.__init__(stack)
     stack._cp_layout_manager = cp_layout_manager
+    stack._has_linear_layer_with_chunkwise_cp = False
     return stack
 
 
@@ -77,6 +78,25 @@ def test_hybrid_ep_overlap_checks_nested_cp_layouts(location, needs_conversion):
         with pytest.raises(ValueError, match="mixed context-parallel layouts"):
             HybridModel._validate_ep_overlap_support(model)
     else:
+        HybridModel._validate_ep_overlap_support(model)
+
+
+@pytest.mark.parametrize("location", ["decoder", "group", "mtp"])
+def test_hybrid_ep_overlap_rejects_chunkwise_linear_cp(location):
+    """Chunkwise linear CP needs packed-sequence metadata that only HybridStack.forward builds."""
+    model = _overlap_model_stub()
+    HybridModel._validate_ep_overlap_support(model)
+    if location == "group":
+        model.decoder.group = _hybrid_stack_stub()
+        target = model.decoder.group
+    elif location == "mtp":
+        model.mtp = _hybrid_stack_stub()
+        target = model.mtp
+    else:
+        target = model.decoder
+    target._has_linear_layer_with_chunkwise_cp = True
+
+    with pytest.raises(ValueError, match="linear_cp_mode='chunkwise'"):
         HybridModel._validate_ep_overlap_support(model)
 
 
