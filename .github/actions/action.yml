@@ -233,7 +233,7 @@ runs:
               if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
                 && PR_CHANGED_FILES=$(jq -er --arg sha "$TESTED_SHA" \
                   'select(.tested_sha == $sha) | .changed_files |
-                   select(type == "number" and . >= 0 and . <= 3000 and floor == .)' \
+                   select(type == "number" and . >= 0 and floor == .)' \
                   "$PR_FILES_DIR/metadata.json") \
                 && CHANGED_FILES=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
                 && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \

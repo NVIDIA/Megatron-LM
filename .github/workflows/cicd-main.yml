@@ -447,33 +447,56 @@ jobs:
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
 
-      - name: Get changed files for mandatory unit tests
-        id: unit-test-pr-files
+      - name: Checkout tested commit for mandatory unit tests
+        id: unit-test-pr-checkout
         if: steps.configure.outputs.unit_testmon_eligible == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        continue-on-error: true
+        with:
+          ref: ${{ steps.resolve-sha.outputs.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Get changed files for mandatory unit tests
+        id: changed-files
+        if: steps.unit-test-pr-checkout.outcome == 'success'
+        uses: step-security/changed-files@2e07db73e5ccdb319b9a6c7766bd46d39d304bad # v47.0.5
+        continue-on-error: true
+        with:
+          # The first parent is the base of the tested synthetic PR merge.
+          base_sha: ${{ steps.resolve-sha.outputs.sha }}^1
+          sha: ${{ steps.resolve-sha.outputs.sha }}
+          skip_initial_fetch: true
+          fail_on_initial_diff_error: true
+          exclude_submodules: true
+          output_renamed_files_as_deleted_and_added: true
+          json: true
+          escape_json: false
+          safe_output: false
+          quotepath: false
+          write_output_files: true
+          output_dir: ${{ runner.temp }}/unit-test-changed-files
+
+      - name: Package changed files for mandatory unit tests
+        id: unit-test-pr-files
+        if: steps.changed-files.outcome == 'success'
         shell: bash -e -u -o pipefail {0}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          PR_CHANGED_FILES: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').changed_files }}
-          PR_MERGE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          PR_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_and_modified_files_count }}
           TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
         run: |
           PR_FILES_DIR="$RUNNER_TEMP/unit-test-pr-files"
-          # Fetch once for all buckets. Missing or stale PR data leaves no
+          CHANGED_FILES_JSON="$RUNNER_TEMP/unit-test-changed-files/all_changed_and_modified_files.json"
+          # Share the validated file list across buckets. Missing data leaves no
           # artifact ID, so consumers fall back to the full unit-test bucket.
           if mkdir -p "$PR_FILES_DIR" \
             && [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ \
-                  && "$PR_MERGE_SHA" == "$TESTED_SHA" \
-                  && "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
-                  && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
-                  && "$PR_CHANGED_FILES" -le 3000 ]] \
-            && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-              --jq '.[].filename' > "$PR_FILES_DIR/changed-files" \
+                  && "$PR_CHANGED_FILES" =~ ^[0-9]+$ ]] \
+            && jq -e 'type == "array" and all(.[]; type == "string")' "$CHANGED_FILES_JSON" > /dev/null \
+            && jq -r '.[]' "$CHANGED_FILES_JSON" > "$PR_FILES_DIR/changed-files" \
             && CHANGED_FILES=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
             && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
-            && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
-            && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]] \
             && jq -n --arg tested_sha "$TESTED_SHA" --argjson changed_files "$CHANGED_FILES" \
               '{tested_sha: $tested_sha, changed_files: $changed_files}' > "$PR_FILES_DIR/metadata.json"; then
             echo "ready=true" >> "$GITHUB_OUTPUT"

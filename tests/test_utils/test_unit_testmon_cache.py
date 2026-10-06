@@ -354,7 +354,7 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "fractional-file-count",
         "truncated-files",
         "empty-pr",
-        "too-many-files",
+        "large-pr",
         "wrong-sha",
     ],
 )
@@ -374,6 +374,8 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     expected_files = (
         [] if restore == "empty-pr" else ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
     )
+    if restore == "large-pr":
+        expected_files = [f"megatron/core/source_{index}.py" for index in range(3001)]
     pr_files_dir = tmp_path / "pr-files"
     pr_files_dir.mkdir()
     (pr_files_dir / "changed-files").write_text("".join(f"{path}\n" for path in expected_files))
@@ -382,7 +384,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         "changed_files": {
             "empty-pr": 0,
             "truncated-files": 3,
-            "too-many-files": 3001,
+            "large-pr": 3001,
             "string-file-count": "2",
             "boolean-file-count": True,
             "negative-file-count": -1,
@@ -452,7 +454,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    valid = restore in {"valid", "different-image", "missing-image", "empty-pr"}
+    valid = restore in {"valid", "different-image", "missing-image", "empty-pr", "large-pr"}
     assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
