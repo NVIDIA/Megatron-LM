@@ -648,6 +648,12 @@ class PipelineOffloadManager:
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
         for chunk in self._cached_chunks_backward:
+            # An empty warmup group may gain eligible tensors when sequence
+            # lengths grow. Fraction zero must keep even those groups on GPU.
+            if self._activation_offload_fraction == 0:
+                for group in chunk.offload_groups:
+                    group.offload = False
+                continue
             eligible_offload_groups = [
                 group
                 for group in chunk.offload_groups
@@ -1013,12 +1019,13 @@ class ChunkOffloadHandler:
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # TODO: check if this is correct
-        # Mark it as finished when there are no groups to offload or reload
+        # Empty transfer queues do not imply forward is complete: fraction zero
+        # can keep every group on GPU while later layers still need this chunk.
         if (
             len(self._groups_to_reload) == 0
             and len(self._groups_to_offload) == 0
             and self._offloaded_group_index > 0
+            and self._offloaded_group_index >= self._max_group_size
         ):
             return True
         assert name is not None, "Name is required"

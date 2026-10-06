@@ -87,8 +87,17 @@ dependency described below.
 
 Warmup offloads every group to learn its size. Steady state retains the final group
 of each name to avoid a reload stall. Fraction is then applied to the eligible
-groups, with integer rounding, rather than to individual tensors or bytes. Report
-the actual number of selected groups alongside the requested fraction.
+groups, with integer rounding, rather than to individual tensors or bytes. Nonzero
+fractions use the group eligibility learned during warmup rather than dynamically
+reselecting groups when tensor shapes change. Report the actual number of selected groups alongside the requested fraction.
+
+Fraction zero disables all groups after warmup, including groups whose initial
+tensors were below the threshold. Otherwise a later, longer sequence can enable
+copies despite requesting zero offload. Empty transfer queues also do not mark a
+chunk complete until all its scheduled groups have run: advancing early can assign
+later layers to another microbatch and fail backward with a chunk mismatch. Tests
+cover growing sequences and consecutive microbatches, with delayed reloads and no
+transfer synchronization between microbatches.
 
 ### Fallback transfer ordering
 
@@ -153,7 +162,8 @@ Measurements on 2026-10-06 used the default compilation setting, the stack above
 batch size 1, seed 123, the 1M-element threshold, three warmup steps and ten measured
 forward/backward steps per arm. Each sequence length has three independent process
 runs. The default forward synchronization is disabled, and all 13 distinct-input
-steps per enabled arm are checked, including warmup. The GPU was not exclusive:
+steps per enabled arm are checked, including warmup. These runs include the
+fraction-zero policy and chunk-completion fixes. The GPU was not exclusive:
 another process held 23,304 MiB, with no concurrent compute observed during idle checks.
 The host was shared and clocks were not locked.
 These observations establish allocated-memory savings; runtime estimates require
@@ -167,22 +177,21 @@ time medians. Peak allocated memory was stable across all 30 measured steps per 
 
 | Sequence | Requested fraction | Selected groups | Peak allocated (MiB) | Step time (ms), median [range] | Paired runtime change, median [range] |
 | ---: | --- | ---: | ---: | --- | --- |
-| 2048 | Disabled | 0 | 1274.80 | 32.63 [31.99, 36.30] | Reference |
-| 2048 | 0 | 0 | 1274.80 | 32.68 [31.05, 40.84] | +0.1% [-2.9%, +12.5%] |
-| 2048 | 0.5 | 2 | 1162.80 | 39.75 [36.13, 45.51] | +10.7% [+9.5%, +42.3%] |
-| 2048 | 1 | 3 | 1106.80 | 43.18 [40.74, 45.29] | +24.8% [+19.0%, +41.6%] |
-| 4096 | Disabled | 0 | 2272.34 | 56.90 [56.90, 56.94] | Reference |
-| 4096 | 0 | 0 | 2272.34 | 57.03 [56.88, 57.04] | +0.2% [-0.03%, +0.24%] |
-| 4096 | 0.5 | 2 | 2048.34 | 65.29 [65.20, 69.45] | +14.7% [+14.6%, +22.1%] |
-| 4096 | 1 | 3 | 1936.34 | 77.56 [77.53, 77.56] | +36.3% [+36.2%, +36.3%] |
+| 2048 | Disabled | 0 | 1274.80 | 31.69 [31.63, 32.14] | Reference |
+| 2048 | 0 | 0 | 1274.80 | 32.71 [32.23, 32.87] | +1.8% [+1.7%, +3.9%] |
+| 2048 | 0.5 | 2 | 1162.80 | 36.80 [36.53, 38.20] | +16.1% [+13.7%, +20.8%] |
+| 2048 | 1 | 3 | 1106.80 | 39.61 [39.47, 41.96] | +25.0% [+22.8%, +32.7%] |
+| 4096 | Disabled | 0 | 2272.34 | 56.73 [56.18, 56.81] | Reference |
+| 4096 | 0 | 0 | 2272.34 | 56.62 [56.60, 56.66] | -0.2% [-0.4%, +0.9%] |
+| 4096 | 0.5 | 2 | 2048.34 | 65.31 [65.17, 65.83] | +15.9% [+14.9%, +16.3%] |
+| 4096 | 1 | 3 | 1936.34 | 77.51 [77.31, 78.14] | +36.6% [+36.1%, +39.1%] |
 
 Fraction 1 reduces peak allocation by approximately **168 MiB (13.2%)** at sequence
 2048 and **336 MiB (14.8%)** at sequence 4096. End-of-forward allocations decrease
 by the same amounts. Fraction 0 adds only 512 allocated bytes, with no steady-state
 transfers. Every enabled arm passed bitwise comparisons of outputs, input gradients
-and all parameter gradients against its disabled baseline. Timing variance is large
-even in the fraction-zero control, so these data do not establish a reliable ordering
-between fractions 0.5 and 1 or a production-training overhead.
+and all parameter gradients against its disabled baseline. Shared hardware and unlocked clocks limit runtime conclusions; these data do not
+establish a production-training overhead.
 
 [Raw A6000 step samples](gdn_activation_offloading_a6000.csv) include all 240 measured
 steps, peak allocated/reserved memory, end-of-forward allocation, selected groups,
@@ -193,16 +202,18 @@ The CSV records this checked-step count and the forward synchronization setting.
 ## Acceptance and next steps
 
 On one RTX A6000 with Python 3.12.4, PyTorch 2.11.0+cu130, Transformer Engine
-2.20.2, and FLA 0.5.1, all **32 tests passed** both with `TORCH_COMPILE_DISABLE=1`
+2.20.2, and FLA 0.5.1, all **40 tests passed** both with `TORCH_COMPILE_DISABLE=1`
 and with the default compilation setting. This includes exact output, input-gradient
 and parameter-gradient comparisons with changing inputs over one warmup and two
 steady-state iterations, fraction 0/0.5/1, threshold skipping, shared and expanded
 Q/K storage, `gdn_norm_out` recomputation, packed sequences, delayed D2H, frozen Q,
-and eval/no-grad/fully frozen bypass. Pinned-buffer usage returned to zero after
-backward.
+eval/no-grad/fully frozen bypass, growing sequences at fraction zero, and three
+accumulated microbatches per iteration without synchronization between them.
+Pinned-buffer usage returned to zero after backward.
 
-The common-manager subset passed **12 tests**, including the delayed-transfer
-sentinel regression; one aggregation test requires two ranks and was skipped.
+The common-manager subset passed **13 tests**, including the delayed-transfer
+sentinel regression and a fraction-zero growing-microbatch lifecycle test that
+does not require FLA; one aggregation test requires two ranks and was skipped.
 An existing eight-layer BF16 GPT/MoE `core_attn` offload test also passed its
 output/gradient and peak-memory checks, covering the shared-manager change outside GDN.
 
@@ -213,9 +224,8 @@ runs used `--confcutdir=tests/unit_tests/ssm` to omit root dataset-download fixt
 configuration-only regression tests used `--noconftest`.
 
 `tools/autoformat.sh` passes its Black, isort, Pylint and Ruff gates, and kernel
-determinism coverage passes. With the common manager and its test file now included,
-the non-blocking mypy step reports 23 existing diagnostics; checking the original
-`main` versions reproduces the same 23. The new tool and GDN offload test file pass
+determinism coverage passes. With the common manager and its test file included, the non-blocking mypy step
+reports 23 existing diagnostics; checking original `main` reproduces the same 23. The new tool and GDN offload test file pass
 a separate mypy check.
 
 The measured first slice meets these acceptance criteria: outputs and all gradients
