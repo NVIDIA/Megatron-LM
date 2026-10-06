@@ -701,6 +701,109 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     fused_call.assert_called_once()
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("loss_coeff", [0.0, 0.3])
+def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministic, loss_coeff):
+    """Exercise both real dispatch paths; only the backend computations are mocked."""
+    from megatron.core.transformer.experimental_attention_variant import csa as csa_module
+
+    sequence, batch, heads, dim = 8, 2, 2, 4
+    selected = torch.full((batch, sequence, 3), -1, dtype=torch.int32)
+    selected[:, 3:, 0] = 0
+    selected[:, 7:, 1] = 1
+    q_indexer = torch.zeros(sequence, batch, heads, dim)
+    k_indexer = torch.zeros(sequence // 4, batch, dim)
+    weights = torch.zeros(sequence, batch, heads)
+    module = csa_module.CompressedSparseAttention.__new__(csa_module.CompressedSparseAttention)
+    torch.nn.Module.__init__(module)
+    module.use_fused_kernels = True
+    module.compress_ratio = 4
+    module.window_size = 3
+    module.softmax_scale = 0.5
+    module.attn_sink = torch.nn.Parameter(torch.zeros(heads))
+    module.num_attention_heads = heads
+    module.layer_number = 1
+    module.config = SimpleNamespace(
+        dsa_indexer_loss_coeff=loss_coeff,
+        dsa_indexer_use_sparse_loss=True,
+        calculate_per_token_loss=False,
+        deterministic_mode=deterministic,
+        num_layers=1,
+        mtp_num_layers=0,
+    )
+    module.__dict__["compressor"] = lambda x: x.new_zeros(sequence // 4, batch, dim)
+    module.__dict__["indexer"] = SimpleNamespace(
+        index_topk=selected.shape[-1],
+        softmax_scale=0.5,
+        forward_before_topk=lambda _x, _qr: (q_indexer, k_indexer, weights),
+    )
+    module.train()
+    topk_modes = []
+
+    def fake_topk(_q, _k, _w, _topk, _ratio, *, deterministic=False):
+        topk_modes.append(deterministic)
+        return selected.clone(), (selected >= 0).sum(-1).int(), torch.zeros(batch, sequence, 2)
+
+    captured = []
+
+    def fake_flash(query, _kv, indices, _scale, *, topk_length, **_kwargs):
+        captured.append((indices.clone(), topk_length.clone()))
+        # Make the fake result sensitive to slot order as the real online softmax is.
+        slots = torch.arange(1, indices.shape[-1] + 1)
+        value = (indices.clamp_min(0) * slots).sum(-1).to(query.dtype)
+        output = value[:, None, None].expand_as(query).clone()
+        return output, query.new_zeros(query.shape[:2]), None
+
+    monkeypatch.setattr(fused_csa, "_indexer_topk_bshd", fake_topk)
+    monkeypatch.setattr(fused_csa, "_csa_fwd_flash_mla", fake_flash)
+    monkeypatch.setattr(
+        fused_csa, "_compute_attn_target", lambda *_args, **_kwargs: (selected >= 0).float() * 0.5
+    )
+    monkeypatch.setattr(
+        fused_csa,
+        "_DSA",
+        SimpleNamespace(
+            indexer_backward_wrapper=lambda q, w, k, *_args, **_kwargs: {
+                "d_index_q": torch.zeros_like(q),
+                "d_index_k": torch.zeros_like(k),
+                "d_weights": torch.zeros_like(w),
+            }
+        ),
+    )
+    monkeypatch.setattr(csa_module, "nvtx_range_push", lambda *_args: None)
+    monkeypatch.setattr(csa_module, "nvtx_range_pop", lambda *_args: None)
+    monkeypatch.setattr(
+        csa_module.DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **_kwargs: None
+    )
+    query = torch.zeros(sequence, batch, heads, dim, requires_grad=True)
+    key = torch.zeros(sequence, batch, 1, dim)
+    x = torch.zeros(sequence, batch, dim)
+    outputs = []
+    for grad_enabled in (False, True, False, True):
+        with torch.set_grad_enabled(grad_enabled):
+            output = module(query, key, key, None, x=x, qr=x)
+        assert output.requires_grad == grad_enabled
+        outputs.append(output.detach())
+
+    window = csa_module.get_window_topk_idxs(module.window_size, batch, sequence, query.device)
+    compressed = torch.where(selected >= 0, selected + sequence, -1)
+    training_order, expected_lengths = fused_csa.build_flat_topk_idxs(
+        compressed, window, batch_size=batch, compact=True
+    )
+    default_order, _ = fused_csa.build_flat_topk_idxs(
+        window, compressed, batch_size=batch, compact=True
+    )
+    assert not torch.equal(training_order, default_order)
+    assert (training_order == -1).any()
+    for position, (indices, lengths) in enumerate(captured):
+        expected = training_order if deterministic or position % 2 else default_order
+        assert torch.equal(indices, expected), "no-grad and training key order differ"
+        assert torch.equal(lengths, expected_lengths)
+    assert topk_modes == [deterministic] * 4
+    assert torch.equal(outputs[0], outputs[2]) and torch.equal(outputs[1], outputs[3])
+    assert torch.equal(outputs[0], outputs[1]) == deterministic
+
+
 def test_public_surface_is_csa_namespaced_and_sbhd_only():
     assert "csa_sparse_attn" in fused_csa.__all__
     assert "fused_csa_indexer_sparse_attn" in fused_csa.__all__

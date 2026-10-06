@@ -279,6 +279,126 @@ def test_non_cp_sparse_attention_backward_reference_and_replay(heads):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("loss_coeff", [0.0, 0.3])
+def test_real_ratio4_no_grad_and_training_forward_parity(loss_coeff, monkeypatch):
+    """Real learned-indexer CSA forwards preserve compact key order and output bits."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("deterministic cuDNN sparse attention requires SM10x")
+    pytest.importorskip("flash_mla")
+    pytest.importorskip("cudnn.deepseek_sparse_attention")
+    pytest.importorskip("fast_hadamard_transform")
+    from megatron.core.models.common.embeddings import RotaryEmbedding
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant import csa as csa_module
+    from tests.unit_tests.test_utilities import Utils
+    from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_csa import (
+        _make_csa_submodules,
+        _make_mla_config,
+    )
+
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    prior_fill = torch.utils.deterministic.fill_uninitialized_memory
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        torch.manual_seed(193)
+        model_parallel_cuda_manual_seed(193)
+        config = _make_mla_config(
+            num_layers=1,
+            num_attention_heads=64,
+            v_head_dim=512,
+            csa_compress_ratios=[4],
+            csa_window_size=32,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=64,
+            dsa_indexer_loss_coeff=loss_coeff,
+            dsa_indexer_use_sparse_loss=True,
+        )
+        config.dsa_kernel_backend = "cudnn"
+        config.deterministic_mode = True
+        groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        rotary = RotaryEmbedding(
+            config.qk_pos_emb_head_dim,
+            rotary_percent=config.rotary_percent,
+            rotary_base=config.rotary_base,
+            cp_group=groups.cp,
+        )
+        module = (
+            csa_module.CompressedSparseAttention(
+                config=config,
+                submodules=_make_csa_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type="self",
+                pg_collection=groups,
+                rotary_pos_emb=rotary,
+                compress_ratio=4,
+            )
+            .cuda()
+            .train()
+        )
+        assert module.use_fused_kernels
+        assert isinstance(module.indexer, csa_module.CSAIndexer)
+        assert any(parameter.requires_grad for parameter in module.indexer.parameters())
+        monkeypatch.setattr(csa_module.DSAIndexerLossLoggingHelper, "tracker", {})
+        sequence, batch = 128, 2
+        device = torch.device("cuda", torch.cuda.current_device())
+        query = torch.randn(sequence, batch, 64, 512, device=device, dtype=torch.bfloat16) * 0.5
+        key = torch.randn(sequence, batch, 1, 512, device=device, dtype=torch.bfloat16) * 0.5
+        x = torch.randn(sequence, batch, config.hidden_size, device=device, dtype=torch.bfloat16)
+        qr = torch.randn(sequence, batch, config.q_lora_rank, device=device, dtype=torch.bfloat16)
+        captured = []
+        real_flash = dk._csa_fwd_flash_mla
+
+        def recording_flash(q, kv, indices, scale, **kwargs):
+            captured.append((indices.detach().clone(), kwargs["topk_length"].detach().clone()))
+            return real_flash(q, kv, indices, scale, **kwargs)
+
+        monkeypatch.setattr(dk, "_csa_fwd_flash_mla", recording_flash)
+
+        def forward(grad_enabled):
+            with torch.set_grad_enabled(grad_enabled):
+                output = module(query, key, key, None, x=x, qr=qr)
+            assert output.requires_grad == grad_enabled
+            assert torch.isfinite(output).all()
+            return output.detach()
+
+        # Compile/autotune both paths before comparing repeated real kernel calls.
+        forward(False)
+        forward(True)
+        captured.clear()
+        outputs = [forward(enabled) for enabled in (False, True, False, True)]
+        assert len(captured) == 4
+        indices, lengths = captured[0]
+        assert (indices == -1).any() and (lengths < indices.shape[-1]).any()
+        assert torch.equal(lengths, (indices >= 0).sum(-1).int())
+        sample_ids = torch.arange(batch, device=device).repeat(sequence)[:, None]
+        query_rows = torch.arange(sequence, device=device).repeat_interleave(batch)[:, None]
+        assert torch.all((indices < 0) | (indices % batch == sample_ids))
+        local_ids = indices // batch
+        compressed = local_ids >= sequence
+        assert compressed.any()
+        assert torch.all(~compressed | ((local_ids - sequence) < (query_rows + 1) // 4))
+        window = (indices >= 0) & ~compressed
+        assert torch.all(~window | ((local_ids <= query_rows) & (local_ids > query_rows - 32)))
+        for (other_indices, other_lengths), output in zip(captured[1:], outputs[1:]):
+            assert torch.equal(indices, other_indices), "no-grad and training key order differ"
+            assert torch.equal(lengths, other_lengths), "no-grad and training key lengths differ"
+            assert torch.equal(
+                outputs[0].contiguous().view(torch.uint8), output.contiguous().view(torch.uint8)
+            ), "no-grad and training forward bytes differ"
+    finally:
+        Utils.destroy_model_parallel()
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
+        torch.utils.deterministic.fill_uninitialized_memory = prior_fill
+
+
 @pytest.mark.parametrize("global_mode", [False, True])
 def test_stable_topk_ties_causal_padding_and_short_keys(monkeypatch, global_mode):
     # Force one row per slab and tied zero logits: selection must prefer smaller IDs.
