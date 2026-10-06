@@ -713,7 +713,7 @@ class TestMambaIntermediateChunkLayout:
     def test_snapshot_uses_actual_chunk_layout(
         self, cu_seqlens, last_chunks, real_count, padded_count, expected_index
     ):
-        metadata = MambaMetadata(
+        metadata = PrefixCachedMambaMetadata(
             max_requests=4, max_tokens=1024, max_intermediate_count=12, d_conv=4
         )
         # Supply the descriptors produced by the prefill chunk builder. The
