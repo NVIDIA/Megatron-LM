@@ -2283,6 +2283,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_router_quantile_balancing_estimation_scope must be "
                     "'micro_batch' or 'global_batch'."
                 )
+            if self.num_moe_experts is None or not (0 < self.moe_router_topk < self.num_moe_experts):
+                raise ValueError(
+                    "quantile_balancing requires 0 < moe_router_topk < num_moe_experts."
+                )
             if scope == "global_batch":
                 if self.moe_router_quantile_balancing_ema != 0.0:
                     raise ValueError(
@@ -2321,13 +2325,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "global_batch quantile_balancing with expert-rank capacity requires "
                         "moe_paged_stash for the dropless retry."
-                    )
-                if self.num_moe_experts is None or not (
-                    0 < self.moe_router_topk < self.num_moe_experts
-                ):
-                    raise ValueError(
-                        "global_batch quantile_balancing requires "
-                        "0 < moe_router_topk < num_moe_experts."
                     )
                 if self.moe_router_qb_num_bins <= 1:
                     raise ValueError("moe_router_qb_num_bins must be greater than one.")
