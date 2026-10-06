@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from megatron.core.utils import experimental_api
@@ -109,16 +109,7 @@ class InferenceEngineCapabilities:
     def to_dict(self) -> dict[str, int | bool]:
         """Return a serialization-friendly representation."""
 
-        return {
-            "context_length": self.context_length,
-            "kv_cache_block_size": self.kv_cache_block_size,
-            "total_kv_blocks": self.total_kv_blocks,
-            "max_num_seqs": self.max_num_seqs,
-            "max_num_batched_tokens": self.max_num_batched_tokens,
-            "bos_token_id": self.bos_token_id,
-            "enable_prefix_caching": self.enable_prefix_caching,
-            "logical_data_parallel_size": self.logical_data_parallel_size,
-        }
+        return asdict(self)
 
 
 @experimental_api
@@ -169,7 +160,4 @@ class InferenceEngineEndpoint:
     def to_dict(self) -> dict[str, Any]:
         """Return a serialization-friendly representation."""
 
-        return {
-            "coordinator_address": self.coordinator_address,
-            "capabilities": self.capabilities.to_dict(),
-        }
+        return asdict(self)

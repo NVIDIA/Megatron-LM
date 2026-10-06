@@ -13,11 +13,6 @@ from megatron.core.inference.shards_spec import (
 )
 
 
-def is_disagg_rollout(args) -> bool:
-    """Whether RL rollouts should run through a prefill/decode split."""
-    return spec_declares_disaggregation(args.inference_shards)
-
-
 def disagg_refit_pools(
     inference_shards: str | None, world_size: int, rank: int | None = None
 ) -> tuple[int, int]:
@@ -31,12 +26,7 @@ def disagg_refit_pools(
 
 
 def build_disagg_inference_model(
-    args,
-    model_type,
-    transformer_config,
-    *,
-    cfg_container,
-    model_alloc_ctx,
+    args, model_type, transformer_config, *, cfg_container, model_alloc_ctx
 ):
     """Build this rank's disaggregated RL inference shard."""
     if not args.inference_dynamic_batching_enable_prefix_caching:

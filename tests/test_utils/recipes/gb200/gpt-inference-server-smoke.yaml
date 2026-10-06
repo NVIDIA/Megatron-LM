@@ -25,14 +25,6 @@ spec:
     git fetch origin $MCORE_MR_COMMIT
     git checkout $MCORE_MR_COMMIT
     git rev-parse HEAD
-    cd /opt
-    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
-    git init
-    git remote add origin $MCORE_REPO
-    git fetch origin $MCORE_BACKWARDS_COMMIT
-    git checkout $MCORE_BACKWARDS_COMMIT
-    git rev-parse HEAD
-    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
     rm -f "$HOME/.netrc"
     unset RO_API_TOKEN
   script: |-

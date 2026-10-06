@@ -87,6 +87,13 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     return runtime, sent
 
 
+def _prefill_done(runtime, *, hybrid=False):
+    kv_meta = {"ssm": {"positions": [0]}} if hybrid else {"agent": "prefill"}
+    runtime.handle_prefill_done(
+        5, {"request_id": 5, "disaggregated_params": {"kv_meta": kv_meta, "block_ids": [4]}}
+    )
+
+
 def test_request_routes_prefill_then_decode():
     runtime, sent = _runtime()
     sampling_params = {"temperature": 0.0, "return_log_probs": True, "skip_prompt_log_probs": True}
@@ -109,6 +116,9 @@ def test_request_routes_prefill_then_decode():
     assert message[1:4] == [5, [1, 2, 3], sampling_params]
     assert message[4:] == [handoff["kv_meta"], handoff["block_ids"]]
     assert runtime.coordinator.hash_updates == [(b"prefill", [1, 2, 3]), (b"decode", [1, 2, 3])]
+    assert runtime.requests[5].prompt is None
+    assert runtime.requests[5].sampling_params == {}
+    assert runtime.requests[5].block_hashes == []
 
 
 def test_prompt_log_probs_are_rejected_before_prefill():
@@ -148,13 +158,7 @@ def test_nccl_send_waits_for_decode_destinations():
     runtime, sent = _runtime(backend="nccl")
     runtime.route_submit(5, [1], {})
     sent.clear()
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime)
 
     assert [(identity, Headers(message[0])) for identity, message in sent] == [
         (b"decode", Headers.SUBMIT_REQUEST_WITH_KV)
@@ -197,14 +201,12 @@ def test_read_done_releases_prefill_and_admits_queued_request():
     runtime, sent = _runtime(request_capacity=1)
     runtime.route_submit(5, [1], {})
     runtime.route_submit(6, [2], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime)
     sent.clear()
+
+    runtime.handle_kv_read_done(b"other-decode", 5)
+    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
+    assert sent == []
 
     runtime.handle_kv_read_done(b"decode", 5)
 
@@ -213,24 +215,6 @@ def test_read_done_releases_prefill_and_admits_queued_request():
         (b"prefill", Headers.SUBMIT_REQUEST),
     ]
     assert runtime.scheduler.reserved_engine("prefill", 6) == b"prefill"
-
-
-def test_read_done_from_wrong_decode_does_not_release_prefill():
-    runtime, sent = _runtime()
-    runtime.route_submit(5, [1], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
-        },
-    )
-    sent.clear()
-
-    runtime.handle_kv_read_done(b"other-decode", 5)
-
-    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
-    assert sent == []
 
 
 def test_decode_ssm_capacity_is_released_on_generation_completion():
@@ -263,13 +247,7 @@ def test_decode_ssm_capacity_is_released_on_generation_completion():
 def test_active_decode_cancellation_waits_for_engine_safety():
     runtime, sent = _runtime()
     runtime.route_submit(5, [1], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime)
     sent.clear()
 
     runtime.abort_request(5)
@@ -288,13 +266,7 @@ def test_active_decode_cancellation_waits_for_engine_safety():
 def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
     runtime, sent = _runtime(ssm_capacity=1)
     runtime.route_submit(5, [1], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime, hybrid=True)
 
     runtime.abort_request(5)
     runtime.handle_engine_aborted(5, source_safe=False)
@@ -315,13 +287,7 @@ def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
 def test_decode_removal_does_not_release_inflight_source():
     runtime, sent = _runtime(ssm_capacity=1)
     runtime.route_submit(5, [1], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime, hybrid=True)
     sent.clear()
 
     runtime.remove_engine(b"decode")
@@ -346,13 +312,7 @@ def test_undelivered_decode_handoff_releases_prefill_source():
         return True
 
     runtime.coordinator._send_to_engine = reject_decode
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime, hybrid=True)
 
     assert runtime.scheduler.reserved_engine("prefill", 5) is None
     assert runtime.scheduler.prefill_load(b"prefill") == (0, 0, 0)
@@ -367,13 +327,7 @@ def test_undelivered_decode_handoff_releases_prefill_source():
 def test_engine_removal_after_kv_read_preserves_source_safety():
     runtime, sent = _runtime(ssm_capacity=1)
     runtime.route_submit(5, [1], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime, hybrid=True)
     sent.clear()
 
     def reject_prefill_release(identity, frames, *, remove_unreachable=True):
@@ -407,13 +361,7 @@ def test_engine_removal_after_kv_read_preserves_source_safety():
 def test_late_source_safety_releases_prefill_after_request_failure():
     runtime, sent = _runtime(ssm_capacity=1)
     runtime.route_submit(5, [1], {})
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
-        },
-    )
+    _prefill_done(runtime, hybrid=True)
     sent.clear()
 
     runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
@@ -438,23 +386,6 @@ def test_late_source_safety_releases_prefill_after_request_failure():
         and Headers(msgpack.unpackb(message[1], raw=False)[0]) == Headers.REQUEST_ABORTED
         for identity, message in sent
     )
-
-
-def test_serialized_handoff_releases_prompt_storage():
-    runtime, _ = _runtime()
-    runtime.route_submit(5, [1, 2, 3], {})
-
-    runtime.handle_prefill_done(
-        5,
-        {
-            "request_id": 5,
-            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
-        },
-    )
-
-    assert runtime.requests[5].prompt is None
-    assert runtime.requests[5].sampling_params == {}
-    assert runtime.requests[5].block_hashes == []
 
 
 def test_load_balanced_routing_uses_free_capacity_independent_of_prefix_alpha():

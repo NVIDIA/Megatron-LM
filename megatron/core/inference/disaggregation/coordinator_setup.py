@@ -19,19 +19,6 @@ PREFILL = "prefill"
 DECODE = "decode"
 
 
-def _validate_disagg_specs(specs: list[InferenceShardSpec]) -> None:
-    """Require at least one shard for each disaggregated role."""
-    untagged = [spec for spec in specs if spec.role not in (PREFILL, DECODE)]
-    if untagged:
-        raise ValueError(
-            "every disaggregated shard must declare role=prefill or role=decode; "
-            f"{len(untagged)} shard(s) did not: {untagged}"
-        )
-    roles = {spec.role for spec in specs}
-    if not {PREFILL, DECODE}.issubset(roles):
-        raise ValueError("disaggregation needs at least one prefill and one decode shard")
-
-
 def validate_disaggregation_shards(
     shards: str | Sequence[InferenceShardSpec] | Sequence[dict], world_size: int
 ) -> list[InferenceShardSpec]:
@@ -49,7 +36,15 @@ def validate_disaggregation_shards(
             at least one prefill and one decode shard.
     """
     specs = normalize_shard_specs(shards, world_size)
-    _validate_disagg_specs(specs)
+    untagged = [spec for spec in specs if spec.role not in (PREFILL, DECODE)]
+    if untagged:
+        raise ValueError(
+            "every disaggregated shard must declare role=prefill or role=decode; "
+            f"{len(untagged)} shard(s) did not: {untagged}"
+        )
+    roles = {spec.role for spec in specs}
+    if not {PREFILL, DECODE}.issubset(roles):
+        raise ValueError("disaggregation needs at least one prefill and one decode shard")
     return specs
 
 

@@ -16,7 +16,6 @@ from megatron.inference.integrations.dynamo import engine_service
 from megatron.inference.integrations.dynamo.args import parse_args
 from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
 from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
-from megatron.inference.integrations.dynamo.main import main
 
 
 def _argv():
@@ -89,20 +88,10 @@ def test_external_launch_accepts_deployment_managed_engine():
 
 
 def test_disaggregated_role_requires_coordinator_address():
+    argv = _argv()
+    argv[1] = "prefill"
     with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--role",
-                "prefill",
-                "--model",
-                "model-meta",
-                "--nproc-per-node",
-                "1",
-                "--",
-                "--load",
-                "/checkpoint",
-            ]
-        )
+        parse_args(argv)
 
 
 def test_external_decode_requires_durable_cleanup_and_unique_owner(tmp_path):
@@ -123,12 +112,6 @@ def test_external_decode_requires_durable_cleanup_and_unique_owner(tmp_path):
     MegatronLLMEngine(config)
     with pytest.raises(ValueError, match="already used"):
         MegatronLLMEngine(config)
-
-
-def test_public_entrypoint_uses_common_runner():
-    with patch("megatron.inference.integrations.dynamo.main.run") as run:
-        main()
-    run.assert_called_once_with(MegatronLLMEngine)
 
 
 def test_owned_engine_command_targets_megatron_only_service():
@@ -183,33 +166,17 @@ async def test_engine_service_validates_handoff_and_log_probs_before_constructio
 
 
 @pytest.mark.asyncio
-async def test_from_args_resolves_only_registration_metadata(monkeypatch):
-    async def fail_create_subprocess(*args, **kwargs):
-        raise AssertionError("from_args must not start a process")
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fail_create_subprocess)
+@pytest.mark.parametrize("local_model", [False, True])
+async def test_from_args_resolves_only_registration_metadata(tmp_path, monkeypatch, local_model):
+    launch = AsyncMock(side_effect=AssertionError("from_args must not start a process"))
+    monkeypatch.setattr("asyncio.create_subprocess_exec", launch)
     fetch_model = AsyncMock(return_value="/cache/model-meta")
     monkeypatch.setattr(
         "megatron.inference.integrations.dynamo.llm_engine.fetch_model", fetch_model
     )
-    engine, worker = await MegatronLLMEngine.from_args(_argv())
-
-    assert engine._process is None
-    assert engine.client is None
-    assert worker.component == "backend"
-    assert worker.model_name == "/cache/model-meta"
-    assert engine.registration_model == "/cache/model-meta"
-    fetch_model.assert_awaited_once_with("model-meta", ignore_weights=True)
-
-
-@pytest.mark.asyncio
-async def test_from_args_preserves_local_registration_model(tmp_path, monkeypatch):
-    fetch_model = AsyncMock()
-    monkeypatch.setattr(
-        "megatron.inference.integrations.dynamo.llm_engine.fetch_model", fetch_model
-    )
     argv = _argv()
-    argv[argv.index("model-meta")] = str(tmp_path)
+    if local_model:
+        argv[argv.index("model-meta")] = str(tmp_path)
     argv[argv.index("--nproc-per-node") : argv.index("--nproc-per-node")] = [
         "--endpoint-types",
         "completions",
@@ -217,10 +184,18 @@ async def test_from_args_preserves_local_registration_model(tmp_path, monkeypatc
 
     engine, worker = await MegatronLLMEngine.from_args(argv)
 
-    assert worker.model_name == str(tmp_path.resolve())
+    expected_model = str(tmp_path.resolve()) if local_model else "/cache/model-meta"
+    assert engine._process is None
+    assert engine.client is None
+    assert worker.component == "backend"
+    assert worker.model_name == expected_model
     assert worker.endpoint_types == "completions"
-    assert engine.registration_model == str(tmp_path.resolve())
-    fetch_model.assert_not_awaited()
+    assert engine.registration_model == expected_model
+    launch.assert_not_awaited()
+    if local_model:
+        fetch_model.assert_not_awaited()
+    else:
+        fetch_model.assert_awaited_once_with("model-meta", ignore_weights=True)
 
 
 @pytest.mark.asyncio

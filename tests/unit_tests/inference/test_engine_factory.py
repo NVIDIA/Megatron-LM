@@ -40,9 +40,13 @@ def mock_pipeline(monkeypatch):
     return context, wrapper_cls, controller, configure
 
 
-def test_builds_standard_engine(mock_pipeline):
+@pytest.mark.parametrize("disaggregated", [False, True])
+def test_builds_and_configures_engine(mock_pipeline, disaggregated):
     context, wrapper_cls, controller, configure = mock_pipeline
-    config = InferenceConfig()
+    config = InferenceConfig(
+        disaggregation_shards="tp=1,role=prefill+tp=1,role=decode" if disaggregated else None,
+        enable_prefix_caching=True,
+    )
     model = SimpleNamespace(config=MagicMock())
 
     engine = factory_module.build_dynamic_inference_engine(
@@ -52,30 +56,15 @@ def test_builds_standard_engine(mock_pipeline):
         inference_wrapper_cls=wrapper_cls,
     )
 
-    assert type(engine) is _DynamicEngine
+    assert type(engine) is (_DisaggEngine if disaggregated else _DynamicEngine)
     assert engine.context is context
     assert engine.controller is controller
-    assert config.reserve_recurrent_state_dummy_slot is False
+    assert config.reserve_recurrent_state_dummy_slot is disaggregated
     wrapper_cls.assert_called_once_with(model, context)
-    configure.assert_not_called()
-
-
-def test_builds_and_configures_disaggregated_engine(mock_pipeline):
-    _, wrapper_cls, _, configure = mock_pipeline
-    config = InferenceConfig(
-        disaggregation_shards="tp=1,role=prefill+tp=1,role=decode", enable_prefix_caching=True
-    )
-
-    engine = factory_module.build_dynamic_inference_engine(
-        model=SimpleNamespace(config=MagicMock()),
-        tokenizer="tokenizer",
-        inference_config=config,
-        inference_wrapper_cls=wrapper_cls,
-    )
-
-    assert type(engine) is _DisaggEngine
-    assert config.reserve_recurrent_state_dummy_slot is True
-    configure.assert_called_once_with(engine)
+    if disaggregated:
+        configure.assert_called_once_with(engine)
+    else:
+        configure.assert_not_called()
 
 
 def test_disaggregation_rejects_incompatible_engine_override(mock_pipeline):

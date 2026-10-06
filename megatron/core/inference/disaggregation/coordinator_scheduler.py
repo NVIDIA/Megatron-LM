@@ -418,23 +418,18 @@ class DisaggCoordinatorScheduler:
     def pop_queued_for_engine(self, identity) -> List[int]:
         """Remove and return all requests queued for an engine."""
 
-        prefills = self._prefill.queues.pop(identity, ())
-        handoffs = self._decode.queues.pop(identity, ())
-        return [request.request_id for request in prefills] + [
-            handoff.request_id for handoff in handoffs
+        return [
+            request.request_id
+            for state in (self._prefill, self._decode)
+            for request in state.queues.pop(identity, ())
         ]
 
     def reservations_for_engine(self, identity) -> List[int]:
         """Return request IDs currently holding capacity on an engine."""
 
-        prefills = [
+        return [
             request_id
-            for request_id, (reserved_identity, _) in self._prefill.reservations.items()
+            for state in (self._prefill, self._decode)
+            for request_id, (reserved_identity, _) in state.reservations.items()
             if reserved_identity == identity
         ]
-        decodes = [
-            request_id
-            for request_id, (reserved_identity, _) in self._decode.reservations.items()
-            if reserved_identity == identity
-        ]
-        return prefills + decodes

@@ -61,6 +61,7 @@ from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
@@ -187,12 +188,12 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
-    get_run_config,
     set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -214,7 +215,7 @@ from .utils import (
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
 try:
     from megatron.rl import rl_utils
-    from megatron.rl.inference.disagg import build_disagg_inference_model, is_disagg_rollout
+    from megatron.rl.inference.disagg import build_disagg_inference_model
     from megatron.rl.rl_profiling import (
         RL_LOGGABLE_TIMER_NAMES,
         initialize_rl_profiler,
@@ -1960,7 +1961,7 @@ def pretrain(
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
-        if is_disagg_rollout(args):
+        if spec_declares_disaggregation(args.inference_shards):
             # Disaggregated rollouts build this rank's prefill/decode model on
             # the shard process groups maintained by the per-pool refit path.
             inference_model = build_disagg_inference_model(

@@ -13,22 +13,18 @@ def _meta(*, request_capacity=32, **values):
     return {"request_capacity": request_capacity, **values}
 
 
-def test_registration_uses_conservative_model_parallel_limits():
-    flow = DisaggCoordinatorScheduler()
-
-    capacity = flow.register_engine(
-        b"decode",
-        "decode",
-        [_meta(ssm_slot_capacity=12), _meta(request_capacity=24, ssm_slot_capacity=10)],
-    )
-
-    assert capacity == 10
-    assert flow.capacity(b"decode") == 10
-
-
 def test_weighted_decode_reservations_are_fifo_and_held_until_release():
     flow = DisaggCoordinatorScheduler()
-    flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=5)])
+    # Reservations must use the weakest model-parallel rank's capacity.
+    assert (
+        flow.register_engine(
+            b"decode", "decode", [_meta(ssm_slot_capacity=7), _meta(ssm_slot_capacity=5)]
+        )
+        == 5
+    )
+    assert flow.capacity(b"decode") == 5
+    assert not flow.can_ever_fit(b"decode", 6)
+    assert flow.decode_load(b"decode") == (0, 0, 0)
 
     assert flow.try_reserve(b"decode", 1, 4)
     assert not flow.try_reserve(b"decode", 2, 2)
@@ -68,26 +64,19 @@ def test_duplicate_registration_requires_explicit_removal():
     assert flow.capacity(b"decode") == 5
 
 
-def test_oversized_handoff_is_rejected_without_mutating_usage():
-    flow = DisaggCoordinatorScheduler()
-    flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=4)])
-
-    assert not flow.can_ever_fit(b"decode", 5)
-    assert flow.decode_load(b"decode") == (0, 0, 0)
-
-
-def test_invalid_advertised_capacity_is_rejected():
-    flow = DisaggCoordinatorScheduler()
-
-    with pytest.raises(ValueError, match="must be positive"):
-        flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=0)])
-
-
-@pytest.mark.parametrize("metadata", [None, [None]])
-def test_malformed_engine_metadata_is_rejected(metadata):
+@pytest.mark.parametrize(
+    "metadata,message",
+    [
+        (None, "transfer metadata"),
+        ([None], "transfer metadata"),
+        ([_meta(ssm_slot_capacity=0)], "must be positive"),
+        ([_meta(ssm_slot_capacity=4), _meta(global_rank=1)], "missing from part"),
+    ],
+)
+def test_invalid_engine_metadata_is_rejected(metadata, message):
     flow = DisaggCoordinatorScheduler()
 
-    with pytest.raises(ValueError, match="transfer metadata"):
+    with pytest.raises(ValueError, match=message):
         flow.register_engine(b"decode", "decode", metadata)
 
 
@@ -102,15 +91,6 @@ def test_removed_engine_cannot_acquire_new_reservations():
     assert flow.available_fraction(b"decode", "decode") == 0.0
     assert not flow.try_reserve_prefill(b"prefill", 1, 0)
     assert not flow.try_reserve(b"decode", 2, 0)
-
-
-def test_partially_advertised_model_parallel_capacity_is_rejected():
-    flow = DisaggCoordinatorScheduler()
-
-    with pytest.raises(ValueError, match="missing from part"):
-        flow.register_engine(
-            b"decode", "decode", [_meta(ssm_slot_capacity=4), _meta(global_rank=1)]
-        )
 
 
 def test_prefill_reservations_use_advertised_handoff_bound_and_fifo_queue():

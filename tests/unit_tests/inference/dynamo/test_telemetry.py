@@ -1,28 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from megatron.inference.integrations.dynamo.telemetry import (
     EngineEventReceiver,
     EngineEventReporter,
 )
-
-
-class _DynamoHelper:
-    def add_kv_event_listener(self, listener):
-        self.listener = listener
-
-
-class _Context:
-    def __init__(self):
-        self.dynamo_helper = _DynamoHelper()
-
-
-class _Engine:
-    rank = 0
-
-    def __init__(self):
-        self.context = _Context()
 
 
 def test_kv_events_bypass_request_coordinator():
@@ -36,12 +21,14 @@ def test_kv_events_bypass_request_coordinator():
 
     receiver = EngineEventReceiver(observe, "127.0.0.1")
     address = receiver.start()
-    engine = _Engine()
+    helper = MagicMock()
+    engine = SimpleNamespace(rank=0, context=SimpleNamespace(dynamo_helper=helper))
     reporter = EngineEventReporter(engine, address)
     reporter.start()
     try:
         reporter.observe("ready", {"version": 3})
-        engine.context.dynamo_helper.listener("stored", {"block_hashes": [101]})
+        listener = helper.add_kv_event_listener.call_args.args[0]
+        listener("stored", {"block_hashes": [101]})
         assert ready.wait(timeout=2.0)
         assert received == [("ready", {"version": 3}), ("stored", {"block_hashes": [101]})]
     finally:

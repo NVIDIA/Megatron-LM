@@ -78,16 +78,3 @@ def restore_registered_nixl_agent_metadata(value: Any, instance_meta: Any) -> An
         return child
 
     return restore(value)
-
-
-def make_submit_request_with_kv_message(
-    header_value: int,
-    request_id: int,
-    prompt: Any,
-    sampling_params: dict,
-    kv_meta: dict,
-    src_block_ids: list,
-) -> list:
-    """Build a ``SUBMIT_REQUEST_WITH_KV`` message."""
-
-    return [header_value, int(request_id), prompt, sampling_params, kv_meta, list(src_block_ids)]
