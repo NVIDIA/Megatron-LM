@@ -115,6 +115,9 @@ class InferenceClient:
         self.coordinator_instance_id: str | None = None
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
+        # Cancellation and local shutdown do not prove remote transfers safe.
+        # Only a terminal reply or explicit source-safe acknowledgement removes an ID.
+        self._pending_source_requests: set[int] = set()
         # Resolves when abort cleanup makes transferred state safe to reuse.
         self.abort_futures: dict[int, asyncio.Future] = {}
         # Background socket receiver for request, stream, and abort replies.
@@ -421,12 +424,24 @@ class InferenceClient:
         """Cancel a request and return its source-safety acknowledgement."""
 
         request_id = int(request_id)
+        if not 0 <= request_id < self.next_request_id:
+            raise ValueError(f"Unknown request ID: {request_id}")
         existing = self.abort_futures.get(request_id)
         if existing is not None:
             return existing
         abort_future = self._new_abort_future(request_id)
-        self._send_abort(request_id)
+        if request_id not in self._pending_source_requests:
+            abort_future.set_result(True)
+        else:
+            self._send_abort(request_id)
         return abort_future
+
+    def _mark_source_safe(self, request_id: int) -> None:
+        """Resolve cancellation even when normal completion wins the race."""
+        self._pending_source_requests.discard(request_id)
+        future = self.abort_futures.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(True)
 
     def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
@@ -518,6 +533,7 @@ class InferenceClient:
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
+        self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
@@ -527,6 +543,7 @@ class InferenceClient:
 
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
+        self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
@@ -556,6 +573,7 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id = data[1]
+                    self._mark_source_safe(request_id)
                     if request_id in self.aborted_request_ids:
                         self.aborted_request_ids.discard(request_id)
                         continue
@@ -596,11 +614,9 @@ class InferenceClient:
                     request_id, reason, source_safe = data[1:]
                     self.request_submission_times.pop(request_id, None)
                     error = InferenceRequestError(str(reason), source_safe=bool(source_safe))
-                    abort_future = self.abort_futures.get(request_id)
                     if source_safe:
+                        self._mark_source_safe(request_id)
                         self.aborted_request_ids.discard(request_id)
-                        if abort_future is not None and not abort_future.done():
-                            abort_future.set_result(True)
                     stream = self.streams.pop(request_id, None)
                     if stream is not None:
                         stream.finish(exception=error)
@@ -611,12 +627,8 @@ class InferenceClient:
                 elif header == Headers.REQUEST_ABORTED:
                     request_id, source_safe = int(data[1]), bool(data[2])
                     if source_safe:
+                        self._mark_source_safe(request_id)
                         self.aborted_request_ids.discard(request_id)
-                    future = self.abort_futures.get(request_id)
-                    if future is None:
-                        continue
-                    if source_safe and not future.done():
-                        future.set_result(True)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue

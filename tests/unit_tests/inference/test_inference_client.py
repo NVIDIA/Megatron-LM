@@ -218,6 +218,44 @@ async def test_terminal_error_and_abort_acknowledgement():
     client.stop()
 
 
+@pytest.mark.parametrize("completed_before_abort", [False, True])
+async def test_abort_acknowledges_racing_normal_completion(completed_before_abort):
+    client, _, socket = _make_client()
+    replies = [[msgpack.packb([Headers.CONNECT_ACK.value])]]
+
+    def receive(*args, **kwargs):
+        if replies:
+            return replies.pop(0)
+        raise zmq.Again()
+
+    socket.recv_multipart.side_effect = receive
+    client.start()
+    try:
+        stream = client.add_request_streaming([1, 2], SamplingParams())
+        reply = [
+            msgpack.packb([Headers.ENGINE_REPLY.value, stream.request_id]),
+            msgpack.packb({"status": "COMPLETED", "generated_tokens": [3]}),
+        ]
+        if completed_before_abort:
+            replies.append(reply)
+            async with asyncio.timeout(2):
+                while stream.request_id in client.streams:
+                    await asyncio.sleep(0.005)
+        socket.send.reset_mock()
+        ack = client.abort_request_and_wait(stream.request_id)
+        if completed_before_abort:
+            socket.send.assert_not_called()
+        else:
+            replies.append(reply)
+        assert await asyncio.wait_for(ack, timeout=2)
+        assert not client._pending_source_requests
+        assert not client.aborted_request_ids
+        with pytest.raises(ValueError, match="Unknown request ID"):
+            client.abort_request_and_wait(client.next_request_id)
+    finally:
+        client.stop()
+
+
 async def test_fire_and_forget_abort_acknowledgement_clears_late_reply_guard():
     client, _, fake_socket = _make_client()
     recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
