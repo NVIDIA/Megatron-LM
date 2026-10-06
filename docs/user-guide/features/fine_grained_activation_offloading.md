@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"shortcut_post_norm"`, and `"gdn_core_attn"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`. `gdn_core_attn` requires BF16 GDN with the FLA recurrence.
 
 ## User Guide
 
@@ -24,13 +24,13 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm", "gdn_core_attn".
 --offload-modules core_attn attn_proj expert_fc1
 ```
 
 ### Offloadable Modules
 
-Each module offloads its **input** activation to CPU during forward and reloads it before backward:
+Each scope offloads saved activations to CPU during forward and reloads them before backward:
 
 | Module | Description | Notes |
 |---|---|---|
@@ -43,10 +43,34 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only; no full recomputation or CUDA graphs |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
 replay-owned forward so that replay and offloading do not release the same activation.
+
+### GDN Recurrence Offloading
+
+Use `--fine-grained-activation-offloading --offload-modules gdn_core_attn` with BF16
+GDN (`--experimental-attention-variant gdn`, including the legacy `gated_delta_net`
+alias). This scope captures tensors saved by FLA's chunked gated delta rule, including
+Q/K/V and its internal WY representation. It commits the transfer on the recurrence
+output, before the gated output norm, and reloads before recurrence backward.
+
+This option is separate from `core_attn`, which continues to select standard attention.
+It leaves input projection, causal convolution, and output normalization outside the
+GDN offload scope. `gdn_norm_out` selective recomputation can be used alongside it.
+Evaluation and forwards under `torch.no_grad()` bypass the offload scope.
+
+Initial support requires BF16 without FP8/FP4, the FLA recurrence (not the deterministic
+Torch reference), and no CUDA graphs or full-layer recomputation. GDN2 is not included.
+Saved inputs are not force-released: any storage still held by another operation stays
+on GPU. The manager's minimum size, fraction, and last-group margin still apply; a
+single GDN group is kept resident after warmup. Use multiple layers when evaluating
+steady-state memory savings.
+
+See [GDN profiling and validation](../../developer/gdn_activation_offloading.md) for
+the saved-tensor analysis, reproducible benchmark, and scope of validation.
 
 ### Tuning Parameters
 
@@ -142,6 +166,9 @@ Offloading and recomputation are complementary:
 
 
 ### Compatibility
+
+The table describes the existing transformer scopes. The initial `gdn_core_attn`
+scope has the restrictions and validation coverage described above.
 
 | Feature | Supported |
 |---|---|
