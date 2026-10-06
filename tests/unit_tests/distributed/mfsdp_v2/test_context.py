@@ -288,15 +288,22 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
 
 
 def test_combined_scheduler_uses_post_accumulate_grad(distributed_setup):
-    """The manual scheduler still reduces when parameter gradients become ready."""
+    """The manual scheduler reduces gradients and completes deferred frozen units."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Linear(4, 4, bias=False).to(device)
+    trainable = nn.Linear(4, 4, bias=False)
+    frozen = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable, frozen).to(device)
+    nn.init.ones_(frozen.weight)
     with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
+        fully_shard(trainable, mesh, _default_placements(), register_hooks=False)
         fully_shard(model, mesh, _default_placements(), register_hooks=False)
     register_combined_1f1b_hooks(model)
     model(torch.ones(2, 4, device=device)).sum().backward()
     context.finish_grad_sync()
     torch.testing.assert_close(
-        model.weight.grad.full_tensor(), torch.full((4, 4), 2.0, device=device)
+        trainable.weight.grad.full_tensor(), torch.full((4, 4), 8.0, device=device)
     )
+    # The root has no input gradients; its weights are released by the final callback.
+    frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
+    assert frozen_weight.untyped_storage().nbytes() == 0

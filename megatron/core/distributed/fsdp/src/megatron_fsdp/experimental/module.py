@@ -210,7 +210,7 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this backward's gradient reductions."""
-        # No-input module hooks arrive in outer-to-inner order. Finish children first.
+        # Finish in reverse order to close nested backward NVTX ranges correctly.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
@@ -399,6 +399,7 @@ class FsdpModule:
 
         Without input gradients, PyTorch's module hook fires before internal
         backward. Defer that case to autograd completion instead.
+        Custom schedulers must register the context's final callback during backward.
         """
 
         def grad_checking_post_backward_hook(module, grad_input, _grad_output):
@@ -407,7 +408,6 @@ class FsdpModule:
             else:
                 context = module.context
                 context._delayed_post_backward_callbacks.append((module, post_backward_hook))
-                context.register_post_backward_hook()
 
         cast(nn.Module, self).register_full_backward_hook(grad_checking_post_backward_hook)
 
