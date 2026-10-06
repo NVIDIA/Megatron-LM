@@ -25,7 +25,10 @@ from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    mamba_stack_spec,
+    wide_residual_hybrid_stack_spec,
+)
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -245,7 +248,8 @@ def language_model_spec(
         expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:
         assert all(
-            getattr(pg_collection, name, None) is not None for name in ("pp", "tp", "cp", "ep", "expt_tp")
+            getattr(pg_collection, name, None) is not None
+            for name in ("pp", "tp", "cp", "ep", "expt_tp")
         ), "language pg_collection is missing a required pp/tp/cp/ep/expt_tp group"
         pp_rank = get_pg_rank(pg_collection.pp)
         pp_size = get_pg_size(pg_collection.pp)
@@ -258,11 +262,16 @@ def language_model_spec(
         args, tp_size, pp_size, ep_size, expt_tp_size, cp_size=cp_size
     )
     require_per_token_loss(config)
+    stack_spec = (
+        wide_residual_hybrid_stack_spec
+        if getattr(config, "wide_residual", None) is not None
+        else mamba_stack_spec
+    )
     return ModuleSpec(
         module=MambaModel,
         params={
             "config": config,
-            "mamba_stack_spec": mamba_stack_spec,
+            "mamba_stack_spec": stack_spec,
             "vocab_size": _vocab_size(args),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,

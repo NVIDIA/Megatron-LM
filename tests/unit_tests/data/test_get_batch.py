@@ -28,6 +28,13 @@ from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(autouse=True)
+def destroy_test_environment():
+    yield
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+
+
 def initialize_test_environment(
     tp_size: int,
     pp_size: int,
