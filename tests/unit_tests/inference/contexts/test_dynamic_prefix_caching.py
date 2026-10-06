@@ -39,6 +39,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
+    reset_rounder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -55,6 +56,9 @@ class PrefixCachingTestBase:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        reset_rounder()
 
     @staticmethod
     def _mamba_config(mamba_chunk_size=128):
@@ -1747,6 +1751,79 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
             assert ctx.kv_block_allocator.block_ref_counts[block_id].item() == 2
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize("record_mamba_match", [False, True])
+@pytest.mark.parametrize(
+    "mamba_boundaries",
+    [None, [], [2], [2, 6, 9]],
+    ids=["memory_only", "snapshots_evicted", "earlier_snapshot", "later_snapshots"],
+)
+def test_hybrid_cached_continuation_preserves_recurrent_position(
+    mamba_boundaries, record_mamba_match
+):
+    """KV reuse must not skip transitions in a continuation's live Mamba state."""
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = True
+    hashes = list(range(1, 11))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    ctx.mamba_slot_allocator = (
+        None
+        if mamba_boundaries is None
+        else SimpleNamespace(hash_to_block_id={h: h for h in mamba_boundaries})
+    )
+    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    bs = ctx.block_size_tokens
+    recurrent_position = 0
+
+    for chunk_length in (4 * bs, 4 * bs, 2 * bs + 2):
+        finished = req.finished_chunk_token_count
+        match = ctx._compute_prefix_match(req, chunk_length, record_mamba_match=record_mamba_match)
+        allocated = match.already_allocated_blocks
+        required = match.overall_required_blocks
+        assert match.matched_block_ids == hashes[allocated:required]
+        assert match.num_blocks_from_pool == required - allocated - len(match.matched_block_ids)
+        if finished == 0:
+            # A valid first-chunk snapshot still permits its matching prefix skip.
+            assert match.prefix_skip_tokens == (2 * bs if mamba_boundaries else 0)
+            recurrent_position = match.prefix_skip_tokens
+        else:
+            # No Mamba restore occurs on continuation admission. Sharing KV must
+            # not advance the logical position past uncomputed recurrent state.
+            assert match.prefix_skip_tokens == 0
+            assert match.effective_prefill_chunk_length == chunk_length
+        recurrent_position += match.effective_prefill_chunk_length
+        req.finished_chunk_token_count += chunk_length
+        assert recurrent_position == req.finished_chunk_token_count
+
+
+@pytest.mark.internal
+def test_attention_only_cached_continuation_still_skips():
+    """Attention-only continuations can still skip matching KV blocks."""
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = False
+    ctx.mamba_slot_allocator = None
+    hashes = list(range(1, 11))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    req = SimpleNamespace(
+        finished_chunk_token_count=4 * ctx.block_size_tokens, precomputed_block_hashes=hashes
+    )
+
+    match = ctx._compute_prefix_match(req, 6 * ctx.block_size_tokens + 2)
+
+    assert match.matched_block_ids == hashes[4:]
+    assert match.num_blocks_from_pool == 1
+    assert match.already_allocated_blocks == 4
+    assert match.overall_required_blocks == 11
+    assert match.prefix_skip_tokens == 6 * ctx.block_size_tokens
+    assert match.effective_prefill_chunk_length == 2
+
+
 def _make_cpu_mamba_slot_allocator(
     monkeypatch, *, total_blocks: int, max_slots: int
 ) -> MambaSlotAllocator:
@@ -3257,9 +3334,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         try:
             self._run_engine_case(case)
         finally:
-            DynamicInferenceContext.ROUNDER = 64
-            DynamicInferenceContext.TOKEN_ROUNDER = 64
-            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            reset_rounder()
             Utils.destroy_model_parallel()
 
 

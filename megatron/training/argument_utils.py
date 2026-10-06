@@ -4,6 +4,7 @@ import ast
 import builtins
 import dataclasses
 import enum
+import importlib
 import inspect
 import itertools
 import types
@@ -593,6 +594,33 @@ def gpt_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> ModuleSpec | None:
+    """Return the inference_optimized counterpart of a HybridStack training --spec.
+
+    Checkpoints record their training spec, which --use-checkpoint-args restores; its inference
+    sibling keeps the layer types, e.g. gated_delta_product_stack_spec ->
+    wide_residual_gated_delta_product_inference_stack_spec (GDP rather than Mamba). Aliases such
+    as gdp_stack_spec resolve through the spec object they name. Returns None if the module
+    defines no counterpart.
+    """
+    if len(spec) != 2:
+        raise ValueError(f"--spec must name a module and a spec, got {spec}.")
+    base_path, name = spec
+    training_spec = import_module((base_path, name))
+    module_specs = vars(importlib.import_module(base_path))
+    aliases = sorted({alias for alias, value in module_specs.items() if value is training_spec})
+    for alias in aliases or [name]:
+        stem = alias.removeprefix("wide_residual_").replace("_inference_", "_")
+        if not stem.endswith("_stack_spec"):
+            continue
+        candidate = stem.removesuffix("_stack_spec") + "_inference_stack_spec"
+        if wide_residual:
+            candidate = "wide_residual_" + candidate
+        if isinstance(module_specs.get(candidate), ModuleSpec):
+            return module_specs[candidate]
+    return None
+
+
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
@@ -624,6 +652,17 @@ def hybrid_config_from_args(
         assert (
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
+        if args.spec is not None:
+            hybrid_stack_spec = _hybrid_inference_stack_spec(
+                args.spec, wide_residual=transformer_cfg.wide_residual is not None
+            )
+            if hybrid_stack_spec is None:
+                warnings.warn(
+                    f"No inference_optimized counterpart of --spec {args.spec}; using the "
+                    "default hybrid inference stack spec."
+                )
+            else:
+                kwargs["hybrid_stack_spec"] = hybrid_stack_spec
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
