@@ -108,6 +108,9 @@ class LLaVAModel(MegatronModule):
         vp_stage (int): Virtual pipeline stage.
     """
 
+    # Set by vision encoders (e.g. ViTModel) that read the per-image patch grid on the host.
+    _vision_reads_host_imgs_sizes = False
+
     def __init__(
         self,
         language_transformer_config: TransformerConfig,
@@ -315,7 +318,6 @@ class LLaVAModel(MegatronModule):
         class_token_len = 1
         self.vision_model = None
         self.vision_projection = None
-        self._vision_reads_host_imgs_sizes = False
         self._vision_projection_input_size = None
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
@@ -443,7 +445,6 @@ class LLaVAModel(MegatronModule):
                 class_token_len = 0
                 vmt = vision_transformer_config.vision_model_type
                 if vmt in ("pixtral-vit", "pixtral-vit-large"):
-                    # ViTModel reads the per-image patch grid on the host.
                     self._vision_reads_host_imgs_sizes = True
                     self.vision_model = ViTModel(
                         transformer_config=vision_transformer_config,
