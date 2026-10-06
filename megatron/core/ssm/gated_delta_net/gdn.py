@@ -266,13 +266,21 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        # The group-start input must participate in backward to trigger prefetch.
+        # Frozen projections can leave only a gate differentiable; a completely
+        # frozen recurrence has no saved tensors to offload.
+        offload_input_name = None
+        if self.offload_core_attention and self.training and torch.is_grad_enabled():
+            offload_input_name = next(
+                (name for name, tensor in kernel_inputs.items() if tensor.requires_grad), None
+            )
         core_attn_manager = off_interface(
-            self.offload_core_attention and self.training and torch.is_grad_enabled(),
-            query,
+            offload_input_name is not None,
+            kernel_inputs[offload_input_name or "q"],
             "gdn_core_attn",
         )
-        with core_attn_manager as query:
-            kernel_inputs["q"] = query
+        with core_attn_manager as offload_input:
+            kernel_inputs[offload_input_name or "q"] = offload_input
             core_attn_out, _ = self.gated_delta_rule(
                 **kernel_inputs,
                 initial_state=None,

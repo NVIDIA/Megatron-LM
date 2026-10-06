@@ -14,6 +14,7 @@ import os
 import statistics
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 import torch
 
@@ -30,7 +31,9 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 
 
-def build_model(args, offload=False, fraction=1.0):
+def build_model(
+    args: argparse.Namespace, offload: bool = False, fraction: float = 1.0
+) -> torch.nn.ModuleList:
     """Build a stack of real GDN layers with FLA recurrence and TE projections."""
     config = TransformerConfig(
         num_layers=args.layers,
@@ -72,7 +75,7 @@ def build_model(args, offload=False, fraction=1.0):
     )
 
 
-def forward(model, x):
+def forward(model: torch.nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
     """Run the GDN stack, preserving the residual between layers."""
     for layer in model:
         y, _ = layer(x, None)
@@ -80,16 +83,16 @@ def forward(model, x):
     return x
 
 
-def profile(model, x):
+def profile(model: torch.nn.ModuleList, x: torch.Tensor) -> dict[str, Any]:
     """Record saves, shared storage, and first backward use without retaining extra tensors."""
-    rows = []
+    rows: list[dict[str, Any]] = []
     phase = "outside_recurrence"
-    input_names = {}
+    input_names: dict[int, str] = {}
     parameter_storages = {p.untyped_storage().data_ptr() for p in model.parameters()}
     original_kernels = [layer.gated_delta_rule for layer in model]
 
-    def wrap(kernel, layer_number):
-        def call(**kwargs):
+    def wrap(kernel: Callable[..., Any], layer_number: int) -> Callable[..., Any]:
+        def call(**kwargs: Any) -> Any:
             nonlocal phase, input_names
             phase = f"gdn_core_attn.{layer_number}"
             input_names = {
@@ -103,7 +106,7 @@ def profile(model, x):
 
         return call
 
-    def pack(tensor):
+    def pack(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
         index = len(rows)
         storage = tensor.untyped_storage()
         rows.append(
@@ -120,14 +123,19 @@ def profile(model, x):
                 "parameter_alias": storage.data_ptr() in parameter_storages,
                 "save_host_seconds": time.perf_counter(),
                 "first_unpack_host_seconds": None,
+                "last_unpack_host_seconds": None,
+                "unpack_count": 0,
             }
         )
         return tensor.detach(), index
 
-    def unpack(saved):
+    def unpack(saved: tuple[torch.Tensor, int]) -> torch.Tensor:
         tensor, index = saved
+        unpack_time = time.perf_counter()
         if rows[index]["first_unpack_host_seconds"] is None:
-            rows[index]["first_unpack_host_seconds"] = time.perf_counter()
+            rows[index]["first_unpack_host_seconds"] = unpack_time
+        rows[index]["last_unpack_host_seconds"] = unpack_time
+        rows[index]["unpack_count"] += 1
         return tensor
 
     try:
@@ -143,7 +151,7 @@ def profile(model, x):
         for layer, kernel in zip(model, original_kernels):
             layer.gated_delta_rule = kernel
 
-    storages = {}
+    storages: dict[int, dict[str, Any]] = {}
     for row in rows:
         storage = storages.setdefault(
             row["storage"], {"bytes": row["storage_bytes"], "save_indices": [], "phases": []}
@@ -166,8 +174,31 @@ def profile(model, x):
     }
 
 
-def benchmark_arm(args, input_cpu, offload, fraction):
-    """Warm up independently, then measure synchronized forward/backward steps."""
+def snapshot_step(
+    model: torch.nn.ModuleList, x: torch.Tensor, y: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Copy outputs and gradients after timing, without retaining the autograd graph."""
+    if x.grad is None:
+        raise RuntimeError("Input gradient is missing.")
+    return {
+        "output": y.detach().cpu(),
+        "input_grad": x.grad.detach().cpu(),
+        **{
+            f"grad.{name}": p.grad.detach().cpu()
+            for name, p in model.named_parameters()
+            if p.grad is not None
+        },
+    }
+
+
+def benchmark_arm(
+    args: argparse.Namespace,
+    inputs_cpu: list[torch.Tensor],
+    offload: bool,
+    fraction: float,
+    reference: list[dict[str, torch.Tensor]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, torch.Tensor]]]:
+    """Measure complete steps and compare every replay outside timing."""
     off_interface.reset_instance()
     gc.collect()
     torch.cuda.empty_cache()
@@ -176,8 +207,9 @@ def benchmark_arm(args, input_cpu, offload, fraction):
     peak_allocated = []
     end_forward_allocated = []
     peak_reserved = []
-    snapshot = {}
-    for step in range(args.warmup + args.iterations):
+    snapshots = []
+    max_pool_in_use = 0
+    for step, input_cpu in enumerate(inputs_cpu):
         model.zero_grad(set_to_none=True)
         x = input_cpu.cuda().requires_grad_()
         if offload:
@@ -189,9 +221,10 @@ def benchmark_arm(args, input_cpu, offload, fraction):
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
         y = forward(model, x)
-        # Report a synchronized end-of-forward allocation separately from the peak.
-        # Both arms synchronize here; this explicit phase boundary limits D2H overlap.
-        torch.cuda.synchronize()
+        # The default does not join transfer streams before backward. The opt-in
+        # phase synchronization supports diagnostics, but changes runtime overlap.
+        if args.sync_forward:
+            torch.cuda.synchronize()
         forward_bytes = torch.cuda.memory_allocated()
         y.float().square().mean().backward()
         torch.cuda.synchronize()
@@ -201,16 +234,29 @@ def benchmark_arm(args, input_cpu, offload, fraction):
             peak_allocated.append(torch.cuda.max_memory_allocated())
             peak_reserved.append(torch.cuda.max_memory_reserved())
             end_forward_allocated.append(forward_bytes)
-        if step == args.warmup + args.iterations - 1:
-            snapshot = {
-                "output": y.detach().cpu(),
-                "input_grad": x.grad.cpu(),
-                **{
-                    f"grad.{name}": p.grad.cpu()
-                    for name, p in model.named_parameters()
-                    if p.grad is not None
-                },
-            }
+        # Every warmup/measured step uses distinct inputs and is checked outside
+        # timing. Identical repeated inputs could conceal stale cached activations.
+        snapshot = snapshot_step(model, x, y)
+        if reference is None:
+            snapshots.append(snapshot)
+        else:
+            expected = reference[step]
+            if snapshot.keys() != expected.keys():
+                raise RuntimeError(f"Gradient coverage differs at step {step}.")
+            mismatches = [
+                name for name in expected if not torch.equal(expected[name], snapshot[name])
+            ]
+            if mismatches:
+                raise RuntimeError(
+                    f"Offload changed outputs/gradients at step {step}: {mismatches}"
+                )
+        if offload:
+            pool = PipelineOffloadManager.get_instance().cpu_tensor_pool
+            in_use = pool.get_pool_status()["global_stats"]["current_in_use"]
+            max_pool_in_use = max(max_pool_in_use, in_use)
+            if in_use:
+                raise RuntimeError(f"Pinned buffers remain in use after step {step}: {in_use}")
+        del snapshot
         del x, y
     manager = PipelineOffloadManager.get_instance() if offload else None
     result = {
@@ -223,17 +269,28 @@ def benchmark_arm(args, input_cpu, offload, fraction):
         "end_forward_allocated_bytes": end_forward_allocated,
         "selected_offload_bytes": manager.offload_summary_bytes if manager else {},
         "steady_offloaded_groups": (
-            sum(g.offload for c in manager._cached_chunks_forward for g in c.offload_groups)
+            sum(
+                g.offload and g.total_offload_bytes > 0
+                for c in manager._cached_chunks_forward
+                for g in c.offload_groups
+            )
             if manager
             else 0
         ),
     }
+    if reference is not None:
+        result.update(
+            bitwise_equal=True,
+            checked_steps=len(inputs_cpu),
+            mismatches=[],
+            max_pinned_buffers_in_use_after_backward=max_pool_in_use,
+        )
     del model
     off_interface.reset_instance()
-    return result, snapshot
+    return result, snapshots
 
 
-def main():
+def main() -> None:
     """Write machine-readable profile or comparison evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["profile", "benchmark"], required=True)
@@ -250,19 +307,47 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--sync-forward",
+        action="store_true",
+        help="Synchronize after forward in both arms for phase diagnostics (changes overlap).",
+    )
     args = parser.parse_args()
-    if args.warmup < 2 or args.iterations < 1 or args.layers < 2:
+    if args.mode == "benchmark" and (args.warmup < 2 or args.iterations < 1 or args.layers < 2):
         parser.error("Use at least two layers, two warmup steps, and one measured step.")
+    if (
+        min(
+            args.layers,
+            args.seq_length,
+            args.batch_size,
+            args.hidden_size,
+            args.key_heads,
+            args.value_heads,
+            args.head_dim,
+        )
+        < 1
+    ):
+        parser.error("Model dimensions must be positive.")
+    if args.min_offloaded_tensor_size < 0 or any(not 0 <= f <= 1 for f in args.fractions):
+        parser.error("Use a non-negative tensor threshold and fractions in [0, 1].")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     torch.distributed.init_process_group("nccl")
     parallel_state.initialize_model_parallel()
     try:
-        torch.manual_seed(args.seed)
-        input_cpu = torch.randn(
-            args.seq_length, args.batch_size, args.hidden_size, dtype=torch.bfloat16
-        )
-        evidence = {
+        generator = torch.Generator().manual_seed(args.seed)
+        inputs_cpu = [
+            torch.randn(
+                args.seq_length,
+                args.batch_size,
+                args.hidden_size,
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            for _ in range(1 if args.mode == "profile" else args.warmup + args.iterations)
+        ]
+        evidence: dict[str, Any] = {
             "config": {**vars(args), "output": str(args.output)},
+            "input_policy": "seeded_distinct_input_per_step",
             "environment": {
                 "torch": torch.__version__,
                 "cuda": torch.version.cuda,
@@ -274,20 +359,13 @@ def main():
         }
         if args.mode == "profile":
             model = build_model(args)
-            evidence["profile"] = profile(model, input_cpu.cuda().requires_grad_())
+            evidence["profile"] = profile(model, inputs_cpu[0].cuda().requires_grad_())
         else:
-            baseline, reference = benchmark_arm(args, input_cpu, False, 1.0)
+            baseline, reference = benchmark_arm(args, inputs_cpu, False, 1.0)
             arms = [baseline]
             for fraction in args.fractions:
-                arm, snapshot = benchmark_arm(args, input_cpu, True, fraction)
-                assert snapshot.keys() == reference.keys(), "Gradient coverage differs."
-                mismatches = [
-                    name for name in reference if not torch.equal(reference[name], snapshot[name])
-                ]
-                arm["bitwise_equal"] = not mismatches
-                arm["mismatches"] = mismatches
+                arm, _ = benchmark_arm(args, inputs_cpu, True, fraction, reference)
                 arms.append(arm)
-                assert not mismatches, f"Offload changed outputs/gradients: {mismatches}"
             evidence["arms"] = arms
         output = args.output
         if torch.distributed.get_world_size() > 1:

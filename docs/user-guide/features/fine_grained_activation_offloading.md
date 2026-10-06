@@ -60,7 +60,9 @@ output, before the gated output norm, and reloads before recurrence backward.
 This option is separate from `core_attn`, which continues to select standard attention.
 It leaves input projection, causal convolution, and output normalization outside the
 GDN offload scope. `gdn_norm_out` selective recomputation can be used alongside it.
-Evaluation and forwards under `torch.no_grad()` bypass the offload scope.
+Evaluation, forwards under `torch.no_grad()`, and recurrences with no differentiable
+inputs bypass the offload scope. When Q is frozen, the first differentiable input
+anchors the backward prefetch callback.
 
 Initial support requires BF16 without FP8/FP4, the FLA recurrence (not the deterministic
 Torch reference), and no CUDA graphs or full-layer recomputation. GDN2 is not included.
