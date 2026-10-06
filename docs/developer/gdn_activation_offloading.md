@@ -89,7 +89,8 @@ Warmup offloads every group to learn its size. Steady state retains the final gr
 of each name to avoid a reload stall. Fraction is then applied to the eligible
 groups, with integer rounding, rather than to individual tensors or bytes. Nonzero
 fractions use the group eligibility learned during warmup rather than dynamically
-reselecting groups when tensor shapes change. Report the actual number of selected groups alongside the requested fraction.
+reselecting groups when tensor shapes change. Report the actual number of selected
+groups alongside the requested fraction.
 
 Fraction zero disables all groups after warmup, including groups whose initial
 tensors were below the threshold. Otherwise a later, longer sequence can enable
@@ -98,6 +99,13 @@ chunk complete until all its scheduled groups have run: advancing early can assi
 later layers to another microbatch and fail backward with a chunk mismatch. Tests
 cover growing sequences and consecutive microbatches, with delayed reloads and no
 transfer synchronization between microbatches.
+
+Forward-only passes cannot establish a training offload policy. The scheduler
+passes `forward_only` into reset; initial evaluation chunks are discarded while
+warmup remains active. This uses the shared phase flag rather than inferring
+training from a rank-local backward callback, preserving collective participation.
+Direct interface callers should also pass `forward_only=True` when resetting an
+initial evaluation pass.
 
 ### Fallback transfer ordering
 
@@ -202,18 +210,20 @@ The CSV records this checked-step count and the forward synchronization setting.
 ## Acceptance and next steps
 
 On one RTX A6000 with Python 3.12.4, PyTorch 2.11.0+cu130, Transformer Engine
-2.20.2, and FLA 0.5.1, all **40 tests passed** both with `TORCH_COMPILE_DISABLE=1`
+2.20.2, and FLA 0.5.1, all **46 tests passed** both with `TORCH_COMPILE_DISABLE=1`
 and with the default compilation setting. This includes exact output, input-gradient
 and parameter-gradient comparisons with changing inputs over one warmup and two
 steady-state iterations, fraction 0/0.5/1, threshold skipping, shared and expanded
 Q/K storage, `gdn_norm_out` recomputation, packed sequences, delayed D2H, frozen Q,
 eval/no-grad/fully frozen bypass, growing sequences at fraction zero, and three
 accumulated microbatches per iteration without synchronization between them.
-Pinned-buffer usage returned to zero after backward.
+Initial eval/no-grad passes also preserve training warmup, including output-norm
+recomputation. Pinned-buffer usage returned to zero after backward.
 
 The common-manager subset passed **13 tests**, including the delayed-transfer
 sentinel regression and a fraction-zero growing-microbatch lifecycle test that
 does not require FLA; one aggregation test requires two ranks and was skipped.
+Four schedule-helper cases cover phase forwarding for single-model and MIMO groups.
 An existing eight-layer BF16 GPT/MoE `core_attn` offload test also passed its
 output/gradient and peak-memory checks, covering the shared-manager change outside GDN.
 
@@ -224,8 +234,9 @@ runs used `--confcutdir=tests/unit_tests/ssm` to omit root dataset-download fixt
 configuration-only regression tests used `--noconftest`.
 
 `tools/autoformat.sh` passes its Black, isort, Pylint and Ruff gates, and kernel
-determinism coverage passes. With the common manager and its test file included, the non-blocking mypy step
-reports 23 existing diagnostics; checking original `main` reproduces the same 23. The new tool and GDN offload test file pass
+determinism coverage passes. With the common manager, scheduling code and their tests included, the non-blocking
+mypy step reports 44 existing diagnostics; checking an isolated original `main`
+worktree reproduces the same 44. The new tool and GDN offload test file pass
 a separate mypy check.
 
 The measured first slice meets these acceptance criteria: outputs and all gradients

@@ -231,6 +231,21 @@ def test_zero_fraction_with_growing_microbatches(monkeypatch: pytest.MonkeyPatch
     snapshots = []
     try:
         manager = PipelineOffloadManager.get_instance()
+        # Forward-only preprocessing must not consume the training warmup,
+        # even when other module scopes still create empty offload groups.
+        off_interface.init_chunk_handler(0, None, None, 1024, 0, 0.0)
+        with torch.no_grad():
+            result = torch.randn(512, device="cuda")
+            for _ in range(3):
+                group = off_interface(True, result, "core_attn")
+                with group as group_input:
+                    result = (group_input * 2).sin()
+                result = group.group_offload(result)
+        off_interface.reset(process_group=torch.distributed.group.WORLD, forward_only=True)
+        assert manager._is_warmup
+        assert not manager._cached_chunks_forward
+        assert not manager._cached_chunks_backward
+
         for size in (512, 4096, 2048):
             for _ in range(2):
                 source = torch.randn(size, device="cuda")
