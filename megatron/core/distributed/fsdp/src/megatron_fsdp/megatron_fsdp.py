@@ -1078,13 +1078,11 @@ class MegatronFSDP(torch.nn.Module):
                 # additional memory consumption.
                 output = tree_map(lambda t: t.view_as(t) if torch.is_tensor(t) else t, output)
 
-                output_list = []
-
-                # Post-process forward output.
-                if isinstance(output, torch.Tensor):
-                    output_list = [output]
-                elif isinstance(output, (tuple, list)):
-                    output_list = [t for t in output if isinstance(t, torch.Tensor)]
+                # Include mappings and registered output containers (e.g. HF ModelOutput),
+                # using the same pytree structure as the output transformation above.
+                output_list = [
+                    t for t in tree_flatten(output)[0] if torch.is_tensor(t) and t.requires_grad
+                ]
 
                 # Register pre-backward hook on the output tensor(s). This hook
                 # will trigger immediately after the gradients of the output
