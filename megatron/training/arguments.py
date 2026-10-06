@@ -1404,8 +1404,6 @@ def validate_args(args, defaults={}):
 
     if args.hybrid_context_parallel:
         assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        # The deprecated --enable-cuda-graph / --external-cuda-graph flags were already
-        # translated into cuda_graph_impl (and deleted) above, so check cuda_graph_impl.
         assert args.cuda_graph_impl == "none", 'Hybrid context parallelism not supported with CUDA Graph'
         assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
