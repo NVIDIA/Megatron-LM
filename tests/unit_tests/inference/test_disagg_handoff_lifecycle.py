@@ -519,6 +519,45 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 0
 
 
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("log_probs", [["invalid"], []])
+def test_invalid_handoff_metadata_does_not_reserve_or_queue(handoff_loop, queued, log_probs):
+    engine = _HandoffHarness(handoff_loop)
+    params = SamplingParams(
+        num_tokens_to_generate=2, return_log_probs=True, skip_prompt_log_probs=True
+    )
+    meta = {"resume_tokens": [99], "resume_log_probs": [-0.25]}
+    if queued:
+        with mock.patch.object(engine, "_handoff_capacity_available", return_value=False):
+            engine.add_request_with_kv_handoff(6, [5, 6, 7, 8], params, meta, [100])
+    with pytest.raises(ValueError):
+        engine.add_request_with_kv_handoff(
+            7, [1, 2, 3, 4], params, {**meta, "resume_log_probs": log_probs}, [100]
+        )
+    assert not engine._pending_handoff_hash_owners
+    assert [h.request_id for h in engine._deferred_kv_handoffs] == ([6] if queued else [])
+    engine._drain_deferred_kv_handoffs()
+    engine.add_request_with_kv_handoff(8, [1, 2, 3, 4], params, meta, [100])
+    assert not engine._deferred_kv_handoffs
+    assert engine._pending_kv_imports[-1].request_id == 8
+    _drain_loop(handoff_loop)
+
+
+def test_failed_handoff_allocation_releases_hash_reservation(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    params = SamplingParams(num_tokens_to_generate=2)
+    allocator = engine.context.kv_block_allocator
+    with mock.patch.object(allocator, "allocate_memory_blocks", side_effect=RuntimeError("OOM")):
+        with pytest.raises(RuntimeError, match="OOM"):
+            engine.add_request_with_kv_handoff(
+                7, [1, 2, 3, 4], params, {"resume_tokens": [99]}, [100]
+            )
+    assert not engine._pending_handoff_hash_owners
+    engine.add_request_with_kv_handoff(8, [1, 2, 3, 4], params, {"resume_tokens": [99]}, [100])
+    assert engine._pending_kv_imports[-1].request_id == 8
+    _drain_loop(handoff_loop)
+
+
 def test_matching_inflight_prefix_waits_for_hash_owner(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     params = SamplingParams(num_tokens_to_generate=2)
@@ -1187,6 +1226,8 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
         prompt=[1] * 8,
         sampling_params=SamplingParams(num_tokens_to_generate=2),
         kv_meta={"request_id": 8, "resume_tokens": [99]},
+        resume_tokens=[99],
+        resume_log_probs=[],
         src_block_ids=[100, 101],
         hashes=compute_block_hashes_batched(torch.tensor([1] * 8), 4),
         num_blocks=2,

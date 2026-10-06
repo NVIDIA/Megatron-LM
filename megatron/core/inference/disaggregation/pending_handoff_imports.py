@@ -19,6 +19,8 @@ class DeferredKvHandoff:
     prompt: list
     sampling_params: SamplingParams
     kv_meta: dict
+    resume_tokens: List[int]
+    resume_log_probs: List[float]
     src_block_ids: List[int]
     hashes: List[int]
     num_blocks: int

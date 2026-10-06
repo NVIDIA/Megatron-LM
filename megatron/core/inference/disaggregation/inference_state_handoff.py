@@ -812,6 +812,13 @@ class InferenceStateHandoffMixin:
             raise NotImplementedError(
                 "Decode-only handoff does not transfer prompt log probabilities"
             )
+        resume_log_probs = [float(value) for value in kv_meta.get("resume_log_probs", [])]
+        expected_log_probs = 1 if sampling_params.return_log_probs else 0
+        if len(resume_log_probs) != expected_log_probs:
+            raise ValueError(
+                "Decode-only handoff has an invalid first-token log probability count: "
+                f"expected {expected_log_probs}, got {len(resume_log_probs)}"
+            )
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(prompt_tensor, self.context.block_size_tokens)
@@ -833,6 +840,8 @@ class InferenceStateHandoffMixin:
             prompt=prompt,
             sampling_params=sampling_params,
             kv_meta=kv_meta,
+            resume_tokens=resume_tokens,
+            resume_log_probs=resume_log_probs,
             src_block_ids=list(src_block_ids),
             hashes=hashes,
             num_blocks=num_blocks,
@@ -870,20 +879,9 @@ class InferenceStateHandoffMixin:
         cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
 
         hashes_to_import = handoff.hashes[len(cached_blocks) : handoff.num_blocks]
-        if not self._reserve_handoff_hashes(handoff.request_id, hashes_to_import):
-            return False
-
         num_blocks_to_import = handoff.num_blocks - len(cached_blocks)
-        resume_tokens = (
-            [int(token) for token in handoff.kv_meta.get("resume_tokens", [])]
-            if isinstance(handoff.kv_meta, dict)
-            else []
-        )
-        resume_log_probs = (
-            [float(log_prob) for log_prob in handoff.kv_meta.get("resume_log_probs", [])]
-            if isinstance(handoff.kv_meta, dict)
-            else []
-        )
+        resume_tokens = handoff.resume_tokens
+        resume_log_probs = handoff.resume_log_probs
         ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
         continuation_block_count = (
             additional_decode_blocks(
@@ -898,23 +896,28 @@ class InferenceStateHandoffMixin:
         if not self._handoff_capacity_available(
             num_blocks_to_import + continuation_block_count, cached_blocks
         ):
-            self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
             return False
         if ssm_meta and self.context.mamba_metadata.mamba_state_free_slot_count < 1:
-            self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
+            return False
+        if not self._reserve_handoff_hashes(handoff.request_id, hashes_to_import):
             return False
 
-        allocator.retain_memory_blocks(cached_blocks)
-        allocated_blocks_tensor = allocator.allocate_memory_blocks(
-            num_blocks_to_import + continuation_block_count
-        )
-        if allocated_blocks_tensor is None:
-            if cached_blocks:
+        retained_cached_blocks = False
+        try:
+            allocator.retain_memory_blocks(cached_blocks)
+            retained_cached_blocks = True
+            allocated_blocks_tensor = allocator.allocate_memory_blocks(
+                num_blocks_to_import + continuation_block_count
+            )
+            if allocated_blocks_tensor is None:
+                raise RuntimeError("KV allocator capacity changed during handoff admission")
+        except Exception:
+            if retained_cached_blocks and cached_blocks:
                 allocator.release_memory_blocks(
                     torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
                 )
             self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
-            raise RuntimeError("KV allocator capacity changed during handoff admission")
+            raise
         allocated_blocks = [int(block) for block in allocated_blocks_tensor.tolist()]
         imported_blocks = allocated_blocks[:num_blocks_to_import]
         continuation_blocks = allocated_blocks[num_blocks_to_import:]
