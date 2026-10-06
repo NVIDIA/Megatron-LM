@@ -1473,6 +1473,14 @@ class TransformerConfig(ModelParallelConfig):
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
 
+    moe_paged_stash_copy_block_size: int = 1024
+    """Elements each program of the paged stash copy/pop kernels moves per inner-loop iteration.
+    Must be a power of two. Larger values (e.g. 4096) keep more bytes in flight per program and
+    speed up stashing of wide activations."""
+
+    moe_paged_stash_copy_max_blocks: int = 2048
+    """Maximum number of programs (CTAs) per paged stash copy/pop kernel launch."""
+
     fine_grained_offloading_max_inflight_offloads: Optional[int] = None
     """Per fine-grained offloading group name, max number of inflight offloads for that name not
     yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
@@ -2428,6 +2436,17 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                     "there is no need to use paged stashing without it."
+                )
+            block_size = self.moe_paged_stash_copy_block_size
+            if block_size <= 0 or block_size & (block_size - 1):
+                raise ValueError(
+                    "moe_paged_stash_copy_block_size must be a positive power of two, "
+                    f"got {block_size}."
+                )
+            if self.moe_paged_stash_copy_max_blocks <= 0:
+                raise ValueError(
+                    "moe_paged_stash_copy_max_blocks must be positive, "
+                    f"got {self.moe_paged_stash_copy_max_blocks}."
                 )
             moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
                 self.offload_modules

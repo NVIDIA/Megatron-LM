@@ -11,6 +11,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
+    GLOBAL_MAX_BLOCKS,
     paged_stash_copy_kernel,
     paged_stash_pop_kernel,
 )
@@ -195,8 +196,17 @@ class PagedTensor:
         """Get the schedule layer."""
         return self.schedule_layer_no
 
-    def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full)."""
+    def offload_to_stash(
+        self,
+        paged_stash_buffer: PagedStashBuffer,
+        block_size: int = GLOBAL_BLOCK_SIZE,
+        max_blocks: int = GLOBAL_MAX_BLOCKS,
+    ):
+        """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full).
+
+        ``block_size`` is the number of elements each program copies per inner-loop iteration
+        (a power of two) and ``max_blocks`` the maximum number of programs per launch.
+        """
         # Zero uninitialized metadata before copy kernel (enqueued on current stream;
         # stash_paged_tensors runs offload on the pack stream).
         self.page_record.zero_()
@@ -212,7 +222,6 @@ class PagedTensor:
             max_num_tokens = self.max_num_tokens
 
         tensor_to_copy = self._tensor
-        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
@@ -241,15 +250,22 @@ class PagedTensor:
             new_free_list_head,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=block_size,
             HAS_HOST_BUFFER=has_host,
         )
         paged_stash_buffer.free_list_head.copy_(new_free_list_head)
         self._original_tensor = self._tensor
         self._tensor = None
 
-    def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
+    def reload_from_stash(
+        self,
+        paged_stash_buffer: PagedStashBuffer,
+        block_size: int = GLOBAL_BLOCK_SIZE,
+        max_blocks: int = GLOBAL_MAX_BLOCKS,
+    ):
         """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host).
+
+        ``block_size`` / ``max_blocks``: kernel launch configuration, as in offload_to_stash.
 
         ``_tensor`` must already be allocated on the main (default) stream by the caller;
         this method only enqueues unpack-stream kernels that fill it from the stash.
@@ -267,7 +283,6 @@ class PagedTensor:
         else:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
-        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
@@ -292,7 +307,7 @@ class PagedTensor:
             new_free_list_tail,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=block_size,
         )
 
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
@@ -441,6 +456,10 @@ class PagedStashManager:
 
         # Page size for paged memory (default; overwritten from config in paged_stash_reset)
         self.page_size = 64
+        # Copy/pop kernel launch configuration (defaults; overwritten from config in
+        # paged_stash_reset)
+        self.copy_block_size = GLOBAL_BLOCK_SIZE
+        self.copy_max_blocks = GLOBAL_MAX_BLOCKS
 
     @property
     def pack_stream(self):
@@ -492,7 +511,11 @@ class PagedStashManager:
                 while len(self.paged_tensors_to_stash) > 0:
                     paged_tensor = self.paged_tensors_to_stash.pop(0)
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.offload_to_stash(stash_buffer)
+                    paged_tensor.offload_to_stash(
+                        stash_buffer,
+                        block_size=self.copy_block_size,
+                        max_blocks=self.copy_max_blocks,
+                    )
                     self.paged_tensors_to_reload[pp_schedule_layer].append(paged_tensor)
                     self.paged_tensors_stash_in_progress.append(paged_tensor)
             else:
@@ -540,7 +563,11 @@ class PagedStashManager:
                 self._unpack_stream_status = 'reloading'
                 for paged_tensor in reload_batch:
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.reload_from_stash(stash_buffer)
+                    paged_tensor.reload_from_stash(
+                        stash_buffer,
+                        block_size=self.copy_block_size,
+                        max_blocks=self.copy_max_blocks,
+                    )
             else:
                 pass
             assert len(self.paged_tensors_to_reload[pp_schedule_layer]) == 0, (
@@ -894,14 +921,17 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
-    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu and
-    moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
+    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu,
+    moe_paged_stash_page_size and moe_paged_stash_copy_block_size/max_blocks are read from it.
+    Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
     stash_manager.iteration += 1
     if config is not None:
         stash_manager.page_size = config.moe_paged_stash_page_size
+        stash_manager.copy_block_size = config.moe_paged_stash_copy_block_size
+        stash_manager.copy_max_blocks = config.moe_paged_stash_copy_max_blocks
     # current layer and microbatch for each vp stage for forward pass
     stash_manager.current_schedule_index = 0
 

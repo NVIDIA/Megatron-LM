@@ -10,7 +10,10 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
+from megatron.core.transformer.moe.ops.paged_stash import GLOBAL_BLOCK_SIZE, GLOBAL_MAX_BLOCKS
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashBuffer,
+    PagedTensor,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -58,6 +61,53 @@ def _pad_token_counts_to_align_size(
     """Round each count up to a multiple of ``pad_multiple`` (``n + (-n % m)`` like budget)."""
     t = tokens_per_expert.to(torch.int64)
     return t + (-t % pad_multiple)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestPagedTensorRoundTrip:
+    """Stash -> reload through the copy/pop kernels under different launch configurations."""
+
+    @pytest.mark.parametrize(
+        "block_size,max_blocks", [(GLOBAL_BLOCK_SIZE, GLOBAL_MAX_BLOCKS), (4096, 8192)]
+    )
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16])
+    # 64: one unmasked block per row; 1000 and 7168: masked tail of the last block.
+    @pytest.mark.parametrize("hidden_size", [64, 1000, 7168])
+    # With more rows than programs, each program loops over several rows.
+    @pytest.mark.parametrize("more_rows_than_programs", [False, True])
+    def test_round_trip_is_bit_exact(
+        self, block_size, max_blocks, dtype, hidden_size, more_rows_than_programs
+    ):
+        device = torch.device("cuda")
+        page_size = 64
+        num_tokens = 2 * max_blocks + 100 if more_rows_than_programs else 300
+        max_num_tokens = 2 * num_tokens
+        if dtype == torch.uint8:
+            src = torch.randint(0, 256, (max_num_tokens, hidden_size), dtype=dtype, device=device)
+        else:
+            src = torch.randn(max_num_tokens, hidden_size, device=device).to(dtype)
+        overflow = torch.zeros(1, dtype=torch.int64, device=device)
+        host_spill = torch.zeros(1, dtype=torch.int64, device=device)
+        stash = PagedStashBuffer(
+            max_num_tokens, hidden_size, page_size, device, overflow, host_spill, dtype
+        )
+        # Pages come back in arbitrary order after earlier stash/reload rounds.
+        stash.free_list_cuda.copy_(torch.randperm(stash.num_cuda_pages, device=device))
+        paged = PagedTensor(
+            src.clone(),
+            num_tokens_tensor=torch.tensor([num_tokens], dtype=torch.int64, device=device),
+            max_num_tokens=max_num_tokens,
+            hidden_size=hidden_size,
+            page_size=page_size,
+        )
+
+        paged.offload_to_stash(stash, block_size=block_size, max_blocks=max_blocks)
+        paged._tensor = torch.zeros_like(src)
+        paged.reload_from_stash(stash, block_size=block_size, max_blocks=max_blocks)
+        torch.cuda.synchronize()
+
+        assert overflow.item() == 0
+        assert torch.equal(paged._tensor[:num_tokens], src[:num_tokens])
 
 
 class MoEModelTestContainer:
