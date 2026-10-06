@@ -1464,7 +1464,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
-        if self.is_moe_layer and packed_seq_params is not None:
+        if self.is_moe_layer:
             moe_kwargs["packed_seq_params"] = packed_seq_params
 
         if self.recompute_mlp:
