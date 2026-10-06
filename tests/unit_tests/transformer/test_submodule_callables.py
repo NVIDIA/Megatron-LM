@@ -195,8 +195,23 @@ class TestTransformerLayerSubmoduleCallables:
         reset_hybrid_ep_buffer()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
-    @pytest.mark.parametrize("grouped_gemm", [True, False])
+    @pytest.mark.parametrize(
+        "grouped_gemm, dispatcher_type",
+        [
+            pytest.param(
+                grouped_gemm,
+                dispatcher_type,
+                # NCCL 2.31 nonblocking all-to-all crashes in dev (#7744).
+                marks=(
+                    pytest.mark.flaky_in_dev
+                    if not grouped_gemm and dispatcher_type == "alltoall"
+                    else ()
+                ),
+            )
+            for grouped_gemm in [True, False]
+            for dispatcher_type in get_valid_token_dispatcher_types()
+        ],
+    )
     @pytest.mark.parametrize("permute_fusion", [True, False])
     def test_1f1b_overlap(self, dispatcher_type, grouped_gemm, permute_fusion):
         """
