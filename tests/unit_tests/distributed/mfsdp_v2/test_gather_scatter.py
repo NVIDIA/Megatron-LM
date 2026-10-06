@@ -17,7 +17,7 @@ from typing import cast
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
@@ -34,7 +34,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_gro
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
 
 
-def _setup():
+def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
     """Read torchrun env and return (rank, world_size, device, mesh)."""
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
