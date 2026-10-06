@@ -1105,11 +1105,12 @@ def save_checkpoint(
         if ckpt_type == CheckpointType.LOCAL:
 
             def iter_finalize_fn():
+                cfg = get_run_config()
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully '
                     f'saved local checkpoint from iteration {iteration:7d}'
                 )
-                if args.log_progress and args.async_save:
+                if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save,
                         f'Saved async local checkpoint\tIteration: {iteration}',
@@ -1151,6 +1152,7 @@ def save_checkpoint(
                 )
 
             def iter_finalize_fn():
+                cfg = get_run_config()
                 prev_iteration = 0
                 save_retain_interval = getattr(
                     args, 'save_retain_interval', None
@@ -1200,7 +1202,7 @@ def save_checkpoint(
                 ):
                     config = _default_config_from_args(TokenizerConfig, args)
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if args.log_progress and args.async_save:
+                if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
@@ -1252,7 +1254,7 @@ def save_checkpoint(
                                     args=(
                                         args.save,
                                         prev_iteration,
-                                        args.log_progress,
+                                        cfg.logger.log_progress,
                                         True,
                                         args.async_ckpt_cpu_priority,
                                         args.async_ckpt_io_priority,
@@ -1265,7 +1267,7 @@ def save_checkpoint(
                             else:
                                 th = threading.Thread(
                                     target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, args.log_progress),
+                                    args=(args.save, prev_iteration, cfg.logger.log_progress),
                                 )
                                 th.start()
 
