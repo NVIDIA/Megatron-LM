@@ -1358,14 +1358,14 @@ class DynamicInferenceEngine(AbstractEngine):
         # group, so every rank in it must step in lockstep. With ETP == 1 this is
         # the EP group; with ETP > 1 it also includes the expert-TP peers.
         # Falls back to the EP group for pg_collections built without tp_ep.
-        expert_sync_group = getattr(self.pg_collection, "tp_ep", self.pg_collection.ep)
-        self.ep_rank = get_pg_rank(expert_sync_group)
-        self.ep_world_size = get_pg_size(expert_sync_group)
+        tp_ep_group = getattr(self.pg_collection, "tp_ep", self.pg_collection.ep)
+        self.tp_ep_rank = get_pg_rank(tp_ep_group)
+        self.tp_ep_world_size = get_pg_size(tp_ep_group)
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus: tuple[int, bool] = (0, False)
-        if self.ep_world_size > 1:
+        if self.tp_ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=expert_sync_group, hostname=hostname
+                self.zmq_context, process_group=tp_ep_group, hostname=hostname
             )
             # Give the context a CPU-side MAX-reduction primitive so
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
@@ -4664,7 +4664,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # will be zero and we will defer processing the signal.
         # When all ranks receive the signal, global consensus will be -1 and we can process.
 
-        if self.ep_world_size > 1:
+        if self.tp_ep_world_size > 1:
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
@@ -4736,7 +4736,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self._state_events[EngineState.PAUSED].set()
                         elif local_schedulable > 0:
                             await self.async_step()
-                        elif self.ep_world_size == 1 and local_pending_imports > 0:
+                        elif self.tp_ep_world_size == 1 and local_pending_imports > 0:
                             # No model work is ready; poll the network transfer without
                             # spending a dummy forward while waiting for decode admission.
                             await asyncio.sleep(0.001)
