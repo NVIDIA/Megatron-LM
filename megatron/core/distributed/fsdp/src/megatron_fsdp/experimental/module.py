@@ -66,6 +66,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        parameter_to_owner: dict[nn.Parameter, int] | None = None,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -75,6 +76,8 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            parameter_to_owner: Construction-time TensorAtomic owner assignments. See
+                ``fully_shard_context``.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
@@ -84,6 +87,7 @@ class FsdpContext:
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
+        self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self.allgather_stream = torch.cuda.Stream(device)
         if unify_communication_stream:
@@ -122,6 +126,7 @@ class FsdpContext:
             _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
         self._registered_modules.clear()
+        self.parameter_to_owner = None
         self._is_finalized = True
 
     def ensure_finalized(self) -> None:
@@ -230,6 +235,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    parameter_to_owner=context.parameter_to_owner,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
