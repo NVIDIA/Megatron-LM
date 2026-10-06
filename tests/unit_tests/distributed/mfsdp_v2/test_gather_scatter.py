@@ -52,31 +52,42 @@ def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
     return rank, world_size, device, mesh
 
 
-def _make_dbuffer(mesh, device, tensor_shapes):
-    """Create a `DBuffer` with all-`Flat` placement, filled with known data.
-
-    Also builds its `GroupOwnerLayout` by mocking the minimal `FsdpParameterGroup`
-    surface that `GroupOwnerLayout.from_group` reads (default NS-5 cost balancing and
-    default >=2D eligibility).
-    """
-    dbuffer = DBuffer.empty(
+def _make_dbuffer(
+    mesh: DeviceMesh, device: torch.device, tensor_shapes: list[torch.Size]
+) -> DBuffer:
+    """Create a `DBuffer` with all-`Flat` placement."""
+    return DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=tensor_shapes,
         dtype=torch.float32,
         device=device,
     )
+
+
+def _owner_layout(dbuffer: DBuffer, tensor_shapes: list[torch.Size]) -> GroupOwnerLayout:
+    """Build the `DBuffer`'s `GroupOwnerLayout`.
+
+    Mocks the minimal `FsdpParameterGroup` surface that `GroupOwnerLayout.from_group` reads: `mesh`,
+    `main_weight.layout`, and `fsdp_parameters` (default NS-5 cost balancing and default ≥2D
+    eligibility).
+    """
     params = tuple(nn.Parameter(torch.empty(shape)) for shape in tensor_shapes)
     group = SimpleNamespace(
-        mesh=mesh,
+        mesh=dbuffer.mesh,
         main_weight=SimpleNamespace(layout=dbuffer.layout),
         fsdp_parameters=tuple(SimpleNamespace(sharded=param) for param in params),
     )
-    owner_layout = GroupOwnerLayout.from_group(cast(FsdpParameterGroup, group))
+    return GroupOwnerLayout.from_group(cast(FsdpParameterGroup, group))
 
-    this_rank = mesh.get_local_rank()
+
+def _known_full_tensors(
+    dbuffer: DBuffer, owner_layout: GroupOwnerLayout, device: torch.device
+) -> list[torch.Tensor]:
+    """Fill this rank's local views with known data; return the distinct full tensors."""
+    this_rank = dbuffer.mesh.get_local_rank()
     full_tensors = []
-    for i, shape in enumerate(tensor_shapes):
+    for i, shape in enumerate(dbuffer.layout.tensor_shapes):
         full = (
             torch.arange(shape.numel(), dtype=torch.float32, device=device).view(shape) + i * 100.0
         )
@@ -87,7 +98,7 @@ def _make_dbuffer(mesh, device, tensor_shapes):
             offset = layout.rank_offset(this_rank)
             numel = layout.rank_numel(this_rank)
             local_view.copy_(full.flatten()[offset : offset + numel].view(local_view.shape))
-    return dbuffer, full_tensors, owner_layout
+    return full_tensors
 
 
 def _local_chunks(dbuffer, owner_layout, this_rank):
@@ -108,7 +119,9 @@ def test_gather_scatter_round_trip():
     """
     _, _, device, mesh = _setup()
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
-    dbuffer, full_tensors, owner_layout = _make_dbuffer(mesh, device, tensor_shapes)
+    dbuffer = _make_dbuffer(mesh, device, tensor_shapes)
+    owner_layout = _owner_layout(dbuffer, tensor_shapes)
+    full_tensors = _known_full_tensors(dbuffer, owner_layout, device)
     this_rank = mesh.get_local_rank()
 
     # --- Gather ---
@@ -147,7 +160,9 @@ def test_gather_scatter_with_stream():
         pytest.skip("Needs CUDA for stream testing.")
 
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
-    dbuffer, full_tensors, owner_layout = _make_dbuffer(mesh, device, tensor_shapes)
+    dbuffer = _make_dbuffer(mesh, device, tensor_shapes)
+    owner_layout = _owner_layout(dbuffer, tensor_shapes)
+    full_tensors = _known_full_tensors(dbuffer, owner_layout, device)
     this_rank = mesh.get_local_rank()
 
     stream = torch.cuda.Stream(device=device)
