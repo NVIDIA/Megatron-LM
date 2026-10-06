@@ -316,7 +316,7 @@ def test_real_ratio4_no_grad_and_training_forward_parity(loss_coeff, monkeypatch
             csa_window_size=32,
             dsa_indexer_n_heads=64,
             dsa_indexer_head_dim=128,
-            dsa_indexer_topk=64,
+            dsa_indexer_topk=128,
             dsa_indexer_loss_coeff=loss_coeff,
             dsa_indexer_use_sparse_loss=True,
         )
