@@ -692,6 +692,10 @@ class _CudagraphGlobalRecord:
         # Recording/warmup can keep AccumulateGrad nodes alive on the default stream.
         # Match full-iteration capture: let autograd redirect those stale references to
         # the capturing stream rather than introduce an illegal default-stream dependency.
+        # Intentionally leave this process-global setting enabled, as full-iteration capture
+        # does. The API has no getter for restoring its previous value; resetting it to False
+        # could disable an override enabled by another caller. It only affects capture-time
+        # stream handling, not ordinary eager backward.
         if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
             torch.autograd.graph.set_override_stale_capture_stream(True)
 

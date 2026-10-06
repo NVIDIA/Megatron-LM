@@ -647,7 +647,7 @@ class TestPackedSeqCudagraphs:
         )
 
     @pytest.mark.parametrize("cp_size", [1, pytest.param(2, marks=pytest.mark.flaky_in_dev)])
-    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+    def test_thd_capture_with_pad_between_seqs(self, cp_size, monkeypatch):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         model_parallel_cuda_manual_seed(123)
@@ -724,8 +724,29 @@ class TestPackedSeqCudagraphs:
         assert padded_cu_seqlens_metadata.is_cudagraph_input
         eager_out.sum().backward()
 
-        # This is the primary function under test.
-        create_cudagraphs()
+        # Reproduce the stale AccumulateGrad stream failure without inheriting an override
+        # enabled by an earlier test. Keep the eager graph alive through backward capture.
+        set_override = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
+        if set_override is None:
+            create_cudagraphs()
+        else:
+            override_calls = []
+
+            def tracked_override(enabled):
+                override_calls.append(enabled)
+                return set_override(enabled)
+
+            set_override(False)
+            try:
+                with monkeypatch.context() as capture_patch:
+                    capture_patch.setattr(
+                        torch.autograd.graph, "set_override_stale_capture_stream", tracked_override
+                    )
+                    create_cudagraphs()
+                assert override_calls == [True]
+            finally:
+                # Preserve MCore's enabled policy even if this regression test fails.
+                set_override(True)
 
         runners = []
         for layer in block.layers:
