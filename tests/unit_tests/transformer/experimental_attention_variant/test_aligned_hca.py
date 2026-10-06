@@ -2,8 +2,10 @@
 
 """Aligned HCA dispatch, stock parity, and graph replay checks."""
 
+import sys
 from argparse import ArgumentParser
 from dataclasses import fields
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 import pytest
@@ -28,6 +30,71 @@ def test_cli_default_and_opt_in():
     ArgumentGroupFactory(TransformerConfig, exclude=excluded).build_group(parser)
     assert parser.parse_args([]).hca_aligned_backward is False
     assert parser.parse_args(["--hca-aligned-backward"]).hca_aligned_backward is True
+
+
+@pytest.mark.parametrize("missing_api", [None, ModuleType("cudnn")])
+def test_optional_api_import_and_cache(missing_api):
+    """Missing APIs report the requirement; successful imports are cached."""
+    api = ModuleType("cudnn")
+    api.AlignedHCABackward = object()
+    api.aligned_hca_backward_wrapper = Mock()
+    expected = (api.AlignedHCABackward, api.aligned_hca_backward_wrapper)
+    hca._get_aligned_hca_backward.cache_clear()
+    try:
+        with patch.dict(sys.modules, {"cudnn": missing_api}):
+            with pytest.raises(ImportError, match="NVIDIA/cudnn-frontend#1198"):
+                hca._get_aligned_hca_backward()
+        with patch.dict(sys.modules, {"cudnn": api}):
+            assert hca._get_aligned_hca_backward() == expected
+        with patch.dict(sys.modules, {"cudnn": None}):
+            assert hca._get_aligned_hca_backward() == expected
+    finally:
+        hca._get_aligned_hca_backward.cache_clear()
+
+
+@pytest.mark.parametrize("cp_rank,cp_size", [(None, 16), (0, 4), (7, 8), (15, 16)])
+def test_backward_dispatch_and_strides(cp_rank, cp_size):
+    """Autograd routes gradients and passes contiguous inputs to aligned HCA."""
+    q = torch.randn(3, 2, 8, device="cpu")[..., ::2].requires_grad_()
+    kv = torch.randn(5, 8, device="cpu")[:, ::2].requires_grad_()
+    sink = torch.randn(4, device="cpu")[::2].requires_grad_()
+    out = torch.randn(3, 2, 8, device="cpu")[..., ::2]
+    lse = torch.randn(2, 6, device="cpu")[:, ::2]
+    topk = torch.zeros(3, 2, device="cpu", dtype=torch.int32)
+    dout = torch.randn(3, 2, 8, device="cpu")[..., ::2]
+    grads = dict(
+        dq=torch.full_like(q, 1), dkv=torch.full_like(kv, 2), d_sink=torch.full_like(sink, 3)
+    )
+    aligned = Mock(return_value=grads)
+    stock = Mock()
+    stock.sparse_attention_backward_wrapper.return_value = grads
+    with (
+        patch.object(sparse, "_csa_fwd_flash_mla", return_value=(out, lse, None)),
+        patch.object(sparse, "_DSA", stock),
+        patch.object(hca, "_get_aligned_hca_backward", return_value=(Mock(), aligned)) as loader,
+    ):
+        result = sparse.csa_sparse_attn(
+            q, kv, sink, topk, 0.125, is_thd=True, hca_cp_rank=cp_rank, hca_cp_size=cp_size
+        )
+        torch.testing.assert_close(result, out.reshape(3, -1))
+        result.backward(dout.reshape_as(result))
+    for actual, expected in zip((q.grad, kv.grad, sink.grad), grads.values()):
+        torch.testing.assert_close(actual, expected)
+    if cp_rank is None:
+        loader.assert_not_called()
+        aligned.assert_not_called()
+        stock.sparse_attention_backward_wrapper.assert_called_once()
+    else:
+        stock.sparse_attention_backward_wrapper.assert_not_called()
+        aligned.assert_called_once()
+        assert aligned.call_args.kwargs == dict(
+            cp_rank=cp_rank, cp_size=cp_size, softmax_scale=0.125
+        )
+        for actual, expected in zip(
+            aligned.call_args.args, (q, kv, out, dout, lse, sink), strict=True
+        ):
+            assert actual.is_contiguous()
+            torch.testing.assert_close(actual, expected)
 
 
 def _metadata(cp_rank=0, sequence_length=65536, cp_size=16):
