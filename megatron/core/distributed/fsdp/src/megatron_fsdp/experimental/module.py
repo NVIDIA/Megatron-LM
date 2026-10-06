@@ -110,7 +110,9 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
-        self._post_backward_callbacks: list[tuple[FsdpModule, Callable[[FsdpModule], None]]] = []
+        self._delayed_post_backward_callbacks: list[
+            tuple[FsdpModule, Callable[[FsdpModule], None]]
+        ] = []
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self.parameter_to_owner = parameter_to_owner
@@ -209,8 +211,8 @@ class FsdpContext:
     def post_backward(self) -> None:
         """Order current-stream consumers after this backward's gradient reductions."""
         # No-input module hooks arrive in outer-to-inner order. Finish children first.
-        while self._post_backward_callbacks:
-            module, callback = self._post_backward_callbacks.pop()
+        while self._delayed_post_backward_callbacks:
+            module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
         if not self.caller_managed_grad_sync:
             self.finish_grad_sync()
@@ -404,7 +406,7 @@ class FsdpModule:
                 post_backward_hook(module)
             else:
                 context = module.context
-                context._post_backward_callbacks.append((module, post_backward_hook))
+                context._delayed_post_backward_callbacks.append((module, post_backward_hook))
                 context.register_post_backward_hook()
 
         cast(nn.Module, self).register_full_backward_hook(grad_checking_post_backward_hook)
