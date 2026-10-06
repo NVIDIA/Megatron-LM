@@ -20,13 +20,13 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
-    GroupOwnerLayout,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.gather_scatter import (
     gather,
     scatter,
     waiting_stream_scope,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
+    GroupOwnerLayout,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -102,13 +102,11 @@ def _known_full_tensors(
 
 
 def _nonempty_local_tensors(
-    dbuffer: DBuffer, owner_layout: GroupOwnerLayout, this_rank: int
+    dbuffer: DBuffer, owner_layout: GroupOwnerLayout
 ) -> dict[int, torch.Tensor]:
     """The gather source dict: the `DBuffer`'s local views for held parameters."""
     return {
-        i: dbuffer.get_tensor_view(i)
-        for i in owner_layout.layouts
-        if owner_layout.layouts[i].rank_numel(this_rank) > 0
+        i: view for i in owner_layout.layouts if (view := dbuffer.get_tensor_view(i)).numel() > 0
     }
 
 
@@ -131,11 +129,7 @@ def test_gather_scatter_round_trip():
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(
-        _nonempty_local_tensors(dbuffer, owner_layout, this_rank),
-        destination,
-        owner_layout=owner_layout,
-    )
+    gather(_nonempty_local_tensors(dbuffer, owner_layout), destination, owner_layout=owner_layout)
 
     # Owners got the correct full tensors; nothing else was written.
     for i in owned:
@@ -179,9 +173,7 @@ def test_gather_scatter_with_stream():
     }
     with waiting_stream_scope(stream):
         gather(
-            _nonempty_local_tensors(dbuffer, owner_layout, this_rank),
-            destination,
-            owner_layout=owner_layout,
+            _nonempty_local_tensors(dbuffer, owner_layout), destination, owner_layout=owner_layout
         )
     stream.synchronize()
 
