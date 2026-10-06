@@ -487,7 +487,7 @@ class PagedStashManager:
 
         # Page size for paged memory (default; overwritten from config in paged_stash_reset)
         self.page_size = 64
-        # Copy/pop kernel launch configuration (defaults; overwritten from config in
+        # Copy/pop kernel launch sizes (defaults; selected for the current device in
         # paged_stash_reset)
         self.copy_block_size = GLOBAL_BLOCK_SIZE
         self.copy_max_blocks = GLOBAL_MAX_BLOCKS
@@ -949,10 +949,10 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
-    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu,
-    moe_paged_stash_page_size and moe_paged_stash_copy_block_size/max_blocks are read from it.
-    Otherwise defaults to 1.10 (CUDA), 0.0 (CPU). Unset copy launch options resolve on the
-    current device: 4096/8192 on Rubin (SM107), 1024/2048 elsewhere.
+    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu
+    and moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
+    Copy launch sizes are fixed for the current device: 4096/8192 on Rubin (SM107),
+    1024/2048 elsewhere.
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
@@ -965,17 +965,9 @@ def paged_stash_reset(enabled=True, config=None):
     if not enabled:
         return
 
-    block_size = config.moe_paged_stash_copy_block_size if config is not None else None
-    max_blocks = config.moe_paged_stash_copy_max_blocks if config is not None else None
-    if block_size is None or max_blocks is None:
-        # Resolve after device selection, rather than during config construction.
-        is_rubin = torch.cuda.get_device_capability() == (10, 7)
-        if block_size is None:
-            block_size = 4096 if is_rubin else GLOBAL_BLOCK_SIZE
-        if max_blocks is None:
-            max_blocks = 8192 if is_rubin else GLOBAL_MAX_BLOCKS
-    stash_manager.copy_block_size = block_size
-    stash_manager.copy_max_blocks = max_blocks
+    is_rubin = torch.cuda.get_device_capability() == (10, 7)
+    stash_manager.copy_block_size = 4096 if is_rubin else GLOBAL_BLOCK_SIZE
+    stash_manager.copy_max_blocks = 8192 if is_rubin else GLOBAL_MAX_BLOCKS
 
     if stash_manager.status == 'begin':
         stash_manager.status = 'capture'

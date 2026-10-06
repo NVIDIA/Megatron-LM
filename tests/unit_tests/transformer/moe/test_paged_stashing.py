@@ -95,31 +95,15 @@ class TestStashBufferDtype:
 
 
 @pytest.mark.parametrize("capability", [(10, 7), (10, 0), (10, 3), (9, 0), (12, 0)])
-@pytest.mark.parametrize(
-    "block_size,max_blocks", [(None, None), (1024, None), (None, 2048), (2048, 4096)]
-)
 @pytest.mark.parametrize("with_config", [False, True])
-def test_paged_stash_copy_device_defaults(
-    monkeypatch, capability, block_size, max_blocks, with_config
-):
+def test_paged_stash_copy_device_sizes(monkeypatch, capability, with_config):
     manager = SimpleNamespace(iteration=0, status="begin")
     monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-    stash_config = None
-    if with_config:
-        stash_config = SimpleNamespace(
-            moe_paged_stash_page_size=64,
-            moe_paged_stash_copy_block_size=block_size,
-            moe_paged_stash_copy_max_blocks=max_blocks,
-        )
+    stash_config = SimpleNamespace(moe_paged_stash_page_size=64) if with_config else None
     paged_stash_reset(config=stash_config)
-    default_block_size, default_max_blocks = (4096, 8192) if capability == (10, 7) else (1024, 2048)
-    assert manager.copy_block_size == (
-        block_size if with_config and block_size is not None else default_block_size
-    )
-    assert manager.copy_max_blocks == (
-        max_blocks if with_config and max_blocks is not None else default_max_blocks
-    )
+    expected = (4096, 8192) if capability == (10, 7) else (1024, 2048)
+    assert (manager.copy_block_size, manager.copy_max_blocks) == expected
 
 
 def test_disabled_paged_stash_does_not_query_device(monkeypatch):

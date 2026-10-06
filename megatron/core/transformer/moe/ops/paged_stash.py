@@ -4,9 +4,8 @@
 import triton
 import triton.language as tl
 
-# Default launch configuration of the copy/pop kernels (TransformerConfig
-# moe_paged_stash_copy_block_size / moe_paged_stash_copy_max_blocks): elements each program
-# copies per inner-loop iteration, and the maximum number of programs per launch.
+# Default copy/pop launch sizes for non-Rubin GPUs: elements each program copies
+# per inner-loop iteration, and the maximum number of programs per launch.
 GLOBAL_BLOCK_SIZE = 1024
 GLOBAL_MAX_BLOCKS = 2048
 
