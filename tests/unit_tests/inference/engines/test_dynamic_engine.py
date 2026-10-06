@@ -1736,6 +1736,126 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert replayed == [23, 24, 26, 25]
 
 
+def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
+    """Requests holding no KV at resume must hash under the post-refit weights.
+
+    Under PERSIST the prefix cache survives the refit. A request still waiting
+    at suspend, or submitted while suspended (the coordinator loop keeps
+    admitting), would otherwise match blocks the old weights computed. Requests
+    with prefill or decode progress keep their original salt.
+    """
+    block_size = 4
+    prompt = list(range(100, 100 + 4 * block_size))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        block_size_tokens=block_size,
+        enable_prefix_caching=True,
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=mock.Mock(),
+    )
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(validate_input_modalities=mock.Mock())
+    )
+    engine.requests = {}
+    engine.waiting_request_ids = deque()
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = True
+    engine.vision_embedding_cache_max_bytes = 0
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+
+    def register(request, *, is_resume=False):
+        if not is_resume:
+            engine.requests[request.request_id] = types.SimpleNamespace(
+                record=DynamicInferenceRequestRecord.from_request(request)
+            )
+            engine.waiting_request_ids.append(request.request_id)
+
+    engine._add_request = mock.Mock(side_effect=register)
+
+    def hashes(salt):
+        return compute_block_hashes_batched(
+            torch.tensor(prompt, dtype=torch.int64), block_size, cache_salt=salt
+        )
+
+    with (
+        mock.patch.object(torch.cuda, "current_device", return_value="cpu"),
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        # Served under the pre-refit weights; its blocks stay published under PERSIST.
+        engine.add_request(1, prompt)
+        published = set(engine.get_request(1).precomputed_block_hashes)
+        decoding = engine.get_request(1)
+        decoding.finished_chunk_token_count = len(prompt)
+        decoding.generated_tokens = [7]
+        engine.waiting_request_ids.remove(1)
+
+        # Part-way through a chunked prefill under the old weights.
+        engine.add_request(2, prompt)
+        partial = engine.get_request(2)
+        partial.finished_chunk_token_count = block_size
+        partial.remaining_prompt_tokens = partial.prompt_tokens[block_size:]
+
+        # Still waiting when the refit begins.
+        engine.add_request(3, prompt)
+        engine._add_request(
+            DynamicVLMInferenceRequest(
+                request_id=5,
+                prompt_tokens=torch.tensor(prompt, dtype=torch.int64),
+                sampling_params=SamplingParams(),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
+                block_hash_salt=dynamic_engine._weight_scoped_salt(0, "img-a"),
+                media_cache_key="img-a",
+                num_img_embeddings_per_tile=0,
+                imgs=None,
+                num_tiles=None,
+                decoder_seq_length=0,
+                image_embeddings=torch.zeros(1),
+                image_token_mask=torch.zeros(1),
+            )
+        )
+
+        engine.suspend()
+        # Submitted while suspended for the refit.
+        engine.add_request(4, prompt)
+        assert set(engine.get_request(4).precomputed_block_hashes) <= published
+
+        engine.resume()
+        engine.add_request(6, prompt)
+
+    new_salt = dynamic_engine._weight_scoped_salt(1, None)
+    for request_id in (3, 4):
+        request = engine.get_request(request_id)
+        assert request.block_hash_salt == new_salt
+        assert request.precomputed_block_hashes == hashes(new_salt)
+        assert published.isdisjoint(request.precomputed_block_hashes)
+        assert request.num_matched_prefix_blocks == 0
+    # A post-resume arrival hashes identically, so the two can still share KV.
+    assert engine.get_request(6).precomputed_block_hashes == hashes(new_salt)
+
+    vlm_salt = dynamic_engine._weight_scoped_salt(1, "img-a")
+    assert engine.get_request(5).block_hash_salt == vlm_salt
+    assert engine.get_request(5).precomputed_block_hashes == hashes(vlm_salt)
+
+    # Requests with progress keep the generation their leading blocks were computed by.
+    for request_id in (1, 2):
+        request = engine.get_request(request_id)
+        assert request.block_hash_salt is None
+        assert request.precomputed_block_hashes == hashes(None)
+
+
 def test_add_request_defaults_sampling_params():
     """The public optional sampling argument constructs a fresh default before token handling."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
