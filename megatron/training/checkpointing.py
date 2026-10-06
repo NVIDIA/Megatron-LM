@@ -43,7 +43,6 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
 from megatron.core.post_training.modelopt.checkpointing import (
@@ -3118,7 +3117,6 @@ def load_checkpoint(
         if restore_training_state:
             args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
             args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
             args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
@@ -3143,7 +3141,6 @@ def load_checkpoint(
         iteration = args.override_ckpt_iteration
         args.consumed_train_samples = iteration * args.global_batch_size
         args.skipped_train_samples = 0
-        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
                      f'(consumed_train_samples {args.consumed_train_samples})')
 

@@ -177,7 +177,6 @@ class TestLocalCheckpointing:
             TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
             mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
             mock.patch('torch.empty', new=deterministic_empty),
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
@@ -280,7 +279,6 @@ class TestLocalCheckpointing:
                 TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir,
                 mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
                 mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-                mock.patch("megatron.training.checkpointing.update_num_microbatches"),
                 mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
                 caplog.at_level(logging.INFO),
             ):

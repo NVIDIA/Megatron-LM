@@ -928,10 +928,16 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
 @pytest.mark.parametrize("no_load_rng", [False, True])
-def test_inference_checkpoint_without_training_state(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, no_load_rng
+@pytest.mark.parametrize("load_mode", ["inference", "resume", "override"])
+def test_checkpoint_load_without_microbatch_calculator(
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    ckpt_format,
+    no_load_rng,
+    load_mode,
 ):
-    """Load real weights and preserve RNG policy without a training calculator."""
+    """Checkpoint loading restores data, not the training runtime calculator."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = False
@@ -980,33 +986,34 @@ def test_inference_checkpoint_without_training_state(
         before_load_cuda_rng = torch.cuda.get_rng_state().clone()
         args.no_load_rng = no_load_rng
         # These training options must not influence an inference load.
-        args.override_ckpt_iteration = 7
-        args.phase_transition_iterations = [100]
-        for name in (
-            "global_batch_size",
-            "micro_batch_size",
-            "consumed_train_samples",
-            "skipped_train_samples",
-            "consumed_valid_samples",
-        ):
-            delattr(args, name)
+        args.override_ckpt_iteration = None if load_mode == "resume" else 7
+        args.phase_transition_iterations = [100] if load_mode == "inference" else None
+        args.no_load_optim = True
+        args.consumed_train_samples = 0
+        if load_mode == "inference":
+            for name in (
+                "global_batch_size",
+                "micro_batch_size",
+                "consumed_train_samples",
+                "skipped_train_samples",
+                "consumed_valid_samples",
+            ):
+                delattr(args, name)
         unset_num_microbatches_calculator()
-        with (
-            mock.patch(
-                "megatron.training.checkpointing.update_num_microbatches",
-                side_effect=AssertionError("Inference must not update training microbatches"),
-            ),
-            mock.patch(
+        if load_mode == "inference":
+            with mock.patch(
                 "megatron.training.checkpointing.get_rerun_state_machine",
                 side_effect=AssertionError("Inference must not restore training rerun state"),
-            ),
-        ):
-            metadata = load_checkpoint_for_inference([restored])
-
-        assert metadata == (123, 456)
-        assert not hasattr(args, "consumed_train_samples")
-        assert not hasattr(args, "skipped_train_samples")
-        assert not hasattr(args, "consumed_valid_samples")
+            ):
+                metadata = load_checkpoint_for_inference([restored])
+            assert not hasattr(args, "consumed_train_samples")
+            assert not hasattr(args, "skipped_train_samples")
+            assert not hasattr(args, "consumed_valid_samples")
+        else:
+            metadata = load_checkpoint([restored], None, None)
+            expected_iteration = 7 if load_mode == "override" else 123
+            assert args.consumed_train_samples == expected_iteration * args.global_batch_size
+        assert metadata == (7 if load_mode == "override" else 123, 456)
         for expected, actual in zip(model.parameters(), restored.parameters()):
             assert torch.equal(expected, actual)
         assert torch.equal(torch.get_rng_state(), before_load_rng if no_load_rng else saved_rng)

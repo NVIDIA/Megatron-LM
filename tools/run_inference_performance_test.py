@@ -35,11 +35,10 @@ from functools import partial
 from typing import List
 
 from megatron.core import mpu
-from megatron.inference.initialize import initialize_runtime_services_for_inference
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -163,7 +162,7 @@ def main():
         },
     )
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services_for_inference(args)
+    initialize_runtime_services(args, inference=True)
     initialize_megatron(inference=True)
 
     args = get_args()

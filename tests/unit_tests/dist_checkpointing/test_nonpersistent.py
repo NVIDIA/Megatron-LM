@@ -48,7 +48,6 @@ class TestNonPersistentSaveAndLoad:
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_non_persistent") as non_persistent_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
             mock.patch('torch.empty', new=deterministic_empty),
         ):
             init_basic_mock_args(mock_args, tp, pp)
@@ -136,7 +135,6 @@ class TestLegacySaveAndLoad:
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, legacy_ckpt_dir)

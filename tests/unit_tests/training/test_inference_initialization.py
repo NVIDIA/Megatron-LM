@@ -4,13 +4,58 @@
 
 import sys
 from argparse import ArgumentParser, Namespace
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from megatron.inference import initialize as inference_initialize
 from megatron.training import arguments, global_vars, initialize
+
+
+@pytest.mark.parametrize("restored_samples", [0, 8, 32])
+def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples):
+    from megatron.training import training
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.skip_train = True  # Evaluation-only setup must also restore the calculator.
+    args.load = "checkpoint"
+    args.data_parallel_size = 1
+    args.micro_batch_size = 1
+    args.consumed_train_samples = 0
+    model = [SimpleNamespace()]
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "get_model", Mock(return_value=model))
+    monkeypatch.setattr(training, "unwrap_model", lambda value: value)
+    events = []
+
+    def restore(*unused_args, **unused_kwargs):
+        args.consumed_train_samples = restored_samples
+        events.append("load")
+        return 7, 0
+
+    def update(consumed_samples, verbose):
+        assert consumed_samples == restored_samples
+        assert verbose
+        events.append("update")
+
+    class ReachedBatchValidation(Exception):
+        pass
+
+    def validate():
+        assert events == ["load", "update"]
+        raise ReachedBatchValidation
+
+    monkeypatch.setattr(training, "load_checkpoint", restore)
+    monkeypatch.setattr(training, "update_num_microbatches", update)
+    monkeypatch.setattr(training, "get_num_microbatches", validate)
+    with pytest.raises(ReachedBatchValidation):
+        training.setup_model_and_optimizer(Mock(), model_provider_func=Mock())
 
 
 @pytest.mark.parametrize("build_tokenizer", [False, True])
@@ -23,14 +68,14 @@ def test_inference_services_without_training_arguments(
     )
     experimental = Mock()
     jit = Mock()
-    monkeypatch.setattr(inference_initialize, "set_experimental_flag", experimental)
-    monkeypatch.setattr(inference_initialize, "disable_jit_fuser", jit)
+    monkeypatch.setattr(global_vars, "set_experimental_flag", experimental)
+    monkeypatch.setattr(global_vars, "disable_jit_fuser", jit)
     services = {}
     for name in ("_build_tokenizer", "_set_wandb_writer", "_set_telemetry"):
         services[name] = Mock()
         monkeypatch.setattr(global_vars, name, services[name])
     for name in (
-        "initialize_runtime_services",
+        "initialize_training_runtime_services",
         "init_num_microbatches_calculator",
         "_set_tensorboard_writer",
         "_set_timers",
@@ -42,9 +87,7 @@ def test_inference_services_without_training_arguments(
     ):
         monkeypatch.setattr(global_vars, name, Mock(side_effect=AssertionError(name)))
 
-    inference_initialize.initialize_runtime_services_for_inference(
-        args, build_tokenizer=build_tokenizer
-    )
+    global_vars.initialize_runtime_services(args, build_tokenizer=build_tokenizer, inference=True)
 
     assert services["_build_tokenizer"].call_count == int(build_tokenizer)
     services["_set_wandb_writer"].assert_called_once_with(args)

@@ -27,11 +27,10 @@ from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.initialize import initialize_runtime_services_for_inference
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -131,7 +130,7 @@ def main(model_type: str = "gpt"):
         },
     )
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services_for_inference(args)
+    initialize_runtime_services(args, inference=True)
     initialize_megatron(inference=True)
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:

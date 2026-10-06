@@ -165,8 +165,27 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     initialize_runtime_services(args, build_tokenizer=build_tokenizer)
 
 
-def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
-    """Construct training services independently of parsing and config construction."""
+def initialize_runtime_services(
+    args: Namespace, *, build_tokenizer: bool = True, inference: bool = False
+) -> None:
+    """Initialize shared services and, unless inference, training-only services."""
+    if build_tokenizer:
+        _build_tokenizer(args)
+    _set_wandb_writer(args)
+    _set_telemetry(args, include_training=not inference)
+
+    if args.enable_experimental:
+        set_experimental_flag(True)
+
+    if args.disable_jit_fuser:
+        disable_jit_fuser()
+
+    if not inference:
+        initialize_training_runtime_services(args)
+
+
+def initialize_training_runtime_services(args: Namespace) -> None:
+    """Initialize training-only services after the shared runtime services."""
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
@@ -183,19 +202,12 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
-    if build_tokenizer:
-        _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
     _set_energy_monitor(args)
-    _set_telemetry(args)
     _set_train_state()
-
-    if args.enable_experimental:
-        set_experimental_flag(True)
 
     if args.exit_signal_handler:
         _set_signal_handler(args.exit_signal)
@@ -203,9 +215,6 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
     if args.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
-
-    if args.disable_jit_fuser:
-        disable_jit_fuser()
 
 
 def unset_global_variables():

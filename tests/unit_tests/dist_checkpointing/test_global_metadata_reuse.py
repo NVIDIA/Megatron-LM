@@ -39,7 +39,6 @@ class TestGlobalMetadataReuse:
                 tmp_path_dist_ckpt / "test_global_metadata_reuse"
             ) as non_persistent_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
@@ -112,7 +111,6 @@ class TestGlobalMetadataReuse:
                 tmp_path_dist_ckpt / "test_global_metadata_reuse"
             ) as non_persistent_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
