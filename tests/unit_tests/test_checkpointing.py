@@ -521,7 +521,7 @@ def create_checkpoint(load_path, ckpt_format):
 
 
 @pytest.fixture
-def create_args():
+def create_args(run_config):
     """Setup dummy args."""
     args = SimpleNamespace()
     args.finetune = False
@@ -890,7 +890,7 @@ def test_strict_load_idle_rerun_checkpoint(
         assert loaded_machine.mode == load_rerun_mode
         assert not loaded_machine.rerun_requested
 
-        
+
 @pytest.mark.parametrize(
     ('first', 'second', 'should_raise'),
     [
