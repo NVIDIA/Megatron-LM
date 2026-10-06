@@ -458,6 +458,33 @@ def cudagraph_needs_generator_registration() -> bool:
     return git_version not in (None, "Unknown") and not git_version.startswith("4fdf77b940")
 
 
+def prime_cuda_rng_states_for_graph_capture() -> None:
+    """Create each CUDA generator's capture state at the start of a graph capture.
+
+    Call as the first operation inside a `torch.cuda.graph` capture. PyTorch >= 2.14
+    (pytorch/pytorch#176753) creates this state lazily on the generator's first Philox use in
+    the capture and allocates it on the default stream. Mid-capture, that allocation makes the
+    caching allocator record and query events for blocks freed earlier in the capture; if a
+    block's recorded stream has since joined the capture (e.g. an NCCL stream after a pipeline
+    recv), the query raises cudaErrorCapturedEvent and invalidates the capture
+    (pytorch/pytorch#193982). Priming here, while nothing is pending, restores the pre-2.14
+    behavior of `capture_begin`. Each primed generator advances by one tiny draw per replay.
+    No-op outside a capture and on PyTorch < 2.14.
+    """
+    # TODO: Remove once the minimum supported PyTorch includes the upstream fix for lazy RNG
+    # capture-state allocation (pytorch/pytorch#193993 or its successor).
+    if cudagraph_needs_generator_registration() or not torch.cuda.is_current_stream_capturing():
+        return
+    scratch = torch.empty(1, device=torch.cuda.current_device())
+    generators = [torch.cuda.default_generators[scratch.device.index]]
+    if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
+        generators.extend((get_all_rng_states() or {}).values())
+    for generator in generators:
+        # Graph-safe trackers hold generators; tensor states cannot be drawn from under capture.
+        if isinstance(generator, torch.Generator) and generator.device == scratch.device:
+            scratch.uniform_(generator=generator)
+
+
 def model_parallel_cuda_manual_seed(
     seed: int,
     te_rng_tracker: bool = False,

@@ -242,8 +242,10 @@ class SSMDynamicInferenceMixin:
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
             )
-            # Flatten back to [N*S, 1, d] to match the merge logic.
-            y_decode = y_decode.view(decode_token_count, 1, -1)
+            # Flatten back to [N*S, 1, d] to match the merge logic. reshape, not view: with
+            # speculative decoding, some kernels (e.g. GatedDeltaProduct) return a
+            # non-contiguous [N, S, d].
+            y_decode = y_decode.reshape(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
         if prefill_req_count > 0:
