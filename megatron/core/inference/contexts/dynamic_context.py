@@ -2690,6 +2690,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if not self.using_cuda_graph_this_step() and real_bs == 0:
             max_seqlen_q = self.num_speculative_tokens + 1
             max_seqlen_k = 1
+        assert self.is_decode_only() or max_seqlen_q > 1, (
+            "a batch routed to the varlen attention kernel must publish max_seqlen_q > 1, "
+            f"got {max_seqlen_q}"
+        )
 
         # Bind state_data to GPU views now. set_state_data() only creates Python
         # slice references into the GPU buffer (no GPU reads), so it's safe to
