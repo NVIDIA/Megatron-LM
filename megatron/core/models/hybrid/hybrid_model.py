@@ -499,19 +499,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         # The schedule plan calls the layer callables directly and bypasses
         # ``HybridStack.forward``, which is where per-layer context-parallel layout
-        # conversion happens. A bracketed group presents the boundary layout to its
-        # enclosing stack even when its own layers need conversion, so check every
-        # stack, including the nested ones.
+        # conversion happens and where chunkwise linear CP gets its packed-sequence
+        # metadata and padding-mask check. A bracketed group presents the boundary
+        # layout to its enclosing stack even when its own layers need conversion, so
+        # check every stack, including the nested ones.
         for module in self.modules():
+            if not isinstance(module, HybridStack):
+                continue
             if (
-                isinstance(module, HybridStack)
-                and module._cp_layout_manager is not None
+                module._cp_layout_manager is not None
                 and module._cp_layout_manager.requires_conversion
             ):
                 raise ValueError(
                     "overlap_moe_expert_parallel_comm with HybridModel does not support mixed "
                     "context-parallel layouts (linear_cp_layout != attention_cp_layout with "
                     "context_parallel_size > 1)."
+                )
+            if module._has_linear_layer_with_chunkwise_cp:
+                raise ValueError(
+                    "overlap_moe_expert_parallel_comm with HybridModel does not support "
+                    "linear_cp_mode='chunkwise' with context_parallel_size > 1."
                 )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
