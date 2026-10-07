@@ -33,17 +33,6 @@ from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGath
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push, round_up_to_nearest_multiple
 
 
-def get_mtp_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Return the module that owns the MTP block.
-
-    That is the model itself, or the language model a multimodal wrapper (e.g. LLaVAModel)
-    holds; the wrapper's language model writes the decoder hidden states MTP reads.
-    """
-    if not hasattr(model, 'mtp') and hasattr(getattr(model, 'language_model', None), 'mtp'):
-        return model.language_model
-    return model
-
-
 @dataclass
 class _CommitSegments:
     """One request class's contribution to the commit pass, in active-request order.
@@ -460,7 +449,7 @@ class MTPControllerMixin:
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
-        unwrapped_model = get_mtp_model(self._unwrapped_model)
+        unwrapped_model = self._language_model
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
         has_mtp = self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
@@ -698,7 +687,7 @@ class MTPControllerMixin:
             return
 
         context = self.inference_wrapped_model.inference_context
-        unwrapped_model = get_mtp_model(self._unwrapped_model)
+        unwrapped_model = self._language_model
         has_mtp = self._is_last_pp_stage and hasattr(unwrapped_model, "mtp")
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
