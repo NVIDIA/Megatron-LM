@@ -295,7 +295,10 @@ class FsdpModule:
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
         module.register_forward_pre_hook(
-            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
+            lambda hooked_module, _args, kwargs: cast(FsdpModule, hooked_module).pre_forward(
+                forward_kwargs=kwargs
+            ),
+            with_kwargs=True,
         )
         module.register_forward_hook(
             lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
@@ -382,7 +385,7 @@ class FsdpModule:
                 "Load before fully_shard() or use an in-place load path with assign=False."
             )
 
-    def pre_forward(self) -> None:
+    def pre_forward(self, *, forward_kwargs: dict[str, object] | None = None) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
 
         While this FsdpModule computes, we issue the next FsdpModule's all-gather
@@ -405,7 +408,11 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        prefetch = not is_recomputing
+        predicate = self._schedule_policy.forward_prefetch_predicate
+        if prefetch and predicate is not None:
+            prefetch = predicate(forward_kwargs if forward_kwargs is not None else {})
+        self.unshard(prefetch="forward" if prefetch else "none")
 
     def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
         """Unshard this FsdpModule's parameter groups immediately.

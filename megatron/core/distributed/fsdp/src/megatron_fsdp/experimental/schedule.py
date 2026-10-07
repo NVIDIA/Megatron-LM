@@ -14,6 +14,7 @@
 
 """Scheduling configuration for the minimal Megatron-FSDP path."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -23,10 +24,16 @@ class SchedulePolicy:
 
     ``None`` prefetches one successor, preserving the default behavior. ``0``
     disables prefetching. Positive values specify parameter-element budgets.
+
+    ``forward_prefetch_predicate`` optionally decides whether to prefetch a
+    successor for this invocation, using the module's forward keyword arguments.
+    It never suppresses gathering the current module's own parameters. The
+    decision must be consistent across ranks participating in those collectives.
     """
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
+    forward_prefetch_predicate: Callable[[dict[str, object]], bool] | None = None
 
     def __post_init__(self) -> None:
         """Validate non-negative prefetch budgets."""
