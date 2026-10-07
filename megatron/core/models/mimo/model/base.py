@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 _LANGUAGE_INPUT_PROJECTIONS_ATTR = "mimo_input_projections"
 
 
+class MimoEncoderFloat16Module(Float16Module):
+    """Float16Module that keeps encoder outputs in model precision for the bridge."""
+
+    def forward(self, *inputs, fp32_output=False, **kwargs):
+        """Run forward while keeping encoder outputs in model precision by default."""
+        return super().forward(*inputs, fp32_output=fp32_output, **kwargs)
+
+
 class MimoModel(MegatronModule):
     """Multimodal In/Out Model supporting arbitrary combinations of modalities.
 

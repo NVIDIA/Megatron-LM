@@ -20,6 +20,7 @@ from megatron.core.transformer.wide_residual_layer import (
     StreamwiseSigmoidMap,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
+    StreamwiseSigmoidWideResidualRead,
     WideResidualTransformerLayer,
     expand_wide_residual_stream,
 )
@@ -153,8 +154,6 @@ def test_wide_residual_config_rejects_negative_map_init_scale():
     ("override", "expected_error"),
     [
         ({"enable_mhc_connections": True}, "mutually exclusive"),
-        ({"moe_shortcut_connection": True}, "moe_shortcut_connection"),
-        ({"mtp_num_layers": 1}, "Multi-Token Prediction"),
         ({"inference_fuse_tp_communication": True}, "fuse_tp_communication"),
         ({"heterogeneous_block_specs": True}, "heterogeneous_block_specs"),
         ({"overlap_moe_expert_parallel_comm": True}, "overlap_moe_expert_parallel_comm"),
@@ -179,6 +178,87 @@ def test_transformer_config_accepts_fp32_wide_residual_stream():
 
     assert config.fp32_residual_connection
     assert config.pipeline_dtype == torch.float32
+
+
+def test_transformer_config_accepts_mtp_with_wide_residual_replay():
+    config = _wide_config(
+        mtp_num_layers=2,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+
+    assert config.mtp_num_layers == 2
+    assert config.residual_stream_recompute_num_layers == 1
+
+
+def test_transformer_config_accepts_shortcut_moe_with_wide_residual_replay():
+    config = _wide_config(
+        num_layers=2,
+        num_moe_experts=1,
+        moe_shortcut_connection=True,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+
+    assert config.moe_shortcut_connection
+    assert config.residual_stream_recompute_num_layers == 1
+
+
+class TestStreamwiseSigmoidWideResidualRead:
+    def test_initial_read_preserves_replicated_base_stream(self):
+        config = _wide_config()
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+        base = torch.randn(2, 3, config.hidden_size)
+
+        shortcut_hidden = residual_read(expand_wide_residual_stream(base, 3))
+
+        assert shortcut_hidden.shape == base.shape
+        assert torch.allclose(shortcut_hidden, base)
+
+    def test_read_owns_independent_trainable_controller(self):
+        config = _wide_config(init_scale=0.01)
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+        hidden_states = torch.randn(4, 3 * config.hidden_size, requires_grad=True)
+
+        residual_read(hidden_states).square().mean().backward()
+
+        gradient = residual_read.read_map.logit.grad
+        assert gradient is not None
+        assert torch.count_nonzero(gradient[: residual_read.num_streams]) > 0
+        assert torch.count_nonzero(gradient[residual_read.num_streams :]) == 0
+        assert hidden_states.grad is not None
+
+    def test_read_converts_fp32_residual_to_parameter_dtype(self):
+        config = _wide_config(bf16=True, params_dtype=torch.bfloat16, fp32_residual_connection=True)
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+        hidden_states = torch.randn(
+            4, 3 * config.hidden_size, dtype=torch.float32, requires_grad=True
+        )
+
+        branch_input = residual_read(hidden_states)
+        branch_input.float().square().mean().backward()
+
+        assert branch_input.dtype == torch.bfloat16
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.dtype == torch.float32
+        assert residual_read.read_map.logit.grad is not None
+
+    def test_rejects_wrong_residual_stream_width(self):
+        config = _wide_config()
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+
+        with pytest.raises(ValueError, match="expected residual-stream hidden size"):
+            residual_read(torch.randn(2, config.hidden_size))
 
 
 class TestStreamwiseSigmoidWideResidualConnection:
@@ -606,6 +686,22 @@ class TestWideResidualStaticConstruction:
                 layer_spec,
                 config=config,
                 layer_number=1,
+                add_layer_offset=False,
+                pg_collection=_process_groups(),
+            )
+
+    def test_static_subclass_is_rejected_for_mtp_auxiliary_stacks(self):
+        layer_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
+            submodules=TransformerLayerSubmodules(self_attention=_ActiveBranch),
+        )
+
+        with pytest.raises(ValueError, match="MTP auxiliary stacks"):
+            build_module(
+                layer_spec,
+                config=_wide_config(),
+                layer_number=1,
+                is_mtp_layer=True,
                 add_layer_offset=False,
                 pg_collection=_process_groups(),
             )
