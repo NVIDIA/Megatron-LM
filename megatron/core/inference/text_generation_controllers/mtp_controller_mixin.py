@@ -395,13 +395,14 @@ class MTPControllerMixin:
         context.mtp_metadata.end_forward()
 
     def _mtp_dummy_prefill_forward(self, context, unwrapped_model) -> None:
-        """Issue one MTP-layer forward with dummy tensors and NO KV append.
+        """Issue one MTP-layer forward with dummy tensors whose KV goes to the dummy block.
 
         Every rank must run exactly one MTP "prefill-slot" forward per step so the MoE/EP
         all-to-alls stay balanced when some ranks seed a real prompt and others (idle ranks,
-        or active ranks with no prefill this step) do not. Uses `inference_context=None` so
-        the attention runs cache-free (no child append); only the MoE all-to-all matters here.
-        Mirrors the real seed's single `forward_single_position` call.
+        or active ranks with no prefill this step) do not. Mirrors the real seed's single eager
+        `forward_single_position` call, and like it runs the attention through the inference
+        context; every row writes and reads only the dummy block, so the requests in the
+        context keep their draft KV.
         """
         device = torch.cuda.current_device()
         dtype = self.model_config.params_dtype
@@ -414,13 +415,16 @@ class MTPControllerMixin:
             )
         dummy_tokens = torch.zeros((1, n), device=device, dtype=torch.long)
         dummy_positions = torch.zeros((1, n), device=device, dtype=torch.long)
+        context.mtp_metadata.begin_decode_for_capture(n, graphed=False)
+        context._mtp_setup_decode_step()
         unwrapped_model.mtp.layers[0].forward_single_position(
             hidden_states=dummy_hidden,
             next_token_ids=dummy_tokens,
             position_ids=dummy_positions,
             embedding=unwrapped_model.embedding,
-            inference_context=None,
+            inference_context=context,
         )
+        context.mtp_metadata.end_forward()
 
     def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:
         """Run the MTP phase with the main forward's execution state held across it."""
@@ -727,38 +731,52 @@ class MTPControllerMixin:
         # `_mtp_resolved_padded_count` (None iff the main step was eager) -- NOT the local live
         # `using_cuda_graph_this_step()`, which the commit pass clobbers on the real ranks.
         #
-        # The dummy always replays the CACHE-FREE ("mtp", ...) MTP graph, never the KV-aware
-        # ("mtp_kv", ...) one: replaying the KV-aware graph here would run its append against the
-        # idle rank's KV cache with no valid block table (OOB). The cache-free graph has the same
-        # fixed-size MoE all-to-all footprint, so EP stays matched -- this is exactly the (working)
-        # dummy path used by the normal non-KV spec-decode flow.
-        mtp_cache_active = getattr(context, "enable_mtp_kv_cache", False)
+        # With the MTP KV cache the dummy runs the attention through the inference context like
+        # the real path, replaying the same KV-aware ("mtp_kv", ...) graphs. Its draft state is
+        # staged on the dummy block (`begin_decode_for_capture`) rather than taken from the
+        # context's requests: this also runs on ranks holding real requests (the async-sched
+        # primer), whose draft KV it must not overwrite. `_mtp_forward_phase` restores the main
+        # step's attention metadata afterwards, and since this runs before the step's own forward
+        # (which reads the same shared GPU bookkeeping buffer), the step's bookkeeping too.
+        mtp_cache_active = getattr(context, "enable_mtp_kv_cache", False) and has_mtp
         main_graphed = getattr(self, "_mtp_resolved_padded_count", None) is not None
         mtp_forward_eager = not main_graphed
-        if mtp_cache_active and has_mtp:
-            self._mtp_dummy_prefill_forward(context, unwrapped_model)
+        mtp_graph_key_prefix = "mtp_kv" if mtp_cache_active else "mtp"
+        mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
+        with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
+            if mtp_cache_active:
+                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
+            for depth in range(self.num_mtp_depths):
+                nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
+                mtp_logits_2d = None
+                if has_mtp:
+                    mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                    if mtp_context_kwarg:
+                        context._mtp_setup_decode_step()
+                    dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                        hidden_states=dummy_hidden,
+                        next_token_ids=dummy_token_ids,
+                        position_ids=dummy_position_ids,
+                        depth=mtp_depth,
+                        eager=mtp_forward_eager,
+                        cache_key=(
+                            (mtp_graph_key_prefix, padded_count, mtp_depth)
+                            if not mtp_forward_eager
+                            else None
+                        ),
+                        **mtp_context_kwarg,
+                    )
+                    if mtp_context_kwarg:
+                        context.mtp_metadata.advance_decode_step()
+                    mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
-        for depth in range(self.num_mtp_depths):
-            nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
-            mtp_logits_2d = None
-            if has_mtp:
-                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
-                dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
-                    hidden_states=dummy_hidden,
-                    next_token_ids=dummy_token_ids,
-                    position_ids=dummy_position_ids,
-                    depth=mtp_depth,
-                    eager=mtp_forward_eager,
-                    cache_key=(("mtp", padded_count, mtp_depth) if not mtp_forward_eager else None),
-                )
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
-
-            # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
-            if self.model_is_pipeline_parallel:
-                broadcast_from_last_pipeline_stage(
-                    [padded_count, self.vocab_size],
-                    dtype=dtype,
-                    tensor=mtp_logits_2d,
-                    pp_group=self.pp_group,
-                )
-            nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
+                # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
+                if self.model_is_pipeline_parallel:
+                    broadcast_from_last_pipeline_stage(
+                        [padded_count, self.vocab_size],
+                        dtype=dtype,
+                        tensor=mtp_logits_2d,
+                        pp_group=self.pp_group,
+                    )
+                nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")

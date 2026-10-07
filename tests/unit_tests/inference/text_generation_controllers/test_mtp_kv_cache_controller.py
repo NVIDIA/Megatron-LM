@@ -86,6 +86,8 @@ def _make_context(
         mha_block_table=torch.zeros(
             (MAX_REQUESTS, MAX_KV_BLOCK_COUNT), dtype=torch.int32, device=DEVICE
         ),
+        # The step's GPU bookkeeping, which the EP dummy MTP forwards must leave intact.
+        _buf=torch.zeros(64, dtype=torch.uint8, device=DEVICE),
     )
 
     context = SimpleNamespace(
@@ -94,6 +96,12 @@ def _make_context(
         # end-of-phase cleanups (`end_forward`, releasing the hidden states) that these tests
         # assert on, and a no-op scope would drop them silently.
         active_attn_metadata=None,
+        graph_attn_metadata={
+            "mha_metadata": SimpleNamespace(state_data={}, _max_seqlen_q=0, _max_seqlen_k=0)
+        },
+        non_graph_attn_metadata={
+            "mha_metadata": SimpleNamespace(state_data={}, _max_seqlen_q=0, _max_seqlen_k=0)
+        },
         active_token_count=0,
         padded_active_token_count=0,
         _using_cuda_graph_this_step=False,
@@ -125,6 +133,9 @@ def _make_context(
         context.setup_prefill_calls.append(kwargs)
 
     context._mtp_setup_prefill_step = _setup_prefill_step
+    # Records draft-depth setups; their GPU writes are covered in
+    # tests/unit_tests/inference/contexts/test_dynamic_context_mtp_kv_cache.py.
+    context._mtp_setup_decode_step = mock.Mock()
     context.using_cuda_graph_this_step = lambda: False
 
     # A REAL MTPMetadata, so the chunk-boundary carry's id+position gating is exercised rather
@@ -691,16 +702,25 @@ class TestMtpCommitPassSequenceParallel:
 class TestMtpDummyPrefillForward:
     """The EP-balance dummy that idle ranks run in place of a real commit pass."""
 
-    def test_runs_cache_free(self):
-        """`inference_context=None` keeps the dummy from appending to the idle rank's KV."""
-        context = _make_context()
+    def test_runs_through_the_context_on_the_dummy_block(self):
+        """The dummy attends through the inference context, staged only on the dummy block."""
+        context = _make_context(num_decode_requests=2)
         model = _make_model()
         controller = _make_controller(context, model)
 
         controller._mtp_dummy_prefill_forward(context, model)
 
         call = model.mtp_layer_calls[-1]
-        assert call["inference_context"] is None
+        assert call["inference_context"] is context
+        metadata = context.mtp_metadata
+        # Staged on the dummy block, never on the context's live requests' block tables.
+        assert metadata.block_table[:1].eq(metadata.dummy_block_idx).all()
+        assert metadata.offsets[:1].cpu().tolist() == [0]
+        assert metadata.graphed is False
+        context._mtp_setup_decode_step.assert_called_once()
+        # It leaves MTP-forward mode, like the real commit forward.
+        assert context.finalize_prefill_calls == 1
+        assert metadata.forward_active is False
         assert call["hidden_states"].shape == (1, 1, HIDDEN_SIZE)
         assert call["next_token_ids"].shape == (1, 1)
         assert torch.count_nonzero(call["next_token_ids"]) == 0
@@ -1061,11 +1081,46 @@ class TestMtpCudaGraphs:
             assert call["cache_key"] is None
             assert call["eager"] is True
 
-    def test_dummy_rank_replays_cache_free_keys(self):
-        """An idle rank has no live block table, even when its peers use draft KV."""
+    def test_dummy_rank_replays_kv_aware_keys_on_the_dummy_block(self):
+        """An idle rank replays its peers' KV-aware graphs, staged on the dummy block."""
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(
             context, num_mtp_depths=2, active_request_count=2, graphed=True
+        )
+        controller.model_config.expert_model_parallel_size = 2
+        # The step's own forward runs after this and reads the bookkeeping the dummy overwrites.
+        context.gpu_view._buf.fill_(7)
+        step_mha = context.non_graph_attn_metadata["mha_metadata"]
+        step_mha._max_seqlen_q = 64
+
+        def clobber():
+            context.gpu_view._buf.fill_(0)
+            step_mha._max_seqlen_q = 1
+
+        context._mtp_setup_decode_step.side_effect = clobber
+
+        controller._run_dummy_serial_mtp_forward()
+
+        assert context.gpu_view._buf.eq(7).all()
+        assert step_mha._max_seqlen_q == 64
+        assert len(model.mtp_step_calls) == 2
+        for call in model.mtp_step_calls:
+            assert call["cache_key"] == ("mtp_kv", 2, None)
+            assert call["eager"] is False
+            assert call["mtp_inference_context"] is context
+        metadata = context.mtp_metadata
+        assert metadata.block_table[:2].eq(metadata.dummy_block_idx).all()
+        assert metadata.graphed is True
+        assert context._mtp_setup_decode_step.call_count == 2
+        assert metadata.advance_decode_step.call_count == 2
+        controller._mtp_dummy_prefill_forward.assert_called_once()
+        context._mtp_begin_decode.assert_not_called()
+
+    def test_dummy_rank_replays_cache_free_keys_when_the_kv_cache_is_off(self):
+        """Without the MTP KV cache neither rank passes the context."""
+        context = _make_context(num_decode_requests=2)
+        controller, model, context = _make_draft_loop_controller(
+            context, num_mtp_depths=2, active_request_count=2, graphed=True, mtp_kv_cache_on=False
         )
         controller.model_config.expert_model_parallel_size = 2
 
@@ -1074,8 +1129,9 @@ class TestMtpCudaGraphs:
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
             assert call["cache_key"] == ("mtp", 2, None)
-            assert call["eager"] is False
             assert "mtp_inference_context" not in call
+        controller._mtp_dummy_prefill_forward.assert_not_called()
+        context._mtp_setup_decode_step.assert_not_called()
 
     def test_block_scope_slices_the_persistent_hidden_buffer(self):
         """Block-scope graphs write a max_tokens-sized buffer; only this step's prefix is valid."""
@@ -1206,17 +1262,28 @@ def _build_step(
     # The real context's `_mtp_setup_decode_step` routes to graph or non-graph metadata and
     # RESTORES the live graph flag (which the eager commit pass clobbered to False). Emulate
     # that here so the depth loop's `eager=`/`cache_key=` decisions are exercised faithfully.
-    state = {"graphed": False, "positions": []}
+    state = {"graphed": False, "positions": [], "scratch": False, "scratch_setups": 0}
 
     def begin_decode(active_count, padded_count, start_positions, graphed=False):
+        state["scratch"] = False
         state["graphed"] = graphed
         state["begin"] = (active_count, padded_count, start_positions.clone())
         state["offsets"] = start_positions.clone()
         context._using_cuda_graph_this_step = graphed
 
+    def begin_decode_for_capture(padded_count, graphed=True):
+        # The EP placeholder's staging: every row on the dummy block at position 0.
+        state["scratch"] = True
+        state["graphed"] = graphed
+        state["offsets"] = torch.zeros(padded_count, dtype=torch.int64, device=DEVICE)
+        context._using_cuda_graph_this_step = graphed
+
     def setup_decode_step():
         context._using_cuda_graph_this_step = state["graphed"]
-        state["positions"].append(state["offsets"].cpu().tolist())
+        if state["scratch"]:
+            state["scratch_setups"] += 1
+        else:
+            state["positions"].append(state["offsets"].cpu().tolist())
 
     def advance_decode_step():
         state["offsets"] = state["offsets"] + 1
@@ -1228,6 +1295,7 @@ def _build_step(
     context.using_cuda_graph_this_step = lambda: context._using_cuda_graph_this_step
     context._mtp_begin_decode = mock.Mock(side_effect=begin_decode)
     context._mtp_setup_decode_step = mock.Mock(side_effect=setup_decode_step)
+    context.mtp_metadata.begin_decode_for_capture = mock.Mock(side_effect=begin_decode_for_capture)
     context.mtp_metadata.advance_decode_step = mock.Mock(side_effect=advance_decode_step)
     context.mtp_metadata.end_forward = mock.Mock()
     # The commit pass drives real prefill metadata; keep recording it.
@@ -1272,8 +1340,8 @@ class TestSerialMtpCacheReadBounds:
                 return prefix.mean()
 
             def commit_forward(**kwargs):
-                if kwargs["inference_context"] is None:
-                    return  # Empty commit pass: the EP placeholder must not touch the cache.
+                if state["scratch"]:
+                    return  # Empty commit pass: the EP placeholder writes only the dummy block.
                 metadata = context.setup_prefill_calls[-1]
                 start = int(metadata["request_start_positions"][0])
                 count = int(metadata["append_counts"][0])
@@ -1395,7 +1463,8 @@ class TestExpertParallelForwardParity:
         # The commit pass issued nothing, so the EP-balance dummy slot ran in its place.
         assert len(model.all_forwards) == 3
         assert model.all_forwards[0][0] == "mtp_layer"
-        assert model.all_forwards[0][1]["inference_context"] is None
+        assert model.all_forwards[0][1]["inference_context"] is context
+        context.mtp_metadata.begin_decode_for_capture.assert_called_once_with(1, graphed=False)
         dummy = self._dummy_rank_forwards(2, graphed=False, kv_cache_on=True)
         assert len(dummy) == len(model.all_forwards)
 
@@ -1575,11 +1644,16 @@ class TestMtpKvCacheCombinations:
             assert all(kw["eager"] is True for kw in steps)
 
         # 3. Draft writes: one setup+advance per forward, positions strictly +1 per depth.
-        assert context._mtp_setup_decode_step.call_count == num_mtp_depths
+        # An empty commit pass runs the EP placeholder, which stages one scratch depth instead.
+        placeholder_ran = not context.setup_prefill_calls
+        assert state["scratch_setups"] == int(placeholder_ran)
+        assert context._mtp_setup_decode_step.call_count == num_mtp_depths + int(placeholder_ran)
         assert context.mtp_metadata.advance_decode_step.call_count == num_mtp_depths
         # One `end_forward` closes each MTP forward phase: the draft loop always, plus the
-        # commit pass whenever it had rows to write (one `_mtp_setup_prefill_step` per forward).
-        assert context.mtp_metadata.end_forward.call_count == 1 + len(context.setup_prefill_calls)
+        # commit-pass slot (one `_mtp_setup_prefill_step` per forward, or the placeholder).
+        assert context.mtp_metadata.end_forward.call_count == 1 + len(
+            context.setup_prefill_calls
+        ) + int(placeholder_ran)
         positions = state["positions"]
         assert positions[0] == (base_position - 1).cpu().tolist()
         for earlier, later in zip(positions, positions[1:]):

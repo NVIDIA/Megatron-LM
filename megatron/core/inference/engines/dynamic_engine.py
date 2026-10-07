@@ -1075,24 +1075,31 @@ class DynamicInferenceEngine(AbstractEngine):
                         mtp_seen_batch_sizes.add(n)
                         device = torch.cuda.current_device()
                         batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                        for depth in mtp_warmup_depths:
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                                cache_key=("mtp", n, depth),
-                            )
+                        # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
+                        # it on, real and EP dummy forwards both replay the KV-aware graph below.
+                        if not context.enable_mtp_kv_cache:
+                            # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                            for depth in mtp_warmup_depths:
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
+                                    depth=depth,
+                                    cache_key=("mtp", n, depth),
+                                )
 
-                        # KV-aware MTP graph: when the MTP KV cache is enabled, ALSO capture a graph
-                        # that includes the draft-attention KV append+attend (the cache-free graph
-                        # above does not), under a distinct ("mtp_kv", n, depth) key that the real
-                        # spec-decode path replays. The EP dummy path keeps the cache-free graph.
+                        # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
+                        # that includes the draft-attention KV append+attend under a distinct
+                        # ("mtp_kv", n, depth) key, replayed by the real spec-decode path and the
+                        # EP dummy path (which stages the same dummy-block metadata).
                         # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
                         # replay overwrites it from gpu_view each step, so only shapes/bounds count.
                         if context.enable_mtp_kv_cache:
