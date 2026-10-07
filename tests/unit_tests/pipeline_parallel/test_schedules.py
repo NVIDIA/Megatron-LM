@@ -143,19 +143,23 @@ class _FakeProcessGroup:
         return self._size
 
 
-def _hybrid_cp_pg_collection(monkeypatch, *, is_first_tp_rank):
-    """Process groups for the hybrid CP scheduler: a TP group of size 2 and a single-rank
-    DP-CP group. The scheduler resolves the TP broadcast source through
+def _hybrid_cp_pg_collection(monkeypatch, *, is_first_tp_rank, with_gtp_remat_group):
+    """Process groups for the hybrid CP scheduler: a TP group of size 2 and single-rank DP-CP
+    groups. With ``with_gtp_remat_group`` the collection also carries a distinct GTP-remat-inclusive
+    DP-CP group, as use_mpu_process_groups() does; without it, only dp_cp, as a collection built
+    for a custom grid. The scheduler resolves the TP broadcast source through
     torch.distributed.get_global_rank, which needs a real group, so map it to the group rank."""
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.distributed,
         "get_global_rank",
         lambda group, group_rank: group_rank,
     )
-    return SimpleNamespace(
-        tp=_FakeProcessGroup(rank=0 if is_first_tp_rank else 1, size=2),
-        dp_cp=_FakeProcessGroup(rank=0, size=1),
-    )
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = _FakeProcessGroup(rank=0 if is_first_tp_rank else 1, size=2)
+    pg_collection.dp_cp = _FakeProcessGroup(rank=0, size=1)
+    if with_gtp_remat_group:
+        pg_collection.dp_cp_gtp_remat = _FakeProcessGroup(rank=0, size=1)
+    return pg_collection
 
 
 def _patch_hybrid_cp_cpu_tensors(monkeypatch):
@@ -172,9 +176,14 @@ def _patch_hybrid_cp_cpu_tensors(monkeypatch):
     )
 
 
-def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypatch):
+@pytest.mark.parametrize("with_gtp_remat_group", [True, False])
+def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(
+    monkeypatch, with_gtp_remat_group
+):
     _patch_hybrid_cp_cpu_tensors(monkeypatch)
-    pg_collection = _hybrid_cp_pg_collection(monkeypatch, is_first_tp_rank=True)
+    pg_collection = _hybrid_cp_pg_collection(
+        monkeypatch, is_first_tp_rank=True, with_gtp_remat_group=with_gtp_remat_group
+    )
 
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.distributed, "broadcast", lambda *args, **kwargs: None
@@ -301,11 +310,18 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
         ("input", 2.0, "grad"),
     ]
     assert all(call[3] is config for call in backward_calls)
-    assert pg_collection.dp_cp in barrier_groups
+    # The GTP-remat-inclusive group is preferred; dp_cp is used only when it is absent.
+    if with_gtp_remat_group:
+        assert pg_collection.dp_cp_gtp_remat in barrier_groups
+        assert pg_collection.dp_cp not in barrier_groups
+    else:
+        assert pg_collection.dp_cp in barrier_groups
 
 
 def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkeypatch):
-    pg_collection = _hybrid_cp_pg_collection(monkeypatch, is_first_tp_rank=False)
+    pg_collection = _hybrid_cp_pg_collection(
+        monkeypatch, is_first_tp_rank=False, with_gtp_remat_group=True
+    )
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
     )

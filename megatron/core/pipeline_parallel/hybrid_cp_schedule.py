@@ -515,9 +515,13 @@ def hybrid_context_parallel_forward_backward(
 
     if pg_collection is None:
         warn_global_process_group_fallback("hybrid_context_parallel_forward_backward")
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'dp_cp'])
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'dp_cp_gtp_remat']
+        )
     tp_group = pg_collection.tp
-    dp_cp_group = pg_collection.dp_cp
+    # GTP-remat peers read distinct samples, so the hybrid-CP domain includes them, as in the
+    # default data-parallel group HybridCPDataLoaderWrapper partitions samples over.
+    dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
 
     def _broadcast(item):
         if item is not None:
