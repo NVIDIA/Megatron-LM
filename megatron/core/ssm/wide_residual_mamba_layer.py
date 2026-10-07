@@ -14,8 +14,7 @@ from megatron.core.transformer.residual_recompute import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_layer import (
-    StreamwiseSigmoidWideResidualConnectionRead,
-    StreamwiseSigmoidWideResidualWrite,
+    StreamwiseSigmoidWideResidualConnection,
     _load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -59,8 +58,12 @@ class WideResidualMambaLayer(MambaLayer):
                 "returns its own residual."
             )
 
-        self.residual_read = StreamwiseSigmoidWideResidualConnectionRead(config)
-        self.residual_write = StreamwiseSigmoidWideResidualWrite(config, self.layer_number, "mamba")
+        self.residual_read = StreamwiseSigmoidWideResidualConnection(
+            config, self.layer_number, "mamba", mode="read"
+        )
+        self.residual_write = StreamwiseSigmoidWideResidualConnection(
+            config, self.layer_number, "mamba", mode="write"
+        )
         self.register_load_state_dict_pre_hook(_load_residual_state)
         self.residual_stream_hidden_size = (
             config.wide_residual.num_streams * self.config.hidden_size

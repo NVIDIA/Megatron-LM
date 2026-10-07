@@ -16,8 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_layer import (
-    StreamwiseSigmoidWideResidualConnectionRead,
-    StreamwiseSigmoidWideResidualWrite,
+    StreamwiseSigmoidWideResidualConnection,
     WideResidualTransformerLayer,
 )
 from megatron.training.initialize import _set_random_seed
@@ -86,8 +85,9 @@ def _assert_branchwise_geometry(
     wide_hidden_size = config.wide_residual.num_streams * config.hidden_size
     reader = layer.residual_read_mlp
     writer = layer.residual_write_mlp
-    assert isinstance(reader, StreamwiseSigmoidWideResidualConnectionRead)
-    assert isinstance(writer, StreamwiseSigmoidWideResidualWrite)
+    assert isinstance(reader, StreamwiseSigmoidWideResidualConnection)
+    assert isinstance(writer, StreamwiseSigmoidWideResidualConnection)
+    assert (reader.mode, writer.mode) == ("read", "write")
     assert layer.residual_stream_hidden_size == wide_hidden_size
     for operation in (reader, writer):
         assert operation.residual_stream_hidden_size == wide_hidden_size

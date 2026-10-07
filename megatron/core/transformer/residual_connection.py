@@ -15,11 +15,28 @@ ResidualConnectionWriteState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionOperation: TypeAlias = Literal["read", "write"]
 
 
-class _ResidualModule(nn.Module):
-    """Common dimensions and state validation for residual operations."""
+class ResidualConnection(nn.Module, ABC):
+    """Read one branch input from, then write its update to, a residual stream.
 
-    def __init__(self, residual_stream_hidden_size: int, branch_hidden_size: int):
+    ``forward`` validates the common contract and retains the incoming residual
+    stream as the first tensor in ``ResidualConnectionState``. Concrete connections
+    own bias, dropout, mapping, and residual-update semantics.
+
+    ``mode`` fixes an instance to one operation at construction. ``None`` preserves
+    the legacy interface where callers pass ``operation`` to each forward.
+    """
+
+    def __init__(
+        self,
+        residual_stream_hidden_size: int,
+        branch_hidden_size: int,
+        *,
+        mode: ResidualConnectionOperation | None = None,
+    ):
         super().__init__()
+        if mode not in (None, "read", "write"):
+            raise ValueError(f"Unsupported residual connection mode: {mode}.")
+        self.mode = mode
         if residual_stream_hidden_size <= 0:
             raise ValueError("Residual-stream hidden size must be positive.")
         if branch_hidden_size <= 0:
@@ -39,39 +56,79 @@ class _ResidualModule(nn.Module):
 
         return self._branch_hidden_size
 
-    @staticmethod
-    def residual_stream(state: ResidualConnectionState) -> Tensor:
-        """Return the carried residual stream from a validated connection state."""
+    @overload
+    def forward(
+        self,
+        value: Tensor,
+        *,
+        operation: Literal["read"] | None = None,
+        fp32_residual_connection: bool = False,
+        branch_input_dtype: torch.dtype | None = None,
+    ) -> tuple[Tensor, ResidualConnectionState]: ...
 
-        _ResidualModule._validate_tensor_state(
-            state, state_name="connection state", allow_empty=False
-        )
-        return state[0]
+    @overload
+    def forward(
+        self,
+        value: ResidualBranchOutput,
+        *,
+        operation: Literal["write"] | None = None,
+        state: ResidualConnectionState,
+        dropout_probability: float,
+        training: bool,
+    ) -> Tensor: ...
 
-    @staticmethod
-    def _validate_tensor_state(
-        state: tuple[Tensor, ...], *, state_name: str, allow_empty: bool
-    ) -> None:
-        if not isinstance(state, tuple) or (not allow_empty and not state):
-            qualifier = "possibly empty" if allow_empty else "non-empty"
-            raise TypeError(f"{state_name.capitalize()} must be a {qualifier} tuple of tensors.")
-        if not all(torch.is_tensor(tensor) for tensor in state):
-            raise TypeError(f"{state_name.capitalize()} must contain only tensors.")
+    def forward(
+        self,
+        value: ResidualBranchOutput,
+        *,
+        operation: ResidualConnectionOperation | None = None,
+        state: ResidualConnectionState | None = None,
+        fp32_residual_connection: bool = False,
+        branch_input_dtype: torch.dtype | None = None,
+        dropout_probability: float | None = None,
+        training: bool | None = None,
+    ) -> Tensor | tuple[Tensor, ResidualConnectionState]:
+        """Execute one residual operation through the standard module call path.
 
-    @staticmethod
-    def _validate_branch_output(branch_output: ResidualBranchOutput) -> None:
-        if torch.is_tensor(branch_output):
-            return
-        if not isinstance(branch_output, tuple) or len(branch_output) != 2:
-            raise TypeError(
-                "A residual branch must return a tensor or an (output, bias) tensor tuple."
+        ``branch_input_dtype`` is read-only. ``None`` preserves the connection's natural read
+        dtype; otherwise compatible connections may produce that dtype directly in a fused read.
+        """
+
+        if self.mode is not None:
+            if operation is not None and operation != self.mode:
+                raise ValueError(f"Residual connection mode is fixed to {self.mode!r}.")
+            operation = self.mode
+        if operation == "read":
+            if not torch.is_tensor(value):
+                raise TypeError("Residual connection read expects a tensor.")
+            if state is not None or dropout_probability is not None or training is not None:
+                raise TypeError("Residual connection read received write-only arguments.")
+            if branch_input_dtype is not None and (
+                not isinstance(branch_input_dtype, torch.dtype)
+                or not branch_input_dtype.is_floating_point
+            ):
+                raise TypeError(
+                    "branch_input_dtype must be a floating-point torch.dtype or None, got "
+                    f"{branch_input_dtype!r}."
+                )
+            return self._read_with_validation(
+                value,
+                fp32_residual_connection=fp32_residual_connection,
+                branch_input_dtype=branch_input_dtype,
             )
-        output, bias = branch_output
-        if not torch.is_tensor(output) or (bias is not None and not torch.is_tensor(bias)):
-            raise TypeError(
-                "A residual branch (output, bias) tuple must contain a tensor and an "
-                "optional tensor."
+        if operation == "write":
+            if fp32_residual_connection or branch_input_dtype is not None:
+                raise TypeError("Residual connection write received read-only arguments.")
+            if state is None:
+                raise TypeError("Residual connection write requires connection state.")
+            if dropout_probability is None or training is None:
+                raise TypeError(
+                    "Residual connection write requires dropout_probability and training."
+                )
+            return self._write_with_validation(
+                value, state, dropout_probability=dropout_probability, training=training
             )
+        raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
     def _read_with_validation(
         self,
@@ -117,22 +174,6 @@ class _ResidualModule(nn.Module):
         residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
         return branch_input, (residual_stream, *write_state)
 
-    def _read_with_output_dtype(
-        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
-    ) -> tuple[Tensor, ResidualConnectionWriteState]:
-        """Read with an optional terminal dtype conversion.
-
-        Subclasses with a fused read kernel can override this hook to perform the conversion
-        in that kernel. The default preserves compatibility for existing connection subclasses.
-        """
-
-        branch_input, write_state = self._read(hidden_states)
-        if output_dtype is not None:
-            if not torch.is_tensor(branch_input):
-                return branch_input, write_state
-            branch_input = branch_input.to(dtype=output_dtype)
-        return branch_input, write_state
-
     def _write_with_validation(
         self,
         branch_output: ResidualBranchOutput,
@@ -170,140 +211,59 @@ class _ResidualModule(nn.Module):
             )
         return hidden_states
 
+    @staticmethod
+    def residual_stream(state: ResidualConnectionState) -> Tensor:
+        """Return the carried residual stream from a validated connection state."""
 
-class ResidualRead(_ResidualModule, ABC):
-    """Read a branch input and carry its state to a separate writer."""
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        *,
-        fp32_residual_connection: bool = False,
-        branch_input_dtype: torch.dtype | None = None,
-    ) -> tuple[Tensor, ResidualConnectionState]:
-        """Read through the module hook path, preserving the requested precision."""
-        if not torch.is_tensor(hidden_states):
-            raise TypeError("Residual connection read expects a tensor.")
-        if branch_input_dtype is not None and (
-            not isinstance(branch_input_dtype, torch.dtype)
-            or not branch_input_dtype.is_floating_point
-        ):
-            raise TypeError("branch_input_dtype must be a floating-point torch.dtype or None.")
-        return self._read_with_validation(
-            hidden_states,
-            fp32_residual_connection=fp32_residual_connection,
-            branch_input_dtype=branch_input_dtype,
+        ResidualConnection._validate_tensor_state(
+            state, state_name="connection state", allow_empty=False
         )
+        return state[0]
+
+    @staticmethod
+    def _validate_tensor_state(
+        state: tuple[Tensor, ...], *, state_name: str, allow_empty: bool
+    ) -> None:
+        if not isinstance(state, tuple) or (not allow_empty and not state):
+            qualifier = "possibly empty" if allow_empty else "non-empty"
+            raise TypeError(f"{state_name.capitalize()} must be a {qualifier} tuple of tensors.")
+        if not all(torch.is_tensor(tensor) for tensor in state):
+            raise TypeError(f"{state_name.capitalize()} must contain only tensors.")
+
+    @staticmethod
+    def _validate_branch_output(branch_output: ResidualBranchOutput) -> None:
+        if torch.is_tensor(branch_output):
+            return
+        if not isinstance(branch_output, tuple) or len(branch_output) != 2:
+            raise TypeError(
+                "A residual branch must return a tensor or an (output, bias) tensor tuple."
+            )
+        output, bias = branch_output
+        if not torch.is_tensor(output) or (bias is not None and not torch.is_tensor(bias)):
+            raise TypeError(
+                "A residual branch (output, bias) tuple must contain a tensor and an "
+                "optional tensor."
+            )
 
     @abstractmethod
     def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
         """Return the branch input and state needed only by the later write."""
 
+    def _read_with_output_dtype(
+        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
+    ) -> tuple[Tensor, ResidualConnectionWriteState]:
+        """Read with an optional terminal dtype conversion.
 
-class ResidualWrite(_ResidualModule, ABC):
-    """Write a branch update using state produced by a separate reader."""
-
-    def forward(
-        self,
-        branch_output: ResidualBranchOutput,
-        *,
-        state: ResidualConnectionState,
-        dropout_probability: float,
-        training: bool,
-    ) -> Tensor:
-        """Validate and apply the residual update through the module hook path."""
-        return self._write_with_validation(
-            branch_output, state, dropout_probability=dropout_probability, training=training
-        )
-
-    @abstractmethod
-    def _write(
-        self,
-        branch_output: ResidualBranchOutput,
-        state: ResidualConnectionState,
-        *,
-        dropout_probability: float,
-        training: bool,
-    ) -> Tensor:
-        """Implement the architecture-specific residual-stream update."""
-
-
-class ResidualConnection(_ResidualModule, ABC):
-    """Compatibility interface combining read and write operations in one module."""
-
-    @overload
-    def forward(
-        self,
-        value: Tensor,
-        *,
-        operation: Literal["read"],
-        fp32_residual_connection: bool = False,
-        branch_input_dtype: torch.dtype | None = None,
-    ) -> tuple[Tensor, ResidualConnectionState]: ...
-
-    @overload
-    def forward(
-        self,
-        value: ResidualBranchOutput,
-        *,
-        operation: Literal["write"],
-        state: ResidualConnectionState,
-        dropout_probability: float,
-        training: bool,
-    ) -> Tensor: ...
-
-    def forward(
-        self,
-        value: ResidualBranchOutput,
-        *,
-        operation: ResidualConnectionOperation,
-        state: ResidualConnectionState | None = None,
-        fp32_residual_connection: bool = False,
-        branch_input_dtype: torch.dtype | None = None,
-        dropout_probability: float | None = None,
-        training: bool | None = None,
-    ) -> Tensor | tuple[Tensor, ResidualConnectionState]:
-        """Execute one residual operation through the standard module call path.
-
-        ``branch_input_dtype`` is read-only. ``None`` preserves the connection's natural read
-        dtype; otherwise compatible connections may produce that dtype directly in a fused read.
+        Subclasses with a fused read kernel can override this hook to perform the conversion
+        in that kernel. The default preserves compatibility for existing connection subclasses.
         """
 
-        if operation == "read":
-            if not torch.is_tensor(value):
-                raise TypeError("Residual connection read expects a tensor.")
-            if state is not None or dropout_probability is not None or training is not None:
-                raise TypeError("Residual connection read received write-only arguments.")
-            if branch_input_dtype is not None and (
-                not isinstance(branch_input_dtype, torch.dtype)
-                or not branch_input_dtype.is_floating_point
-            ):
-                raise TypeError(
-                    "branch_input_dtype must be a floating-point torch.dtype or None, got "
-                    f"{branch_input_dtype!r}."
-                )
-            return self._read_with_validation(
-                value,
-                fp32_residual_connection=fp32_residual_connection,
-                branch_input_dtype=branch_input_dtype,
-            )
-        if operation == "write":
-            if fp32_residual_connection or branch_input_dtype is not None:
-                raise TypeError("Residual connection write received read-only arguments.")
-            if state is None:
-                raise TypeError("Residual connection write requires connection state.")
-            if dropout_probability is None or training is None:
-                raise TypeError(
-                    "Residual connection write requires dropout_probability and training."
-                )
-            return self._write_with_validation(
-                value, state, dropout_probability=dropout_probability, training=training
-            )
-        raise ValueError(f"Unsupported residual connection operation: {operation}.")
-
-    @abstractmethod
-    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        """Return the branch input and state needed only by the later write."""
+        branch_input, write_state = self._read(hidden_states)
+        if output_dtype is not None:
+            if not torch.is_tensor(branch_input):
+                return branch_input, write_state
+            branch_input = branch_input.to(dtype=output_dtype)
+        return branch_input, write_state
 
     @abstractmethod
     def _write(

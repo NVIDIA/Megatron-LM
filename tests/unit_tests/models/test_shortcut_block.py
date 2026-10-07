@@ -18,10 +18,7 @@ from megatron.core.transformer.residual_recompute import build_residual_stream_r
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import (
-    StreamwiseSigmoidWideResidualConnectionRead,
-    StreamwiseSigmoidWideResidualWrite,
-)
+from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -58,10 +55,12 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
         self.is_last_layer = False
         self.supports_two_stage = supports_two_stage
         if config.wide_residual is not None:
-            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnectionRead(config)
+            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "test", mode="read"
+            )
             self.input_layernorm = torch.nn.Identity()
-            self.residual_write_self_attn = StreamwiseSigmoidWideResidualWrite(
-                config, 1, "self_attention"
+            self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
+                config, 1, "self_attention", mode="write"
             )
 
     def supports_two_stage_attention(self) -> bool:
@@ -108,9 +107,11 @@ class _FakeMoE(torch.nn.Module):
         )
         self.mlp = _FakeMLP()
         if config.wide_residual is not None:
-            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnectionRead(config)
-            self.residual_write_mlp = StreamwiseSigmoidWideResidualWrite(
-                config, layer_number, "mlp"
+            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "test", mode="read"
+            )
+            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, layer_number, "mlp", mode="write"
             )
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):

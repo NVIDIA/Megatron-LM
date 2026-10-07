@@ -24,8 +24,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.wide_residual_layer import (
-    StreamwiseSigmoidWideResidualConnectionRead,
-    StreamwiseSigmoidWideResidualWrite,
+    StreamwiseSigmoidWideResidualConnection,
     _load_residual_state,
 )
 
@@ -39,9 +38,11 @@ class _Block(nn.Module):
             num_attention_heads=4,
             wide_residual=WideResidualConfig(num_streams=3, learned_retention=retention),
         )
-        self.residual_read = StreamwiseSigmoidWideResidualConnectionRead(config)
+        self.residual_read = StreamwiseSigmoidWideResidualConnection(config, 1, "mlp", mode="read")
         self.branch = nn.Linear(32, 32, bias=False)
-        self.residual_write = StreamwiseSigmoidWideResidualWrite(config, 1, "mlp")
+        self.residual_write = StreamwiseSigmoidWideResidualConnection(
+            config, 1, "mlp", mode="write"
+        )
         self.register_load_state_dict_pre_hook(_load_residual_state)
 
     def forward(self, x):
@@ -76,6 +77,8 @@ def _full_values(model, attribute):
 @pytest.mark.parametrize("retention", [False, True])
 def test_independent_ownership_loads_legacy_model_keys(distributed_setup, retention):
     model = _Block(retention=retention).to(distributed_setup.device)
+    assert type(model.residual_read) is type(model.residual_write)
+    assert (model.residual_read.mode, model.residual_write.mode) == ("read", "write")
     assert not set(model.residual_read.parameters()) & set(model.residual_write.parameters())
     state = model.state_dict()
     expected = {"residual_read.read_map.logit", "residual_write.write_map.logit", "branch.weight"}

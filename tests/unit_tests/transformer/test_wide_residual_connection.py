@@ -20,9 +20,7 @@ from megatron.core.transformer.wide_residual_layer import (
     StreamwiseSigmoidMap,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
-    StreamwiseSigmoidWideResidualConnectionRead,
     StreamwiseSigmoidWideResidualRead,
-    StreamwiseSigmoidWideResidualWrite,
     WideResidualTransformerLayer,
     expand_wide_residual_stream,
 )
@@ -264,6 +262,57 @@ class TestStreamwiseSigmoidWideResidualRead:
 
 
 class TestStreamwiseSigmoidWideResidualConnection:
+    @pytest.mark.parametrize("retention", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_construction_modes_match_combined_forward_and_backward(self, retention, dtype):
+        config = _wide_config(
+            learned_retention=retention, params_dtype=dtype, bf16=dtype == torch.bfloat16
+        )
+        combined, reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(config, 1, "test", mode=mode).to(
+                device="cuda", dtype=dtype
+            )
+            for mode in (None, "read", "write")
+        )
+        assert type(reader) is type(writer) is type(combined)
+        assert set(reader.state_dict()) == {"read_map.logit"}
+        writer_keys = {"write_map.logit"}
+        if retention:
+            writer_keys.add("retention.retention_logit")
+        assert set(writer.state_dict()) == writer_keys
+        for module in (reader, writer):
+            module.load_state_dict(
+                {key: combined.state_dict()[key] for key in module.state_dict()}, strict=True
+            )
+
+        x = torch.randn(4, reader.residual_stream_hidden_size, device="cuda", requires_grad=True)
+        reference_x = x.detach().clone().requires_grad_()
+        branch, state = reader(x, fp32_residual_connection=True, branch_input_dtype=dtype)
+        reference_branch, reference_state = combined(
+            reference_x, operation="read", fp32_residual_connection=True, branch_input_dtype=dtype
+        )
+        assert branch.dtype == dtype and state[0] is x
+        output = writer(branch.tanh(), state=state, dropout_probability=0.0, training=True)
+        expected = combined(
+            reference_branch.tanh(),
+            operation="write",
+            state=reference_state,
+            dropout_probability=0.0,
+            training=True,
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        output.square().mean().backward()
+        expected.square().mean().backward()
+        torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
+        reference_parameters = dict(combined.named_parameters())
+        for module in (reader, writer):
+            for name, parameter in module.named_parameters():
+                assert parameter.grad is not None
+                torch.testing.assert_close(
+                    parameter.grad, reference_parameters[name].grad, rtol=0, atol=0
+                )
+
     def test_maps_materialize_expected_initial_factors(self):
         config = _wide_config(num_streams=3, init_scale=0.2)
         read_map = StreamwiseSigmoidMap(config, map_kind="read")
@@ -631,8 +680,9 @@ class TestWideResidualStaticConstruction:
         }
         for branch_name, connection in connections.items():
             if branch_name in expected_connections:
-                assert isinstance(connection[0], StreamwiseSigmoidWideResidualConnectionRead)
-                assert isinstance(connection[1], StreamwiseSigmoidWideResidualWrite)
+                assert isinstance(connection[0], StreamwiseSigmoidWideResidualConnection)
+                assert isinstance(connection[1], StreamwiseSigmoidWideResidualConnection)
+                assert (connection[0].mode, connection[1].mode) == ("read", "write")
             else:
                 assert connection is None
         if len(expected_connections) == 2:

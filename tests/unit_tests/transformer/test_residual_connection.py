@@ -17,8 +17,9 @@ class _ProtocolResidualConnection(ResidualConnection):
         branch_hidden_size=4,
         read_behavior="valid",
         write_behavior="valid",
+        mode=None,
     ):
-        super().__init__(residual_stream_hidden_size, branch_hidden_size)
+        super().__init__(residual_stream_hidden_size, branch_hidden_size, mode=mode)
         self.read_behavior = read_behavior
         self.write_behavior = write_behavior
 
@@ -45,6 +46,20 @@ class _ProtocolResidualConnection(ResidualConnection):
 
 
 class TestResidualConnectionContract:
+    def test_construction_mode_dispatches_and_rejects_switching(self):
+        reader = _ProtocolResidualConnection(mode="read")
+        writer = _ProtocolResidualConnection(mode="write")
+        residual = torch.randn(2, 12)
+        branch, state = reader(residual)
+        assert writer(branch, state=state, dropout_probability=0.0, training=False) is residual
+        for module, operation in ((reader, "write"), (writer, "read")):
+            with pytest.raises(ValueError, match="mode is fixed"):
+                module(residual, operation=operation)
+
+    def test_constructor_rejects_invalid_mode(self):
+        with pytest.raises(ValueError, match="Unsupported residual connection mode"):
+            _ProtocolResidualConnection(mode="invalid")
+
     @pytest.mark.parametrize(
         ("residual_stream_hidden_size", "branch_hidden_size"), [(0, 4), (12, 0)]
     )
