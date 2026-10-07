@@ -1,10 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import filecmp
 import logging
 import shutil
 import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
@@ -278,8 +278,19 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
-            if Utils.rank > 0:  # Skip assertion on rank 0 due to harmless nondeterminism
-                assert filecmp.cmp(ckpt_path, backup_path, shallow=False), [ckpt_path, backup_path]
+            checkpoint_diff = ([], [], [])
+            if Utils.rank > 0:  # Skip comparison on rank 0 due to harmless nondeterminism
+                # Pickle bytes can differ after load due to object aliasing, including
+                # strings shared by optimizer state and the newly saved run config.
+                # Compare all values (including tensor data and shard metadata) instead.
+                current = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                previous = torch.load(backup_path, map_location="cpu", weights_only=False)
+                checkpoint_diff = diff(asdict(current), asdict(previous))
+            # Fail together: otherwise rank 0 enters the next save's collectives while
+            # a rank with a mismatch enters test teardown, hanging until NCCL times out.
+            checkpoint_diffs = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(checkpoint_diffs, checkpoint_diff)
+            assert not any(any(rank_diff) for rank_diff in checkpoint_diffs), checkpoint_diffs
             save_checkpoint(
                 2,
                 model,
