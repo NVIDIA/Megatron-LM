@@ -1017,6 +1017,35 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+def _get_microbatch_release_offsets(
+    schedule_table: list[tuple[int, int]],
+    num_model_chunks: int,
+    num_warmup_microbatches: int,
+    forward_only: bool,
+) -> list[int]:
+    """Count released inputs before each forward microbatch in one pass.
+
+    Forward-only schedules release inputs after forward. Training schedules release
+    them after backward, whose chunk order is reversed and delayed by warmup.
+    The count excludes the current forward or backward microbatch.
+    """
+    released_counts = [0] * num_model_chunks
+    release_offsets = []
+    for virtual_microbatch_id, (_, model_chunk_id) in enumerate(schedule_table):
+        completed_microbatches = (
+            virtual_microbatch_id
+            if forward_only
+            else virtual_microbatch_id - num_warmup_microbatches
+        )
+        if completed_microbatches > 0:
+            released_chunk_id = schedule_table[completed_microbatches - 1][1]
+            if not forward_only:
+                released_chunk_id = num_model_chunks - released_chunk_id - 1
+            released_counts[released_chunk_id] += 1
+        release_offsets.append(released_counts[model_chunk_id])
+    return release_offsets
+
+
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -1241,6 +1270,9 @@ def forward_backward_pipelining_with_interleaving(
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
     # Both tables are indexed with virtual_microbatch_id.
     microbatch_id_table, model_chunk_id_table = zip(*schedule_table)
+    released_microbatch_offsets = _get_microbatch_release_offsets(
+        schedule_table, num_model_chunks, num_warmup_microbatches, forward_only
+    )
 
     def get_model_chunk_id(virtual_microbatch_id, forward):
         """Helper method to get the model chunk ID given the iteration number."""
@@ -1254,20 +1286,6 @@ def forward_backward_pipelining_with_interleaving(
         assert forward
         microbatch_id_in_model_chunk = microbatch_id_table[iteration_id]
         return microbatch_id_in_model_chunk
-
-    def num_released_microbatches(virtual_microbatch_id, model_chunk_id):
-        """Helper method to count number of released (i.e. popped from input_tensors)
-        microbatches for a model chunk."""
-        if forward_only:  # Micro-batch is released after forward prop.
-            return model_chunk_id_table[:virtual_microbatch_id].count(model_chunk_id)
-        else:  # Micro-batch is released after backward prop.
-            # Zero backward prop in warmup.
-            if virtual_microbatch_id < num_warmup_microbatches:
-                return 0
-            else:
-                backward_microbatch_id = virtual_microbatch_id - num_warmup_microbatches
-                model_chunk_id = num_model_chunks - model_chunk_id - 1
-                return model_chunk_id_table[:backward_microbatch_id].count(model_chunk_id)
 
     def is_first_microbatch_for_model_chunk(virtual_microbatch_id: int) -> bool:
         """Check if an iteration is the first for a model chunk."""
@@ -1363,7 +1381,7 @@ def forward_backward_pipelining_with_interleaving(
         # This input buffering is needed to overlap the computation with the receipt of
         # the next inputs. To index the proper buffered inputs for forword_step, we use
         # microbatch_id offset with number of released microbatches that have completed backprop.
-        offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
+        offset = released_microbatch_offsets[virtual_microbatch_id]
         input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
 
         return input_tensor
