@@ -2,6 +2,7 @@
 """Tests for selective wide-residual replay and offload ownership."""
 
 import copy
+from functools import partial
 
 import pytest
 import torch
@@ -106,14 +107,17 @@ class _StaticResidualChain(nn.Module):
                 branch_input = apply_module(norm)(branch_input)
             else:
                 branch_input, state = checkpoint_residual_read(
-                    connection, hidden_states, context, fp32_residual_connection=False
+                    partial(connection, operation="read"),
+                    hidden_states,
+                    context,
+                    fp32_residual_connection=False,
                 )
                 branch_input = context.checkpoint(apply_module(norm), branch_input)
 
             branch_output = apply_module(branch)(branch_input)
             if context is not None and not context.is_block_end:
                 hidden_states = checkpoint_residual_write(
-                    connection,
+                    partial(connection, operation="write"),
                     branch_output,
                     state,
                     context,
@@ -371,7 +375,7 @@ def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
     context = build_residual_stream_recompute_plan(num_layers=1, block_size=1)[0]
 
     _, state = checkpoint_residual_read(
-        connection,
+        partial(connection, operation="read"),
         hidden_states,
         context,
         fp32_residual_connection=True,
@@ -734,18 +738,15 @@ class TestResidualStreamRecomputeIntegration:
 
         def record_read(mode):
             def hook(_module, _args, kwargs, output):
-                if kwargs.get("operation") == "read":
-                    branch_input, state = output
-                    read_dtypes[mode].append(branch_input.dtype)
-                    state_dtypes[mode].append(state[0].dtype)
-                    read_grad_fns[mode].append(type(branch_input.grad_fn).__name__)
+                branch_input, state = output
+                read_dtypes[mode].append(branch_input.dtype)
+                state_dtypes[mode].append(state[0].dtype)
+                read_grad_fns[mode].append(type(branch_input.grad_fn).__name__)
 
             return hook
 
-        reference.residual_connection.register_forward_hook(record_read("eager"), with_kwargs=True)
-        recomputed.residual_connection.register_forward_hook(
-            record_read("replay"), with_kwargs=True
-        )
+        reference.residual_read.register_forward_hook(record_read("eager"), with_kwargs=True)
+        recomputed.residual_read.register_forward_hook(record_read("replay"), with_kwargs=True)
         reference_output = reference(hidden_states=reference_input)
         reference_output.square().mean().backward()
 

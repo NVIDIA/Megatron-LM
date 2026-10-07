@@ -129,6 +129,18 @@ def group_layers_into_shortcut_blocks(
     return grouped_layers
 
 
+def _load_shortcut_state(
+    module, state_dict, prefix, local_metadata, strict, missing, unexpected, errors
+):
+    """Load existing shortcut model keys into their single registered owners."""
+    del local_metadata, strict, missing, unexpected, errors
+    for key in list(state_dict):
+        for current, legacy in module._checkpoint_aliases:
+            if key.startswith(prefix + legacy):
+                state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
+                break
+
+
 class ShortcutMoEBlock(MegatronModule):
     """Own and execute one attention-layer/shortcut-MoE pair."""
 
@@ -150,6 +162,28 @@ class ShortcutMoEBlock(MegatronModule):
         moe_local_idx: int | None = None,
     ):
         super().__init__(compute_layer.config)
+
+        split_residual = compute_layer.config.wide_residual is not None and not getattr(
+            compute_layer, "is_mtp_layer", False
+        )
+        if split_residual:
+            # Reserve ownership slots in the order this block calls them. In particular,
+            # routed experts execute between the compute branch's read and write.
+            for child_name in (
+                "shortcut_residual_read",
+                "shortcut_pre_mlp_layernorm",
+                "compute_residual_read",
+                "compute_norm",
+                "compute_layer",
+                "routed_experts",
+                "compute_residual_write",
+                "moe_residual_read",
+                "moe_norm",
+                "moe_layer",
+                "shortcut_post_norm",
+                "moe_residual_write",
+            ):
+                self.add_module(child_name, None)
 
         self.overlap_mode = overlap_a2a
         self.layer_number = compute_layer.layer_number
@@ -200,7 +234,7 @@ class ShortcutMoEBlock(MegatronModule):
                 )
             if (
                 self.shortcut_residual_read.residual_stream_hidden_size
-                != outer_connection.residual_stream_hidden_size
+                != outer_connection[0].residual_stream_hidden_size
             ):
                 raise ValueError(
                     "The shortcut read and outer MoE residual connection must consume the "
@@ -233,6 +267,62 @@ class ShortcutMoEBlock(MegatronModule):
             else IdentityOp()
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+
+        if split_residual:
+            self._own_residual_operations()
+
+    def _own_residual_operations(self):
+        """Own interleaved operations here; retain non-owning references for layer helpers.
+
+        Each module has one registered owner. The partial-forward helpers still access
+        their original attributes, while traversal, device moves, and FSDP follow this
+        block's execution order. Keeping ordinary references also preserves deepcopy.
+        """
+        self._checkpoint_aliases = []
+
+        def move(name, owner, source, legacy_prefix, parameters=("",)):
+            child = owner._modules.pop(source)
+            # This attribute is a reference, not another registered ownership edge.
+            object.__setattr__(owner, source, child)
+            setattr(self, name, child)
+            for parameter in parameters:
+                self._checkpoint_aliases.append((name + "." + parameter, legacy_prefix + parameter))
+
+        mamba = isinstance(self.compute_layer, MambaLayer)
+        suffix = "" if mamba else "_self_attn"
+        norm = "norm" if mamba else "input_layernorm"
+        move(
+            "compute_residual_read",
+            self.compute_layer,
+            "residual_read" + suffix,
+            "compute_layer.residual_connection" + suffix + ".",
+            ("read_map.",),
+        )
+        move("compute_norm", self.compute_layer, norm, "compute_layer." + norm + ".")
+        move("routed_experts", self.moe_layer.mlp, "experts", "moe_layer.mlp.experts.")
+        move(
+            "compute_residual_write",
+            self.compute_layer,
+            "residual_write" + suffix,
+            "compute_layer.residual_connection" + suffix + ".",
+            ("write_map.", "retention."),
+        )
+        move(
+            "moe_residual_read",
+            self.moe_layer,
+            "residual_read_mlp",
+            "moe_layer.residual_connection_mlp.",
+            ("read_map.",),
+        )
+        move("moe_norm", self.moe_layer, "pre_mlp_layernorm", "moe_layer.pre_mlp_layernorm.")
+        move(
+            "moe_residual_write",
+            self.moe_layer,
+            "residual_write_mlp",
+            "moe_layer.residual_connection_mlp.",
+            ("write_map.", "retention."),
+        )
+        self.register_load_state_dict_pre_hook(_load_shortcut_state)
 
     def _read_shortcut_hidden(
         self,

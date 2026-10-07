@@ -13,13 +13,15 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
+from megatron.core.transformer.wide_residual_layer import (
+    StreamwiseSigmoidWideResidualConnectionRead,
+    StreamwiseSigmoidWideResidualWrite,
+)
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -55,6 +57,12 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
         self.is_first_layer = True
         self.is_last_layer = False
         self.supports_two_stage = supports_two_stage
+        if config.wide_residual is not None:
+            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnectionRead(config)
+            self.input_layernorm = torch.nn.Identity()
+            self.residual_write_self_attn = StreamwiseSigmoidWideResidualWrite(
+                config, 1, "self_attention"
+            )
 
     def supports_two_stage_attention(self) -> bool:
         return self.supports_two_stage
@@ -70,6 +78,7 @@ class _FakeMLP(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.tp_group = None
+        self.experts = torch.nn.Identity()
 
 
 class _FakeNorm:
@@ -98,13 +107,22 @@ class _FakeMoE(torch.nn.Module):
             config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon
         )
         self.mlp = _FakeMLP()
+        if config.wide_residual is not None:
+            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnectionRead(config)
+            self.residual_write_mlp = StreamwiseSigmoidWideResidualWrite(
+                config, layer_number, "mlp"
+            )
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
     def _get_mlp_residual_connection(self):
-        return getattr(self, "residual_connection_mlp", None)
+        return (
+            (self.residual_read_mlp, self.residual_write_mlp)
+            if self.config.wide_residual is not None
+            else None
+        )
 
 
 @pytest.mark.parametrize(
@@ -157,22 +175,15 @@ def test_wide_shortcut_owns_independent_registered_read():
     """The routed shortcut reads wide X_l through its own ordinary-width controller."""
 
     config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
-    pg_collection = ProcessGroupCollection()
     compute = _FakeCompute(config)
     compute.residual_stream_hidden_size = config.wide_residual.num_streams * config.hidden_size
     moe = _FakeMoE(config)
-    moe.residual_connection_mlp = StreamwiseSigmoidWideResidualConnection(
-        config=config, layer_number=moe.layer_number, branch_name="mlp", pg_collection=pg_collection
-    )
     block = ShortcutMoEBlock(compute, moe, overlap_a2a=False).cuda()
 
     state_keys = set(block.state_dict())
     assert "shortcut_residual_read.read_map.logit" in state_keys
-    assert "moe_layer.residual_connection_mlp.read_map.logit" in state_keys
-    assert (
-        block.shortcut_residual_read.read_map.logit
-        is not block.moe_layer.residual_connection_mlp.read_map.logit
-    )
+    assert "moe_residual_read.read_map.logit" in state_keys
+    assert block.shortcut_residual_read.read_map.logit is not block.moe_residual_read.read_map.logit
 
     wide_hidden = torch.randn(
         5, 3 * config.hidden_size, device=torch.cuda.current_device(), requires_grad=True

@@ -22,9 +22,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     save_checkpoint,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
+from megatron.core.transformer.wide_residual_layer import (
+    StreamwiseSigmoidWideResidualConnectionRead,
+    StreamwiseSigmoidWideResidualWrite,
+    _load_residual_state,
+)
 
 
 class _Block(nn.Module):
@@ -36,19 +39,15 @@ class _Block(nn.Module):
             num_attention_heads=4,
             wide_residual=WideResidualConfig(num_streams=3, learned_retention=retention),
         )
-        self.residual = StreamwiseSigmoidWideResidualConnection(
-            config, 1, "mlp", ProcessGroupCollection()
-        )
+        self.residual_read = StreamwiseSigmoidWideResidualConnectionRead(config)
         self.branch = nn.Linear(32, 32, bias=False)
+        self.residual_write = StreamwiseSigmoidWideResidualWrite(config, 1, "mlp")
+        self.register_load_state_dict_pre_hook(_load_residual_state)
 
     def forward(self, x):
-        branch, state = self.residual(x, operation="read")
-        return self.residual(
-            self.branch(branch),
-            operation="write",
-            state=state,
-            dropout_probability=0.0,
-            training=self.training,
+        branch, state = self.residual_read(x)
+        return self.residual_write(
+            self.branch(branch), state=state, dropout_probability=0.0, training=self.training
         )
 
 
@@ -56,12 +55,9 @@ def _shard(model, mesh, device):
     placements = Placements(
         dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
     )
-    with fully_shard_context(device=device) as context:
-        for module in (model.residual.reader, model.residual.writer, model.branch, model):
+    with fully_shard_context(device=device):
+        for module in (model.residual_read, model.residual_write, model.branch, model):
             fully_shard(module, mesh=mesh, placements=placements)
-        context.set_forward_order(
-            model, (model, model.residual.reader, model.branch, model.residual.writer)
-        )
     return model
 
 
@@ -78,17 +74,22 @@ def _full_values(model, attribute):
 
 
 @pytest.mark.parametrize("retention", [False, True])
-def test_independent_ownership_preserves_legacy_model_keys(distributed_setup, retention):
+def test_independent_ownership_loads_legacy_model_keys(distributed_setup, retention):
     model = _Block(retention=retention).to(distributed_setup.device)
-    residual = model.residual
-    assert not set(residual.reader.parameters()) & set(residual.writer.parameters())
+    assert not set(model.residual_read.parameters()) & set(model.residual_write.parameters())
     state = model.state_dict()
-    expected = {"residual.read_map.logit", "residual.write_map.logit", "branch.weight"}
+    expected = {"residual_read.read_map.logit", "residual_write.write_map.logit", "branch.weight"}
     if retention:
-        expected.add("residual.retention.retention_logit")
+        expected.add("residual_write.retention.retention_logit")
     assert set(state) == expected
     restored = _Block(retention=retention).to(distributed_setup.device)
-    restored.load_state_dict(state, strict=True)
+    legacy = {
+        key.replace("residual_read.", "residual_connection.").replace(
+            "residual_write.", "residual_connection."
+        ): value
+        for key, value in state.items()
+    }
+    restored.load_state_dict(legacy, strict=True)
     x = torch.randn(8, 96, device=distributed_setup.device)
     torch.testing.assert_close(restored(x), model(x), rtol=0, atol=0)
 
@@ -105,7 +106,7 @@ def test_split_prefetch_preserves_training(distributed_setup, recompute):
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
     prefetched = []
-    model.residual.writer.register_forward_pre_hook(
+    model.residual_write.register_forward_pre_hook(
         lambda module, args: prefetched.append(module._unshard_event is not None), prepend=True
     )
     for step in range(3):

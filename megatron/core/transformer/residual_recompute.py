@@ -22,10 +22,8 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
-    ResidualConnection,
     ResidualConnectionState,
 )
-from megatron.core.typed_torch import apply_module
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -155,7 +153,7 @@ def build_residual_stream_recompute_plan(
 
 
 def checkpoint_residual_read(
-    connection: ResidualConnection,
+    connection: Callable[..., tuple[Tensor, ResidualConnectionState]],
     hidden_states: Tensor,
     context: ResidualStreamRecomputeContext,
     *,
@@ -169,11 +167,8 @@ def checkpoint_residual_read(
     """
 
     def run_read(stream: Tensor) -> tuple[Tensor, ...]:
-        branch_input, state = apply_module(connection)(
-            stream,
-            operation="read",
-            fp32_residual_connection=False,
-            branch_input_dtype=branch_input_dtype,
+        branch_input, state = connection(
+            stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
         )
         if state[0].shape != stream.shape:
             raise ValueError("Residual connection read returned an incompatible carried stream.")
@@ -195,7 +190,7 @@ def checkpoint_residual_read(
 
 
 def checkpoint_residual_write(
-    connection: ResidualConnection,
+    connection: Callable[..., Tensor],
     branch_output: ResidualBranchOutput,
     state: ResidualConnectionState,
     context: ResidualStreamRecomputeContext,
@@ -216,9 +211,8 @@ def checkpoint_residual_write(
         branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
     ) -> Tensor:
         value = (branch_update, branch_bias) if return_tuple else branch_update
-        return apply_module(connection)(
+        return connection(
             value,
-            operation="write",
             state=connection_state,
             dropout_probability=dropout_probability,
             training=training,

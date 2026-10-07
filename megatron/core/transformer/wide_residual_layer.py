@@ -17,6 +17,8 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionState,
     ResidualConnectionWriteState,
+    ResidualRead,
+    ResidualWrite,
 )
 from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_read,
@@ -184,31 +186,42 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         )
 
 
-class StreamwiseSigmoidWideResidualConnectionRead(nn.Module):
-    """Own the connection's read map and preserve its existing output-dtype contract."""
+class StreamwiseSigmoidWideResidualConnectionRead(ResidualRead):
+    """Own the read map for one wide-residual branch."""
 
     def __init__(self, config: TransformerConfig) -> None:
-        super().__init__()
+        if config.wide_residual is None:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualConnectionRead requires wide_residual config."
+            )
+        super().__init__(config.wide_residual.num_streams * config.hidden_size, config.hidden_size)
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
         self.num_streams = config.wide_residual.num_streams
 
-    def forward(self, hidden_states: Tensor, *, output_dtype: torch.dtype | None = None) -> Tensor:
-        """Read in the input dtype unless the connection requests a branch dtype."""
-        return streamwise_sigmoid_read(
-            hidden_states,
-            self.read_map(return_logits=True),
-            self.num_streams,
-            output_dtype=output_dtype,
+    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
+        return self._read_with_output_dtype(hidden_states, output_dtype=None)
+
+    def _read_with_output_dtype(
+        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
+    ) -> tuple[Tensor, ResidualConnectionWriteState]:
+        return (
+            streamwise_sigmoid_read(
+                hidden_states,
+                self.read_map(return_logits=True),
+                self.num_streams,
+                output_dtype=output_dtype,
+            ),
+            (),
         )
 
 
-class StreamwiseSigmoidWideResidualWrite(nn.Module):
+class StreamwiseSigmoidWideResidualWrite(ResidualWrite):
     """Own only the write map and optional retention controller."""
 
     def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
-        super().__init__()
         if config.wide_residual is None:
             raise ValueError("StreamwiseSigmoidWideResidualWrite requires wide_residual config.")
+        super().__init__(config.wide_residual.num_streams * config.hidden_size, config.hidden_size)
         self.num_streams = config.wide_residual.num_streams
         self.write_map = StreamwiseSigmoidMap(config, map_kind="write")
         self.retention = (
@@ -219,7 +232,7 @@ class StreamwiseSigmoidWideResidualWrite(nn.Module):
             else None
         )
 
-    def forward(
+    def _write(
         self,
         branch_output: ResidualBranchOutput,
         state: ResidualConnectionState,
@@ -265,7 +278,7 @@ class StreamwiseSigmoidWideResidualWrite(nn.Module):
 
 
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
-    """Compose independently callable read and write modules around a branch."""
+    """Positive streamwise maps around one ordinary-width residual branch."""
 
     def __init__(
         self,
@@ -280,40 +293,46 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             raise ValueError(
                 "StreamwiseSigmoidWideResidualConnection requires wide_residual config."
             )
+        wr = config.wide_residual
         super().__init__(
-            residual_stream_hidden_size=config.wide_residual.num_streams * config.hidden_size,
+            residual_stream_hidden_size=wr.num_streams * config.hidden_size,
             branch_hidden_size=config.hidden_size,
         )
         self.layer_number = layer_number
         self.branch_name = branch_name
-        self.num_streams = config.wide_residual.num_streams
-        self.reader = StreamwiseSigmoidWideResidualConnectionRead(config)
-        self.writer = StreamwiseSigmoidWideResidualWrite(config, layer_number, branch_name)
-        self.register_state_dict_post_hook(_export_residual_state)
-        self.register_load_state_dict_pre_hook(_load_residual_state)
-
-    @property
-    def read_map(self) -> StreamwiseSigmoidMap:
-        """Expose the read controller under its existing attribute name."""
-        return self.reader.read_map
-
-    @property
-    def write_map(self) -> StreamwiseSigmoidMap:
-        """Expose the write controller under its existing attribute name."""
-        return self.writer.write_map
-
-    @property
-    def retention(self) -> LearnedWideResidualRetention | None:
-        """Expose the retention controller under its existing attribute name."""
-        return self.writer.retention
+        self.num_streams = wr.num_streams
+        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+        self.write_map = StreamwiseSigmoidMap(config, map_kind="write")
+        self.retention = (
+            LearnedWideResidualRetention(
+                config, layer_number, branch_name, num_streams=self.num_streams
+            )
+            if wr.learned_retention
+            else None
+        )
 
     def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return self.reader(hidden_states), ()
+        return (
+            streamwise_sigmoid_read(
+                hidden_states, self.read_map(return_logits=True), self.num_streams
+            ),
+            (),
+        )
 
     def _read_with_output_dtype(
         self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
     ) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return self.reader(hidden_states, output_dtype=output_dtype), ()
+        """Fuse an optional branch-output conversion into the streamwise read."""
+
+        return (
+            streamwise_sigmoid_read(
+                hidden_states,
+                self.read_map(return_logits=True),
+                self.num_streams,
+                output_dtype=output_dtype,
+            ),
+            (),
+        )
 
     def _write(
         self,
@@ -323,38 +342,62 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         dropout_probability: float,
         training: bool,
     ) -> Tensor:
-        return self.writer(
-            branch_output, state, dropout_probability=dropout_probability, training=training
+        residual_stream = state[0]
+        if isinstance(branch_output, tuple):
+            branch_update, bias = branch_output
+        else:
+            branch_update, bias = branch_output, None
+
+        dropout_is_active = training and dropout_probability > 0.0
+        defer_update_cast = (
+            residual_stream.dtype == torch.float32
+            and branch_update.dtype in (torch.bfloat16, torch.float16)
+            and bias is None
+            and not dropout_is_active
+        )
+        # Bias addition and active dropout currently run in residual precision. Only defer the
+        # update cast when neither operation can observe its placement; the mixed-dtype Triton
+        # write then performs the BF16/FP16 -> FP32 conversion while loading the update.
+        if not defer_update_cast:
+            branch_update = branch_update.to(dtype=residual_stream.dtype)
+        if bias is not None:
+            branch_update = branch_update + bias.to(
+                device=branch_update.device, dtype=branch_update.dtype
+            )
+        branch_update = F.dropout(branch_update, p=dropout_probability, training=training)
+        retention_logits = (
+            self.retention(return_logits=True) if self.retention is not None else None
+        )
+        return streamwise_sigmoid_writeback(
+            residual_stream,
+            branch_update,
+            self.write_map(return_logits=True),
+            self.num_streams,
+            retention_logits=retention_logits,
+            retention_max_forget=(self.retention.max_forget if self.retention is not None else 0.0),
         )
 
 
-def _export_residual_state(module, state_dict, prefix, local_metadata):
-    """Keep existing checkpoint parameter keys after splitting operation ownership."""
-    del module, local_metadata
-    for key in list(state_dict):
-        for child, legacy in (
-            ("reader.read_map.", "read_map."),
-            ("writer.write_map.", "write_map."),
-            ("writer.retention.", "retention."),
-        ):
-            if key.startswith(prefix + child):
-                state_dict[prefix + legacy + key[len(prefix + child) :]] = state_dict.pop(key)
-                break
+_RESIDUAL_STATE_PREFIXES = tuple(
+    (f"residual_{operation}{suffix}.{parameter}.", f"residual_connection{suffix}.{parameter}.")
+    for suffix in ("", "_self_attn", "_mlp")
+    for operation, parameter in (
+        ("read", "read_map"),
+        ("write", "write_map"),
+        ("write", "retention"),
+    )
+)
 
 
 def _load_residual_state(
     module, state_dict, prefix, local_metadata, strict, missing, unexpected, errors
 ):
-    """Accept the existing checkpoint parameter keys with strict loading."""
+    """Accept existing residual model keys with strict loading."""
     del module, local_metadata, strict, missing, unexpected, errors
     for key in list(state_dict):
-        for legacy, child in (
-            ("read_map.", "reader.read_map."),
-            ("write_map.", "writer.write_map."),
-            ("retention.", "writer.retention."),
-        ):
+        for current, legacy in _RESIDUAL_STATE_PREFIXES:
             if key.startswith(prefix + legacy):
-                state_dict[prefix + child + key[len(prefix + legacy) :]] = state_dict.pop(key)
+                state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
                 break
 
 
@@ -403,43 +446,30 @@ class WideResidualTransformerLayer(TransformerLayer):
                 "WideResidualTransformerLayer does not support cross-attention branches."
             )
 
-        self.residual_connection_self_attn = (
-            StreamwiseSigmoidWideResidualConnection(
-                config=self.config,
-                layer_number=self.layer_number,
-                branch_name="self_attention",
-                pg_collection=self.pg_collection,
-                name=(name + ".residual_connection_self_attn") if name is not None else None,
+        for suffix, branch_name in (("self_attn", "self_attention"), ("mlp", "mlp")):
+            if isinstance(getattr(self, branch_name), IdentityOp):
+                continue
+            setattr(
+                self, "residual_read_" + suffix, StreamwiseSigmoidWideResidualConnectionRead(config)
             )
-            if not isinstance(self.self_attention, IdentityOp)
-            else None
-        )
-        self.residual_connection_mlp = (
-            StreamwiseSigmoidWideResidualConnection(
-                config=self.config,
-                layer_number=self.layer_number,
-                branch_name="mlp",
-                pg_collection=self.pg_collection,
-                name=(name + ".residual_connection_mlp") if name is not None else None,
+            setattr(
+                self,
+                "residual_write_" + suffix,
+                StreamwiseSigmoidWideResidualWrite(config, self.layer_number, branch_name),
             )
-            if not isinstance(self.mlp, IdentityOp)
-            else None
-        )
-
+        self.register_load_state_dict_pre_hook(_load_residual_state)
         residual_connections = [
-            connection
-            for connection in (self.residual_connection_self_attn, self.residual_connection_mlp)
-            if connection is not None
+            reader
+            for reader in (self.residual_read_self_attn, self.residual_read_mlp)
+            if reader is not None
         ]
-        if (
-            self.residual_connection_self_attn is not None
-            and self._input_layernorm_returns_residual
-        ):
+
+        if self.residual_read_self_attn is not None and self._input_layernorm_returns_residual:
             raise ValueError(
                 "A self-attention residual connection cannot be combined with a layer norm "
                 "that returns its own residual."
             )
-        if self.residual_connection_mlp is not None and self._pre_mlp_layernorm_returns_residual:
+        if self.residual_read_mlp is not None and self._pre_mlp_layernorm_returns_residual:
             raise ValueError(
                 "An MLP residual connection cannot be combined with a layer norm that returns "
                 "its own residual."
@@ -466,15 +496,23 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"{connection.branch_hidden_size}."
                 )
 
-    def _get_self_attention_residual_connection(self) -> ResidualConnection | None:
+    def _get_self_attention_residual_connection(self) -> tuple[ResidualRead, ResidualWrite] | None:
         """Return the connection surrounding the self-attention branch."""
 
-        return self.residual_connection_self_attn
+        return (
+            (self.residual_read_self_attn, self.residual_write_self_attn)
+            if self.residual_read_self_attn is not None
+            else None
+        )
 
-    def _get_mlp_residual_connection(self) -> ResidualConnection | None:
+    def _get_mlp_residual_connection(self) -> tuple[ResidualRead, ResidualWrite] | None:
         """Return the connection surrounding the MLP or MoE branch."""
 
-        return self.residual_connection_mlp
+        return (
+            (self.residual_read_mlp, self.residual_write_mlp)
+            if self.residual_read_mlp is not None
+            else None
+        )
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):

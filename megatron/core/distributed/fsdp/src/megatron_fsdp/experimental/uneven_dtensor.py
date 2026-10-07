@@ -110,18 +110,11 @@ def chunk_metadata_by_fqn(model: nn.Module) -> dict[str, ChunkStorageMetadata]:
                 )
     # Tied parameters share one nn.Parameter under several FQNs, and the state dict carries an
     # entry for each of them, so iterate without deduplicating.
-    metadata_by_fqn = {
+    return {
         fqn: metadata_by_parameter[parameter]
         for fqn, parameter in model.named_parameters(remove_duplicate=False)
         if parameter in metadata_by_parameter
     }
-    # State-dict hooks may preserve checkpoint names when a module is split into
-    # children. Associate those aliases by parameter identity, not by spelling.
-    # Optimizer state still uses named_parameters(), so retain both sets of keys.
-    for fqn, value in model.state_dict(keep_vars=True).items():
-        if isinstance(value, torch.Tensor) and value in metadata_by_parameter:
-            metadata_by_fqn[fqn] = metadata_by_parameter[value]
-    return metadata_by_fqn
 
 
 def attach_uneven_dtensor_metadata(

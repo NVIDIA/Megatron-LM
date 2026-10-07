@@ -20,7 +20,9 @@ from megatron.core.transformer.wide_residual_layer import (
     StreamwiseSigmoidMap,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
+    StreamwiseSigmoidWideResidualConnectionRead,
     StreamwiseSigmoidWideResidualRead,
+    StreamwiseSigmoidWideResidualWrite,
     WideResidualTransformerLayer,
     expand_wide_residual_stream,
 )
@@ -624,16 +626,17 @@ class TestWideResidualStaticConstruction:
         assert layer_spec.module is WideResidualTransformerLayer
         assert type(layer) is WideResidualTransformerLayer
         connections = {
-            "self_attention": layer.residual_connection_self_attn,
-            "mlp": layer.residual_connection_mlp,
+            "self_attention": layer._get_self_attention_residual_connection(),
+            "mlp": layer._get_mlp_residual_connection(),
         }
         for branch_name, connection in connections.items():
             if branch_name in expected_connections:
-                assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+                assert isinstance(connection[0], StreamwiseSigmoidWideResidualConnectionRead)
+                assert isinstance(connection[1], StreamwiseSigmoidWideResidualWrite)
             else:
                 assert connection is None
         if len(expected_connections) == 2:
-            assert layer.residual_connection_self_attn is not layer.residual_connection_mlp
+            assert layer.residual_read_self_attn is not layer.residual_read_mlp
 
     def test_cross_attention_is_rejected_explicitly(self):
         layer_spec = ModuleSpec(
@@ -856,7 +859,7 @@ class TestWideResidualLayerIntegration:
         connection_parameters = {
             name: parameter
             for name, parameter in layer.named_parameters()
-            if "residual_connection" in name
+            if "residual_read" in name or "residual_write" in name
         }
         assert connection_parameters
         assert all(parameter.grad is not None for parameter in connection_parameters.values())
@@ -878,19 +881,30 @@ class TestWideResidualLayerIntegration:
             pg_collection=_process_groups(),
         )
         with torch.no_grad():
-            source.residual_connection_self_attn.read_map.logit[0].add_(0.25)
-            source.residual_connection_mlp.write_map.logit[1].sub_(0.125)
+            source.residual_read_self_attn.read_map.logit[0].add_(0.25)
+            source.residual_write_mlp.write_map.logit[1].sub_(0.125)
 
         state = source.state_dict()
         expected_connection_keys = {
-            f"residual_connection_{branch}.{parameter}"
+            f"residual_{operation}_{branch}.{parameter}"
             for branch in ("self_attn", "mlp")
-            for parameter in ("read_map.logit", "write_map.logit", "retention.retention_logit")
+            for operation, parameter in (
+                ("read", "read_map.logit"),
+                ("write", "write_map.logit"),
+                ("write", "retention.retention_logit"),
+            )
         }
-        connection_keys = {key for key in state if key.startswith("residual_connection_")}
-
+        connection_keys = {
+            key for key in state if key.startswith(("residual_read_", "residual_write_"))
+        }
         assert connection_keys == expected_connection_keys
-        destination.load_state_dict(state, strict=True)
+        legacy = {
+            key.replace("residual_read_", "residual_connection_").replace(
+                "residual_write_", "residual_connection_"
+            ): value
+            for key, value in state.items()
+        }
+        destination.load_state_dict(legacy, strict=True)
         for key in state:
             assert torch.equal(destination.state_dict()[key], state[key])
 
@@ -905,14 +919,13 @@ class TestWideResidualLayerIntegration:
         )
         operations = []
 
-        def record_operation(module, args, kwargs):
-            del args
-            operations.append((module.branch_name, kwargs["operation"]))
-
-        layer.residual_connection_self_attn.register_forward_pre_hook(
-            record_operation, with_kwargs=True
-        )
-        layer.residual_connection_mlp.register_forward_pre_hook(record_operation, with_kwargs=True)
+        for branch, suffix in (("self_attention", "self_attn"), ("mlp", "mlp")):
+            for operation in ("read", "write"):
+                getattr(layer, f"residual_{operation}_{suffix}").register_forward_pre_hook(
+                    lambda module, args, branch=branch, operation=operation: operations.append(
+                        (branch, operation)
+                    )
+                )
         base = torch.randn(2, 3, config.hidden_size)
 
         layer(hidden_states=expand_wide_residual_stream(base, 3), attention_mask=None)
