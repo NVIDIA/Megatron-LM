@@ -1520,6 +1520,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 chunk_moe_kwargs = {}
                 if input_id_chunk is not None:
                     chunk_moe_kwargs["input_ids"] = input_id_chunk
+                if self.is_moe_layer:
+                    chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
                 outputs.append(
                     apply_module(self.mlp)(
                         chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs

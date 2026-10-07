@@ -602,6 +602,10 @@ class TopKRouter(Router):
             )
         )
 
+        # local_num_tokens is per-sequence (bsz is folded into the expert dim above) and floors
+        # uneven padding, so per-token-loss scaling uses the physical valid-token count instead.
+        num_valid_tokens = routing_map.sum() // self.topk if with_padding_mask else seq_length * bsz
+
         aux_loss = (
             switch_load_balancing_loss_func(
                 probs=scores_for_aux_loss,
@@ -623,9 +627,7 @@ class TopKRouter(Router):
             aux_loss_groups.metric_reduce_group,
             avg_group=aux_loss_groups.metric_avg_group,
             needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
-            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
-            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
-            valid_token_count=local_num_tokens * bsz,
+            valid_token_count=num_valid_tokens,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
         )
