@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import (
+    HAVE_EMERGING_OPTIMIZERS,
     ChainedOptimizer,
     OptimizerConfig,
     ParamKey,
@@ -1584,6 +1585,50 @@ def test_get_megatron_optimizer_with_gloo_collection(mocker, create_gloo, use_gl
         assert distributed_optimizer.data_parallel_group_gloo is (
             pg_collection.intra_dp_cp_gloo if use_gloo else None
         )
+
+
+class DenseAndExpertLinear(nn.Module):
+    """One dense and one expert-parallel weight, as the optimizer factory sees an MoE layer."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.dense = nn.Linear(16, 16, bias=False, device='cuda')
+        self.experts = nn.Linear(16, 16, bias=False, device='cuda')
+        self.experts.weight.allreduce = False
+
+
+@pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
+def test_emerging_optimizer_expert_grad_norm_covers_egtp_remat_shards():
+    """Every EGTP_remat peer reports the norm over all expert-weight shards."""
+    if torch.distributed.get_world_size() % 4 != 0:
+        pytest.skip("Needs a world size divisible by expert_model_parallel_size x egtp_remat (4)")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_gtp_remat_size=2)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = DenseAndExpertLinear(TransformerConfig(num_attention_heads=1, num_layers=1))
+    # EGTP_remat shards each expert weight, so every peer owns distinct gradient values.
+    model.experts.weight.is_gtp_weight_remat = True
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(optimizer='muon', lr=0.01, muon_tp_mode='duplicated'),
+        [model],
+        pg_collection=pg_collection,
+    )
+
+    # Dense gradients are replicated. Each (EP rank, EGTP_remat rank) pair holds its own expert
+    # shard, filled here with that shard's 1-based index.
+    num_egtp_remat_ranks = pg_collection.expt_gtp_remat.size()
+    num_expert_shards = pg_collection.ep.size() * num_egtp_remat_ranks
+    expert_shard_index = (
+        pg_collection.ep.rank() * num_egtp_remat_ranks + pg_collection.expt_gtp_remat.rank()
+    )
+    model.dense.weight.grad = torch.ones_like(model.dense.weight)
+    model.experts.weight.grad = torch.full_like(model.experts.weight, expert_shard_index + 1.0)
+    expected_grad_norm = (
+        model.dense.weight.numel()
+        + model.experts.weight.numel() * sum(i**2 for i in range(1, num_expert_shards + 1))
+    ) ** 0.5
+
+    assert optimizer.get_grad_norm() == pytest.approx(expected_grad_norm, rel=1e-6)
 
 
 def _chain_member(param_groups):

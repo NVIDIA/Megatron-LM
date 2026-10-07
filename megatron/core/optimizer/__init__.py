@@ -899,6 +899,13 @@ def _get_megatron_emerging_optimizer(
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
+    # Expert parameters reduce gradient statistics over the expert analog of ``mp``: tp_ep_pp
+    # merged across EGTP_remat peers, which hold distinct shards of each expert weight.
+    # tp_ep_pp is the same group when EGTP_remat is off.
+    expert_model_parallel_group = pg_collection.tp_ep_pp_with_egtp_remat
+    if expert_model_parallel_group is None:
+        expert_model_parallel_group = pg_collection.tp_ep_pp
+
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
@@ -910,7 +917,7 @@ def _get_megatron_emerging_optimizer(
         if not groups:
             continue
 
-        model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
+        model_parallel_group = expert_model_parallel_group if is_expert else pg_collection.mp
 
         # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
         # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
