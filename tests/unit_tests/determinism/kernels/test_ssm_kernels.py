@@ -21,10 +21,20 @@ Each kernel is replayed in that mode, including with Triton's autotune cache ena
 import pytest
 import torch
 
+from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
 from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
+    _build_mixer,
+    requires_deterministic_conv1d,
+)
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    seeded,
+)
+from tests.unit_tests.test_utilities import Utils
 
 try:
     import triton  # noqa: F401
@@ -514,3 +524,71 @@ def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
         return o, state
 
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="fla chunk_gated_delta_rule")
+
+
+# --- Mamba mixer: the batch-invariant unfused training path (_static_prefill) ----------------
+
+
+@pytest.mark.skipif(mamba_mixer_module.mamba_chunk_scan_combined is None, reason="needs mamba_ssm")
+@pytest.mark.parametrize("batch_invariant", [True, False], ids=["batch-invariant", "default"])
+def test_unfused_mixer_applies_the_gate_exactly_once(monkeypatch, batch_invariant):
+    """Batch-invariant mode gates inside the scan (as ssm_prefill does), else in the norm.
+
+    The kernel tests above call the scan with ``z`` supplied, so they cannot see which side of
+    the mixer applies it.
+    """
+    mixer = _build_mixer(deterministic_mode=False)
+    try:
+        mixer.use_mem_eff_path = False  # dispatch to _static_prefill
+        mixer.config.batch_invariant_mode = batch_invariant
+        assert mixer.rmsnorm, "the gate placement under test only exists with an RMSNorm"
+
+        scan_gates, norm_gates = [], []
+        real_scan = mamba_mixer_module.mamba_chunk_scan_combined
+        real_norm_forward = mixer.norm.forward
+
+        def scan(*args, **kwargs):
+            scan_gates.append(kwargs.get("z"))
+            return real_scan(*args, **kwargs)
+
+        def norm_forward(x, z=None):
+            norm_gates.append(z)
+            return real_norm_forward(x, z)
+
+        monkeypatch.setattr(mamba_mixer_module, "mamba_chunk_scan_combined", scan)
+        monkeypatch.setattr(mixer.norm, "forward", norm_forward)
+
+        with torch.no_grad():
+            mixer(torch.randn(256, 2, mixer.config.hidden_size, device="cuda"))
+
+        assert len(scan_gates) == 1 and len(norm_gates) == 1
+        gated_in_scan, gated_in_norm = scan_gates[0] is not None, norm_gates[0] is not None
+        assert gated_in_scan != gated_in_norm, "the gate must be applied exactly once"
+        assert gated_in_scan == batch_invariant, (
+            f"batch_invariant_mode={batch_invariant}: the gate went "
+            f"{'into the scan' if gated_in_scan else 'into the norm'}"
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_deterministic_conv1d
+def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
+    """Forward and backward through the batch-invariant unfused training path replay bitwise."""
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    mixer = _build_mixer()
+    try:
+        mixer.use_mem_eff_path = False  # dispatch to _static_prefill
+        mixer.config.batch_invariant_mode = True
+        hidden_states = torch.randn(1024, 4, mixer.config.hidden_size, device="cuda")
+        hidden_states.requires_grad_()
+        assert_module_replays_bit_exact(
+            mixer,
+            (hidden_states,),
+            replays=3,
+            contention=True,
+            what="batch-invariant Mamba mixer (_static_prefill)",
+        )
+    finally:
+        Utils.destroy_model_parallel()
