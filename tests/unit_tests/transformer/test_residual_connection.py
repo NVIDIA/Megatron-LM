@@ -13,12 +13,13 @@ class _ProtocolResidualConnection(ResidualConnection):
     def __init__(
         self,
         *,
+        mode,
         residual_stream_hidden_size=12,
         branch_hidden_size=4,
         read_behavior="valid",
         write_behavior="valid",
     ):
-        super().__init__(residual_stream_hidden_size, branch_hidden_size)
+        super().__init__(residual_stream_hidden_size, branch_hidden_size, mode=mode)
         self.read_behavior = read_behavior
         self.write_behavior = write_behavior
 
@@ -45,6 +46,17 @@ class _ProtocolResidualConnection(ResidualConnection):
 
 
 class TestResidualConnectionContract:
+    def test_construction_mode_dispatches(self):
+        reader = _ProtocolResidualConnection(mode="read")
+        writer = _ProtocolResidualConnection(mode="write")
+        residual = torch.randn(2, 12)
+        branch, state = reader(residual)
+        assert writer(branch, state=state, dropout_probability=0.0, training=False) is residual
+
+    def test_constructor_rejects_invalid_mode(self):
+        with pytest.raises(ValueError, match="Unsupported residual connection mode"):
+            _ProtocolResidualConnection(mode="invalid")
+
     @pytest.mark.parametrize(
         ("residual_stream_hidden_size", "branch_hidden_size"), [(0, 4), (12, 0)]
     )
@@ -53,34 +65,33 @@ class TestResidualConnectionContract:
     ):
         with pytest.raises(ValueError, match="hidden size must be positive"):
             _ProtocolResidualConnection(
+                mode="read",
                 residual_stream_hidden_size=residual_stream_hidden_size,
                 branch_hidden_size=branch_hidden_size,
             )
 
-    def test_forward_rejects_operation_argument_mismatches(self):
-        connection = _ProtocolResidualConnection()
+    def test_forward_rejects_mode_argument_mismatches(self):
+        reader = _ProtocolResidualConnection(mode="read")
+        writer = _ProtocolResidualConnection(mode="write")
         residual = torch.randn(2, 12)
         branch = torch.randn(2, 4)
 
         with pytest.raises(TypeError, match="read expects a tensor"):
-            connection((residual, None), operation="read")
+            reader((residual, None))
         with pytest.raises(TypeError, match="write-only arguments"):
-            connection(residual, operation="read", state=())
+            reader(residual, state=())
         with pytest.raises(TypeError, match="read-only arguments"):
-            connection(
+            writer(
                 branch,
-                operation="write",
                 state=(residual,),
                 fp32_residual_connection=True,
                 dropout_probability=0.0,
                 training=False,
             )
         with pytest.raises(TypeError, match="requires connection state"):
-            connection(branch, operation="write", dropout_probability=0.0, training=False)
+            writer(branch, dropout_probability=0.0, training=False)
         with pytest.raises(TypeError, match="requires dropout_probability and training"):
-            connection(branch, operation="write", state=(residual,))
-        with pytest.raises(ValueError, match="Unsupported residual connection operation"):
-            connection(residual, operation="invalid")
+            writer(branch, state=(residual,))
 
     @pytest.mark.parametrize(
         ("read_behavior", "expected_exception", "expected_error"),
@@ -95,22 +106,20 @@ class TestResidualConnectionContract:
     def test_read_validates_implementation_outputs(
         self, read_behavior, expected_exception, expected_error
     ):
-        connection = _ProtocolResidualConnection(read_behavior=read_behavior)
+        connection = _ProtocolResidualConnection(mode="read", read_behavior=read_behavior)
 
         with pytest.raises(expected_exception, match=expected_error):
-            connection(torch.randn(2, 12), operation="read")
+            connection(torch.randn(2, 12))
 
     def test_read_validates_input_width(self):
         with pytest.raises(ValueError, match="expected residual-stream hidden size"):
-            _ProtocolResidualConnection()(torch.randn(2, 11), operation="read")
+            _ProtocolResidualConnection(mode="read")(torch.randn(2, 11))
 
     def test_write_validates_state_branch_output_and_implementation_output(self):
-        connection = _ProtocolResidualConnection()
+        connection = _ProtocolResidualConnection(mode="write")
         residual = torch.randn(2, 12)
         branch = torch.randn(2, 4)
-        write_kwargs = dict(
-            operation="write", state=(residual,), dropout_probability=0.0, training=False
-        )
+        write_kwargs = dict(state=(residual,), dropout_probability=0.0, training=False)
 
         with pytest.raises(TypeError, match="non-empty tuple of tensors"):
             connection(branch, **{**write_kwargs, "state": ()})
@@ -129,7 +138,9 @@ class TestResidualConnectionContract:
             ("non_tensor", "expected a tensor"),
             ("wrong_shape", "changed the residual-stream shape"),
         ):
-            invalid_connection = _ProtocolResidualConnection(write_behavior=write_behavior)
+            invalid_connection = _ProtocolResidualConnection(
+                mode="write", write_behavior=write_behavior
+            )
             with pytest.raises(
                 TypeError if write_behavior == "non_tensor" else ValueError, match=expected_error
             ):

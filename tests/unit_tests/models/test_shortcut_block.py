@@ -13,7 +13,6 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -98,13 +97,24 @@ class _FakeMoE(torch.nn.Module):
             config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon
         )
         self.mlp = _FakeMLP()
+        if config.wide_residual is not None:
+            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "test", mode="read"
+            )
+            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, layer_number, "mlp", mode="write"
+            )
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
     def _get_mlp_residual_connection(self):
-        return getattr(self, "residual_connection_mlp", None)
+        return (
+            (self.residual_read_mlp, self.residual_write_mlp)
+            if self.config.wide_residual is not None
+            else None
+        )
 
 
 @pytest.mark.parametrize(
@@ -157,21 +167,17 @@ def test_wide_shortcut_owns_independent_registered_read():
     """The routed shortcut reads wide X_l through its own ordinary-width controller."""
 
     config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
-    pg_collection = ProcessGroupCollection()
     compute = _FakeCompute(config)
     compute.residual_stream_hidden_size = config.wide_residual.num_streams * config.hidden_size
     moe = _FakeMoE(config)
-    moe.residual_connection_mlp = StreamwiseSigmoidWideResidualConnection(
-        config=config, layer_number=moe.layer_number, branch_name="mlp", pg_collection=pg_collection
-    )
     block = ShortcutMoEBlock(compute, moe, overlap_a2a=False).cuda()
 
     state_keys = set(block.state_dict())
     assert "shortcut_residual_read.read_map.logit" in state_keys
-    assert "moe_layer.residual_connection_mlp.read_map.logit" in state_keys
+    assert "moe_layer.residual_read_mlp.read_map.logit" in state_keys
     assert (
         block.shortcut_residual_read.read_map.logit
-        is not block.moe_layer.residual_connection_mlp.read_map.logit
+        is not block.moe_layer.residual_read_mlp.read_map.logit
     )
 
     wide_hidden = torch.randn(
