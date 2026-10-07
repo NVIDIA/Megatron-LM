@@ -201,6 +201,23 @@ runs:
         path: ${{ steps.unit-test-pr-files-directory.outputs.path }}
         merge-multiple: true
 
+    # Validation PR only: exercise a private baseline without publishing a cache.
+    - name: Require PR files for the private Testmon probe
+      if: inputs.is_unit_test == 'true' && inputs.tag == 'latest' && inputs.platform == 'dgx_h100' && inputs.test_case == 'tests/unit_tests/distributed/mfsdp_v2/**/*.py'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        ARTIFACT_ID: ${{ inputs.unit_test_pr_files_artifact_id }}
+      run: |
+        [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+
+    - name: Download PR files for the private Testmon probe
+      if: inputs.is_unit_test == 'true' && inputs.tag == 'latest' && inputs.platform == 'dgx_h100' && inputs.test_case == 'tests/unit_tests/distributed/mfsdp_v2/**/*.py'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      with:
+        artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
+        path: assets_dir/testmon-probe-input
+        merge-multiple: true
+
     - name: Resolve unit Testmon mode
       id: unit-testmon
       if: inputs.is_unit_test == 'true'
@@ -431,6 +448,10 @@ runs:
       run: |
         if [[ -f "$SUMMARY_FILE" ]]; then
           cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        PROBE_SUMMARY=assets_dir/logs/testmon-private-probe/summary.md
+        if [[ -f "$PROBE_SUMMARY" ]]; then
+          cat "$PROBE_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Check result

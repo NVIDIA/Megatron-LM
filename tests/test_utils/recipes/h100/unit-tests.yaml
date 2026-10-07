@@ -58,12 +58,20 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    # Validation PR only: prove mandatory selection using a private baseline.
+    if [[ "$TAG" == "latest" && "$ENVIRONMENT" == "dev" && "$BUCKET" == "tests/unit_tests/distributed/mfsdp_v2/**/*.py" ]]; then
+        /opt/venv/bin/python "$TEST_PATH/tests/unit_tests/testmon_mandatory_probe.py" \
+          --changed-files {assets_dir}/testmon-probe-input/changed-files \
+          --metadata {assets_dir}/testmon-probe-input/metadata.json \
+          --evidence-dir {assets_dir}/logs/testmon-private-probe
+    else
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket "$BUCKET" \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+    fi
 
     ls -al 
 

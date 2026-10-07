@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+# Validation PR probe: this comment must trigger mandatory MFSDP v2 test selection.
+
 """
 Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`RowAtomic` layout.
 
