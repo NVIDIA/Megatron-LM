@@ -629,6 +629,12 @@ class TestMcoreAdapterCudaGraph:
                 assert state["exp_avg_sq"].dtype == torch.bfloat16
         torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
 
+        # The optimizer holds the wrapper as its step attribute. The wrapper saves
+        # the original step method, which keeps a reference to the optimizer it
+        # operates on. Remove the wrapper to break this cycle so the optimizer's
+        # GPU memory can be released when the test returns.
+        del graph_optimizer.step
+
 
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
@@ -722,7 +728,7 @@ class TestMcoreAdapterExpertParallel:
             if isinstance(model_layer, ShortcutMoEBlock):
                 model_layer = model_layer.moe_layer
                 reference_layer = reference_layer.moe_layer
-            if not isinstance(model_layer, MoETransformerLayer):
+            if not isinstance(model_layer.mlp, MoELayer):
                 continue
             for fc in ("linear_fc1", "linear_fc2"):
                 model_fc = getattr(model_layer.mlp.experts, fc)
@@ -764,7 +770,7 @@ class TestMcoreAdapterExpertParallel:
             block = model.module.decoder.layers[0]
             assert isinstance(block, ShortcutMoEBlock)
             assert isinstance(block, FsdpModule)
-            assert not isinstance(block.attn_layer, FsdpModule)
+            assert not isinstance(block.compute_layer, FsdpModule)
             assert not isinstance(block.moe_layer, FsdpModule)
             assert not isinstance(block.moe_layer.mlp, FsdpModule)
             assert isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule) == custom_units

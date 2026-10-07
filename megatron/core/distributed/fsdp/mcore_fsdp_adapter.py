@@ -696,7 +696,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             grad_divisor=config.expert_model_parallel_size,
                             **common_fully_shard_kwargs,
                         )
-            # ShortcutMoEBlock calls attn_layer.forward_pre_attn_and_core_attn(),
+            # ShortcutMoEBlock calls compute_layer.forward_pre_attn_and_core_attn(),
             # moe_layer._pre_mlp_layernorm_and_residual(), and mlp.route()/dispatch()
             # directly. Their __call__ hooks never run, so these modules must not own
             # FSDP shards. The block gathers their weights around its own forward/backward.
@@ -706,7 +706,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 child
                 for block in module.modules()
                 if isinstance(block, ShortcutMoEBlock)
-                for child in (block.attn_layer, block.moe_layer, block.moe_layer.mlp)
+                for child in (block.compute_layer, block.moe_layer, block.moe_layer.mlp)
             }
             for submodule in reversed(list(module.modules())):
                 if submodule in shortcut_inner_modules:
