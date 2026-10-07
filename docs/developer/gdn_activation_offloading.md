@@ -67,6 +67,14 @@ selects two of three eligible groups (112 MiB), and fraction 1 selects three
 (168 MiB). Models without Q/K head expansion may retain normalized Q/K upstream
 and therefore realize smaller memory savings.
 
+A separate fused pre-GDR profile uses three layers, sequence 128, hidden size 256,
+four key heads, eight value heads and head dimension 64. It records seven saves per
+recurrence, all first unpacked after forward. Q and K each cover half of one
+262,144-byte storage. The manager's covering-view policy can copy that full storage
+twice, so logical slot sizes alone understate transfer bytes. The profile reports
+1,597,440 bytes held only by recurrence save sites across the three layers; this is
+a saved-storage measurement, not a peak-memory result or a fused runtime claim.
+
 ## Offload boundary and policy
 
 The existing `FineGrainedActivationOffloadingInterface` adds the group-start identity
@@ -121,6 +129,15 @@ before enqueueing H2D, matching the dependency in bulk reload. The existing grap
 capture guard is preserved; this patch does not qualify the GDN CUDA-graph path.
 A sentinel-backed pool test covers the transfer itself, and GDN gradient regressions
 delay D2H through warmup and steady state, with both normal and frozen Q paths.
+
+Pooled buffers also need ordering in the other direction. Reload returns a pinned
+buffer to the pool when its H2D copy is queued. A later forward can reuse that
+buffer while prefetch is still reading it, particularly when pipeline microbatches
+have different saved-tensor shapes. A delayed-H2D reproduction restored a value
+of 2 from a buffer originally holding 1 after a new forward reused that slot.
+For pooled groups outside graph capture, D2H now waits for queued H2D reads before
+writing pool slots. The regression requires reuse of the same buffer and exact
+recovery of the original tensor. This reuses the existing streams and pool.
 
 ## Reproducing the evidence
 
@@ -202,6 +219,10 @@ transfers. Every enabled arm passed bitwise comparisons of outputs, input gradie
 and all parameter gradients against its disabled baseline. Shared hardware and unlocked clocks limit runtime conclusions; these data do not
 establish a production-training overhead.
 
+These initial stack measurements predate the pooled-buffer H2D/D2H ordering fix.
+The [complete-model measurements](gdn_activation_offload_training.md) report the
+current implementation; the stack numbers above are historical evidence only.
+
 [Raw A6000 step samples](gdn_activation_offloading_a6000.csv) include all 240 measured
 steps, peak allocated/reserved memory, end-of-forward allocation, selected groups,
 selected transfer bytes, and each arm's correctness result. Each enabled arm checks
@@ -211,27 +232,27 @@ The CSV records this checked-step count and the forward synchronization setting.
 ## Acceptance and next steps
 
 On one RTX A6000 with Python 3.12.4, PyTorch 2.11.0+cu130, Transformer Engine
-2.20.2, and FLA 0.5.1, all **46 tests passed** both with `TORCH_COMPILE_DISABLE=1`
+2.20.2, and FLA 0.5.1, all **65 tests passed** both with `TORCH_COMPILE_DISABLE=1`
 and with the default compilation setting. This includes exact output, input-gradient
 and parameter-gradient comparisons with changing inputs over one warmup and two
 steady-state iterations, fraction 0/0.5/1, threshold skipping, shared and expanded
-Q/K storage, `gdn_norm_out` recomputation, packed sequences, delayed D2H, frozen Q,
+Q/K storage, fused/unfused pre-GDR, `gdn_norm_out` recomputation, packed sequences,
+delayed D2H, frozen Q,
 eval/no-grad/fully frozen bypass, growing sequences at fraction zero, and three
 accumulated microbatches per iteration without synchronization between them.
 Initial eval/no-grad passes also preserve training warmup, including output-norm
 recomputation. Pinned-buffer usage returned to zero after backward.
 
-The common-manager subset passed **13 tests**, including the delayed-transfer
-sentinel regression and a fraction-zero growing-microbatch lifecycle test that
-does not require FLA; one aggregation test requires two ranks and was skipped.
+The common-manager subset passed **14 tests**, including the delayed-transfer
+sentinel, pooled-buffer reuse, and fraction-zero growing-microbatch regressions.
+Its aggregation regression also passed on both ranks of a separate two-rank run.
 Four schedule-helper cases cover phase forwarding for single-model and MIMO groups.
 Two existing eight-layer BF16 GPT/MoE cases (`core_attn`, and MLA with
 `core_attn` + `attn_proj`) passed their output/gradient and peak-memory checks,
 covering the shared-manager change outside GDN with both one and two group names.
 
-Existing single-rank GDN and output-norm recomputation tests passed **7 cases**;
-one fused causal-conv1d case was skipped because its native backward extension is
-not installed. Existing TransformerConfig tests passed **53 cases**. Data-free SSM
+The existing pre-GDR fusion suite passed **11 cases** with native causal-conv1d
+1.6.1 installed. Existing TransformerConfig tests passed **53 cases**. Data-free SSM
 runs used `--confcutdir=tests/unit_tests/ssm` to omit root dataset-download fixtures;
 configuration-only regression tests used `--noconftest`.
 
@@ -248,17 +269,17 @@ recomputation remain correct, and multi-layer A6000 comparisons show reduced
 allocated memory with an explicit runtime cost. A speedup is not required for a
 memory option. This does not replace the upstream CI or full-model qualification.
 
-Before expanding support, review the option name and its relationship to #7852.
-The proposed follow-up order is:
+Complete pretrained training and several parallel configurations have since been
+qualified in [complete-model GDN offload validation](gdn_activation_offload_training.md).
+The remaining follow-up work is:
 
 1. Confirm the scope/name and integration boundary with #7852. Keep recurrence saves
    independently selectable when combining projection/QKV recomputation and offload.
-2. Run complete BF16 Qwen training on dedicated A6000 hardware, including optimizer
-   updates and representative sequence lengths. Compare loss, gradients, full-step
-   peak allocation, and throughput, with and without output-norm recomputation.
-3. Qualify TP/SP/CP and PP/VPP schedules with multiple microbatches, then fused
-   pre-GDR. Require matching outputs/gradients and clean manager/pool lifecycle before
-   advertising those combinations.
+2. Finish the unqualified configurations in that status table. Require matching
+   outputs/gradients and clean manager/pool lifecycle before advertising additional
+   combinations.
+3. Extend the DP memory/runtime comparison to other parallel configurations, using
+   complete optimizer steps and raw per-rank samples separately from correctness.
 4. Treat GDN2, quantized training and CUDA graphs as later extensions with separate
    implementation and acceptance evidence.
 
@@ -267,4 +288,5 @@ the manager alone does not establish support.
 
 The prepared complete-model integration cases and multi-rank run commands are
 described in [complete-model GDN offload validation](gdn_activation_offload_training.md).
-Their GPU runs and pretrained Qwen qualification are pending.
+That document records completed pretrained Qwen training and A6000 measurements,
+qualified parallel configurations, and the remaining validation gaps.
