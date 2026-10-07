@@ -9,6 +9,7 @@ from transformer_engine.pytorch import is_mxfp8_available, is_nvfp4_available
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    _GTP_PARAMS,
     GTPShardedParam,
     reset_gtp_state,
 )
@@ -45,6 +46,8 @@ def reset_gtp_globals():
     """
     yield
     reset_gtp_state()
+    # Not part of the production reset: every GTP param ever built stays in it (and allocated).
+    _GTP_PARAMS.clear()
 
 
 # ---------------------------------------------------------------------------

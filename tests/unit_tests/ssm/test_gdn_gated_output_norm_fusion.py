@@ -250,7 +250,7 @@ def test_post_fusion_distributed_layout(
     tp, cp, sequence_parallel, batch, packed, pre_fusion, recompute, value_heads
 ):
     """Enable the post fusion through CP redistribution and the complete backward."""
-    if torch.distributed.get_world_size() < tp * cp:
+    if Utils.world_size < tp * cp:
         pytest.skip("This layout requires four distributed GPU ranks")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
