@@ -1728,6 +1728,11 @@ class TestFusedMLAPreMLPResidualNorm:
         )
         return TransformerLayer(config, submodules).cuda()
 
+    @staticmethod
+    def _assert_close_up_to_rounding(actual, expected, name):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error < 1e-2, f"{name}: relative error {error.item():.2e}"
+
     def test_fused_residual_norm_matches_unfused(self):
         """Fusing the residual-gradient add into the norm backward keeps the forward bitwise and
         the gradients equal up to the rounding of that add."""
@@ -1750,15 +1755,24 @@ class TestFusedMLAPreMLPResidualNorm:
             layer_input = hidden_states.clone().requires_grad_(True)
             output, _ = layer(hidden_states=layer_input, attention_mask=attention_mask)
             output.backward(output_grad)
-            grads = {name: param.grad for name, param in layer.named_parameters()}
+            grads = {
+                name: param.grad
+                for name, param in layer.named_parameters()
+                if param.grad is not None
+            }
             results.append((output.detach(), layer_input.grad, grads))
         (ref_output, ref_input_grad, ref_grads), (output, input_grad, grads) = results
 
         torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
-        torch.testing.assert_close(input_grad, ref_input_grad)
+        # The MoE backward runs before the residual-gradient add, so its gradients are unchanged.
+        # The gradients that flow through the add differ only by its bf16 rounding.
         assert grads.keys() == ref_grads.keys()
         for name, ref_grad in ref_grads.items():
-            torch.testing.assert_close(grads[name], ref_grad, msg=lambda msg: f"{name}: {msg}")
+            if name.startswith("mlp."):
+                torch.testing.assert_close(grads[name], ref_grad, rtol=0, atol=0)
+            else:
+                self._assert_close_up_to_rounding(grads[name], ref_grad, name)
+        self._assert_close_up_to_rounding(input_grad, ref_input_grad, "input")
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
