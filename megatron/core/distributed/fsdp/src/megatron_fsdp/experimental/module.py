@@ -14,7 +14,6 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
-import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
@@ -31,8 +30,8 @@ from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
-    ComputePhase,
     FsdpParameterGroup,
+    Phase,
     effective_dtype,
     get_containing_parameter_group,
 )
@@ -171,13 +170,7 @@ class FsdpContext:
 
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
-
-    class Phase(enum.Enum):
-        """Lifecycle phase of this FsdpModule."""
-
-        RESTING = enum.auto()
-        FORWARD = enum.auto()
-        BACKWARD = enum.auto()
+    Phase = Phase
 
     # Name relative to the root FSDP module from named_modules().
     # Root uses "" and None means uninitialized.
@@ -410,14 +403,15 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(ComputePhase.FORWARD, prefetch=not is_recomputing)
+        self.unshard(FsdpModule.Phase.FORWARD, prefetch=not is_recomputing)
 
-    def unshard(self, compute_phase: ComputePhase | None = None, prefetch: bool = False) -> None:
+    def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
-        Parameters are unsharded for the phase of ``compute_phase``, or for every
-        phase when it is None. With ``prefetch``, successors in that phase's
-        module order are also unsharded for it.
+        Args:
+            phase: In what phase this module runs. None unshards for every phase.
+            prefetch: Whether to also prefetch successors in the module order of a
+                FORWARD or BACKWARD ``phase``.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -426,10 +420,8 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
-        if prefetch and compute_phase is None:
-            raise ValueError("prefetch requires a compute_phase.")
         with self._nvtx_range("unshard"):
-            self._unshard_parameter_groups(compute_phase)
+            self._unshard_parameter_groups(phase)
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -438,55 +430,56 @@ class FsdpModule:
             context = self.context
             if not prefetch:
                 return
-            if compute_phase is ComputePhase.FORWARD:
+            if phase is FsdpModule.Phase.FORWARD:
                 self._prefetch_parameter_groups(
-                    context.forward_order,
-                    self._schedule_policy.forward_prefetch_size,
-                    compute_phase,
+                    context.forward_order, self._schedule_policy.forward_prefetch_size
                 )
-            elif compute_phase is ComputePhase.BACKWARD:
+            elif phase is FsdpModule.Phase.BACKWARD:
                 self._prefetch_parameter_groups(
-                    context.backward_order,
-                    self._schedule_policy.backward_prefetch_size,
-                    compute_phase,
+                    context.backward_order, self._schedule_policy.backward_prefetch_size
                 )
 
     def _prefetch_parameter_groups(
-        self,
-        order: IndexedOrder["FsdpModule"],
-        prefetch_size: int | None,
-        compute_phase: ComputePhase,
+        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
     ) -> None:
-        """Prefetch successors from ``order`` for ``compute_phase`` within this module's budget."""
+        """Prefetch successors from ``order`` according to this module's budget.
+
+        Successors are unsharded for this module's phase, which is the compute they
+        run next in ``order``.
+        """
         next_module = order.next_item(self)
         if prefetch_size is None:
             if next_module is not None:
-                next_module._unshard_parameter_groups(compute_phase)
+                next_module._unshard_parameter_groups(self.phase)
             return
 
         prefetched_size = 0
         while next_module is not None and prefetched_size < prefetch_size:
-            next_module._unshard_parameter_groups(compute_phase)
+            next_module._unshard_parameter_groups(self.phase)
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self, compute_phase: ComputePhase | None) -> None:
-        """Unshard parameter groups for ``compute_phase`` on the all-gather stream.
+    def _unshard_parameter_groups(self, phase: Phase | None) -> None:
+        """Unshard parameter groups for compute in ``phase`` on the all-gather stream.
 
         If they were already unsharded or prefetched for that phase, this method
-        is a no-op. Otherwise, it materializes the missing weights and
+        is a no-op, so compute keeps waiting on the existing event instead of on
+        later prefetches. Otherwise, it materializes the missing weights and
         records ``_unshard_event`` so compute can wait without depending on
         later release work.
         """
         if self._unshard_event is not None and not any(
-            group.needs_unshard(compute_phase) for group in self._parameter_groups
+            group.needs_unshard(phase) for group in self._parameter_groups
         ):
+            # Skip only if this module was unsharded since its last reshard and no group
+            # lacks what ``phase`` reads. MXFP8 groups can still lack planes, e.g. during
+            # recomputation, which needs rowwise planes after backward gathered columnwise.
             return
 
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters(compute_phase)
+                group.unshard_parameters(phase)
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -541,7 +534,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(ComputePhase.BACKWARD, prefetch=True)
+        self.unshard(FsdpModule.Phase.BACKWARD, prefetch=True)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

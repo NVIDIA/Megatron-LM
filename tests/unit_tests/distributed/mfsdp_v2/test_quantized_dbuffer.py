@@ -134,14 +134,16 @@ def test_quantized_dbuffer_partial_get_tensor_supports_gemm(distributed_setup, r
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
     quantized.quantize_(main_weight)
-    # Only the selected planes of ``gathered`` hold data; the others stay uninitialized.
     gathered = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, device)
     quantized.redistribute([Replicate()], out=gathered, rowwise=rowwise, columnwise=columnwise)
+    # Release the unselected planes, as unsharding does, so compute tensors omit them.
+    for plane in gathered.planes_for(rowwise=not rowwise, columnwise=not columnwise):
+        plane.release_storage()
     gathered_main = main_weight.redistribute([Replicate()])
 
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_tensor(index, rowwise=rowwise, columnwise=columnwise)
+        compute_tensor = gathered.get_tensor(index)
         reference = quantizer(gathered_main.get_tensor_view(index))
         layout, inner_dim = ("TN", shape[1]) if rowwise else ("NN", shape[0])
         activation = quantizer(torch.randn((64, inner_dim), device=device))
@@ -154,8 +156,8 @@ def test_quantized_dbuffer_partial_get_tensor_supports_gemm(distributed_setup, r
 def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, rowwise):
     """Selecting rowwise or columnwise planes gathers only those planes.
 
-    Compute tensors built from the selection carry only those planes, with a
-    quantizer advertising the same usages.
+    Compute tensors carry only allocated planes, with a quantizer advertising the
+    same usages.
     """
     columnwise = not rowwise
     if distributed_setup.world_size < 2:
@@ -184,8 +186,13 @@ def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, roww
         else:
             assert actual.local_buffer.eq(sentinel).all()
 
+    # Release the unselected planes, as unsharding does, so compute tensors omit them.
+    for plane in destination.planes_for(rowwise=not rowwise, columnwise=not columnwise):
+        plane.release_storage()
+    assert destination.has_rowwise == rowwise
+    assert destination.has_columnwise == columnwise
     for index in range(len(shapes)):
-        tensor = destination.get_tensor(index, rowwise=rowwise, columnwise=columnwise)
+        tensor = destination.get_tensor(index)
         assert tensor.shape == shapes[index]
         assert (tensor._rowwise_data is not None) == rowwise
         assert (tensor._rowwise_scale_inv is not None) == rowwise
@@ -197,6 +204,9 @@ def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, roww
 
     with pytest.raises(ValueError, match="requires every plane"):
         source.redistribute([Replicate()], rowwise=rowwise, columnwise=columnwise)
+    destination.release_storage()
+    with pytest.raises(RuntimeError, match="no allocated"):
+        destination.get_tensor(0)
 
 
 def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):

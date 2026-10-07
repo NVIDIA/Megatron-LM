@@ -196,16 +196,25 @@ class QuantizedDBuffer:
         result.columnwise_scale = columnwise_scale
         return result
 
-    def get_tensor_view(
-        self, index: int, *, rowwise: bool = True, columnwise: bool = True
-    ) -> MXFP8Tensor:
-        """Return a compact, unswizzled MXFP8 view that aliases the selected local planes.
+    @property
+    def has_rowwise(self) -> bool:
+        """Whether rowwise data and scales are allocated."""
+        return self.rowwise_data.is_allocated and self.rowwise_scale.is_allocated
 
-        Unselected planes are omitted, so the view never reads planes whose storage
-        may be released.
+    @property
+    def has_columnwise(self) -> bool:
+        """Whether columnwise data and scales are allocated."""
+        return self.columnwise_data.is_allocated and self.columnwise_scale.is_allocated
+
+    def get_tensor_view(self, index: int) -> MXFP8Tensor:
+        """Return a compact, unswizzled MXFP8 view that aliases every allocated plane pair.
+
+        Released planes are omitted, so the view never reads storage that
+        ``release_storage()`` freed.
         """
+        rowwise, columnwise = self.has_rowwise, self.has_columnwise
         if not (rowwise or columnwise):
-            raise ValueError("Expected rowwise and/or columnwise planes.")
+            raise RuntimeError("QuantizedDBuffer has no allocated rowwise or columnwise planes.")
         rowwise_data = self.rowwise_data.get_tensor_view(index) if rowwise else None
         columnwise_data = self.columnwise_data.get_tensor_view(index) if columnwise else None
         data = rowwise_data if rowwise_data is not None else columnwise_data
@@ -213,9 +222,7 @@ class QuantizedDBuffer:
             shape=data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=(
-                self.rowwise_scale.get_tensor_view(index) if rowwise else None
-            ),
+            rowwise_scale_inv=(self.rowwise_scale.get_tensor_view(index) if rowwise else None),
             columnwise_data=columnwise_data,
             columnwise_scale_inv=(
                 self.columnwise_scale.get_tensor_view(index) if columnwise else None
@@ -226,16 +233,14 @@ class QuantizedDBuffer:
             device=data.device,
         )
 
-    def get_tensor(
-        self, index: int, *, rowwise: bool = True, columnwise: bool = True
-    ) -> MXFP8Tensor:
+    def get_tensor(self, index: int) -> MXFP8Tensor:
         """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
 
-        Only the selected planes are included. Data planes remain views. Scale
-        planes alias storage only when no padding is needed; otherwise they are
-        copied into padded allocations.
+        Only allocated planes are included. Data planes remain views. Scale planes
+        alias storage only when no padding is needed; otherwise they are copied into
+        padded allocations.
         """
-        tensor = self.get_tensor_view(index, rowwise=rowwise, columnwise=columnwise)
+        tensor = self.get_tensor_view(index)
         # GEMM requires padded scales. Pad here until TE fuses padding into its
         # scale-swizzle kernel, avoiding these separate allocations and copies:
         # https://github.com/NVIDIA/TransformerEngine/issues/3518
