@@ -87,6 +87,7 @@ class FsdpContext:
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
+        self._forward_order_overrides: dict[nn.Module, tuple[nn.Module, ...]] = {}
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self.allgather_stream = torch.cuda.Stream(device)
@@ -103,6 +104,17 @@ class FsdpContext:
             raise RuntimeError("Cannot register an FSDP module after its context is finalized.")
         self._registered_modules.append(module)
 
+    def set_forward_order(self, root: nn.Module, modules: tuple[nn.Module, ...]) -> None:
+        """Declare a root's static execution order before construction is finalized.
+
+        The order must contain every FSDP unit in this root exactly once, including
+        the root itself. Backward visits FSDP parents before their children,
+        with sibling units in reverse forward order. Ownership and hooks do not change.
+        """
+        if self._is_finalized:
+            raise RuntimeError("Cannot change prefetch order after finalization.")
+        self._forward_order_overrides[root] = modules
+
     def finalize(self) -> None:
         """Finalize roots, names, and cross-root prefetch orders."""
         if self._is_finalized:
@@ -116,16 +128,29 @@ class FsdpContext:
 
         for root in roots:
             root._is_root = True
+            units = []
             for name, module in cast(nn.Module, root).named_modules():
                 if not isinstance(module, FsdpModule):
                     continue
                 module._name = name
+                units.append(module)
+            order = self._forward_order_overrides.get(root, tuple(units))
+            if len(order) != len(units) or set(order) != set(units):
+                raise ValueError("Forward prefetch order must contain each root FSDP unit once.")
+            for module in order:
                 self.forward_order.append(module)
 
         for root in reversed(roots):
-            _collect_backward_order(cast(nn.Module, root), self.backward_order)
+            if root in self._forward_order_overrides:
+                positions = {
+                    unit: index for index, unit in enumerate(self._forward_order_overrides[root])
+                }
+                _collect_ordered_backward(root, self.backward_order, positions)
+            else:
+                _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
         self._registered_modules.clear()
+        self._forward_order_overrides.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
 
@@ -586,6 +611,17 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
+
+
+def _collect_ordered_backward(
+    module: "FsdpModule", order: IndexedOrder["FsdpModule"], positions: dict[nn.Module, int]
+) -> None:
+    """Keep parents before children and reverse the declared order among siblings."""
+    order.append(module)
+    children: set[FsdpModule] = set()
+    _collect_fsdp_children(cast(nn.Module, module), children)
+    for child in sorted(children, key=positions.__getitem__, reverse=True):
+        _collect_ordered_backward(child, order, positions)
 
 
 def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> None:

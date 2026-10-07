@@ -40,11 +40,13 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
@@ -63,6 +65,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
     )
@@ -78,6 +81,64 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _residual_forward_order(module):
+    """Enumerate FSDP units in the residual branches' static forward order."""
+    if isinstance(module, FsdpModule):
+        yield module
+
+    def visit(child):
+        if child is not None:
+            yield from _residual_forward_order(child)
+
+    def connection_parts(layer, name):
+        connection = getattr(layer, name, None)
+        if isinstance(connection, StreamwiseSigmoidWideResidualConnection):
+            return connection.reader, connection.writer
+        return connection, None
+
+    if isinstance(module, ShortcutMoEBlock):
+        yield from visit(module.shortcut_residual_read)
+        yield from visit(module.shortcut_pre_mlp_layernorm)
+        compute = list(visit(module.compute_layer))
+        compute_writes = {
+            unit
+            for child in module.compute_layer.modules()
+            if isinstance(child, StreamwiseSigmoidWideResidualConnection)
+            for unit in visit(child.writer)
+        }
+        yield from (unit for unit in compute if unit not in compute_writes)
+        experts = list(visit(module.moe_layer.mlp.experts))
+        yield from experts
+        yield from (unit for unit in compute if unit in compute_writes)
+        tail = list(visit(module.moe_layer))
+        _, writer = connection_parts(module.moe_layer, "residual_connection_mlp")
+        tail_writes = list(visit(writer))
+        excluded = set(experts + tail_writes)
+        yield from (unit for unit in tail if unit not in excluded)
+        yield from visit(module.shortcut_post_norm)
+        yield from tail_writes
+    elif isinstance(module, MambaLayer):
+        reader, writer = connection_parts(module, "residual_connection")
+        yield from visit(reader)
+        yield from visit(module.norm)
+        yield from visit(module.mixer)
+        yield from visit(writer)
+    elif isinstance(module, (TransformerLayer, MoETransformerLayer)):
+        for suffix, norm_name, branch_name in (
+            ("self_attn", "input_layernorm", "self_attention"),
+            ("cross_attn", "pre_cross_attn_layernorm", "cross_attention"),
+            ("mlp", "pre_mlp_layernorm", "mlp"),
+        ):
+            reader, writer = connection_parts(module, "residual_connection_" + suffix)
+            yield from visit(reader)
+            yield from visit(getattr(module, norm_name, None))
+            yield from visit(getattr(module, branch_name, None))
+            yield from visit(writer)
+    else:
+        for child in module.children():
+            yield from visit(child)
 
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
@@ -577,6 +638,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer, MoE transformer, and Mamba layers are used.
+                Residual-stream replay additionally wraps its parameterized child norms
+                and residual connections so their forward hooks gather weights during replay.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -608,6 +671,37 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+        recompute_units = set()
+        if config.recompute_granularity == "selective" and "residual_stream" in (
+            config.recompute_modules or []
+        ):
+            # A replay block calls these children before their parent's backward
+            # hook. Give each child its own gather hook (see Megatron-LM #7777).
+            for layer in module.modules():
+                if isinstance(layer, (TransformerLayer, MoETransformerLayer)):
+                    names = (
+                        "input_layernorm",
+                        "pre_mlp_layernorm",
+                        "residual_connection_self_attn",
+                        "residual_connection_mlp",
+                    )
+                elif isinstance(layer, MambaLayer):
+                    names = ("norm", "residual_connection")
+                elif isinstance(layer, ShortcutMoEBlock):
+                    names = (
+                        "shortcut_pre_mlp_layernorm",
+                        "shortcut_post_norm",
+                        "shortcut_residual_read",
+                    )
+                else:
+                    continue
+                for name in names:
+                    child = getattr(layer, name, None)
+                    if isinstance(child, StreamwiseSigmoidWideResidualConnection):
+                        recompute_units.update((child.reader, child.writer))
+                    elif child is not None and next(child.parameters(), None) is not None:
+                        recompute_units.add(child)
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -677,7 +771,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if active_context is not None
             else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
         )
-        with construction_context:
+        with construction_context as fsdp_context:
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -698,7 +792,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
-                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                if submodule in recompute_units or any(
+                    isinstance(submodule, module_type) for module_type in fsdp_unit_modules
+                ):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
                     fully_shard(
@@ -712,6 +808,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             fully_shard(
                 module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
             )
+            if any(
+                isinstance(child, StreamwiseSigmoidWideResidualConnection)
+                for child in module.modules()
+            ):
+                fsdp_context.set_forward_order(module, tuple(_residual_forward_order(module)))
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:

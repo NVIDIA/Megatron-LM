@@ -168,7 +168,7 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         self.branch_input_dtype = config.params_dtype
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
 
-    def forward(self, hidden_states: Tensor) -> Tensor:
+    def forward(self, hidden_states: Tensor, *, output_dtype: torch.dtype | None = None) -> Tensor:
         """Read in branch precision; the operator fixes the output shape and dtype."""
 
         if hidden_states.shape[-1] != self.residual_stream_hidden_size:
@@ -180,68 +180,28 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
             hidden_states,
             self.read_map(return_logits=True),
             self.num_streams,
-            output_dtype=self.branch_input_dtype,
+            output_dtype=self.branch_input_dtype if output_dtype is None else output_dtype,
         )
 
 
-class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
-    """Positive streamwise maps around one ordinary-width residual branch."""
+class StreamwiseSigmoidWideResidualWrite(nn.Module):
+    """Own only the write map and optional retention controller."""
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-        layer_number: int,
-        branch_name: str,
-        pg_collection: ProcessGroupCollection,
-        name: str | None = None,
-    ) -> None:
-        del pg_collection, name
+    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+        super().__init__()
         if config.wide_residual is None:
-            raise ValueError(
-                "StreamwiseSigmoidWideResidualConnection requires wide_residual config."
-            )
-        wr = config.wide_residual
-        super().__init__(
-            residual_stream_hidden_size=wr.num_streams * config.hidden_size,
-            branch_hidden_size=config.hidden_size,
-        )
-        self.layer_number = layer_number
-        self.branch_name = branch_name
-        self.num_streams = wr.num_streams
-        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+            raise ValueError("StreamwiseSigmoidWideResidualWrite requires wide_residual config.")
+        self.num_streams = config.wide_residual.num_streams
         self.write_map = StreamwiseSigmoidMap(config, map_kind="write")
         self.retention = (
             LearnedWideResidualRetention(
                 config, layer_number, branch_name, num_streams=self.num_streams
             )
-            if wr.learned_retention
+            if config.wide_residual.learned_retention
             else None
         )
 
-    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return (
-            streamwise_sigmoid_read(
-                hidden_states, self.read_map(return_logits=True), self.num_streams
-            ),
-            (),
-        )
-
-    def _read_with_output_dtype(
-        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
-    ) -> tuple[Tensor, ResidualConnectionWriteState]:
-        """Fuse an optional branch-output conversion into the streamwise read."""
-
-        return (
-            streamwise_sigmoid_read(
-                hidden_states,
-                self.read_map(return_logits=True),
-                self.num_streams,
-                output_dtype=output_dtype,
-            ),
-            (),
-        )
-
-    def _write(
+    def forward(
         self,
         branch_output: ResidualBranchOutput,
         state: ResidualConnectionState,
@@ -249,6 +209,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         dropout_probability: float,
         training: bool,
     ) -> Tensor:
+        """Write the branch update into the carried stream using this module's controllers."""
         residual_stream = state[0]
         if isinstance(branch_output, tuple):
             branch_update, bias = branch_output
@@ -283,6 +244,106 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             retention_logits=retention_logits,
             retention_max_forget=(self.retention.max_forget if self.retention is not None else 0.0),
         )
+
+
+class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
+    """Compose independently callable read and write modules around a branch."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        branch_name: str,
+        pg_collection: ProcessGroupCollection,
+        name: str | None = None,
+    ) -> None:
+        del pg_collection, name
+        if config.wide_residual is None:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualConnection requires wide_residual config."
+            )
+        super().__init__(
+            residual_stream_hidden_size=config.wide_residual.num_streams * config.hidden_size,
+            branch_hidden_size=config.hidden_size,
+        )
+        self.layer_number = layer_number
+        self.branch_name = branch_name
+        self.num_streams = config.wide_residual.num_streams
+        self.reader = StreamwiseSigmoidWideResidualRead(config, layer_number, branch_name)
+        self.writer = StreamwiseSigmoidWideResidualWrite(config, layer_number, branch_name)
+        self.register_state_dict_post_hook(_export_residual_state)
+        self.register_load_state_dict_pre_hook(_load_residual_state)
+
+    @property
+    def read_map(self) -> StreamwiseSigmoidMap:
+        """Expose the read controller under its existing attribute name."""
+        return self.reader.read_map
+
+    @property
+    def write_map(self) -> StreamwiseSigmoidMap:
+        """Expose the write controller under its existing attribute name."""
+        return self.writer.write_map
+
+    @property
+    def retention(self) -> LearnedWideResidualRetention | None:
+        """Expose the retention controller under its existing attribute name."""
+        return self.writer.retention
+
+    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
+        return self.reader(hidden_states, output_dtype=hidden_states.dtype), ()
+
+    def _read_with_output_dtype(
+        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
+    ) -> tuple[Tensor, ResidualConnectionWriteState]:
+        return (
+            self.reader(
+                hidden_states,
+                output_dtype=hidden_states.dtype if output_dtype is None else output_dtype,
+            ),
+            (),
+        )
+
+    def _write(
+        self,
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        *,
+        dropout_probability: float,
+        training: bool,
+    ) -> Tensor:
+        return self.writer(
+            branch_output, state, dropout_probability=dropout_probability, training=training
+        )
+
+
+def _export_residual_state(module, state_dict, prefix, local_metadata):
+    """Keep existing checkpoint parameter keys after splitting operation ownership."""
+    del module, local_metadata
+    for key in list(state_dict):
+        for child, legacy in (
+            ("reader.read_map.", "read_map."),
+            ("writer.write_map.", "write_map."),
+            ("writer.retention.", "retention."),
+        ):
+            if key.startswith(prefix + child):
+                state_dict[prefix + legacy + key[len(prefix + child) :]] = state_dict.pop(key)
+                break
+
+
+def _load_residual_state(
+    module, state_dict, prefix, local_metadata, strict, missing, unexpected, errors
+):
+    """Accept the existing checkpoint parameter keys with strict loading."""
+    del module, local_metadata, strict, missing, unexpected, errors
+    for key in list(state_dict):
+        for legacy, child in (
+            ("read_map.", "reader.read_map."),
+            ("write_map.", "writer.write_map."),
+            ("retention.", "writer.retention."),
+        ):
+            if key.startswith(prefix + legacy):
+                state_dict[prefix + child + key[len(prefix + legacy) :]] = state_dict.pop(key)
+                break
 
 
 class WideResidualTransformerLayer(TransformerLayer):
