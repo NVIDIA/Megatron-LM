@@ -2583,6 +2583,17 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MoonEP's symmetric-memory windows must be released while their expert process group
+    # is still alive. Idempotent and a no-op when virtual experts were never initialized.
+    try:
+        from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+            VirtualExpertLoadBalancer,
+        )
+
+        VirtualExpertLoadBalancer.finalize()
+    except Exception:
+        logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.

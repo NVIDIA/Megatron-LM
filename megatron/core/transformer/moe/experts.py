@@ -4,6 +4,8 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
+import weakref
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -145,6 +147,7 @@ class GroupedLinearFc1Builder(Protocol):
         output_size: int,
         /,
         *,
+        num_virtual_experts: int = 0,
         config: TransformerConfig,
         init_method: Callable[[torch.Tensor], None],
         bias: bool,
@@ -182,6 +185,7 @@ class GroupedLinearFc2Builder(Protocol):
         output_size: int,
         /,
         *,
+        num_virtual_experts: int = 0,
         config: TransformerConfig,
         init_method: Callable[[torch.Tensor], None],
         bias: bool,
@@ -230,6 +234,33 @@ def _te_grouped_tensor_supports_sharded_weights() -> bool:
     return "is_dist_weight" in signature.parameters
 
 
+class _VirtualExpertFC2WgradStore:
+    """Start the FC2 virtual-expert gradient reduction when TE enqueues FC2's wgrad GEMM.
+
+    Installed on the executing FC2 GroupedLinear module or op. TE's delayed-wgrad
+    protocol hands the wgrad GEMM to ``put`` instead of launching it; this store
+    runs the GEMM at once and starts the reduction behind FC1's dgrad and wgrad GEMMs
+    instead of the dispatch-backward all-to-all. The queue stays empty, so TE's
+    ``backward_dw`` has nothing to run.
+    """
+
+    context = None
+
+    def __init__(self, load_balancer) -> None:
+        # TE's backward context retains this store; the manager holds routing tensors.
+        self._load_balancer = weakref.proxy(load_balancer)
+
+    @staticmethod
+    def delay_wgrad_compute() -> bool:
+        """TE routes the wgrad GEMM through :meth:`put` when this is true."""
+        return True
+
+    def put(self, tensors, wgrad_gemm) -> None:
+        """Run the wgrad GEMM now and start FC2's virtual-expert reduction behind it."""
+        wgrad_gemm(*tensors)
+        self._load_balancer.start_fc2_grad_reduce()
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -264,10 +295,14 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        num_virtual_experts = (
+            self.num_local_experts if self.config.moe_virtual_expert_load_balance else 0
+        )
         self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
             self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.init_method),
             bias=self.config.add_bias_linear,
@@ -291,6 +326,7 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.moe_latent_size is None
                 else self.config.moe_latent_size
             ),
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
@@ -399,6 +435,24 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
+
+    def bind_virtual_experts(self, load_balancer) -> None:
+        """Bind native and virtual runtime weights after main gradients are initialized."""
+        if self._fused_ops is not None:
+            raise RuntimeError("Virtual-expert weights must be bound before fused ops are created.")
+
+        for fc_layer, linear in enumerate((self.linear_fc1, self.linear_fc2)):
+            runtime_weights = load_balancer.runtime_weights(fc_layer)
+            if len(runtime_weights) != linear.num_gemms:
+                raise ValueError("Runtime weight count must match grouped-linear GEMMs.")
+            # TE's unfused path reads weight{i} with getattr(); the fused op copies these
+            # same references below. Avoid registering virtual experts as parameters so DDP
+            # and checkpointing don't pick them up.
+            for index, weight in enumerate(runtime_weights):
+                object.__setattr__(linear, f"weight{index}", weight)
+        # For non GTP, trigger the virtual expert reduce scatter on TE's 'wgrad_store'
+        if not getattr(self.linear_fc2.weight0, "is_distributed_weight", False):
+            self.linear_fc2.wgrad_store = _VirtualExpertFC2WgradStore(load_balancer)
 
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
@@ -559,7 +613,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight: bool,
             single_grouped_bias: bool,
         ) -> None:
-            """Register real GroupedLinear params on a meta TE op shell."""
+            """Give a fused op the weights exposed by its source GroupedLinear."""
             if single_grouped_weight:
                 op.register_parameter("weight", linear.get_parameter("weight"))
                 for idx in range(linear.num_gemms):
@@ -567,7 +621,7 @@ class TEGroupedMLP(MegatronModule):
             else:
                 op.register_parameter("weight", None)
                 for idx in range(linear.num_gemms):
-                    op.register_parameter(f"weight{idx}", linear.get_parameter(f"weight{idx}"))
+                    op.register_parameter(f"weight{idx}", getattr(linear, f"weight{idx}"))
 
             if not linear.use_bias:
                 return
@@ -735,6 +789,7 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
+        op.wgrad_store = self.linear_fc2.wgrad_store
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
         # view at the op boundary.

@@ -309,7 +309,95 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **HybridEP with virtual-expert load balancing** | Balances overloaded experts with runtime virtual-expert slots and asynchronously transfers only selected weights/gradients | Fixed-shape NVLink HybridEP training | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep --moe-virtual-expert-load-balance` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+#### Virtual-expert load balancing
+
+Enable with `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep
+--moe-virtual-expert-load-balance`. MoonEP balances overloaded experts by temporarily copying
+selected experts to other EP ranks. The planner uses the algorithm from
+[MoonshotAI/MoonEP](https://github.com/MoonshotAI/MoonEP); the integration here combines custom
+Triton kernels, a virtual-expert dispatcher, and Transformer Engine's grouped expert computation.
+
+- **Dispatcher:** Flex selects `_VirtualExpertHybridEPManager` in
+  [token_dispatcher.py](token_dispatcher.py), which extends the existing HybridEP manager with
+  `VirtualExpertLoadBalancer`. It accepts the router's `[tokens, topk]` expert IDs and
+  probabilities, starts planning and weight prefetch, then supplies remapped runtime expert
+  IDs to HybridEP. HybridEP handles token dispatch and combine using a fixed receive capacity
+  calculated to cover the balanced workload and padding.
+- **Triton kernels:** [virtual_expert_triton.py](virtual_expert_triton.py) implements planning,
+  selected-weight prefetch, and replica-gradient reduction. The planner combines histogram
+  construction, cross-rank histogram exchange, placement, and route remapping in one cooperative
+  kernel launch. Separate transport kernels push selected weights into peer virtual slots and
+  read replica gradients back into their owners' native gradients through NCCL symmetric memory.
+  These kernels move expert weights and gradients; token movement remains with HybridEP.
+- **Expert buffers:** [virtual_expert_load_balancer.py](virtual_expert_load_balancer.py) binds
+  native weights and temporary virtual slots into the FC1/FC2 runtime weight lists consumed by
+  TE's grouped GEMMs. Compatible layers share persistent weight and gradient arenas, reusing
+  replica storage across layers. Non-GTP native gradients accumulate directly into DDP buffers;
+  GTP natives use stable wgrad buffers acquired through TE's `DistributedWeight` interface.
+- **Execution and backward:** Autograd hooks coordinate planning, weight prefetch, and gradient
+  reduction on separate CUDA streams, with events establishing dependencies on expert compute.
+  Each forward retains its placement for backward, which refreshes replica weights before the
+  expert GEMMs. FC2 replica-gradient reduction can start as soon as its wgrad is ready, followed
+  by FC1. At the MoE input-backward boundary, compute waits for both replica reductions before
+  handing gradients to DDP or expert GTP.
+
+The router's logical expert selections and probabilities are preserved; remapping changes where
+the selected experts execute. Replica gradients return to the original parameters, which retain
+optimizer and checkpoint ownership. Replicas have no separate optimizer state.
+
+Requirements and limits:
+
+- Triton 3.5 or newer is required for launch-scoped descriptor allocation.
+- Use EP sizes 2–64, up to 8,192 experts evenly divided across EP ranks, top-k from 1 to
+  min(32, number of experts), and expert tensor parallel size 1.
+- All layers must share one EP topology. Local token counts must be equal across EP ranks and
+  remain fixed after each layer's first forward.
+- Use per-expert parameters with grouped-tensor GEMM, fused gradient accumulation, FP32 router
+  probabilities, and BF16 or native MXFP8 weights. The op fuser is optional. MXFP8 additionally
+  requires `--fp8-param --fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag` with the
+  `mxfp8` recipe and `e4m3` format.
+- Use regular DDP or the distributed optimizer with eagerly allocated expert `main_grad` buffers.
+  Megatron-FSDP v1/v2 and lazy gradient allocation are unsupported. Expert GTP is supported.
+- Leave `moe_expert_rank_capacity_factor` unset and disable `moe_paged_stash`. MoonEP selects
+  static-capacity HybridEP transport and calculates its own dropless budget, including padding.
+  Token dropping and expert capacity limits are unsupported.
+- Use `moe_hybridep_routing_map_mode='indices'` (the default) and a HybridEP build supporting
+  `topk_idx`. MoonEP routers return selected expert IDs and probabilities directly. If TE
+  cannot emit expert IDs, routing uses the unfused implementation.
+- Sinkhorn routing and DeepSeek-style expert bias (`--moe-router-enable-expert-bias`) are
+  unsupported. For CUDA graphs, use the whole-layer `moe` scope rather than `moe_router` or
+  `moe_preprocess`. Full/whole-MoE recomputation is unsupported. FC1 CPU offload currently
+  requires a separate HybridEP/TE capacity-buffer fix; MoE activation and fused-MLP offload
+  have test coverage.
+
+Supported routing includes FP32 sigmoid scores, router fusion, hash routing, `seq_aux_loss`, and quantile
+balancing with its own bias update. For `micro_batch` quantile balancing, set
+`--moe-router-load-balancing-type quantile_balancing --moe-aux-loss-coeff 0`, omit
+`--moe-router-enable-expert-bias` and `--moe-router-fusion`, and disable
+`--moe-router-force-load-balancing`. Quantile balancing requires token-count × top-k divisible
+by the expert count and does not support padding masks or group-limited routing.
+
+Virtual-expert gradients use FP32 storage and transport by default. With `--grad-reduce-in-bf16`,
+native and replica partial gradients are stored in BF16, added locally in FP32, then downcast once.
+BF16 partial storage can lose small cancellation residuals and increase optimizer-update differences;
+later FP32 addition cannot recover those residuals. To retain FP32 accumulation in subsequent
+reductions, enable `--ddp-reduce-scatter-with-fp32-accumulation` and, with expert GTP,
+`--gtp-remat-reduce-scatter-with-fp32-accumulation`.
+
+MoonEP's peer handshakes and cooperative-grid barriers time out after approximately 100 seconds
+of polling, including when `TRITON_DEBUG=0`. A timeout aborts the kernel and surfaces as an
+asynchronous CUDA launch failure; restart the affected processes. Other ranks still waiting in
+these barriers time out independently. This does not cover unrelated collectives or stalled
+GPU instructions.
+
+Training parity and supported offload/recompute cases are covered in
+`tests/unit_tests/transformer/moe/test_virtual_experts.py`. Planner correctness and CUDA graph
+replay are covered in `tests/unit_tests/determinism/kernels/test_moe_kernels.py`; checkpoint
+loading and initialization parity are covered by
+`test_te_grouped_linear_virtual_expert_checkpoint` in the neighboring `test_te_wrappers.py`.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
