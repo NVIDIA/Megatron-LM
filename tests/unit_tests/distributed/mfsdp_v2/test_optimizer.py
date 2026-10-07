@@ -89,7 +89,8 @@ def test_fused_adam_adapter_accepts_mismatched_grads(distributed_setup):
         # Match Megatron's workaround for TE skipping updates with trailing empty shards:
         # https://github.com/NVIDIA/TransformerEngine/issues/3207.
         optimizer_parameters = [p for p in optimizer_parameters if p.numel() > 0]
-    optimizer = FusedAdam(optimizer_parameters, lr=0.01)
+    # An explicit group also supports ranks with no parameters after filtering.
+    optimizer = FusedAdam([{"params": optimizer_parameters}], lr=0.01)
     fully_shard_optimizer(optimizer, precision_aware=True)
 
     x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
@@ -104,7 +105,9 @@ def test_fused_adam_adapter_accepts_mismatched_grads(distributed_setup):
     params_before_step = [parameter.detach().clone() for parameter in model.parameters()]
     optimizer.step()
 
-    assert any(
-        not torch.equal(parameter_before, parameter.detach())
-        for parameter_before, parameter in zip(params_before_step, model.parameters())
-    )
+    # With enough ranks, this tiny model leaves some ranks owning only padding.
+    if any(parameter.numel() > 0 for parameter in model.parameters()):
+        assert any(
+            not torch.equal(parameter_before, parameter.detach())
+            for parameter_before, parameter in zip(params_before_step, model.parameters())
+        )
