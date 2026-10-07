@@ -20,6 +20,14 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 
 import torch  # noqa: E402
 
+from examples.inference.advanced.vlm_dynamic_inference import (  # noqa: E402
+    _detect_vlm_from_checkpoint,
+    _print_resolved_args,
+    add_vlm_inference_args,
+)
+from examples.inference.advanced.vlm_dynamic_inference import (  # noqa: E402
+    get_model as get_vlm_model,
+)
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
 from megatron.core.inference.config import (  # noqa: E402
     ImageProcessingConfig,
@@ -39,14 +47,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (
-    _detect_vlm_from_checkpoint,
-    _print_resolved_args,
-    add_vlm_inference_args,
-)
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
-    get_model as get_vlm_model,
-)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
 from megatron.core.utils import (  # noqa: E402
     configure_nvtx_profiling,
@@ -60,9 +60,13 @@ from megatron.inference.utils import (  # noqa: E402
 )
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
-from megatron.training.arguments import parse_and_validate_args  # noqa: E402
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
+from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
