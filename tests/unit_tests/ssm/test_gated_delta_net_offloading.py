@@ -191,7 +191,7 @@ def test_gdn_offload_replay(
 ) -> None:
     """Outputs and every gradient agree through warmup, policy selection, and pool reuse."""
     if fused_pre_gdr:
-        pytest.importorskip("causal_conv1d.cpp_functions")
+        pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     config = _config(
         activation_offload_fraction=fraction,
@@ -341,7 +341,7 @@ def test_gdn_offload_packed_sequence(
 ) -> None:
     """Packed-sequence metadata survives the saved-tensor hooks."""
     if fused_pre_gdr:
-        pytest.importorskip("causal_conv1d.cpp_functions")
+        pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     config = _config(
         gdn_pre_gated_delta_rule_fusion=fused_pre_gdr,

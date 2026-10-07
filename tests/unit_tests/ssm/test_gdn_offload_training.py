@@ -51,7 +51,15 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def _training_config(
-    tp: int, sp: bool, cp: int, pp: int, vp: int | None, fraction: float, recompute_norm: bool
+    tp: int,
+    sp: bool,
+    cp: int,
+    pp: int,
+    vp: int | None,
+    fraction: float,
+    recompute_norm: bool,
+    *,
+    fused_pre_gdr: bool = False,
 ) -> TransformerConfig:
     """Configure the reduced-size complete decoder and its parallel topology."""
     return TransformerConfig(
@@ -89,7 +97,9 @@ def _training_config(
         linear_key_head_dim=64,
         linear_value_head_dim=64,
         linear_num_key_heads=4,
-        linear_num_value_heads=4,
+        # Keep value heads divisible by four per TP/CP shard for native conv alignment.
+        linear_num_value_heads=16,
+        gdn_pre_gated_delta_rule_fusion=fused_pre_gdr,
         recompute_granularity="selective" if recompute_norm else None,
         recompute_modules=["gdn_norm_out"] if recompute_norm else [],
         fine_grained_activation_offloading=True,
@@ -177,6 +187,7 @@ def _snapshot_leaf(value: Any) -> Any:
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("recompute_norm", [False, True])
+@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused", "fused"])
 @pytest.mark.parametrize(
     "tp,sp,cp,pp,vp",
     [
@@ -199,11 +210,15 @@ def test_gdn_offload_training(
     vp: int | None,
     fraction: float,
     recompute_norm: bool,
+    fused_pre_gdr: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Match losses, accumulated gradients, updated weights and Adam states on every rank."""
     if Utils.world_size % (tp * cp * pp):
         pytest.skip("This topology requires a world size divisible by TP * CP * PP.")
+    if fused_pre_gdr:
+        pytest.importorskip("causal_conv1d", minversion="1.6.1")
+        monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     # Avoid attention-backward nondeterminism obscuring the offload comparison.
     # GDN still uses FLA: config.deterministic_mode would select its reference path.
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
@@ -211,7 +226,9 @@ def test_gdn_offload_training(
     off_interface.reset_instance()
     try:
         groups = ProcessGroupCollection.use_mpu_process_groups()
-        config = _training_config(tp, sp, cp, pp, vp, fraction, recompute_norm)
+        config = _training_config(
+            tp, sp, cp, pp, vp, fraction, recompute_norm, fused_pre_gdr=fused_pre_gdr
+        )
         baseline_config = replace(
             config, fine_grained_activation_offloading=False, offload_modules=[]
         )

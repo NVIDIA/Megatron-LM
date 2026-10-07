@@ -57,6 +57,9 @@ alias). This scope captures tensors saved by FLA's chunked gated delta rule, inc
 Q/K/V and its internal WY representation. It commits the transfer on the recurrence
 output, before the gated output norm, and reloads before recurrence backward.
 
+Megatron's training CLI requires `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine
+2.10 or newer. Set it before starting the training process.
+
 This option is separate from `core_attn`, which continues to select standard attention.
 It leaves input projection, causal convolution, and output normalization outside the
 GDN offload scope. `gdn_norm_out` selective recomputation can be used alongside it.
