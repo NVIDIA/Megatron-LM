@@ -578,6 +578,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer, MoE transformer, and Mamba layers are used.
+                Shortcut MoE blocks are always units; their directly invoked attention
+                layer, MoE layer, and MoE MLP are owned by the block instead.
                 Residual-stream replay additionally wraps its parameterized child norms
                 and residual connections so their forward hooks gather weights during replay.
             disable_bucketing: Compatibility argument that must remain ``False`` for
@@ -612,14 +614,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
 
-        shortcut_blocks = {
-            child for child in module.modules() if isinstance(child, ShortcutMoEBlock)
-        }
-        shortcut_internals = {
-            child
-            for block in shortcut_blocks
-            for child in (block.compute_layer, block.moe_layer, block.moe_layer.mlp)
-        }
         recompute_units = set()
         if config.recompute_granularity == "selective" and "residual_stream" in (
             config.recompute_modules or []
@@ -735,15 +729,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             grad_divisor=config.expert_model_parallel_size,
                             **common_fully_shard_kwargs,
                         )
+            # ShortcutMoEBlock calls compute_layer.forward_pre_attn_and_core_attn(),
+            # moe_layer._pre_mlp_layernorm_and_residual(), and mlp.route()/dispatch()
+            # directly. Their __call__ hooks never run, so these modules must not own
+            # FSDP shards. The block gathers their weights around its own forward/backward.
+            # Experts keep their expert-DP units above; other explicitly selected children
+            # (e.g. a norm called through __call__) can still be separate units.
+            shortcut_inner_modules = {
+                child
+                for block in module.modules()
+                if isinstance(block, ShortcutMoEBlock)
+                for child in (block.compute_layer, block.moe_layer, block.moe_layer.mlp)
+            }
             for submodule in reversed(list(module.modules())):
+                if submodule in shortcut_inner_modules:
+                    continue
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
-                if submodule in shortcut_internals:
-                    continue
                 if (
-                    submodule in shortcut_blocks
+                    isinstance(submodule, ShortcutMoEBlock)
                     or submodule in recompute_units
                     or any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
                 ):
