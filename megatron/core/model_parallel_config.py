@@ -6,6 +6,8 @@ from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
+from megatron.core.gtp_parallel_layout import resolve_tensor_parallel_sequence_shards
+
 
 def resolve_tensor_parallel_weight_shards(
     tensor_model_parallel_size: int,
@@ -73,6 +75,15 @@ class ModelParallelConfig:
        INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
        ``__post_init__`` from ``tensor_parallel_num_weight_shards`` (= that value divided by
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
+    """
+
+    tensor_parallel_num_sequence_shards: Optional[int] = None
+    """Sequence shards within the TP + GTP weight group, including TP when SP is enabled.
+    Defaults to TP with SP, otherwise 1. Dividing by that SP factor gives
+    gtp_num_sequence_shards, which must divide gtp_weight_remat_size. CP adds
+    independent sequence splitting; context_parallel_size in this config is the
+    resolved total group size. GTP sequence sharding requires SP when TP > 1 and
+    TP-fastest, PP-last ranks.
     """
 
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
@@ -500,6 +511,16 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    @property
+    def gtp_num_sequence_shards(self) -> int:
+        """Sequence-shard count within GTP, excluding sequence parallelism across TP."""
+        return resolve_tensor_parallel_sequence_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_sequence_shards,
+            self.gtp_weight_remat_size,
+            self.sequence_parallel,
+        )[1]
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -570,6 +591,9 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+
+        if self.gtp_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
+            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
 
         if self.sequence_packing_scheduler is not None:
             supported_schedulers = ['dp_balanced']

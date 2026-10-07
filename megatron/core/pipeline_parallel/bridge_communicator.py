@@ -4,6 +4,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from math import prod
 from typing import Deque, Dict, List, Optional, Tuple
 
 import torch
@@ -122,16 +123,15 @@ class BridgeCommunicator:
                 "a bridge without backward communication requires source pipeline parallelism 1"
             )
 
-        if 'cp' in self.src_grid.dim_names:
-            assert self.src_grid.shape[self.src_grid.dim_names.index('cp')] == 1, (
-                f"Source grid CP size must be 1, got "
-                f"{self.src_grid.shape[self.src_grid.dim_names.index('cp')]}"
-            )
+        src_cp_size = prod(
+            self.src_grid.shape[self.src_grid.dim_names.index(dim)]
+            for dim in self._context_parallel_dims(self.src_grid)
+        )
+        assert src_cp_size == 1, f"Source grid CP size must be 1, got {src_cp_size}"
 
-        self.dest_cp_size = (
-            self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]
-            if 'cp' in self.dest_grid.dim_names
-            else 1
+        self.dest_cp_size = prod(
+            self.dest_grid.shape[self.dest_grid.dim_names.index(dim)]
+            for dim in self._context_parallel_dims(self.dest_grid)
         )
 
         self.current_rank = dist.get_rank()
@@ -192,7 +192,7 @@ class BridgeCommunicator:
             and self.dest_local_leader_rank is not None
             and self.current_rank in self.dest_grid_broadcast_ranks
         ):
-            dest_cp_pg = self.dest_grid.get_pg("cp")
+            dest_cp_pg = self.dest_grid.get_pg(self._context_parallel_dims(self.dest_grid))
             if self.dest_local_leader_rank in dist.get_process_group_ranks(dest_cp_pg):
                 self.dest_cp_reduce_pg = dest_cp_pg
 
@@ -289,6 +289,11 @@ class BridgeCommunicator:
             leader_ranks.extend(ranks)
         return leader_ranks, local_leader_rank
 
+    @staticmethod
+    def _context_parallel_dims(grid: HyperCommGrid) -> List[str]:
+        """Return every grid dimension that partitions a sample's sequence."""
+        return [dim for dim in ("cp", "gtp_sequence_shards") if dim in grid.dim_names]
+
     def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
         """Get TP-CP ranks at boundary PP stage for each DP replica.
 
@@ -297,7 +302,7 @@ class BridgeCommunicator:
         """
 
         # Get tp-cp rank enumeration (each list has same dp and pp, different tp and cp)
-        tpcp_rank_lists = grid._gen_rank_enum(['tp', 'cp'])
+        tpcp_rank_lists = grid._gen_rank_enum(["tp"] + self._context_parallel_dims(grid))
         pp_size = grid.shape[grid.dim_names.index('pp')]
 
         # Determine boundary pp stage
