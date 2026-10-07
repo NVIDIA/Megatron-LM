@@ -136,6 +136,25 @@ class ParamKey:
         return False
 
 
+def muon_effective_expert_tp_mode(config) -> str:
+    """NS mode the routed MoE expert weights run under: ``muon_expert_tp_mode`` when set,
+    otherwise ``muon_tp_mode``.
+
+    Accepts any object carrying the two attributes (an OptimizerConfig or the parsed training
+    args), so the CLI validation and the optimizer builders share this one definition.
+    """
+    return getattr(config, 'muon_expert_tp_mode', None) or getattr(
+        config, 'muon_tp_mode', 'duplicated'
+    )
+
+
+def muon_modes_are_hybrid(config) -> bool:
+    """Whether dense and expert weights run DIFFERENT NS modes, so the Muon builder keeps the
+    two weight families in separate base optimizers (see
+    ``megatron.core.optimizer._get_megatron_emerging_optimizer``)."""
+    return muon_effective_expert_tp_mode(config) != getattr(config, 'muon_tp_mode', 'duplicated')
+
+
 @dataclass
 class OptimizerConfig:
     """Configuration object for Megatron optimizers."""
@@ -312,18 +331,21 @@ class OptimizerConfig:
     path. Values > 1 require emerging-optimizers >= 0.3.0."""
 
     muon_expert_tp_mode: Optional[str] = None
-    """NS mode for expert-parallel weights. None (default): expert weights follow
-    muon_tp_mode. Any muon_tp_mode value gives the expert domain its own mode — e.g.
+    """NS mode for the routed MoE expert weights. None (default): expert weights follow
+    muon_tp_mode. Any muon_tp_mode value gives the expert weights their own mode — e.g.
     muon_tp_mode='auto' with muon_expert_tp_mode='layer_sharded' runs the per-weight
     duplicated/distributed cost model on dense weights while layer-sharding the MoE expert
     weights, where the layer-sharded win concentrates (many identically shaped matrices per
-    NS home). When the effective modes differ, the optimizer builder keeps the dense and
-    expert buckets separate and constructs one base optimizer per bucket; both feed
-    LayerWiseDistributedOptimizer. layer_sharded on either side needs optimizer='muon' and
-    the layer-wise path (__post_init__ checks); the split-QKV restriction is keyed to
-    muon_tp_mode only, since expert weights own no QKV. Requires num_experts when set
-    explicitly (validate_args: a model without expert weights has no expert bucket to
-    route)."""
+    NS home). When the effective modes differ, the optimizer builder keys the param groups
+    by the routed-expert marker (``param.expert_tp``, the semantic marker TensorParallelMuon
+    already keys its expert process groups on; not the expert-parallel communication flag,
+    so EP=1 experts count too) and constructs one base optimizer per weight family, on the
+    layer-wise path and on the plain Float16/FP32 path alike. Only optimizer='muon'
+    implements it; __post_init__ rejects an explicit value for every other optimizer, which
+    would silently apply muon_tp_mode to all weights. layer_sharded on either side needs the
+    layer-wise path; the split-QKV restriction is keyed to muon_tp_mode only, since expert
+    weights own no QKV. Requires num_experts when set explicitly (validate_args: a model
+    without expert weights has no expert bucket to route)."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
@@ -476,8 +498,16 @@ class OptimizerConfig:
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
 
-        # Expert-parallel weights follow muon_tp_mode unless muon_expert_tp_mode overrides it.
-        muon_expert_tp_mode = self.muon_expert_tp_mode or self.muon_tp_mode
+        if self.muon_expert_tp_mode is not None and self.optimizer not in ('muon', 'dist_muon'):
+            # Only the muon entry builds one base optimizer per weight family; every other
+            # optimizer applies muon_tp_mode to all weights and would ignore the override.
+            raise ValueError(
+                f"muon_expert_tp_mode is only implemented for optimizer='muon' (got "
+                f"{self.optimizer!r}); other optimizers, including adaptive_muon, apply "
+                "muon_tp_mode to every weight and would silently ignore it."
+            )
+        # Expert weights follow muon_tp_mode unless muon_expert_tp_mode overrides it.
+        muon_expert_tp_mode = muon_effective_expert_tp_mode(self)
         if 'layer_sharded' in (self.muon_tp_mode, muon_expert_tp_mode):
             selector = (
                 "muon_tp_mode" if self.muon_tp_mode == 'layer_sharded' else "muon_expert_tp_mode"

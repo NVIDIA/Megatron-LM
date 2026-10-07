@@ -1802,12 +1802,20 @@ def validate_args(args, defaults={}):
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
     # Effective per-domain modes: expert weights follow --muon-tp-mode unless
-    # --muon-expert-tp-mode overrides them.
+    # --muon-expert-tp-mode overrides them (one definition, shared with OptimizerConfig).
+    from megatron.core.optimizer.optimizer_config import muon_effective_expert_tp_mode
+
     muon_dense_mode = getattr(args, 'muon_tp_mode', 'duplicated')
-    muon_expert_mode = getattr(args, 'muon_expert_tp_mode', None) or muon_dense_mode
+    muon_expert_mode = muon_effective_expert_tp_mode(args)
     # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
     # sgd/adam that block is skipped entirely, which would silently ignore the
     # mode — the one case where the loud failure matters most.
+    if getattr(args, 'muon_expert_tp_mode', None) is not None:
+        assert args.optimizer in ('muon', 'dist_muon'), (
+            f"--muon-expert-tp-mode is only implemented for --optimizer muon (got "
+            f"--optimizer {args.optimizer}). Other optimizers, including adaptive_muon, "
+            "apply --muon-tp-mode to every weight and would silently ignore it."
+        )
     if 'layer_sharded' in (muon_dense_mode, muon_expert_mode):
         assert args.optimizer in ('muon', 'dist_muon'), (
             f"--muon-tp-mode/--muon-expert-tp-mode layer_sharded is only supported "
@@ -2839,7 +2847,8 @@ def _add_regularization_args(parser):
                        'cost model on dense weights while layer-sharding the MoE '
                        'expert weights. When the modes differ, the optimizer builder '
                        'keeps dense/expert buckets separate and constructs one base '
-                       'optimizer per bucket. Requires --num-experts when set. See '
+                       'optimizer per bucket. Requires --num-experts when set; only '
+                       '--optimizer muon implements it. See '
                        'OptimizerConfig.muon_expert_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '

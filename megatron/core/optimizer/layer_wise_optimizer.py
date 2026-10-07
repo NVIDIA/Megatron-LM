@@ -724,8 +724,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             if not isinstance(inner, LayerShardedMuon):
                 continue
 
-            # Domain per param group (group['is_expert_parallel'] is the param-group-level
-            # expert marker), pooling the params of groups that share a domain.
+            # Domain per param group, pooling the params of groups that share a domain. The
+            # axes follow the communication flag group['is_expert_parallel'] (the topology the
+            # layer reduces gradients over), not the semantic group['is_expert'] marker that
+            # selects the Muon mode: a routed expert has allreduce=True only when EP=1 and the
+            # expert TP/GTP sizes match the dense ones, where the expert-named groups it is
+            # sharded over hold the same ranks as the dense ones. _check_gtp_group_matches
+            # verifies the gtp axis against the group the GTP layer recorded on the param.
             group_axes: Dict[int, Tuple] = {}
             domains: Dict[Tuple, List] = {}
             for group_index, group in enumerate(inner.param_groups):
