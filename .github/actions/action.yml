@@ -74,6 +74,10 @@ inputs:
     description: "Baseline source branch. Selective unit tests currently support main only."
     required: false
     default: ""
+  unit_test_pr_files_artifact_id:
+    description: "Artifact containing the validated PR file list from the configure job."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -176,6 +180,27 @@ runs:
         key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
 
+    - name: Prepare PR file download
+      id: unit-test-pr-files-directory
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      run: |
+        # Keep the artifact separate from the restored Testmon cache. A fresh
+        # directory also prevents a failed download from reusing stale files.
+        PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/unit-test-pr-files.XXXXXX")
+        echo "path=$PR_FILES_DIR" >> "$GITHUB_OUTPUT"
+
+    - name: Download PR files for mandatory unit tests
+      id: download-unit-test-pr-files
+      if: steps.unit-test-pr-files-directory.outcome == 'success'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      continue-on-error: true
+      with:
+        artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
+        path: ${{ steps.unit-test-pr-files-directory.outputs.path }}
+        merge-multiple: true
+
     - name: Resolve unit Testmon mode
       id: unit-testmon
       if: inputs.is_unit_test == 'true'
@@ -185,6 +210,9 @@ runs:
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
+        PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
+        TESTED_SHA: ${{ inputs.sha || github.sha }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -200,7 +228,23 @@ runs:
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
-              EFFECTIVE_MODE=enforce
+              # Configure fetches the PR's files once for all buckets. The
+              # artifact is tied to the tested commit, not the Testmon baseline.
+              if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
+                && PR_CHANGED_PATHS=$(jq -er --arg sha "$TESTED_SHA" \
+                  'select(.tested_sha == $sha) |
+                   select(.changed_files | type == "number" and . >= 0 and . <= 3000 and floor == .) |
+                   .changed_paths | select(type == "number" and . >= 0 and . <= 6000 and floor == .)' \
+                  "$PR_FILES_DIR/metadata.json") \
+                && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
+                && [[ "$CHANGED_PATHS" == "$PR_CHANGED_PATHS" ]] \
+                && cp "$PR_FILES_DIR/changed-files" assets_dir/testmon/changed-files; then
+                EFFECTIVE_MODE=enforce
+              else
+                EFFECTIVE_MODE=full
+                FALLBACK_REASON="unable to read the complete PR changed-file list for the tested commit; running the full bucket without recording or saving"
+                echo "::notice::PR changed-file list unavailable or incomplete; running the full unit-test bucket."
+              fi
             else
               EFFECTIVE_MODE=full
               FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
@@ -222,6 +266,9 @@ runs:
           echo "- Effective mode: $EFFECTIVE_MODE"
           if [[ "$REQUESTED_MODE" == "enforce" ]]; then
             echo "- Restored cache key: ${MATCHED_KEY:-none}"
+          fi
+          if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
+            echo "- Changed paths in PR: ${CHANGED_PATHS}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
             echo "- Fallback: $FALLBACK_REASON"
