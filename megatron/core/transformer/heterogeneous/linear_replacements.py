@@ -1,10 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
@@ -52,7 +55,14 @@ if HAVE_TE:
         Supports gathering TP outputs when sequence parallel is enabled.
         """
 
-        def __init__(self, config: TransformerConfig, tp_comm_buffer_name: str, *args, **kwargs):
+        def __init__(
+            self,
+            config: TransformerConfig,
+            tp_comm_buffer_name: str,
+            *args,
+            pg_collection: Optional[ProcessGroupCollection] = None,
+            **kwargs,
+        ):
             super().__init__(
                 input_size=config.hidden_size,
                 output_size=config.hidden_size,
@@ -63,6 +73,8 @@ if HAVE_TE:
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name=tp_comm_buffer_name,
+                tp_group=pg_collection.tp if pg_collection is not None else None,
+                pg_collection=pg_collection,
             )
 
         def forward(self, x, **kwargs):
@@ -81,7 +93,13 @@ class ColumnParallelLinearGathered(ColumnParallelLinear):
     Supports gathering TP outputs when sequence parallel is enabled.
     """
 
-    def __init__(self, config: TransformerConfig, *args, **kwargs):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        *args,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        **kwargs,
+    ):
         super().__init__(
             input_size=config.hidden_size,
             output_size=config.hidden_size,
@@ -91,6 +109,8 @@ class ColumnParallelLinearGathered(ColumnParallelLinear):
             bias=config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=pg_collection.tp if pg_collection is not None else None,
+            pg_collection=pg_collection,
         )
 
     def forward(
