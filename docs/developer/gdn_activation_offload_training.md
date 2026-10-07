@@ -2,9 +2,51 @@
 
 The [initial offload measurements](gdn_activation_offloading.md) exercise GDN
 stacks. `tests/unit_tests/ssm/test_gdn_offload_training.py` adds a reduced-size
-language-model comparison through the native training schedules. Its GPU runs are
-pending; collecting the cases and validating their configurations on CPU do not
-qualify any parallel topology or pretrained Qwen checkpoint.
+language-model comparison through the native training schedules. GPU results
+are listed below. Configuration checks on CPU do not qualify a parallel topology.
+
+## GPU validation status
+
+The 2026-10-06 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
+Engine 2.20.2, FLA 0.5.1 and cuDNN 9.19.0. These public-package container runs
+do not replace upstream CI.
+
+| Workload | Result |
+| --- | --- |
+| Reduced model, one rank | 6 passed, 42 topology cases skipped |
+| Reduced model, two ranks: DP, TP, TP+SP | 18 passed on each rank |
+| Reduced model, two ranks: PP | 6 passed on each rank |
+| Reduced model, PP+VPP | 6 passed on each rank after fixing the fixture's explicit layer separators |
+| Reduced model, CP | Baseline failed before offloading: no compatible deterministic attention backend in this A6000 environment |
+| Reduced model, four-rank combinations | Not run |
+| Pretrained Qwen3.5-0.8B, one rank | All 8 comparison arms passed; 24 optimizer updates |
+| Pretrained Qwen, multiple ranks | Not run |
+| Pretrained Qwen memory/runtime | Measurements in progress; no result qualified yet |
+
+The Qwen comparison uses all 24 text decoder layers, hidden size 1024 and
+vocabulary size 248320 from the original checkpoint. Each arm starts from the
+same local Hugging Face weights and consumes the same 128 real text conversations
+(30,727 rendered tokens). Sequence length is 128, with four microbatches per
+optimizer step, one warmup step and two steady steps. All eight arms
+(disabled/0/0.5/1 × output-norm recomputation off/on) match exactly, including
+across the recomputation settings: losses, numeric gradient norms, all 230
+parameter-gradient and updated-weight fingerprints, and complete Adam state.
+The manager warmup completes in enabled arms and pinned-buffer use returns to
+zero after every step. Fraction 0 selects no transfer bytes; fractions 0.5 and 1
+select 66,945,024 and 132,030,464 bytes per full iteration, respectively.
+
+Checkpoint revision: `eb706f593d2d43c90a10271199c10b07ced7569a`.
+The single safetensors shard has SHA-256
+`04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696`;
+the prepared messages JSONL has SHA-256
+`94f22b43be94403da5519036c05a40575bb1eed698606c0a7323fa14736ad1f5`.
+Data contents and model weights are not included in the repository.
+
+The CP failure occurs in the disabled baseline. TE disables its available
+arbitrary-length fused attention backend for deterministic training on compute
+capability below 9.0; FlashAttention is not installed in this environment.
+The unfused backend does not support CP. This leaves CP unqualified; the test
+does not relax determinism to turn the comparison into a pass.
 
 ## Training comparison
 
@@ -91,12 +133,15 @@ are outside this pilot. Bridge's dense VL importer currently rejects
 The pinned Bridge Qwen forward also omits GPT's offload preprocessing call. The
 tool invokes the existing native preprocessing method before each forward when
 offloading is enabled, so each pipeline chunk uses the native manager lifecycle.
+It uses TE's automatic attention selection to keep language and vision backend
+settings compatible during checkpoint import. CP still requires a compatible
+attention backend on the selected hardware.
 
 Use a Bridge environment with Qwen3.5 VL mappings. The prepared
 environment uses Bridge revision `c860f8a5bc5fddd78690f32baa0b8696774308b4`,
 Transformers 5.15.0 and Tokenizers 0.22.2, with the local Megatron-LM checkout on
 `PYTHONPATH`. Bridge is an optional dependency of this tool, not a new core runtime
-dependency. GPU training remains unqualified until its actual runs pass.
+dependency. Only the configurations reported above are qualified by these runs.
 
 The input is local JSONL containing text conversations:
 
@@ -151,7 +196,7 @@ of accumulated gradients before clipping, updated weights and optimizer-state
 tensors. It streams fingerprints through CPU memory and writes no model-sized
 checkpoint or second GPU model copy. These runs emit no timed samples. Every rank
 writes a separate `.rankN.json`; compare every rank for multi-rank correctness.
-Repeat both arms with `--recompute-norm` before claiming that combination.
+Repeat all four arms with `--recompute-norm` before claiming that combination.
 Check the separate `offload_status` in each result: fraction zero must select no
 transfer bytes, and a positive fraction must select transfers on ranks that
 contain GDN layers. Otherwise the comparison has not exercised offloading.

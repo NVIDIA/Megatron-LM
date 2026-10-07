@@ -32,6 +32,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -113,7 +114,9 @@ def _provider(args: argparse.Namespace) -> Any:
             "pipeline_dtype": torch.bfloat16,
             "use_cpu_initialization": False,
             "gradient_accumulation_fusion": False,
-            "attention_backend": AttnBackend.fused if args.cp > 1 else AttnBackend.unfused,
+            # The VL import also constructs vision with the default auto backend;
+            # TE backend settings must agree across both models in one process.
+            "attention_backend": AttnBackend.auto,
             "attention_dropout": 0.0,
             "hidden_dropout": 0.0,
             "mtp_num_layers": 0,
@@ -239,7 +242,10 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
         del parents
         torch.cuda.empty_cache()
         optimizer = get_megatron_optimizer(
-            OptimizerConfig(bf16=True, lr=1e-4, clip_grad=1.0), models, pg_collection=groups
+            OptimizerConfig(bf16=True, lr=1e-4, clip_grad=1.0),
+            models,
+            use_gloo_process_groups=False,
+            pg_collection=groups,
         )
         for model in models:
             config = get_model_config(model)
@@ -264,6 +270,7 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
                 seq_length=args.seq_length,
                 micro_batch_size=1,
                 forward_only=False,
+                p2p_communicator=P2PCommunicator(groups.pp, get_model_config(models[0])),
                 pg_collection=groups,
             )
             if args.check_state:
@@ -288,14 +295,16 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
             offload_status = {
                 "selected_group_calls": len(selected),
                 "selected_transfer_bytes": sum(group.total_offload_bytes for group in selected),
-                "offload_summary_bytes": manager.offload_summary_total_bytes,
+                "offload_summary_bytes": (
+                    manager.offload_summary_total_bytes if args.fraction is not None else 0
+                ),
             }
             if args.check_state:
                 states.append(
                     {
                         "step": step,
                         "losses": [float(item["loss"]) for item in losses],
-                        "grad_norm": grad_norm,
+                        "grad_norm": float(grad_norm),
                         "grads": gradients,
                         "weights": {
                             f"{stage}.{name}": _fingerprint(parameter)
@@ -315,6 +324,14 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
                         **offload_status,
                     }
                 )
+            logging.info(
+                "Rank %d step %d: losses=%s grad_norm=%s selected_transfer_bytes=%d",
+                torch.distributed.get_rank(),
+                step,
+                [float(item["loss"]) for item in losses],
+                grad_norm,
+                offload_status["selected_transfer_bytes"],
+            )
         return {
             "rank": torch.distributed.get_rank(),
             "gpu": torch.cuda.get_device_name(),
