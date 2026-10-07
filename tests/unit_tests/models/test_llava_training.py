@@ -227,22 +227,36 @@ def test_forward_cp_loss_scaling_rejects_all_ignored_labels(device):
 
 @pytest.fixture
 def vision_cp_group(monkeypatch):
+    """A CP group distinct from the global one, with every global CP accessor forbidden."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
-    group = parallel_state.get_context_parallel_group()
+    # Same ranks as the global CP group but a separate communicator, so a helper that ignored
+    # the supplied group could not pass the identity checks below.
+    global_cp_ranks = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(
+        global_cp_ranks,
+        torch.distributed.get_process_group_ranks(parallel_state.get_context_parallel_group()),
+    )
+    group, _ = torch.distributed.new_subgroups_by_enumeration(
+        [list(ranks) for ranks in sorted({tuple(ranks) for ranks in global_cp_ranks})]
+    )
+    assert group is not parallel_state.get_context_parallel_group()
 
     def forbid_global_cp():
         raise AssertionError("Vision CP must use the model's supplied group")
 
     try:
         with monkeypatch.context() as patch:
-            for name in (
-                "get_context_parallel_group",
-                "get_context_parallel_rank",
-                "get_context_parallel_world_size",
-            ):
-                patch.setattr(parallel_state, name, forbid_global_cp)
+            # context_parallel imports the accessors by name, so patch its references too.
+            for module in (parallel_state, context_parallel):
+                for name in (
+                    "get_context_parallel_group",
+                    "get_context_parallel_rank",
+                    "get_context_parallel_world_size",
+                ):
+                    patch.setattr(module, name, forbid_global_cp)
             yield group
     finally:
+        torch.distributed.destroy_process_group(group)
         Utils.destroy_model_parallel()
 
 
