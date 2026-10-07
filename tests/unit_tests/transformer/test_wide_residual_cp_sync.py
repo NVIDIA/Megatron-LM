@@ -29,16 +29,17 @@ class _WideResidualHarness(nn.Module):
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
-        self.connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=None
+        self.reader = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", mode="read"
+        )
+        self.writer = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", mode="write"
         )
 
     def forward(self, residual_stream: torch.Tensor) -> torch.Tensor:
-        branch_input, state = self.connection(residual_stream, operation="read")
+        branch_input, state = self.reader(residual_stream)
         branch_update = torch.tanh(branch_input) + 0.125 * branch_input
-        return self.connection(
-            branch_update, operation="write", state=state, dropout_probability=0.0, training=False
-        )
+        return self.writer(branch_update, state=state, dropout_probability=0.0, training=False)
 
 
 class _WideResidualReplayHarness(nn.Module):
@@ -48,8 +49,13 @@ class _WideResidualReplayHarness(nn.Module):
         super().__init__()
         self.connections = nn.ModuleList(
             [
-                StreamwiseSigmoidWideResidualConnection(
-                    config=config, layer_number=layer_number, branch_name="test", pg_collection=None
+                nn.ModuleList(
+                    [
+                        StreamwiseSigmoidWideResidualConnection(
+                            config=config, layer_number=layer_number, branch_name="test", mode=mode
+                        )
+                        for mode in ("read", "write")
+                    ]
                 )
                 for layer_number in range(1, 3)
             ]
@@ -57,31 +63,22 @@ class _WideResidualReplayHarness(nn.Module):
 
     def forward(self, residual_stream: torch.Tensor, *, replay: bool) -> torch.Tensor:
         contexts = build_residual_stream_recompute_plan(2, 2) if replay else [None, None]
-        for connection, context in zip(self.connections, contexts):
+        for (reader, writer), context in zip(self.connections, contexts):
             if context is None:
-                branch_input, state = connection(residual_stream, operation="read")
+                branch_input, state = reader(residual_stream)
             else:
                 branch_input, state = checkpoint_residual_read(
-                    connection, residual_stream, context, fp32_residual_connection=False
+                    reader, residual_stream, context, fp32_residual_connection=False
                 )
 
             branch_update = torch.tanh(branch_input) + 0.125 * branch_input
             if context is not None and not context.is_block_end:
                 residual_stream = checkpoint_residual_write(
-                    connection,
-                    branch_update,
-                    state,
-                    context,
-                    dropout_probability=0.0,
-                    training=False,
+                    writer, branch_update, state, context, dropout_probability=0.0, training=False
                 )
             else:
-                residual_stream = connection(
-                    branch_update,
-                    operation="write",
-                    state=state,
-                    dropout_probability=0.0,
-                    training=False,
+                residual_stream = writer(
+                    branch_update, state=state, dropout_probability=0.0, training=False
                 )
             if context is not None:
                 context.finalize(residual_stream)
