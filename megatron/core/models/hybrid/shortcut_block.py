@@ -200,7 +200,7 @@ class ShortcutMoEBlock(MegatronModule):
                 )
             if (
                 self.shortcut_residual_read.residual_stream_hidden_size
-                != outer_connection.residual_stream_hidden_size
+                != outer_connection[0].residual_stream_hidden_size
             ):
                 raise ValueError(
                     "The shortcut read and outer MoE residual connection must consume the "

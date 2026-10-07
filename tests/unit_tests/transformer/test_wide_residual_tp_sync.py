@@ -54,8 +54,13 @@ def _config(*, sequence_parallel: bool) -> TransformerConfig:
 @pytest.mark.parametrize(("sequence_parallel", "expected_value"), [(False, 1.5), (True, 3.0)])
 def test_streamwise_control_gradients_use_correct_tp_reduction(sequence_parallel, expected_value):
     config = _config(sequence_parallel=sequence_parallel)
-    connection = StreamwiseSigmoidWideResidualConnection(
-        config=config, layer_number=1, branch_name="test", pg_collection=None
+    connection = torch.nn.ModuleList(
+        [
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", mode=mode
+            )
+            for mode in ("read", "write")
+        ]
     ).cuda()
     connection.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
 
