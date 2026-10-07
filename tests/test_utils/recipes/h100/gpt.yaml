@@ -287,8 +287,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2]
     products:
       - environment: [dev]
-        # https://github.com/NVIDIA/Megatron-LM/issues/7733
-        scope: [mr, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # Megatron-FSDP v2 shards over dp_cp, the same axis it reduces gradients over, so
   # context parallelism must not change the math.
@@ -300,20 +299,17 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last]
     products:
       - environment: [dev]
-        # https://github.com/NVIDIA/Megatron-LM/issues/7733
-        scope: [mr, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss]
     products:
       - environment: [dev]
-        # https://github.com/NVIDIA/Megatron-LM/issues/7733
-        scope: [mr, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last]
     products:
       - environment: [dev]
-        # https://github.com/NVIDIA/Megatron-LM/issues/7733
-        scope: [mr, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_nondeterministic]
     products:
