@@ -403,11 +403,11 @@ class FsdpModule:
         """
 
         def grad_checking_post_backward_hook(module, grad_input, _grad_output):
-            if any(grad is not None for grad in grad_input):
-                post_backward_hook(module)
-            else:
+            if all(grad is None for grad in grad_input):
                 context = module.context
                 context._delayed_post_backward_callbacks.append((module, post_backward_hook))
+            else:
+                post_backward_hook(module)
 
         cast(nn.Module, self).register_full_backward_hook(grad_checking_post_backward_hook)
 
@@ -418,7 +418,7 @@ class FsdpModule:
         module = cast(nn.Module, self)
         module_ref = ref(self)
 
-        def grad_hook(_: nn.Parameter) -> None:
+        def parameter_post_accumulate_grad_hook(_: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
@@ -433,7 +433,9 @@ class FsdpModule:
                 # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
                 # gradients are materialized by ``backward_dw()``, not autograd.
                 if not getattr(parameter, "skip_backward_post_hook", False):
-                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    parameter.register_post_accumulate_grad_hook(
+                        parameter_post_accumulate_grad_hook
+                    )
                     continue
                 if len(fsdp_parameter.fqns) > 1:
                     raise ValueError(
@@ -443,7 +445,7 @@ class FsdpModule:
                     )
                 parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
-                    lambda parameter=parameter: grad_hook(parameter)
+                    lambda parameter=parameter: parameter_post_accumulate_grad_hook(parameter)
                 )
 
     @staticmethod
@@ -589,7 +591,7 @@ class FsdpModule:
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
         if self.phase is FsdpModule.Phase.BACKWARD:
-            # A previous invocation may be awaiting the no-input fallback.
+            # A shared invocation may still be awaiting the final callback.
             return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
