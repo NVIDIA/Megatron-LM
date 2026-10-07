@@ -482,6 +482,9 @@ jobs:
       - name: Test DCO gate publisher
         run: python3 .github/scripts/test_dco_gate.py
 
+      - name: Test scheduled CI notification wiring
+        run: python3 .github/scripts/test_ci_notifications.py
+
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 

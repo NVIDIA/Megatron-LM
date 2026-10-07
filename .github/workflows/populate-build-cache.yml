@@ -134,3 +134,21 @@ jobs:
           is_unit_test: "true"
           unit_testmon_mode: baseline
           unit_testmon_target_branch: main
+
+  notify-nightly-failure:
+    name: Notify scheduled CI failure
+    runs-on: ubuntu-latest
+    needs: [validate-source, populate-build-cache, parse-unit-tests, populate-testmon-cache]
+    permissions: {}
+    # Do not depend on setup outputs: failures there skip downstream jobs.
+    if: >-
+      ${{ always() && !cancelled() && failure() &&
+          github.repository == 'NVIDIA/Megatron-LM' &&
+          github.event_name == 'schedule' &&
+          github.ref_name == github.event.repository.default_branch }}
+    steps:
+      - name: Notify CI alerts channel
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@631c404d00a9e60afc591cd071d35d2e18f82fc6
+        with:
+          needs-json: ${{ toJSON(needs) }}
+          webhook: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}
