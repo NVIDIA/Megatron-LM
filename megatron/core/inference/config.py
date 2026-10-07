@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
 
@@ -121,7 +121,8 @@ class MambaInferenceStateConfig:
             # gated off for GDP (batch-invariant chunk lengths, prefix-cache
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
-            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
+            # Align layers with layer_type_list (Shortcut-MoE registers each pair as one module).
+            chunking = ssm_chunking(decoder.layer_type_list, decoder.physical_layers())
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
@@ -141,6 +142,24 @@ class MambaInferenceStateConfig:
                 gdp_num_householder=gdp_num_householder,
             )
         return None
+
+
+def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
+    """Layer types of one MTP draft-head depth, or None for a non-hybrid model.
+
+    The MTP head's layer types come from the unified hybrid pattern ("<main>/<mtp>/..."), which
+    only HybridModel parses. Independent of whether the MAIN decoder has recurrent layers, so it
+    cannot be derived from `MambaInferenceStateConfig`.
+
+    Callers that never enable speculative decoding do not need this: the draft-KV gate requires
+    `num_speculative_tokens > 0` first, so leaving `InferenceConfig.mtp_layer_type_list` at None
+    is correct for them.
+    """
+    try:
+        mtp_pattern = get_attr_wrapped_model(model, "mtp_pattern")
+    except RuntimeError:
+        return None
+    return list(mtp_pattern) if mtp_pattern else None
 
 
 class PrefixCachingEvictionPolicy(str, Enum):
@@ -247,53 +266,203 @@ class AsyncScheduleMode(str, Enum):
 
 @dataclass
 class ImageProcessingConfig:
-    """Configuration for converting raw images into model input tensors."""
+    """Configuration for converting raw images into model input tensors.
+
+    Each image is resized to a patch grid, normalized, and flattened into
+    ``[1, num_patches, 3 * patch_dim**2]`` with its resized ``[H, W]`` in ``imgs_sizes``.
+    """
 
     patch_dim: int
+    """Side length in pixels of each square patch the vision encoder embeds. For example,
+    with 16, a 448x448 image is split into a 28x28 grid of 16x16-pixel patches (784 total)."""
+
     dynamic_resolution: bool = False
+    """Resize each image to its own aspect-preserving patch grid. Required for raw image
+    bytes (all HTTP requests); static-tiling inputs must be preprocessed tensors passed to
+    ``engine.add_request`` or ``InferenceClient``."""
+
     use_tiling: bool = False
+    """Static tiling. Overrides ``dynamic_resolution`` and is not preprocessed in-core."""
+
     pixel_shuffle: bool = False
+    """Round patch-grid sides to even numbers so 2x2 pixel shuffle can merge patches."""
+
     spatial_merge_size: int = 1
+    """Round patch-grid sides to a multiple of this, e.g. 2 for a 2x2 patch merger. Also
+    scales the ``dynamic_resolution_model_length`` budget by ``spatial_merge_size**2``."""
+
+    image_break_token_id: Optional[int] = None
+    """Token placed after each row of a dynamic-resolution image's tokens except the last, e.g.
+    [IMG_BREAK]. None lays out each image as one run of image tokens."""
+
+    image_end_token_id: Optional[int] = None
+    """Token placed after the last row of a dynamic-resolution image's tokens, e.g. [IMG_END]."""
+
     dynamic_resolution_min_patches: int = 1
+    """Minimum patches per image; smaller images are upscaled to reach it."""
+
     dynamic_resolution_max_patches: int = 128
+    """Maximum patches per image (or per video frame), e.g. 1024 with 16-px patches
+    caps a square image near 512x512."""
+
     vision_model_type: str = "radio"
+    """Encoder registry key, e.g. ``radio`` or ``siglip``, used to look up pixel
+    mean/std when ``pixel_mean`` or ``pixel_std`` is unset."""
+
     pixel_mean: Optional[List[float]] = None
+    """Per-channel RGB mean for normalization, e.g. ``[0.485, 0.456, 0.406]``."""
+
     pixel_std: Optional[List[float]] = None
+    """Per-channel RGB std for normalization, e.g. ``[0.229, 0.224, 0.225]``."""
+
     img_h: Optional[int] = None
+    """Tile height for static tiling. Not read by in-core preprocessing."""
+
     img_w: Optional[int] = None
+    """Tile width for static tiling. Not read by in-core preprocessing."""
+
     max_num_tiles: int = 1
+    """Maximum tiles per image for static tiling. Not read by in-core preprocessing."""
+
     use_thumbnail: bool = False
+    """Append a downscaled thumbnail tile for static tiling. Not read by in-core preprocessing."""
+
     num_img_embeddings_per_tile: int = 0
+    """Embeddings per tile for static tiling. Not read by in-core preprocessing."""
+
+    dynamic_resolution_model_length: Optional[int] = None
+    """Token budget shared by a request's images, mirroring HF ``max_model_len``. Each image's
+    max patches becomes ``min(max_patches, (length - 4) * spatial_merge_size**2)``, e.g.
+    16384 with a 2x2 merge allows up to 65520 patches."""
+
+    dynamic_resolution_rounding_mode: Literal["ceil", "round_plus_half"] = "ceil"
+    """How pixel sides round to patch counts before scaling. For a 48-px side and 16-px
+    patches, ``ceil`` gives 3 and ``round_plus_half`` (HF's ``round(x + 0.5)``) gives 4."""
+
+    dynamic_resolution_resize_mode: Literal["pil", "torch_bicubic_antialias"] = "pil"
+    """Resize backend: ``pil`` uses ``PIL.Image.resize``; ``torch_bicubic_antialias`` uses
+    ``F.interpolate(mode="bicubic", antialias=True)`` to match torch-based HF processors."""
+
+    def __post_init__(self):
+        if self.dynamic_resolution_rounding_mode not in ("ceil", "round_plus_half"):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_rounding_mode must be "
+                "'ceil' or 'round_plus_half'."
+            )
+        if self.dynamic_resolution_resize_mode not in ("pil", "torch_bicubic_antialias"):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_resize_mode must be "
+                "'pil' or 'torch_bicubic_antialias'."
+            )
+        if (
+            self.dynamic_resolution_model_length is not None
+            and self.dynamic_resolution_model_length <= 4
+        ):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_model_length must be " "greater than 4."
+            )
 
 
 @dataclass
 class VideoProcessingConfig:
-    """Configuration for decoding raw video bytes into model input tensors."""
+    """Configuration for decoding raw video bytes into model input tensors.
+
+    Frames are sampled uniformly, resized to the first frame's grid, and packed like
+    images, with per-video ``num_frames``, ``video_frame_indices``, and ``video_fps``.
+    """
 
     image_config: ImageProcessingConfig
+    """Per-frame preprocessing. Requires ``dynamic_resolution=True`` without tiling."""
+
     num_frames: int = 8
+    """Frames sampled uniformly, rounded down to a multiple of ``temporal_patch_size``,
+    e.g. 8 of 300 frames gives indices ``0, 43, 85, ..., 299``."""
+
     temporal_patch_size: int = 1
+    """Consecutive frames per tubelet, e.g. 2 turns 8 sampled frames into 4 tubelets."""
+
     frame_manifest_magic: Optional[bytes] = None
-    """Prefix for payloads encoded as ``magic + UTF-8 {"frame_paths": [...]}``."""
+    """Prefix for pre-extracted frame payloads: ``magic + UTF-8 JSON`` with ``frame_paths`` and
+    optional ``metadata`` (``frames_indices``, ``fps``). Must supply exactly ``num_frames``."""
+
     video_maintain_aspect_ratio: bool = True
+    """Fit each frame's grid to ``dynamic_resolution_max_patches``. With 256 patches, True maps
+    16:9 to 12x21 and False to a 16x16 square."""
 
 
 @dataclass(frozen=True)
 class MediaPromptSpec:
-    """Map one API media type to the model's prompt-token contract."""
+    """Map one API media type to the model's prompt-token contract.
+
+    Each media block renders as ``prefix + model_token + suffix``, e.g. Nemotron Omni
+    images as ``<img><image></img>``.
+    """
 
     model_token: str = "<image>"
+    """Single tokenizer token marking where media embeddings go, e.g. ``<image>``."""
+
     prefix: str = ""
+    """Text tokenized before the media token, e.g. ``<img>``."""
+
     suffix: str = ""
+    """Text tokenized after the media token, e.g. ``</img>``."""
+
     input_marker: Optional[str] = None
+    """Placeholder text removed from user text when this media type is present, e.g. a
+    literal ``<video>`` in ``"<video> What happens?"``."""
+
+    content_part_separator: str = ""
+    """Joins a media message's content parts, e.g. ``"\\n"`` renders [image, text] as
+    ``<img><image></img>\\nWhat is this?``."""
+
+    expansion_mode: Literal["single", "temporal_patch"] = "single"
+    """``single`` wraps each media item once; ``temporal_patch`` wraps each video tubelet,
+    e.g. 8 frames with ``temporal_patch_size=2`` become 4 newline-joined blocks."""
+
+    include_frame_timestamps_for_nemotron_vl: bool = False
+    """Prefix each tubelet with its frame times, e.g. ``Frame 1 sampled at 0.00 seconds and
+    frame 2 sampled at 0.03 seconds: <img><image></img>``. Requires ``temporal_patch``."""
+
+    def __post_init__(self):
+        if self.expansion_mode not in ("single", "temporal_patch"):
+            raise ValueError(
+                "MediaPromptSpec.expansion_mode must be 'single' or "
+                f"'temporal_patch', got {self.expansion_mode!r}."
+            )
+        if (
+            self.include_frame_timestamps_for_nemotron_vl
+            and self.expansion_mode != "temporal_patch"
+        ):
+            raise ValueError(
+                "MediaPromptSpec.include_frame_timestamps_for_nemotron_vl requires "
+                "expansion_mode='temporal_patch'."
+            )
 
 
 @dataclass(frozen=True)
 class MultimodalPromptConfig:
-    """Prompt contracts used to lower structured image/video blocks."""
+    """Prompt contracts used to lower structured image/video blocks.
+
+    Chat endpoints use this to turn OpenAI-style media blocks into prompt tokens;
+    model wrappers such as ``NemotronOmniInferenceWrapper`` define their defaults.
+    """
 
     image_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+    """Prompt contract for ``image_url`` blocks."""
+
     video_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+    """Prompt contract for ``video_url`` blocks."""
+
+    content_part_order: Literal["preserve", "media_first"] = "preserve"
+    """``preserve`` keeps each message's content order; ``media_first`` moves media ahead of
+    text, e.g. [text, video] renders the video first."""
+
+    def __post_init__(self):
+        if self.content_part_order not in ("preserve", "media_first"):
+            raise ValueError(
+                "MultimodalPromptConfig.content_part_order must be 'preserve' or "
+                f"'media_first', got {self.content_part_order!r}."
+            )
 
     def get_spec(self, modality: str) -> MediaPromptSpec:
         """Return the prompt specification for ``image`` or ``video``."""
@@ -304,13 +473,15 @@ class MultimodalPromptConfig:
         raise ValueError(f"Unsupported media modality: {modality!r}")
 
     @classmethod
-    def from_dict(cls, value):
-        """Build from image and video specs."""
+    def from_dict(cls, value, defaults=None):
+        """Build from image and video overrides, preserving optional defaults."""
         if not value:
-            return cls()
+            return defaults or cls()
+        defaults = defaults or cls()
         return cls(
-            image_spec=MediaPromptSpec(**value.get("image_spec", {})),
-            video_spec=MediaPromptSpec(**value.get("video_spec", {})),
+            image_spec=replace(defaults.image_spec, **dict(value.get("image_spec", {}))),
+            video_spec=replace(defaults.video_spec, **dict(value.get("video_spec", {}))),
+            content_part_order=value.get("content_part_order", defaults.content_part_order),
         )
 
 
@@ -348,6 +519,12 @@ class InferenceConfig:
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
     """The Mamba inference state config if the model is a hybrid model."""
+
+    mtp_layer_type_list: Optional[List[str]] = None
+    """Layer types of one MTP draft-head depth, one symbol per layer, or None for a non-hybrid
+    model, whose head is a single attention layer by construction. Read by
+    `DynamicInferenceContext` to decide whether the MTP draft attention can be given its own KV
+    plane."""
 
     mamba_memory_ratio: Optional[float] = None
     """
@@ -453,6 +630,9 @@ class InferenceConfig:
 
     video_preprocessing_config: Optional[VideoProcessingConfig] = None
     """Configuration for decoding and preprocessing raw video payloads."""
+
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None
+    """Optional per-engine overrides for the inference wrapper's media prompt contract."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """

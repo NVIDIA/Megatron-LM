@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Optional
 
 # tools/ lives at the repo root; put the repo root on sys.path so the
 # megatron.* and examples.* packages are importable regardless of cwd.
@@ -22,6 +23,8 @@ import torch  # noqa: E402
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
 from megatron.core.inference.config import (  # noqa: E402
     ImageProcessingConfig,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
     VideoProcessingConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
@@ -49,6 +52,7 @@ from megatron.core.utils import (  # noqa: E402
     configure_nvtx_profiling,
     get_pg_size,
     trace_async_exceptions,
+    unwrap_model,
 )
 from megatron.inference.utils import (  # noqa: E402
     get_dynamic_inference_engine,
@@ -57,6 +61,8 @@ from megatron.inference.utils import (  # noqa: E402
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -103,20 +109,26 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--default-temperature",
         type=float,
-        default=1.0,
-        help="Default temperature sampling value when a request does not specify temperature.",
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     parser.add_argument(
         "--default-top-p",
         type=float,
-        default=1.0,
-        help="Default top-p sampling value when a request does not specify top_p.",
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     parser.add_argument(
         "--default-top-k",
         type=int,
-        default=0,
-        help="Default top-k sampling value when a request does not specify top_k.",
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
     )
     parser.add_argument(
         "--eval-mode",
@@ -127,6 +139,56 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         ),
     )
     return parser
+
+
+def parse_args_and_detect_vlm(
+    extra_args_provider, args_defaults: dict, user_passed_attrs: Optional[set] = None
+):
+    """Parse CLI args and auto-detect VLM vs language model only from the checkpoint.
+
+    `add_multimodal_extra_args` via `add_text_generation_server_args` requires
+    --language-model-type or --tokenizer-prompt-format for a text-only checkpoint, so this injects
+    placeholders before parsing when the caller hasn't already set them, then overwrites them with
+    real values once the checkpoint shape is known.
+    Precedence for VLM-relevant args is CLI > checkpoint > parser default.
+
+    Callers that inject their own argv defaults first should compute user_passed_attrs beforehand
+    and pass it in.
+
+    Returns (args, is_vlm).
+    """
+    if user_passed_attrs is None:
+        user_passed_attrs = set()
+        for tok in sys.argv[1:]:
+            if tok.startswith('--'):
+                user_passed_attrs.add(tok[2:].split('=', 1)[0].replace('-', '_'))
+
+    _defaults = []
+    if "language_model_type" not in user_passed_attrs:
+        _defaults += ["--language-model-type", "placeholder"]
+    if "tokenizer_prompt_format" not in user_passed_attrs:
+        _defaults += ["--tokenizer-prompt-format", "mistral"]
+    sys.argv[1:1] = _defaults
+
+    args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
+    args = get_args()
+
+    is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
+    # Tiling and dynamic_resolution are mutually exclusive at inference, so
+    # use --use-tiling explicitly.
+    if getattr(args, 'use_tiling', False):
+        args.dynamic_resolution = False
+    if is_vlm:
+        _print_resolved_args("resolved VLM arguments", args)
+    if torch.distributed.get_rank() == 0:
+        print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
+
+    return args, is_vlm
 
 
 def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
@@ -146,6 +208,12 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     model = get_vlm_model(is_vlm=True)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
+    # A vision encoder with a native spatial merger (e.g. ViTModel's 2x2 merger) emits one token per
+    # merge_size x merge_size patch block and needs patch grids divisible by merge_size.
+    vision_merge_size = getattr(
+        getattr(unwrap_model(model), "vision_model", None), "spatial_merge_size", 1
+    )
+
     # Grow inference_config.max_sequence_length to accommodate the worst-case
     # image-expanded prompt, matching vlm_server.py's pre-engine bookkeeping.
     args.num_img_embeddings_per_tile = 0
@@ -158,6 +226,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             max_img_embeddings = max_patches
             if getattr(args, 'pixel_shuffle', False):
                 max_img_embeddings = max_img_embeddings // 4
+            max_img_embeddings //= vision_merge_size**2
             inference_config.max_sequence_length = max(
                 inference_config.max_sequence_length,
                 max_img_embeddings + args.num_tokens_to_generate + 512,
@@ -189,7 +258,9 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         dynamic_resolution=getattr(args, 'dynamic_resolution', False),
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
-        spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
+        spatial_merge_size=max(getattr(args, 'spatial_merge_size', 1), vision_merge_size),
+        image_break_token_id=getattr(args, 'image_break_token_id', None),
+        image_end_token_id=getattr(args, 'image_end_token_id', None),
         dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
         dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),
@@ -212,6 +283,16 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             )
         ),
     )
+    if getattr(args, 'mimo_checkpoint_prefix_map', None) is not None:
+        # MIMO training data marks image positions with a tokenizer special token (e.g. <img>);
+        # write that token into chat prompts instead of the default <image>.
+        image_token = tokenizer.detokenize([args.image_token_id], skip_special_tokens=False)
+        image_prompt_spec = MediaPromptSpec(model_token=image_token)
+        inference_config.multimodal_prompt_config = MultimodalPromptConfig(
+            image_spec=image_prompt_spec, video_spec=image_prompt_spec
+        )
+        if torch.distributed.get_rank() == 0:
+            print(f"MIMO image prompt token: {image_token!r} (id {args.image_token_id})")
 
     context = DynamicInferenceContext(model.config, inference_config)
     wrapped_model = VLMInferenceWrapper(model, context)
@@ -226,9 +307,9 @@ async def run_text_generation_server(
     server_port: int,
     hostname: str | None = None,
     chat_template: str | None = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: float | None = None,
+    default_top_p: float | None = None,
+    default_top_k: int | None = None,
     eval_mode: bool = False,
 ):
     """
@@ -241,9 +322,11 @@ async def run_text_generation_server(
         server_port (int): The network for port the frontend text generation server.
         hostname (str | None): Hostname or IP address for coordinator and HTTP traffic.
         chat_template (str | None): Inline chat template or contents loaded from a file.
-        default_temperature (float): Sampling default when a request omits `temperature`.
-        default_top_p (float): Sampling default when a request omits `top_p`.
-        default_top_k (int): Sampling default when a request omits `top_k`.
+        default_temperature (float | None): Sampling default when a request omits
+            `temperature`. None leaves it unset so the model's generation_config.json
+            can supply it; a value here takes precedence over that file.
+        default_top_p (float | None): Same, for `top_p`.
+        default_top_k (int | None): Same, for `top_k`.
         eval_mode (bool): Whether to use evaluation response defaults.
     """
 
@@ -346,9 +429,9 @@ if __name__ == "__main__":
     with torch.inference_mode():
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
-        # Snapshot what the user actually typed BEFORE we inject defaults, so
-        # _detect_vlm_from_checkpoint can tell explicit CLI args from injected
-        # defaults / parser defaults.  Precedence: CLI > checkpoint > default.
+        # Snapshot what the user actually typed BEFORE we inject defaults below,
+        # so parse_args_and_detect_vlm's checkpoint-vs-CLI precedence isn't
+        # confounded by server-specific injected defaults. Precedence: CLI > checkpoint > default.
         user_passed_attrs = set()
         for tok in sys.argv[1:]:
             if tok.startswith('--'):
@@ -366,13 +449,6 @@ if __name__ == "__main__":
             "1",
             "--inference-dynamic-batching-buffer-size-gb",
             "2.0",
-            # Placeholders for add_multimodal_extra_args' required args. These
-            # are injected as defaults, so _detect_vlm_from_checkpoint will
-            # replace them with the checkpoint's real values when loading a VLM.
-            "--language-model-type",
-            "placeholder",
-            "--tokenizer-prompt-format",
-            "mistral",
         ]
         # store_true flags: only inject when the user hasn't expressed a
         # conflicting choice on the CLI.
@@ -388,31 +464,20 @@ if __name__ == "__main__":
             _defaults.append("--return-log-probs")
         sys.argv[1:1] = _defaults
 
-        parse_and_validate_args(
+        args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
+            user_passed_attrs=user_passed_attrs,
         )
-        initialize_megatron()
-
-        args = get_args()
-
-        # Auto-detect VLM and copy VLM args from the checkpoint with precedence
-        # CLI > checkpoint > parser default.  Tiling and dynamic_resolution are
-        # mutually exclusive at inference, so honor --use-tiling explicitly.
-        is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
-        if getattr(args, 'use_tiling', False):
-            args.dynamic_resolution = False
-        if is_vlm:
-            _print_resolved_args("resolved VLM arguments", args)
-
-        if torch.distributed.get_rank() == 0:
-            print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
 
         # Match training's NVTX gating (training.py only flips this when both
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
         # nvtx_range_push labels (bookkeeping, Decode, _ep_establish_consensus,
         # etc.) are no-ops and the inter-step gap is unattributable in nsys.
-        if args.profile and args.nvtx_ranges:
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        cfg = get_run_config()
+        if (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler) and cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(True)
 
         # Already requested via --return-log-probs default above; keep this

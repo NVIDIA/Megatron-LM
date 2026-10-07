@@ -80,12 +80,19 @@ def test_mtp_layer_uses_global_fp8_context():
     get_fp8_context.assert_called_once_with(config)
 
 
-def test_mtp_layer_does_not_use_fp4_context():
+def test_mtp_layer_uses_fp4_context():
     config = SimpleNamespace(fp8=None, fp8_recipe=Fp8Recipe.delayed, fp4="e2m1")
     layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
     torch.nn.Module.__init__(layer)
     layer.config = config
+    expected_context = nullcontext()
 
-    context = layer.get_inner_quantization_context()
+    with patch(
+        "megatron.core.transformer.multi_token_prediction.get_fp4_context",
+        return_value=expected_context,
+    ) as get_fp4_context:
+        context = layer.get_inner_quantization_context()
 
-    assert isinstance(context, nullcontext)
+    assert context is expected_context
+    # MTP layer numbers are depth-local, so no decoder layer index is passed.
+    get_fp4_context.assert_called_once_with(config)

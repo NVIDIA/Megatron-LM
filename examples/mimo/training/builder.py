@@ -95,11 +95,24 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             modality_submodules_spec[name] = provider.encoder_specs[name](args, pg, grid)
             special_token_ids[name] = provider_token_ids[name]
 
+        language_model_spec = provider.language_spec(
+            args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
+        )
+        language_input_projections = {}
+        for name, factory in provider.language_input_projection_specs.items():
+            spec = factory(
+                args,
+                active_pg if is_language else None,
+                topology.grids[MIMO_LANGUAGE_MODULE_KEY],
+                language_model_spec,
+            )
+            if spec is not None:
+                language_input_projections[name] = spec
+
         mimo_config = MimoModelConfig(
-            language_model_spec=provider.language_spec(
-                args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
-            ),
+            language_model_spec=language_model_spec,
             modality_submodules_spec=modality_submodules_spec,
+            language_model_input_projections_spec=language_input_projections,
             special_token_ids=special_token_ids,
             module_to_grid_map=topology.grids,
         )

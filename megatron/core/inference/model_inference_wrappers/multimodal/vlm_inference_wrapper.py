@@ -149,6 +149,38 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     # ---- Dynamic inference methods ----
 
+    def _image_rows(self, module, imgs_sizes, per_image_embeddings, num_frames):
+        """Return (num_rows, row_len, break_id, end_id) per image for row-separated layouts.
+
+        Returns None unless the image preprocessing config sets a row break or image end token,
+        in which case each dynamic-resolution image is laid out row by row (Pixtral-style).
+        """
+        image_config = getattr(
+            getattr(getattr(self, "inference_context", None), "config", None),
+            "image_preprocessing_config",
+            None,
+        )
+        break_id = getattr(image_config, "image_break_token_id", None)
+        end_id = getattr(image_config, "image_end_token_id", None)
+        if break_id is None and end_id is None:
+            return None
+        if num_frames is not None:
+            raise NotImplementedError("Image row separators are not supported for video inputs.")
+        if module._pixel_shuffle:
+            raise NotImplementedError("Image row separators are not supported with pixel shuffle.")
+        merge = 2 if module._conv_merging else 1
+        image_rows = []
+        for (height, width), count in zip(imgs_sizes.tolist(), per_image_embeddings):
+            num_rows = height // module.patch_dim // merge
+            row_len = width // module.patch_dim // merge
+            if num_rows * row_len != count:
+                raise ValueError(
+                    f"Image of {num_rows}x{row_len} merged patches does not match its {count} "
+                    "embeddings; row separators need one embedding per merged patch."
+                )
+            image_rows.append((num_rows, row_len, break_id, end_id))
+        return image_rows
+
     def expand_image_tokens(
         self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None, *, image_token_id=None
     ):
@@ -237,6 +269,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         if per_image_embeddings is not None:
             # Dynamic resolution path
+            image_rows = self._image_rows(module, imgs_sizes, per_image_embeddings, num_frames)
             image_global_idx = 0
             for batch_idx in range(batch_size):
                 sample_tokens = tokens[batch_idx]
@@ -247,11 +280,22 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 for token in sample_tokens:
                     if token == image_token_index and image_global_idx < len(per_image_embeddings):
                         tokens_for_image = per_image_embeddings[image_global_idx]
-                        expanded_sample.extend([pad_value] * tokens_for_image)
-
-                        start_idx = image_embedding_offset
-                        end_idx = start_idx + tokens_for_image
-                        mask_sample.extend(list(range(start_idx, end_idx)))
+                        if image_rows is None:
+                            expanded_sample.extend([pad_value] * tokens_for_image)
+                            start_idx = image_embedding_offset
+                            end_idx = start_idx + tokens_for_image
+                            mask_sample.extend(list(range(start_idx, end_idx)))
+                        else:
+                            # Row-major image tokens, each row followed by its separator token.
+                            num_rows, row_len, break_id, end_id = image_rows[image_global_idx]
+                            for row in range(num_rows):
+                                start_idx = image_embedding_offset + row * row_len
+                                expanded_sample.extend([pad_value] * row_len)
+                                mask_sample.extend(range(start_idx, start_idx + row_len))
+                                separator = break_id if row < num_rows - 1 else end_id
+                                if separator is not None:
+                                    expanded_sample.append(separator)
+                                    mask_sample.append(None)
 
                         image_embedding_offset += tokens_for_image
                         image_global_idx += 1
@@ -498,8 +542,8 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         Dispatches to one of three paths:
         1. Dynamic VLM path: 'image_token_mask' key is present.
         2. Static VLM path: 'images' key is present (LLaVA forward).
-        3. Pure text (GPT) path: neither key present — delegates to the base
-           GPTInferenceWrapper._forward so that text-only models work unmodified.
+        3. Pure-text/decode path: neither key present — embeds tokens directly
+           and calls LLaVAModel.forward_lm_only without media preprocessing.
 
         Args:
             inference_input(Dict[str, Any]): The input data.
@@ -507,34 +551,11 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         Returns:
             The model output logits.
         """
-        # Dynamic path: image_token_mask is present
-        if "image_token_mask" in inference_input:
+        # Dynamic prefill and media-free decode both use the LM-only path.
+        # Keep the legacy static path below only for callers that pass raw
+        # images for LLaVAModel.forward to encode.
+        if "image_token_mask" in inference_input or "images" not in inference_input:
             return self._forward_dynamic(inference_input)
-
-        # Pure text path: no VLM keys.
-        # Cannot delegate to super()._forward() because the abstract wrapper passes
-        # (tokens, position_ids, attention_mask) positionally, but LLaVAModel.forward
-        # expects (images, input_ids, position_ids, attention_mask).
-        if "images" not in inference_input:
-            tokens = inference_input["tokens"]
-            position_ids = inference_input["position_ids"]
-            attention_mask = inference_input["attention_mask"]
-            # Pass an empty images tensor (not None) to match what the training
-            # data pipeline provides for text-only samples.
-            empty_images = torch.tensor([], device=tokens.device).reshape(0, 0, 0)
-            output = self.model(
-                empty_images,
-                tokens,
-                position_ids,
-                attention_mask=attention_mask,
-                inference_context=self.inference_context,
-                runtime_gather_output=True,
-            )
-            if isinstance(output, tuple):
-                logits, _ = output
-            else:
-                logits = output
-            return logits
 
         # VLM path: standard LLaVA forward
         images = inference_input["images"]

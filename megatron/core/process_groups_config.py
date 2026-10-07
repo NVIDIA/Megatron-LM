@@ -49,6 +49,8 @@ class ProcessGroupCollection:
 
         # Data Parallelism Groups
         dp: Data parallel process group
+        dp_gtp_remat: Full data-distribution group without CP, dp x gtp_remat;
+            identical to dp when GTP_remat_size=1
         dp_cp: Data and context parallel group
         dp_cp_gtp_remat: Full data-distribution group, dp_cp x gtp_remat;
             identical to dp_cp when GTP_remat_size=1
@@ -121,6 +123,11 @@ class ProcessGroupCollection:
     # Data Parallelism Process Groups
     # _DATA_PARALLEL_GROUP
     dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _DATA_PARALLEL_GROUP_WITH_GTP_REMAT: the full data-distribution group without CP, DP x
+    # gtp_remat. This is the axis a dataloader shards on, so index per-rank dataloader state
+    # with it. Identical to ``dp`` when gtp_remat_size=1.
+    dp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _DATA_PARALLEL_GROUP_WITH_CP
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
@@ -263,6 +270,7 @@ class ProcessGroupCollection:
                 parallel_state.get_position_embedding_group, check_initialized=False
             ),
             'dp': partial(parallel_state.get_data_parallel_group, with_gtp_remat=False),
+            'dp_gtp_remat': partial(parallel_state.get_data_parallel_group, with_gtp_remat=True),
             'dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
