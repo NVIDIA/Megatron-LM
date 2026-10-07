@@ -38,7 +38,7 @@ _PREFIX_MAP = {
 def checkpoint_keys(monkeypatch):
     """Serve the given keys as the tensor keys of the loaded checkpoint."""
     keys = [_LANGUAGE_KEY]
-    monkeypatch.setattr(vlm, '_checkpoint_tensor_keys', lambda args: keys)
+    monkeypatch.setattr(vlm, '_checkpoint_tensor_keys', lambda args, checkpoint_dir=None: keys)
     return keys
 
 
@@ -118,6 +118,7 @@ def test_resolve_mimo_vision_args(tmp_path):
 def test_check_mimo_checkpoint_fully_loaded(monkeypatch, checkpoint_keys):
     monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 1)
     monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+    monkeypatch.setattr(vlm, '_loaded_checkpoint_dir', lambda args: '/checkpoint/iter_0000001')
     monkeypatch.setattr(
         torch.distributed, 'all_gather_object', lambda out, obj: out.__setitem__(0, obj)
     )
@@ -194,3 +195,24 @@ def test_dynamic_image_rows(break_id, end_id, expanded, mask):
     assert wrapper.expand_image_tokens(
         [[5, 18, 7]], imgs_sizes=torch.tensor([[56, 84]]), image_token_id=18
     ) == ([expanded], [mask])
+
+
+def test_every_rank_resolves_the_checkpoint_dir(monkeypatch, checkpoint_keys):
+    """Resolving the iteration from the tracker all-reduces, so a non-zero rank must join it."""
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 1)
+    monkeypatch.setattr(torch.distributed, 'all_gather_object', lambda out, obj: None)
+    monkeypatch.setattr(torch.distributed, 'broadcast_object_list', lambda objs, src: None)
+    resolved = []
+    monkeypatch.setattr(vlm, '_loaded_checkpoint_dir', lambda args: resolved.append(args))
+    read = []
+    monkeypatch.setattr(
+        vlm, '_checkpoint_tensor_keys', lambda args, checkpoint_dir=None: read.append(args)
+    )
+    args = SimpleNamespace(mimo_checkpoint_prefix_map=_PREFIX_MAP)
+    model = SimpleNamespace(sharded_checkpoint_keys={_LANGUAGE_KEY})
+
+    vlm._check_mimo_checkpoint_fully_loaded(args, model)
+
+    assert resolved == [args]
+    assert read == []  # Only rank 0 reads the checkpoint metadata.
