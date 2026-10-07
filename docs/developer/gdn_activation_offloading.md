@@ -262,9 +262,10 @@ configuration-only regression tests used `--noconftest`.
 
 `tools/autoformat.sh` passes its Black, isort, Pylint and Ruff gates, and kernel
 determinism coverage passes. With the common manager, scheduling code and their tests included, the non-blocking
-mypy step reports 44 existing diagnostics; checking an isolated original `main`
-worktree reproduces the same 44. The new tool and GDN offload test file pass
-a separate mypy check.
+mypy step reports 48 existing diagnostics: 44 reproduce in an isolated original
+`main` worktree, and four from the newly checked native fusion file reproduce
+before its gate-backward fix. The new tool, training test and gate replay test
+pass a separate mypy check with the optional Bridge dependency available.
 
 The measured first slice meets these acceptance criteria: outputs and all gradients
 agree through warmup and multiple steady iterations, pinned buffers return to the
@@ -276,10 +277,13 @@ memory option. This does not replace the upstream CI or full-model qualification
 Complete pretrained training and several parallel configurations have since been
 qualified in [complete-model GDN offload validation](gdn_activation_offload_training.md).
 Short-sequence fused training passes on all five available two-rank topologies.
-At sequence 2048, native pre-GDR gate-parameter gradients are not bitwise
-repeatable even with offloading disabled, so fused long-sequence full-state
-qualification remains open. The complete-model document records this failure
-separately from the passed comparisons and unfused performance measurements.
+The original sequence-2048 failure also occurred with offloading disabled. Replacing
+native gate-backward atomic reductions and autotuning with fixed tiles and ordered
+FP32 partial reduction restores bit-exact complete states at sequences 2048/4096,
+with norm recomputation off/on. The complete-model document records the reproduced
+failure, the fix and its new acceptance evidence separately from the earlier runs.
+It also reports complete-optimizer-step memory/runtime comparisons with separate
+raw samples and runtime-source provenance for unfused and fixed fused pre-GDR.
 The remaining follow-up work is:
 
 1. Confirm the scope/name and integration boundary with #7852. Keep recurrence saves

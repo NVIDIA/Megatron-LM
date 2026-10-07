@@ -14,9 +14,10 @@ do not replace upstream CI.
 The GDN recurrence suite passes 65 cases in both eager mode and with default
 compilation. It covers dense and packed inputs with fused pre-GDR disabled/enabled
 and output-norm recomputation disabled/enabled. Fused runs use causal-conv1d 1.6.1
-with its deterministic convolution-weight-gradient reduction. This does not
-determinize the separate native pre-GDR gate-parameter reductions. The existing
-pre-GDR fusion suite also passes all 11 cases.
+with its deterministic convolution-weight-gradient reduction. Gate-parameter
+backward now uses fixed tiles and an ordered FP32 reduction, as described below.
+The existing pre-GDR fusion suite passes all 11 cases. A new kernel test passes
+16 cases with byte-exact FP32 gradient replays under side-stream contention.
 Fused and unfused offload comparisons use separate disabled baselines; they do
 not require the two pre-GDR implementations to produce identical bits.
 The previously skipped shared-manager aggregation regression and existing GDN
@@ -42,9 +43,11 @@ from pretrained CP, which remains unqualified.
 | Pretrained Qwen, fused pre-GDR on two ranks | DP, TP, TP+SP, PP and PP+VPP: all 8 arms per topology passed on each rank; every pre-reset pool count is zero |
 | Pretrained Qwen, CP on two ranks | Disabled baseline cannot select an attention backend for head dimension 256 on A6000; unqualified |
 | Pretrained Qwen, unfused pre-GDR at sequence lengths 2048/4096 | Baseline and fraction 1 passed with norm recomputation off/on; all 3 step states also match across recomputation settings |
-| Pretrained Qwen, fused pre-GDR at sequence 2048 | Complete step states are not bit-exact; repeated disabled baselines also differ in native gate-parameter gradients and Adam moments; unqualified |
+| Pretrained Qwen, fused pre-GDR at sequence lengths 2048/4096 | Disabled/fraction-1 with norm recomputation off/on: all 24 complete step states match, including across norm settings |
 | Pretrained Qwen, unfused pre-GDR memory/runtime | All 48 processes completed; 480 measured samples across 2 lengths × 2 norm settings × 4 arms × 3 repeats |
 | Pretrained Qwen, unfused pre-GDR DP=2 memory/runtime | Disabled/full offload, sequence 2048, three repeats; 60 measured world steps / 120 rank samples |
+| Pretrained Qwen, fixed fused pre-GDR memory/runtime | All 48 fresh processes completed; 480 measured samples across 2 lengths × 2 norm settings × 4 arms × 3 repeats |
+| Pretrained Qwen, fixed fused pre-GDR DP=2 memory/runtime | Disabled/full offload, sequence 2048, three repeats; 60 measured world steps / 120 rank samples |
 
 The single-rank Qwen comparison uses all 24 text decoder layers, hidden size 1024 and
 vocabulary size 248320 from the original checkpoint. Each arm starts from the
@@ -77,6 +80,9 @@ on SM86, and its fused CP backend rejects this head dimension. The unfused
 backend does not support CP. Installing FlashAttention 2.8.3 therefore qualifies
 reduced-model CP but leaves pretrained Qwen CP unqualified. These runs do not
 change external backend checks or relax the comparison's determinism setting.
+Native backend queries also reject all nine combinations of `p2p`, `all_gather`
+and `a2a` communication with sequence lengths 128, 2048 and 4096 at the original
+256-dimensional heads on this A6000 environment.
 
 The reduced-model suite checks pinned-buffer ownership immediately before every
 native schedule reset. A deliberate omission of one pool return fails this check;
@@ -96,7 +102,7 @@ run and check ownership before every reset. The unfused reduced-model fraction/n
 matrix also passed at this commit. Expanded fusion coverage uses the same production
 runtime files.
 
-The complete two-rank fused comparisons run at
+The earlier complete two-rank fused comparisons ran at
 `b3434091b84235548945e3f8f7989c2ddb19137f`, with production runtime files identical
 to `4e18562c6bcf894795d23378a8f1699c79e4b797`. DP, TP, TP+SP, PP and PP+VPP each
 pass all eight arms, including across norm recomputation settings: 40 fresh
@@ -109,20 +115,78 @@ fractions 0.5 and 1 select positive bytes on both ranks. DP replicas have distin
 losses and identical reduced gradients, updated weights and Adam states. These
 are correctness runs; they contain no performance samples.
 
-A subsequent fused sequence-2048 comparison does not pass the same bit-exact
-full-state check, with norm recomputation off or on. Losses, gradient norms and
-all updated weights match for all three steps, but a few `A_log`/`dt_bias`
-gradients and their Adam moments differ. Fresh repeats of the disabled baseline
-on the same GPU reproduce differences in those parameters without activation
-offloading. Other parameter gradients match exactly in these comparisons, and
-all pre-reset pool counts are zero.
-The existing `_g_beta_backward_kernel` uses FP32 `atomic_add` parameter reductions;
-the kernel manifest already records pre-GDR fusion as non-deterministic. Setting
-`CAUSAL_CONV1D_DETERMINISTIC=1` controls convolution backward, not those reductions.
-The short-sequence fused results above do not establish repeatable full-state
-training at longer sequences. Fused sequence 4096 and fused performance runs have
-not run. These limits are retained rather than relaxing the comparison or changing
-the native fusion kernel in this offload pilot.
+Before the gate-backward fix, fused sequence-2048 comparisons failed the bit-exact
+full-state check with norm recomputation off or on. Losses, gradient norms and
+all updated weights matched for all three steps, but a few `A_log`/`dt_bias`
+gradients and their Adam moments differed. Fresh repeats of the disabled baseline
+on the same GPU reproduced differences in those parameters without activation
+offloading. Other parameter gradients matched exactly in these comparisons, and
+all pre-reset pool counts were zero.
+The old `_g_beta_backward_kernel` atomically added FP32 partial sums into shared
+parameter-gradient buffers. Program scheduling changed their addition order;
+backward autotuning could also change the partition between fresh processes.
+`CAUSAL_CONV1D_DETERMINISTIC=1` controls convolution backward, not these reductions.
+
+At code commit `2f1ee4f2e3dd6d909d08981338f5879632131139`, gate backward instead
+uses fixed 128-token by 16-head tiles. Each program writes its FP32 parameter
+partials to its own slot, followed by one Torch sum over batch and sequence blocks
+on the same stream. The temporary buffer has
+`2 * batch * ceil(sequence_length / 128) * value_heads` FP32 elements (4 KiB for
+batch 1, sequence 4096 and 16 heads). This follows the existing gated-norm reduction
+pattern and adds no new configuration option or offload component.
+An isolated A6000 gate-backward measurement compares the old atomic helper with
+the fixed helper using a preallocated projection-gradient buffer. It covers batch
+1, sequences 128/2048/4096, 16 or 8 value heads and head dimension 128, with three
+alternating trials after autotuning. The ordered helper takes approximately
+2–3 microseconds longer per call. CUDA-event medians are quantized at this scale;
+complete training-step measurements below remain the offload trade-off evidence.
+
+The new replay test reproduced parameter-gradient differences with the old kernel
+before passing all 16 cases with the fix. It compares all returned gradients byte
+for byte, including FP32 parameter gradients before their BF16 cast, over five
+replays with side-stream contention. Cases cover BF16/FP32, multiple batches,
+strided upstream gradients, an explicit side stream, sequence lengths 2048/4096
+and partial sequence/head tiles. A separate Torch-autograd numerical reference
+checks accuracy; its tolerance does not weaken replay or training-state equality.
+
+Eight fresh pretrained fused runs at the fixed commit compare disabled/full
+offload at sequences 2048/4096 with norm recomputation off/on. All 24 complete step
+states match, including across norm settings, and every pre-reset pool count is
+zero. The default 1,048,576-element threshold selects 2,084,569,088 and
+4,169,138,176 transfer bytes per full iteration, respectively. The earlier failed
+artifacts are preserved separately from these successful runs.
+Four additional fresh disabled-baseline repeats, one per sequence/norm setting
+on the same device, also match every complete state. In total, 12 independent
+processes produce 36 exact step states; gradient and Adam equality is required,
+including for `A_log` and `dt_bias`.
+Full pre-GDR fusion still rejects `deterministic_mode=True`: other native kernels
+autotune, and convolution backward requires its external determinism setting.
+These results qualify the recorded configuration rather than all FLA/fusion
+implementations or hardware.
+Changing the reduction tree can change rounded gradients relative to the old
+atomic implementation. A short DP replay against the old source differed in one
+first-step `A_log` gradient and Adam state while losses, gradient norms and updated
+weights matched. Qualification therefore uses disabled baselines from the same
+fixed implementation, rather than requiring identical bits across the old and new
+reduction algorithms.
+
+Eight fresh single-rank runs with the fixed gate kernel also compare all four
+offload arms with norm recomputation off/on. All 24 complete states match the
+norm-disabled baseline, and every pre-reset pool count is zero. They use sequence
+128 and a 1024-element threshold to exercise transfers.
+
+The fixed implementation also reruns all eight arms for DP, TP, TP+SP, PP and
+PP+VPP against fresh disabled baselines from the same runtime source: 40 fresh
+two-rank runs, 80 rank-result files and 240 complete rank-step states. All losses,
+gradient norms, parameter gradients, updated weights and complete Adam states
+match each rank's norm-disabled baseline, including across norm recomputation
+settings. Every pre-reset pool count is zero. Disabled/fraction-zero select no
+steady transfers; positive fractions select transfers on both ranks. DP replicas
+use distinct data and have identical reduced gradients, weights and Adam states.
+The runtime source is `2f1ee4f2e3dd6d909d08981338f5879632131139`; the later kernel
+registry commit changes test metadata only. An independent artifact validator
+checks all 80 two-rank files, eight single-rank files and 12 long-sequence files,
+and records their hashes.
 
 The shared-manager changes also pass all nine existing GPT/MoE CUDA Graph offload
 cases on one A6000. These cover attention/MLA and expert groups, fractions 0/0.5/1
@@ -131,8 +195,10 @@ graph path; GDN offloading still rejects CUDA graphs at configuration time.
 
 ## Complete-Qwen A6000 measurements
 
+### Unfused pre-GDR
+
 These measurements use unfused pre-GDR with the pretrained model and real text
-dataset described above. Fused correctness runs are reported separately. They use
+dataset described above. They use
 four microbatches per complete optimizer step, the default 1,048,576-element
 threshold, three warmup steps and ten measured steps. Each of the four arms
 runs in a fresh process; the comparison repeats three times for each sequence
@@ -194,7 +260,7 @@ These measurements use code commit
 The earlier 480-sample comparison is preserved at `496232fe0`; its runtime figures
 are superseded here.
 
-### Two-rank data-parallel measurement
+#### Unfused data-parallel measurement
 
 A separate DP=2 comparison uses physical GPUs 1 and 4 together, sequence 2048,
 norm recomputation disabled, four microbatches per replica, the default threshold,
@@ -219,6 +285,74 @@ contains these rank samples, identified by `dp_size=2` and `rank`; its 480
 single-rank samples have `dp_size=1` and `rank=0`. These data qualify this DP
 measurement, not TP/CP/PP throughput or scaling efficiency.
 
+### Fixed fused pre-GDR
+
+This separate matrix uses the fixed gate-backward implementation from
+`2f1ee4f2e3dd6d909d08981338f5879632131139`, with the same model, data, default
+threshold, microbatches and timing method as the unfused matrix. The later
+`6f83b6c7b` commit only scopes the kernel determinism registry; production runtime
+files remain identical. Fused and unfused results each use their own disabled
+baselines.
+
+Both norm-setting matrices ran sequentially on physical GPU 4
+(`GPU-7595108b-553d-3126-385e-30133180c720`). Every timed process has per-second
+occupancy evidence with no external compute process on its measured GPU.
+The host and other GPUs were shared, and clocks were not locked. These results
+measure the offload trade-off within each fusion/norm setting; they do not isolate
+the cost of changing the gate kernel or compare fusion speed across environments.
+
+| Sequence | Norm recompute | Fraction | Peak allocated (MiB) | Selected D2H/iteration (GiB) | Runtime change, median [range] |
+| ---: | --- | --- | ---: | ---: | --- |
+| 2048 | Off | disabled | 21737.65 | 0.000 | — |
+| 2048 | Off | 0 | 21737.03 | 0.000 | +0.34% [-6.45%, +2.76%] |
+| 2048 | Off | 0.5 | 21484.90 | 0.984 | +3.30% [-2.48%, +5.37%] |
+| 2048 | Off | 1 | 21261.03 | 1.941 | +7.65% [-2.42%, +10.20%] |
+| 4096 | Off | disabled | 31302.17 | 0.000 | — |
+| 4096 | Off | 0 | 31302.17 | 0.000 | +0.38% [+0.30%, +0.59%] |
+| 4096 | Off | 0.5 | 30798.17 | 1.969 | +2.85% [+2.53%, +3.60%] |
+| 4096 | Off | 1 | 30350.17 | 3.883 | +5.80% [+4.95%, +8.10%] |
+| 2048 | On | disabled | 21446.40 | 0.000 | — |
+| 2048 | On | 0 | 21446.78 | 0.000 | +2.37% [-0.22%, +7.92%] |
+| 2048 | On | 0.5 | 21194.65 | 0.984 | +9.45% [+2.97%, +9.77%] |
+| 2048 | On | 1 | 20970.78 | 1.941 | +9.68% [+2.49%, +19.03%] |
+| 4096 | On | disabled | 30721.67 | 0.000 | — |
+| 4096 | On | 0 | 30721.92 | 0.000 | +0.48% [+0.41%, +1.45%] |
+| 4096 | On | 0.5 | 30217.92 | 1.969 | +2.99% [+2.89%, +5.01%] |
+| 4096 | On | 1 | 29769.92 | 3.883 | +6.21% [+4.30%, +8.50%] |
+
+Full offload saves 476.62 MiB (2.19%) at sequence 2048 and 952.00 MiB (3.04%) at
+4096 without norm recomputation. With norm recomputation, it saves 475.62 MiB
+(2.22%) and 951.75 MiB (3.10%), respectively.
+Complete-model peaks include attention, MLPs, vocabulary loss and optimizer state.
+
+The 48 fresh single-rank processes produce 480 measured samples. All 13 logged
+loss records match exactly across arms, repeats and norm settings at each length.
+Gradient, weight and complete Adam fingerprints are checked separately in the
+three-step correctness runs; those snapshots are excluded from timed runs.
+
+#### Fused data-parallel measurement
+
+A separate fused DP=2 comparison uses physical GPUs 1 and 4 together, sequence
+2048, norm recomputation disabled and the same timing method. Four microbatches
+per replica give a global batch of eight sequences per update. Both measured GPUs
+have occupancy evidence without external compute processes. As in the unfused
+DP comparison, each world step uses the larger allocated peak and the slower
+rank's synchronized time.
+
+| DP size | Sequence | Norm recompute | Disabled peak (MiB) | Full-offload peak (MiB) | Memory reduction | Runtime change, median [range] |
+| ---: | ---: | --- | ---: | ---: | --- | --- |
+| 2 | 2048 | Off | 21737.65 | 21261.78 | 475.87 MiB / 2.19% | +6.16% [+2.07%, +7.01%] |
+
+The six fresh two-rank runs produce 60 measured world steps and 120 rank
+samples. All 13 loss records on each rank match its own disabled baseline across
+arms and repeats; replicas consume distinct data. Full offload selects
+2,084,569,088 transfer bytes per replica per iteration.
+
+[Raw fixed-fusion single-rank and DP samples](gdn_activation_offload_training_fused_a6000.csv)
+contain all 600 rank samples. The earlier unfused CSV remains separate with its
+original runtime-source provenance; historical failures are retained separately.
+These DP figures qualify the measured configuration, not TP/CP/PP throughput.
+
 ## Training comparison
 
 The test builds eight complete decoder blocks with the `GGG*GGG*` pattern: three
@@ -232,8 +366,8 @@ GDN uses four key heads, sixteen value heads and head dimension 64. The sixteen
 value heads keep local counts divisible by four for the listed TP/CP shards, so
 the packed projection stride meets native causal-conv1d backward's eight-element
 alignment requirement. The initial four-value-head fixture failed in its disabled
-fused TP baseline with an unaligned stride. Both comparison arms now use aligned
-dimensions; no production fusion kernel or external backend check is changed.
+fused TP baseline with an unaligned stride. Both comparison arms use aligned
+dimensions, preserving the native convolution contract and external backend checks.
 
 For each topology, baseline and offloaded models start from identical weights and
 consume the same changing batches. Three optimizer iterations each accumulate
