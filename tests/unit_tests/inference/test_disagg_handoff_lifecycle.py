@@ -811,7 +811,9 @@ def test_handoff_finishes_without_an_extra_decode_step(
 def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     engine = object.__new__(DynamicInferenceEngine)
     engine.stop_word_being_finished_ids = set()
-    engine.controller = SimpleNamespace(terminating_token_ids=lambda _: frozenset())
+    engine.controller = SimpleNamespace(
+        terminating_token_ids=lambda _, stop_token_ids=None: frozenset(stop_token_ids or ())
+    )
     request = DynamicInferenceRequest(
         request_id=7,
         prompt_tokens=torch.arange(4),

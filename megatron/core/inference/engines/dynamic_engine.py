@@ -2957,7 +2957,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Token ids that end generation for this request.
 
         The CPU-side counterpart of the controller's per-step tensor check, resolved
-        through the controller and combined with explicit request stop ids.
+        through the controller, including explicit request stop ids.
         Disabling model EOS (`ignore_eos`) does not disable explicit stops.
 
         Args:
@@ -2967,8 +2967,9 @@ class DynamicInferenceEngine(AbstractEngine):
             frozenset: Model EOS ids (unless disabled) and explicit request stop ids.
         """
         return self.controller.terminating_token_ids(
-            request.sampling_params.termination_id
-        ) | frozenset(request.sampling_params.stop_token_ids or ())
+            request.sampling_params.termination_id,
+            stop_token_ids=request.sampling_params.stop_token_ids,
+        )
 
     def _truncate_at_mid_block_eos(
         self,

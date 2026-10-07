@@ -425,24 +425,28 @@ class TextGenerationController(MTPControllerMixin):
             return None
         return torch.tensor(sorted(self.extra_eos_token_id_set), dtype=torch.long)
 
-    def terminating_token_ids(self, termination_id: Optional[int]) -> frozenset:
-        """Token ids that end generation for a request with this `termination_id`.
+    def terminating_token_ids(
+        self, termination_id: Optional[int], stop_token_ids: Optional[List[int]] = None
+    ) -> frozenset:
+        """Model EOS and explicit stop token ids that end generation for a request.
 
         The CPU-side counterpart of the `extra_eos_token_id_tensor` check, for the
         termination sites that work on Python ints rather than a batched tensor:
         the engine's mid-speculative-block scan and the disaggregated handoff
-        admission check. Returns an empty set when termination is disabled
-        (`ignore_eos`, i.e. `termination_id` of -1 or None).
+        admission check. Disabling model EOS (`ignore_eos`, i.e. `termination_id`
+        of -1 or None) does not disable explicit stop token ids.
 
         Args:
             termination_id (Optional[int]): The request's own termination id.
+            stop_token_ids (Optional[List[int]]): Explicit request stop token ids.
 
         Returns:
-            frozenset: Terminating token ids, empty when termination is disabled.
+            frozenset: Model EOS ids (unless disabled) and explicit request stop ids.
         """
+        explicit_stops = frozenset(stop_token_ids or ())
         if termination_id is None or termination_id < 0:
-            return frozenset()
-        return self.extra_eos_token_id_set | {termination_id}
+            return explicit_stops
+        return self.extra_eos_token_id_set | {termination_id} | explicit_stops
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:

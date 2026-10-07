@@ -2141,7 +2141,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert merged.generated_tokens == generated
         assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
         assert merged.finish_reason == "length"
-        engine.controller.terminating_token_ids.assert_called_with(-1)
+        engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
         np.testing.assert_array_equal(current.routing_indices, expected)
         np.testing.assert_array_equal(merged.routing_indices, expected)
         assert merged.routing_indices.shape[0] == (

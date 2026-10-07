@@ -1930,6 +1930,23 @@ def test_terminating_token_ids_empty_when_ignore_eos(termination_id):
     assert controller.terminating_token_ids(termination_id) == frozenset()
 
 
+@pytest.mark.parametrize("termination_id", [2, -1, None])
+@pytest.mark.parametrize("stop_token_ids", [None, [], [7, 11, 7]])
+def test_terminating_token_ids_combines_request_stops(termination_id, stop_token_ids):
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, 11]})
+    original_stops = None if stop_token_ids is None else list(stop_token_ids)
+    expected = set(stop_token_ids or ())
+    if termination_id == 2:
+        expected.update([2, 11])
+
+    result = controller.terminating_token_ids(termination_id, stop_token_ids=stop_token_ids)
+
+    assert isinstance(result, frozenset)
+    assert result == expected
+    assert stop_token_ids == original_stops
+    assert controller.extra_eos_token_id_set == frozenset({2, 11})
+
+
 def test_build_extra_eos_token_id_set_rejects_booleans():
     # bool is an int subclass, so {"eos_token_id": true} must not become id 1.
     controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, True]})
