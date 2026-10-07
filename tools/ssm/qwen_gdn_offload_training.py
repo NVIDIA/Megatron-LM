@@ -112,6 +112,8 @@ def _provider(args: argparse.Namespace) -> Any:
             "pipeline_model_parallel_size": args.pp,
             "virtual_pipeline_model_parallel_size": args.vp,
             "pipeline_dtype": torch.bfloat16,
+            # PP=2/VPP sends both directions to one peer; native unbatched P2P orders them.
+            "batch_p2p_comm": False,
             "use_cpu_initialization": False,
             "gradient_accumulation_fusion": False,
             # The VL import also constructs vision with the default auto backend;
@@ -358,6 +360,8 @@ def main() -> None:
         "text_layers": provider.num_layers,
         "text_hidden_size": provider.hidden_size,
         "dataset_tokens": len(token_ids),
+        "pipeline_batch_p2p_comm": provider.batch_p2p_comm,
+        "pipeline_deallocate_outputs": provider.deallocate_pipeline_outputs,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu_training_run": not args.dry_run,
