@@ -271,7 +271,8 @@ class PretrainConfigContainer(ConfigContainerBase):
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
         super().validate()
-        cuda_graph_impl = None if self.model is None else self.model.transformer.cuda_graph_impl
+        transformer = getattr(self.model, "transformer", None)
+        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
         self.rl.validate_run(
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,

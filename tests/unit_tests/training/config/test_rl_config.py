@@ -227,19 +227,37 @@ def test_validate_run_at_every_call_site():
     cfg.validate_run(**{**RUN, "cuda_graph_impl": None})
     RLConfig(rl_use_sequence_packing=True).validate_run(**{**RUN, "micro_batch_size": 4})
 
-    # Through the container: the sections supply the inputs; no model skips the CUDA-graph rule.
-    def container(**rl_kwargs):
+    # Through the container: the sections supply the inputs.
+    # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
+    from megatron.training.models.base import ModelConfig
+
+    @dataclasses.dataclass
+    class TopologyOnlyModelConfig(ModelConfig):
+        builder: typing.ClassVar[str] = "tests.topology_only"
+
+    @dataclasses.dataclass
+    class TransformerModelConfig(ModelConfig):
+        builder: typing.ClassVar[str] = "tests.transformer"
+        transformer: types.SimpleNamespace = dataclasses.field(
+            default_factory=lambda: types.SimpleNamespace(cuda_graph_impl="none")
+        )
+
+    def container(model=None, rl=None, **rl_kwargs):
         return PretrainConfigContainer(
             train=TrainingConfig(micro_batch_size=4, global_batch_size=12),
-            model=None,
+            model=model,
             optimizer=OptimizerConfig(),
             scheduler=SchedulerConfig(),
             logger=LoggerConfig(),
             checkpoint=CheckpointConfig(),
-            rl=RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
+            rl=rl if rl is not None else RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
         )
 
     container(rl_training_cuda_graphs=True).validate()
+    container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
+    container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
+    with pytest.raises(ValueError, match="no CUDA graphs"):
+        container(model=TransformerModelConfig(), rl_training_cuda_graphs=True).validate()
     with pytest.raises(ValueError, match="must be 1"):
         container(rl_use_sequence_packing=True).validate()
 
