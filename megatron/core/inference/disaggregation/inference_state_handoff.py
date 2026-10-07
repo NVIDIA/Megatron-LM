@@ -758,6 +758,8 @@ class InferenceStateHandoffMixin:
         sampling_params: "SamplingParams",
         kv_meta: dict,
         src_block_ids: list,
+        *,
+        offload_params: dict | None = None,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
         """Start or capacity-queue a KV import and return its completion future.
 
@@ -847,6 +849,7 @@ class InferenceStateHandoffMixin:
             hashes=hashes,
             num_blocks=num_blocks,
             future=future,
+            offload_params=offload_params,
         )
         # Preserve receive order under backpressure. This is required by NCCL's
         # two-sided transport and also prevents a stream of small handoffs from
@@ -973,6 +976,7 @@ class InferenceStateHandoffMixin:
         pending = PendingKvImport(
             request_id=handoff.request_id,
             prompt=handoff.prompt,
+            offload_params=handoff.offload_params,
             sampling_params=handoff.sampling_params,
             local_blocks=local_blocks,
             hashes=handoff.hashes,
@@ -1194,6 +1198,7 @@ class InferenceStateHandoffMixin:
             pending.request_id,
             pending.prompt,
             pending.sampling_params,
+            offload_params=pending.offload_params,
             precomputed_block_hashes=(
                 pending.hashes[:registration_end] if registration_end > 0 else None
             ),

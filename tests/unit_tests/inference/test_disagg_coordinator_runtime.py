@@ -27,8 +27,16 @@ def _decode_engine_frames(frames):
         return [metadata[0], metadata[1], decoded[1], metadata[2], decoded[2], decoded[3]]
     if header == Headers.SUBMIT_REQUEST_WITH_KV:
         assert len(metadata) == 4
-        assert len(decoded) == 3
-        return [metadata[0], metadata[1], decoded[1], metadata[2], metadata[3], decoded[2]]
+        assert len(decoded) == 4
+        return [
+            metadata[0],
+            metadata[1],
+            decoded[1],
+            metadata[2],
+            metadata[3],
+            decoded[2],
+            decoded[3],
+        ]
     assert len(decoded) == 1
     return metadata
 
@@ -73,10 +81,16 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     return runtime, sent
 
 
-def _prefill_done(runtime, *, hybrid=False):
+def _prefill_done(runtime, *, hybrid=False, prompt_frame=None, offload_frame=b"\xc0"):
     kv_meta = {"ssm": {"positions": [0]}} if hybrid else {"agent": "prefill"}
     runtime.handle_prefill_done(
-        5, {"request_id": 5, "disaggregated_params": {"kv_meta": kv_meta, "block_ids": [4]}}
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": kv_meta, "block_ids": [4]},
+            "prompt_frame": msgpack.packb([1]) if prompt_frame is None else prompt_frame,
+            "offload_frame": offload_frame,
+        },
     )
 
 
@@ -100,13 +114,21 @@ def test_request_routes_prefill_then_decode():
     assert message[3]["skip_prompt_log_probs"] is True
 
     handoff = {"kv_meta": {"agent": "prefill"}, "block_ids": [4, 5], "request_id": 5}
-    runtime.handle_prefill_done(5, {"request_id": 5, "disaggregated_params": handoff})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": handoff,
+            "prompt_frame": msgpack.packb([1, 2, 3]),
+            "offload_frame": msgpack.packb(None),
+        },
+    )
 
     identity, message = sent.pop()
     assert identity == b"decode"
     assert Headers(message[0]) == Headers.SUBMIT_REQUEST_WITH_KV
     assert message[1:4] == [5, [1, 2, 3], sampling_params]
-    assert message[4:] == [handoff["kv_meta"], handoff["block_ids"]]
+    assert message[4:] == [handoff["kv_meta"], handoff["block_ids"], None]
     assert runtime.coordinator.hash_updates == [(b"prefill", [1, 2, 3]), (b"decode", [1, 2, 3])]
     assert runtime.requests[5].prompt_frame is None
     assert runtime.requests[5].sampling_params == {}
@@ -125,19 +147,24 @@ def test_prompt_log_probs_are_rejected_before_prefill():
 
 
 @pytest.mark.parametrize(
-    "handoff",
+    "handoff, prompt_frame",
     [
-        {"kv_meta": {"agent": "prefill"}},
-        {"block_ids": [4]},
-        {"kv_meta": {"agent": "prefill"}, "block_ids": "4"},
+        ({"kv_meta": {"agent": "prefill"}}, msgpack.packb([1])),
+        ({"block_ids": [4]}, msgpack.packb([1])),
+        ({"kv_meta": {"agent": "prefill"}, "block_ids": "4"}, msgpack.packb([1])),
+        ({"kv_meta": {"agent": "prefill"}, "block_ids": [4]}, None),
+        ({"kv_meta": {"agent": "prefill"}, "block_ids": [4]}, [1]),
     ],
 )
-def test_malformed_prefill_handoff_fails_the_request(handoff):
+def test_malformed_prefill_handoff_fails_the_request(handoff, prompt_frame):
     runtime, sent = _runtime()
     _submit(runtime, 5, [1], {})
     sent.clear()
 
-    runtime.handle_prefill_done(5, {"disaggregated_params": handoff})
+    reply = {"disaggregated_params": handoff, "offload_frame": msgpack.packb(None)}
+    if prompt_frame is not None:
+        reply["prompt_frame"] = prompt_frame
+    runtime.handle_prefill_done(5, reply)
 
     client_frame = next(message for identity, message in sent if identity == b"client")
     response = msgpack.unpackb(client_frame[1], raw=False)
@@ -215,9 +242,23 @@ def test_decode_ssm_capacity_is_released_on_generation_completion():
         _submit(runtime, request_id, [request_id], {})
     sent.clear()
     handoff = {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]}
-    runtime.handle_prefill_done(5, {"request_id": 5, "disaggregated_params": handoff})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "disaggregated_params": handoff,
+            "prompt_frame": msgpack.packb([5]),
+            "offload_frame": msgpack.packb(None),
+        },
+    )
     runtime.handle_kv_read_done(b"decode", 5)
-    runtime.handle_prefill_done(6, {"request_id": 6, "disaggregated_params": handoff})
+    runtime.handle_prefill_done(
+        6,
+        {
+            "disaggregated_params": handoff,
+            "prompt_frame": msgpack.packb([6]),
+            "offload_frame": msgpack.packb(None),
+        },
+    )
 
     decode_submits = [
         message[1]
@@ -443,7 +484,8 @@ def test_prefix_alpha_penalizes_role_local_load(role, alpha):
     )
 
 
-def test_native_routing_forwards_prompt_frames_and_frontend_hashes(monkeypatch):
+@pytest.mark.parametrize("original", ["hello world", [2] * 16384, [1] * 16384])
+def test_native_routing_forwards_prompt_frames_and_frontend_hashes(monkeypatch, original):
     runtime, _ = _runtime()
     coordinator = runtime.coordinator
     coordinator.known_clients = {b"client"}
@@ -454,12 +496,16 @@ def test_native_routing_forwards_prompt_frames_and_frontend_hashes(monkeypatch):
     coordinator._send_to_engine = (
         lambda _identity, payload, **_kwargs: frames.append(payload) or True
     )
-    prompt = msgpack.packb([1] * 16384)
+    prompt = msgpack.packb(original)
+    canonical = msgpack.packb([1] * 16384)
     offload = msgpack.packb({"destination": "frontend"})
+    prepared_offload = msgpack.packb({"destination": "prepared"})
     unpack = msgpack.unpackb
 
     def unpack_without_prompt(frame, **kwargs):
         assert frame is not prompt, "The coordinator must not decode the prompt"
+        assert frame is not canonical, "The coordinator must not decode canonical tokens"
+        assert frame is not prepared_offload, "The coordinator must not decode offload metadata"
         return unpack(frame, **kwargs)
 
     monkeypatch.setattr(msgpack, "unpackb", unpack_without_prompt)
@@ -472,6 +518,7 @@ def test_native_routing_forwards_prompt_frames_and_frontend_hashes(monkeypatch):
     assert frames[-1][1] is prompt
     assert frames[-1][3] is offload
     assert runtime.requests[5].block_hashes == [1, 2]
-    _prefill_done(runtime)
-    assert frames[-1][1] is prompt
+    _prefill_done(runtime, prompt_frame=canonical, offload_frame=prepared_offload)
+    assert frames[-1][1] is canonical
+    assert frames[-1][3] is prepared_offload
     coordinator.compute_request_hashes.assert_not_called()

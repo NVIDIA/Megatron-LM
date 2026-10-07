@@ -25,6 +25,7 @@ class DeferredKvHandoff:
     hashes: List[int]
     num_blocks: int
     future: asyncio.Future
+    offload_params: dict | None = None
 
 
 @dataclass(kw_only=True)
@@ -48,6 +49,7 @@ class PendingKvImport:
     handle: Any
     future: asyncio.Future
     ssm: PendingSSMImport | None = None
+    offload_params: dict | None = None
     resume_tokens: List[int] = field(default_factory=list)  # Sampled token, then MTP proposals.
     resume_log_probs: List[float] = field(default_factory=list)  # First sampled token only.
     continuation_blocks: List[int] = field(default_factory=list)  # Empty KV for resume writes.

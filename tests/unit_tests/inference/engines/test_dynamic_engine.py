@@ -2558,6 +2558,37 @@ def _submit_request_message(request_id, sampling_params, prompt, offload_params)
     ]
 
 
+@pytest.mark.parametrize("offload_params", [None, {"destination": "payload-store"}])
+def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params):
+    params = SamplingParams(num_tokens_to_generate=2)
+    kv_meta = {"resume_tokens": [99]}
+    message = [
+        msgpack.packb([Headers.SUBMIT_REQUEST_WITH_KV.value, 42, params.serialize(), kv_meta]),
+        msgpack.packb([3, 4]),
+        msgpack.packb([7]),
+    ]
+    if offload_params is not None:
+        message.append(msgpack.packb(offload_params))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request_with_kv_handoff = mock.Mock()
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+        message,
+        dynamic_engine.zmq.Again,
+    ]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    assert engine.schedule_requests() == 1
+    engine.add_request_with_kv_handoff.assert_called_once_with(
+        42, [3, 4], params, kv_meta, [7], offload_params=offload_params
+    )
+
+
 def test_engine_prepares_prompt_before_model_parallel_broadcast():
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):

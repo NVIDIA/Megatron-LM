@@ -276,10 +276,14 @@ class DisaggCoordinatorRuntime:
             return
         kv_meta = handoff.get("kv_meta")
         block_ids = handoff.get("block_ids")
+        prompt_frame = finished_request.get("prompt_frame")
+        offload_frame = finished_request.get("offload_frame")
         if (
             not isinstance(kv_meta, dict)
             or not isinstance(block_ids, list)
             or any(type(block_id) is not int for block_id in block_ids)
+            or not isinstance(prompt_frame, bytes)
+            or not isinstance(offload_frame, bytes)
         ):
             self.drop_request(
                 request_id, "prefill reply carried invalid handoff metadata", source_safe=True
@@ -313,8 +317,9 @@ class DisaggCoordinatorRuntime:
                 ],
                 use_bin_type=True,
             ),
-            request_state.prompt_frame,
+            prompt_frame,
             msgpack.packb(block_ids, use_bin_type=True),
+            offload_frame,
         ]
         # The serialized handoff owns these values until decode receives it.
         request_state.prompt_frame = None

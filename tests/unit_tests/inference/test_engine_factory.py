@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import msgpack
 import pytest
+import torch
 
 import megatron.core.inference.engine_factory as factory_module
 from megatron.core.inference.config import InferenceConfig
@@ -39,6 +40,8 @@ def test_prefill_reply_registers_external_ownership_or_sends_compact_native_meta
     serialized = {"request_id": 7, "prompt_tokens": [1] * 16384, "disaggregated_params": handoff}
     request = SimpleNamespace(
         request_id=7,
+        prompt_tokens=torch.tensor(serialized["prompt_tokens"]),
+        offload_params={"destination": "payload-store"},
         status=Status.COMPLETED,
         disaggregated_params=handoff,
         serialize=MagicMock(return_value=serialized),
@@ -48,7 +51,12 @@ def test_prefill_reply_registers_external_ownership_or_sends_compact_native_meta
     if native:
         assert len(calls) == 1
         request.serialize.assert_not_called()
-        expected = {"request_id": 7, "disaggregated_params": handoff}
+        expected = {
+            "request_id": 7,
+            "disaggregated_params": handoff,
+            "prompt_frame": msgpack.packb(serialized["prompt_tokens"], use_bin_type=True),
+            "offload_frame": msgpack.packb(request.offload_params, use_bin_type=True),
+        }
     else:
         assert msgpack.unpackb(calls[0].args[0]) == [Headers.REGISTER_KV.value, 7]
         expected = serialized

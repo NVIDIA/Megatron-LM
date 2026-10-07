@@ -49,11 +49,15 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     def _serialize_finished_request(
         self, request: DynamicInferenceRequest, finished_metadata: FinishedRequestRecord | None
     ) -> dict:
-        """Send only handoff metadata on the internal prefill-to-decode hop."""
+        """Send handoff metadata and canonical tokens on the internal decode hop."""
         if self._is_disaggregated_role("prefill") and request.disaggregated_params:
             return {
                 "request_id": request.request_id,
                 "disaggregated_params": request.disaggregated_params,
+                # Tokenization or prompt preparation may have changed the input.
+                # Keep the canonical tokens opaque to the coordinator.
+                "prompt_frame": msgpack.packb(request.prompt_tokens.tolist(), use_bin_type=True),
+                "offload_frame": msgpack.packb(request.offload_params, use_bin_type=True),
             }
         return super()._serialize_finished_request(request, finished_metadata)
 

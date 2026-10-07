@@ -713,7 +713,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return 0
 
     def add_request_with_kv_handoff(
-        self, request_id, prompt, sampling_params, kv_meta, src_block_ids
+        self, request_id, prompt, sampling_params, kv_meta, src_block_ids, *, offload_params=None
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("SUBMIT_REQUEST_WITH_KV")
@@ -4526,13 +4526,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Decode-side KV import. As on the plain path, the prompt rides
                 # in its own frame and the engine is its first consumer.
                 request_id, sampling_params, kv_meta = data[1:]
-                prompt = msgpack.unpackb(message[1], raw=False)
-                src_block_ids = msgpack.unpackb(message[2], raw=False)
-                sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
                 try:
+                    prompt = msgpack.unpackb(message[1], raw=False)
+                    src_block_ids = msgpack.unpackb(message[2], raw=False)
+                    offload_params = (
+                        msgpack.unpackb(message[3], raw=False) if len(message) > 3 else None
+                    )
+                    sampling_params = SamplingParams.deserialize(sampling_params)
                     self.add_request_with_kv_handoff(
-                        request_id, prompt, sampling_params, kv_meta, src_block_ids
+                        request_id,
+                        prompt,
+                        sampling_params,
+                        kv_meta,
+                        src_block_ids,
+                        offload_params=offload_params,
                     )
                 except Exception as error:
                     self._notify_request_error(request_id, error, source_safe=True)

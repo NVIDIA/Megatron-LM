@@ -179,12 +179,20 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
     def _notify_request_aborted(self, request_id, *, source_safe):
         return None
 
-    def add_request(self, request_id, prompt, sampling_params, precomputed_block_hashes=None):
+    def add_request(
+        self,
+        request_id,
+        prompt,
+        sampling_params,
+        precomputed_block_hashes=None,
+        offload_params=None,
+    ):
         request = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=torch.tensor(prompt),
             sampling_params=sampling_params,
             precomputed_block_hashes=precomputed_block_hashes or [],
+            offload_params=offload_params,
         )
         request.add_event_add_engine()
         self.requests[request_id] = request
@@ -326,7 +334,9 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
     )
     request.add_event_add_engine()
 
-    def add_request(request_id, prompt, sampling_params, precomputed_block_hashes=None):
+    def add_request(
+        request_id, prompt, sampling_params, precomputed_block_hashes=None, offload_params=None
+    ):
         assert request_id == request.request_id
         engine.requests[request_id] = request
         engine.waiting_request_ids.append(request_id)
@@ -922,7 +932,9 @@ def test_handoff_finishes_without_an_extra_decode_step(
     request.add_event_add_engine()
     request.stop_word_ids = stop_word_ids
 
-    def add_request(request_id, _prompt, _sampling_params, precomputed_block_hashes=None):
+    def add_request(
+        request_id, _prompt, _sampling_params, precomputed_block_hashes=None, offload_params=None
+    ):
         engine.requests[request_id] = request
         engine.waiting_request_ids.append(request_id)
         return request_future
@@ -1167,6 +1179,7 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
         SamplingParams(num_tokens_to_generate=2, return_log_probs=True, skip_prompt_log_probs=True),
         kv_meta,
         [100, 101, 102],
+        offload_params={"destination": "payload-store"},
     )
     _drain_loop(handoff_loop)
 
@@ -1182,6 +1195,7 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]
     assert engine.get_request(5).generated_tokens == [99]
     assert engine.get_request(5).generated_log_probs == [-0.25]
+    assert engine.get_request(5).offload_params == {"destination": "payload-store"}
     assert 5 not in engine.waiting_request_ids
     admit.assert_called_once_with(
         engine.context, engine.get_request(5), [10, 11, 12], [13], [99], ssm_state_idx=None
@@ -1194,7 +1208,12 @@ def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
 
     kv_meta = {"request_id": 8, "resume_tokens": [99]}
     future = engine.add_request_with_kv_handoff(
-        8, [1] * 8, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101]
+        8,
+        [1] * 8,
+        SamplingParams(num_tokens_to_generate=2),
+        kv_meta,
+        [100, 101],
+        offload_params={"destination": "payload-store"},
     )
 
     assert engine.pending_kv_import_count == 1
@@ -1209,6 +1228,7 @@ def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
 
     assert not engine._deferred_kv_handoffs
     assert len(engine._pending_kv_imports) == 1
+    assert engine._pending_kv_imports[0].offload_params == {"destination": "payload-store"}
     assert engine._kv_transfer_agent.calls == [(kv_meta, [100, 101], [10, 11])]
 
 
