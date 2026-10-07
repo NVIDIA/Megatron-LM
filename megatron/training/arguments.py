@@ -2733,7 +2733,8 @@ def _add_regularization_args(parser):
                        'cost model on dense weights while layer-sharding the MoE '
                        'expert weights. When the modes differ, the optimizer builder '
                        'keeps dense/expert buckets separate and constructs one base '
-                       'optimizer per bucket. Requires --num-experts when set. See '
+                       'optimizer per bucket. Requires --num-experts when set; only '
+                       '--optimizer muon implements it. See '
                        'OptimizerConfig.muon_expert_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '

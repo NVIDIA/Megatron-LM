@@ -66,7 +66,6 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
-    _muon_modes_are_hybrid,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -87,6 +86,7 @@ from .optimizer_config import (
     ParamPredicate,
     ParamWithNamePredicate,
     SGDOptimizerConfig,
+    muon_modes_are_hybrid,
 )
 
 logger = logging.getLogger(__name__)
@@ -323,6 +323,8 @@ def _get_param_groups(
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    expert_param_fn: Optional[Callable[[torch.nn.Parameter], bool]] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -343,11 +345,18 @@ def _get_param_groups(
             empty dictionary rather than the default value of None.
         process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks must construct
             aligned parameter groups. ``None`` preserves the WORLD-group behavior.
+        expert_param_fn (Optional[Callable[[torch.nn.Parameter], bool]]): semantic
+            routed-expert predicate. When given, the groups are additionally keyed by it and
+            carry ``is_expert``, so dense and routed-expert weights never share a group even
+            when they share process groups (EP=1 with matching dense/expert TP and GTP sizes,
+            where routed experts have ``allreduce=True``). ``None`` leaves the grouping as
+            before, without an ``is_expert`` key.
     Returns:
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel, is_dsa_indexer) to params.
+    # Map (pg_overrides, is_expert_parallel, is_dsa_indexer, is_expert) to params; ``is_expert``
+    # stays None unless ``expert_param_fn`` is given.
     params_map = {}
     model_order: Dict[int, int] = {}
 
@@ -373,12 +382,13 @@ def _get_param_groups(
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
             is_dsa_indexer = name.startswith("indexer.") or ".indexer." in name
+            is_expert = bool(expert_param_fn(param)) if expert_param_fn is not None else None
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel, is_dsa_indexer)
+            key = (param_override_tuple, is_expert_parallel, is_dsa_indexer, is_expert)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -401,16 +411,23 @@ def _get_param_groups(
     param_groups = []
 
     # Sort keys, None first.
-    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer
-    # element; treat a missing element as False so ordering stays total either way.
+    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer /
+    # is_expert elements; treat a missing element as False so ordering stays total either way.
     def _key_order(key):
-        return (key[0] is not None, key[0], key[1], key[2] if len(key) > 2 else False)
+        return (
+            key[0] is not None,
+            key[0],
+            key[1],
+            key[2] if len(key) > 2 else False,
+            bool(key[3]) if len(key) > 3 else False,
+        )
 
     _tag_pre_split_param_index(params_map, params_key, model_order, _key_order)
 
     for key in sorted(params_key, key=_key_order):
         param_override_tuple, is_expert_parallel = key[0], key[1]
         is_dsa_indexer = key[2] if len(key) > 2 else False
+        is_expert = key[3] if len(key) > 3 else None
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -449,6 +466,9 @@ def _get_param_groups(
             **param_override,  # keep **param_override last so that users can override other fields.
         }
         param_group['is_dsa_indexer'] = is_dsa_indexer
+        if is_expert is not None:
+            # Semantic routed-expert marker, present only when the caller asked for the split.
+            param_group['is_expert'] = is_expert
         param_groups.append(param_group)
 
     return param_groups
@@ -469,7 +489,8 @@ def _tag_pre_split_param_index(params_map, params_key, model_order, key_order) -
     that used to be one, and sorting their members by model order reproduces the interleaving
     of indexer and backbone parameters that the old group had.
 
-    Numbered separately for expert-parallel and dense parameters, because those go to
+    Numbered separately for expert-parallel and dense parameters (and, under hybrid
+    dense/expert Muon modes, for routed-expert and dense parameters), because those go to
     different optimizers and torch numbers from zero within each.
 
     The index is written onto the parameter rather than onto the group, so it stays out of the
@@ -477,20 +498,59 @@ def _tag_pre_split_param_index(params_map, params_key, model_order, key_order) -
     """
     collapsed = {}
     for key in params_key:
-        collapsed.setdefault((key[0], key[1]), []).append(key)
+        # The routed-expert element (hybrid dense/expert Muon) is kept: its groups go to a
+        # separate base optimizer, which numbers its parameters from zero on its own.
+        is_expert = key[3] if len(key) > 3 else None
+        collapsed.setdefault((key[0], key[1], is_expert), []).append(key)
 
-    for is_expert_parallel in (False, True):
-        subset = [k for k in collapsed if k[1] == is_expert_parallel]
+    for optimizer_key in sorted({(k[1], bool(k[2])) for k in collapsed}):
+        subset = [k for k in collapsed if (k[1], bool(k[2])) == optimizer_key]
         next_index = 0
-        # (param_override_tuple, is_expert_parallel) ordered exactly as _key_order would,
-        # with the is_dsa_indexer element absent -- which is the ordering of the groups that
-        # preceded the split.
-        for collapsed_key in sorted(subset, key=lambda k: key_order((k[0], k[1]))):
+        # (param_override_tuple, is_expert_parallel, is_expert) ordered exactly as _key_order
+        # would, with the is_dsa_indexer element absent -- which is the ordering of the groups
+        # that preceded the split.
+        for collapsed_key in sorted(subset, key=lambda k: key_order((k[0], k[1], False, k[2]))):
             members = [p for key in collapsed[collapsed_key] for p in params_map.get(key, [])]
             members.sort(key=lambda param: model_order[id(param)])
             for param in members:
                 param.pre_split_param_index = next_index
                 next_index += 1
+
+
+def _is_routed_expert_param(param: torch.nn.Parameter) -> bool:
+    """Semantic expert marker for Muon mode selection: the routed-expert tag that
+    ``_get_megatron_emerging_optimizer`` stamps on expert weights (``param.expert_tp``, also
+    what TensorParallelMuon keys its expert process groups on).
+
+    Distinct from the communication flag ``is_expert_parallel`` (``not param.allreduce``):
+    with EP=1 and matching dense/expert TP and GTP sizes, routed experts reduce their
+    gradients over the dense groups and carry ``allreduce=True``, yet they are still expert
+    weights and must get the expert NS mode.
+    """
+    return bool(getattr(param, 'expert_tp', False))
+
+
+def _bucket_emerging_param_groups(
+    param_groups: List[Dict], eopt_name: str, use_layer_wise: bool, hybrid_muon_modes: bool
+) -> Dict[Tuple[str, bool, bool], List[Dict]]:
+    """Bucket param groups by ``(optimizer_name, is_expert_parallel, is_expert)``; one base
+    optimizer is built per bucket.
+
+    ``is_expert_parallel`` (communication: the group needs the expert process groups) splits
+    only on the plain path; LayerWiseDistributedOptimizer handles expert-parallel params
+    internally, so that split is collapsed under it. ``is_expert`` (semantic: routed expert
+    weight, see ``_is_routed_expert_param``) splits the primary Muon optimizer only under
+    hybrid dense/expert modes, so each weight family gets the base optimizer its mode
+    selects. Scalar (adam/lion) groups never split on it: the non-emerging fallback path
+    rejects expert-parallel groups.
+    """
+    grouped: Dict[Tuple[str, bool, bool], List[Dict]] = defaultdict(list)
+    for group in param_groups:
+        opt_name = group.get('optimizer', eopt_name)
+        is_expert_parallel = bool(group['is_expert_parallel']) and not use_layer_wise
+        is_expert = hybrid_muon_modes and opt_name == 'muon' and bool(group.get('is_expert', False))
+        grouped[(opt_name, is_expert_parallel, is_expert)].append(group)
+    return grouped
 
 
 def _get_param_groups_and_buffers(
@@ -911,27 +971,22 @@ def _get_megatron_emerging_optimizer(
                 override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
-    # Layer-wise distributed optimizer handles expert params internally so we skip that split.
+    # Build param groups and bucket them by (optimizer_name, is_expert_parallel, is_expert);
+    # see _bucket_emerging_param_groups for what each flag splits. Under hybrid dense/expert
+    # Muon modes the groups are additionally keyed by the routed-expert marker, so EP=1
+    # experts (allreduce=True, otherwise grouped with the dense weights) still form their own
+    # groups and reach the expert bucket.
+    hybrid_muon_modes = eopt_name == 'muon' and muon_modes_are_hybrid(config)
     all_param_groups = _get_param_groups(
-        model_chunks, config, config_overrides, param_group_process_group
+        model_chunks,
+        config,
+        config_overrides,
+        param_group_process_group,
+        expert_param_fn=_is_routed_expert_param if hybrid_muon_modes else None,
     )
-    # Layer-wise distributed optimizer handles expert params internally so the
-    # expert split is normally collapsed — EXCEPT when the effective expert NS
-    # mode differs from the dense one (muon_expert_tp_mode): the primary
-    # optimizer's dense and expert buckets then deliberately stay separate so
-    # _create_emerging_optimizer can build one base optimizer per bucket under
-    # its own mode (both feed layer_wise_base_results). The split is restricted
-    # to the primary emerging optimizer: scalar (adam/lion) groups keep
-    # collapsing, since the non-emerging fallback path rejects expert-parallel
-    # groups.
-    hybrid_muon_modes = use_layer_wise and eopt_name == 'muon' and _muon_modes_are_hybrid(config)
-    grouped_param_groups = defaultdict(list)
-    for group in all_param_groups:
-        opt_name = group.get('optimizer', eopt_name)
-        keep_expert_split = not use_layer_wise or (hybrid_muon_modes and opt_name == eopt_name)
-        is_expert = group['is_expert_parallel'] and keep_expert_split
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+    grouped_param_groups = _bucket_emerging_param_groups(
+        all_param_groups, eopt_name, use_layer_wise, hybrid_muon_modes
+    )
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
@@ -959,7 +1014,7 @@ def _get_megatron_emerging_optimizer(
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
         # e.g., Muon). This includes scalar optimizers like Adam or Lion.
         not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-        for (opt_name, _), groups in grouped_param_groups.items()
+        for (opt_name, _, _), groups in grouped_param_groups.items()
         if groups
     ):
         # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
@@ -984,25 +1039,26 @@ def _get_megatron_emerging_optimizer(
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
-    # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
+    # Build an optimizer for each (optimizer_name, is_expert_parallel, is_expert) bucket and
+    # combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
     # — that is, the LayerWise optimizer only owns Muon-managed matrix parameters,
     # and the rest go through DistOpt's standard byte-level shard machinery.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (opt_name, is_expert_parallel, is_expert), groups in grouped_param_groups.items():
         if not groups:
             continue
 
-        model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
+        model_parallel_group = pg_collection.tp_ep_pp if is_expert_parallel else pg_collection.mp
 
         # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
         # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
         # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
         if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config, groups, eopt_name, model_chunks, pg_collection, is_expert=is_expert
             )
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
