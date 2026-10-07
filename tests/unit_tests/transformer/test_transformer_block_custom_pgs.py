@@ -215,8 +215,6 @@ class TestTransformerBlockWithProcessGroups:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),

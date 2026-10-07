@@ -51,7 +51,7 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase as _DynamicInferenceEngineTestBase,
 )
-from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -1958,7 +1958,7 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        _set_rounder(64)
+        _reset_rounder()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("scenario", _ASYNC_PAIR_SCENARIOS, ids=lambda case: case.name)
@@ -2026,7 +2026,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             gc.collect()
             delete_cuda_graphs()
             torch.cuda.empty_cache()
-            _set_rounder(64)
+            _reset_rounder()
             Utils.destroy_model_parallel()
 
 
