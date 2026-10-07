@@ -26,7 +26,9 @@ import torch.nn.functional as F
 from megatron.core.activations import squared_relu
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.determinism import configure_determinism, is_determinism_configured
 from megatron.training.argument_utils import _mfsdp_v2_disables_pipeline_output_dealloc
+from megatron.training.utils import print_rank_0
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -109,6 +111,12 @@ def validate_yaml(args, defaults={}):
                                                flush=True)
         else:
             setattr(args, key, defaults[key])
+
+    # Recheck the early entrypoint policy against the resolved YAML options.
+    policy_config = vars(args) | vars(args.model_parallel) | vars(args.language_model)
+    if policy_config.get('deterministic_mode', False) or is_determinism_configured():
+        policy = configure_determinism(policy_config)
+        print_rank_0(f"Determinism policy: {json.dumps(policy, sort_keys=True)}", args.rank)
 
     # Batch size.
     assert args.micro_batch_size is not None
@@ -464,4 +472,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

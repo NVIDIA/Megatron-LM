@@ -9,6 +9,12 @@ import warnings
 from collections import defaultdict
 from typing import List
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import torch
 import torch.distributed as dist
 

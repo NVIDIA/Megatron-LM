@@ -10,6 +10,12 @@ import json
 import time
 from pathlib import Path
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import torch
 
 from gpt_builders import gpt_builder

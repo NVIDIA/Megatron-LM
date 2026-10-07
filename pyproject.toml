@@ -11,6 +11,8 @@ include-package-data = true
 include = [
     "megatron.core",
     "megatron.core.*",
+    "megatron.determinism",
+    "megatron.determinism.*",
     "megatron.training",
     "megatron.training.*",
 ]

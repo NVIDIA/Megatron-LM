@@ -6,6 +6,12 @@ import faulthandler
 import os
 import time
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import numpy as np
 import torch
 import tqdm
