@@ -17,6 +17,15 @@ def test_mimo_text_detection_selects_text_backbone(monkeypatch, provider):
     args = Namespace(model_provider="gpt")
     saved = Namespace(model_provider=provider, mimo_llm_tp=1)
     monkeypatch.setattr(vlm_dynamic_inference, "load_args_from_checkpoint", lambda _: (args, saved))
+    # Detection also reads tensor metadata on newer main; keep this unit test independent of I/O.
+    monkeypatch.setattr(
+        vlm_dynamic_inference,
+        "_checkpoint_tensor_keys",
+        lambda _: [
+            "language_model.module.module.decoder.layers.0.self_attention.linear_qkv.weight"
+        ],
+        raising=False,
+    )
     assert not vlm_dynamic_inference._detect_vlm_from_checkpoint(args)
     assert args.model_provider == "hybrid"
     assert args.checkpoint_model_prefix == "language_model.module.module."
