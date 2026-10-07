@@ -57,14 +57,19 @@ from megatron.core.utils import (
     is_te_min_version,
     unwrap_model,
 )
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -2328,7 +2333,11 @@ class TestMultiTokenPrediction:
         args.swiglu = True
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        set_run_config(pretrain_cfg_container_from_args(args))
+        initialize_runtime_services(args, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -3519,7 +3528,11 @@ class TestMultiTokenPredictionHybrid:
         args.swiglu = True
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        set_run_config(pretrain_cfg_container_from_args(args))
+        initialize_runtime_services(args, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):

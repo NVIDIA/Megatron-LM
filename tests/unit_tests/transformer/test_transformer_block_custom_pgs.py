@@ -64,6 +64,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         hidden_dropout: float | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         vp_stage: int | None = None,
+        name: str | None = None,
     ):
         # Temporarily replace attention with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
@@ -82,6 +83,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name=name,
         )
 
         assert (
@@ -213,8 +215,6 @@ class TestTransformerBlockWithProcessGroups:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),

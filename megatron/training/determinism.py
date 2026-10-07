@@ -39,6 +39,10 @@ AUX_LOSS_FUSION_ARG = "moe_router_aux_loss_fusion"
 # Env-var defaults required for bit-exact reproducibility.
 DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
     "NCCL_ALGO": "Ring",
+    # NCCL EP's count-exchange path assigns expert slots with atomic counters.
+    # Scan mode preserves token order, and therefore expert wgrad reduction order.
+    # NCCL EP snapshots this setting when its group is created.
+    "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     # TRITON_CACHE_AUTOTUNING is deliberately absent: unset is already deterministic, so
@@ -76,7 +80,10 @@ ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", 
 #     other truthy spelling ("true", "yes") would silently read as opted out.
 #     Both settings are deterministic, so both are accepted and neither is
 #     defaulted -- see :func:`apply_determinism_env` for the pairing rule.
+#   - ``NCCL_EP_HT_EM_AG_SCAN_MODE``: require the canonical enabled value to
+#     preserve expert token order instead of using atomic slot assignment.
 ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
+    "NCCL_EP_HT_EM_AG_SCAN_MODE": frozenset({"1"}),
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": frozenset({"0"}),
     "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
     "TRITON_CACHE_AUTOTUNING": frozenset({"0", "1"}),
@@ -90,7 +97,8 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
       :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
-    * ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` / ``CUBLAS_WORKSPACE_CONFIG`` —
+    * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
+      ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
     * ``MAMBA_DETERMINISTIC`` / ``CAUSAL_CONV1D_DETERMINISTIC`` — if set
       (non-empty), must start with ``'1'``; unset auto-follows
@@ -168,7 +176,8 @@ def apply_determinism_to_args(args) -> None:
        mutates ``args``.
     2. Calls :func:`apply_determinism_env` on ``os.environ`` — validates
        every determinism-relevant env var (``NCCL_ALGO``,
-       ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
+       ``NCCL_EP_HT_EM_AG_SCAN_MODE``, ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``,
+       ``CUBLAS_WORKSPACE_CONFIG``,
        ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
        ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
        setdefaults the canonical values.

@@ -64,6 +64,8 @@ class MegatronCheckpointSaverBase:
             # These are arguments that we are either changing, or cause problems for validation if they are set
             # Note that some of these deal with T5 so will need to be changed if we support T5.
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
+                            'tensor_parallel_num_weight_shards', 'gtp_weight_remat_size',
+                            'expert_tensor_parallel_num_weight_shards', 'expert_gtp_weight_remat_size',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                             'sequence_parallel',
@@ -141,13 +143,15 @@ class MegatronCheckpointSaverBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
+            from megatron.training.argument_utils import inference_cfg_container_from_args
             from megatron.training.global_vars import set_global_variables, get_args
             from megatron.core import mpu
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
+        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
