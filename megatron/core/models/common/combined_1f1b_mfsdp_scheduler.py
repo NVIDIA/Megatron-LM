@@ -39,7 +39,7 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
-    """Install the sub-module hooks and gradient multiplicity for combined 1F1B."""
+    """Install sub-module hooks and gradient callback counts for combined 1F1B."""
 
     # Nearest owning FSDP unit per module (first parent wins), recorded by the walk
     # below: unshard/reshard act on an FSDP *unit*, so a module that consumes another
@@ -73,8 +73,10 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
             continue
-        submodule.param_grad_readiness.expected.update(_unit_grad_multiplicity(submodule, extras))
-        submodule.register_post_backward_hook(_module_post_backward_hook)
+        submodule.register_post_backward_hook(
+            _module_post_backward_hook,
+            grad_accumulation_count=_unit_grad_accumulation_count(submodule, extras),
+        )
 
 
 def _register_borrowed_weight_unshard_hooks(model, owners) -> None:
@@ -112,7 +114,7 @@ def _window_extras(model) -> list:
 
     A parameter accumulates its gradient once per schedule node that consumes it in its
     own GraphTask, and nearly every parameter has exactly one such node -- the base
-    count of 1 in ``_unit_grad_multiplicity``. Three groups have more:
+    count of 1 in ``_unit_grad_accumulation_count``. Three groups have more:
 
       1. The output projection: the ``post_process`` node and the ``mtp_post_process``
          node (one per MTP layer) each consume it. When the weights are tied it runs
@@ -206,8 +208,8 @@ def _mtp_layer_weights(model):
     )
 
 
-def _unit_grad_multiplicity(unit, extras) -> dict:
-    """Per-parameter backward contribution counts for the combined 1F1B path.
+def _unit_grad_accumulation_count(unit: FsdpModule, extras: list) -> int:
+    """Total parameter-gradient callbacks per combined 1F1B reduction window.
 
     ``1`` per parameter plus every extra contribution of the weights it is
     (``_window_extras``). Contributions add rather than being alternatives, so a weight
@@ -215,8 +217,8 @@ def _unit_grad_multiplicity(unit, extras) -> dict:
     cannot be derived from the FSDP unit alone -- they depend on this chunk's stage
     flags and the pipeline size -- which is why the caller passes them in.
     """
-    return {
-        fsdp_parameter.fqns: 1
-        + sum(n for weight, n in extras if _matches_fsdp_parameter(fsdp_parameter, weight))
+    return sum(
+        1
+        + sum(count for weight, count in extras if _matches_fsdp_parameter(fsdp_parameter, weight))
         for fsdp_parameter in unit._trainable_fsdp_parameters()
-    }
+    )

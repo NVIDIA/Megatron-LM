@@ -873,7 +873,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         for submodule in self.module.modules():
             if isinstance(submodule, FsdpModule):
-                submodule.param_grad_readiness.seal()
+                submodule._trainable_parameter_countdown.check_complete()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

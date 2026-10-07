@@ -1,19 +1,26 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Gradient completion for a shared parameter under multiple autograd GraphTasks (Combined 1F1B)."""
+"""Countdown-based gradient completion across combined 1F1B GraphTasks."""
+
+import copy
 
 import pytest
 import torch
+import torch.distributed as dist
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.countdown import Countdown
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import _module_post_backward_hook
 
 
 class TwoNodeUnit(nn.Module):
@@ -30,76 +37,199 @@ class TwoNodeUnit(nn.Module):
         return self.second(self.first(inputs))
 
 
-def _sharded_unit(setup, multiplicity: int):
-    """Fully shard a ``TwoNodeUnit`` and install a completion hook behind a spy."""
-    torch.manual_seed(0)  # identical across ranks: the test is rank-symmetric
-    model = TwoNodeUnit().to(setup.device)
+def _sharded_unit(setup, grad_accumulation_count=None, model=None):
+    """Install the scheduler's reduction callback behind a completion spy."""
+    torch.manual_seed(0)
+    if model is None:
+        model = TwoNodeUnit().to(setup.device)
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements(
         dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
     )
     with fully_shard_context(device=setup.device):
-        # ``register_hooks=False`` mirrors production, where the combined
-        # scheduler installs its own completion hooks instead of the default.
         fully_shard(model, mesh=mesh, placements=placements, register_hooks=False)
-    model.param_grad_readiness.expected.update(
-        {parameter.fqns: multiplicity for parameter in model._trainable_fsdp_parameters()}
-    )
     finalized = []
-    model.register_post_backward_hook(lambda hooked_module: finalized.append(hooked_module))
+
+    def post_backward(hooked_module):
+        _module_post_backward_hook(hooked_module)
+        finalized.append(hooked_module)
+
+    model.register_post_backward_hook(
+        post_backward, grad_accumulation_count=grad_accumulation_count
+    )
     return model, finalized
 
 
-def _graph_task(model: FsdpModule, setup) -> None:
-    """Run one forward-backward: one independent autograd GraphTask."""
-    if model.is_root():
-        model.context.allgather_stream.wait_stream(model.context.current_stream())
-    inputs = torch.randn(4, 16, device=setup.device)
-    model.unshard()  # forward over the resting sharded state deadlocks in a weight all-gather
-    model(inputs).sum().backward()
+def _graph_task(model: FsdpModule, inputs, submodule_name=None) -> torch.Tensor:
+    """Run one independently gathered forward/backward schedule node."""
+    model.context.allgather_stream.wait_stream(model.context.current_stream())
+    model.unshard()
+    consumer = model if submodule_name is None else getattr(model, submodule_name)
+    loss = consumer(inputs).square().mean()
+    loss.backward()
     model.reshard()
+    return loss.detach()
+
+
+class TestCountdown:
+    """Scalar callback totals re-arm at reduction-window boundaries."""
+
+    @pytest.mark.parametrize("count", [0, 1, 4])
+    def test_complete_cycles_rearm(self, count):
+        """Untouched and completed cycles pass the synchronization check."""
+        countdown = Countdown(count)
+        countdown.check_complete()
+        for _ in range(3):
+            for callback_index in range(count):
+                assert countdown.decrement() == (callback_index == count - 1)
+            countdown.check_complete()
+        assert countdown.initial_value == count
+
+    def test_partial_cycle_fails(self):
+        """A partially counted window cannot leak across steps."""
+        countdown = Countdown(4)
+        assert not countdown.decrement()
+        with pytest.raises(ValueError, match="1/4"):
+            countdown.check_complete()
+        for _ in range(2):
+            assert not countdown.decrement()
+        assert countdown.decrement()
+        countdown.check_complete()
+
+    def test_negative_count_fails(self):
+        """Negative callback totals are invalid."""
+        with pytest.raises(ValueError, match="non-negative"):
+            Countdown(-1)
 
 
 class TestPostBackwardHookAcrossGraphTasks:
-    """``register_post_backward_hook`` with one GraphTask per schedule node."""
+    """Real reductions wait for every declared wgrad callback, not each dgrad."""
 
-    def test_the_window_finalizes_once_across_graph_tasks(self, distributed_setup):
-        """Two GraphTasks owe two contributions; the hook fires after the second.
+    @pytest.mark.parametrize("num_graph_tasks", [1, 2, 3])
+    @pytest.mark.parametrize("set_to_none", [False, True])
+    def test_gradients_and_updates_match_baseline(
+        self, distributed_setup, num_graph_tasks, set_to_none
+    ):
+        """Shared contributions match SGD across steps and microbatch windows."""
+        setup = distributed_setup
+        torch.manual_seed(0)
+        baseline = TwoNodeUnit().to(setup.device)
+        model, finalized = _sharded_unit(
+            setup, grad_accumulation_count=2 * num_graph_tasks, model=copy.deepcopy(baseline)
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        fully_shard_optimizer(optimizer)
+        baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.1)
 
-        This is the coexistence under test: a finalize per GraphTask would
-        reshard and reduce after the first schedule node's backward and drop the
-        second node's contribution. The declared multiplicity holds the window
-        open until every GraphTask has landed.
-        """
-        model, finalized = _sharded_unit(distributed_setup, multiplicity=2)
+        torch.manual_seed(123 + setup.rank)
+        for step in range(3):
+            optimizer.zero_grad(set_to_none=set_to_none)
+            baseline_optimizer.zero_grad(set_to_none=set_to_none)
+            for microbatch_index in range(2):
+                previous_finalizations = len(finalized)
+                for graph_index in range(num_graph_tasks):
+                    inputs = torch.randn(4, 16, device=setup.device)
+                    baseline_loss = baseline(inputs).square().mean()
+                    baseline_loss.backward()
+                    loss = _graph_task(model, inputs)
+                    torch.testing.assert_close(loss, baseline_loss.detach())
+                    if graph_index < num_graph_tasks - 1:
+                        assert len(finalized) == previous_finalizations
+                        with pytest.raises(ValueError, match="mid-flight"):
+                            model._trainable_parameter_countdown.check_complete()
+                assert len(finalized) == step * 2 + microbatch_index + 1
+                model._trainable_parameter_countdown.check_complete()
 
-        _graph_task(model, distributed_setup)  # first schedule node
-        assert finalized == [], "the window closed after the first GraphTask"
-        with pytest.raises(ValueError, match="1/2"):
-            model.param_grad_readiness.seal()  # both keys are in flight at half
-        _graph_task(model, distributed_setup)  # second schedule node
-        assert len(finalized) == 1, f"expected one finalize, got {len(finalized)}"
-        model.param_grad_readiness.seal()  # closed window: nothing in flight
+            model.context.post_backward()
+            for group in model.parameter_groups:
+                replicated_grads = group.main_grad.redistribute((Replicate(),) * group.mesh.ndim)
+                for parameter_index, parameter in enumerate(group.fsdp_parameters):
+                    reference = baseline.get_parameter(parameter.fqns[0])
+                    dist.all_reduce(reference.grad)
+                    reference.grad.div_(setup.world_size)
+                    torch.testing.assert_close(
+                        replicated_grads.get_tensor_view(parameter_index), reference.grad
+                    )
+            optimizer.step()
+            baseline_optimizer.step()
+            for group in model.parameter_groups:
+                replicated_weights = group.main_weight.redistribute(
+                    (Replicate(),) * group.mesh.ndim
+                )
+                for parameter_index, parameter in enumerate(group.fsdp_parameters):
+                    torch.testing.assert_close(
+                        replicated_weights.get_tensor_view(parameter_index),
+                        baseline.get_parameter(parameter.fqns[0]),
+                    )
 
-    def test_an_undeclared_second_graph_task_fails_loudly(self, distributed_setup):
-        """An undeclared second contribution over-fires the declaration of one.
+    def test_different_parameter_multiplicities(self, distributed_setup):
+        """The unit total includes two callbacks for first and one for second."""
+        setup = distributed_setup
+        model, finalized = _sharded_unit(setup, grad_accumulation_count=3)
+        for node_index, name in enumerate(["first", "second", "first"]):
+            inputs = torch.randn(4, 16, device=setup.device)
+            _graph_task(model, inputs, submodule_name=name)
+            assert len(finalized) == (1 if node_index == 2 else 0)
+        model.context.post_backward()
+        model._trainable_parameter_countdown.check_complete()
 
-        The declared window finalizes after the first GraphTask and re-arms, so
-        the surplus is staged against the re-armed window: a key's declared fire
-        followed by the undeclared second GraphTask's fire of the same key. Both
-        are delivered at the readiness API rather than from inside a distributed
-        backward -- a raise in the autograd engine would leave peer ranks stuck
-        in collectives. The surplus must raise over-fired without triggering
-        another finalize.
-        """
-        model, finalized = _sharded_unit(distributed_setup, multiplicity=1)
-
-        _graph_task(model, distributed_setup)
+    def test_default_count_is_one_per_trainable_parameter(self, distributed_setup):
+        """The ordinary path keeps its original countdown without a declaration."""
+        model, finalized = _sharded_unit(distributed_setup)
+        assert model._trainable_parameter_countdown.initial_value == 2
+        _graph_task(model, torch.randn(4, 16, device=distributed_setup.device))
         assert len(finalized) == 1
+        model.context.post_backward()
 
-        key = next(iter(model.param_grad_readiness.expected))
-        readiness = model.param_grad_readiness
-        readiness.mark(key)  # the re-armed window's declared contribution
-        with pytest.raises(ValueError, match="over-fired"):
-            readiness.mark(key)  # the undeclared second GraphTask's surplus
-        assert len(finalized) == 1, "the surplus must not trigger another finalize"
+    def test_delayed_wgrad_completes_the_countdown(self, distributed_setup):
+        """Dgrad and an ordinary gradient cannot substitute for TE's wgrad."""
+        device = distributed_setup.device
+        model = nn.Sequential(
+            te.Linear(
+                16,
+                16,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device=device,
+                delay_wgrad_compute=True,
+                fuse_wgrad_accumulation=False,
+            ),
+            nn.Linear(16, 16, bias=False, device=device, dtype=torch.bfloat16),
+        )
+        model, finalized = _sharded_unit(distributed_setup, grad_accumulation_count=2, model=model)
+        model.context.allgather_stream.wait_stream(model.context.current_stream())
+        model.unshard()
+        inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+        model(inputs).float().square().mean().backward()
+        assert inputs.grad is not None
+        assert finalized == []
+        with pytest.raises(ValueError, match="1/2"):
+            model._trainable_parameter_countdown.check_complete()
+        model[0].backward_dw()
+        assert len(finalized) == 1
+        model.context.post_backward()
+        model._trainable_parameter_countdown.check_complete()
+
+    @pytest.mark.parametrize("count", [0, -1])
+    def test_invalid_trainable_count_fails(self, distributed_setup, count):
+        """Trainable modules cannot use the no-parameter fallback or negative totals."""
+        with pytest.raises(ValueError):
+            _sharded_unit(distributed_setup, grad_accumulation_count=count)
+
+    @pytest.mark.parametrize("count", [None, 0])
+    def test_parameter_free_module_uses_full_backward_hook(self, distributed_setup, count):
+        """Zero callbacks preserve the module-level completion fallback."""
+        model, finalized = _sharded_unit(
+            distributed_setup, grad_accumulation_count=count, model=nn.ReLU()
+        )
+        inputs = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
+        _graph_task(model, inputs)
+        assert inputs.grad is not None
+        assert len(finalized) == 1
+        model.context.post_backward()
+        model._trainable_parameter_countdown.check_complete()
+
+    def test_parameter_free_module_rejects_nonzero_count(self, distributed_setup):
+        """A parameter-free unit cannot wait for callbacks that never arrive."""
+        with pytest.raises(ValueError, match="owns no trainable parameters"):
+            _sharded_unit(distributed_setup, grad_accumulation_count=1, model=nn.ReLU())
