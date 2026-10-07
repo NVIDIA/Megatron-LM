@@ -232,6 +232,23 @@ def get_current_iteration() -> int:
     return iteration
 
 
+def is_packed_sequence_run() -> bool:
+    """Return whether the current run packs multiple documents per sequence.
+
+    Mirrors ``training.py``'s ``has_cu_seqlens`` formula
+    (``training.py:3059``): packing is active under ``--sft`` or
+    ``--dataloader-inter-document-masking``. Shared by the saver
+    (``LogitsSaverHooks``, to know whether to capture/persist
+    ``cu_seqlens_padded``) and the loader (``TeacherTarDataset``'s
+    document-aware CP reslicing requirement, and ``CachedLogitsKDLoss``'s
+    sequence-length-trim safety check) so the two can't drift out of sync.
+    """
+    args = get_args()
+    return bool(
+        getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+    )
+
+
 def get_consumed_train_samples() -> int:
     """Return the cumulative global sample count consumed so far.
 

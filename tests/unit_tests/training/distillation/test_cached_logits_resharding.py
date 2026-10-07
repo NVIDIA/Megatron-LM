@@ -288,6 +288,7 @@ def _bare_kd_loss(dataloader_items):
     loss.tp_rank = 0
     loss.tp_size = 1
     loss.tp_group = None
+    loss._is_packed = False
     loss._dataloader_iter = iter(dataloader_items)
     loss._current_iteration = None
     loss._loaded_iteration = None
@@ -405,6 +406,28 @@ def test_teacher_logits_equal_len_no_trim_no_warning(monkeypatch, recwarn):
 
     assert captured["teacher_values"].size(0) == 3
     assert len(recwarn) == 0
+
+
+def test_teacher_logits_trimmed_raises_when_packed(monkeypatch):
+    """Packed (--sft) runs must not silently trim: a tail-trim on packed,
+    multi-document data can't correct a mismatch that originated in an
+    earlier document (and, under CP>1, isn't even a contiguous tail), so a
+    size mismatch there should surface loudly instead."""
+    loss = _bare_kd_loss([])
+    loss._is_packed = True
+    loss._current_iteration = 5
+    loss._current_values = [torch.randn(4, 1, 2)]
+    loss._current_indices = [torch.randint(0, 2, (4, 1, 2))]
+
+    monkeypatch.setattr(
+        cached_logits_loss,
+        "topk_kl_div",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("topk_kl_div should not be reached")),
+    )
+
+    student_logits = torch.randn(3, 1, 4)  # shorter than the teacher's seq_len=4
+    with pytest.raises(RuntimeError, match="packed"):
+        loss(student_logits, iteration=5)
 
 
 def test_teacher_shorter_than_student_is_not_trimmed_known_gap(monkeypatch):

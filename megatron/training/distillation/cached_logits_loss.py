@@ -102,6 +102,7 @@ from megatron.training.distillation.utils import (
     decode_logprobs_payload,
     detect_saved_dp_size,
     get_current_iteration,
+    is_packed_sequence_run,
     is_remote_storage_path,
     iter_logprobs_tar_entries,
     pad_and_stack_cu_seqlens,
@@ -263,10 +264,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         # with cp_size > 1. When True, a decoded payload missing
         # cu_seqlens_padded means it was written before the CP+packing fix
         # and can't be correctly resharded; see _decode_entry.
-        args = get_args()
-        self._requires_cu_seqlens = self.cp_size > 1 and (
-            getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-        )
+        self._requires_cu_seqlens = self.cp_size > 1 and is_packed_sequence_run()
 
         # Packed (--sft) documents are padded per-document to a multiple of
         # 2 * context_parallel_size of whichever run built the SFTDataset
@@ -1181,6 +1179,13 @@ class CachedLogitsKDLoss:
         self.dp_rank = parallel_state.get_data_parallel_rank()
         self.dp_size = parallel_state.get_data_parallel_world_size()
 
+        # Whether this run packs multiple documents per sequence (--sft).
+        # Gates the sequence-length trim below: trimming the raw tail only
+        # ever touches the *last* packed document and, under CP>1, that tail
+        # is a non-contiguous zigzag half-chunk -- neither is a meaningful
+        # "drop the trailing tokens" operation for packed data. See __call__.
+        self._is_packed = is_packed_sequence_run()
+
         # ---- DataLoader (lazy-initialised on first call) ----
         self._dataloader_iter: Optional[Iterator] = None
 
@@ -1308,6 +1313,21 @@ class CachedLogitsKDLoss:
 
         # ---- trim teacher logits to match student sequence length ----
         if teacher_values.size(0) > student_logits.size(0):
+            if self._is_packed:
+                # For packed (--sft) data, trimming the raw tail is not a
+                # meaningful "drop the trailing tokens" operation: a packed
+                # sequence concatenates multiple documents, so the tail only
+                # ever belongs to the *last* one -- it can't correct a
+                # mismatch that originated earlier in the pack -- and under
+                # CP>1 that tail is a non-contiguous zigzag half-chunk, not
+                # literally the end of any document's real content.
+                raise RuntimeError(
+                    "CachedLogitsKDLoss: teacher sequence length "
+                    f"({teacher_values.size(0)}) exceeds student sequence length "
+                    f"({student_logits.size(0)}) on a packed (--sft) run; trimming "
+                    "is unsafe for packed data. Check for a --seq-length mismatch "
+                    "between the teacher dump and this run."
+                )
             if safe_get_rank() == 0:
                 warnings.warn(
                     "CachedLogitsKDLoss: teacher logits sequence length "

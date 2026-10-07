@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from megatron.training.distillation import cached_logits_loss
+from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.cached_logits_loss import make_teacher_tar_dataset
 from megatron.training.distillation.utils import (
     LOGPROBS_TAR_MEMBER_SUFFIX,
@@ -93,6 +94,10 @@ def _load_args(monkeypatch, *, sft: bool, num_samples: int):
         dataloader_inter_document_masking=False,
     )
     monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
+    # is_packed_sequence_run() reads get_args() bound inside utils.py itself,
+    # not cached_logits_loss's binding -- patch both so TeacherTarDataset's
+    # _requires_cu_seqlens sees the same args.
+    monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
 
 
 # ---------------------------------------------------------------------------

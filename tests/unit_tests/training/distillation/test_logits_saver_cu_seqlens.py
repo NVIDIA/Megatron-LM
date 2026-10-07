@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from megatron.training.distillation import logits_saver
+from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
 
 zstandard = pytest.importorskip("zstandard")
@@ -189,6 +190,10 @@ def _patch_init_deps(monkeypatch, *, cp_size, sft):
         freeze_all_layers=False,
     )
     monkeypatch.setattr(logits_saver, "get_args", lambda: args)
+    # is_packed_sequence_run() reads get_args() bound inside utils.py itself,
+    # not logits_saver's binding -- patch both so LogitsSaverHooks.__init__
+    # sees the same args.
+    monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
     monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda: ("hash", {}))
     monkeypatch.setattr(logits_saver, "storage_makedirs", lambda *a, **k: None)
 

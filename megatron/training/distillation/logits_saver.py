@@ -60,6 +60,7 @@ from megatron.training.distillation.utils import (
     compute_dataset_hash,
     get_consumed_train_samples,
     get_current_iteration,
+    is_packed_sequence_run,
     is_remote_storage_path,
     open_logit_file,
     pad_and_stack_cu_seqlens,
@@ -269,10 +270,7 @@ class LogitsSaverHooks:
         # Surface the resulting load-time CP constraint up front rather than
         # only when a student's TeacherTarDataset construction later raises
         # or warns about it (see the cp_size_save checks there).
-        is_packed = getattr(args, 'sft', False) or getattr(
-            args, 'dataloader_inter_document_masking', False
-        )
-        if is_packed and self.cp_size > 1:
+        if is_packed_sequence_run() and self.cp_size > 1:
             print_rank_last(
                 f"Cached-logits saver: writing packed (--sft) sequences with "
                 f"context-parallel size {self.cp_size}. Document padding is "
