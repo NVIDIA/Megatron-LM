@@ -192,6 +192,7 @@ def get_batch(data_iterator, vp_stage=None):
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
     )
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not has_cu_seqlens:
