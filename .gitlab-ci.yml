@@ -303,3 +303,4 @@ include:
   - .gitlab/stages/04.functional-tests.yml
   - .gitlab/stages/05.publish.yml
   - .gitlab/stages/06.triage.yml
+  - .gitlab/stages/07.health.yml
