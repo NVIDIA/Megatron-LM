@@ -52,6 +52,7 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
 def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     """Match training's probability placement and BF16 rounding before FC2."""
     from megatron.core.activations import squared_relu
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu
     from megatron.core.inference.moe.activations import padded_squared_relu
     from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
 
@@ -65,7 +66,10 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
     actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs)
     expected_unweighted = squared_relu(x)
-    expected = (squared_relu(x) * probs.unsqueeze(1)).to(torch.bfloat16)
+    # The kernel reproduces the fused training op (use_fused_weighted_squared_relu=True),
+    # which keeps the square in FP32 and rounds to BF16 once. Eager ops would round the
+    # square to BF16 first and land one ULP away for some elements.
+    expected = weighted_squared_relu(x, probs.unsqueeze(1))
 
     assert torch.equal(unweighted, expected_unweighted)
     assert torch.equal(actual, expected)

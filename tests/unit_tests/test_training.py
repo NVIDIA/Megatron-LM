@@ -9,7 +9,7 @@ import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
@@ -126,6 +126,7 @@ class TestTraining:
         Utils.initialize_model_parallel(1, 1)
         args = create_test_args()
         set_args(args)
+        _set_train_state()
 
     def test_build_train_valid_test_data_iterators(self):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
@@ -199,6 +200,7 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        destroy_global_vars()
 
 
 class TestGetModelBucketSizingPgCollection:

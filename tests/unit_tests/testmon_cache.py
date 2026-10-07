@@ -19,6 +19,10 @@ from pathlib import Path
 SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
+PLATFORMS = {
+    "dgx_h100": {"cloud": "aws-h100", "recipe": "tests/test_utils/recipes/h100/unit-tests.yaml"},
+    "dgx_gb200": {"cloud": "gb-gpu", "recipe": "tests/test_utils/recipes/gb200/unit-tests.yaml"},
+}
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
@@ -35,11 +39,10 @@ COMPATIBILITY_FILES = (
     "tests/unit_tests/find_test_cases.py",
     "tests/unit_tests/testmon_selector.py",
     "tests/unit_tests/testmon_cache.py",
+    "tests/unit_tests/testmon_mandatory.py",
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-    "tests/test_utils/recipes/h100/unit-tests.yaml",
-    "tests/test_utils/recipes/gb200/unit-tests.yaml",
 )
 COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
 DATABASE_TABLES = {
@@ -103,11 +106,12 @@ def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
-    if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
+    if recipe_platform not in PLATFORMS:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
+    paths.update(root / definition["recipe"] for definition in PLATFORMS.values())
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )
@@ -254,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     """Expose cache identity and validation to the host without Python dependencies."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("platforms", help="Print the Testmon platform definitions as JSON")
     identity_parser = subparsers.add_parser("identity")
     identity_parser.add_argument("--root", type=Path, default=Path("."))
     identity_parser.add_argument("--bucket", required=True)
@@ -271,7 +276,9 @@ def main(argv: list[str] | None = None) -> int:
             child.add_argument("--generation", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "identity":
+        if args.command == "platforms":
+            print(json.dumps(PLATFORMS))
+        elif args.command == "identity":
             identity = cache_identity(args.root, args.bucket, args.platform, args.image_id)
             _write_json(args.output, identity)
             print(f"cache_prefix={identity['cache_prefix']}")

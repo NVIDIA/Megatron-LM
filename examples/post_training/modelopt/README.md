@@ -199,6 +199,8 @@ requirements and optional distillation-loss configuration.
 
 For both QAT and QAD, configure the training data, hyper parameters, and the PTQ student and/or BF16 teacher according to your desired training recipe.
 
+For scale-learning QAD (LSQ), where the PTQ checkpoint was quantized with learnable scales, add `--lsq-scale-lr` to `MLM_EXTRA_ARGS` to train the scale (`_amax_pre`/`_amax_post`) parameters with their own learning rate; otherwise they use `--lr`. Setting `--lr 0` with a nonzero `--lsq-scale-lr` trains only the scales.
+
 Export the QAT or QAD checkpoint with [`export.sh`](#-megatron-checkpoint-export)
 before running inference with it.
 
