@@ -16,6 +16,13 @@ class CheckpointableShardedTensor(torch.Tensor):
     """ShardedTensor extension compatible with PyTorch DCP checkpointing library.
 
     Implements the torch.distributed._checkpointable._Checkpointable protocol.
+
+    ShardedTensors with prepended axes (``prepend_axis_num > 0``, e.g. the expert axis of grouped
+    MoE weights) are supported: the DCP chunk is described in global-tensor dimensions, with one
+    singleton dimension per prepended axis, and the data is exposed through a view of that shape.
+    This is exactly the chunk layout the torch ``ShardedTensor`` translation
+    (``sharded_tensor_to_torch_sharded_tensor``) produces, so checkpoints written through either
+    path are interchangeable.
     """
 
     def __new__(cls, data: torch.Tensor, sh_ten: ShardedTensor):
@@ -24,6 +31,22 @@ class CheckpointableShardedTensor(torch.Tensor):
     def __init__(self, data: torch.Tensor, sh_ten: ShardedTensor):
         self._data = data
         self._sh_ten = sh_ten
+
+    def _chunk_shape(self) -> torch.Size:
+        """Local shard shape in global-tensor dimensions: prepended singleton axes + local_shape."""
+        sh_ten = self._sh_ten
+        return torch.Size((1,) * sh_ten.prepend_axis_num + tuple(sh_ten.local_shape))
+
+    def _shard_tensor(self) -> torch.Tensor:
+        """Local data as DCP expects it: a view with the prepended singleton axes (same storage)."""
+        sh_ten = self._sh_ten
+        data = sh_ten.data
+        assert data.size() == torch.Size(sh_ten.local_shape), (data.size(), sh_ten.local_shape)
+        if sh_ten.prepend_axis_num == 0:
+            return data
+        if not data.is_contiguous():
+            sh_ten.data = data = data.contiguous()
+        return data.view(self._chunk_shape())
 
     def __create_write_items__(
         self, fqn: str, sh_ten: 'CheckpointableShardedTensor', index: int = None
@@ -41,8 +64,8 @@ class CheckpointableShardedTensor(torch.Tensor):
         """
         offsets = torch.Size(sh_ten._sh_ten.global_offset)
         global_shape = torch.Size(sh_ten._sh_ten.global_shape)
-        chunk_size = torch.Size(sh_ten._sh_ten.local_shape)
-        assert chunk_size == sh_ten._sh_ten.data.size()
+        chunk_size = sh_ten._chunk_shape()
+        assert torch.Size(sh_ten._sh_ten.local_shape) == sh_ten._sh_ten.data.size()
 
         return [
             WriteItem(
@@ -63,21 +86,21 @@ class CheckpointableShardedTensor(torch.Tensor):
             List[ChunkStorageMetadata]: list of DCP ChunkStorageMetadata metadata objects.
         """
         offsets = torch.Size(self._sh_ten.global_offset)
-        chunk_size = torch.Size(self._sh_ten.local_shape)
-        assert chunk_size == self._sh_ten.data.size()
+        chunk_size = self._chunk_shape()
+        assert torch.Size(self._sh_ten.local_shape) == self._sh_ten.data.size()
 
         return [ChunkStorageMetadata(offsets=offsets, sizes=chunk_size)]
 
     def __get_tensor_shard__(self, index: MetadataIndex) -> torch.Tensor:
-        """Trivial implementation which simply yields the underlying tensor.
+        """Yields the underlying data tensor, viewed with the prepended singleton axes if any.
 
         Args:
             index (MetadataIndex): unused
 
         Returns:
-            Tensor: the underlying data tensor
+            Tensor: the underlying data tensor (a view sharing its storage when axes are prepended)
         """
-        return self._sh_ten.data
+        return self._shard_tensor()
 
     @classmethod
     def from_sh_ten(cls, sh_ten: ShardedTensor) -> 'CheckpointableShardedTensor':
