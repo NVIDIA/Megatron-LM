@@ -888,7 +888,7 @@ def save_checkpoint(
                 rerun_state=rerun_state,
             )
 
-        validate_glu_checkpoint_backend(state_dict, args, ckpt_format=ckpt_format)
+        validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
         state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -2799,10 +2799,7 @@ def load_checkpoint(
 
     def validate_glu_layout(checkpoint_state, is_release):
         validate_glu_checkpoint_backend(
-            checkpoint_state,
-            args,
-            ckpt_format=ckpt_format,
-            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            args, ckpt_format=ckpt_format, skip_load_to_model_and_opt=skip_load_to_model_and_opt
         )
         loading_optimizer = (
             optimizer is not None

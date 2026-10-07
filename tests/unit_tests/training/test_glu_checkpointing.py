@@ -72,15 +72,6 @@ def _expert_fc1(state, expert, single_weight, single_bias):
     return weight, bias
 
 
-def _saved_layout(routed=None, shared=None, tp=1, etp=1):
-    return {
-        "model": "contiguous",
-        "optimizer": {"routed": routed, "shared": shared},
-        "tensor_model_parallel_size": tp,
-        "expert_tensor_parallel_size": etp,
-    }
-
-
 @pytest.mark.parametrize("size", [2, 32])
 @pytest.mark.parametrize("single_weight", [False, True])
 @pytest.mark.parametrize("single_bias", [False, True])
@@ -150,18 +141,25 @@ def test_save_restores_canonical_model_without_mutating_master_or_moments():
         }
     }
     snapshots = {key: value.clone() for key, value in optimizer["param_state"].items()}
-    checkpoint = {"model": {ROUTED + "weight0": runtime}, "optimizer": optimizer}
+    args = _args(routed=2)
+    checkpoint = {
+        "model": {ROUTED + "weight0": runtime},
+        "optimizer": optimizer,
+        "args": args,
+        "iteration": 7,
+        "rerun_state_machine": {"state": "snapshot"},
+    }
 
-    saved = prepare_glu_checkpoint_for_save(checkpoint, _args(routed=2))
+    saved = prepare_glu_checkpoint_for_save(checkpoint, args)
 
     assert saved is not checkpoint
     assert saved["model"] is not checkpoint["model"]
-    assert saved["optimizer"] is optimizer
+    assert saved.keys() == checkpoint.keys()
+    for key in checkpoint.keys() - {"model"}:
+        assert saved[key] is checkpoint[key]
     assert checkpoint["model"][ROUTED + "weight0"] is runtime
     torch.testing.assert_close(runtime, _interleaved(canonical, 2), rtol=0, atol=0)
     torch.testing.assert_close(saved["model"][ROUTED + "weight0"], canonical, rtol=0, atol=0)
-    assert saved["glu_checkpoint_layout"] == _saved_layout(routed=2)
-    assert "glu_checkpoint_layout" not in checkpoint
     for key, original in snapshots.items():
         torch.testing.assert_close(optimizer["param_state"][key], original, rtol=0, atol=0)
 
@@ -244,7 +242,9 @@ def test_non_grouped_shared_expert_ignores_inactive_interleave_setting():
     loaded = prepare_glu_checkpoint_for_load(checkpoint, args)
     assert loaded["model"][SHARED + "weight"] is weight
     saved = prepare_glu_checkpoint_for_save(loaded, args)
-    assert saved["glu_checkpoint_layout"]["optimizer"]["shared"] is None
+    assert saved.keys() == checkpoint.keys()
+    assert saved["model"][SHARED + "weight"] is weight
+    validate_glu_optimizer_layout({"args": args}, _args(), loading_optimizer=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -262,29 +262,33 @@ def test_model_conversion_keeps_checkpoint_precision_for_master_initialization(d
 def test_two_load_save_round_trips_do_not_double_interleave():
     canonical = _canonical((16, 3))
     args = _args(routed=2)
-    checkpoint = {"model": {ROUTED + "weight0": canonical}, "args": _args()}
+    checkpoint = {"model": {ROUTED + "weight0": canonical}, "args": args}
     for _ in range(2):
         loaded = prepare_glu_checkpoint_for_load(checkpoint, args)
         torch.testing.assert_close(
             loaded["model"][ROUTED + "weight0"], _interleaved(canonical, 2), rtol=0, atol=0
         )
-        # Real saves write the active run's args, which must not override the marker.
-        loaded["args"] = args
+        assert loaded["args"] is args
         checkpoint = prepare_glu_checkpoint_for_save(loaded, args)
+        assert checkpoint.keys() == {"model", "args"}
+        assert checkpoint["args"] is args
         torch.testing.assert_close(checkpoint["model"][ROUTED + "weight0"], canonical)
 
 
 @pytest.mark.parametrize("target_size", [2, 4, None])
-def test_legacy_native_layout_is_interpreted_from_source_args(target_size):
+def test_model_layout_is_contiguous_regardless_of_saved_args(target_size):
     canonical = _canonical((16, 3))
-    source_runtime = _interleaved(canonical, 2)
-    checkpoint = {"model": {ROUTED + "weight0": source_runtime}, "args": _args(routed=2)}
+    snapshot = canonical.clone()
+    source_args = _args(routed=2)
+    checkpoint = {"model": {ROUTED + "weight0": canonical}, "args": source_args}
 
     loaded = prepare_glu_checkpoint_for_load(checkpoint, _args(routed=target_size))
 
     expected = canonical if target_size is None else _interleaved(canonical, target_size)
     torch.testing.assert_close(loaded["model"][ROUTED + "weight0"], expected, rtol=0, atol=0)
-    torch.testing.assert_close(source_runtime, _interleaved(canonical, 2), rtol=0, atol=0)
+    torch.testing.assert_close(canonical, snapshot, rtol=0, atol=0)
+    assert loaded["args"] is source_args
+    assert loaded.keys() == checkpoint.keys()
 
 
 @pytest.mark.parametrize("source_size,target_size", [(None, 2), (2, None), (2, 4)])
@@ -292,7 +296,7 @@ def test_legacy_native_layout_is_interpreted_from_source_args(target_size):
 def test_optimizer_layout_switch_requires_weights_only_load(source_size, target_size, component):
     source = {component: source_size}
     target = {component: target_size}
-    checkpoint = {"glu_checkpoint_layout": _saved_layout(**source), "optimizer": {}}
+    checkpoint = {"args": _args(**source), "optimizer": {}}
 
     with pytest.raises(ValueError):
         validate_glu_optimizer_layout(checkpoint, _args(**target), loading_optimizer=True)
@@ -300,19 +304,16 @@ def test_optimizer_layout_switch_requires_weights_only_load(source_size, target_
 
 
 def test_optimizer_resume_accepts_matching_runtime_layout():
-    checkpoint = {"glu_checkpoint_layout": _saved_layout(routed=2, shared=4), "optimizer": {}}
+    checkpoint = {"args": _args(routed=2, shared=4), "optimizer": {}}
     validate_glu_optimizer_layout(checkpoint, _args(routed=2, shared=4), loading_optimizer=True)
 
 
 @pytest.mark.parametrize(
     "source,target",
-    [
-        (_saved_layout(shared=2), _args(shared=2, tp=2)),
-        (_saved_layout(routed=2), _args(routed=2, etp=2)),
-    ],
+    [(_args(shared=2), _args(shared=2, tp=2)), (_args(routed=2), _args(routed=2, etp=2))],
 )
 def test_interleaved_optimizer_resharding_rejects_tp_or_etp_change(source, target):
-    checkpoint = {"glu_checkpoint_layout": source, "optimizer": {}}
+    checkpoint = {"args": source, "optimizer": {}}
 
     with pytest.raises(ValueError):
         validate_glu_optimizer_layout(checkpoint, target, loading_optimizer=True)
@@ -320,14 +321,34 @@ def test_interleaved_optimizer_resharding_rejects_tp_or_etp_change(source, targe
 
 
 def test_contiguous_optimizer_does_not_add_new_tp_resharding_restriction():
-    checkpoint = {"glu_checkpoint_layout": _saved_layout(), "optimizer": {}}
+    checkpoint = {"args": _args(), "optimizer": {}}
     validate_glu_optimizer_layout(checkpoint, _args(tp=2, etp=2), loading_optimizer=True)
 
 
-def test_legacy_interleaved_model_cannot_be_resharded_even_without_optimizer():
-    checkpoint = {"args": _args(routed=2)}
+@pytest.mark.parametrize("config_format", ["args-dict", "bridge-dict", "bridge-namespace"])
+def test_existing_checkpoint_config_describes_optimizer_only(config_format):
+    source = _args(routed=2, shared=4)
+    if config_format == "args-dict":
+        checkpoint = {"args": vars(source)}
+    elif config_format == "bridge-dict":
+        checkpoint = {"cfg": {"model": vars(source)}}
+    else:
+        checkpoint = {"cfg": Namespace(model=source)}
+    canonical = _canonical((16, 3))
+    checkpoint["model"] = {ROUTED + "weight0": canonical}
+
+    validate_glu_optimizer_layout(checkpoint, source, loading_optimizer=True)
+    target = _args(routed=4, shared=4, tp=2, etp=2)
     with pytest.raises(ValueError):
-        validate_glu_optimizer_layout(checkpoint, _args(routed=2, etp=2), loading_optimizer=False)
+        validate_glu_optimizer_layout(checkpoint, target, loading_optimizer=True)
+    validate_glu_optimizer_layout(checkpoint, target, loading_optimizer=False)
+    loaded = prepare_glu_checkpoint_for_load(checkpoint, target)
+    torch.testing.assert_close(
+        loaded["model"][ROUTED + "weight0"], _interleaved(canonical, 4), rtol=0, atol=0
+    )
+    assert loaded.keys() == checkpoint.keys()
+    for key in checkpoint.keys() - {"model"}:
+        assert loaded[key] is checkpoint[key]
 
 
 @pytest.mark.parametrize("single_weight", [False, True])
@@ -381,6 +402,7 @@ def test_adam_update_and_resume_match_canonical_and_uninterrupted_training(
             {
                 "model": {key: parameter.detach() for key, parameter in runtime.items()},
                 "optimizer": runtime_optimizer.state_dict(),
+                "args": args,
             },
             args,
         )
@@ -417,16 +439,16 @@ def test_adam_update_and_resume_match_canonical_and_uninterrupted_training(
 @pytest.mark.parametrize("ckpt_format", ["torch_dcp", "fsdp_dtensor"])
 def test_backend_guard_leaves_unrelated_layouts_unchanged(ckpt_format):
     validate_glu_checkpoint_backend(
-        {}, _args(), ckpt_format=ckpt_format, skip_load_to_model_and_opt=True
+        _args(), ckpt_format=ckpt_format, skip_load_to_model_and_opt=True
     )
     with pytest.raises(NotImplementedError):
-        validate_glu_checkpoint_backend({}, _args(routed=2), ckpt_format=ckpt_format)
+        validate_glu_checkpoint_backend(_args(routed=2), ckpt_format=ckpt_format)
 
 
 def test_interleaving_rejects_inplace_load_even_for_supported_checkpoint_format():
     with pytest.raises(NotImplementedError):
         validate_glu_checkpoint_backend(
-            {}, _args(routed=2), ckpt_format="torch_dist", skip_load_to_model_and_opt=True
+            _args(routed=2), ckpt_format="torch_dist", skip_load_to_model_and_opt=True
         )
 
 

@@ -5,6 +5,8 @@
 Model weights are saved as [all gate rows, all up rows]. Optimizer tensors keep
 their runtime layout: changing that layout on resume would also require moving
 FP32 master weights and moments across distributed-optimizer shard boundaries.
+The existing checkpoint configuration describes the optimizer layout; no extra
+layout metadata is added to the checkpoint.
 """
 
 import re
@@ -15,7 +17,6 @@ import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 
-_LAYOUT_KEY = 'glu_checkpoint_layout'
 _FC1_KEY = re.compile(r'(?:^|\.)(experts|shared_experts)\.linear_fc1\.(weight|bias)\d*$')
 
 
@@ -43,21 +44,8 @@ def _interleave_sizes(config):
 def _checkpoint_config(state_dict):
     if 'args' in state_dict:
         return state_dict['args']
-    # Bridge model checkpoints are canonical, while its optimizer uses runtime rows.
+    # Bridge stores its model configuration under cfg.model instead of args.
     return _config_value(state_dict.get('cfg'), 'model')
-
-
-def _source_layouts(state_dict):
-    layout = state_dict.get(_LAYOUT_KEY)
-    if layout is not None:
-        if layout['model'] != 'contiguous':
-            raise ValueError(f'Unknown GLU model checkpoint layout: {layout["model"]!r}')
-        return {'routed': None, 'shared': None}, layout['optimizer']
-    sizes = _interleave_sizes(_checkpoint_config(state_dict))
-    # Before this conversion was introduced, native MLM saved physical runtime rows.
-    # Bridge/exported weights without native MLM args use contiguous gate/up rows.
-    model_sizes = sizes if 'args' in state_dict else {'routed': None, 'shared': None}
-    return model_sizes, sizes
 
 
 def _parallel_sizes(config):
@@ -69,22 +57,18 @@ def _parallel_sizes(config):
 def validate_glu_optimizer_layout(state_dict, args, *, loading_optimizer):
     """Reject incompatible runtime optimizer rows before loading any tensor storage.
 
-    Legacy noncanonical model checkpoints also require the original TP partitioning.
-    New canonical model weights can be loaded with a different runtime layout or TP
+    Saved configuration describes the optimizer's runtime layout. Model weights
+    are always contiguous and can be loaded with a different runtime layout or TP
     size when optimizer state is not restored.
     """
-    source_model, source_optimizer = _source_layouts(state_dict)
+    if not loading_optimizer:
+        return
+    source_config = _checkpoint_config(state_dict)
+    source_optimizer = _interleave_sizes(source_config)
     target = _interleave_sizes(args)
-    source_parallel = _parallel_sizes(state_dict.get(_LAYOUT_KEY, _checkpoint_config(state_dict)))
+    source_parallel = _parallel_sizes(source_config)
     target_parallel = _parallel_sizes(args)
     for kind in target:
-        if source_model[kind] is not None and source_parallel[kind] != target_parallel[kind]:
-            raise ValueError(
-                f'Cannot reshard a legacy interleaved {kind} GLU model checkpoint. '
-                'Re-save it with its original TP/ETP configuration to produce contiguous weights.'
-            )
-        if not loading_optimizer:
-            continue
         if source_optimizer[kind] != target[kind] or (
             source_optimizer[kind] is not None and source_parallel[kind] != target_parallel[kind]
         ):
@@ -115,7 +99,7 @@ def _permute_glu_rows(tensor, size, axis, *, interleave):
     return tensor.transpose(axis, axis + 1).contiguous().reshape(shape)
 
 
-def _convert_model_rows(model_state_dict, source, target):
+def _convert_model_rows(model_state_dict, sizes, *, interleave):
     def convert(value, key):
         if isinstance(value, dict):
             result = copy(value)
@@ -128,7 +112,7 @@ def _convert_model_rows(model_state_dict, source, target):
         if match is None:
             return value
         kind = 'routed' if match[1] == 'experts' else 'shared'
-        if source[kind] == target[kind]:
+        if sizes[kind] is None:
             return value
         sharded = isinstance(value, (ShardedTensor, ShardedTensorFactory))
         tensor = value.data if sharded else value
@@ -145,22 +129,19 @@ def _convert_model_rows(model_state_dict, source, target):
             raise ValueError(
                 f'Unexpected GLU FC1 checkpoint shape for {key}: {tuple(tensor.shape)}'
             )
-        if source[kind] is not None:
-            tensor = _permute_glu_rows(tensor, source[kind], axis, interleave=False)
-        if target[kind] is not None:
-            tensor = _permute_glu_rows(tensor, target[kind], axis, interleave=True)
+        tensor = _permute_glu_rows(tensor, sizes[kind], axis, interleave=interleave)
         # Never mutate the model, its parameter aliases, or the optimizer's factory.
         return replace(value, data=tensor) if sharded else tensor
 
     return convert(model_state_dict, '')
 
 
-def _convert_model_sections(state_dict, source, target):
+def _convert_model_sections(state_dict, sizes, *, interleave):
     result = copy(state_dict)
-    if source != target:
+    if any(size is not None for size in sizes.values()):
         for key, value in state_dict.items():
             if key == 'model' or (key.startswith('model') and key[5:].isdigit()):
-                result[key] = _convert_model_rows(value, source, target)
+                result[key] = _convert_model_rows(value, sizes, interleave=interleave)
     return result
 
 
@@ -173,30 +154,22 @@ def prepare_glu_checkpoint_for_save(state_dict, args):
     for each converted model weight; optimizer factories retain their runtime data.
     """
     sizes = _interleave_sizes(args)
-    result = _convert_model_sections(state_dict, sizes, {'routed': None, 'shared': None})
-    parallel_sizes = _parallel_sizes(args)
-    result[_LAYOUT_KEY] = {
-        'model': 'contiguous',
-        'optimizer': sizes,
-        'tensor_model_parallel_size': parallel_sizes['shared'],
-        'expert_tensor_parallel_size': parallel_sizes['routed'],
-    }
-    return result
+    return _convert_model_sections(state_dict, sizes, interleave=False)
 
 
 @torch.no_grad()
 def prepare_glu_checkpoint_for_load(state_dict, args):
-    """Convert full-precision model entries before model and master-weight loading."""
-    source, _ = _source_layouts(state_dict)
-    return _convert_model_sections(state_dict, source, _interleave_sizes(args))
+    """Interleave contiguous model entries before model and master-weight loading.
+
+    Saved runtime settings apply only to the optimizer, never to model rows.
+    Legacy interleaved model checkpoints must be canonicalized before loading.
+    """
+    return _convert_model_sections(state_dict, _interleave_sizes(args), interleave=True)
 
 
-def validate_glu_checkpoint_backend(
-    state_dict, args, *, ckpt_format, skip_load_to_model_and_opt=False
-):
+def validate_glu_checkpoint_backend(args, *, ckpt_format, skip_load_to_model_and_opt=False):
     """Require the explicit load-state-dict path used for GLU layout conversion."""
-    source, _ = _source_layouts(state_dict)
-    if not any(size is not None for size in (*source.values(), *_interleave_sizes(args).values())):
+    if not any(size is not None for size in _interleave_sizes(args).values()):
         return
     if ckpt_format not in ('torch', 'torch_dist') or skip_load_to_model_and_opt:
         raise NotImplementedError(
