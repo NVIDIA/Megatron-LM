@@ -276,18 +276,21 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("is_vlm", [False, True])
-def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm):
+@pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])
+def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm, is_mimo):
     from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
         vlm_dynamic_inference,
     )
 
     args = Namespace(load="checkpoint", inference_ckpt_non_strict=False)
+    if is_mimo:
+        args.mimo_checkpoint_prefix_map = {"language_model.": "language_model.module.module."}
     model = Mock()
     provider_module = ModuleType("model")
     provider_module.model_provider = Mock()
     monkeypatch.setitem(sys.modules, "model", provider_module)
     monkeypatch.setitem(sys.modules, "model_provider", provider_module)
+    monkeypatch.setitem(sys.modules, "mimo_checkpoint_model", provider_module)
     gpt_builders = ModuleType("gpt_builders")
     gpt_builders.gpt_builder = Mock()
     monkeypatch.setitem(sys.modules, "gpt_builders", gpt_builders)
@@ -296,6 +299,19 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm):
     load = Mock()
     monkeypatch.setattr(vlm_dynamic_inference, "load_checkpoint_for_inference", load)
 
+    def check_mimo(received_args, received_model):
+        load.assert_called_once_with([model], strict=True)
+        assert received_args is args
+        assert received_model is model
+        model.eval.assert_not_called()
+
+    check = Mock(side_effect=check_mimo)
+    monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", check)
+
     assert vlm_dynamic_inference.get_model(is_vlm=is_vlm) is model
     load.assert_called_once_with([model], strict=True)
+    if is_mimo:
+        check.assert_called_once_with(args, model)
+    else:
+        check.assert_not_called()
     model.eval.assert_called_once()
