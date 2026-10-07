@@ -306,6 +306,36 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_waits_for_pooled_h2d() -> None:
+    """A later forward cannot overwrite a pooled buffer still read by prefetch."""
+    off_interface.reset_instance()
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        handler = ChunkOffloadHandler(1024, manager.cpu_tensor_pool)
+        handler.is_warmup = False
+        source = torch.ones(1_048_576, device="cuda", dtype=torch.bfloat16)
+        next_source = torch.full_like(source, 2)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(handler.d2h_stream):
+            state = handler.offload(source)
+        with torch.cuda.stream(handler.h2d_stream):
+            handler.h2d_stream.wait_stream(handler.d2h_stream)
+            torch.cuda._sleep(100_000_000)
+            recovered = handler.reload(state)
+
+        group = OffloadTensorGroup("gdn_core_attn")
+        group.push_tensor((1, 0), next_source)
+        handler._groups_to_offload.append(group)
+        handler.on_group_commit_forward("gdn_core_attn", [])
+        assert state[1] is group._tensors[(1, 0)][1]
+        torch.cuda.synchronize()
+        assert torch.equal(recovered, source)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
 @pytest.mark.skipif(
     Utils.world_size < 2, reason="Rank-0 duplicate aggregation requires at least two ranks."
 )

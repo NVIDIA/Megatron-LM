@@ -31,7 +31,10 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    OffloadTensorPool,
+    PipelineOffloadManager,
+)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -55,6 +58,11 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--fraction", type=float, choices=[0.0, 0.5, 1.0], default=None)
     parser.add_argument("--recompute-norm", action="store_true")
+    parser.add_argument(
+        "--fused-pre-gdr",
+        action="store_true",
+        help="Use native pre-GDR fusion (requires causal-conv1d)",
+    )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--sp", action="store_true")
     parser.add_argument("--cp", type=int, default=1)
@@ -127,6 +135,7 @@ def _provider(args: argparse.Namespace) -> Any:
             "vision_recompute_granularity": None,
             "language_max_sequence_length": args.seq_length,
             "deterministic_mode": False,
+            "gdn_pre_gated_delta_rule_fusion": args.fused_pre_gdr,
             "fine_grained_activation_offloading": args.fraction is not None,
             "offload_modules": ["gdn_core_attn"] if args.fraction is not None else [],
             "activation_offload_fraction": args.fraction if args.fraction is not None else 1.0,
@@ -215,6 +224,21 @@ def _fingerprint(value: Any) -> Any:
     return value
 
 
+def _finalize_grads_and_check_pool(
+    models: list[torch.nn.Module],
+    num_tokens: torch.Tensor | None,
+    *,
+    pg_collection: ProcessGroupCollection,
+    force_all_reduce: bool,
+    pool: OffloadTensorPool,
+) -> None:
+    """Check buffer ownership after native backward, before the schedule clears counters."""
+    finalize_model_grads(
+        models, num_tokens, pg_collection=pg_collection, force_all_reduce=force_all_reduce
+    )
+    assert pool.get_pool_status()["global_stats"]["current_in_use"] == 0
+
+
 def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> dict[str, Any]:
     """Run native gradient accumulation, finalization and BF16 Adam updates."""
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -249,12 +273,17 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
             use_gloo_process_groups=False,
             pg_collection=groups,
         )
+        manager = PipelineOffloadManager.get_instance()
+        finalize_grads = (
+            partial(_finalize_grads_and_check_pool, pool=manager.cpu_tensor_pool)
+            if args.check_state
+            else finalize_model_grads
+        )
         for model in models:
             config = get_model_config(model)
             config.grad_scale_func = optimizer.scale_loss
-            config.finalize_model_grads_func = partial(finalize_model_grads, pg_collection=groups)
+            config.finalize_model_grads_func = partial(finalize_grads, pg_collection=groups)
         schedule = get_forward_backward_func(pp_size=args.pp, vp_size=args.vp)
-        manager = PipelineOffloadManager.get_instance()
         samples, states = [], []
         for step in range(args.warmup + args.iterations):
             batches = _batches(token_ids, args, step, groups)
@@ -285,7 +314,6 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
             torch.cuda.synchronize()
             seconds = time.perf_counter() - start
             assert success and math.isfinite(grad_norm) and grad_norm > 0
-            assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
             if args.fraction is not None:
                 assert not manager._is_warmup
             selected = [
@@ -353,6 +381,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = _arguments()
     os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+    if args.fused_pre_gdr:
+        os.environ["CAUSAL_CONV1D_DETERMINISTIC"] = "1"
     provider = _provider(args)
     token_ids = _tokenize(args)
     result = {
@@ -362,6 +392,7 @@ def main() -> None:
         "dataset_tokens": len(token_ids),
         "pipeline_batch_p2p_comm": provider.batch_p2p_comm,
         "pipeline_deallocate_outputs": provider.deallocate_pipeline_outputs,
+        "pool_verified_before_reset": args.check_state and not args.dry_run,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu_training_run": not args.dry_run,
