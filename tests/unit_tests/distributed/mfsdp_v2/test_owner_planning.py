@@ -295,15 +295,17 @@ def _round_trip_group(this_rank=0):
 def _per_rank_owner_layouts():
     """Build the round-trip group's `GroupOwnerLayout` once per rank (DP size 3)."""
     return [
-        GroupOwnerLayout.from_group(_round_trip_group(this_rank=rank), cost_fn=ns_cost_fn(5))
+        GroupOwnerLayout.from_groups([_round_trip_group(this_rank=rank)], cost_fn=ns_cost_fn(5))[0]
         for rank in range(3)
     ]
 
 
-def test_group_owner_layout_from_group_composes_the_steps():
-    """`from_group` bundles the group, its mesh, the layouts, and the balanced owners."""
+def test_group_owner_layout_from_groups_composes_the_steps():
+    """For one group, `from_groups` bundles the group, its mesh, the layouts, and the balanced
+    owners.
+    """
     group = _round_trip_group()
-    owner_layout = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
+    (owner_layout,) = GroupOwnerLayout.from_groups([group], cost_fn=ns_cost_fn(5))
     assert owner_layout.group is group
     assert owner_layout.mesh is group.mesh
     # Composition equivalence: the bundle is exactly the two steps composed.
@@ -311,11 +313,11 @@ def test_group_owner_layout_from_group_composes_the_steps():
     assert owner_layout.owners == assign_owner_work([owner_layout.layouts], ns_cost_fn(5))[0]
 
 
-def test_group_owner_layout_from_group_respects_eligible_fn():
+def test_group_owner_layout_from_groups_respects_eligible_fn():
     """`eligible_fn` filters participation; layouts and owners cover exactly those."""
     group = _round_trip_group()
-    owner_layout = GroupOwnerLayout.from_group(
-        group, cost_fn=ns_cost_fn(5), eligible_fn=lambda param: param.numel() >= 8
+    (owner_layout,) = GroupOwnerLayout.from_groups(
+        [group], cost_fn=ns_cost_fn(5), eligible_fn=lambda param: param.numel() >= 8
     )
     assert list(owner_layout.layouts) == [0, 1]
     assert set(owner_layout.owners) == {0, 1}
@@ -441,7 +443,7 @@ def test_pack_and_unpack_result_round_trip():
 def test_pack_with_no_eligible_params():
     """A group with no eligible params packs to an empty owner layout."""
     group = _mock_group([(16,)], dp_size=2)  # 1D bias only.
-    owner_layout = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
+    (owner_layout,) = GroupOwnerLayout.from_groups([group], cost_fn=ns_cost_fn(5))
     assert owner_layout.layouts == {}
     assert owner_layout.owners == {}
 

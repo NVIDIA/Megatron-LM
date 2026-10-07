@@ -9,8 +9,9 @@ Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`RowAt
   `FsdpParameterGroup`, keyed by each parameter's index within the group.
 - `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
   function.
-- `GroupOwnerLayout.from_group` builds a data structure capturing the per-group owner layout upon
-  the above.
+- `GroupOwnerLayout` is a data structure capturing the per-group owner layout.
+- `GroupOwnerLayout.from_groups` builds one `GroupOwnerLayout` per group, balancing owner work
+  jointly across the groups.
 - `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` take the `GroupOwnerLayout` plus this rank's data
   and build the flat P2P send/recv buffers,
 - `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full flat tensor on the
@@ -244,30 +245,51 @@ class GroupOwnerLayout:
     owners: dict[int, int]
 
     @classmethod
-    def from_group(
+    def from_groups(
         cls,
-        group: FsdpParameterGroup,
+        groups: list[FsdpParameterGroup],
         *,
         cost_fn: Callable[[ParameterLayout], float] | None = None,
         eligible_fn: Callable[[torch.Tensor], bool] | None = None,
-    ) -> Self:
-        """Build the owner layout for one group.
+    ) -> list[Self]:
+        """Build one owner layout per group, balancing owner work jointly across the groups.
 
-        Balances owner work within this group alone; to balance jointly across several groups,
-        collect each group's layouts and pass them together to `assign_owner_work` instead.
+        All groups must sit on the same DP mesh: owner ranks index into that one mesh, and the joint
+        balancing assumes each rank index denotes the same rank in every group.
 
         Args:
-            group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
+            groups: The FSDP parameter groups whose DBuffer layouts describe the parameter
+                placements, in rank-identical order.
             cost_fn: Cost estimate per parameter layout used to balance owner assignments across
                 ranks. When `None`, defaults to a compute estimate for orthogonalization via
                 Newton-Schulz with 5 iterations/steps. See also `assign_owner_work`.
             eligible_fn: Predicate selecting which parameters participate in owner-compute
                 orthogonalization. When `None`, defaults to matching ≥2D tensors. See also
                 `ParameterLayout.from_group`.
+
+        Returns:
+            One `GroupOwnerLayout` per group, in input order.
         """
-        layouts = ParameterLayout.from_group(group, eligible_fn=eligible_fn)
-        owners = assign_owner_work([layouts], cost_fn)[0]
-        return cls(group=group, layouts=layouts, owners=owners)
+        if not groups:
+            return []
+        mesh = groups[0].mesh
+        for group_index, group in enumerate(groups[1:], start=1):
+            if group.mesh != mesh:
+                raise ValueError(
+                    "`GroupOwnerLayout.from_groups` requires every group to sit on the same "
+                    f"DP mesh; group {group_index}'s mesh differs from group 0's. "
+                    "Balance groups per mesh instead."
+                )
+        layouts_per_group = [
+            ParameterLayout.from_group(group, eligible_fn=eligible_fn) for group in groups
+        ]
+        owners_per_group = assign_owner_work(layouts_per_group, cost_fn)
+        return [
+            cls(group=group, layouts=layouts, owners=owners)
+            for group, layouts, owners in zip(
+                groups, layouts_per_group, owners_per_group, strict=True
+            )
+        ]
 
     @property
     def mesh(self) -> DeviceMesh:
