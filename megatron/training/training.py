@@ -3080,6 +3080,9 @@ def setup_model_and_optimizer(
         )
         train_state.iteration = 1
         train_state.resume_iteration = 1
+        train_state.resume_num_floating_point_operations = (
+            train_state.num_floating_point_operations_so_far
+        )
         save_checkpoint(
             train_state.iteration, model, None, None, train_state.num_floating_point_operations_so_far
         )
@@ -3117,6 +3120,9 @@ def setup_model_and_optimizer(
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
             train_state.resume_iteration = train_state.iteration
+            train_state.resume_num_floating_point_operations = (
+                train_state.num_floating_point_operations_so_far
+            )
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -3134,6 +3140,7 @@ def setup_model_and_optimizer(
         train_state.iteration = 0
         train_state.resume_iteration = 0
         train_state.num_floating_point_operations_so_far = 0
+        train_state.resume_num_floating_point_operations = 0.0
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
@@ -4184,11 +4191,11 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
     # Compute job throughput.
-    # args.num_floating_point_operations_so_far keeps track of floating-point operations
+    # train_state.resume_num_floating_point_operations keeps track of floating-point operations
     # completed at the start of job.
     global _TRAIN_START_TIME
     job_throughput = (
-        num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
+        num_floating_point_operations_so_far - train_state.resume_num_floating_point_operations
     ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * llm_world_size)
 
     # Compute cumulative throughput since jobs of this world size were launched.
@@ -4814,8 +4821,6 @@ def train(
         num_floating_point_operations_so_far=train_state.num_floating_point_operations_so_far,
     )
 
-    num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
-
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
@@ -4938,7 +4943,8 @@ def train(
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
         num_floating_point_operations_since_current_train_start = (
-            num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
+            train_state.num_floating_point_operations_so_far
+            - train_state.resume_num_floating_point_operations
         )
         return {
             'iteration': iteration,
@@ -4946,7 +4952,7 @@ def train(
             'eval_duration': eval_duration,
             'eval_iterations': eval_iterations,
             'total_flops_since_current_train_start': num_floating_point_operations_since_current_train_start,
-            'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
+            'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': getattr(args, 'mimo_llm_world_size', args.world_size),
             'seq_length': args.seq_length,
@@ -5109,7 +5115,7 @@ def train(
                         model,
                         optimizer,
                         opt_param_scheduler,
-                        num_floating_point_operations_so_far,
+                        train_state.num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
@@ -5258,7 +5264,7 @@ def train(
                 model,
                 optimizer,
                 opt_param_scheduler,
-                num_floating_point_operations_so_far,
+                train_state.num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
@@ -5362,7 +5368,6 @@ def train(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
-        num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
 
@@ -5522,7 +5527,7 @@ def train(
             optimizer,
             opt_param_scheduler,
             iteration,
-            num_floating_point_operations_so_far,
+            train_state.num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
         )
@@ -5620,7 +5625,7 @@ def train(
     # ends the block via _end_otel_job_spans() instead.
     _end_otel_train_span()
 
-    return iteration, num_floating_point_operations_so_far
+    return iteration, train_state.num_floating_point_operations_so_far
 
 
 @_otel_trace_fn('evaluate', 'megatron.evaluate')

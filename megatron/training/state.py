@@ -21,6 +21,8 @@ class TrainState(Stateful):
     skipped_train_samples: int = 0
     consumed_valid_samples: int = 0
     num_floating_point_operations_so_far: int = 0
+    # FLOPs at the start of this run; derived on resume, not checkpointed.
+    resume_num_floating_point_operations: int = 0
     do_train: bool = False
     do_valid: bool = False
     do_test: bool = False
