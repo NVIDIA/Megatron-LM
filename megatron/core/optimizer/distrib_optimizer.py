@@ -1935,9 +1935,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         if i == len(bucket_state) - 1:
                             # Include intra-bucket padding, but exclude the tail
                             # used only to divide the buffer across DP ranks.
-                            next_param_start = min(
-                                gbuf_local_numel,
-                                gbuf_world_numel_unpadded - data_parallel_rank * gbuf_local_numel,
+                            next_param_start = max(
+                                0,
+                                min(
+                                    gbuf_local_numel,
+                                    gbuf_world_numel_unpadded
+                                    - data_parallel_rank * gbuf_local_numel,
+                                ),
                             )
                         else:
                             next_param_start = bucket_state[i + 1]['gbuf_local_start']
