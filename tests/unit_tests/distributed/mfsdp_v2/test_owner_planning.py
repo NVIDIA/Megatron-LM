@@ -151,3 +151,27 @@ def test_assign_owner_work_empty_groups(distributed_setup):
     assert assign_owner_work([]) == []
     assert assign_owner_work([(buffer, [])]) == [{}]
     assert assign_owner_work([(buffer, []), (buffer, [1]), (buffer, [])]) == [{}, {1: 0}, {}]
+
+
+def test_assign_owner_work_tie_breaks_by_tensor_index(distributed_setup):
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer.empty(
+        mesh, [Replicate()], [(8, 8), (8, 8)], torch.float32, distributed_setup.device
+    )
+    assert assign_owner_work([(buffer, [1, 0])]) == [{0: 0, 1: 1}]
+
+
+@pytest.mark.parametrize("other_ranks", [[0], [0, 2]])
+def test_assign_owner_work_rejects_mixed_meshes(other_ranks, distributed_setup):
+    """Reject both different mesh sizes and different rank sets of the same size."""
+    if distributed_setup.world_size <= max(1, *other_ranks):
+        pytest.skip(f"Test meshes require at least {max(1, *other_ranks) + 1} ranks.")
+    meshes = [DeviceMesh(distributed_setup.device.type, ranks) for ranks in [[0, 1], other_ranks]]
+    if any(mesh.get_coordinate() is None for mesh in meshes):
+        pytest.skip("Rank is outside one of the test meshes.")
+    buffers = [
+        DBuffer.empty(mesh, [RowAtomic()], [(8, 8)], torch.float32, distributed_setup.device)
+        for mesh in meshes
+    ]
+    with pytest.raises(ValueError, match="same DP mesh"):
+        assign_owner_work([(buffer, [0]) for buffer in buffers])
