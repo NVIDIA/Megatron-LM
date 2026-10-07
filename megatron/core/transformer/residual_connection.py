@@ -22,8 +22,7 @@ class ResidualConnection(nn.Module, ABC):
     stream as the first tensor in ``ResidualConnectionState``. Concrete connections
     own bias, dropout, mapping, and residual-update semantics.
 
-    ``mode`` fixes an instance to one operation at construction. ``None`` preserves
-    the legacy interface where callers pass ``operation`` to each forward.
+    ``mode`` fixes an instance to one operation at construction.
     """
 
     def __init__(
@@ -31,10 +30,10 @@ class ResidualConnection(nn.Module, ABC):
         residual_stream_hidden_size: int,
         branch_hidden_size: int,
         *,
-        mode: ResidualConnectionOperation | None = None,
+        mode: ResidualConnectionOperation,
     ):
         super().__init__()
-        if mode not in (None, "read", "write"):
+        if mode not in ("read", "write"):
             raise ValueError(f"Unsupported residual connection mode: {mode}.")
         self.mode = mode
         if residual_stream_hidden_size <= 0:
@@ -61,7 +60,6 @@ class ResidualConnection(nn.Module, ABC):
         self,
         value: Tensor,
         *,
-        operation: Literal["read"] | None = None,
         fp32_residual_connection: bool = False,
         branch_input_dtype: torch.dtype | None = None,
     ) -> tuple[Tensor, ResidualConnectionState]: ...
@@ -71,7 +69,6 @@ class ResidualConnection(nn.Module, ABC):
         self,
         value: ResidualBranchOutput,
         *,
-        operation: Literal["write"] | None = None,
         state: ResidualConnectionState,
         dropout_probability: float,
         training: bool,
@@ -81,7 +78,6 @@ class ResidualConnection(nn.Module, ABC):
         self,
         value: ResidualBranchOutput,
         *,
-        operation: ResidualConnectionOperation | None = None,
         state: ResidualConnectionState | None = None,
         fp32_residual_connection: bool = False,
         branch_input_dtype: torch.dtype | None = None,
@@ -94,11 +90,7 @@ class ResidualConnection(nn.Module, ABC):
         dtype; otherwise compatible connections may produce that dtype directly in a fused read.
         """
 
-        if self.mode is not None:
-            if operation is not None and operation != self.mode:
-                raise ValueError(f"Residual connection mode is fixed to {self.mode!r}.")
-            operation = self.mode
-        if operation == "read":
+        if self.mode == "read":
             if not torch.is_tensor(value):
                 raise TypeError("Residual connection read expects a tensor.")
             if state is not None or dropout_probability is not None or training is not None:
@@ -116,19 +108,15 @@ class ResidualConnection(nn.Module, ABC):
                 fp32_residual_connection=fp32_residual_connection,
                 branch_input_dtype=branch_input_dtype,
             )
-        if operation == "write":
-            if fp32_residual_connection or branch_input_dtype is not None:
-                raise TypeError("Residual connection write received read-only arguments.")
-            if state is None:
-                raise TypeError("Residual connection write requires connection state.")
-            if dropout_probability is None or training is None:
-                raise TypeError(
-                    "Residual connection write requires dropout_probability and training."
-                )
-            return self._write_with_validation(
-                value, state, dropout_probability=dropout_probability, training=training
-            )
-        raise ValueError(f"Unsupported residual connection operation: {operation}.")
+        if fp32_residual_connection or branch_input_dtype is not None:
+            raise TypeError("Residual connection write received read-only arguments.")
+        if state is None:
+            raise TypeError("Residual connection write requires connection state.")
+        if dropout_probability is None or training is None:
+            raise TypeError("Residual connection write requires dropout_probability and training.")
+        return self._write_with_validation(
+            value, state, dropout_probability=dropout_probability, training=training
+        )
 
     def _read_with_validation(
         self,

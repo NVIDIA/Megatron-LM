@@ -262,56 +262,6 @@ class TestStreamwiseSigmoidWideResidualRead:
 
 
 class TestStreamwiseSigmoidWideResidualConnection:
-    @pytest.mark.parametrize("retention", [False, True])
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_construction_modes_match_combined_forward_and_backward(self, retention, dtype):
-        config = _wide_config(
-            learned_retention=retention, params_dtype=dtype, bf16=dtype == torch.bfloat16
-        )
-        combined, reader, writer = (
-            StreamwiseSigmoidWideResidualConnection(config, 1, "test", mode=mode).to(
-                device="cuda", dtype=dtype
-            )
-            for mode in (None, "read", "write")
-        )
-        assert type(reader) is type(writer) is type(combined)
-        assert set(reader.state_dict()) == {"read_map.logit"}
-        writer_keys = {"write_map.logit"}
-        if retention:
-            writer_keys.add("retention.retention_logit")
-        assert set(writer.state_dict()) == writer_keys
-        for module in (reader, writer):
-            module.load_state_dict(
-                {key: combined.state_dict()[key] for key in module.state_dict()}, strict=True
-            )
-
-        x = torch.randn(4, reader.residual_stream_hidden_size, device="cuda", requires_grad=True)
-        reference_x = x.detach().clone().requires_grad_()
-        branch, state = reader(x, fp32_residual_connection=True, branch_input_dtype=dtype)
-        reference_branch, reference_state = combined(
-            reference_x, operation="read", fp32_residual_connection=True, branch_input_dtype=dtype
-        )
-        assert branch.dtype == dtype and state[0] is x
-        output = writer(branch.tanh(), state=state, dropout_probability=0.0, training=True)
-        expected = combined(
-            reference_branch.tanh(),
-            operation="write",
-            state=reference_state,
-            dropout_probability=0.0,
-            training=True,
-        )
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
-        output.square().mean().backward()
-        expected.square().mean().backward()
-        torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
-        reference_parameters = dict(combined.named_parameters())
-        for module in (reader, writer):
-            for name, parameter in module.named_parameters():
-                assert parameter.grad is not None
-                torch.testing.assert_close(
-                    parameter.grad, reference_parameters[name].grad, rtol=0, atol=0
-                )
 
     def test_maps_materialize_expected_initial_factors(self):
         config = _wide_config(num_streams=3, init_scale=0.2)
@@ -345,6 +295,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
                 layer_number=1,
                 branch_name="test",
                 pg_collection=_process_groups(),
+                mode="read",
             )
         with pytest.raises(ValueError, match="StreamwiseSigmoidResidualReadout requires"):
             StreamwiseSigmoidResidualReadout(base_config)
@@ -366,15 +317,17 @@ class TestStreamwiseSigmoidWideResidualConnection:
 
         config = _wide_config(bf16=True, params_dtype=torch.bfloat16, fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            mode="read",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
         )
 
-        branch_input, state = connection(
-            residual_stream, operation="read", fp32_residual_connection=True
-        )
+        branch_input, state = connection(residual_stream, fp32_residual_connection=True)
 
         assert branch_input.dtype == torch.float32
         assert connection.residual_stream(state).dtype == torch.float32
@@ -384,17 +337,18 @@ class TestStreamwiseSigmoidWideResidualConnection:
     def test_read_output_dtype_does_not_change_fp32_connection_state(self):
         config = _wide_config(fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            mode="read",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
         )
 
         branch_input, state = connection(
-            residual_stream,
-            operation="read",
-            fp32_residual_connection=True,
-            branch_input_dtype=torch.bfloat16,
+            residual_stream, fp32_residual_connection=True, branch_input_dtype=torch.bfloat16
         )
 
         assert branch_input.dtype == torch.bfloat16
@@ -422,7 +376,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
     ):
         config = _wide_config(fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            mode="write",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
@@ -453,7 +411,6 @@ class TestStreamwiseSigmoidWideResidualConnection:
         )
         connection(
             (branch_update, bias),
-            operation="write",
             state=(residual_stream,),
             dropout_probability=dropout_probability,
             training=training,
@@ -475,7 +432,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
         torch.manual_seed(8765)
         config = _wide_config(fp32_residual_connection=True, init_scale=0.01)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            mode="write",
         )
         residual = torch.randn(
             4, connection.residual_stream_hidden_size, dtype=torch.float32, requires_grad=True
@@ -492,11 +453,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
 
         torch.manual_seed(4321)
         output = connection(
-            (update, bias),
-            operation="write",
-            state=(residual,),
-            dropout_probability=0.25,
-            training=True,
+            (update, bias), state=(residual,), dropout_probability=0.25, training=True
         )
         torch.manual_seed(4321)
         reference_preprocessed = torch.nn.functional.dropout(
@@ -521,18 +478,19 @@ class TestStreamwiseSigmoidWideResidualConnection:
 
     def test_initial_read_write_and_readout_preserve_base_stream(self):
         config = _wide_config(init_scale=0.0)
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", mode=mode
+            )
+            for mode in ("read", "write")
         )
         readout = StreamwiseSigmoidResidualReadout(config)
         base = torch.randn(2, config.hidden_size)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        branch_input, state = connection(residual_stream, operation="read")
+        branch_input, state = reader(residual_stream)
         branch_update = torch.randn_like(base)
-        output = connection(
-            branch_update, operation="write", state=state, dropout_probability=0.0, training=False
-        )
+        output = writer(branch_update, state=state, dropout_probability=0.0, training=False)
 
         assert torch.allclose(branch_input, base)
         assert torch.allclose(output, expand_wide_residual_stream(base + branch_update, 3))
@@ -542,84 +500,86 @@ class TestStreamwiseSigmoidWideResidualConnection:
     def test_controllers_have_replicated_tp_gradient_metadata(self, sequence_parallel):
         config = _wide_config(learned_retention=True)
         config.sequence_parallel = sequence_parallel
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", mode=mode
+            )
+            for mode in ("read", "write")
         )
 
         parameters = (
-            connection.read_map.logit,
-            connection.write_map.logit,
-            connection.retention.retention_logit,
+            reader.read_map.logit,
+            writer.write_map.logit,
+            writer.retention.retention_logit,
         )
         for parameter in parameters:
             assert parameter.allreduce
             assert not parameter.tensor_model_parallel
             assert parameter.sequence_parallel == sequence_parallel
             assert parameter.average_gradients_across_tp_domain is not sequence_parallel
-        assert connection.retention.retention_logit.is_wide_residual_retention_parameter
+        assert writer.retention.retention_logit.is_wide_residual_retention_parameter
 
     def test_nested_module_hooks_run_before_controller_access(self):
         config = _wide_config(learned_retention=True)
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", mode=mode
+            )
+            for mode in ("read", "write")
         )
         operations = []
-        connection.read_map.register_forward_pre_hook(lambda *_: operations.append("read"))
-        connection.write_map.register_forward_pre_hook(lambda *_: operations.append("write"))
-        connection.retention.register_forward_pre_hook(lambda *_: operations.append("retention"))
+        reader.read_map.register_forward_pre_hook(lambda *_: operations.append("read"))
+        writer.write_map.register_forward_pre_hook(lambda *_: operations.append("write"))
+        writer.retention.register_forward_pre_hook(lambda *_: operations.append("retention"))
 
         residual_stream = torch.randn(2, 3 * config.hidden_size)
-        branch_input, state = connection(residual_stream, operation="read")
-        connection(
-            branch_input, operation="write", state=state, dropout_probability=0.0, training=False
-        )
+        branch_input, state = reader(residual_stream)
+        writer(branch_input, state=state, dropout_probability=0.0, training=False)
 
         assert operations == ["read", "retention", "write"]
 
     def test_gradients_reach_active_controllers_but_not_padding(self):
         config = _wide_config(init_scale=0.01, learned_retention=True)
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", mode=mode
+            )
+            for mode in ("read", "write")
         )
         residual_stream = torch.randn(4, 3 * config.hidden_size, requires_grad=True)
-        branch_input, state = connection(residual_stream, operation="read")
-        output = connection(
-            branch_input.square(),
-            operation="write",
-            state=state,
-            dropout_probability=0.0,
-            training=True,
-        )
+        branch_input, state = reader(residual_stream)
+        output = writer(branch_input.square(), state=state, dropout_probability=0.0, training=True)
         output.square().mean().backward()
 
         parameters = (
-            connection.read_map.logit,
-            connection.write_map.logit,
-            connection.retention.retention_logit,
+            reader.read_map.logit,
+            writer.write_map.logit,
+            writer.retention.retention_logit,
         )
         for parameter in parameters:
             assert parameter.grad is not None
-            assert torch.count_nonzero(parameter.grad[: connection.num_streams]) > 0
-            assert torch.count_nonzero(parameter.grad[connection.num_streams :]) == 0
+            assert torch.count_nonzero(parameter.grad[: reader.num_streams]) > 0
+            assert torch.count_nonzero(parameter.grad[reader.num_streams :]) == 0
 
     def test_checkpoint_round_trip_is_strict(self):
         config = _wide_config(learned_retention=True)
-        source = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
-        )
-        destination = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
-        )
-        with torch.no_grad():
-            source.read_map.logit[0].add_(0.25)
-            source.write_map.logit[1].sub_(0.125)
-            source.retention.retention_logit[2].add_(0.5)
+        for mode in ("read", "write"):
+            source = StreamwiseSigmoidWideResidualConnection(config, 1, "test", mode=mode)
+            destination = StreamwiseSigmoidWideResidualConnection(config, 1, "test", mode=mode)
+            with torch.no_grad():
+                for parameter in source.parameters():
+                    parameter[0].add_(0.25)
 
-        state = source.state_dict()
-        destination.load_state_dict(state, strict=True)
-        assert set(state) == {"read_map.logit", "write_map.logit", "retention.retention_logit"}
-        for name, value in state.items():
-            assert torch.equal(destination.state_dict()[name], value)
+            state = source.state_dict()
+            destination.load_state_dict(state, strict=True)
+            expected_keys = (
+                {"read_map.logit"}
+                if mode == "read"
+                else {"write_map.logit", "retention.retention_logit"}
+            )
+            assert set(state) == expected_keys
+            for name, value in state.items():
+                assert torch.equal(destination.state_dict()[name], value)
 
     def test_retention_initializes_to_requested_factor(self):
         config = _wide_config(learned_retention=True)

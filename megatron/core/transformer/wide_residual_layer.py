@@ -186,7 +186,7 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
 
 
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
-    """Streamwise residual maps, optionally restricted to a read or write at construction."""
+    """Streamwise residual maps restricted to a read or write at construction."""
 
     def __init__(
         self,
@@ -196,7 +196,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         pg_collection: ProcessGroupCollection | None = None,
         name: str | None = None,
         *,
-        mode: ResidualConnectionOperation | None = None,
+        mode: ResidualConnectionOperation,
     ) -> None:
         del pg_collection, name
         if config.wide_residual is None:
@@ -212,15 +212,15 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         self.layer_number = layer_number
         self.branch_name = branch_name
         self.num_streams = wr.num_streams
-        if mode != "write":
+        if mode == "read":
             self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
-        if mode != "read":
+        else:
             self.write_map = StreamwiseSigmoidMap(config, map_kind="write")
         self.retention = (
             LearnedWideResidualRetention(
                 config, layer_number, branch_name, num_streams=self.num_streams
             )
-            if mode != "read" and wr.learned_retention
+            if mode == "write" and wr.learned_retention
             else None
         )
 

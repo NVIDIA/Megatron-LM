@@ -2,7 +2,6 @@
 """Tests for selective wide-residual replay and offload ownership."""
 
 import copy
-from functools import partial
 
 import pytest
 import torch
@@ -50,10 +49,16 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class _StaticTestConnection(ResidualConnection):
-    def __init__(self, stream_width: int, branch_width: int):
-        super().__init__(stream_width, branch_width)
-        self.read_map = nn.Parameter(torch.randn(stream_width, branch_width) / stream_width**0.5)
-        self.write_map = nn.Parameter(torch.randn(branch_width, stream_width) / branch_width**0.5)
+    def __init__(self, stream_width: int, branch_width: int, *, mode):
+        super().__init__(stream_width, branch_width, mode=mode)
+        if mode == "read":
+            self.read_map = nn.Parameter(
+                torch.randn(stream_width, branch_width) / stream_width**0.5
+            )
+        else:
+            self.write_map = nn.Parameter(
+                torch.randn(branch_width, stream_width) / branch_width**0.5
+            )
 
     def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
         return hidden_states @ self.read_map, ()
@@ -87,7 +92,15 @@ class _StaticResidualChain(nn.Module):
     def __init__(self, stream_width: int = 12, branch_width: int = 6):
         super().__init__()
         self.connections = nn.ModuleList(
-            [_StaticTestConnection(stream_width, branch_width) for _ in range(2)]
+            [
+                nn.ModuleList(
+                    [
+                        _StaticTestConnection(stream_width, branch_width, mode=mode)
+                        for mode in ("read", "write")
+                    ]
+                )
+                for _ in range(2)
+            ]
         )
         self.norms = nn.ModuleList([nn.LayerNorm(branch_width) for _ in range(2)])
         self.branches = nn.ModuleList([_HeavyTestBranch(branch_width) for _ in range(2)])
@@ -96,41 +109,29 @@ class _StaticResidualChain(nn.Module):
         self, hidden_states: Tensor, contexts: list[ResidualStreamRecomputeContext] | None = None
     ) -> tuple[Tensor, list[Tensor]]:
         managed_outputs = []
-        for index, (connection, norm, branch) in enumerate(
+        for index, ((reader, writer), norm, branch) in enumerate(
             zip(self.connections, self.norms, self.branches)
         ):
             context = contexts[index] if contexts is not None else None
             if context is None:
-                branch_input, state = apply_module(connection)(
-                    hidden_states, operation="read", fp32_residual_connection=False
+                branch_input, state = apply_module(reader)(
+                    hidden_states, fp32_residual_connection=False
                 )
                 branch_input = apply_module(norm)(branch_input)
             else:
                 branch_input, state = checkpoint_residual_read(
-                    partial(connection, operation="read"),
-                    hidden_states,
-                    context,
-                    fp32_residual_connection=False,
+                    reader, hidden_states, context, fp32_residual_connection=False
                 )
                 branch_input = context.checkpoint(apply_module(norm), branch_input)
 
             branch_output = apply_module(branch)(branch_input)
             if context is not None and not context.is_block_end:
                 hidden_states = checkpoint_residual_write(
-                    partial(connection, operation="write"),
-                    branch_output,
-                    state,
-                    context,
-                    dropout_probability=0.2,
-                    training=True,
+                    writer, branch_output, state, context, dropout_probability=0.2, training=True
                 )
             else:
-                hidden_states = apply_module(connection)(
-                    branch_output,
-                    operation="write",
-                    state=state,
-                    dropout_probability=0.2,
-                    training=True,
+                hidden_states = apply_module(writer)(
+                    branch_output, state=state, dropout_probability=0.2, training=True
                 )
 
             if context is not None and context.is_block_end:
@@ -348,17 +349,14 @@ def _assert_matching_gradients(reference: nn.Module, recomputed: nn.Module) -> N
         torch.testing.assert_close(recomputed_parameter.grad, reference_parameter.grad)
 
 
-def test_legacy_residual_connection_subclass_honors_requested_branch_dtype():
-    """Existing subclasses inherit the default terminal-cast compatibility hook."""
+def test_residual_connection_subclass_honors_requested_branch_dtype():
+    """Subclasses inherit the default terminal-cast hook."""
 
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32)
 
     branch_input, state = connection(
-        hidden_states,
-        operation="read",
-        fp32_residual_connection=True,
-        branch_input_dtype=torch.bfloat16,
+        hidden_states, fp32_residual_connection=True, branch_input_dtype=torch.bfloat16
     )
 
     expected = (hidden_states @ connection.read_map).to(torch.bfloat16)
@@ -370,12 +368,12 @@ def test_legacy_residual_connection_subclass_honors_requested_branch_dtype():
 def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
     """Replay's defensive FP32 promotion must not allocate for normal FP32 ingress."""
 
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32, requires_grad=True)
     context = build_residual_stream_recompute_plan(num_layers=1, block_size=1)[0]
 
     _, state = checkpoint_residual_read(
-        partial(connection, operation="read"),
+        connection,
         hidden_states,
         context,
         fp32_residual_connection=True,
@@ -389,28 +387,21 @@ def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
 
 @pytest.mark.parametrize("invalid_dtype", ["bfloat16", torch.int32])
 def test_residual_connection_rejects_invalid_branch_dtype(invalid_dtype):
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="read")
     hidden_states = torch.randn(4, 12)
 
     with pytest.raises(TypeError, match="branch_input_dtype"):
-        connection(
-            hidden_states,
-            operation="read",
-            fp32_residual_connection=False,
-            branch_input_dtype=invalid_dtype,
-        )
+        connection(hidden_states, fp32_residual_connection=False, branch_input_dtype=invalid_dtype)
 
 
 def test_residual_connection_rejects_branch_dtype_on_write():
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="write")
     hidden_states = torch.randn(4, 12)
-    branch_input, state = connection(hidden_states, operation="read")
 
     with pytest.raises(TypeError, match="read-only"):
         connection(
-            branch_input,
-            operation="write",
-            state=state,
+            torch.randn(4, 6),
+            state=(hidden_states,),
             branch_input_dtype=torch.bfloat16,
             dropout_probability=0.0,
             training=False,
@@ -579,12 +570,13 @@ class TestResidualStreamRecomputeIntegration:
         reference_output.square().mean().backward()
 
         operation_counts = {"connections": 0, "norms": 0, "branches": 0}
-        for connection in recomputed.connections:
-            connection.register_forward_pre_hook(
-                lambda *_: operation_counts.__setitem__(
-                    "connections", operation_counts["connections"] + 1
+        for pair in recomputed.connections:
+            for connection in pair:
+                connection.register_forward_pre_hook(
+                    lambda *_: operation_counts.__setitem__(
+                        "connections", operation_counts["connections"] + 1
+                    )
                 )
-            )
         for norm in recomputed.norms:
             norm.register_forward_pre_hook(
                 lambda *_: operation_counts.__setitem__("norms", operation_counts["norms"] + 1)
