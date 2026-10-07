@@ -203,7 +203,10 @@ runs:
 
     # Validation PR only: exercise a private baseline without publishing a cache.
     - name: Require PR files for the private Testmon probe
-      if: inputs.is_unit_test == 'true' && inputs.tag == 'latest' && inputs.platform == 'dgx_h100' && inputs.test_case == 'tests/unit_tests/distributed/mfsdp_v2/**/*.py'
+      if: >-
+        inputs.is_unit_test == 'true' && inputs.tag == 'latest' &&
+        ((inputs.platform == 'dgx_h100' && inputs.test_case == 'tests/unit_tests/distributed/mfsdp_v2/**/*.py') ||
+         (inputs.platform == 'dgx_gb200' && inputs.test_case == 'tests/unit_tests/**/*.py'))
       shell: bash -e -u -o pipefail {0}
       env:
         ARTIFACT_ID: ${{ inputs.unit_test_pr_files_artifact_id }}
@@ -211,7 +214,10 @@ runs:
         [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
 
     - name: Download PR files for the private Testmon probe
-      if: inputs.is_unit_test == 'true' && inputs.tag == 'latest' && inputs.platform == 'dgx_h100' && inputs.test_case == 'tests/unit_tests/distributed/mfsdp_v2/**/*.py'
+      if: >-
+        inputs.is_unit_test == 'true' && inputs.tag == 'latest' &&
+        ((inputs.platform == 'dgx_h100' && inputs.test_case == 'tests/unit_tests/distributed/mfsdp_v2/**/*.py') ||
+         (inputs.platform == 'dgx_gb200' && inputs.test_case == 'tests/unit_tests/**/*.py'))
       uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
       with:
         artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}

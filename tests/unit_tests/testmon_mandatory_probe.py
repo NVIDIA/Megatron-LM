@@ -13,7 +13,10 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BUCKET = "tests/unit_tests/distributed/mfsdp_v2/**/*.py"
+BUCKETS = {
+    "h100": "tests/unit_tests/distributed/mfsdp_v2/**/*.py",
+    "gb200": "tests/unit_tests/**/*.py",
+}
 PHASES = ("prod", "experimental")
 PROBE_SOURCE = "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/owner_planning.py"
 
@@ -46,9 +49,9 @@ def run_stage(name: str, mode: str, cache: Path, evidence: Path, report: dict) -
         "--environment",
         "dev",
         "--bucket",
-        BUCKET,
+        report["bucket"],
         "--platform",
-        "h100",
+        report["platform"],
         "--unit-test-repeat",
         "1",
         "--log-dir",
@@ -124,11 +127,21 @@ def run_probe(args: argparse.Namespace, report: dict) -> None:
         PROBE_SOURCE in paths and (ROOT / PROBE_SOURCE).is_file(),
         f"real PR artifact must contain the existing probe source: {PROBE_SOURCE}",
     )
-    expected = sorted(
-        str(path.relative_to(ROOT))
-        for path in (ROOT / "tests/unit_tests/distributed/mfsdp_v2").rglob("test_*.py")
-    )
-    require(len(expected) == 16, f"expected 16 MFSDP v2 test files, found {len(expected)}")
+    if args.platform == "h100":
+        expected = sorted(
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "tests/unit_tests/distributed/mfsdp_v2").rglob("test_*.py")
+        )
+        require(len(expected) == 16, f"expected 16 MFSDP v2 test files, found {len(expected)}")
+    else:
+        expected = [
+            f"tests/unit_tests/distributed/mfsdp_v2/{name}.py"
+            for name in ("test_mcore_adapter", "test_quantization", "test_quantized_dbuffer")
+        ]
+        require(
+            all((ROOT / path).is_file() for path in expected),
+            "expected all three GB200 MFSDP v2 test files to exist",
+        )
     report.update(tested_sha=sha, artifact_metadata=metadata, expected_mandatory_files=expected)
     shutil.copyfile(args.metadata, args.evidence_dir / "input-metadata.json")
     shutil.copyfile(args.changed_files, args.evidence_dir / "input-changed-files")
@@ -175,11 +188,17 @@ def main() -> int:
     parser.add_argument("--changed-files", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
+    parser.add_argument("--platform", choices=BUCKETS, default="h100")
     args = parser.parse_args()
     for name in ("changed_files", "metadata", "evidence_dir"):
         setattr(args, name, getattr(args, name).resolve())
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
-    report = {"status": "failed", "bucket": BUCKET, "stages": {}}
+    report = {
+        "status": "failed",
+        "platform": args.platform,
+        "bucket": BUCKETS[args.platform],
+        "stages": {},
+    }
     try:
         run_probe(args, report)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -191,7 +210,8 @@ def main() -> int:
             "### Testmon private probe",
             "",
             f"- Result: **{report['status']}**",
-            f"- Bucket: `{BUCKET}`",
+            f"- Platform: `{report['platform']}`",
+            f"- Bucket: `{report['bucket']}`",
             f"- Evidence: `{report.get('attempt', 'report.json')}`",
         ]
         for name, stage in report["stages"].items():
