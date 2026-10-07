@@ -4,6 +4,7 @@
 import json
 from copy import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,10 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils,
+    packed_layout,
+)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     HAVE_HADAMARD,
@@ -23,6 +28,75 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
 pytestmark = pytest.mark.launch_on_gb200
 
 
+@pytest.fixture(autouse=True)
+def fresh_packed_compile_cache():
+    """Isolate independent layouts without changing the production recompile limit."""
+    # Keep compiled state shared between CP/reference or replay arms within one case.
+    # Carrying every parameterized layout into the next case can exhaust Dynamo's limit.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires compiled CUDA metadata")
+@pytest.mark.parametrize("cu_values", [(0, 128, 256), (0, 0, 128, 128, 256), (0, 96, 256)])
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("torch_deterministic", [False, True])
+def test_compiled_packed_metadata_matches_document_positions(cu_values, ratio, torch_deterministic):
+    """Compiled metadata must preserve real document positions, including empty segments."""
+    cu = torch.tensor(cu_values, dtype=torch.int32, device="cuda")
+    capacity = 40 if ratio == 4 else 2
+    halo = 8 if ratio == 4 else ratio
+    prior = torch.are_deterministic_algorithms_enabled()
+    prior_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(torch_deterministic)
+    try:
+        for start in (0, 128):
+            hidden = torch.arange(start, start + 128, device="cuda").float().view(128, 1, 1)
+            boundary = (
+                torch.arange(start - 128, start, device="cuda").float().view(128, 1, 1)
+                if start
+                else hidden[:0]
+            )
+            args = (hidden, boundary, cu, start, ratio, halo, capacity, 2)
+            expected = packed_layout._compact_compressor_input(*args)
+            actual = packed_layout._compiled_compactor(*args)
+            for reference, result in zip(expected, actual):
+                assert torch.equal(reference, result)
+            # An independent integer oracle also protects the eager reference.
+            ids, positions, source_rows = [], [], []
+            for begin, end in zip(cu_values, cu_values[1:]):
+                first = (max(start - halo - begin, 0) + ratio - 1) // ratio
+                stop = (min(end, start + 128) - begin) // ratio
+                if begin < start + 128 and end > start:
+                    for group in range(first, max(first, stop)):
+                        ids.append(group)
+                        positions.append(group * ratio)
+                        assert 0 <= group * ratio < end - begin
+                        source_rows.extend(
+                            range(begin + group * ratio, begin + (group + 1) * ratio)
+                        )
+            valid_groups = len(ids)
+            ids.extend([-1] * (capacity - valid_groups))
+            positions.extend([0] * (capacity - valid_groups))
+            source_rows.extend([0] * ((capacity - valid_groups) * ratio))
+            assert actual[1].tolist() == ids
+            assert actual[2].tolist() == positions
+            assert actual[0].flatten().tolist() == source_rows
+            # The other compiled bucketize consumer must retain every window row.
+            index_args = (cu, start, 128, boundary.shape[0], 128, ratio, 0)
+            index_expected = packed_layout._build_attention_indices(*index_args)
+            index_actual = packed_layout._compiled_attention_indices(*index_args)
+            for reference, result in zip(index_expected, index_actual):
+                if reference is None:
+                    assert result is None
+                else:
+                    assert torch.equal(reference, result)
+            assert (index_actual[1] > 0).all()
+    finally:
+        torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
+
+
 class _CP1:
     @staticmethod
     def size():
@@ -31,6 +105,21 @@ class _CP1:
     @staticmethod
     def rank():
         return 0
+
+
+def test_packed_deterministic_mode_is_rejected():
+    """Do not silently run external nondeterministic backward for an explicit mode request."""
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4
+    )
+    config = SimpleNamespace(
+        dsa_kernel_backend="cudnn", deterministic_mode=True, attention_cp_layout="contiguous"
+    )
+    with pytest.raises(NotImplementedError, match="does not yet support deterministic_mode"):
+        cp_utils.validate_packed_inputs(packed, config, _CP1())
+    config.deterministic_mode = False
+    cp_utils.validate_packed_inputs(packed, config, _CP1())
 
 
 def _similarities(actual, expected):
@@ -129,16 +218,19 @@ def _compare_results(actual, expected, label, failures, rows=None):
 )
 @pytest.mark.parametrize("cp_size", [2, 4])
 @pytest.mark.parametrize(
-    "ratio,sparse,coeff,recompute",
+    "ratio,sparse,coeff,recompute,rope_fusion",
     [
-        (0, True, 0.0, False),
-        (4, True, 0.2, True),
-        (4, False, 0.0, False),
-        (4, False, 0.2, False),
-        (128, True, 0.0, True),
+        (0, True, 0.0, False, True),
+        (4, True, 0.2, True, True),
+        (4, False, 0.0, False, True),
+        (4, False, 0.2, False, True),
+        (128, True, 0.0, True, True),
+        (4, True, 0.2, False, False),
     ],
 )
-def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, coeff, recompute):
+def test_packed_cp_matches_full_attention_and_gradients(
+    cp_size, ratio, sparse, coeff, recompute, rope_fusion
+):
     if Utils.world_size < cp_size:
         pytest.skip(f"requires {cp_size} ranks")
     pytest.importorskip("flash_mla")
@@ -178,7 +270,7 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
             attention_cp_layout="contiguous",
             linear_cp_layout="contiguous",
             qk_layernorm=True,
-            apply_rope_fusion=True,
+            apply_rope_fusion=rope_fusion,
             gradient_accumulation_fusion=True,
             recompute_granularity="selective" if recompute else None,
             recompute_modules=["mla_up_proj"] if recompute else [],
@@ -206,7 +298,7 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
         actual = _run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp)
         expected = _run_attention(reference, whole, grad, packed)
         failures = []
-        label = f"ratio={ratio}:cp={cp_size}:fp32_wgrad"
+        label = f"ratio={ratio}:cp={cp_size}:rope_fusion={rope_fusion}:fp32_wgrad"
         _compare_results(actual, expected, f"{label}:cp_vs_fused_cp1", failures, rows)
         if ratio == 4 and coeff == 0:
             for name, value in actual.items():

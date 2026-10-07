@@ -378,8 +378,11 @@ def fused_csa_teacher_lse(
     """
     if ratio <= 0:
         raise ValueError(f"ratio must be positive, got {ratio}")
-    if not can_use_fused_csa_teacher_lse(query, full_kv, compressed_kv, attn_sink, window_indices):
-        raise ValueError("unsupported tensor layout or dtype for fused CSA teacher LSE")
+    unsupported_reason = csa_teacher_lse_unsupported_reason(
+        query, full_kv, compressed_kv, attn_sink, window_indices
+    )
+    if unsupported_reason is not None:
+        raise RuntimeError(f"fused CSA teacher LSE is unavailable: {unsupported_reason}")
 
     total_q, num_heads, head_dim = query.shape
     block_d = max(16, triton.next_power_of_2(head_dim))

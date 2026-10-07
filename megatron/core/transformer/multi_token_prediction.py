@@ -228,8 +228,8 @@ def roll_tensor(
     boundary conditions.
 
     For CP=1 (default behavior): Uses standard torch.roll with zero padding
-    For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
-    boundary elements between adjacent CP ranks to maintain sequence continuity.
+    For zigzag CP>1: Rolls within each chunk, then exchanges boundary elements between
+    adjacent CP ranks. The contiguous layout exchanges shard boundaries and honors fill_value.
 
     For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
     from different sequences.
@@ -244,6 +244,10 @@ def roll_tensor(
                                             If provided, respects sequence boundaries.
         return_sum (bool): Whether to calculate and return the rolled tensor sum.
                            Defaults to True.
+        cp_layout (CPLayout): "contiguous" selects contiguous CP shards and requires
+                              shifts=-1; "zigzag" retains the legacy rolling paths.
+        fill_value: Value used outside the same real document in the contiguous path.
+                    Other layouts require the default zero fill.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor). The sum is None when disabled.
     """
@@ -255,6 +259,9 @@ def roll_tensor(
             raise ValueError("Contiguous CP roll supports shifts=-1.")
         result = roll_contiguous(tensor, dims, cp_group, packed_seq_params, fill_value)
         return result, result.sum() if return_sum else None
+
+    if fill_value != 0:
+        raise ValueError("roll_tensor honors fill_value only with cp_layout='contiguous'.")
 
     # Handle packed sequences cases
     if packed_seq_params is not None:
@@ -1184,7 +1191,6 @@ def process_mtp_loss(
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
-                cp_layout=config.attention_cp_layout,
             )
             if mtp_input_mask is not None:
                 # Each MTP step consumes one additional token. Accumulate validity so
@@ -1199,7 +1205,6 @@ def process_mtp_loss(
                     cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
-                    cp_layout=config.attention_cp_layout,
                 )
                 loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
                 mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
@@ -1216,7 +1221,6 @@ def process_mtp_loss(
                     dims=-1,
                     cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
-                    cp_layout=config.attention_cp_layout,
                 )
                 layer_loss_mask = loss_mask
                 # roll_tensor already computed this reduction. Preserve the legacy
@@ -1573,7 +1577,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
-                    cp_layout=self.config.attention_cp_layout,
                 )
             else:
                 # Roll IDs and validity together so CP performs one boundary exchange.
@@ -1587,7 +1590,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
-                    cp_layout=self.config.attention_cp_layout,
                 )
                 input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
                 mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
@@ -1598,7 +1600,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
-                cp_layout=self.config.attention_cp_layout,
             )
             if padding_mask is not None:
                 padding_mask, _ = roll_tensor(
@@ -1608,8 +1609,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
-                    cp_layout=self.config.attention_cp_layout,
-                    fill_value=True,
                 )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)

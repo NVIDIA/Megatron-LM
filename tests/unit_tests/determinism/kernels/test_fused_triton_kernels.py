@@ -45,6 +45,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_teacher_lse_reports_unsupported_cpu_inputs():
+    """The public entry point keeps RuntimeError and reports the unsupported reason."""
+    with pytest.raises(RuntimeError, match="teacher LSE is unavailable:.*(Triton|CUDA)"):
+        fused_csa_teacher_lse(
+            torch.zeros(4, 2, 16, device="cpu"),
+            torch.zeros(4, 16, device="cpu"),
+            torch.zeros(1, 16, device="cpu"),
+            torch.zeros(2, device="cpu"),
+            torch.zeros(4, 2, dtype=torch.int32, device="cpu"),
+            softmax_scale=0.25,
+            ratio=4,
+        )
+
+
 @pytest.fixture
 def experimental_enabled():
     """Force the experimental flag on (the fused routing kernels are experimental features)."""

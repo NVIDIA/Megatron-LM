@@ -287,7 +287,7 @@ def compute_cp_indexer_topk(
         cu_seqlens_q, cu_seqlens_compressed, global_start, l_local, k_indexer_seq_major.shape[0]
     )
 
-    if max_seqlen_kv == 0 or k_indexer_seq_major.shape[0] == 0:
+    if max_seqlen_kv == 0:
         topk = torch.full(
             (l_local, topk_width), -1, device=q_indexer_local.device, dtype=torch.int32
         )
@@ -318,6 +318,11 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
     """
     if config.dsa_kernel_backend != "cudnn":
         raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
+    if config.deterministic_mode:
+        raise NotImplementedError(
+            "Packed DSv4 attention does not yet support deterministic_mode; "
+            "deterministic THD/CP backward is tracked in #7921."
+        )
     if packed_seq_params.qkv_format != "thd":
         raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
     if cp_group is None:

@@ -683,7 +683,6 @@ class Compressor(MegatronModule):
                 self.head_dim - self.qk_pos_emb_head_dim,
                 self.qk_pos_emb_head_dim,
                 self.config,
-                None,
                 self.pg_collection.cp,
             )
         return rotate_activation(compressed) if self.rotate else compressed
@@ -1716,28 +1715,15 @@ def _apply_unfused_rope(
     nope_dim: int,
     pos_dim: int,
     config: TransformerConfig,
-    cu_seqlens: Optional[torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
-    max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply unfused RoPE (split, rotate, concat) with 3-D / 4-D handling.
 
     DSv4 forces ``mscale=1.0`` — the model relies on Q/KV RMS-norm +
     unit-magnitude rotation, not Yarn's concentration factor.
     """
-    packed_seq = cu_seqlens is not None
-
-    # Drop dummy ``b=1`` from packed 4-D ``(total, 1, h, d)`` callers.
-    squeezed_b = packed_seq and x.dim() == 4 and x.size(1) == 1
-    # Packed 3-D ``(total, 1, d)``: collapse batch and add a temporary head dim.
-    squeezed_b_3d = packed_seq and x.dim() == 3 and x.size(1) == 1
-    if squeezed_b:
-        x = x.squeeze(1)
-    elif squeezed_b_3d:
-        x = x.squeeze(1).unsqueeze(-2)
-
-    # Non-packed 3-D ``(b, s, d)``: add a temporary head dim.
-    squeeze_head = not packed_seq and x.dim() == 3
+    # Frequencies are already gathered per row; do not dispatch through THD RoPE.
+    squeeze_head = x.dim() == 3
     if squeeze_head:
         x = x.unsqueeze(-2)
 
@@ -1746,19 +1732,12 @@ def _apply_unfused_rope(
         x_pe,
         rotary_pos_emb,
         config=config,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=None,
         mscale=1.0,
         cp_group=cp_group,
         mla_rotary_interleaved=True,
         mla_output_remove_interleaving=True,
-        max_seqlen=max_seqlen,
     )
     out = torch.cat([x_nope, x_pe], dim=-1)
 
-    if squeezed_b:
-        out = out.unsqueeze(1)
-    elif squeezed_b_3d:
-        out = out.squeeze(-2).unsqueeze(1)
-    elif squeeze_head:
-        out = out.squeeze(-2)
-    return out
+    return out.squeeze(-2) if squeeze_head else out

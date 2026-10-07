@@ -8,7 +8,18 @@ import torch.distributed as dist
 from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.multi_token_prediction import roll_tensor
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_roll_tensor_fill_value_contract():
+    """Nonzero fill is explicit and applies only to the contiguous layout."""
+    tensor = torch.zeros(1, 4, dtype=torch.bool)
+    with pytest.raises(ValueError, match="only with cp_layout='contiguous'"):
+        roll_tensor(tensor, cp_layout="zigzag", fill_value=True)
+    rolled, total = roll_tensor(tensor, cp_layout="contiguous", fill_value=True, return_sum=False)
+    assert torch.equal(rolled, torch.tensor([[False, False, False, True]]))
+    assert total is None
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
