@@ -16,6 +16,8 @@ ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
+    # Remove the Nsight Systems EFA metrics plugin from the image.
+    rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
     apt-get update
     apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime
     apt-get clean
