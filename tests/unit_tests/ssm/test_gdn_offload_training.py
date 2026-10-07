@@ -77,6 +77,8 @@ def _training_config(
         context_parallel_size=cp,
         pipeline_model_parallel_size=pp,
         virtual_pipeline_model_parallel_size=vp,
+        # PP=2/VPP requires the native ordering for both directions to the same peer.
+        batch_p2p_comm=False,
         attention_backend=AttnBackend.fused if cp > 1 else AttnBackend.unfused,
         experimental_attention_variant="gdn",
         linear_attention_freq=4,

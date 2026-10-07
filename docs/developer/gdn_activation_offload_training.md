@@ -16,11 +16,12 @@ do not replace upstream CI.
 | Reduced model, one rank | 6 passed, 42 topology cases skipped |
 | Reduced model, two ranks: DP, TP, TP+SP | 18 passed on each rank |
 | Reduced model, two ranks: PP | 6 passed on each rank |
-| Reduced model, PP+VPP | 6 passed on each rank after fixing the fixture's explicit layer separators |
+| Reduced model, PP+VPP | 6 passed on each rank with native unbatched P2P |
 | Reduced model, CP | Baseline failed before offloading: no compatible deterministic attention backend in this A6000 environment |
 | Reduced model, four-rank combinations | Not run |
 | Pretrained Qwen3.5-0.8B, one rank | All 8 comparison arms passed; 24 optimizer updates |
-| Pretrained Qwen, multiple ranks | Not run |
+| Pretrained Qwen, TP+SP on two ranks | All 8 arms passed on each rank, including across norm recomputation settings |
+| Pretrained Qwen, PP+VPP on two ranks | Batched P2P baseline failed activation-transfer checks; native unbatched P2P rerun pending |
 | Pretrained Qwen memory/runtime | Measurements in progress; no result qualified yet |
 
 The Qwen comparison uses all 24 text decoder layers, hidden size 1024 and
@@ -89,6 +90,17 @@ a compatible CP backend; non-CP cases use its unfused attention path. GDN uses F
 and has no deterministic reference fallback. The test sets
 `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` for reproducible attention backward while
 leaving GDN's FLA dispatch enabled.
+
+Both training entry points select native unbatched P2P. In the two-rank VPP
+ring, previous and next stages are the same peer. Batched P2P delivered
+mismatched forward activations after the initial forward-only microbatches in
+the Qwen baseline. Tracing all four microbatches confirmed unchanged parameters and
+mismatched activation hashes at pipeline boundaries. Native unbatched P2P
+restored matching send/receive hashes and initial losses identical to the
+single-GPU baseline. Pipeline-output deallocation did not cause this failure;
+the tool retains Bridge's deallocation setting and records the communication
+and deallocation settings. Baseline/offload equivalence alone does not qualify an unhealthy
+training baseline.
 
 ## Run on available GPUs
 
