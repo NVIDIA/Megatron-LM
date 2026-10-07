@@ -123,7 +123,10 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
 class _StubCoordinator:
     """Minimal stand-in exposing only what the submit handlers touch."""
 
+    is_disaggregated_inference = DataParallelInferenceCoordinator.is_disaggregated_inference
+
     def __init__(self, identity=b"engine-0"):
+        self.disaggregated_runtime = None
         self.known_clients = {b"client-0"}
         self.next_request_id = 100
         self.request_id_to_client_id = {}
@@ -147,11 +150,13 @@ class _StubCoordinator:
         return True
 
 
-def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame():
+@pytest.mark.parametrize("native_disaggregation", [False, True])
+def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame(native_disaggregation):
     """Client -> coordinator -> engine for a KV handoff, asserting the framing.
 
     The prompt must never be decoded by the coordinator: it is forwarded as the
-    opaque body frame the client packed, byte for byte.
+    opaque body frame the client packed, byte for byte. Native coordinators
+    reject external handoffs before routing or allocating request state.
     """
     prompt_tokens = [11, 22, 33, 44]
     kv_meta = {"agent": "nixl-0"}
@@ -176,8 +181,28 @@ def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame():
 
     # --- coordinator side: route it ---
     coordinator = _StubCoordinator()
+    if native_disaggregation:
+        coordinator.disaggregated_runtime = object()
+        coordinator.router_socket = unittest.mock.Mock()
     handler = HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV]
-    handler(coordinator, b"client-0", metadata, frames[1:])
+    assert handler(coordinator, b"client-0", metadata, frames[1:]) is None
+
+    if native_disaggregation:
+        assert coordinator.sent == []
+        assert coordinator.next_request_id == 100
+        assert not coordinator.request_id_to_client_id
+        assert not coordinator.request_id_to_client_request_id
+        assert not coordinator.client_request_to_request_id
+        assert not coordinator.request_id_to_rank
+        assert coordinator._pending_counts[0] == 0
+        coordinator.router_socket.send_multipart.assert_called_once()
+        destination, error_frame = coordinator.router_socket.send_multipart.call_args.args[0]
+        header, rejected_id, reason, source_safe = msgpack.unpackb(error_frame, raw=False)
+        assert destination == b"client-0"
+        assert header == Headers.REQUEST_ERROR.value and rejected_id == request_id
+        assert "native disaggregation" in reason and "use SUBMIT_REQUEST" in reason
+        assert source_safe is True
+        return
 
     assert len(coordinator.sent) == 1
     identity, out_frames = coordinator.sent[0]

@@ -288,10 +288,15 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
 @message_handler(Headers.SUBMIT_REQUEST_WITH_KV)
 def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies):
-    """Route a client-supplied KV handoff to a decode engine.
+    """Route an externally orchestrated KV handoff within a decode service.
 
     Sent by ``InferenceClient.add_request_with_kv_handoff`` /
-    ``add_request_with_kv_handoff_streaming``.
+    ``add_request_with_kv_handoff_streaming`` to an externally managed decode
+    endpoint. Its registered engines must all be decode-capable.
+
+    Native disaggregation rejects client-supplied handoffs here: its runtime
+    selects and reserves a decode engine, then sends SUBMIT_REQUEST_WITH_KV
+    directly to that engine, bypassing this handler.
 
     ``metadata``: ``[header, client_request_id, sampling_params, kv_meta]``,
         where ``kv_meta`` is the peer's NIXL agent/layout export. It is bounded
@@ -300,9 +305,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     ``bodies``: ``[prompt, src_block_ids]``. ``src_block_ids`` names one remote
         block per block_size_tokens of prompt, so it grows with the prompt and
         travels as its own frame. Both bodies are forwarded to the engine
-        untouched, so the coordinator decodes nothing sequence-dependent. In
-        disaggregated serving every decode request arrives here, so this is as
-        hot as a plain submission.
+        untouched, so the coordinator decodes nothing sequence-dependent.
     """
 
     if sender_identity not in coordinator.known_clients:
@@ -319,6 +322,25 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
         return
 
     _, client_request_id, sampling_params, kv_meta = metadata
+    if coordinator.is_disaggregated_inference():
+        # No engine has read the source state. Reject before allocating an ID
+        # or bypassing the native runtime's role routing and reservations.
+        coordinator.router_socket.send_multipart(
+            [
+                sender_identity,
+                msgpack.packb(
+                    [
+                        Headers.REQUEST_ERROR.value,
+                        client_request_id,
+                        "SUBMIT_REQUEST_WITH_KV is not supported by native disaggregation; "
+                        "use SUBMIT_REQUEST",
+                        True,
+                    ],
+                    use_bin_type=True,
+                ),
+            ]
+        )
+        return
     request_id = coordinator.next_request_id
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
