@@ -55,6 +55,20 @@ class _RecomputedMLP(nn.Module):
 _ZERO3_PLACEMENTS = Placements(
     dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
 )
+# Sharded compute weights gather MXFP8 planes per phase; replicated ones need no gather.
+_MXFP8_PLACEMENTS = [
+    pytest.param(_ZERO3_PLACEMENTS, id="zero3"),
+    pytest.param(
+        Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]),
+        id="zero2",
+    ),
+    pytest.param(
+        Placements(
+            dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
+        ),
+        id="no_shard",
+    ),
+]
 
 requires_mxfp8 = pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
@@ -64,17 +78,7 @@ requires_mxfp8 = pytest.mark.skipif(
 
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
-@pytest.mark.parametrize(
-    "placements",
-    [
-        Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]),
-        Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]),
-        Placements(
-            dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
-        ),
-    ],
-    ids=["zero3", "zero2", "no_shard"],
-)
+@pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
     """MXFP8 MLP losses track an independently trained unsharded model."""
     device = distributed_setup.device
@@ -211,13 +215,18 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
 
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
+@pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-def test_mxfp8_activation_recompute_matches_no_recompute(distributed_setup, use_reentrant):
+def test_mxfp8_activation_recompute_matches_no_recompute(
+    distributed_setup, use_reentrant, placements
+):
     """Recomputation regathers rowwise planes in backward without changing numerics.
 
-    Backward prefetch gathers only columnwise planes, so recomputed forwards must
-    gather rowwise planes on demand. Shapes need padded scales, which covers
-    reinstalling padded scale copies on the Parameter TE saved for backward.
+    With sharded compute weights, backward prefetch gathers only columnwise planes,
+    so recomputed forwards must gather rowwise planes on demand. Replicated compute
+    weights need no gather and keep both planes installed. Shapes need padded
+    scales, which covers reinstalling padded scale copies on the Parameter TE saved
+    for backward.
     """
     device = distributed_setup.device
     if distributed_setup.world_size < 2:
@@ -237,9 +246,9 @@ def test_mxfp8_activation_recompute_matches_no_recompute(distributed_setup, use_
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
         with fully_shard_context(device=device):
-            fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS)
-            fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
-            fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+            fully_shard(model.fc1, mesh=mesh, placements=placements)
+            fully_shard(model.fc2, mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
         model.fc1.register_forward_pre_hook(record_recompute)
         model.fc2.register_forward_pre_hook(record_recompute)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
