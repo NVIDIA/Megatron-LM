@@ -188,7 +188,9 @@ class InferenceStateHandoffMixin:
             )
         self._handoff_completion_notifications.clear()
 
-    def schedule_waiting_requests(self) -> None:
+    def schedule_waiting_requests(
+        self, prompt_logprob_updates: Dict[int, Dict[str, object]] | None = None
+    ) -> None:
         """Reject prompt scheduling on a dedicated disaggregated decode engine.
 
         Side: decode engine; pull and push transport paths.
@@ -202,7 +204,7 @@ class InferenceStateHandoffMixin:
                 raise RuntimeError(
                     "A disaggregated decode engine cannot schedule prompt prefill requests"
                 )
-        super().schedule_waiting_requests()
+        super().schedule_waiting_requests(prompt_logprob_updates)
 
     def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
         """Bring up the KV transfer agents for this engine.

@@ -982,6 +982,8 @@ class DynamicInferenceRequest(InferenceRequest):
 
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("_prompt_logprobs_cache_key", None)
+        obj.pop("_pending_prompt_logprob_row", None)
         # Request metadata is input-only. Only the stager's response metadata
         # crosses back to the REST endpoint.
         obj.pop("offload_params", None)
