@@ -313,7 +313,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
     def test_fp32_state_promotion_aliases_an_already_fp32_stream(self):
         """The defensive FP32 promotion must not allocate for normal FP32 model ingress."""
 
-        config = _wide_config(fp32_residual_connection=True)
+        config = _wide_config(bf16=True, params_dtype=torch.bfloat16, fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
             config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
         )
@@ -321,8 +321,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
             2, connection.residual_stream_hidden_size, dtype=torch.float32
         )
 
-        _, state = connection(residual_stream, operation="read", fp32_residual_connection=True)
+        branch_input, state = connection(
+            residual_stream, operation="read", fp32_residual_connection=True
+        )
 
+        assert branch_input.dtype == torch.float32
         assert connection.residual_stream(state).dtype == torch.float32
         assert connection.residual_stream(state) is residual_stream
         assert connection.residual_stream(state).data_ptr() == residual_stream.data_ptr()

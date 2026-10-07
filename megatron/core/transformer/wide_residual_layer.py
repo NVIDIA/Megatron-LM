@@ -168,7 +168,7 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         self.branch_input_dtype = config.params_dtype
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
 
-    def forward(self, hidden_states: Tensor, *, output_dtype: torch.dtype | None = None) -> Tensor:
+    def forward(self, hidden_states: Tensor) -> Tensor:
         """Read in branch precision; the operator fixes the output shape and dtype."""
 
         if hidden_states.shape[-1] != self.residual_stream_hidden_size:
@@ -180,7 +180,25 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
             hidden_states,
             self.read_map(return_logits=True),
             self.num_streams,
-            output_dtype=self.branch_input_dtype if output_dtype is None else output_dtype,
+            output_dtype=self.branch_input_dtype,
+        )
+
+
+class StreamwiseSigmoidWideResidualConnectionRead(nn.Module):
+    """Own the connection's read map and preserve its existing output-dtype contract."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+        self.num_streams = config.wide_residual.num_streams
+
+    def forward(self, hidden_states: Tensor, *, output_dtype: torch.dtype | None = None) -> Tensor:
+        """Read in the input dtype unless the connection requests a branch dtype."""
+        return streamwise_sigmoid_read(
+            hidden_states,
+            self.read_map(return_logits=True),
+            self.num_streams,
+            output_dtype=output_dtype,
         )
 
 
@@ -269,7 +287,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         self.layer_number = layer_number
         self.branch_name = branch_name
         self.num_streams = config.wide_residual.num_streams
-        self.reader = StreamwiseSigmoidWideResidualRead(config, layer_number, branch_name)
+        self.reader = StreamwiseSigmoidWideResidualConnectionRead(config)
         self.writer = StreamwiseSigmoidWideResidualWrite(config, layer_number, branch_name)
         self.register_state_dict_post_hook(_export_residual_state)
         self.register_load_state_dict_pre_hook(_load_residual_state)
@@ -290,18 +308,12 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         return self.writer.retention
 
     def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return self.reader(hidden_states, output_dtype=hidden_states.dtype), ()
+        return self.reader(hidden_states), ()
 
     def _read_with_output_dtype(
         self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
     ) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return (
-            self.reader(
-                hidden_states,
-                output_dtype=hidden_states.dtype if output_dtype is None else output_dtype,
-            ),
-            (),
-        )
+        return self.reader(hidden_states, output_dtype=output_dtype), ()
 
     def _write(
         self,
