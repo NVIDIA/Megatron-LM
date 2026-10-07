@@ -2155,7 +2155,6 @@ def pretrain(
             print_rank_0('training ...')
 
         iteration = 0
-        args.curr_iteration = iteration
         if train_state.do_train and (args.train_iters or 0) > 0:
             try:
                 iteration, num_floating_point_operations_so_far = train(
@@ -2207,7 +2206,6 @@ def pretrain(
         print_rank_0('skipping training (--skip-train is on) ...')
 
         iteration = train_state.iteration
-        args.curr_iteration = iteration
 
     if train_state.do_valid:
         prefix = f'iteration {iteration} on validation set'
@@ -5164,7 +5162,6 @@ def train(
             train_state.skipped_train_samples += batch_size
             continue
 
-        args.curr_iteration = iteration
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
