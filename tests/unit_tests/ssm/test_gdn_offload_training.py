@@ -28,7 +28,10 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    OffloadTensorPool,
+    PipelineOffloadManager,
+)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import (
@@ -79,7 +82,7 @@ def _training_config(
         virtual_pipeline_model_parallel_size=vp,
         # PP=2/VPP requires the native ordering for both directions to the same peer.
         batch_p2p_comm=False,
-        attention_backend=AttnBackend.fused if cp > 1 else AttnBackend.unfused,
+        attention_backend=AttnBackend.auto if cp > 1 else AttnBackend.unfused,
         experimental_attention_variant="gdn",
         linear_attention_freq=4,
         linear_conv_kernel_dim=4,
@@ -222,6 +225,15 @@ def test_gdn_offload_training(
         schedule = get_forward_backward_func(pp_size=pp, vp_size=vp)
         generator = torch.Generator().manual_seed(19 + groups.dp.rank())
         manager = PipelineOffloadManager.get_instance()
+        pool_before_reset: list[int] = []
+        reset_pool = OffloadTensorPool.reset
+
+        # The schedule resets counters; observe ownership before they are cleared.
+        def record_pool_reset(pool: OffloadTensorPool) -> None:
+            pool_before_reset.append(pool.get_pool_status()["global_stats"]["current_in_use"])
+            reset_pool(pool)
+
+        monkeypatch.setattr(OffloadTensorPool, "reset", record_pool_reset)
         for _ in range(3):
             batches = []
             for _ in range(2):
@@ -240,6 +252,7 @@ def test_gdn_offload_training(
                 (baseline, baseline_optimizer),
                 (offloaded, offload_optimizer),
             ):
+                pool_before_reset.clear()
                 optimizer.zero_grad()
                 for model in models:
                     model.zero_grad_buffer()
@@ -255,14 +268,17 @@ def test_gdn_offload_training(
                     pg_collection=groups,
                 )
                 # Reject a bad baseline on every rank before the next collective.
-                losses_valid = torch.tensor(
+                step_valid = torch.tensor(
                     len(losses) == (4 if is_pp_last_stage(groups.pp) else 0)
-                    and not any(diff(losses[:2], losses[2:])),
+                    and not any(diff(losses[:2], losses[2:]))
+                    and pool_before_reset == ([0] if models is offloaded else []),
                     dtype=torch.int32,
                     device="cuda",
                 )
-                torch.distributed.all_reduce(losses_valid, op=torch.distributed.ReduceOp.MIN)
-                assert losses_valid.item(), "Loss records must preserve repeated microbatch inputs."
+                torch.distributed.all_reduce(step_valid, op=torch.distributed.ReduceOp.MIN)
+                assert (
+                    step_valid.item()
+                ), "Microbatch losses or pre-reset pinned buffers are invalid."
                 grads = {
                     f"{stage}.{name}": parameter.main_grad.detach().clone()
                     for stage, model in enumerate(models)
@@ -285,7 +301,6 @@ def test_gdn_offload_training(
                 )
             torch.cuda.synchronize()
             assert not any(diff(snapshots[0], snapshots[1]))
-            assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
             assert not manager._is_warmup
             if fraction == 0:
                 assert manager.offload_summary_total_bytes == 0

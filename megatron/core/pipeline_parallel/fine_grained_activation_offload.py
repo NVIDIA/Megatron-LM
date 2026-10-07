@@ -1117,6 +1117,10 @@ class ChunkOffloadHandler:
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
+            # Reload returns pooled buffers as soon as H2D is queued. A later
+            # forward must finish those reads before D2H reuses the buffers.
+            if group_to_offload.use_cpu_pool and not is_graph_capturing():
+                self.d2h_stream.wait_stream(self.h2d_stream)
             # Warmup-only accounting local to this offload group. Every tensor in
             # the group is alive here, so device + data_ptr identifies its storage.
             storage_records = (

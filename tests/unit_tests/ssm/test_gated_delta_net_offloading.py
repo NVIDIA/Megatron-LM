@@ -179,18 +179,25 @@ def _run(
 )
 @pytest.mark.parametrize("recompute_norm", [False, True])
 @pytest.mark.parametrize("value_heads", [4, 8], ids=["shared_qk", "expanded_qk"])
+@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused_pre_gdr", "fused_pre_gdr"])
 def test_gdn_offload_replay(
     gdn_offload_groups: ProcessGroupCollection,
     fraction: float,
     threshold: int,
     recompute_norm: bool,
     value_heads: int,
+    fused_pre_gdr: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Outputs and every gradient agree through warmup, policy selection, and pool reuse."""
+    if fused_pre_gdr:
+        pytest.importorskip("causal_conv1d.cpp_functions")
+        monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     config = _config(
         activation_offload_fraction=fraction,
         min_offloaded_tensor_size=threshold,
         linear_num_value_heads=value_heads,
+        gdn_pre_gated_delta_rule_fusion=fused_pre_gdr,
     )
     if recompute_norm:
         config.recompute_granularity = "selective"
@@ -324,9 +331,23 @@ def test_gdn_offload_microbatch_accumulation(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_gdn_offload_packed_sequence(gdn_offload_groups: ProcessGroupCollection) -> None:
+@pytest.mark.parametrize("recompute_norm", [False, True])
+@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused_pre_gdr", "fused_pre_gdr"])
+def test_gdn_offload_packed_sequence(
+    gdn_offload_groups: ProcessGroupCollection,
+    fused_pre_gdr: bool,
+    recompute_norm: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Packed-sequence metadata survives the saved-tensor hooks."""
-    config = _config()
+    if fused_pre_gdr:
+        pytest.importorskip("causal_conv1d.cpp_functions")
+        monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    config = _config(
+        gdn_pre_gated_delta_rule_fusion=fused_pre_gdr,
+        recompute_granularity="selective" if recompute_norm else None,
+        recompute_modules=["gdn_norm_out"] if recompute_norm else [],
+    )
     baseline, offloaded = _build_pair(config, gdn_offload_groups)
     cu = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
@@ -335,6 +356,8 @@ def test_gdn_offload_packed_sequence(gdn_offload_groups: ProcessGroupCollection)
         reference = _run(baseline, source, packed)
         result = _run(offloaded, source, packed, offload=True)
         _assert_step_equal(reference, result)
+        manager = PipelineOffloadManager.get_instance()
+        assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
         off_interface.reset(process_group=torch.distributed.group.WORLD)
 
 
