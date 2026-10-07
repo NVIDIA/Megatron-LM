@@ -1617,44 +1617,6 @@ def test_optimizer_gloo_group_must_mirror_a_replaced_dp_cp_group():
         )
 
 
-@pytest.mark.parametrize('create_gloo', [False, True])
-@pytest.mark.parametrize('use_gloo', [False, True])
-def test_get_megatron_optimizer_with_gloo_collection(mocker, create_gloo, use_gloo):
-    """The optimizer uses caller-owned Gloo groups without resolving the global grid again."""
-    Utils.initialize_model_parallel(create_gloo_process_groups=create_gloo)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    assert (pg_collection.intra_dp_cp_gloo is not None) == create_gloo
-    assert (pg_collection.intra_expt_dp_gloo is not None) == create_gloo
-    model = DistributedDataParallel(
-        TransformerConfig(num_attention_heads=1, num_layers=1),
-        DistributedDataParallelConfig(use_distributed_optimizer=True),
-        torch.nn.Linear(16, 16, bias=False, device='cuda'),
-        pg_collection=pg_collection,
-    )
-    mocker.patch.object(
-        ProcessGroupCollection,
-        'use_mpu_process_groups',
-        side_effect=AssertionError('explicit collection must not read the global grid'),
-    )
-    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
-    if use_gloo and not create_gloo:
-        # Gloo was requested but the job has no Gloo groups: that is an error, not a downgrade.
-        with pytest.raises(ValueError, match="use_gloo_process_groups=True requires"):
-            get_megatron_optimizer(
-                optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
-            )
-    else:
-        optimizer = get_megatron_optimizer(
-            optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=use_gloo
-        )
-        assert len(optimizer.chained_optimizers) == 1
-        distributed_optimizer = optimizer.chained_optimizers[0]
-        assert isinstance(distributed_optimizer, DistributedOptimizer)
-        assert distributed_optimizer.data_parallel_group_gloo is (
-            pg_collection.intra_dp_cp_gloo if use_gloo else None
-        )
-
-
 class DenseAndExpertLinear(nn.Module):
     """One dense and one expert-parallel weight, as the optimizer factory sees an MoE layer."""
 
@@ -1664,6 +1626,61 @@ class DenseAndExpertLinear(nn.Module):
         self.dense = nn.Linear(16, 16, bias=False, device='cuda')
         self.experts = nn.Linear(16, 16, bias=False, device='cuda')
         self.experts.weight.allreduce = False
+
+
+@pytest.mark.parametrize('use_gloo', [False, True])
+def test_get_megatron_optimizer_with_gloo_collection(use_gloo):
+    """The dense and expert distributed optimizers take their Gloo groups from the collection."""
+    Utils.initialize_model_parallel()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # Fresh Gloo groups over every rank, which are the dp_cp and expt_dp ranks here. They are
+    # distinct from the parallel_state Gloo groups, so only reading the collection passes.
+    pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(backend="gloo")
+    pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(backend="gloo")
+    config = TransformerConfig(num_attention_heads=1, num_layers=1)
+    model = DistributedDataParallel(
+        config,
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        DenseAndExpertLinear(config),
+        pg_collection=pg_collection,
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=use_gloo
+    )
+
+    dense_optimizer, expert_optimizer = optimizer.chained_optimizers
+    assert isinstance(dense_optimizer, DistributedOptimizer)
+    assert isinstance(expert_optimizer, DistributedOptimizer)
+    assert dense_optimizer.data_parallel_group_gloo is (
+        pg_collection.intra_dp_cp_gloo if use_gloo else None
+    )
+    assert expert_optimizer.data_parallel_group_gloo is (
+        pg_collection.intra_expt_dp_gloo if use_gloo else None
+    )
+
+
+def test_get_megatron_optimizer_requires_gloo_groups_when_enabled():
+    """Requesting Gloo in a job built without Gloo groups is an error, not a silent downgrade."""
+    Utils.initialize_model_parallel(create_gloo_process_groups=False)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert pg_collection.intra_dp_cp_gloo is None
+    assert pg_collection.intra_expt_dp_gloo is None
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        nn.Linear(16, 16, bias=False, device='cuda'),
+        pg_collection=pg_collection,
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+
+    with pytest.raises(
+        ValueError, match="use_gloo_process_groups=True requires pg_collection.intra_dp_cp_gloo"
+    ):
+        get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+        )
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
