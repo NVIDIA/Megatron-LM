@@ -208,6 +208,39 @@ class TestSymmPoolBackend:
             gtp_symm._pools.pop("fallback_group", None)
 
 
+@pytest.mark.parametrize("symmetric", [False, True], ids=["plain", "symmetric"])
+def test_wgrad_pool_fences_cross_stream_reuse(monkeypatch, symmetric):
+    """Recycling scratch must not let the next writer clobber an outstanding reader."""
+    monkeypatch.setattr(gtp_module, "_wgrad_buf_pool", {})
+    pool, group = RegisteredLIFOPool(), _StubGroup()
+
+    def alloc():
+        if symmetric:
+            return pool.alloc((1024,), torch.bfloat16, "cuda", group)
+        return gtp_module._wgrad_pool_get((1024,), torch.bfloat16, "cuda")
+
+    buf = alloc()
+    buf.fill_(1)
+    observed = torch.empty_like(buf)
+    reader = torch.cuda.Stream()
+    reader.wait_stream(torch.cuda.current_stream())
+    ready = torch.cuda.Event()
+    with torch.cuda.stream(reader):
+        torch.cuda._sleep(50_000_000)
+        observed.copy_(buf)
+        ready.record()
+    if symmetric:
+        pool.free(buf, ready_event=ready)
+    else:
+        gtp_module._wgrad_pool_put(buf, ready_event=ready)
+    reused = alloc()
+    assert reused.data_ptr() == buf.data_ptr()
+    reused.fill_(17)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(observed, torch.ones_like(observed))
+    torch.testing.assert_close(reused, torch.full_like(reused, 17))
+
+
 class TestRegisteredLIFOPool:
     def test_alloc_returns_tagged_view(self):
         pool = RegisteredLIFOPool()
