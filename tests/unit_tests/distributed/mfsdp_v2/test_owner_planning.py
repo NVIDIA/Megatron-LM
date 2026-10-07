@@ -29,17 +29,20 @@ def _mock_mesh(dp_size: int, this_rank: int):
     return SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank)
 
 
-def _mock_group(shapes, dp_size, this_rank=0):
+def _mock_group(shapes, dp_size, this_rank=0, mesh=None):
     """Mock a `FsdpParameterGroup` whose DBuffer uses the RowAtomic layout built for `shapes`.
 
     Creates `nn.Parameter`s for each shape so the default `eligible_fn` (`param.ndim >= 2`) can
-    filter on them.
+    filter on them. When `mesh` is given, the group uses that mesh; pass one shared mesh to mock
+    several groups on the same DP mesh.
     """
     layout = GlobalLayout.build_for_row_atomic(shapes, dp_size)
     params = tuple(nn.Parameter(torch.zeros(s)) for s in shapes)
     fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)
+    if mesh is None:
+        mesh = _mock_mesh(dp_size, this_rank)
     return SimpleNamespace(
-        mesh=_mock_mesh(dp_size, this_rank),
+        mesh=mesh,
         main_weight=SimpleNamespace(layout=layout),
         fsdp_parameters=fsdp_parameters,
         sharded_parameters=params,
@@ -321,6 +324,47 @@ def test_group_owner_layout_from_groups_respects_eligible_fn():
     )
     assert list(owner_layout.layouts) == [0, 1]
     assert set(owner_layout.owners) == {0, 1}
+
+
+def test_group_owner_layout_from_groups_balances_across_groups():
+    """`from_groups` balances jointly: group 0's forced load steers group 1's boundary owner."""
+    mesh = _mock_mesh(2, 0)
+    # Group 0's (4, 3) param lands entirely on rank 0's flat shard (cost 12 * 16 = 192); its 1D
+    # param absorbs the rest of the buffer but is excluded by the default `eligible_fn`.
+    group0 = _mock_group([(4, 3), (18,)], dp_size=2, mesh=mesh)
+    # Group 1's (8, 8) param spans both ranks (cost 64 * 41 = 2624).
+    group1 = _mock_group([(8, 8)], dp_size=2, mesh=mesh)
+
+    owner_layouts = GroupOwnerLayout.from_groups([group0, group1], cost_fn=ns_cost_fn(5))
+
+    assert len(owner_layouts) == 2
+    assert owner_layouts[0].group is group0
+    assert owner_layouts[1].group is group1
+    assert owner_layouts[0].mesh is mesh
+    assert owner_layouts[1].mesh is mesh
+    assert owner_layouts[0].layouts == ParameterLayout.from_group(group0)
+    assert owner_layouts[1].layouts == ParameterLayout.from_group(group1)
+    # Alone, group 1's boundary param would go to rank 0 (all running costs are equal).
+    (g1_owner_layout,) = GroupOwnerLayout.from_groups([group1], cost_fn=ns_cost_fn(5))
+    assert g1_owner_layout.owners == {0: 0}
+    # Jointly, rank 0 already carries group 0's non-boundary cost, so rank 1 takes it.
+    assert owner_layouts[0].owners == {0: 0}
+    assert owner_layouts[1].owners == {0: 1}
+
+
+def test_group_owner_layout_from_groups_rejects_mixed_meshes():
+    """Groups on distinct same-size meshes are rejected; the `dp_size` check cannot catch them."""
+    # Both groups are on a DP mesh of size 2, but distinct ones: owner ranks would live in
+    # different rank spaces, silently mixing the joint balancing.
+    group0 = _mock_group([(2, 2)], dp_size=2)
+    group1 = _mock_group([(8, 8)], dp_size=2)
+    with pytest.raises(ValueError, match="same DP mesh"):
+        GroupOwnerLayout.from_groups([group0, group1], cost_fn=ns_cost_fn(5))
+
+
+def test_group_owner_layout_from_groups_with_no_groups():
+    """No groups yields no owner layouts."""
+    assert GroupOwnerLayout.from_groups([]) == []
 
 
 # ---------------------------------------------------------------------------
