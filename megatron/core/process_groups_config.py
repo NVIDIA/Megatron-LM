@@ -168,8 +168,10 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # Gloo mirrors of the two groups the distributed optimizer needs for checkpoint I/O.
-    # May be None when the job was built without Gloo groups (including GTP remat jobs).
+    # Gloo mirrors of the two groups the distributed optimizer shards over (dp_cp and expt_dp,
+    # or intra_dp_cp and intra_expt_dp with more than one distributed optimizer instance), used
+    # for checkpoint I/O. Each must hold the same ranks, in the same order, as the group it
+    # mirrors. May be None when the job was built without Gloo groups (including GTP remat jobs).
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     intra_dp_cp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
 
@@ -378,7 +380,11 @@ class ProcessGroupCollection:
         Args:
             pg_collection: Optional process group collection. If None, uses parallel_state groups.
             model_chunks: List of model chunks to extract configuration from.
-            use_gloo_process_groups: Whether to set up gloo process groups.
+            use_gloo_process_groups: Whether to set up gloo process groups. With a
+                pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields
+                (the expert one only when the collection has an expert data-parallel group),
+                and a missing group or one whose ranks differ from the group it mirrors raises
+                ValueError.
 
         Returns:
             Dictionary containing all required process groups:
@@ -566,13 +572,24 @@ class ProcessGroupCollection:
                 expt_gtp_remat_group is not None and expt_gtp_remat_group.size() > 1
             )
             if use_gloo_process_groups and not gtp_active:
-                intra_dp_cp_group_gloo = vars(pg_collection).get('intra_dp_cp_gloo')
-                intra_expt_dp_group_gloo = vars(pg_collection).get('intra_expt_dp_gloo')
-                if intra_dp_cp_group_gloo is None or intra_expt_dp_group_gloo is None:
-                    raise ValueError(
-                        "use_gloo_process_groups=True requires the intra_dp_cp_gloo and "
-                        "intra_expt_dp_gloo groups in pg_collection. Build the job with Gloo "
-                        "process groups or pass use_gloo_process_groups=False."
+                intra_dp_cp_group_gloo = _get_gloo_mirror_group(
+                    pg_set,
+                    'intra_dp_cp_gloo',
+                    intra_dp_cp_group,
+                    "the data-parallel group (dp_cp, or intra_dp_cp with more than one "
+                    "distributed optimizer instance)",
+                )
+                # Only expert parameters use the expert Gloo group, so a collection without an
+                # expert data-parallel group (a dense model) does not need one.
+                if intra_expt_dp_group is None:
+                    intra_expt_dp_group_gloo = None
+                else:
+                    intra_expt_dp_group_gloo = _get_gloo_mirror_group(
+                        pg_set,
+                        'intra_expt_dp_gloo',
+                        intra_expt_dp_group,
+                        "the expert data-parallel group (expt_dp, or intra_expt_dp with more "
+                        "than one distributed optimizer instance)",
                     )
             else:
                 intra_dp_cp_group_gloo = None
@@ -731,6 +748,34 @@ class ProcessGroupCollection:
             result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
 
             return result
+
+
+def _get_gloo_mirror_group(
+    pg_set: Dict,
+    gloo_group_name: str,
+    group: torch.distributed.ProcessGroup,
+    group_description: str,
+) -> torch.distributed.ProcessGroup:
+    """Return the collection's Gloo group ``gloo_group_name`` after checking it mirrors ``group``.
+
+    The distributed optimizer shards its state over ``group`` and gathers that state over the
+    Gloo group for checkpoint I/O, so both must hold the same ranks in the same order.
+    """
+    gloo_group = pg_set.get(gloo_group_name)
+    if gloo_group is None:
+        raise ValueError(
+            f"use_gloo_process_groups=True requires pg_collection.{gloo_group_name}. Build the "
+            "job with Gloo process groups or pass use_gloo_process_groups=False."
+        )
+    gloo_group_ranks = torch.distributed.get_process_group_ranks(gloo_group)
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    if gloo_group_ranks != group_ranks:
+        raise ValueError(
+            f"pg_collection.{gloo_group_name} has ranks {gloo_group_ranks}, but "
+            f"{group_description}, which the distributed optimizer shards over, has ranks "
+            f"{group_ranks}. The Gloo group must hold the same ranks in the same order."
+        )
+    return gloo_group
 
 
 def resolve_gtp_remat_group(
