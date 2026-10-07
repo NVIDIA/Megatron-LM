@@ -300,14 +300,16 @@ using maximum memory and the slowest rank's step time for each iteration.
 The same entry point accepts `--tp 2`, `--tp 2 --sp`, `--cp 2`, `--pp 2`,
 `--pp 2 --vp 2`, `--tp 2 --sp --cp 2` and `--tp 2 --sp --pp 2` with the rank
 counts in the table above. Use four or more microbatches for PP/VPP. DP is the
-remaining world-size factor. All flags are preparation for qualification and
-remain unverified on GPUs until the corresponding runs pass.
+remaining world-size factor. The status table lists the GPU-qualified
+configurations. Plain TP, plain PP, CP and four-rank combinations remain
+unqualified for the pretrained checkpoint; reduced-model results are listed
+separately.
 
-## Pretrained Qwen acceptance
+## Acceptance for additional pretrained configurations
 
-After these integration cases pass, use the selected local model weights and
-training dataset for complete-model qualification. Record the exact architecture
-and checkpoint format first. A Hugging Face directory requires a compatible weight
+For another checkpoint or topology, use its local model weights and training
+dataset for complete-model qualification. Record the exact architecture and
+checkpoint format first. A Hugging Face directory requires a compatible weight
 conversion/loading path; Megatron's `--load` cannot directly consume its safetensors.
 Use the model's tokenizer and an explicitly selected text-training schema. Record
 the treatment of MoE, vision and MTP components when present.
@@ -324,5 +326,5 @@ snapshots from timing. Record representative sequence lengths, microbatch count,
 selected groups/transfer bytes, per-rank peak allocated/reserved CUDA memory and
 synchronized step time. Report the maximum memory and slowest rank's step time,
 preserve raw samples and repeat the comparisons on dedicated A6000s. Any failed or
-unrun topology remains unqualified. Neither the stack measurements nor this
-synthetic integration test establish pretrained Qwen memory/runtime results.
+unrun topology remains unqualified. Use complete pretrained-model runs to
+establish memory/runtime qualification.
