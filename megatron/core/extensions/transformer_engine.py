@@ -2111,6 +2111,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.config = config
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
+        te_forward_params = inspect.signature(te.pytorch.DotProductAttention.forward).parameters
+        self.supports_packed_qkv = (
+            "qkv_layer" in te_forward_params and "qkv_interleave_dim" in te_forward_params
+        )
         # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
         self.num_splits: Optional[int] = (
             1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
@@ -2291,6 +2295,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
         bf16_backward: Optional[bool] = None,
+        packed_qkv: Optional[Tensor] = None,
     ) -> torch.Tensor:
         """Forward."""
         if packed_seq_params is not None:
@@ -2357,6 +2362,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
+        te_query, te_key, te_value = query, key, value
+        if packed_qkv is not None:
+            if not self.supports_packed_qkv:
+                raise ValueError("Transformer Engine does not support packed QKV inputs")
+            te_query = te_key = te_value = None
+            packed_qkv_kwargs = {"qkv_layer": packed_qkv, "qkv_interleave_dim": -2}
+        else:
+            packed_qkv_kwargs = {}
         if self.te_forward_mask_type:
             if qkv_format == "thd" and is_te_min_version("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
@@ -2367,14 +2380,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
             _fa_kwargs = dict(
-                attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
+                attn_mask_type=attn_mask_type.name,
+                **attention_bias_kwargs,
+                **packed_seq_kwargs,
+                **packed_qkv_kwargs,
             )
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
 
-            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+            core_attn_out = super().forward(
+                te_query, te_key, te_value, attention_mask, **_fa_kwargs
+            )
 
             if self.config.qk_clip or self.config.log_max_attention_logit:
                 # qk-clip is only supported in TE 2.9.0 and later
@@ -2400,12 +2418,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     )
 
         else:
-            _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
+            _fa_kwargs = dict(
+                **attention_bias_kwargs, **packed_seq_kwargs, **packed_qkv_kwargs
+            )
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
-            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+            core_attn_out = super().forward(
+                te_query, te_key, te_value, attention_mask, **_fa_kwargs
+            )
 
         return core_attn_out
 
