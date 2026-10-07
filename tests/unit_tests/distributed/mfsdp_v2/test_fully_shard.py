@@ -22,6 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     RowAtomic,
     TensorAtomic,
@@ -295,12 +296,12 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is Phase.BACKWARD
 
     model.backward_dw()
 
     assert model.weight.grad is not None
-    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
@@ -360,16 +361,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])

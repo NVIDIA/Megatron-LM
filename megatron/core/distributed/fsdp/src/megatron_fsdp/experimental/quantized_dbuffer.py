@@ -309,11 +309,7 @@ class QuantizedDBuffer:
         rowwise: bool = True,
         columnwise: bool = True,
     ) -> "QuantizedDBuffer":
-        """Redistribute the selected planes, returning ``out`` or a new wrapper.
-
-        A new wrapper needs every plane, so selecting only some planes requires
-        ``out``. Unselected planes of ``out`` are left untouched.
-        """
+        """Redistribute the selected planes, returning ``out`` or a new wrapper."""
         new_placements = tuple(new_placements)
         if out is None:
             if not (rowwise and columnwise):
