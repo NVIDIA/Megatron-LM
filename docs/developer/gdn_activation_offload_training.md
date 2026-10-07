@@ -14,7 +14,8 @@ do not replace upstream CI.
 The GDN recurrence suite passes 65 cases in both eager mode and with default
 compilation. It covers dense and packed inputs with fused pre-GDR disabled/enabled
 and output-norm recomputation disabled/enabled. Fused runs use causal-conv1d 1.6.1
-with its deterministic convolution-weight-gradient reduction. The existing
+with its deterministic convolution-weight-gradient reduction. This does not
+determinize the separate native pre-GDR gate-parameter reductions. The existing
 pre-GDR fusion suite also passes all 11 cases.
 Fused and unfused offload comparisons use separate disabled baselines; they do
 not require the two pre-GDR implementations to produce identical bits.
@@ -38,10 +39,12 @@ from pretrained CP, which remains unqualified.
 | Pretrained Qwen, TP+SP on two ranks | All 8 arms passed on each rank, including across norm recomputation settings |
 | Pretrained Qwen, PP on two ranks | All 8 arms passed on each rank, including across norm recomputation settings |
 | Pretrained Qwen, PP+VPP on two ranks | All 8 arms passed on each rank with native unbatched P2P, including across norm recomputation settings |
+| Pretrained Qwen, fused pre-GDR on two ranks | DP, TP, TP+SP, PP and PP+VPP: all 8 arms per topology passed on each rank; every pre-reset pool count is zero |
 | Pretrained Qwen, CP on two ranks | Disabled baseline cannot select an attention backend for head dimension 256 on A6000; unqualified |
-| Pretrained Qwen, sequence lengths 2048/4096 | Baseline and fraction 1 passed with norm recomputation off/on; all 3 step states also match across recomputation settings |
-| Pretrained Qwen memory/runtime | All 48 processes completed; 480 measured samples across 2 lengths × 2 norm settings × 4 arms × 3 repeats |
-| Pretrained Qwen, DP=2 memory/runtime | Disabled/full offload, sequence 2048, three repeats; 60 measured world steps / 120 rank samples |
+| Pretrained Qwen, unfused pre-GDR at sequence lengths 2048/4096 | Baseline and fraction 1 passed with norm recomputation off/on; all 3 step states also match across recomputation settings |
+| Pretrained Qwen, fused pre-GDR at sequence 2048 | Complete step states are not bit-exact; repeated disabled baselines also differ in native gate-parameter gradients and Adam moments; unqualified |
+| Pretrained Qwen, unfused pre-GDR memory/runtime | All 48 processes completed; 480 measured samples across 2 lengths × 2 norm settings × 4 arms × 3 repeats |
+| Pretrained Qwen, unfused pre-GDR DP=2 memory/runtime | Disabled/full offload, sequence 2048, three repeats; 60 measured world steps / 120 rank samples |
 
 The single-rank Qwen comparison uses all 24 text decoder layers, hidden size 1024 and
 vocabulary size 248320 from the original checkpoint. Each arm starts from the
@@ -84,8 +87,8 @@ the schedule resets it. Earlier pretrained and timed runs checked counters after
 reset; their loss/state and memory/runtime results remain valid, but that check
 alone does not establish buffer-return correctness.
 All eight single-rank fused arms record zero ownership and match each other across
-output-norm recomputation settings. The eight-arm qualification runs precede the
-pooled-buffer reuse fix. At code commit
+output-norm recomputation settings. The original unfused and single-rank fused
+eight-arm qualification runs precede the pooled-buffer reuse fix. At code commit
 `4e18562c6bcf894795d23378a8f1699c79e4b797`, fraction-1 replays use norm recomputation
 for each qualified unfused topology and both norm settings for single-rank fusion.
 They compare all three complete step states against the corresponding original
@@ -93,9 +96,43 @@ run and check ownership before every reset. The unfused reduced-model fraction/n
 matrix also passed at this commit. Expanded fusion coverage uses the same production
 runtime files.
 
+The complete two-rank fused comparisons run at
+`b3434091b84235548945e3f8f7989c2ddb19137f`, with production runtime files identical
+to `4e18562c6bcf894795d23378a8f1699c79e4b797`. DP, TP, TP+SP, PP and PP+VPP each
+pass all eight arms, including across norm recomputation settings: 40 fresh
+two-rank runs, 80 rank-result files and 240 complete step states. Each topology
+uses its own fused, norm-recomputation-disabled baseline. Every rank matches its
+baseline's losses, gradient norms, gradients, updated weights and complete Adam
+state. All native resets record zero pinned-buffer ownership before clearing
+counters. Disabled and fraction-zero arms select no steady transfer bytes;
+fractions 0.5 and 1 select positive bytes on both ranks. DP replicas have distinct
+losses and identical reduced gradients, updated weights and Adam states. These
+are correctness runs; they contain no performance samples.
+
+A subsequent fused sequence-2048 comparison does not pass the same bit-exact
+full-state check, with norm recomputation off or on. Losses, gradient norms and
+all updated weights match for all three steps, but a few `A_log`/`dt_bias`
+gradients and their Adam moments differ. Fresh repeats of the disabled baseline
+on the same GPU reproduce differences in those parameters without activation
+offloading. Other parameter gradients match exactly in these comparisons, and
+all pre-reset pool counts are zero.
+The existing `_g_beta_backward_kernel` uses FP32 `atomic_add` parameter reductions;
+the kernel manifest already records pre-GDR fusion as non-deterministic. Setting
+`CAUSAL_CONV1D_DETERMINISTIC=1` controls convolution backward, not those reductions.
+The short-sequence fused results above do not establish repeatable full-state
+training at longer sequences. Fused sequence 4096 and fused performance runs have
+not run. These limits are retained rather than relaxing the comparison or changing
+the native fusion kernel in this offload pilot.
+
+The shared-manager changes also pass all nine existing GPT/MoE CUDA Graph offload
+cases on one A6000. These cover attention/MLA and expert groups, fractions 0/0.5/1
+and delayed/non-delayed offload. This is regression coverage for the existing
+graph path; GDN offloading still rejects CUDA graphs at configuration time.
+
 ## Complete-Qwen A6000 measurements
 
-These runs use the pretrained model and real text dataset described above, with
+These measurements use unfused pre-GDR with the pretrained model and real text
+dataset described above. Fused correctness runs are reported separately. They use
 four microbatches per complete optimizer step, the default 1,048,576-element
 threshold, three warmup steps and ten measured steps. Each of the four arms
 runs in a fresh process; the comparison repeats three times for each sequence
@@ -146,10 +183,10 @@ optimizer state; the earlier stack results use a different memory denominator.
 [Raw single-rank and DP samples](gdn_activation_offload_training_a6000.csv) include
 peak allocated/reserved CUDA bytes, synchronized step seconds, device UUID,
 selected group calls and transfer bytes. The separate `offload_summary_bytes`
-field reports the manager's startup overlap window. Every single-rank performance process
-completed 13 optimizer updates with finite positive gradient norms. All 13 logged
-single-rank loss records match exactly across
-arms, repeats and norm settings for each length; full gradient/weight/Adam
+field reports the manager's startup overlap window. Each single-rank performance
+process completed 13 optimizer updates with finite positive gradient norms. Its
+13 logged loss records match exactly across arms, repeats and norm settings for
+each length; full gradient/weight/Adam
 fingerprints were checked in the separate three-step correctness runs above.
 
 These measurements use code commit

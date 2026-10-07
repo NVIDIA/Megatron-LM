@@ -3,10 +3,11 @@
 ## Contribution scope
 
 The GDN activation-offload item in [roadmap #6757](https://github.com/NVIDIA/Megatron-LM/issues/6757)
-targets memory-constrained training. BestJuly confirmed that saved-tensor offloading
-would complement the existing recomputation approaches and that either current
-`main` or `dev` is an acceptable starting point in
-[the follow-up reply](https://github.com/NVIDIA/Megatron-LM/issues/6757#issuecomment-6008766114).
+targets memory-constrained training. BestJuly confirmed in the
+[scope discussion](https://github.com/NVIDIA/Megatron-LM/issues/6757#issuecomment-5965296779)
+that saved-tensor offloading would complement existing recomputation approaches.
+[The follow-up reply](https://github.com/NVIDIA/Megatron-LM/issues/6757#issuecomment-6008766114)
+accepts either current `main` or `dev` as a starting point.
 This implementation uses `main` at `d6316eb45`.
 
 The later [PR #7852](https://github.com/NVIDIA/Megatron-LM/pull/7852) implements
@@ -250,6 +251,9 @@ Four schedule-helper cases cover phase forwarding for single-model and MIMO grou
 Two existing eight-layer BF16 GPT/MoE cases (`core_attn`, and MLA with
 `core_attn` + `attn_proj`) passed their output/gradient and peak-memory checks,
 covering the shared-manager change outside GDN with both one and two group names.
+All nine existing GPT/MoE CUDA Graph offload cases also pass, including
+fraction-zero/partial offload and delayed/non-delayed transfers. This qualifies
+the shared-manager regression checks, not GDN CUDA Graph support.
 
 The existing pre-GDR fusion suite passed **11 cases** with native causal-conv1d
 1.6.1 installed. Existing TransformerConfig tests passed **53 cases**. Data-free SSM
@@ -271,6 +275,11 @@ memory option. This does not replace the upstream CI or full-model qualification
 
 Complete pretrained training and several parallel configurations have since been
 qualified in [complete-model GDN offload validation](gdn_activation_offload_training.md).
+Short-sequence fused training passes on all five available two-rank topologies.
+At sequence 2048, native pre-GDR gate-parameter gradients are not bitwise
+repeatable even with offloading disabled, so fused long-sequence full-state
+qualification remains open. The complete-model document records this failure
+separately from the passed comparisons and unfused performance measurements.
 The remaining follow-up work is:
 
 1. Confirm the scope/name and integration boundary with #7852. Keep recurrence saves
