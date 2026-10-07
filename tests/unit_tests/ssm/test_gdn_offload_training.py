@@ -224,7 +224,7 @@ def test_gdn_offload_training(
         manager = PipelineOffloadManager.get_instance()
         for _ in range(3):
             batches = []
-            for _ in range(4):
+            for _ in range(2):
                 tokens = torch.randint(0, 512, (1, 129), generator=generator, device="cpu").cuda()
                 batch = {
                     "tokens": tokens[:, :-1].contiguous(),
@@ -232,6 +232,9 @@ def test_gdn_offload_training(
                     "position_ids": torch.arange(128, device="cuda").unsqueeze(0),
                 }
                 batches.append(get_batch_on_this_cp_rank(batch, False, cp_group=groups.cp))
+            # Fixed weights and zero dropout must reproduce each repeated example.
+            # This also catches VPP payload mixups in the disabled baseline.
+            batches = batches * 2
             snapshots = []
             for models, optimizer in (
                 (baseline, baseline_optimizer),
@@ -251,7 +254,15 @@ def test_gdn_offload_training(
                     p2p_communicator=P2PCommunicator(groups.pp, models[0].config),
                     pg_collection=groups,
                 )
-                assert len(losses) == (4 if is_pp_last_stage(groups.pp) else 0)
+                # Reject a bad baseline on every rank before the next collective.
+                losses_valid = torch.tensor(
+                    len(losses) == (4 if is_pp_last_stage(groups.pp) else 0)
+                    and not any(diff(losses[:2], losses[2:])),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                torch.distributed.all_reduce(losses_valid, op=torch.distributed.ReduceOp.MIN)
+                assert losses_valid.item(), "Loss records must preserve repeated microbatch inputs."
                 grads = {
                     f"{stage}.{name}": parameter.main_grad.detach().clone()
                     for stage, model in enumerate(models)
