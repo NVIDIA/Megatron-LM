@@ -257,15 +257,12 @@ class _VirtualExpertStorage:
         return tuple(self._runtime_parameter(w, g) for w, g in zip(weights, grads))
 
     def clear_accumulating_grads(self) -> None:
-        """Zero non-GTP virtual-expert gradient slots before the expert backward GEMMs.
+        """Zero non-GTP virtual-expert gradient slots after their reduction is complete.
 
         TE applies the native weights' gradient accumulation mode to the virtual slots too.
-        These shared slots must start from zero for each backward so stale gradients from
-        a previous use are not added to the new contribution.
-
-        The caller must ensure the previous reduction has finished reading the shared arena
-        before clearing it. The current backward schedule supplies this dependency through
-        the previous layer's input-backward hook; this method does not insert a wait itself.
+        Allocation zeros the slots for the first backward; _finish_grad_reduce clears them
+        after waiting for all reduction readers, leaving them ready for the next use.
+        GTP slots use overwrite mode and do not need clearing.
         """
         gtp = self.config.gtp
         if not any(gtp):
@@ -536,9 +533,7 @@ class _VirtualExperts(_GTPTEWeightBridge):
         return tuple(tables)
 
     def prepare_backward(self) -> None:
-        """Prepare accumulating DDP buffers; TE acquires GTP buffers through grad_buffer()."""
-        if not all(self.config.gtp):
-            self.storage.clear_accumulating_grads()
+        """Bind DDP gradient pointers; TE acquires GTP buffers through grad_buffer()."""
         for i, sharded in enumerate(self.config.gtp):
             if not sharded:
                 self.get_weight_table(i, "grad", tuple(p.main_grad for p in self.parameters[i]))
@@ -954,15 +949,17 @@ class VirtualExpertLoadBalancer:
     @torch.no_grad()
     @nvtx_decorator(message="virtual_expert_grad_reduce_wait")
     def _finish_grad_reduce(self) -> tuple[torch.Tensor, ...]:
-        """Wait for VE reductions, finalize GTP FC2 first, and return gradients FC1 first.
+        """Wait for VE reductions, clear accumulating slots, and hand off native gradients.
 
-        Finalize on the compute stream: GTP adds shard gradients to main_grad and fires
-        DDP hooks, which may scale/copy buckets shared with compute-stream parameters."""
+        Finalize GTP FC2 first on the compute stream, returning gradients FC1 first.
+        GTP adds shard gradients to main_grad and fires DDP hooks, which may scale/copy
+        buckets shared with compute-stream parameters."""
         plan, self._plan = self._plan, None
         if plan is None or plan.started != {0, 1}:
             raise RuntimeError(
                 "Virtual-expert gradient reduction of both fc_layers must be started."
             )
         torch.cuda.current_stream(self.device).wait_event(self.grad_reduce_done)
+        self.virtual_experts.storage.clear_accumulating_grads()
         fc2_grads = self.virtual_experts.hand_off_wgrads(1)
         return (*self.virtual_experts.hand_off_wgrads(0), *fc2_grads)
