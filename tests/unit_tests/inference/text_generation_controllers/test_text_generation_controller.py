@@ -221,6 +221,12 @@ class TextGenerationControllerTestBase:
                 ),
             )
 
+        if not static:
+            # Direct controller tests bypass request admission, which normally writes
+            # the unseeded sentinel into these otherwise uninitialized buffers.
+            inference_context.request_metadata["seed"].fill_(-1)
+            inference_context.active_request_metadata["seed"].fill_(-1)
+
         inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
 
         inference_wrapped_model.model_is_pipeline_parallel = not (
