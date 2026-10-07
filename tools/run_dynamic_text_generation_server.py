@@ -60,13 +60,9 @@ from megatron.inference.utils import (  # noqa: E402
 )
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
-from megatron.training.global_vars import (
-    get_run_config,
-    initialize_runtime_services,
-    set_run_config,
-)
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
