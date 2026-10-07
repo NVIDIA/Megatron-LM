@@ -1,5 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+"""Layer callables for HybridModel's EP-overlap (combined 1F1B) schedule plan.
+
+``build_hybrid_stack_callables`` splits one logical HybridStack layer, either a bracketed
+group such as ``[M*E]`` or a single layer symbol, into the schedule plan's slots:
+
+* pre-dispatch compute: the Mamba, attention, MLA or GDN layers that precede the
+  terminal MLP/MoE layer, then the MoE layer's pre-MLP norm, shared experts, router
+  and dispatch preprocessing;
+* token dispatch;
+* the dense MLP or the routed experts;
+* token combine and the MoE residual add, plus the final norm on the last layer.
+
+``HybridStackNode`` is the schedule node that runs these callables, and
+``_MoEBackwardDWWrapper`` gives each slot the delayed MoE weight-gradient work it
+owns. The equivalent callables for GPTModel's ``TransformerLayer`` are in
+``megatron/core/models/gpt/fine_grained_callables.py``.
+"""
+
 from contextlib import nullcontext
 from functools import partial
 from typing import Optional
@@ -80,7 +98,7 @@ class HybridStackNode(TransformerLayerNode):
     def _resolve_free_input(name, is_moe, config, num_local_experts):
         """Hybrid free-input policy.
 
-        Same as the GPT default: dense layers always retain their
+        Same as the GPTModel default: dense layers always retain their
         input for backward; MoE-only "moe_dispatch", "mlp", and "moe_combine"
         slots can free, subject to the dispatcher / cuda-graph constraints
         encoded in ``should_free_input``. Hybrid groups have a
@@ -221,7 +239,7 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     # already registered on ``expert_output`` in ``_run_moe_experts``. A second one
     # would run the layernorm recompute before attention's backward in the same
     # pre-dispatch slot of a bracketed group (``[*E]``), which corrupts the attention
-    # gradients. GPT's ``submodule_combine_forward`` inlines bda for the same reason.
+    # gradients. GPTModel's ``submodule_combine_forward`` inlines bda for the same reason.
     mlp_output_with_bias = (output, None)
     with layer.bias_dropout_add_exec_handler():
         output = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
