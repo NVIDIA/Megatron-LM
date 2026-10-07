@@ -46,7 +46,8 @@ the first `-` or `E`. Source GPT layer 1 maps to the next pair, and so on.
 The pattern can also describe execution layout. A `|` marks a pipeline segment
 boundary, and `/` introduces a repeated Multi-Token Prediction (MTP) pattern.
 For example, `*-*-|*-*-` places four GPT-equivalent blocks across two pipeline
-segments. Separators do not count as layers.
+segments. Separators do not count as layers. Square brackets group layers into
+one logical layer, as described in [Bracketed layer groups](#bracketed-layer-groups).
 
 HybridModel provides the following benefits:
 
@@ -67,6 +68,33 @@ These capabilities do not imply an automatic throughput or quality improvement.
 An architecture-preserving `*-` or `*E` migration should be validated for
 numerical equivalence, and a pattern that adds another layer family should be
 treated as a new architecture and benchmarked independently.
+
+### Bracketed layer groups
+
+Square brackets group consecutive layers into one logical layer, for example
+`[*E][*E]` or `M[M*E]`. HybridModel builds each group as one nested
+`HybridStack`, and the group occupies a single layer index in checkpoint keys:
+`[*-]` stores its attention and MLP under one `layers.<i>.` prefix, as a GPT
+transformer block does. Adding or removing brackets therefore changes the
+checkpoint keys of the affected layers. Each symbol inside a group still counts
+as one layer for layer numbering, so layer-indexed settings such as FP8 layer
+ranges and hash-routed MoE thresholds are unchanged.
+
+Use groups with MoE expert-parallel communication overlap
+(`--overlap-moe-expert-parallel-comm`). The overlap schedule interleaves one
+microbatch's MoE all-to-all with another microbatch's compute one logical layer
+at a time, so group each MoE layer with the layers that run before it, as in
+`[M*E]`.
+
+Groups have the following constraints:
+
+- A group cannot be empty or nested, cannot span a `|` pipeline boundary, and
+  cannot appear in an MTP pattern.
+- An MoE layer must be the last layer of its group.
+- The layers of a group must use different checkpoint namespaces: at most one
+  Mamba layer, one attention or GDN layer, and one MLP or MoE layer.
+- Groups cannot be combined with mHC connections, wide residual streams, or MoE
+  shortcut connections.
 
 ## 2. How to Convert a Checkpoint
 

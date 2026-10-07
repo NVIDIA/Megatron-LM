@@ -72,36 +72,16 @@ def layer_type_list_to_str(layer_type_list: Sequence[LayerPatternItem]) -> str:
 
 
 def validate_layer_group(layer_types: Sequence[str]) -> None:
-    """Require group members to have distinct sharded checkpoint namespaces.
+    """Validate the layer symbols of one bracketed group.
 
-    A group shares one logical checkpoint layer index, so it can contain at most
-    one mixer, one attention module (including GDN), and one MLP or MoE module.
+    A group must not be empty, an MoE layer must be its last member, and its members
+    must use distinct sharded checkpoint namespaces.
     """
     if not layer_types:
         raise ValueError("Layer groups cannot be empty.")
     if Symbols.MOE in layer_types[:-1]:
         raise ValueError(f"MoE layer '{Symbols.MOE}' must be the last symbol inside a layer group.")
-    namespaces = {
-        Symbols.MAMBA: "mixer",
-        Symbols.GDN: "self_attention",
-        Symbols.ATTENTION: "self_attention",
-        Symbols.DS_ATTENTION: "self_attention",
-        Symbols.MLA: "self_attention",
-        Symbols.CSA: "self_attention",
-        Symbols.HCA: "self_attention",
-        Symbols.WINDOW: "self_attention",
-        Symbols.MLP: "mlp",
-        Symbols.MOE: "mlp",
-    }
-    seen = set()
-    for layer_type in layer_types:
-        namespace = namespaces[layer_type]
-        if namespace in seen:
-            raise ValueError(
-                f"Layer group '{layer_type_list_to_str([tuple(layer_types)])}' contains "
-                f"multiple layers in checkpoint namespace '{namespace}'."
-            )
-        seen.add(namespace)
+    layer_utils.validate_layer_group_checkpoint_namespaces(layer_types)
 
 
 @dataclass

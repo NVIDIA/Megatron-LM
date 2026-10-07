@@ -18,6 +18,11 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt.fine_grained_callables import build_transformer_layer_callables
+from megatron.core.models.hybrid.fine_grained_callables import (
+    build_hybrid_stack_callables,
+    get_hybrid_stack_moe_metadata,
+)
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -155,13 +160,10 @@ def build_mtp_layer_callables(layer):
 
 def get_layer_moe_metadata(layer):
     """Return ``(is_moe, num_local_experts)`` for schedule-node construction."""
-    from megatron.core.models.hybrid.hybrid_block import HybridStack
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return get_layer_moe_metadata(layer.mtp_model_layer)
     if isinstance(layer, HybridStack):
-        from megatron.core.models.hybrid.fine_grained_callables import get_hybrid_stack_moe_metadata
-
         return get_hybrid_stack_moe_metadata(layer)
     if isinstance(layer, TransformerLayer):
         is_moe = isinstance(layer.mlp, MoELayer)
@@ -176,13 +178,10 @@ def build_layer_callables(layer):
 
     Returns ``(forward_funcs, backward_dw)``.
     """
-    from megatron.core.models.hybrid.hybrid_block import HybridStack
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
     if isinstance(layer, HybridStack):
-        from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
-
         forward_funcs, backward_dw, _, _ = build_hybrid_stack_callables(layer)
         return forward_funcs, backward_dw
     if isinstance(layer, TransformerLayer):
