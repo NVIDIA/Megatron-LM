@@ -234,13 +234,13 @@ class GroupOwnerLayout:
     `FsdpParameterGroup`.
 
     Attributes:
-        group: The FSDP parameter group the layouts and owners refer to.
+        mesh: The device mesh the layouts and owners refer to.
         layouts: `{tensor_index: layout}` for the participating parameters.
         owners: `{tensor_index: owner_rank}` with an entry for every participating parameter. Ranks
-            are indices into the group's mesh.
+            are indices into the mesh.
     """
 
-    group: FsdpParameterGroup
+    mesh: DeviceMesh
     layouts: dict[int, ParameterLayout]
     owners: dict[int, int]
 
@@ -285,16 +285,11 @@ class GroupOwnerLayout:
         ]
         owners_per_group = assign_owner_work(layouts_per_group, cost_fn)
         return [
-            cls(group=group, layouts=layouts, owners=owners)
+            cls(mesh=group.mesh, layouts=layouts, owners=owners)
             for group, layouts, owners in zip(
                 groups, layouts_per_group, owners_per_group, strict=True
             )
         ]
-
-    @property
-    def mesh(self) -> DeviceMesh:
-        """Device mesh of the group."""
-        return self.group.mesh
 
 
 @dataclasses.dataclass

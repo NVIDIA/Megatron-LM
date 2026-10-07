@@ -66,7 +66,7 @@ def _make_dbuffer(
 def _owner_layout(dbuffer: DBuffer, tensor_shapes: list[torch.Size]) -> GroupOwnerLayout:
     """Build the `DBuffer`'s `GroupOwnerLayout`.
 
-    Mocks the minimal `FsdpParameterGroup` surface that `GroupOwnerLayout.from_group` reads: `mesh`,
+    Mocks the minimal `FsdpParameterGroup` surface that `GroupOwnerLayout.from_groups` reads: `mesh`,
     `main_weight.layout`, and `fsdp_parameters` (default NS-5 cost balancing and default ≥2D
     eligibility).
     """
@@ -76,7 +76,7 @@ def _owner_layout(dbuffer: DBuffer, tensor_shapes: list[torch.Size]) -> GroupOwn
         main_weight=SimpleNamespace(layout=dbuffer.layout),
         fsdp_parameters=tuple(SimpleNamespace(sharded=param) for param in params),
     )
-    return GroupOwnerLayout.from_group(cast(FsdpParameterGroup, group))
+    return GroupOwnerLayout.from_groups([cast(FsdpParameterGroup, group)])[0]
 
 
 def _known_full_tensors(
