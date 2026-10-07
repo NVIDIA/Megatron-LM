@@ -808,6 +808,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                         or self.pg_collection.dp_cp
                     ),
                     main_hidden_states=hidden_states,
+                    cp_batch=cp_batch,
+                    tp_cp_group=self.pg_collection.tp_cp,
                 )
         sequence_parallel_override = False
         if (

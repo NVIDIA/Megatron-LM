@@ -723,6 +723,7 @@ def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_siz
     sequence_tensors = {
         'tokens': tokens,
         'labels': tokens + 1,
+        'mtp_input_mask': tokens.remainder(3) != 0,
         'loss_mask': torch.ones(micro_batch_size, seq_length),
         'position_ids': torch.arange(seq_length, dtype=torch.int64).repeat(micro_batch_size, 1),
     }
@@ -790,6 +791,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     batch = {
         "tokens": tokens,
         "labels": tokens + 100,
+        "mtp_input_mask": tokens.remainder(3) != 0,
         "loss_mask": loss_mask,
         "position_ids": tokens - 1,
         "cu_seqlens": torch.tensor([[0, 3, 13]], dtype=torch.int32),
@@ -842,6 +844,9 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     )
     torch.testing.assert_close(result["tokens"], expected_tokens)
     torch.testing.assert_close(result["loss_mask"], expected_loss_mask)
+    expected_mtp_input_mask = (tokens.remainder(3) != 0).index_select(1, gathered_indices)
+    expected_mtp_input_mask.masked_fill_(padding.view(1, -1), False)
+    torch.testing.assert_close(result["mtp_input_mask"], expected_mtp_input_mask)
     torch.testing.assert_close(
         result["cu_seqlens_padded"], torch.tensor([[0, 8, 32]], dtype=torch.int32)
     )

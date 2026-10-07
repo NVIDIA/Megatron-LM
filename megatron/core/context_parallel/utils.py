@@ -59,7 +59,7 @@ def _get_batch_on_this_cp_rank_contiguous(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids')
+    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids', 'mtp_input_mask')
     if cp_size == 1:
         return batch
 
@@ -108,7 +108,7 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         return batch
 
     sequence_tensor = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'mtp_input_mask'):
         sequence_tensor = batch.get(key)
         if sequence_tensor is not None:
             break
@@ -127,7 +127,7 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         index = rank_order_indices.view(cp_size, -1)[cp_rank]
         valid_index = index.clamp_min(0)
         padding = (index < 0) | ~source_valid.index_select(0, valid_index)
-        for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'mtp_input_mask'):
             tensor = batch.get(key)
             if tensor is not None:
                 local_tensor = tensor.index_select(1, valid_index)
@@ -279,7 +279,14 @@ def get_batches_on_this_cp_rank(
 
     has_sequence_data = any(
         batch.get(key) is not None
-        for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'attention_mask')
+        for key in (
+            'tokens',
+            'labels',
+            'loss_mask',
+            'position_ids',
+            'mtp_input_mask',
+            'attention_mask',
+        )
     )
     if has_sequence_data:
         # Copy the dictionary because the CP sharder replaces sequence-valued entries in place.
