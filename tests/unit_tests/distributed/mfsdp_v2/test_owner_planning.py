@@ -103,3 +103,51 @@ def test_assign_owner_work_custom_selection_and_cost(distributed_setup):
     (tensor_to_owner,) = assign_owner_work([(buffer, indices)], cost_fn=cost)
     assert set(tensor_to_owner) == {0, 2}
     assert seen_shapes == [torch.Size((6, 3)), torch.Size((4, 2))]
+
+
+@pytest.mark.parametrize("ranks", [[0, 1], [1, 3]])
+@pytest.mark.parametrize(
+    "first_shape, first_size, second_shape, second_size, expected",
+    [
+        # Forced work in a later group must count before an earlier group's boundary work.
+        ((8, 8), 64, (8, 8), 128, [{0: 1}, {0: 0}]),
+        # Expensive boundary work in a later group must be assigned before cheap work.
+        ((8, 1), 8, (8, 8), 64, [{0: 1}, {0: 0}]),
+        # Equal-cost boundary work follows group order.
+        ((8, 8), 64, (8, 8), 64, [{0: 0}, {0: 1}]),
+    ],
+)
+def test_assign_owner_work_across_groups(
+    ranks, first_shape, first_size, second_shape, second_size, expected, distributed_setup
+):
+    """Balance all groups together, preserving global owner ranks on a subgroup mesh."""
+    if distributed_setup.world_size <= max(ranks):
+        pytest.skip(f"Mesh {ranks} requires at least {max(ranks) + 1} ranks.")
+    mesh = DeviceMesh(distributed_setup.device.type, ranks)
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the test mesh.")
+    buffers = [
+        DBuffer(
+            mesh,
+            [RowAtomic()],
+            _layout([shape], [0], size, mesh.size()),
+            torch.float32,
+            distributed_setup.device,
+        )
+        for shape, size in [(first_shape, first_size), (second_shape, second_size)]
+    ]
+    assert assign_owner_work([(buffers[0], [0])]) == [{0: ranks[0]}]
+    assert assign_owner_work((buffer, iter([0])) for buffer in buffers) == [
+        {index: ranks[owner] for index, owner in owners.items()} for owners in expected
+    ]
+
+
+def test_assign_owner_work_empty_groups(distributed_setup):
+    """Empty groups keep their result slot, and selected tensors keep their buffer index."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer.empty(
+        mesh, [Replicate()], [(4,), (8, 8)], torch.float32, distributed_setup.device
+    )
+    assert assign_owner_work([]) == []
+    assert assign_owner_work([(buffer, [])]) == [{}]
+    assert assign_owner_work([(buffer, []), (buffer, [1]), (buffer, [])]) == [{}, {1: 0}, {}]
