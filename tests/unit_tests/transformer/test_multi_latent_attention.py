@@ -1669,6 +1669,19 @@ def test_parallel_multi_latent_attention_correctness(
     os.environ.update(_environ)
 
 
+@pytest.mark.parametrize("mla_down_proj_fusion", [False, True])
+def test_moe_pre_mlp_layernorm_has_residual(mla_down_proj_fusion):
+    """The MoE pre-MLP norm of both MLA specs declares its residual, so that
+    ``fused_residual_rmsnorm`` fuses the residual-gradient add into the norm backward."""
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        num_experts=8,
+        moe_grouped_gemm=True,
+        multi_latent_attention=True,
+        mla_down_proj_fusion=mla_down_proj_fusion,
+    )
+    assert submodules.pre_mlp_layernorm is backend.layer_norm(has_residual=True)
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestFusedMLASelfAttention:
 
