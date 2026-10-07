@@ -2,14 +2,69 @@
 
 """Inference startup must not depend on training batch or progress state."""
 
+import importlib.util
 import sys
 from argparse import ArgumentParser, Namespace
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from megatron.training import arguments, global_vars, initialize
+
+
+@pytest.mark.parametrize("load_checkpoint", [False, True])
+@pytest.mark.parametrize("conditional", [False, True])
+def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, conditional):
+    # This legacy example still imports the removed generation module. Isolate
+    # that unrelated dependency so this test exercises its actual startup path.
+    generation = ModuleType("megatron.inference.text_generation")
+    generation.generate_and_post_process = Mock()
+    monkeypatch.setitem(sys.modules, generation.__name__, generation)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "examples/academic_paper_scripts/detxoify_lm/generate_samples_gpt.py"
+    )
+    spec = importlib.util.spec_from_file_location("generate_samples_gpt", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    args = Namespace(
+        load="checkpoint" if load_checkpoint else None,
+        sample_input_file="prompts.jsonl" if conditional else None,
+    )
+    model = Mock()
+    cfg = Mock()
+    monkeypatch.setattr(script, "parse_and_validate_args", Mock(return_value=args))
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "inference_cfg_container_from_args", Mock(return_value=cfg))
+    calls = {}
+    for name in (
+        "set_run_config",
+        "initialize_runtime_services",
+        "initialize_megatron",
+        "load_checkpoint_for_inference",
+        "generate_and_write_samples_conditional",
+        "generate_and_write_samples_unconditional",
+    ):
+        calls[name] = Mock()
+        monkeypatch.setattr(script, name, calls[name])
+    monkeypatch.setattr(script, "get_model", Mock(return_value=[model]))
+
+    script.main()
+
+    calls["set_run_config"].assert_called_once_with(cfg)
+    calls["initialize_runtime_services"].assert_called_once_with(args)
+    calls["initialize_megatron"].assert_called_once_with()
+    if load_checkpoint:
+        calls["load_checkpoint_for_inference"].assert_called_once_with([model])
+    else:
+        calls["load_checkpoint_for_inference"].assert_not_called()
+    selected = "conditional" if conditional else "unconditional"
+    other = "unconditional" if conditional else "conditional"
+    calls[f"generate_and_write_samples_{selected}"].assert_called_once_with(model)
+    calls[f"generate_and_write_samples_{other}"].assert_not_called()
 
 
 @pytest.mark.parametrize("restored_samples", [0, 8, 32])
@@ -61,7 +116,7 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
 @pytest.mark.parametrize("build_tokenizer", [False, True])
 @pytest.mark.parametrize("enable_runtime_flags", [False, True])
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}, {"training": True}])
-def test_shared_services_never_initialize_training_services(
+def test_runtime_services_initialize_training_only_when_requested(
     monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs
 ):
     args = Namespace(
@@ -75,8 +130,9 @@ def test_shared_services_never_initialize_training_services(
     for name in ("_build_tokenizer", "_set_wandb_writer", "_set_telemetry"):
         services[name] = Mock()
         monkeypatch.setattr(global_vars, name, services[name])
+    training_services = Mock()
+    monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
     for name in (
-        "initialize_runtime_services_for_training",
         "init_num_microbatches_calculator",
         "_set_tensorboard_writer",
         "_set_timers",
@@ -97,6 +153,10 @@ def test_shared_services_never_initialize_training_services(
     services["_set_telemetry"].assert_called_once_with(
         args, include_training=training_kwargs.get("training", False)
     )
+    if training_kwargs.get("training", False):
+        training_services.assert_called_once_with(args)
+    else:
+        training_services.assert_not_called()
     if enable_runtime_flags:
         experimental.assert_called_once_with(True)
         jit.assert_called_once_with()

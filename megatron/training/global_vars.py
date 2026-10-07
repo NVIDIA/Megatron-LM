@@ -163,16 +163,12 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     set_run_config(cfg_container)
     set_args(args)
     initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
-    initialize_runtime_services_for_training(args)
 
 
 def initialize_runtime_services(
     args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
-    """Initialize shared services, optionally including training telemetry metadata.
-
-    Training callers must also call initialize_runtime_services_for_training().
-    """
+    """Initialize shared services, plus training-only services when requested."""
     if build_tokenizer:
         _build_tokenizer(args)
     _set_wandb_writer(args)
@@ -184,8 +180,11 @@ def initialize_runtime_services(
     if args.disable_jit_fuser:
         disable_jit_fuser()
 
+    if training:
+        initialize_training_runtime_services(args)
 
-def initialize_runtime_services_for_training(args: Namespace) -> None:
+
+def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back

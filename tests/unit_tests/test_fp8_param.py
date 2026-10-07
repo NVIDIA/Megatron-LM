@@ -27,7 +27,6 @@ from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     initialize_runtime_services,
-    initialize_runtime_services_for_training,
     set_args,
     set_run_config,
 )
@@ -188,7 +187,6 @@ class TestFP8Param:
         # migrated settings use config; remaining settings still use legacy args.
         set_run_config(pretrain_cfg_container_from_args(args))
         initialize_runtime_services(args, build_tokenizer=False, training=True)
-        initialize_runtime_services_for_training(args)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):

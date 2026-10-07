@@ -41,9 +41,9 @@ microbatch calculator, training progress, autoresume, or training signal handler
 TensorBoard, training timers and the energy monitor are also skipped; tokenizer,
 W&B, telemetry and runtime-flag setup run through the same code as training.
 Training callers explicitly use `initialize_runtime_services(args, training=True)`,
-then call `initialize_runtime_services_for_training(args)` for training-only
-services, and use `initialize_megatron(training=True)` for distributed startup.
-The shared runtime initializer never invokes the training-only initializer.
+which calls `initialize_training_runtime_services(args)` after shared setup,
+and use `initialize_megatron(training=True)` for distributed startup. Scripts do
+not call the training-only runtime helper separately.
 Request batching remains owned by the inference engine. The shared CLI parser
 still accepts legacy training batch-size flags; inference runtime setup does not
 consume them.

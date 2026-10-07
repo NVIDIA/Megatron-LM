@@ -18,11 +18,7 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import (
-    initialize_runtime_services,
-    initialize_runtime_services_for_training,
-    set_run_config,
-)
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -58,7 +54,6 @@ if __name__ == "__main__":
     # migrated settings use config; remaining settings still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args, training=True)
-    initialize_runtime_services_for_training(args)
     initialize_megatron(training=True)
 
     args = get_args()

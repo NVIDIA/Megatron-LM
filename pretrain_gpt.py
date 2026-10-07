@@ -65,11 +65,7 @@ from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import (
-    initialize_runtime_services,
-    initialize_runtime_services_for_training,
-    set_run_config,
-)
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from model_provider import model_provider
 
 try:
@@ -584,7 +580,6 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     initialize_runtime_services(args, training=True)
-    initialize_runtime_services_for_training(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,

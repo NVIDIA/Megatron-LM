@@ -12,7 +12,7 @@ import torch
 from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_checkpoint
+from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.core import mpu
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
@@ -23,11 +23,7 @@ from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.global_vars import (
-    initialize_runtime_services,
-    initialize_runtime_services_for_training,
-    set_run_config,
-)
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -233,9 +229,8 @@ def main():
                                            'no_load_optim': True,
                                            'seq_length': 2048})
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, training=True)
-    initialize_runtime_services_for_training(args)
-    initialize_megatron(training=True)
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
@@ -243,7 +238,7 @@ def main():
     args = get_args()
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint_for_inference(model)
     model = model[0]
 
     # Generate samples.
