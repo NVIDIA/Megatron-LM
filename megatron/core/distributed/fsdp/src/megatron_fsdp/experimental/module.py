@@ -579,6 +579,10 @@ class FsdpModule:
         for group in self._parameter_groups:
             group.reshard_parameters()
 
+        self._release_unsharded_storage()
+
+    def _release_unsharded_storage(self) -> None:
+        """Free full weights after compute without changing parameter bindings."""
         allgather_stream = self.context.allgather_stream
         allgather_stream.wait_stream(self.context.current_stream())
         # Release on the all-gather stream where unsharded storage was allocated,
@@ -614,13 +618,15 @@ class FsdpModule:
         """Finish this module's backward and release weights when safe."""
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
-        # TE backward_dw() writes through module.weight, so preserve that binding.
-        if not any(
+        # TE backward_dw() needs the full parameter binding for .grad, but not its data.
+        if any(
             getattr(parameter.unsharded, "skip_backward_post_hook", False)
             for group in self._parameter_groups
             if group.requires_grad
             for parameter in group.fsdp_parameters
         ):
+            self._release_unsharded_storage()
+        else:
             self.reshard()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
@@ -628,9 +634,10 @@ class FsdpModule:
     def post_accumulate_grad(self) -> None:
         """Pack completed gradients and immediately launch their reductions."""
         self.context.validate_grad_sync()
-        # TE backward_dw() runs after autograd, using bindings retained by post_backward().
-        if self.phase is FsdpModule.Phase.RESTING and self._unshard_event is not None:
-            self.reshard()
+        # Restore any full parameter bindings retained for TE backward_dw().
+        if self.phase is FsdpModule.Phase.RESTING:
+            for group in self._parameter_groups:
+                group.reshard_parameters()
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             reduce_scatter_stream = context.reduce_scatter_stream
