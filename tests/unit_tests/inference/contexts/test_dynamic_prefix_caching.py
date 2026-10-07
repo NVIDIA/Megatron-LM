@@ -2315,8 +2315,13 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert np.allclose(result[2 * bs :], expected_partial)
 
     @pytest.mark.internal
-    def test_reconstruct_returns_none_for_missing_block(self):
-        """Reconstruction returns None if a block has no routing data."""
+    @pytest.mark.parametrize("token_offset", [-1, 0, 1])
+    def test_reconstruct_requires_only_needed_blocks(self, token_offset):
+        """Reconstruction fails only if a required block has no routing data.
+
+        Args:
+            token_offset: Number of required routing tokens beyond the first block.
+        """
         ctx = self._ctx()
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
@@ -2325,12 +2330,15 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         bids = block_ids.tolist()
 
         # Only store routing for the first block
-        alloc.store_block_routing(
-            bids[0], np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
-        )
+        routing = np.arange(bs * 4 * 2, dtype=np.int16).reshape(bs, 4, 2)
+        alloc.store_block_routing(bids[0], np.arange(bs), routing)
 
-        result = alloc.reconstruct_routing_from_blocks(bids, 2 * bs)
-        assert result is None
+        total_routing_tokens = bs + token_offset
+        result = alloc.reconstruct_routing_from_blocks(bids, total_routing_tokens)
+        if token_offset > 0:
+            assert result is None
+        else:
+            np.testing.assert_array_equal(result, routing[:total_routing_tokens])
 
     @pytest.mark.internal
     def test_routing_survives_prefix_match_lru(self):
