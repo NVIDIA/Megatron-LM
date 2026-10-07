@@ -329,8 +329,20 @@ def test_packaged_entries_name_live_candidates():
             if not kernel.startswith("megatron.core."):
                 continue
             module_name, name = kernel.rsplit(".", 1)
-            tuner = getattr(importlib.import_module(module_name), name)
+            module = importlib.import_module(module_name)
+            tuner = getattr(module, name)
             if not isinstance(tuner, autotuner.Autotuner):
+                # The kernel may be tuned through a separate wrapper, as in
+                # ``_autotuned_k = triton.autotune(...)(k)``; find it by the kernel it runs.
+                tuner = next(
+                    (
+                        obj
+                        for obj in vars(module).values()
+                        if isinstance(obj, autotuner.Autotuner) and obj.fn is tuner
+                    ),
+                    None,
+                )
+            if tuner is None:
                 pytest.skip(f"{kernel} is not built with this triton install")
             assert f"{selection.kernel_module(tuner)}.{selection.kernel_name(tuner)}" == kernel
             for key in entries:
