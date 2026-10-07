@@ -23,7 +23,10 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions import fused_layer_norm
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.cross_entropy import (
+    VocabParallelCrossEntropy,
+    vocab_parallel_cross_entropy,
+)
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -103,6 +106,58 @@ class TestTensorParallelLayers:
             replays=3,
             what="vocab_parallel_cross_entropy",
         )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_vocab_parallel_cross_entropy_staged_helpers_match_composite(self, dtype):
+        """The fused path calls the read-only gather, the in-place exp and the in-place gradient
+        scaling as separate steps (each compiled on its own); they must produce exactly the
+        bytes of the composite ``calculate_predicted_logits`` / ``calculate_gradients``."""
+        seeded()
+        vocab = 32768
+        logits = torch.randn(4096, vocab, device="cuda", dtype=dtype)
+        target = torch.randint(0, vocab, (4096,), device="cuda")
+        grad_output = torch.rand(4096, device="cuda", dtype=torch.float32)
+
+        composite, logits_max = VocabParallelCrossEntropy.calculate_logits_max(logits.clone())
+        staged, staged_max = VocabParallelCrossEntropy.calculate_logits_max(logits.clone())
+        assert torch.equal(logits_max, staged_max)
+
+        target_mask, masked_target_1d, predicted, sum_exp, exp_logits = (
+            VocabParallelCrossEntropy.calculate_predicted_logits(
+                composite, target, logits_max, 0, vocab
+            )
+        )
+        s_mask, s_masked_target_1d, s_predicted = VocabParallelCrossEntropy.gather_predicted_logits(
+            staged, target, staged_max, 0, vocab
+        )
+        assert torch.equal(staged, logits), "gather_predicted_logits must not modify logits"
+        VocabParallelCrossEntropy.exp_logits_inplace(staged, staged_max)
+        for name, a, b in (
+            ("target_mask", target_mask, s_mask),
+            ("masked_target_1d", masked_target_1d, s_masked_target_1d),
+            ("predicted_logits", predicted, s_predicted),
+            ("exp_logits", exp_logits, staged),
+            ("sum_exp_logits", sum_exp, staged.sum(dim=-1)),
+        ):
+            assert torch.equal(a, b), f"{name} differs between staged and composite forward"
+
+        softmax = exp_logits / sum_exp.unsqueeze(dim=-1)
+        grad_2d, arange_1d, softmax_update, grad_input = (
+            VocabParallelCrossEntropy.prepare_gradient_calculation_operands(
+                softmax.clone(), target_mask
+            )
+        )
+        composite_grad = VocabParallelCrossEntropy.calculate_gradients(
+            grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
+        )
+        grad_2d, arange_1d, softmax_update, grad_input = (
+            VocabParallelCrossEntropy.prepare_gradient_calculation_operands(
+                softmax.clone(), target_mask
+            )
+        )
+        grad_2d[arange_1d, masked_target_1d] -= softmax_update
+        VocabParallelCrossEntropy.scale_gradients_inplace(grad_input, grad_output)
+        assert torch.equal(composite_grad, grad_input), "staged backward differs from composite"
 
     @pytest.mark.parametrize(
         "grad_accum_fusion",

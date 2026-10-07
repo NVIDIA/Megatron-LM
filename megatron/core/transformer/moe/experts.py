@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import warnings
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -301,20 +302,50 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-        self.offload_expert_fc1 = (
-            self.config.fine_grained_activation_offloading
-            and "expert_fc1" in self.config.offload_modules
+        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
+        # autocast state, so they would ignore a --te-precision-config-file override and quantize
+        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
+        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
+        self._with_fused_impl: bool = (
+            self.config.use_transformer_engine_op_fuser
+            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
+            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
+        # Fused implementation with Transformer Engine op fuser API
+        if self.config.use_transformer_engine_op_fuser:
+            _require_te_tanh_clamp_support(self.config)
+            assert (
+                self._is_fused_impl_supported()
+            ), "Fused GroupedMLP is not supported for this configuration."
 
-        self.offload_moe_act = (
-            self.config.fine_grained_activation_offloading
-            and "moe_act" in self.config.offload_modules
-        )
-
+        # Fine-grained activation offloading. "fused_group_mlp" and "expert_fc1" + "moe_act"
+        # describe the same thing for the two GroupedMLP paths: the fused TE op-fuser path
+        # exposes only the input of the whole fc1 -> act -> fc2 block, the unfused path exposes
+        # the fc1 input and the activation input separately. The config accepts either spelling
+        # (they are mutually exclusive there); each instance maps it onto its own path, so a
+        # model mixing fused (quantized) and unfused (e.g. bf16 MTP) experts offloads both.
+        offloading = self.config.fine_grained_activation_offloading
+        self.offload_expert_fc1 = offloading and "expert_fc1" in self.config.offload_modules
+        self.offload_moe_act = offloading and "moe_act" in self.config.offload_modules
         self.offload_fused_group_mlp = (
-            self.config.fine_grained_activation_offloading
-            and "fused_group_mlp" in self.config.offload_modules
+            offloading and "fused_group_mlp" in self.config.offload_modules
         )
+        if self._with_fused_impl:
+            if self.offload_expert_fc1 or self.offload_moe_act:
+                if not (self.offload_expert_fc1 and self.offload_moe_act):
+                    # Message text is constant so the default warning filter shows it once.
+                    warnings.warn(
+                        "Fused GroupedMLPs can only offload the input of the whole "
+                        "fc1 -> act -> fc2 block; a partial 'expert_fc1' or 'moe_act' selection "
+                        "is treated as 'fused_group_mlp' there."
+                    )
+                self.offload_fused_group_mlp = True
+            self.offload_expert_fc1 = False
+            self.offload_moe_act = False
+        elif self.offload_fused_group_mlp:
+            self.offload_fused_group_mlp = False
+            self.offload_expert_fc1 = True
+            self.offload_moe_act = True
 
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
@@ -333,21 +364,6 @@ class TEGroupedMLP(MegatronModule):
 
             set_save_original_input(self.linear_fc1)
 
-        # Fused implementation with Transformer Engine op fuser API
-        if self.config.use_transformer_engine_op_fuser:
-            _require_te_tanh_clamp_support(self.config)
-            assert (
-                self._is_fused_impl_supported()
-            ), "Fused GroupedMLP is not supported for this configuration."
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
@@ -483,8 +499,6 @@ class TEGroupedMLP(MegatronModule):
         # Check for unsupported features
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
-        if getattr(self, "offload_expert_fc1", False) or getattr(self, "offload_moe_act", False):
-            return False  # Selective expert_fc1/moe_act offload is only supported unfused.
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
 
@@ -1019,21 +1033,6 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        expert_fc1_manager = off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        )
-        with expert_fc1_manager as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-        fc1_output = expert_fc1_manager.group_offload(
-            fc1_output,
-            forced_released_tensors=[permuted_local_hidden_states],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
-
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
-
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
             # Whether activation function is interleaved GLU
@@ -1127,15 +1126,47 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.activation_recompute:
-            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with moe_act_manager as fc1_output:
-                bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+        # With both unfused groups enabled, offload fc1 + activation as ONE group named
+        # "fused_group_mlp", like the fused path: the saved-tensor hooks catch everything saved
+        # inside (fc1 input, fc1 output), so it goes to CPU in one D2H burst after fc2 and comes
+        # back in one reload, and the offload manager sees fused and unfused
+        # experts as one stream of same-named groups (its skip/lookahead logic is per name; with
+        # distinct names a fused decoder layer followed only by unfused, e.g. bf16 MTP, experts
+        # looked like "the last fused_group_mlp group" and was never offloaded).
+        offload_group_mlp = self.offload_expert_fc1 and self.offload_moe_act
+        offload_expert_fc1 = self.offload_expert_fc1 and not offload_group_mlp
+        offload_moe_act = self.offload_moe_act and not offload_group_mlp
+        group_mlp_manager = off_interface(
+            offload_group_mlp, permuted_local_hidden_states, "fused_group_mlp"
+        )
+        with group_mlp_manager as permuted_local_hidden_states:
+            expert_fc1_manager = off_interface(
+                offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            )
+            with expert_fc1_manager as permuted_local_hidden_states:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
                 )
-        else:
-            with moe_act_manager as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+            fc1_output = expert_fc1_manager.group_offload(
+                fc1_output,
+                forced_released_tensors=[permuted_local_hidden_states],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
+            )
+
+            moe_act_manager = off_interface(offload_moe_act, fc1_output, "moe_act")
+
+            if self.activation_recompute:
+                self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with moe_act_manager as fc1_output:
+                    bias_act_output = self.activation_checkpoint.checkpoint(
+                        bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    )
+            else:
+                with moe_act_manager as fc1_output:
+                    bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+        # fc2 runs outside the group-MLP offload group's saved-tensor hooks: with moe_act
+        # recompute its saved input is discarded (storage resized to 0) right after fc2, and an
+        # offload group must not hold such a tensor. The commit still happens after fc2 (below).
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
@@ -1145,6 +1176,13 @@ class TEGroupedMLP(MegatronModule):
         output = moe_act_manager.group_offload(
             output,
             forced_released_tensors=[fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
+        # Group-MLP offload group: commit after fc2 so fc1_output is reloaded before the
+        # moe_act recompute.
+        output = group_mlp_manager.group_offload(
+            output,
+            forced_released_tensors=[permuted_local_hidden_states, fc1_output],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
