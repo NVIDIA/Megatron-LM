@@ -3081,6 +3081,7 @@ def setup_model_and_optimizer(
             },
         )
         train_state.iteration = 1
+        train_state.resume_iteration = 1
         save_checkpoint(
             train_state.iteration, model, None, None, train_state.num_floating_point_operations_so_far
         )
@@ -3117,6 +3118,7 @@ def setup_model_and_optimizer(
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
+            train_state.resume_iteration = train_state.iteration
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -3132,6 +3134,7 @@ def setup_model_and_optimizer(
         )
     else:
         train_state.iteration = 0
+        train_state.resume_iteration = 0
         train_state.num_floating_point_operations_so_far = 0
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.

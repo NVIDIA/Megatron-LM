@@ -15,7 +15,8 @@ class TrainState(Stateful):
     and floating-point operations.
     """
 
-    iteration: int = 0
+    iteration: int = 0  # tracks iters as train progresses, whereas args.iteration only updated on resume
+    resume_iteration: int = 0  # during training might need to know which iter was resumed, but this does not need to be ckpt'd
     consumed_train_samples: int = 0
     skipped_train_samples: int = 0
     consumed_valid_samples: int = 0
