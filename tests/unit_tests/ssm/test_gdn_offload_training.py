@@ -29,6 +29,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -108,12 +109,17 @@ def _build_training_model(
     model_parallel_cuda_manual_seed(31)
     models = []
     vp = config.virtual_pipeline_model_parallel_size
+    pattern = "GGG*GGG*"
+    chunk_size = len(pattern) // (config.pipeline_model_parallel_size * (vp or 1))
+    pattern = "|".join(
+        pattern[start : start + chunk_size] for start in range(0, len(pattern), chunk_size)
+    )
     for stage in range(vp or 1):
         vp_stage = stage if vp is not None else None
         model = HybridModel(
             config=config,
             hybrid_stack_spec=stack_spec,
-            hybrid_layer_pattern="GGG*GGG*",
+            hybrid_layer_pattern=pattern,
             vocab_size=512,
             max_sequence_length=128,
             pre_process=is_pp_first_stage(groups.pp) and is_vp_first_stage(vp_stage, vp),
@@ -135,7 +141,10 @@ def _build_training_model(
         )
         models[-1].broadcast_params()
     optimizer = get_megatron_optimizer(
-        OptimizerConfig(bf16=True, lr=1e-3, clip_grad=1.0), models, pg_collection=groups
+        OptimizerConfig(bf16=True, lr=1e-3, clip_grad=1.0),
+        models,
+        use_gloo_process_groups=False,
+        pg_collection=groups,
     )
     config.grad_scale_func = optimizer.scale_loss
     config.finalize_model_grads_func = partial(finalize_model_grads, pg_collection=groups)
@@ -237,6 +246,7 @@ def test_gdn_offload_training(
                     seq_length=128,
                     micro_batch_size=1,
                     forward_only=False,
+                    p2p_communicator=P2PCommunicator(groups.pp, models[0].config),
                     pg_collection=groups,
                 )
                 assert len(losses) == (4 if is_pp_last_stage(groups.pp) else 0)
