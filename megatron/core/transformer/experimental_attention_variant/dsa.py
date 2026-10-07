@@ -1725,6 +1725,7 @@ class DSAttention(MegatronModule):
         )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 

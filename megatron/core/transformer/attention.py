@@ -331,9 +331,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            # run_realtime_tests also reads dp from the collection.
+            # hcp feeds TEDotProductAttention's a2a+p2p path; dp is only read by
+            # run_realtime_tests, so it is resolved only when test_mode needs it.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'dp']
+                required_pgs=['tp', 'cp', 'hcp'] + (['dp'] if self.config.test_mode else [])
             )
         for group_name in ('tp', 'cp'):
             if group_name not in vars(pg_collection):

@@ -54,7 +54,7 @@ class RotaryEmbedding(nn.Module):
             on the GPU. Defaults to False
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Omitting it is deprecated: the global context-parallel group is used and a
-            DeprecationWarning is emitted. It will be required in a future release.
+            FutureWarning is emitted. It becomes required when the fallback is removed.
     """
 
     def __init__(

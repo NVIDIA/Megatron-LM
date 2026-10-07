@@ -131,7 +131,7 @@ def split_to_context_parallel_ranks(global_t, pad_value=0, cp_group=None):
         global_t: [batch, ...]
         pad_value: Value to pad the last rank with.
         cp_group: The context parallel process group to split across. Omitting it is deprecated:
-            the global context-parallel group is used and a DeprecationWarning is emitted.
+            the global context-parallel group is used and a FutureWarning is emitted.
 
     Returns:
         local_t: [samples_per_rank, ...]. samples_per_rank is the # of samples per CP rank.
@@ -228,7 +228,7 @@ def gather_from_context_parallel_ranks(local_t, global_pad, cp_group=None):
     """Gather ``local_t`` across CP ranks, removing ``global_pad`` trailing pad tokens.
 
     Omitting ``cp_group`` is deprecated: the global context-parallel group is used and a
-    DeprecationWarning is emitted.
+    FutureWarning is emitted.
     """
     global_t = GatherFromContextParallelRanks.apply(local_t, cp_group)
     if global_pad > 0:
@@ -240,7 +240,7 @@ def gather_from_context_parallel_ranks_dynamic_res(local_t, num_padded_imgs=0, c
     """Gather dynamic-resolution tensors (variable seq per rank) from CP ranks.
 
     Omitting ``cp_group`` is deprecated: the global context-parallel group is used and a
-    DeprecationWarning is emitted.
+    FutureWarning is emitted.
     """
     if cp_group is None:
         warn_global_process_group_fallback(

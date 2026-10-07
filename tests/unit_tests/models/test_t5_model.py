@@ -164,7 +164,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
     if explicit_pg_collection:
         model = T5Model(**t5_kwargs)
     else:
-        with pytest.warns(DeprecationWarning, match="T5Model was called without `pg_collection`"):
+        with pytest.warns(FutureWarning, match="T5Model was called without `pg_collection`"):
             model = T5Model(**t5_kwargs)
 
     assert model.pg_collection is pg_collection

@@ -2218,6 +2218,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
@@ -2230,11 +2231,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             assert hasattr(
                 pg_collection, "cp"
             ), "TEDotProductAttention pg_collection must have cp pg"
-            if cp_comm_type == "a2a+p2p":
-                if "hcp" not in vars(pg_collection):
-                    raise ValueError(
-                        "TEDotProductAttention pg_collection must have hierarchical cp pg"
-                    )
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -2266,7 +2262,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    # Both the explicit collection and the compatibility fallback carry hcp.
+                    # The global-group fallbacks and use_mpu_process_groups() carry hcp; a
+                    # collection built for another grid must set it.
+                    if vars(pg_collection).get("hcp") is None:
+                        raise ValueError(
+                            "TEDotProductAttention with cp_comm_type='a2a+p2p' requires "
+                            "pg_collection.hcp (the hierarchical context-parallel groups)"
+                        )
                     extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type

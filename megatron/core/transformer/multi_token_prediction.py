@@ -906,6 +906,9 @@ def mtp_on_this_rank(
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
     """
+    if layout is None and mtp_num_layers is None:
+        # No MTP layers anywhere, so the pipeline rank is not needed.
+        return False
     mtp_on_this_rank = False
     if pp_group is None:
         warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
@@ -2332,7 +2335,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
         for group_name in ('tp', 'cp', 'pp'):
