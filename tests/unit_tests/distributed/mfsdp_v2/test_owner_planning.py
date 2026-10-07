@@ -218,6 +218,64 @@ def test_assign_owner_work_non_boundary_cost_counts_toward_balance():
 
 
 # ---------------------------------------------------------------------------
+# Cross-group owner assignment balancing
+# ---------------------------------------------------------------------------
+
+
+def test_assign_owner_work_balances_across_groups():
+    """Joint balancing: load forced onto a rank by one group steers other groups' boundary params
+    away from that rank.
+    """
+    # Group 0's non-boundary param is rank 0's alone (cost 64 * 41 = 2624).
+    forced = ParameterLayout(torch.Size((8, 8)), (64, 0))
+    # Group 1's boundary param is eligible on both ranks (same cost 2624).
+    boundary = ParameterLayout(torch.Size((8, 8)), (32, 32))
+    # Alone, all running costs are 0 and the lowest eligible rank wins.
+    (owners,) = assign_owner_work([{0: boundary}], ns_cost_fn(5))
+    assert owners == {0: 0}
+    # Jointly, rank 0 already carries group 0's forced cost, so rank 1 takes the boundary param.
+    owners_per_group = assign_owner_work([{0: forced}, {0: boundary}], ns_cost_fn(5))
+    assert owners_per_group == [{0: 0}, {0: 1}]
+
+
+def test_assign_owner_work_lpt_across_groups():
+    """Boundary params are longest-processing-time-sorted across groups: an expensive param in a
+    later group is assigned before a cheap param in an earlier one.
+    """
+    cheap = ParameterLayout(torch.Size((8, 1)), (2, 2, 2, 2))  # cost 8 * 6 = 48
+    expensive = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))  # cost 64 * 41 = 2624
+    owners_per_group = assign_owner_work([{0: cheap}, {0: expensive}], ns_cost_fn(5))
+    # LPT: expensive (group 1) → rank 0 first, then cheap (group 0) → rank 1.
+    assert owners_per_group == [{0: 1}, {0: 0}]
+
+
+def test_assign_owner_work_tie_break_across_groups():
+    """Equal-cost boundary params are assigned in (group, tensor index) order."""
+    layout = ParameterLayout(torch.Size((8, 8)), (32, 32))  # cost 2624 each
+    owners_per_group = assign_owner_work([{0: layout}, {0: layout}], ns_cost_fn(5))
+    assert owners_per_group == [{0: 0}, {0: 1}]
+    # Same tie-break within one group: tensor 0 comes before tensor 1.
+    (owners,) = assign_owner_work([{0: layout, 1: layout}], ns_cost_fn(5))
+    assert owners == {0: 0, 1: 1}
+
+
+def test_assign_owner_work_empty_groups():
+    """No layouts yield no assignments; empty groups keep their (empty) slot."""
+    assert assign_owner_work([]) == []
+    assert assign_owner_work([{}]) == [{}]
+    layout = ParameterLayout(torch.Size((4, 2)), (4, 4))  # boundary, eligible on ranks 0 and 1
+    assert assign_owner_work([{}, {5: layout}, {}], ns_cost_fn(5)) == [{}, {5: 0}, {}]
+
+
+def test_assign_owner_work_rejects_mixed_dp_sizes():
+    """Groups on different DP mesh sizes cannot be balanced jointly."""
+    dp2 = ParameterLayout(torch.Size((8, 8)), (32, 32))
+    dp3 = ParameterLayout(torch.Size((8, 8)), (22, 21, 21))
+    with pytest.raises(ValueError, match="share one DP mesh size"):
+        assign_owner_work([{0: dp2}, {0: dp3}], ns_cost_fn(5))
+
+
+# ---------------------------------------------------------------------------
 # Group owner layout
 # ---------------------------------------------------------------------------
 
