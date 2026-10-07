@@ -2,13 +2,14 @@
 
 """Schedule-plan classes for HybridStack-based decoders.
 
-These extend the GPT-side ``TransformerLayerSchedulePlan`` /
-``TransformerModelChunkSchedulePlan`` with the per-layer ``layer_type`` symbol
+These extend GPTModel's schedule plans, ``TransformerLayerSchedulePlan`` and
+``TransformerModelChunkSchedulePlan``, with the per-layer ``layer_type`` symbol
 that HybridStack assigns to each entry of its ``layer_type_list`` (including
-bracketed groups like ``[*-]``). The base classes remain GPT-only; this module
-adds the hybrid-specific dispatch into ``build_hybrid_stack_callables`` and
-uses ``HybridStackNode`` so the schedule node's free-input policy can diverge
-from the GPT default. The pre/post-process nodes from
+bracketed groups like ``[*-]``). The base classes build callables from the layer
+module alone; this module adds the hybrid-specific dispatch into
+``build_hybrid_stack_callables``, which also needs the layer's symbol, and uses
+``HybridStackNode`` so the schedule node's free-input policy can diverge from the
+GPTModel default. The pre/post-process nodes from
 ``core.models.common.utils`` are reused as-is — they already call
 ``model._preprocess`` / ``model._postprocess`` which work on a HybridModel.
 """
@@ -34,7 +35,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
 
     Adds the ``layer_type`` extra-arg propagation; routes through
     ``build_hybrid_stack_callables`` when ``layer_type`` is set (i.e. the layer
-    is a HybridStack entry, possibly a bracketed group); falls back to the GPT
+    is a HybridStack entry, possibly a bracketed group); falls back to the GPTModel
     path for plain TransformerLayer / MTP layers when ``layer_type`` is None.
     """
 
@@ -98,7 +99,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         self.mtp_post_process = NoopScheduleNode()
 
     def get_low_precision_context(self):
-        """Return the layer-level quantization context for GPT-path layers.
+        """Return the layer-level quantization context for GPTModel-path layers.
 
         Hybrid callables enter the quantization context of each physical layer
         themselves, so hybrid layer plans use a null context here.
@@ -116,8 +117,8 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
     Threads HybridStack's ``layer_type_list[layer_idx]`` symbol into each
     layer plan's ``extra_args`` so the per-layer plan can dispatch grouped
     layers correctly. Layers of other modules (e.g. MTP layers) get
-    ``layer_type=None`` and follow the GPT path. The pre/post
-    process nodes inherit from the GPT base class — they already dispatch
+    ``layer_type=None`` and follow the GPTModel path. The pre/post
+    process nodes inherit from the GPTModel base class — they already dispatch
     on ``model._preprocess`` / ``model._postprocess`` which a HybridModel
     implements.
     """
