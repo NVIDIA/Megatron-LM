@@ -20,21 +20,28 @@ do not replace upstream CI.
 | Reduced model, CP | Baseline failed before offloading: no compatible deterministic attention backend in this A6000 environment |
 | Reduced model, four-rank combinations | Not run |
 | Pretrained Qwen3.5-0.8B, one rank | All 8 comparison arms passed; 24 optimizer updates |
+| Pretrained Qwen, DP on two ranks | All 8 arms passed on each rank; replicas have distinct losses and identical reduced gradients, weights and Adam states |
 | Pretrained Qwen, TP+SP on two ranks | All 8 arms passed on each rank, including across norm recomputation settings |
-| Pretrained Qwen, PP+VPP on two ranks | Batched P2P baseline failed activation-transfer checks; native unbatched P2P rerun pending |
-| Pretrained Qwen memory/runtime | Measurements in progress; no result qualified yet |
+| Pretrained Qwen, PP+VPP on two ranks | All 8 arms passed on each rank with native unbatched P2P, including across norm recomputation settings |
+| Pretrained Qwen, sequence lengths 2048/4096 | Baseline and fraction 1 passed with norm recomputation off/on; all 3 step states also match across recomputation settings |
+| Pretrained Qwen memory/runtime | All 48 processes completed; 480 measured samples across 2 lengths × 2 norm settings × 4 arms × 3 repeats |
 
-The Qwen comparison uses all 24 text decoder layers, hidden size 1024 and
+The single-rank Qwen comparison uses all 24 text decoder layers, hidden size 1024 and
 vocabulary size 248320 from the original checkpoint. Each arm starts from the
 same local Hugging Face weights and consumes the same 128 real text conversations
 (30,727 rendered tokens). Sequence length is 128, with four microbatches per
-optimizer step, one warmup step and two steady steps. All eight arms
-(disabled/0/0.5/1 × output-norm recomputation off/on) match exactly, including
+optimizer step, one warmup step and two steady steps. The short-sequence
+checks lower the minimum tensor size to 1024 elements to exercise transfers.
+All eight arms (disabled/0/0.5/1 × output-norm recomputation off/on) match exactly, including
 across the recomputation settings: losses, numeric gradient norms, all 230
 parameter-gradient and updated-weight fingerprints, and complete Adam state.
 The manager warmup completes in enabled arms and pinned-buffer use returns to
 zero after every step. Fraction 0 selects no transfer bytes; fractions 0.5 and 1
 select 66,945,024 and 132,030,464 bytes per full iteration, respectively.
+At lengths 2048 and 4096, separate disabled/fraction-1 correctness runs use the
+default 1,048,576-element threshold and match every step state with norm
+recomputation off/on. Fraction 1 selects 2,084,569,088 and 4,169,138,176 bytes
+per full iteration, respectively.
 
 Checkpoint revision: `eb706f593d2d43c90a10271199c10b07ced7569a`.
 The single safetensors shard has SHA-256
@@ -49,6 +56,67 @@ capability below 9.0; FlashAttention is not installed in this environment.
 The unfused backend does not support CP. This leaves CP unqualified; the test
 does not relax determinism to turn the comparison into a pass.
 
+## Complete-Qwen A6000 measurements
+
+These runs use the pretrained model and real text dataset described above, with
+four microbatches per complete optimizer step, the default 1,048,576-element
+threshold, three warmup steps and ten measured steps. Each of the four arms
+runs in a fresh process; the comparison repeats three times for each sequence
+length and output-norm setting. Correctness snapshots run separately.
+
+The two norm-setting matrices ran concurrently on two otherwise idle A6000s.
+Every comparison keeps its setting on the same device: physical GPU 4
+(`GPU-7595108b-553d-3126-385e-30133180c720`) without norm recomputation, and GPU 1
+(`GPU-5e2e1f94-e88e-48e3-247d-328b52fc68db`) with it. Per-second process samples
+found no external compute process on either measured GPU. Other GPUs and the
+host were shared, and clocks were not locked. Use the paired results within each
+setting/device; absolute runtime comparisons between settings include device
+differences.
+
+Peak allocated memory is the median of three per-run maximums. Runtime change
+is the median [range] of the three within-run percentage changes in median step
+time versus disabled offloading. At sequence 2048, allocation peaks vary by up
+to 1 MiB between processes. Fraction zero keeps the existing manager markers and
+hooks without steady transfers; its measured overhead remains in the table.
+
+| Sequence | Norm recompute | Fraction | Peak allocated (MiB) | Selected D2H/iteration (GiB) | Runtime change, median [range] |
+| ---: | --- | --- | ---: | ---: | --- |
+| 2048 | Off | disabled | 21886.40 | 0.000 | — |
+| 2048 | Off | 0 | 21885.40 | 0.000 | +10.50% [+10.16%, +12.98%] |
+| 2048 | Off | 0.5 | 21634.15 | 0.984 | +2.25% [+1.33%, +8.65%] |
+| 2048 | Off | 1 | 21410.40 | 1.941 | +4.65% [+3.10%, +6.46%] |
+| 4096 | Off | disabled | 31599.17 | 0.000 | — |
+| 4096 | Off | 0 | 31599.17 | 0.000 | +0.29% [+0.03%, +1.19%] |
+| 4096 | Off | 0.5 | 31095.17 | 1.969 | +0.65% [+0.47%, +1.04%] |
+| 4096 | Off | 1 | 30647.17 | 3.883 | +2.19% [+1.98%, +2.79%] |
+| 2048 | On | disabled | 21596.28 | 0.000 | — |
+| 2048 | On | 0 | 21595.28 | 0.000 | +4.36% [-7.85%, +8.04%] |
+| 2048 | On | 0.5 | 21343.15 | 0.984 | +11.29% [+1.80%, +11.52%] |
+| 2048 | On | 1 | 21119.15 | 1.941 | +12.38% [+9.31%, +20.28%] |
+| 4096 | On | disabled | 31018.67 | 0.000 | — |
+| 4096 | On | 0 | 31018.67 | 0.000 | +0.13% [-0.07%, +0.79%] |
+| 4096 | On | 0.5 | 30514.67 | 1.969 | +0.43% [+0.43%, +0.68%] |
+| 4096 | On | 1 | 30066.67 | 3.883 | +1.93% [+1.77%, +1.97%] |
+
+Fraction 1 saves about 476 MiB (2.17%) at 2048 and 952 MiB (3.01%) at 4096 without
+norm recomputation. With norm recomputation, it saves about 477 MiB (2.21%) and
+952 MiB (3.07%), respectively, relative to that setting's disabled baseline.
+These complete-model percentages include attention, MLPs, vocabulary loss and
+optimizer state; the earlier stack results use a different memory denominator.
+
+[All 480 measured step samples](gdn_activation_offload_training_a6000.csv) include
+peak allocated/reserved CUDA bytes, synchronized step seconds, device UUID,
+selected group calls and transfer bytes. The separate `offload_summary_bytes`
+field reports the manager's startup overlap window. Every performance process
+completed 13 optimizer updates with finite positive gradient norms and zero
+outstanding pinned buffers. All 13 logged loss records match exactly across
+arms, repeats and norm settings for each length; full gradient/weight/Adam
+fingerprints were checked in the separate three-step correctness runs above.
+
+The first 2048/no-norm repeat used the tool at `f6b3a6815`; the remaining runs used
+`0d8248f0b`. The only tool differences are unbatched P2P selection (unused with
+PP=1) and two output metadata fields. The measured training path is the same.
+
 ## Training comparison
 
 The test builds eight complete decoder blocks with the `GGG*GGG*` pattern: three
@@ -60,9 +128,12 @@ length 128. Weights and token batches are synthetic.
 
 For each topology, baseline and offloaded models start from identical weights and
 consume the same changing batches. Three optimizer iterations each accumulate
-four microbatches, covering manager warmup and two steady iterations. Each rank
-compares losses, accumulated gradients before clipping, gradient norm, updated
-weights, FP32 master weights and Adam states exactly. The test also requires a
+four microbatches from two new examples repeated in the same order, covering
+manager warmup and two steady iterations. With fixed weights during accumulation
+and dropout disabled, repeated examples must yield identical losses in both
+arms. This checks the baseline's microbatch correspondence as well as offload
+equivalence. Each rank compares losses, accumulated gradients before clipping,
+gradient norm, updated weights, FP32 master weights and Adam states exactly. The test also requires a
 successful optimizer update with a positive gradient norm, the expected number of
 loss records on the last pipeline stage, zero outstanding pinned buffers and a
 completed offload warmup. Fraction zero must select no transfer bytes after
@@ -99,8 +170,10 @@ mismatched activation hashes at pipeline boundaries. Native unbatched P2P
 restored matching send/receive hashes and initial losses identical to the
 single-GPU baseline. Pipeline-output deallocation did not cause this failure;
 the tool retains Bridge's deallocation setting and records the communication
-and deallocation settings. Baseline/offload equivalence alone does not qualify an unhealthy
-training baseline.
+and deallocation settings. Baseline/offload equivalence alone does not qualify
+an unhealthy training baseline. A regression run with batched P2P failed the
+repeated-example check on both ranks; the unbatched two-rank run passed all
+30 non-CP cases on each rank (six four-rank cases skipped, 12 CP cases deselected).
 
 ## Run on available GPUs
 
@@ -214,7 +287,9 @@ transfer bytes, and a positive fraction must select transfers on ranks that
 contain GDN layers. Otherwise the comparison has not exercised offloading.
 
 For memory/runtime comparisons, omit `--check-state`, use sequence lengths 2048
-and 4096 and preserve the default three warmup and ten measured iterations. Run
+and 4096 and preserve the default three warmup and ten measured iterations.
+The default minimum tensor size is 1,048,576 elements (2 MiB for BF16 or 4 MiB
+for FP32), rather than a byte threshold. Run
 disabled/0/0.5/1 in separate processes, repeating the full comparison three times.
 Samples include CUDA peak allocated/reserved memory, synchronized step time and
 selected group calls/transfer bytes for the full iteration. Selection counts and
