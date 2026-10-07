@@ -13,7 +13,10 @@ from megatron.core.transformer.residual_recompute import (
     checkpoint_residual_write,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
+from megatron.core.transformer.wide_residual_layer import (
+    StreamwiseSigmoidWideResidualConnection,
+    _load_residual_state,
+)
 from megatron.core.typed_torch import apply_module
 
 
@@ -55,33 +58,33 @@ class WideResidualMambaLayer(MambaLayer):
                 "returns its own residual."
             )
 
-        self.residual_connection = StreamwiseSigmoidWideResidualConnection(
-            config=self.config,
-            layer_number=self.layer_number,
-            branch_name="mamba",
-            pg_collection=pg_collection,
-            name=(name + ".residual_connection") if name is not None else None,
+        self.residual_read = StreamwiseSigmoidWideResidualConnection(
+            config, self.layer_number, "mamba", mode="read"
         )
+        self.residual_write = StreamwiseSigmoidWideResidualConnection(
+            config, self.layer_number, "mamba", mode="write"
+        )
+        self.register_load_state_dict_pre_hook(_load_residual_state)
         self.residual_stream_hidden_size = (
             config.wide_residual.num_streams * self.config.hidden_size
         )
-        if self.residual_connection.residual_stream_hidden_size != self.residual_stream_hidden_size:
+        if self.residual_read.residual_stream_hidden_size != self.residual_stream_hidden_size:
             raise ValueError(
                 "The wide-residual Mamba connection must carry num_streams * hidden_size "
                 f"features, expected {self.residual_stream_hidden_size}, got "
-                f"{self.residual_connection.residual_stream_hidden_size}."
+                f"{self.residual_read.residual_stream_hidden_size}."
             )
-        if self.residual_connection.branch_hidden_size != self.config.hidden_size:
+        if self.residual_read.branch_hidden_size != self.config.hidden_size:
             raise ValueError(
                 "The wide-residual Mamba connection must produce "
                 f"hidden_size={self.config.hidden_size}, got "
-                f"{self.residual_connection.branch_hidden_size}."
+                f"{self.residual_read.branch_hidden_size}."
             )
 
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""
 
-        return self.residual_connection
+        return self.residual_read, self.residual_write
 
     def _prepare_mixer_state(
         self,
@@ -92,21 +95,20 @@ class WideResidualMambaLayer(MambaLayer):
 
         recompute_context = residual_stream_recompute_context
         if recompute_context is None:
-            hidden_states, connection_state = apply_module(self.residual_connection)(
+            hidden_states, connection_state = apply_module(self.residual_read)(
                 hidden_states,
-                operation="read",
                 fp32_residual_connection=self.config.fp32_residual_connection,
                 branch_input_dtype=self.config.params_dtype,
             )
         else:
             hidden_states, connection_state = checkpoint_residual_read(
-                self.residual_connection,
+                self.residual_read,
                 hidden_states,
                 recompute_context,
                 fp32_residual_connection=self.config.fp32_residual_connection,
                 branch_input_dtype=self.config.params_dtype,
             )
-        residual = self.residual_connection.residual_stream(connection_state)
+        residual = connection_state[0]
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         if recompute_context is not None and not isinstance(self.norm, IdentityOp):
@@ -128,7 +130,7 @@ class WideResidualMambaLayer(MambaLayer):
             raise RuntimeError("Missing state for the Mamba residual connection.")
         if recompute_context is not None and not recompute_context.is_block_end:
             return checkpoint_residual_write(
-                self.residual_connection,
+                self.residual_write,
                 mixer_out_with_bias,
                 connection_state,
                 recompute_context,
@@ -136,9 +138,8 @@ class WideResidualMambaLayer(MambaLayer):
                 training=self.training,
             )
         with self.bias_dropout_add_exec_handler():
-            return apply_module(self.residual_connection)(
+            return apply_module(self.residual_write)(
                 mixer_out_with_bias,
-                operation="write",
                 state=connection_state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,

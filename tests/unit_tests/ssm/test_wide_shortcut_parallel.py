@@ -201,15 +201,14 @@ def _run_forward_backward(module, pg_collection):
     read_count = 0
 
     def record_write(_module, _args, kwargs, output):
-        if kwargs.get("operation") == "write":
-            write_dtypes.append(output.dtype)
+        write_dtypes.append(output.dtype)
 
     def record_shortcut_read(_module, _args, _output):
         nonlocal read_count
         read_count += 1
 
     pair = module.layers[0]
-    write_handle = pair.moe_layer.residual_connection_mlp.register_forward_hook(
+    write_handle = pair.moe_layer.residual_write_mlp.register_forward_hook(
         record_write, with_kwargs=True
     )
     read_handle = pair.shortcut_residual_read.register_forward_hook(record_shortcut_read)
@@ -238,11 +237,11 @@ def _run_forward_backward(module, pg_collection):
                 assert parameter.main_grad is not None, name
                 assert torch.isfinite(parameter.main_grad).all(), name
                 gradients[name] = parameter.main_grad
-                if "residual_connection" in name or "shortcut_residual_read" in name:
+                if "residual_read" in name or "residual_write" in name:
                     assert not _is_gtp_parameter(parameter), name
                     active = parameter.main_grad.flatten()[:_STREAMS]
                     assert torch.count_nonzero(active) > 0, name
-                if ".mlp.experts." in name:
+                if ".mlp.experts." in name or ".routed_experts." in name:
                     assert torch.count_nonzero(parameter.main_grad) > 0, name
 
             records.append(
