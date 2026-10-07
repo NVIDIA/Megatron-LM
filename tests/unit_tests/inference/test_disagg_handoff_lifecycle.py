@@ -737,6 +737,51 @@ def test_quarantined_import_survives_backend_poll_error(handoff_loop, caplog):
     assert "Polling quarantined KV import failed" in caplog.text
 
 
+@pytest.mark.parametrize("failed_handle_index", [0, 1], ids=["kv-failed", "ssm-failed"])
+def test_quarantined_import_polls_all_handles_after_failure(handoff_loop, failed_handle_index):
+    from megatron.core.inference.disaggregation.transfer_backends.nixl import NixlPullHandle
+
+    engine = _HandoffHarness(handoff_loop, hybrid=True, available=1)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    handles = []
+    for index in range(3):
+        agent = mock.Mock()
+        agent.check_xfer_state.side_effect = (
+            ["ERR"] if index == failed_handle_index else ["PROC", "DONE"]
+        )
+        handles.append(
+            NixlPullHandle(
+                agent=agent,
+                xfers=[index],
+                contexts=[f"transfer-{index}"],
+                submitted_at=0,
+                timeout_s=float("inf"),
+            )
+        )
+    pending.handle = handles[0]
+    slot = engine.context.mamba_metadata.allocate_slot()
+    pending.ssm = PendingSSMImport(handles=handles[1:], live_slot=slot)
+    engine._quarantined_kv_imports.append(pending)
+
+    with mock.patch.object(engine, "_notify_kv_read_done") as read_done:
+        engine._poll_quarantined_kv_imports()
+        assert engine.context.kv_block_allocator.releases == []
+        assert engine.context.mamba_metadata.freed == []
+        read_done.assert_not_called()
+
+        engine._poll_quarantined_kv_imports()
+        assert all(handle.storage_safe for handle in handles)
+        assert engine.context.kv_block_allocator.releases == [[block_id]]
+        assert engine.context.mamba_metadata.freed == [slot]
+        assert not engine._quarantined_kv_imports
+        read_done.assert_called_once_with(4)
+
+        engine._poll_quarantined_kv_imports()
+        assert engine.context.kv_block_allocator.releases == [[block_id]]
+        read_done.assert_called_once_with(4)
+
+
 def test_quarantined_import_releases_after_start_cleanup_completes(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
