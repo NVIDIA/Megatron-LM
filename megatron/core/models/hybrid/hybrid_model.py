@@ -126,11 +126,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
-            The main pattern may contain "|" to define pipeline stage boundaries.
+            The main pattern may contain "|" to define pipeline stage boundaries and
+            "[...]" to group layers into one logical layer (see "Bracketed layer groups"
+            in docs/user-guide/hybrid-model-migration.md).
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
                 - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+                - "[M*E][M*E]" -> 2 logical layers, each grouping Mamba, attention and MoE
         hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
             If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
             generated from the ratio with a deprecation warning.

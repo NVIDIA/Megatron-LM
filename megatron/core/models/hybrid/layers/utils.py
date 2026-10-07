@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Sequence
+
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -28,7 +30,9 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    # Bracketed groups (e.g. ``[M*E]``) build one nested HybridStack logical layer.
+    # Brackets group layers into one logical layer that HybridStack builds as a nested
+    # HybridStack, e.g. ``[M*E]``. See "Bracketed layer groups" in
+    # docs/user-guide/hybrid-model-migration.md.
     GROUP_START = "["
     GROUP_END = "]"
     LAYER_CONFIG_MAP = {
@@ -44,6 +48,20 @@ class Symbols:
         MOE: MoELayerConfig,
     }
     DSV4_COMPRESS_RATIO_MAP = {CSA: 4, HCA: 128, WINDOW: 0}
+    # Submodule under which each layer type stores its sharded checkpoint state. The layers
+    # of a bracketed group share one checkpoint layer index, so they need distinct namespaces.
+    CHECKPOINT_NAMESPACE_MAP = {
+        MAMBA: "mixer",
+        GDN: "self_attention",
+        ATTENTION: "self_attention",
+        DS_ATTENTION: "self_attention",
+        CSA: "self_attention",
+        HCA: "self_attention",
+        MLA: "self_attention",
+        WINDOW: "self_attention",
+        MLP: "mlp",
+        MOE: "mlp",
+    }
     MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
     ATTENTION_LAYER_CONFIGS = {AttentionLayerConfig, DSALayerConfig, CSALayerConfig, MLALayerConfig}
 
@@ -56,6 +74,27 @@ class Symbols:
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
+
+
+def validate_layer_group_checkpoint_namespaces(layer_symbols: Sequence[str]) -> None:
+    """Require the layers of one bracketed group to use distinct checkpoint namespaces.
+
+    A group shares one checkpoint layer index, so it can contain at most one mixer, one
+    attention module (including GDN), and one MLP or MoE module.
+
+    Args:
+        layer_symbols: Symbols of the group's layers, in pattern order.
+    """
+    seen = set()
+    for layer_symbol in layer_symbols:
+        namespace = Symbols.CHECKPOINT_NAMESPACE_MAP[layer_symbol]
+        if namespace in seen:
+            group = f"{Symbols.GROUP_START}{''.join(layer_symbols)}{Symbols.GROUP_END}"
+            raise ValueError(
+                f"Layer group '{group}' contains multiple layers in checkpoint namespace "
+                f"'{namespace}'."
+            )
+        seen.add(namespace)
 
 
 def is_valid_symbol(layer_symbol: str, allow_pipe: bool = False) -> bool:
