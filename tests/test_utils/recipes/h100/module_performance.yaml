@@ -45,6 +45,7 @@ spec:
 
     cd /opt/megatron-lm
 
+    export NVTE_FLASH_ATTN_V4=0
     uv run --no-sync python -m torch.distributed.run \
       --log-dir {assets_dir}/logs/1 \
       --tee "0:3,7:3" \

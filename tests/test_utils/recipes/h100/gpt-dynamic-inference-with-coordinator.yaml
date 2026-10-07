@@ -81,14 +81,12 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_long_prompt_logitsmatch_zmq]
     products:
       - environment: [dev]
-        # https://github.com/NVIDIA/Megatron-LM/issues/7737
-        scope: [mr, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_dp2_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        # https://github.com/NVIDIA/Megatron-LM/issues/7737
-        scope: [mr, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq]
     products:

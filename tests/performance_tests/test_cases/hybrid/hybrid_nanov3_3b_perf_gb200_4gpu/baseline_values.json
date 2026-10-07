@@ -42,11 +42,11 @@
       "num_input_tokens_avg": 61.88671875,
       "num_output_tokens": 128,
       "num_iters": 10,
-      "throughput_tok_per_sec": 14311.99826392676,
-      "avg_latency_ms": 1131.901481910245,
-      "p50_latency_ms": 1117.7453272975981,
-      "p99_latency_ms": 1185.6191959232092,
-      "tpot_ms_per_tok": 8.943544964131434
+      "throughput_tok_per_sec": 11512.760737650928,
+      "avg_latency_ms": 1409.1983075107692,
+      "p50_latency_ms": 1402.4255399999674,
+      "p99_latency_ms": 1589.2388540014508,
+      "tpot_ms_per_tok": 11.118097814835437
     }
   }
 }

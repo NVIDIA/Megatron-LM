@@ -10,13 +10,10 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-import megatron.core.transformer.attention as attention_module
 from megatron.core import activations, parallel_state
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
@@ -27,7 +24,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.transformer.attention import Attention, SelfAttention
+from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
@@ -277,76 +274,3 @@ def test_dsv4_q_rms_norm_replays(dtype, layout):
     assert_replays_bit_exact(
         lambda q: _q_rms_norm(q, 1e-6), (q,), replays=3, contention=True, what="_q_rms_norm"
     )
-
-
-@pytest.mark.parametrize("is_decode_only", [False, True])
-@pytest.mark.parametrize("has_sink", [False, True])
-@pytest.mark.parametrize(
-    "flash_attention_version,head_dim,page_size",
-    [pytest.param(4, 64, 128, id="fa4"), pytest.param(None, 8, 256, id="auto-hopper-small-head")],
-)
-def test_paged_attention_dispatch_replays_bit_exactly(
-    monkeypatch, is_decode_only, has_sink, flash_attention_version, head_dim, page_size
-):
-    if not attention_module.HAVE_FA4:
-        pytest.skip("requires FlashAttention-4")
-    capability = torch.cuda.get_device_capability()[0]
-    if capability not in (9, 10, 11):
-        pytest.skip("requires FA4 paged attention on Hopper, Blackwell, or Rubin")
-    if flash_attention_version is None and capability != 9:
-        pytest.skip("requires Hopper to exercise the small-head automatic fallback")
-
-    seeded()
-    attention = object.__new__(SelfAttention)
-    torch.nn.Module.__init__(attention)
-    attention.config = SimpleNamespace(
-        window_size=None, window_attn_skip_freq=None, attn_logit_softcapping=None
-    )
-    attention.layer_number = 1
-    attention.batch_invariant_mode = False
-    attention.flash_attention_version = flash_attention_version
-    attention.train(False)
-
-    # Observe dispatch arguments while still running the real FA4 kernel.
-    fa4 = attention_module.flash_attn4_varlen_func
-    fa4_calls = []
-
-    def checked_fa4(*args, **kwargs):
-        assert kwargs["num_splits"] == (1 if capability == 9 else 0)
-        assert kwargs["return_lse"] is has_sink
-        fa4_calls.append(True)
-        return fa4(*args, **kwargs)
-
-    monkeypatch.setattr(attention_module, "flash_attn4_varlen_func", checked_fa4)
-    q = torch.randn(2, 1, 4, head_dim, device="cuda", dtype=DTYPE)
-    num_pages = 2048 // page_size
-    k = torch.randn(num_pages, page_size, 4, head_dim, device="cuda", dtype=DTYPE)
-    v = torch.randn_like(k)
-    cu_seqlens_q = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
-    cu_seqlens_k = torch.tensor([0, 1024, 2048], device="cuda", dtype=torch.int32)
-    seqlens_k = torch.full((2,), 1024, device="cuda", dtype=torch.int32)
-    block_table = torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(2, -1)
-    offset = torch.arange(4, device="cuda", dtype=torch.float32) if has_sink else None
-
-    @torch.inference_mode()
-    def forward(query, key, value):
-        output = attention.flash_decode_and_prefill(
-            q=query,
-            k=key,
-            v=value,
-            max_seqlen_q=1,
-            max_seqlen_k=1024,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqlens_k=seqlens_k,
-            block_table=block_table,
-            is_decode_only=is_decode_only,
-            softmax_offset=offset,
-        )
-        assert torch.isfinite(output).all()
-        return output
-
-    assert_replays_bit_exact(
-        forward, (q, k, v), replays=3, backward=False, what="paged attention dispatch"
-    )
-    assert len(fa4_calls) == (3 if flash_attention_version == 4 else 0)

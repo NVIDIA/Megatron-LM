@@ -104,10 +104,6 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    # FlashAttention 4.0.0b24 needs a newer CuTe DSL and compatible QuACK APIs.
-    # CUTLASS 4.8 also preserves the existing protobuf 7 dependency.
-    "nvidia-cutlass-dsl>=4.8.0",
-    "quack-kernels>=0.6.5",
     "nvidia-cudnn-frontend[cutedsl]==1.29.0",
     "wget",
     "onnxscript",
@@ -212,7 +208,7 @@ no-build-isolation-package = [
 ]
 link-mode = "copy"
 # The Mamba revision retained from main pins an older TileLang/TVM FFI family.
-# Override those transitive constraints for cuDNN Frontend and FA4 compatibility.
+# Override those transitive constraints for cuDNN Frontend 1.28 compatibility.
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
@@ -220,8 +216,8 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
-    "tilelang==0.1.13",
-    "apache-tvm-ffi==0.1.12",
+    "tilelang==0.1.12",
+    "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
