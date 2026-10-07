@@ -107,9 +107,6 @@
     "megatron/core/inference/text_generation_server/tokenization.py": [
       "tokenize_prompts:accessor:parallel_state.get_data_parallel_src_rank"
     ],
-    "megatron/core/models/T5/t5_model.py": [
-      "T5Model.__init__:shim:use_mpu_process_groups"
-    ],
     "megatron/core/models/common/embeddings/rope_utils.py": [
       "apply_rotary_pos_emb:accessor:parallel_state.get_context_parallel_group"
     ],
@@ -289,5 +286,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 183
+  "total": 182
 }
