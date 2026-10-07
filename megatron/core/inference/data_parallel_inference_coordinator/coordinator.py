@@ -23,6 +23,7 @@ from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoo
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.routing import select_engine
 from megatron.core.inference.utils import detokenize_tokens
 
 from .handlers import HANDLERS
@@ -90,7 +91,7 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    disagg: DisaggCoordinatorRuntime | None = None
+    disaggregated_runtime: DisaggCoordinatorRuntime | None = None
 
     # Exposed as a class attribute for backwards compatibility; the canonical
     # definition lives in state.py.
@@ -271,7 +272,11 @@ class DataParallelInferenceCoordinator:
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
-        self.disagg = DisaggCoordinatorRuntime(self) if disaggregated else None
+        self.disaggregated_runtime = DisaggCoordinatorRuntime(self) if disaggregated else None
+
+    def is_disaggregated_inference(self) -> bool:
+        """Whether this coordinator manages native prefill/decode handoffs."""
+        return self.disaggregated_runtime is not None
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -282,21 +287,7 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the least-loaded data parallel rank.
         """
-        return self._least_loaded_rank(self._identities_list, self._pending_counts)
-
-    @staticmethod
-    def _least_loaded_rank(identities, counts, available_fractions=None):
-        """Prefer free capacity when supplied, then request count and rank order."""
-        if not identities:
-            raise RuntimeError("No engines connected")
-        if available_fractions is None:
-            best_idx = int(np.argmin(counts))
-        else:
-            free = np.fromiter(
-                (available_fractions[identity] for identity in identities), dtype=np.float64
-            )
-            best_idx = int(np.lexsort((np.arange(len(identities)), counts, -free))[0])
-        return identities[best_idx]
+        return select_engine(self._identities_list, self._pending_counts)
 
     def _update_media_affinity(self, media_cache_key: str, identity: bytes) -> None:
         """Record the rank most recently assigned a generated media key."""
@@ -376,8 +367,8 @@ class DataParallelInferenceCoordinator:
                 new_hash_table[h] = new_row
         self._hash_table = new_hash_table
         # Remove role routing and fail disaggregated work assigned to the dead engine.
-        if self.disagg is not None:
-            self.disagg.remove_engine(identity)
+        if self.is_disaggregated_inference():
+            self.disaggregated_runtime.remove_engine(identity)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -441,14 +432,7 @@ class DataParallelInferenceCoordinator:
             token_tensor, self.block_size_tokens, cache_salt=cache_salt
         )
 
-    def get_best_data_parallel_rank(
-        self,
-        request_hashes,
-        media_cache_key: str | None = None,
-        *,
-        candidate_loads: dict[bytes, int] | None = None,
-        available_fractions: dict[bytes, float] | None = None,
-    ):
+    def get_best_data_parallel_rank(self, request_hashes, media_cache_key: str | None = None):
         """Select the best DP rank based on media affinity, prefix affinity, and load.
 
         Uses ``score = cache_score - alpha * relative_load``, where
@@ -459,23 +443,32 @@ class DataParallelInferenceCoordinator:
         Args:
             request_hashes: List of block hashes for the request.
             media_cache_key: Internally generated content key for request media.
-            candidate_loads: Optional eligible identities and queued + active counts.
-                Affinity and mean load are evaluated only within this pool.
-            available_fractions: Optional free-capacity fractions used by load
-                balancing when the eligible pool has no affinity hits.
 
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        if candidate_loads is None:
-            identities, counts = self._identities_list, self._pending_counts
-        else:
-            identities = sorted(candidate_loads, key=self.identity_to_rank_index.__getitem__)
-            counts = np.fromiter(
-                (candidate_loads[identity] for identity in identities), dtype=np.int64
-            )
-        if not identities:
-            raise RuntimeError("No engines connected")
+        return select_engine(
+            self._identities_list,
+            self._pending_counts,
+            affinity_scores=self.get_routing_affinity(
+                self._identities_list, self._pending_counts, request_hashes, media_cache_key
+            ),
+            routing_alpha=self.prefix_caching_routing_alpha,
+        )
+
+    def get_routing_affinity(
+        self,
+        identities: list[bytes],
+        counts: np.ndarray,
+        request_hashes: list[int],
+        media_cache_key: str | None = None,
+    ) -> np.ndarray | None:
+        """Read normalized cache affinity for an ordered eligible engine pool.
+
+        Return None when no candidate has a policy-enabled cache hit. Counts
+        align with identities and gate media affinity at request capacity.
+        Cache state stays here; callers own eligibility, load and selection.
+        """
         # Use load-balancing if text or multimodal coordination affinity is deactivated.
         has_media = isinstance(media_cache_key, str) and bool(media_cache_key)
         use_prefix_affinity = (
@@ -490,14 +483,14 @@ class DataParallelInferenceCoordinator:
             and self.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
         if not use_prefix_affinity and not use_media_affinity:
-            return self._least_loaded_rank(identities, counts, available_fractions)
+            return None
 
         # Compute text affinity.
         n_ranks = len(identities)
         prefix_blocks = np.zeros(n_ranks, dtype=np.float64)
         if use_prefix_affinity:
             prefix_blocks = self._prefix_depth_vector(request_hashes)
-            if candidate_loads is not None:
+            if identities is not self._identities_list:
                 prefix_blocks = prefix_blocks[
                     [self.identity_to_rank_index[identity] for identity in identities]
                 ]
@@ -506,18 +499,15 @@ class DataParallelInferenceCoordinator:
         media_hit = np.zeros(n_ranks, dtype=np.float64)
         if use_media_affinity:
             media_identity = self._media_cache_affinity.get(media_cache_key)
-            if candidate_loads is None:
-                media_rank_idx = self.identity_to_rank_index.get(media_identity)
-            else:
-                media_rank_idx = (
-                    identities.index(media_identity) if media_identity in identities else None
-                )
+            media_rank_idx = (
+                identities.index(media_identity) if media_identity in identities else None
+            )
             if media_rank_idx is not None and counts[media_rank_idx] < self.max_requests:
                 media_hit[media_rank_idx] = 1.0
 
         # If there are no hits anywhere, just fall-back to load balancing.
         if not prefix_blocks.any() and not media_hit.any():
-            return self._least_loaded_rank(identities, counts, available_fractions)
+            return None
 
         # Fraction of this request's reusable work that each rank already holds,
         # combining prompt blocks with a weighted media hit. Normalized by the most
@@ -528,32 +518,7 @@ class DataParallelInferenceCoordinator:
         maximum_reusable_work = prefix_block_count + (
             self.media_cache_routing_weight if use_media_affinity else 0.0
         )
-        cache_score = (
-            reusable_work / maximum_reusable_work if maximum_reusable_work > 0 else reusable_work
-        )
-
-        # Penalise a rank for the load it carries *relative to the fleet* rather
-        # than for its absolute occupancy. Measuring against max_requests scales
-        # the term by a configured ceiling instead of the actual operating point:
-        # with a large ceiling a sizeable imbalance stays a small fraction of it,
-        # so affinity wins however lopsided the fleet gets. Against the mean the
-        # term vanishes while ranks are even -- at saturation this is pure affinity
-        # -- and grows only as they diverge, which is the drain at the end of a
-        # batch, exactly when work should spread to idle ranks.
-        #
-        # Subtractive rather than a convex blend, so a full cache hit cannot cancel
-        # the load term and strand work on a saturated rank. Both terms are
-        # normalized, which is what makes alpha dimensionless.
-        #
-        # The mean is floored at 1 so a near-idle fleet does not turn a single
-        # in-flight request into a large relative load and thrash on noise.
-        mean_load = float(counts.mean())
-        relative_load = (counts - mean_load) / max(1.0, mean_load)
-        scores = cache_score - self.prefix_caching_routing_alpha * relative_load
-
-        # Tiebreak: highest score, then least loaded, then lowest rank index.
-        order = np.lexsort((np.arange(n_ranks), counts, -scores))
-        return identities[int(order[0])]
+        return reusable_work / maximum_reusable_work if maximum_reusable_work > 0 else reusable_work
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.

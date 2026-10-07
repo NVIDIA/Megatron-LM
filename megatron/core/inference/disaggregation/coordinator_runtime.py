@@ -8,6 +8,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from megatron.core.inference.disaggregation.coordinator_scheduler import (
     DECODE,
     PREFILL,
@@ -17,6 +19,7 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     restore_registered_nixl_agent_metadata,
 )
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.routing import select_engine
 
 try:
     import msgpack
@@ -168,14 +171,20 @@ class DisaggCoordinatorRuntime:
         }
         if not loads:
             raise RuntimeError(f"no {role} engines registered")
-        identity = self.coordinator.get_best_data_parallel_rank(
-            block_hashes,
-            candidate_loads={
-                engine: queued + active for engine, (queued, active, _) in loads.items()
-            },
-            available_fractions={
-                engine: self.scheduler.available_fraction(engine, role) for engine in loads
-            },
+        coordinator = self.coordinator
+        identities = sorted(loads, key=coordinator.identity_to_rank_index.__getitem__)
+        counts = np.fromiter(
+            (loads[engine][0] + loads[engine][1] for engine in identities), dtype=np.int64
+        )
+        identity = select_engine(
+            identities,
+            counts,
+            affinity_scores=coordinator.get_routing_affinity(identities, counts, block_hashes),
+            available_fractions=np.fromiter(
+                (self.scheduler.available_fraction(engine, role) for engine in identities),
+                dtype=np.float64,
+            ),
+            routing_alpha=coordinator.prefix_caching_routing_alpha,
         )
         self.scheduler.assign_engine(role, request_id, identity)
         return identity

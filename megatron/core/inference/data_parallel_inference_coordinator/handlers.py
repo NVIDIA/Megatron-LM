@@ -68,10 +68,12 @@ def handle_register_role(coordinator, sender_identity, metadata, bodies):
     """Register a coordinator-native prefill or decode engine."""
 
     try:
-        if coordinator.disagg is None:
+        if not coordinator.is_disaggregated_inference():
             raise ValueError("REGISTER_ROLE requires a disaggregated coordinator")
         _, role, transport, instance_meta = metadata
-        coordinator.disagg.register_engine(sender_identity, role, transport, instance_meta)
+        coordinator.disaggregated_runtime.register_engine(
+            sender_identity, role, transport, instance_meta
+        )
     except (KeyError, TypeError, ValueError) as error:
         logging.warning(
             "Coordinator: rejecting role registration from %r: %s", sender_identity, error
@@ -165,8 +167,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     media_frame = bodies[2]
     offload_frame = bodies[3]
 
-    if coordinator.disagg is not None:
+    if coordinator.is_disaggregated_inference():
         if media_meta or media_frame != b"\xc0":
+            # Native handoffs do not support VLM/media state yet. Reject only
+            # this request, before allocating an ID or reserving engine capacity.
             coordinator.router_socket.send_multipart(
                 [
                     sender_identity,
@@ -239,8 +243,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     ):
         request_hashes = request_hashes[:1]
 
-    if coordinator.disagg is not None:
-        coordinator.disagg.route_submit(
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.route_submit(
             request_id, prompt_frame, sampling_params, request_hashes, offload_frame
         )
         return
@@ -370,14 +374,22 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
         return
     request_id = int(metadata[1])
     instance_id = metadata[2] if len(metadata) > 2 else None
+    # Legacy releases have no instance fence. Fenced releases may affect only
+    # this coordinator incarnation, never a replacement reusing the request ID.
     if len(metadata) == 2 or instance_id == coordinator.instance_id:
         engine = coordinator.handoff_ownership.source_engine(request_id)
         if engine is None:
+            # Legacy/untracked handoffs have no registered owner; engines that
+            # do not hold this request ignore the broadcast (including retries).
             coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
         elif not _release_owned_handoff(coordinator, request_id, engine):
             return  # No ACK: the caller must retry delivery.
     if len(metadata) == 2:
+        # The legacy client is fire-and-forget and does not expect an ACK.
         return
+    # ACK successful releases and stale-instance no-ops. Acknowledging a stale
+    # instance retires the caller's retry without releasing allocations that
+    # belong to the current coordinator incarnation.
     coordinator.router_socket.send_multipart(
         [
             sender_identity,
@@ -520,9 +532,12 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
-        if coordinator.disagg is not None and fid in coordinator.disagg.hop1_request_ids:
+        if (
+            coordinator.is_disaggregated_inference()
+            and fid in coordinator.disaggregated_runtime.hop1_request_ids
+        ):
             finished_request = msgpack.unpackb(body, raw=False)
-            coordinator.disagg.handle_prefill_done(fid, finished_request)
+            coordinator.disaggregated_runtime.handle_prefill_done(fid, finished_request)
             continue
 
         if fid not in coordinator.request_id_to_client_id:
@@ -539,8 +554,8 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             if idx is not None:
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
-        if coordinator.disagg is not None:
-            coordinator.disagg.handle_decode_done(fid)
+        if coordinator.is_disaggregated_inference():
+            coordinator.disaggregated_runtime.handle_decode_done(fid)
 
         if needs_detokenize:
             # Detokenization writes generated_text into the reply, so the body must
@@ -560,20 +575,22 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
 def handle_kv_read_done(coordinator, sender_identity, metadata, bodies):
     """Release prefill-owned cache storage after decode imports it."""
 
-    if coordinator.disagg is None:
+    if not coordinator.is_disaggregated_inference():
         logging.warning("Coordinator: ignoring KV_READ_DONE without disaggregation enabled")
         return
-    coordinator.disagg.handle_kv_read_done(sender_identity, int(metadata[1]))
+    coordinator.disaggregated_runtime.handle_kv_read_done(sender_identity, int(metadata[1]))
 
 
 @message_handler(Headers.KV_TRANSFER_READY)
 def handle_kv_transfer_ready(coordinator, sender_identity, metadata, bodies):
     """Start NCCL sends after decode commits the matching destinations."""
 
-    if coordinator.disagg is None:
+    if not coordinator.is_disaggregated_inference():
         logging.warning("Coordinator: ignoring KV_TRANSFER_READY without disaggregation enabled")
         return
-    coordinator.disagg.handle_kv_transfer_ready(sender_identity, int(metadata[1]), int(metadata[2]))
+    coordinator.disaggregated_runtime.handle_kv_transfer_ready(
+        sender_identity, int(metadata[1]), int(metadata[2])
+    )
 
 
 @message_handler(Headers.REQUEST_ERROR)
@@ -581,8 +598,10 @@ def handle_request_error(coordinator, sender_identity, metadata, bodies):
     """Forward a terminal engine-side request failure to its client."""
 
     request_id, reason, source_safe = int(metadata[1]), str(metadata[2]), bool(metadata[3])
-    if coordinator.disagg is not None:
-        coordinator.disagg.handle_engine_failure(request_id, reason, source_safe=source_safe)
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.handle_engine_failure(
+            request_id, reason, source_safe=source_safe
+        )
         return
 
     client_identity = coordinator.request_id_to_client_id.get(request_id)
@@ -612,8 +631,8 @@ def handle_request_aborted(coordinator, sender_identity, metadata, bodies):
     """Forward engine cancellation completion to the requesting client."""
 
     request_id, source_safe = int(metadata[1]), bool(metadata[2])
-    if coordinator.disagg is not None:
-        coordinator.disagg.handle_engine_aborted(request_id, source_safe=source_safe)
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.handle_engine_aborted(request_id, source_safe=source_safe)
         return
     if not source_safe:
         return
@@ -692,8 +711,8 @@ def handle_abort_request(coordinator, sender_identity, metadata, bodies):
     request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
     if request_id is None:
         return
-    if coordinator.disagg is not None:
-        coordinator.disagg.abort_request(request_id)
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.abort_request(request_id)
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)
     if assigned_rank is not None:

@@ -59,7 +59,7 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
         sent.append((identity, _decode_engine_frames(frames))) or True
     )
     runtime = DisaggCoordinatorRuntime(coordinator)
-    coordinator.disagg = runtime
+    coordinator.disaggregated_runtime = runtime
     coordinator._remove_engine = runtime.remove_engine
 
     common_meta = {
@@ -474,14 +474,13 @@ def test_prefix_alpha_penalizes_role_local_load(role, alpha):
     )
     assert reserve(busy, 99, 0)
 
-    shared_selector = Mock(wraps=runtime.coordinator.get_best_data_parallel_rank)
-    runtime.coordinator.get_best_data_parallel_rank = shared_selector
+    runtime.coordinator.get_best_data_parallel_rank = Mock(
+        side_effect=AssertionError("disaggregated routing must select from its own pool")
+    )
     selected = runtime._select_engine(role, 5, [1])
     assert selected == (busy if alpha == 0 else idle)
     assert runtime.scheduler.assigned_engine(role, 5) == selected
-    shared_selector.assert_called_once_with(
-        [1], candidate_loads={busy: 1, idle: 0}, available_fractions={busy: 31 / 32, idle: 1.0}
-    )
+    runtime.coordinator.get_best_data_parallel_rank.assert_not_called()
 
 
 @pytest.mark.parametrize("original", ["hello world", [2] * 16384, [1] * 16384])

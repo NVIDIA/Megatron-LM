@@ -37,6 +37,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.inference.routing import select_engine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_asyncio_loop
@@ -61,7 +62,8 @@ def test_coordinator_registers_client_kv_handoff_handlers():
 
 def test_invalid_role_registration_replies_without_raising():
     coordinator = unittest.mock.MagicMock()
-    coordinator.disagg = None
+    coordinator.disaggregated_runtime = None
+    coordinator.is_disaggregated_inference.return_value = False
 
     HANDLERS[Headers.REGISTER_ROLE](
         coordinator, b"engine", [Headers.REGISTER_ROLE.value, "prefill", "nixl", []], []
@@ -83,6 +85,7 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
         client_request_to_request_id={},
     )
 
+    coordinator.is_disaggregated_inference.return_value = True
     coordinator._handlers = HANDLERS
     submissions = [
         [
@@ -102,7 +105,7 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
 
     DataParallelInferenceCoordinator.start(coordinator)
 
-    coordinator.disagg.route_submit.assert_called_once_with(
+    coordinator.disaggregated_runtime.route_submit.assert_called_once_with(
         0, msgpack.packb([1]), {}, [], msgpack.packb(None)
     )
     assert coordinator.next_request_id == 1
@@ -963,6 +966,41 @@ def _make_routing_coordinator(
 
 class TestRoutingPolicies:
     """Unit tests for routing behavior under different policies and load conditions."""
+
+    @pytest.mark.parametrize(
+        "loads,affinity,capacity,alpha,expected",
+        [
+            ([2, 0], None, None, 0.0, b"a"),
+            ([0, 0], None, None, 0.0, b"z"),
+            ([0, 2], None, [0.25, 0.75], 1.0, b"a"),
+            ([2, 0], None, [0.5, 0.5], 0.0, b"a"),
+            ([0, 0], None, [0.5, 0.5], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 1.0, b"a"),
+            ([0, 0], [1.0, 1.0], [0.25, 1.0], 1.0, b"z"),
+        ],
+    )
+    def test_stateless_selection(self, loads, affinity, capacity, alpha, expected):
+        identities = [b"z", b"a"]  # Rank order, not lexical identity order.
+        loads = np.array(loads)
+        affinity = None if affinity is None else np.array(affinity)
+        capacity = None if capacity is None else np.array(capacity)
+        for array in (loads, affinity, capacity):
+            if array is not None:
+                array.flags.writeable = False
+        assert (
+            select_engine(
+                identities,
+                loads,
+                affinity_scores=affinity,
+                available_fractions=capacity,
+                routing_alpha=alpha,
+            )
+            == expected
+        )
+        assert identities == [b"z", b"a"]
+        with pytest.raises(RuntimeError, match="No engines connected"):
+            select_engine([], np.array([]))
 
     @pytest.mark.parametrize("header", [Headers.RELEASE_KV, Headers.RELEASE_KV_OWNER])
     def test_handoff_release_retries_after_source_disconnect(self, header):
