@@ -157,6 +157,7 @@ class TestLocalCheckpointingReplication:
                 optimizer,
                 opt_param_scheduler,
                 checkpointing_context=self.checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 1
         # Perform cleanup to ensure no side effects on subsequent tests

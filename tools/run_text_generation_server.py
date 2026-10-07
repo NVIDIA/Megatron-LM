@@ -44,9 +44,9 @@ sys.path.append(
 )
 
 from megatron.core import mpu
-from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -160,7 +160,7 @@ def main(model_type: str = "gpt"):
             )
 
     if args.load is not None:
-        _ = load_checkpoint_for_inference(model, strict=False)
+        _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]

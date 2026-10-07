@@ -16,11 +16,11 @@ import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToPILImage
 
-from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from pretrain_vlm import model_provider
@@ -212,7 +212,7 @@ def main():
 
     args = get_args()
     if args.load is not None:
-        _ = load_checkpoint_for_inference(model)
+        _ = load_checkpoint(model, None, None)
 
     model = model[0]
     model.eval()

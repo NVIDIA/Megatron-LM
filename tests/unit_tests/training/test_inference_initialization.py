@@ -44,7 +44,7 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
         "set_run_config",
         "initialize_runtime_services",
         "initialize_megatron",
-        "load_checkpoint_for_inference",
+        "load_checkpoint",
         "generate_and_write_samples_conditional",
         "generate_and_write_samples_unconditional",
     ):
@@ -58,9 +58,9 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     calls["initialize_runtime_services"].assert_called_once_with(args)
     calls["initialize_megatron"].assert_called_once_with()
     if load_checkpoint:
-        calls["load_checkpoint_for_inference"].assert_called_once_with([model])
+        calls["load_checkpoint"].assert_called_once_with([model], None, None)
     else:
-        calls["load_checkpoint_for_inference"].assert_not_called()
+        calls["load_checkpoint"].assert_not_called()
     selected = "conditional" if conditional else "unconditional"
     other = "unconditional" if conditional else "conditional"
     calls[f"generate_and_write_samples_{selected}"].assert_called_once_with(model)
@@ -90,6 +90,7 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
     events = []
 
     def restore(*unused_args, **unused_kwargs):
+        assert unused_kwargs["restore_training_state"] is True
         args.consumed_train_samples = restored_samples
         events.append("load")
         return 7, 0
@@ -297,10 +298,12 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm, is
     monkeypatch.setattr(vlm_dynamic_inference, "get_args", lambda: args)
     monkeypatch.setattr(vlm_dynamic_inference, "_get_model", Mock(return_value=[model]))
     load = Mock()
-    monkeypatch.setattr(vlm_dynamic_inference, "load_checkpoint_for_inference", load)
+    monkeypatch.setattr(vlm_dynamic_inference, "load_checkpoint", load)
 
     def check_mimo(received_args, received_model):
-        load.assert_called_once_with([model], strict=True)
+        load.assert_called_once_with(
+            ddp_model=[model], optimizer=None, opt_param_scheduler=None, strict=True
+        )
         assert received_args is args
         assert received_model is model
         model.eval.assert_not_called()
@@ -309,7 +312,9 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm, is
     monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", check)
 
     assert vlm_dynamic_inference.get_model(is_vlm=is_vlm) is model
-    load.assert_called_once_with([model], strict=True)
+    load.assert_called_once_with(
+        ddp_model=[model], optimizer=None, opt_param_scheduler=None, strict=True
+    )
     if is_mimo:
         check.assert_called_once_with(args, model)
     else:

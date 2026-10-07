@@ -65,7 +65,11 @@ class TestGlobalMetadataReuse:
 
             resume_ckpt_context = {}
             _, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=resume_ckpt_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=resume_ckpt_context,
+                restore_training_state=True,
             )
 
             load_strategy_cached_metadata = resume_ckpt_context[
@@ -149,7 +153,11 @@ class TestGlobalMetadataReuse:
 
             resume_ckpt_context = {}
             _, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=resume_ckpt_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=resume_ckpt_context,
+                restore_training_state=True,
             )
 
             load_strategy_cached_metadata = resume_ckpt_context[

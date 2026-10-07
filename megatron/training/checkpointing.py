@@ -2646,7 +2646,7 @@ def load_checkpoint(
     rng_state_key_prefix: str = '',
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
-    restore_training_state: bool = True,
+    restore_training_state: bool = False,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -2656,7 +2656,8 @@ def load_checkpoint(
         sharded state dict before loading (torch_dist only), e.g. to remap keys to a
         checkpoint's naming.
     restore_training_state (bool): restore optimizer, scheduler, rerun and data
-        progress. False for inference; RNG loading remains independently controlled.
+        progress. Defaults to False; training resume must explicitly opt in.
+        RNG loading remains independently controlled.
     skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
         for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.

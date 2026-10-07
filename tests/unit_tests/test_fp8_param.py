@@ -869,7 +869,9 @@ class TestFP8Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+            )
             assert iteration == 3
             loaded_state = self.quantized_param_state(model[0])
 

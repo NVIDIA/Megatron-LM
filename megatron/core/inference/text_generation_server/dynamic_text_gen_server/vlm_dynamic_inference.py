@@ -27,7 +27,6 @@ from megatron.core import dist_checkpointing
 from megatron.core.models.vision.encoder_registry import get_spec
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
-from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
@@ -36,6 +35,7 @@ from megatron.training.checkpointing import (
     get_checkpoint_tracker_filename,
     get_loaded_iteration,
     load_args_from_checkpoint,
+    load_checkpoint,
     read_metadata,
 )
 
@@ -473,7 +473,12 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
-    load_checkpoint_for_inference(model, strict=not args.inference_ckpt_non_strict)
+    load_checkpoint(
+        ddp_model=model,
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=not args.inference_ckpt_non_strict,
+    )
     if is_mimo:
         _check_mimo_checkpoint_fully_loaded(args, model[0])
 

@@ -23,7 +23,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
-from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -721,14 +720,19 @@ def test_save_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize(
+    "load_kwargs", [{}, {"restore_training_state": False}, {"restore_training_state": True}]
+)
 def test_load_checkpoint(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, load_kwargs
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
+    args.fp16 = False
+    args.bf16 = False
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -759,7 +763,7 @@ def test_load_checkpoint(
 
         # Load checkpoint
         loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            [new_model], new_optimizer, new_opt_param_scheduler, strict=True, **load_kwargs
         )
 
         assert loaded_iter == iteration
@@ -768,8 +772,12 @@ def test_load_checkpoint(
         for k in model.state_dict():
             assert torch.equal(model.state_dict()[k], new_model.state_dict()[k])
 
-        assert new_optimizer.state_dict() == optimizer.state_dict()
-        assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+        if load_kwargs.get("restore_training_state", False):
+            assert new_optimizer.state_dict() == optimizer.state_dict()
+            assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+        else:
+            assert new_optimizer.state_dict() == {"optimizer": "dummy1"}
+            assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -828,7 +836,11 @@ def test_load_checkpoint_override_opt_param_scheduler(
 
         # Load checkpoint and verify runtime overrides are restored.
         loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            [new_model],
+            new_optimizer,
+            new_opt_param_scheduler,
+            strict=True,
+            restore_training_state=True,
         )
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
@@ -840,7 +852,9 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
-        loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
+        loaded_iter_none, loaded_flops_none = load_checkpoint(
+            [new_model], None, None, strict=True, restore_training_state=True
+        )
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
 
@@ -911,7 +925,9 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=second_job_mock_metadata,
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
-            load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
+            load_checkpoint(
+                [model], optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+            )
             assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
@@ -928,7 +944,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
 @pytest.mark.parametrize("no_load_rng", [False, True])
-@pytest.mark.parametrize("load_mode", ["inference", "resume", "override"])
+@pytest.mark.parametrize("load_mode", ["default", "inference", "resume", "override"])
 def test_checkpoint_load_without_microbatch_calculator(
     init_model_parallel,
     create_ckpt_load_args,
@@ -987,10 +1003,11 @@ def test_checkpoint_load_without_microbatch_calculator(
         args.no_load_rng = no_load_rng
         # These training options must not influence an inference load.
         args.override_ckpt_iteration = None if load_mode == "resume" else 7
-        args.phase_transition_iterations = [100] if load_mode == "inference" else None
+        is_inference = load_mode in ("default", "inference")
+        args.phase_transition_iterations = [100] if is_inference else None
         args.no_load_optim = True
         args.consumed_train_samples = 0
-        if load_mode == "inference":
+        if is_inference:
             for name in (
                 "global_batch_size",
                 "micro_batch_size",
@@ -1000,17 +1017,18 @@ def test_checkpoint_load_without_microbatch_calculator(
             ):
                 delattr(args, name)
         unset_num_microbatches_calculator()
-        if load_mode == "inference":
+        if is_inference:
             with mock.patch(
                 "megatron.training.checkpointing.get_rerun_state_machine",
                 side_effect=AssertionError("Inference must not restore training rerun state"),
             ):
-                metadata = load_checkpoint_for_inference([restored])
+                load_kwargs = {} if load_mode == "default" else {"restore_training_state": False}
+                metadata = load_checkpoint([restored], None, None, **load_kwargs)
             assert not hasattr(args, "consumed_train_samples")
             assert not hasattr(args, "skipped_train_samples")
             assert not hasattr(args, "consumed_valid_samples")
         else:
-            metadata = load_checkpoint([restored], None, None)
+            metadata = load_checkpoint([restored], None, None, restore_training_state=True)
             expected_iteration = 7 if load_mode == "override" else 123
             assert args.consumed_train_samples == expected_iteration * args.global_batch_size
         assert metadata == (7 if load_mode == "override" else 123, 456)

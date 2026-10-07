@@ -12,7 +12,7 @@ import torch
 from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
-from megatron.inference.checkpointing import load_checkpoint_for_inference
+from megatron.training.checkpointing import load_checkpoint
 from megatron.core import mpu
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
@@ -238,7 +238,7 @@ def main():
     args = get_args()
 
     if args.load is not None:
-        _ = load_checkpoint_for_inference(model)
+        _ = load_checkpoint(model, None, None)
     model = model[0]
 
     # Generate samples.

@@ -281,7 +281,7 @@ def finetune(train_valid_datasets_provider, model_provider,
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng
         args.no_load_rng = True
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, restore_training_state=True)
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.load = original_load
         args.no_load_rng = original_rng

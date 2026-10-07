@@ -28,7 +28,6 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank, unwrap_model
-from megatron.inference.checkpointing import load_checkpoint_for_inference
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
@@ -37,6 +36,7 @@ from megatron.training.checkpointing import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
     get_loaded_iteration,
+    load_checkpoint,
     read_metadata,
 )
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
@@ -165,8 +165,10 @@ def get_model_for_inference() -> MegatronModule:
     assert args.load is not None
     requested_keys = set()
     args.exit_on_missing_checkpoint = True
-    load_checkpoint_for_inference(
-        model,
+    load_checkpoint(
+        ddp_model=model,
+        optimizer=None,
+        opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
         model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
     )

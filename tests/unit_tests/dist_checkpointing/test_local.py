@@ -202,7 +202,11 @@ class TestLocalCheckpointing:
             if async_save:
                 maybe_finalize_async_save(True)
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 1
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(iteration)
@@ -212,14 +216,22 @@ class TestLocalCheckpointing:
             backup_path = ckpt_path.with_name('backup_' + ckpt_path.name)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 1
             shutil.move(ckpt_path, backup_path)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             torch.distributed.barrier()
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 0
             save_checkpoint(
@@ -313,6 +325,7 @@ class TestLocalCheckpointing:
                     optimizer,
                     opt_param_scheduler,
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                 )
                 assert iteration == 0
                 assert not any((local_ckpt_dir / str(Utils.rank)).iterdir())

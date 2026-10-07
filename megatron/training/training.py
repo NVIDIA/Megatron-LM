@@ -3076,6 +3076,7 @@ def setup_model_and_optimizer(
                 'model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
+                'restore_training_state': True,
             },
         )
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
@@ -3104,6 +3105,7 @@ def setup_model_and_optimizer(
                 optimizer,
                 opt_param_scheduler,
                 checkpointing_context=checkpointing_context,
+                restore_training_state=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and getattr(args, "use_torch_fsdp2", False)
                 and args.ckpt_format == "torch_dist",
@@ -4697,6 +4699,7 @@ def train(
                     None,  # Don't load optimizer state
                     None,  # Don't load scheduler state
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
@@ -4712,6 +4715,7 @@ def train(
                     None,
                     None,
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
