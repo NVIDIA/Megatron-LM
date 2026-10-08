@@ -42,12 +42,10 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
-from megatron.core.inference.engines import (
-    DynamicInferenceEngine,
-    dynamic_engine_coordinator,
-    dynamic_engine_multimodal,
-    dynamic_engine_requests,
-)
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic import coordinator as dynamic_engine_coordinator
+from megatron.core.inference.engines.dynamic import multimodal as dynamic_engine_multimodal
+from megatron.core.inference.engines.dynamic import requests as dynamic_engine_requests
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
@@ -593,7 +591,7 @@ def test_build_vlm_request_reuses_client_media_cache_key():
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic_engine_multimodal.compute_media_cache_key"
+        "megatron.core.inference.engines.dynamic.multimodal.compute_media_cache_key"
     ) as compute_key:
         request = _call_build_vlm_request(
             engine,
@@ -1942,7 +1940,7 @@ def test_add_request_defaults_sampling_params():
     tokens = torch.tensor([1, 2], dtype=torch.int64)
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic_engine.torch.tensor", return_value=tokens
+        "megatron.core.inference.engines.dynamic.engine.torch.tensor", return_value=tokens
     ):
         result = engine.add_request(3, [1, 2])
         engine.add_request(4, [1, 2])
@@ -2007,11 +2005,11 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     pending_signals = engine._pending_signals
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            "megatron.core.inference.engines.dynamic.engine.torch.distributed.get_rank",
             return_value=0,
         ),
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            "megatron.core.inference.engines.dynamic.engine.torch.cuda.Event",
             return_value=mock.Mock(),
         ),
     ):
