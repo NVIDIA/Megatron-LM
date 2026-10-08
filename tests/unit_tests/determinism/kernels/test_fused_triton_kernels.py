@@ -52,6 +52,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_teacher_lse_reports_unsupported_cpu_inputs():
+    """The public entry point keeps RuntimeError and reports the unsupported reason."""
+    with pytest.raises(RuntimeError, match="teacher LSE is unavailable:.*(Triton|CUDA)"):
+        fused_csa_teacher_lse(
+            torch.zeros(4, 2, 16, device="cpu"),
+            torch.zeros(4, 16, device="cpu"),
+            torch.zeros(1, 16, device="cpu"),
+            torch.zeros(2, device="cpu"),
+            torch.zeros(4, 2, dtype=torch.int32, device="cpu"),
+            softmax_scale=0.25,
+            ratio=4,
+        )
+
+
 @pytest.fixture
 def experimental_enabled():
     """Force the experimental flag on (the fused routing kernels are experimental features)."""
@@ -413,4 +427,59 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
+    )
+
+
+def test_contiguous_thd_rope_and_teacher_replay():
+    """Replay explicit packed positions and the packed streaming teacher LSE."""
+    seeded()
+    cu = torch.tensor([0, 193, 193, 512], device="cuda", dtype=torch.int32)
+    comp_cu = torch.tensor([0, 48, 48, 127], device="cuda", dtype=torch.int32)
+    q = torch.randn(256, 64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    angles = torch.randn(512, 1, 1, 64, device="cuda")
+    cos, sin = angles.cos().to(q.dtype), angles.sin().to(q.dtype)
+
+    def rope(x):
+        return fused_mla_rope_inplace(
+            x.clone(),
+            cos,
+            sin,
+            64,
+            64,
+            cu_seqlens_q=cu,
+            remove_interleaving=True,
+            position_ids=torch.arange(256, 512, device="cuda", dtype=torch.int32) - 193,
+        )
+
+    assert_replays_bit_exact(rope, (q,), contention=True, what="contiguous THD RoPE")
+    full_q = torch.randn(512, 64, 128, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
+    compressed = torch.randn(127, 128, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(64, device="cuda")
+    rows = torch.arange(512, device="cuda")
+    starts = torch.where(rows < 193, 0, 193)
+    window = rows[:, None] - torch.arange(32, device="cuda")
+    window = torch.where(window >= starts[:, None], window, -1).int()
+
+    def teacher(query, keys, ck, bias):
+        return fused_csa_teacher_lse(
+            query,
+            keys,
+            ck,
+            bias,
+            window,
+            128**-0.5,
+            4,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=comp_cu,
+            max_seqlen_q=319,
+            max_seqlen_k=79,
+        )
+
+    assert_replays_bit_exact(
+        teacher,
+        (full_q, kv, compressed, sink),
+        backward=False,
+        contention=True,
+        what="packed CSA teacher",
     )
