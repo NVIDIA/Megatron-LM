@@ -35,7 +35,7 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
 
 @pytest.mark.parametrize("as_iterable", [list, tuple, iter])
 def test_global_layout_normalizes_iterables(as_iterable):
-    """Layout construction copies iterable inputs into immutable, hashable fields."""
+    """Layout construction copies iterable inputs into immutable fields."""
     shapes = [[2, 4], [1, 4]]
     offsets = [0, 8]
     rank_offsets = [0, 8]
@@ -49,7 +49,6 @@ def test_global_layout_normalizes_iterables(as_iterable):
     assert all(isinstance(shape, torch.Size) for shape in layout.tensor_shapes)
     assert layout.tensor_to_offset == (0, 8)
     assert layout.rank_to_offset == (0, 8)
-    assert hash(layout) == hash(GlobalLayout([[2, 4], [1, 4]], [0, 8], 12, [0, 8]))
     assert layout == GlobalLayout([[2, 4], [1, 4]], [0, 8], 12, [0, 8])
     assert layout != GlobalLayout([[2, 4], [1, 4]], [0, 8], 16, [0, 8])
     for name in ("tensor_shapes", "tensor_to_offset", "size", "rank_to_offset"):

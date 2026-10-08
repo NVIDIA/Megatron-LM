@@ -38,6 +38,7 @@ class TensorRange:
     tensor_id: int
 
 
+@dataclasses.dataclass(frozen=True)
 class GlobalLayout:
     """Global tensor layout in element coordinates.
 
@@ -53,6 +54,11 @@ class GlobalLayout:
             ``RowAtomic`` / ``BlockAtomic``; generally uneven for ``TensorAtomic``.
     """
 
+    tensor_shapes: tuple[torch.Size, ...]
+    tensor_to_offset: tuple[int, ...]
+    size: int
+    rank_to_offset: tuple[int, ...]
+
     def __init__(
         self,
         tensor_shapes: Iterable[Shape],
@@ -61,51 +67,13 @@ class GlobalLayout:
         rank_to_offset: Iterable[int],
     ) -> None:
         """Normalize iterable inputs to immutable tuples and validate the layout."""
-        self._tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        self._tensor_to_offset = tuple(tensor_to_offset)
-        self._size = size
-        self._rank_to_offset = tuple(rank_to_offset)
-        self._validate()
-
-    @property
-    def tensor_shapes(self) -> tuple[torch.Size, ...]:
-        """Logical tensor shapes in tensor-id order."""
-        return self._tensor_shapes
-
-    @property
-    def tensor_to_offset(self) -> tuple[int, ...]:
-        """Global element offset of each tensor's first element."""
-        return self._tensor_to_offset
-
-    @property
-    def size(self) -> int:
-        """Total number of global elements, including padding and gaps."""
-        return self._size
-
-    @property
-    def rank_to_offset(self) -> tuple[int, ...]:
-        """Global element offset of each rank segment's first element."""
-        return self._rank_to_offset
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, GlobalLayout) or type(other) is not type(self):
-            return NotImplemented
-        return (
-            self.tensor_shapes == other.tensor_shapes
-            and self.tensor_to_offset == other.tensor_to_offset
-            and self.size == other.size
-            and self.rank_to_offset == other.rank_to_offset
+        object.__setattr__(
+            self, "tensor_shapes", tuple(torch.Size(shape) for shape in tensor_shapes)
         )
-
-    def __hash__(self) -> int:
-        return hash((self.tensor_shapes, self.tensor_to_offset, self.size, self.rank_to_offset))
-
-    def __repr__(self) -> str:
-        return (
-            f"{type(self).__qualname__}(tensor_shapes={self.tensor_shapes!r}, "
-            f"tensor_to_offset={self.tensor_to_offset!r}, size={self.size!r}, "
-            f"rank_to_offset={self.rank_to_offset!r})"
-        )
+        object.__setattr__(self, "tensor_to_offset", tuple(tensor_to_offset))
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "rank_to_offset", tuple(rank_to_offset))
+        self.__post_init__()
 
     @classmethod
     def build_for_row_atomic(
@@ -326,7 +294,7 @@ class GlobalLayout:
         layout.validate_for_tensor_atomic()
         return layout
 
-    def _validate(self) -> None:
+    def __post_init__(self) -> None:
         """Validate offsets are in bounds and tensor ranges do not overlap."""
 
         if self.size < 0:
