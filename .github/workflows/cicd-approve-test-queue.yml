@@ -114,7 +114,7 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
-          def make_request(endpoint, method="GET", data=None, max_retries=5):
+          def make_request(endpoint, method="GET", data=None, max_retries=5, return_response=False):
               """Make a request to the GitHub API with retry on transient errors."""
               url = f"{API_BASE}/{endpoint}"
               for attempt in range(max_retries):
@@ -134,7 +134,7 @@ jobs:
                           time.sleep(delay)
                           continue
                       response.raise_for_status()
-                      return response.json()
+                      return response if return_response else response.json()
                   except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                       delay = 2 ** attempt
                       print(f"Transient error on {endpoint}: {e}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
@@ -146,6 +146,24 @@ jobs:
                       return None
               print(f"Max retries ({max_retries}) exceeded for {endpoint}")
               return None
+
+          def get_workflow_runs(status):
+              """Fetch every page before filtering runs or making approval decisions."""
+              runs = {}
+              page = 1
+              while True:
+                  response = make_request(
+                      f"actions/runs?status={status}&per_page=100&page={page}",
+                      return_response=True,
+                  )
+                  if response is None:
+                      return None
+                  # Runs can move between pages while the queue is changing.
+                  for run in response.json()["workflow_runs"]:
+                      runs[run["id"]] = run
+                  if "next" not in response.links:
+                      return list(runs.values())
+                  page += 1
 
           def is_internal_contributor(pr_info):
               """Return True for internal service accounts or NVIDIA organization members."""
@@ -225,16 +243,14 @@ jobs:
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
-          queued_resp = make_request("actions/runs?status=queued")
-          if queued_resp is None:
+          queued_workflow_runs = get_workflow_runs("queued")
+          if queued_workflow_runs is None:
               print("Failed to fetch queued workflow runs after retries, exiting")
               exit(1)
-          queued_workflow_runs = queued_resp.get("workflow_runs", [])
-          in_progress_resp = make_request("actions/runs?status=in_progress")
-          if in_progress_resp is None:
+          in_progress_workflow_runs = get_workflow_runs("in_progress")
+          if in_progress_workflow_runs is None:
               print("Failed to fetch in-progress workflow runs after retries, exiting")
               exit(1)
-          in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
 
           # The functional-test slot is global across all branch/contributor queues.
           functional_test_workflow_running = any(
@@ -272,11 +288,10 @@ jobs:
 
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
-          waiting_resp = make_request("actions/runs?status=waiting")
-          if waiting_resp is None:
+          pending_workflows = get_workflow_runs("waiting")
+          if pending_workflows is None:
               print("Failed to fetch waiting workflow runs after retries, exiting")
               exit(1)
-          pending_workflows = waiting_resp.get("workflow_runs", [])
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows
