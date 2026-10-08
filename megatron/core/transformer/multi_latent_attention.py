@@ -155,6 +155,18 @@ def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padde
     return core_attn_out
 
 
+def _up_proj_input(projection: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Return the up-projection input, copied to contiguous memory if ``projection`` needs it.
+
+    ``x`` is a column slice of the down-projection output. Transformer Engine projections make
+    such a row-strided input contiguous with ``Tensor.contiguous``, so for them the slice is
+    copied first with the vectorized ``contiguous_rows``; other projections read it as it is.
+    """
+    if HAVE_TE and isinstance(projection, (TELinear, TELayerNormColumnParallelLinear)):
+        return contiguous_rows(x)
+    return x
+
+
 @dataclass
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
@@ -986,10 +998,11 @@ class MLASelfAttention(MultiLatentAttention):
                 )
             else:
                 if self.config.q_lora_rank is not None:
-                    # q_compressed: [num_tokens, q_lora_rank], a column slice of the fused
-                    # down-projection output; made contiguous here with a vectorized copy
+                    # q_compressed: [num_tokens, q_lora_rank]
                     # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                    q, _ = self.linear_q_up_proj(contiguous_rows(q_compressed))
+                    q, _ = self.linear_q_up_proj(
+                        _up_proj_input(self.linear_q_up_proj, q_compressed)
+                    )
                 else:
                     # q_compressed: [num_tokens, hidden_size]
                     # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -998,9 +1011,8 @@ class MLASelfAttention(MultiLatentAttention):
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
-            # kv_compressed: a column slice of the (fused) down-projection output
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(contiguous_rows(kv_compressed))
+            kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
