@@ -34,6 +34,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
+    from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.kda import chunk_kda
 
     # KDA also relies on the shared FLA convolution, normalization, and CP helpers.
@@ -319,15 +320,31 @@ class KimiDeltaAttention(_GDNBase):
         beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
         return raw_g, {"beta": beta.contiguous()}
 
-    @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
+        """Normalize and gate before casting back to the activation dtype.
 
+        Kimi's reference fuses RMSNorm with the sigmoid output gate. Casting the
+        normalized value to BF16 first introduces a second rounding point that
+        accumulates across KDA layers. Parameters retain the existing out_norm
+        checkpoint layout and replicated-gradient metadata.
+        """
         x_dtype = x.dtype
         x = x.reshape(-1, self.value_head_dim)
-        x = self.out_norm(x)
         gate = gate.reshape(-1, self.value_head_dim)
-        return (x * torch.sigmoid(gate.float())).to(x_dtype)
+        if self.config.normalization != "RMSNorm":
+            return (self.out_norm(x) * torch.sigmoid(gate.float())).to(x_dtype)
+        weight = self.out_norm.weight
+        if self.config.layernorm_zero_centered_gamma:
+            weight = weight + 1
+        if self.config.deterministic_mode:
+            value = x.float()
+            value = value * torch.rsqrt(
+                value.square().mean(dim=-1, keepdim=True) + self.config.layernorm_epsilon
+            )
+            return (value * weight.float() * torch.sigmoid(gate.float())).to(x_dtype)
+        return rms_norm_gated(
+            x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
+        )
 
     def forward(
         self,

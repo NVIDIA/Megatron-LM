@@ -865,6 +865,68 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
+    def _forward_hybrid_branch_output_with_bias(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        """Run a split hybrid branch before its residual update.
+
+        The caller owns the residual and BDA. Returning the branch directly
+        avoids reconstructing it with a lossy low-precision add/subtract pair.
+        Keep norm recomputation and offload lifetimes identical to the usual
+        attention/MLP paths.
+        """
+        has_attention = not isinstance(self.self_attention, IdentityOp)
+        has_mlp = not isinstance(self.mlp, IdentityOp)
+        if has_attention == has_mlp or not isinstance(self.cross_attention, IdentityOp):
+            raise ValueError("A raw hybrid branch requires exactly one attention or MLP sublayer.")
+
+        if has_attention:
+            output_with_bias, attn_norm_manager, residual = (
+                self._forward_self_attention_output_with_bias(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    mhc_recompute_manager=mhc_recompute_manager,
+                )
+            )
+            output_with_bias = self._group_offload_output_with_bias(
+                output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
+            )
+            return output_with_bias
+
+        output_with_bias, residual = self._forward_mlp_output_with_bias(
+            hidden_states,
+            inference_context=inference_context,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
+            mhc_recompute_manager=mhc_recompute_manager,
+        )
+        # This fast path bypasses TransformerLayer._forward_post_mlp(), which normally
+        # discards the selective pre-MLP layernorm checkpoint before MLP backward.
+        if self.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        ):
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
+        if self.mlp_norm_manager is not None:
+            output_with_bias = self._group_offload_output_with_bias(
+                output_with_bias, self.mlp_norm_manager, forced_released_tensors=[residual]
+            )
+            self.mlp_norm_manager = None
+        return output_with_bias
+
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """
@@ -894,6 +956,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "automatically by the GPT layer specs); AttnResHybridLayer drives the "
                 "wrapped layer through this path automatically for hybrid stacks."
             )
+        if "_hybrid_attn_res_partial" in kwargs:
+            if not called_from_hybrid_attn_res_wrapper:
+                raise RuntimeError(
+                    "The AttnRes partial sum must be supplied by its hybrid wrapper."
+                )
+            partial = kwargs.pop("_hybrid_attn_res_partial")
+            output_with_bias = self._forward_hybrid_branch_output_with_bias(*args, **kwargs)
+            # A new block has no partial sum. A zero residual lets the same BDA
+            # implementation apply bias/dropout without an irreversible add of
+            # the aggregated input followed by subtraction.
+            residual = torch.zeros_like(output_with_bias[0]) if partial is None else partial
+            bda = (
+                self.mlp_bda if isinstance(self.self_attention, IdentityOp) else self.self_attn_bda
+            )
+            with self.bias_dropout_add_exec_handler():
+                output = bda(self.training, self.config.bias_dropout_fusion)(
+                    output_with_bias, residual, self.hidden_dropout
+                )
+            return output, None
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
