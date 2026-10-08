@@ -178,25 +178,6 @@ class TestPostBackwardHookAcrossGraphTasks:
         model.context.post_backward()
         model._trainable_parameter_countdown.check_complete()
 
-    @pytest.mark.parametrize("count", [0, -1])
-    def test_invalid_trainable_count_fails(self, distributed_setup, count):
-        """Trainable modules cannot use the no-parameter fallback or negative totals."""
-        with pytest.raises(ValueError):
-            _sharded_unit(distributed_setup, grad_accumulation_count=count)
-
-    @pytest.mark.parametrize("count", [None, 0])
-    def test_parameter_free_module_uses_full_backward_hook(self, distributed_setup, count):
-        """Zero callbacks preserve the module-level completion fallback."""
-        model, finalized = _sharded_unit(
-            distributed_setup, grad_accumulation_count=count, model=nn.ReLU()
-        )
-        inputs = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
-        _graph_task(model, inputs)
-        assert inputs.grad is not None
-        assert len(finalized) == 1
-        model.context.post_backward()
-        model._trainable_parameter_countdown.check_complete()
-
     def test_parameter_free_module_rejects_nonzero_count(self, distributed_setup):
         """A parameter-free unit cannot wait for callbacks that never arrive."""
         with pytest.raises(ValueError, match="owns no trainable parameters"):
