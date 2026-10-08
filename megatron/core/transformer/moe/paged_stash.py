@@ -1235,14 +1235,14 @@ class PagedStashRunner:
         if self.optimizer is not None:
             self.optimizer.zero_grad()
 
-        # _handle_mxfp8_param_buffer_copy
+        # Restage only parameters whose gather borrows gradient storage.
         if self.copy_main_params:
 
             def _try_copy_main_params(opt):
                 if (
                     isinstance(opt, DistributedOptimizer)
                     and hasattr(opt, 'shard_fp32_from_float16_groups')
-                    and opt.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                    and opt.reuse_grad_buffer_for_param_ag
                     and opt.ddp_config.overlap_param_gather
                 ):
                     opt._copy_main_params_to_param_buffer()

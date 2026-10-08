@@ -88,7 +88,7 @@ def unimodal_build_distributed_models(
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+            selects padded (True) or compact (False) Muon buffers; Adam remains sharded.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -163,7 +163,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+            selects padded (True) or compact (False) Muon buffers; Adam remains sharded.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -292,8 +292,7 @@ def _ddp_wrap(
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
-            ``False`` keeps LayerWise on its legacy ``allgather_params`` sync path.
+            selects padded (True) or compact (False) Muon buffers; Adam remains sharded.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -329,19 +328,16 @@ def _ddp_wrap(
 
     # Argument validation converts --use-distributed-optimizer into
     # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
-    # the layerwise optimizer needs the reduce-scatter and the shard-aligned param layout
-    # that the distributed-optimizer path provides. Mirrors wrap_model_chunks_with_ddp() in
-    # megatron/training/training.py, which handles the non-ModelBuilder path.
+    # sibling Adam parameters need the distributed-optimizer path in either Muon layout.
+    # Compact Muon buffers disable reduce-scatter through their own DDP config copy.
+    # This mirrors wrap_model_chunks_with_ddp() in megatron/training/training.py.
     compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
-    if (
-        DP is DistributedDataParallel
-        and use_layer_wise_distributed_optimizer
-        and use_layer_wise_param_layout
-    ):
+    if DP is DistributedDataParallel and use_layer_wise_distributed_optimizer:
+        ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
         ddp_config.use_distributed_optimizer = True
         compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
         # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-        # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
+        # (Muon's Newton-Schulz domain) to a separate buffer and routes
         # everything else (embeddings, biases, layernorm) to a separate
         # DistOpt-style buffer.
         tag_params_for_buffer_routing(model)
