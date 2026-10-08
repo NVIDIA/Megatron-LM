@@ -24,12 +24,12 @@ from megatron.core.inference.data_parallel_inference_coordinator.handlers import
     handle_engine_reply,
 )
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
+from megatron.core.inference.engines.dynamic.coordinator import _engine_reply_frames
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
     RequestEntry,
 )
-from megatron.core.inference.engines.dynamic_engine_coordinator import _engine_reply_frames
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (

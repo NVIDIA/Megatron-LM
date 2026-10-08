@@ -19,6 +19,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.utils import (
     get_asyncio_loop,
+    internal_api,
     nvtx_range_pop,
     nvtx_range_push,
     trace_async_exceptions,
@@ -101,6 +102,7 @@ class DynamicInferenceEngineStepResult(TypedDict):
     cuda_graph_request_count: int | None
 
 
+@internal_api
 # pylint: disable=line-too-long
 class EngineLoopMixin:
     """Step loop, shutdown, and run loops for `DynamicInferenceEngine`."""

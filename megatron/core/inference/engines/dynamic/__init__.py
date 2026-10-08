@@ -1,8 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Compatibility re-exports: the dynamic engine lives in `engines/dynamic/`."""
-
-from .dynamic.engine import (
+from .engine import (
     DynamicInferenceEngine,
     DynamicInferenceEngineStepResult,
     EngineState,

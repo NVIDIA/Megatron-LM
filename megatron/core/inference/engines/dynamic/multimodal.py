@@ -15,8 +15,9 @@ from megatron.core.inference.inference_request import (
     compute_media_cache_key,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import internal_api
 
-from .dynamic_engine_requests import _weight_scoped_salt
+from .requests import _weight_scoped_salt
 
 _MULTIMODAL_STITCHING_FIELDS = {
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD: (
@@ -138,6 +139,7 @@ class _VisionCacheEntry:
     video_fps: Optional[List[float]] = None
 
 
+@internal_api
 class MultimodalRequestMixin:
     """VLM request preparation and vision-embedding caching for `DynamicInferenceEngine`."""
 

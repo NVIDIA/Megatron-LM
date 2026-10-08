@@ -27,7 +27,7 @@ from megatron.core.inference.inference_request import (
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -75,6 +75,7 @@ class RequestEntry:
     future: asyncio.Future[DynamicInferenceRequest]
 
 
+@internal_api
 # pylint: disable=line-too-long
 class RequestIntakeMixin:
     """Request admission and prefill scheduling for `DynamicInferenceEngine`."""
