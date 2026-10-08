@@ -43,7 +43,11 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import (
+    deprecate_inference_params,
+    ensure_params_ready,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
@@ -837,6 +841,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         inside the checkpoint, leaving only hidden_states saved for the backward pass.
         """
         zVKQba, _ = self.in_proj(hidden_states)
+
+        # The fused convolution reads weights directly, bypassing Conv1d's DDP
+        # pre-hook. Publish them before CP can slice them in pre_conv_ssm.
+        ensure_params_ready(self.conv1d.parameters())
 
         if not self.chunkwise_context_parallel:
             assert self.cp is not None

@@ -154,6 +154,7 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
             f"GDP in-proj width {in_proj_width} is incompatible with "
             f"{args.fp8_recipe}'s {block_size}-element blocks"
         )
+        conv_params = list(gdp.conv1d.named_parameters(recurse=False))
         in_proj = gdp.in_proj.weight
         out_proj = gdp.out_proj.weight
 
@@ -260,6 +261,45 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
             ("GDP out_proj", out_proj, out_proj_buffer),
             ("MoE expert", expert_weight, expert_buffer),
         ]
+        # The fused GDP convolution reads parameters directly, bypassing the
+        # owning Conv1d module's pre-hook. Include this separate Adam bucket in
+        # update/replica validation and inspect readiness at every actual read.
+        for name, param in conv_params:
+            assert not is_managed_by_layer_wise_optimizer(param)
+            buffer = self._find_buffer(model, param)
+            assert buffer.param_dtype == torch.bfloat16
+            tracked.append((f"GDP conv1d.{name}", param, buffer))
+
+        self._conv_read_checks = 0
+        prepare_qkv = gdp._prepare_qkv
+
+        def checked_prepare_qkv(*positional, **keyword):
+            failures = []
+            for name, param in conv_params:
+                group = model.param_to_bucket_group[param]
+                if group.param_gather_handle is not None:
+                    failures.append(f"GDP conv1d.{name} read before gather completion")
+                if model.remove_forward_pre_hook_handles and not group.param_gather_dispatched:
+                    failures.append(f"GDP conv1d.{name} read before gather dispatch")
+            failure_flag = torch.tensor(bool(failures), dtype=torch.int32, device="cuda")
+            torch.distributed.all_reduce(failure_flag, op=torch.distributed.ReduceOp.MAX)
+            assert not failure_flag.item(), (
+                "; ".join(failures) or "Unready convolution on another rank"
+            )
+            for name, param in conv_params:
+                buffer = self._find_buffer(model, param)
+                value = param.detach().contiguous()
+                replicas = [
+                    torch.empty_like(value) for _ in range(buffer.data_parallel_group.size())
+                ]
+                torch.distributed.all_gather(replicas, value, group=buffer.data_parallel_group)
+                assert all(
+                    torch.equal(replicas[0], replica) for replica in replicas[1:]
+                ), f"GDP conv1d.{name} differs across DP replicas at the actual read"
+            self._conv_read_checks += 1
+            return prepare_qkv(*positional, **keyword)
+
+        gdp._prepare_qkv = checked_prepare_qkv
         self._tracked_params = [
             (label, param, buffer, self._dequantize(param)) for label, param, buffer in tracked
         ]
@@ -267,14 +307,23 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
             ("GDP in_proj AdamW master", in_proj_main, in_proj_main.detach().clone())
         ]
         for label, param, _ in tracked[1:]:
-            main_param = getattr(param, "main_param", None)
+            if param in distributed_optimizer.model_param_group_index_map:
+                group_index, group_order = distributed_optimizer.model_param_group_index_map[param]
+                main_param = distributed_optimizer.optimizer.param_groups[group_index]["params"][
+                    group_order
+                ]
+            else:
+                main_param = getattr(param, "main_param", None)
             if main_param is not None:
                 self._tracked_masters.append(
-                    (f"{label} Muon master", main_param, main_param.detach().clone())
+                    (f"{label} optimizer master", main_param, main_param.detach().clone())
                 )
         self._runtime_validation_ran = False
 
     def _on_forward_complete(self, model_chunks, optimizer, args, step, num_steps):
+        assert (
+            self._conv_read_checks == step + 1
+        ), "Every forward must validate convolution readiness"
         if args.overlap_param_gather:
             hooks_enabled = bool(model_chunks[0].remove_forward_pre_hook_handles)
             assert hooks_enabled == (step > 0), (
