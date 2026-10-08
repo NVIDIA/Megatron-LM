@@ -187,7 +187,9 @@ def test_inference_telemetry_does_not_read_training_fields(monkeypatch):
 
 
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}])
-def test_inference_distributed_initialization_without_training_fields(monkeypatch, training_kwargs):
+def test_inference_distributed_initialization_without_training_fields(
+    monkeypatch, training_kwargs, run_config
+):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
@@ -224,10 +226,10 @@ def test_inference_distributed_initialization_without_training_fields(monkeypatc
 
     distributed.assert_called_once()
     seeds.assert_called_once()
-    assert seeds.call_args.args[0] == args.seed
+    assert seeds.call_args.args[0] == run_config.rng.seed
 
 
-def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch):
+def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
     monkeypatch.setattr(initialize, "get_args", lambda: Namespace(tp_comm_overlap=True))
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
@@ -236,7 +238,7 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
     distributed.assert_not_called()
 
 
-def test_distributed_training_services_require_explicit_opt_in(monkeypatch):
+def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_config):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])

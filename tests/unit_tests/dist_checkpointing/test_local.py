@@ -1,10 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import filecmp
 import logging
 import shutil
 import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
@@ -70,6 +70,50 @@ class TestLocalCheckpointing:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("owned_dp_random_init", [False, True])
+    def test_owned_rng_policy_round_trip(
+        self, tmp_path_dist_ckpt, run_config, owned_dp_random_init
+    ):
+        Utils.initialize_model_parallel(1, 1)
+        model, optimizer = setup_model_and_optimizer(1, 1, 1)
+        args = SimpleNamespace()
+        init_basic_mock_args(args, 1, 1)
+        init_checkpointing_mock_args(args, None)
+        args.non_persistent_ckpt_type = "local"
+        args.non_persistent_local_ckpt_algo = "atomic"
+        args.ckpt_fully_parallel_save = True
+        # Deliberately disagree with the config-owned policy.
+        args.data_parallel_random_init = not owned_dp_random_init
+        run_config.rng.data_parallel_random_init = owned_dp_random_init
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "owned_rng_local", sync=True) as checkpoint_dir,
+            mock.patch("megatron.training.checkpointing.get_args", return_value=args),
+            mock.patch("megatron.training.async_utils.get_args", return_value=args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+        ):
+            context = {"local_checkpoint_manager": LocalCheckpointManager(checkpoint_dir)}
+            expected_rng = torch.get_rng_state().clone()
+            manager = context["local_checkpoint_manager"]
+            with mock.patch.object(manager, "save", wraps=manager.save) as save:
+                save_checkpoint(
+                    1,
+                    model,
+                    optimizer,
+                    None,
+                    0,
+                    checkpointing_context=context,
+                    non_persistent_ckpt=True,
+                )
+            saved_config = save.call_args.args[0].common_state_dict["run_config"]
+            assert saved_config == run_config.to_dict()
+            run_config.logger.log_interval += 1
+            torch.manual_seed(999)
+            iteration, _ = load_checkpoint(model, optimizer, None, checkpointing_context=context)
+            assert iteration == 1
+            assert torch.equal(torch.get_rng_state(), expected_rng)
+            assert args.data_parallel_random_init is not owned_dp_random_init
+            assert run_config.logger.log_interval == saved_config["logger"]["log_interval"] + 1
 
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     @pytest.mark.parametrize(('use_torch_fsdp2'), [True, False])
@@ -245,8 +289,19 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
-            if Utils.rank > 0:  # Skip assertion on rank 0 due to harmless nondeterminism
-                assert filecmp.cmp(ckpt_path, backup_path, shallow=False), [ckpt_path, backup_path]
+            checkpoint_diff = ([], [], [])
+            if Utils.rank > 0:  # Skip comparison on rank 0 due to harmless nondeterminism
+                # Pickle bytes can differ after load due to object aliasing, including
+                # strings shared by optimizer state and the newly saved run config.
+                # Compare all values (including tensor data and shard metadata) instead.
+                current = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                previous = torch.load(backup_path, map_location="cpu", weights_only=False)
+                checkpoint_diff = diff(asdict(current), asdict(previous))
+            # Fail together: otherwise rank 0 enters the next save's collectives while
+            # a rank with a mismatch enters test teardown, hanging until NCCL times out.
+            checkpoint_diffs = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(checkpoint_diffs, checkpoint_diff)
+            assert not any(any(rank_diff) for rank_diff in checkpoint_diffs), checkpoint_diffs
             save_checkpoint(
                 2,
                 model,
