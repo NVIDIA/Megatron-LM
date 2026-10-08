@@ -26,20 +26,9 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
+from .range import Range
+
 Shape: TypeAlias = torch.Size | Iterable[int]
-
-
-@dataclasses.dataclass(frozen=True)
-class Range:
-    """Contiguous element range in a caller-defined coordinate system."""
-
-    start: int
-    numel: int
-
-    @property
-    def end(self) -> int:
-        """Exclusive end of the range."""
-        return self.start + self.numel
 
 
 @dataclasses.dataclass(frozen=True)
@@ -301,10 +290,9 @@ class GlobalLayout:
             raise AssertionError(f"rank_to_offset must be non-decreasing, got {offsets}.")
 
         tensor_ranges = [
-            (tensor_id, self.get_tensor_range(tensor_id))
-            for tensor_id in range(len(self.tensor_shapes))
+            self.get_tensor_range(tensor_id) for tensor_id in range(len(self.tensor_shapes))
         ]
-        for tensor_id, tensor_range in tensor_ranges:
+        for tensor_id, tensor_range in enumerate(tensor_ranges):
             if tensor_range.start < 0:
                 raise AssertionError(f"Tensor {tensor_id} offset {tensor_range.start} is negative.")
             if tensor_range.end > self.size:
@@ -313,7 +301,7 @@ class GlobalLayout:
                     f"layout size {self.size}."
                 )
 
-        ordered_ranges = sorted(tensor_ranges, key=lambda item: item[1].start)
+        ordered_ranges = sorted(enumerate(tensor_ranges), key=lambda item: item[1].start)
         for (previous_id, previous_range), (current_id, current_range) in itertools.pairwise(
             ordered_ranges
         ):
@@ -427,17 +415,6 @@ class GlobalLayout:
     def get_tensor_range(self, tensor_index: int) -> Range:
         """Return the full tensor's element range in the global buffer."""
         return Range(self.tensor_to_offset[tensor_index], self.tensor_shapes[tensor_index].numel())
-
-
-def intersect_ranges(first: Range, second: Range) -> Range:
-    """Intersect two element ranges in the same coordinate system.
-
-    Return the later starting offset and the overlap length, or zero length when
-    the ranges do not overlap.
-    """
-    start = max(first.start, second.start)
-    end = min(first.end, second.end)
-    return Range(start, max(0, end - start))
 
 
 def non_leading_numel(shape: torch.Size) -> int:
