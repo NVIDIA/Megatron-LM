@@ -193,7 +193,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
 
 
-def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack(monkeypatch):
+def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack():
     """CP1/2/4 microbatches get independent layout managers and TPxCP groups."""
 
     class FakeGroup:
@@ -207,11 +207,6 @@ def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack(monkeyp
     tp_group = FakeGroup(2)
     runtime_groups = {size: FakeGroup(size) for size in (1, 2, 4)}
     runtime_tp_cp_groups = {size: object() for size in (2, 4)}
-    monkeypatch.setattr(
-        hybrid_block_module.parallel_state,
-        "get_dynamic_tensor_data_context_parallel_group",
-        lambda *, group_size: runtime_tp_cp_groups[group_size],
-    )
 
     stack = SimpleNamespace(
         cp_group=static_cp_group,
@@ -224,7 +219,12 @@ def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack(monkeyp
     )
 
     for cp_size in (1, 2, 4, 1):
-        packed_seq_params = PackedSeqParams(local_cp_size=cp_size, cp_group=runtime_groups[cp_size])
+        # The batch fetch attaches the runtime TP x CP group next to the runtime CP group.
+        packed_seq_params = PackedSeqParams(
+            local_cp_size=cp_size,
+            cp_group=runtime_groups[cp_size],
+            tp_cp_group=runtime_tp_cp_groups.get(cp_size),
+        )
         runtime_group, manager = HybridStack._resolve_runtime_cp_layout(stack, packed_seq_params)
 
         assert runtime_group is runtime_groups[cp_size]

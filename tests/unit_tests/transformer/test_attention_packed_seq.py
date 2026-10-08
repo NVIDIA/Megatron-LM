@@ -6,7 +6,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -39,6 +39,22 @@ def test_resolve_runtime_cp_group_requires_matching_group():
     with pytest.raises(AssertionError, match="must match"):
         resolve_cp_group(
             _MockCPGroup(4), PackedSeqParams(local_cp_size=2, cp_group=_MockCPGroup(1))
+        )
+
+
+def test_resolve_runtime_tp_cp_group():
+    static_tp_cp_group, runtime_tp_cp_group = object(), object()
+    packed_seq_params = PackedSeqParams(
+        local_cp_size=2, cp_group=_MockCPGroup(2), tp_cp_group=runtime_tp_cp_group
+    )
+
+    assert resolve_tp_cp_group(static_tp_cp_group, packed_seq_params) is runtime_tp_cp_group
+    # Static CP, or no packed metadata, keeps the build-time group.
+    assert resolve_tp_cp_group(static_tp_cp_group, PackedSeqParams()) is static_tp_cp_group
+    assert resolve_tp_cp_group(static_tp_cp_group, None) is static_tp_cp_group
+    with pytest.raises(AssertionError, match="tp_cp_group must be set"):
+        resolve_tp_cp_group(
+            static_tp_cp_group, PackedSeqParams(local_cp_size=2, cp_group=_MockCPGroup(2))
         )
 
 
