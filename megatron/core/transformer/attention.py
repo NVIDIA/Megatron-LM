@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -387,9 +387,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
-        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
-        # it on microbatches that carry no per-microbatch CP group.
-        self._build_time_cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
@@ -612,6 +609,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         sequence_len_offset: Optional[int] = None,
         *,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
@@ -631,12 +629,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
+            cp_group (Optional[ProcessGroup]): Context-parallel group for this
+                forward. Defaults to the group configured on the module.
 
         Return:
             Tuple of: query, key, value, rotary_pos_emb, attn_mask_type, block_table.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        cp_group = self.pg_collection.cp if cp_group is None else cp_group
 
         attn_mask_type = self.attn_mask_type
         if inference_context is None:
@@ -754,11 +755,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key,
-                    k_pos_emb,
-                    self.config,
-                    self.pg_collection.cp,
-                    mscale=self._yarn_concentration_factor,
+                    key, k_pos_emb, self.config, cp_group, mscale=self._yarn_concentration_factor
                 )
 
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
@@ -1190,6 +1187,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
+                # FA2 treats max_seqlen_q == 1 as one query token per sequence and reshapes q
+                # accordingly under GQA, which requires total_q == num_seqs.
+                assert max_seqlen_q > 1 or q.shape[0] == cu_seqlens_q.shape[0] - 1, (
+                    f"FlashAttention-2 got max_seqlen_q={max_seqlen_q} with {q.shape[0]} query "
+                    f"rows for {cu_seqlens_q.shape[0] - 1} sequences"
+                )
                 fa2_ret = flash_attn_varlen_func(
                     q,
                     k,
@@ -1425,6 +1428,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         assert (
             packed_sequence_cp_metadata is None
         ), "Attention does not support packed-sequence chunkwise CP metadata."
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1571,6 +1576,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     rotary_pos_sin,
                     rotary_pos_cos_sin,
                     sequence_len_offset,
+                    cp_group=runtime_cp_group,
                 )
             )
 
@@ -1609,20 +1615,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
 
-            # Hybrid/dynamic CP: bind the sub-sample's runtime CP group
-            # (packed_seq_params.cp_group) on the process-group collection so
-            # RoPE below — and any other CP consumer in this forward — uses
-            # the group this microbatch was actually sharded with. The fused
-            # THD RoPE kernel takes the full cu_seqlens plus (cp_size,
-            # cp_rank) to locate this rank's zigzag slice, and the build-time
-            # group reports cp_size=1. Restore the build-time group when no
-            # runtime group is bound (e.g. local_cp_size == 1 sub-samples):
-            # the previous microbatch may have left a larger group behind.
-            if packed_seq_params is not None and packed_seq_params.cp_group is not None:
-                self.pg_collection.cp = packed_seq_params.cp_group
-            elif self.pg_collection.cp is not self._build_time_cp_group:
-                self.pg_collection.cp = self._build_time_cp_group
-
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
@@ -1633,7 +1625,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
-                            cp_group=self.pg_collection.cp,
+                            cp_group=runtime_cp_group,
                             max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
@@ -1642,7 +1634,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                             q_pos_emb,
                             self.config,
                             cu_seqlens_q,
-                            self.pg_collection.cp,
+                            runtime_cp_group,
                             mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
@@ -1652,7 +1644,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
-                        cp_group=self.pg_collection.cp,
+                        cp_group=runtime_cp_group,
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:

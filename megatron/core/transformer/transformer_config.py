@@ -32,6 +32,7 @@ from megatron.core.transformer.enums import (
     LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -617,7 +618,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm".
+    "shortcut_pre_mlp_layernorm", "residual_stream".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -635,8 +636,10 @@ class TransformerConfig(ModelParallelConfig):
             enable_mhc_connections=True. Cannot be used with "mlp".
     "shortcut_pre_mlp_layernorm": recompute the shortcut router's input normalization.
             Requires moe_shortcut_connection=True and selective recomputation.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
-    "mhc" and "shortcut_pre_mlp_layernorm" use output-discarding checkpointing,
+    "residual_stream": replay wide-residual reads, connected norms, and writes via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager.
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1086,6 +1089,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_routing_map_mode: Literal['indices', 'bool'] = 'indices'
+    """Routing-map format for HybridEP. ``indices`` requests int16 top-k indices and is the
+    default, while ``bool`` forces the bool token-to-expert map. Index routing remains gated on
+    Transformer Engine and HybridEP support and the int16 expert limit; unsupported configurations
+    fall back to the bool routing-map path. ``moe_pad_expert_input_to_capacity`` also forces the
+    bool path (with a warning): a pad-to-capacity routing map can hold more than topk assignments
+    per token, which dense top-k indices cannot represent."""
+
     moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
@@ -1289,6 +1300,23 @@ class TransformerConfig(ModelParallelConfig):
     If None, all layers in the transformer block share a single recompute block.
 
     Must be a positive integer when set."""
+
+    ####################
+    # Wide Residual Configuration
+    ####################
+    wide_residual: Optional[WideResidualConfig] = None
+    """Optional streamwise wide-residual architecture configuration.
+
+    When set, the model carries ``num_streams * hidden_size`` features between
+    layers while attention and MLP branches continue to operate at ``hidden_size``.
+    """
+
+    residual_stream_recompute_num_layers: Optional[int] = None
+    """Number of local layers per ordered residual-stream replay block.
+
+    ``None`` places all local layers in one block. This setting requires selective
+    recomputation with ``"residual_stream"`` in ``recompute_modules``.
+    """
 
     ####################
     # miscellaneous
@@ -1613,6 +1641,36 @@ class TransformerConfig(ModelParallelConfig):
         # downstream reads a plain bool.
         if self.moe_router_aux_loss_fusion is None:
             self.moe_router_aux_loss_fusion = self.moe_router_fusion
+
+        if self.wide_residual is not None:
+            if self.enable_mhc_connections:
+                raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+                raise NotImplementedError(
+                    "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
+                )
+            if self.pipeline_model_parallel_size > 1:
+                raise NotImplementedError(
+                    "wide_residual does not yet support pipeline_model_parallel_size > 1. "
+                    "Inter-stage communication buffers are still sized from hidden_size."
+                )
+            if self.inference_fuse_tp_communication:
+                raise NotImplementedError(
+                    "wide_residual is not compatible with inference_fuse_tp_communication. "
+                    "The fused inference path assumes an ordinary-width residual tensor."
+                )
+            if self.heterogeneous_block_specs:
+                raise NotImplementedError(
+                    "wide_residual does not yet support heterogeneous_block_specs. "
+                    "Residual-stream width is currently owned by the enclosing block."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise NotImplementedError(
+                    "wide_residual does not yet support overlap_moe_expert_parallel_comm. "
+                    "The fine-grained EP-overlap schedule invokes the pre-MLP norm and MLP BDA "
+                    "outside TransformerLayer._forward_mlp, bypassing the wide-residual MLP "
+                    "read and write connection."
+                )
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
@@ -2067,6 +2125,21 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
+            raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
+        if (
+            self.moe_hybridep_routing_map_mode == "indices"
+            and self.moe_pad_expert_input_to_capacity
+            and self.moe_token_dispatcher_type == "flex"
+            and self.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            warnings.warn(
+                "moe_hybridep_routing_map_mode='indices' is disabled by "
+                "moe_pad_expert_input_to_capacity: a pad-to-capacity routing map can hold more "
+                "than topk assignments per token, which dense top-k indices cannot represent. "
+                "HybridEP will use the bool routing-map path."
+            )
+
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError(
@@ -2302,6 +2375,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_qkv",
                     "mhc",
                     "shortcut_pre_mlp_layernorm",
+                    "residual_stream",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2403,6 +2477,47 @@ class TransformerConfig(ModelParallelConfig):
                     "the offloading backward chunk is initialized, causing tensor_pop "
                     "on a None chunk. Disable one of them."
                 )
+
+        use_residual_stream_recompute = (
+            self.recompute_granularity == "selective"
+            and "residual_stream" in self.recompute_modules
+        )
+        if "residual_stream" in self.recompute_modules and not use_residual_stream_recompute:
+            raise ValueError(
+                "'residual_stream' in recompute_modules requires "
+                "recompute_granularity='selective'."
+            )
+        if use_residual_stream_recompute:
+            if self.wide_residual is None:
+                raise ValueError(
+                    "'residual_stream' recomputation requires a configured wide residual stream."
+                )
+            if self.residual_stream_recompute_num_layers is not None and (
+                isinstance(self.residual_stream_recompute_num_layers, bool)
+                or not isinstance(self.residual_stream_recompute_num_layers, int)
+                or self.residual_stream_recompute_num_layers < 1
+            ):
+                raise ValueError(
+                    "residual_stream_recompute_num_layers must be a positive integer or None."
+                )
+            if self.fine_grained_activation_offloading:
+                replay_owned_norms = {"attn_norm", "mlp_norm"} & set(self.offload_modules or [])
+                if replay_owned_norms:
+                    warnings.warn(
+                        "Residual-stream recomputation owns residual reads, connected-branch "
+                        "norms, and writes. Fine-grained activation offloading will skip "
+                        f"{sorted(replay_owned_norms)} only on connected branches."
+                    )
+            if self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "'residual_stream' recomputation requires cuda_graph_impl='none' because "
+                    "its Python checkpoint manager remains outside CUDA graph capture."
+                )
+        elif self.residual_stream_recompute_num_layers is not None:
+            raise ValueError(
+                "residual_stream_recompute_num_layers requires selective recomputation with "
+                "'residual_stream' in recompute_modules."
+            )
 
         if self.enable_mhc_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
@@ -3668,6 +3783,18 @@ class TransformerConfig(ModelParallelConfig):
                 "training and inference attention paths run the same batch-invariant "
                 f"FlashAttention kernel (got {self.flash_attention_version})."
             )
+            if self.is_hybrid_model:
+                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
+
+                # Checked rather than set: the autotune config lists are fixed at
+                # import, so setting the flag here would change nothing.
+                assert use_deterministic_mode(), (
+                    "Batch invariant mode on a hybrid model requires MAMBA_DETERMINISTIC=1 "
+                    "in the environment before Megatron is imported, so the SSM Triton "
+                    "kernels pin their autotune configs instead of choosing per call "
+                    "shape. Setting it after import has no effect; relaunch with it set."
+                )
+
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
             # cannot be pinned to another version; dropout is not batch-invariant.
             assert (
@@ -3784,10 +3911,21 @@ class TransformerConfig(ModelParallelConfig):
             # allgather specifically, the general variable_seq_lengths check
             # above raises first (packing derives variable_seq_lengths=True).
             if self.num_moe_experts is not None:
-                assert self.moe_token_dispatcher_type == "alltoall", (
-                    f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                    "sequence_packing only supports moe_token_dispatcher_type in "
+                    "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                if (
+                    self.moe_token_dispatcher_type == "flex"
+                    and self.moe_flex_dispatcher_backend == "hybridep"
+                    and not self.moe_hybridep_pad_uneven_dispatch_inputs
+                ):
+                    raise ValueError(
+                        "sequence_packing with HybridEP requires "
+                        "moe_hybridep_pad_uneven_dispatch_inputs=True because packed token "
+                        "counts can differ across dispatcher ranks"
+                    )
 
 
 @dataclass

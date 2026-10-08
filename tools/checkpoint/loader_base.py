@@ -132,6 +132,7 @@ class MegatronCheckpointLoaderBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
+            from megatron.training.argument_utils import inference_cfg_container_from_args
             from megatron.training.global_vars import set_global_variables
             from megatron.core import mpu
         except ModuleNotFoundError as e:
@@ -139,7 +140,8 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
-        set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
+        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)

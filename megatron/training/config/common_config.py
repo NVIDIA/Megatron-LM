@@ -11,22 +11,43 @@ class RNGConfig:
     """Random seed used for python, numpy, pytorch, and cuda."""
 
     te_rng_tracker: bool = False
-    """Use the Transformer Engine version of the random number generator.
-    Required for CUDA graphs support."""
+    """Use Transformer Engine's RNG tracker. Authoritative over the model's derived copy."""
 
     inference_rng_tracker: bool = False
-    """Use a random number generator configured for inference."""
+    """Use an RNG tracker configured for inference."""
 
     data_parallel_random_init: bool = False
     """Enable random initialization of params across data parallel ranks"""
+
+    def validate(self) -> None:
+        """Validate the seed before training runtime initialization."""
+        if self.seed is None or self.seed <= 0:
+            raise ValueError("Seed must be a positive integer.")
+
+    def finalize_model_config(self, model_config: object) -> None:
+        """Derive Core tracker settings from this run's RNG policy."""
+        from megatron.core.transformer import TransformerConfig
+
+        transformer = getattr(model_config, "transformer", model_config)
+        if not isinstance(transformer, TransformerConfig):
+            return
+        if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
+            transformer.transformer_impl, transformer.cuda_graph_impl
+        ):
+            self.te_rng_tracker = True
+        # Core retains these fields for standalone use; within a run they are derived.
+        transformer.use_te_rng_tracker = self.te_rng_tracker
+        transformer.inference_rng_tracker = self.inference_rng_tracker
 
 
 @dataclass(kw_only=True)
 class ProfilingConfig:
     """Configuration settings for profiling the training process."""
 
-    use_nsys_profiler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--profile"], "dest": "profile"}})
-    """Enable nsys profiling. When using this option, nsys options should be specified in
+    use_nsys_profiler: bool = False
+    """Enable nsys profiling, mutually exclusive with use_pytorch_profiler.
+    The legacy CLI --profile selects nsys unless --use-pytorch-profiler is also set.
+    When using this option, nsys options should be specified in
     commandline. An example nsys commandline is
     `nsys profile -s none -t nvtx,cuda -o <path/to/output_file> --force-overwrite true
     --capture-range=cudaProfilerApi --capture-range-end=stop`.
@@ -39,7 +60,9 @@ class ProfilingConfig:
     """Global step to stop profiling."""
 
     use_pytorch_profiler: bool = False
-    """Use the built-in pytorch profiler. Useful if you wish to view profiles in tensorboard."""
+    """Use the built-in pytorch profiler, mutually exclusive with use_nsys_profiler.
+    The legacy CLI requires both --profile and --use-pytorch-profiler to select this backend.
+    Useful if you wish to view profiles in tensorboard."""
 
     pytorch_profiler_collect_shapes: bool = False
     """Collect tensor shape in pytorch profiler."""
@@ -65,6 +88,19 @@ class ProfilingConfig:
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
+
+    run_workload_inspector_server: bool = False
+    """Run the optional workload-inspector web server for on-demand profiling."""
+
+    def validate(self) -> None:
+        """Validate profiler settings before training runtime initialization."""
+        # Match torch.profiler.schedule's active-window requirement. Inactive
+        # options and CUDA-profiler windows retain their existing CLI behavior.
+        if self.use_nsys_profiler and self.use_pytorch_profiler:
+            raise ValueError("use_nsys_profiler and use_pytorch_profiler are mutually exclusive")
+        if self.use_pytorch_profiler:
+            if self.profile_step_end <= self.profile_step_start:
+                raise ValueError("PyTorch profiling requires profile_step_end > profile_step_start")
 
 
 @dataclass(kw_only=True)

@@ -15,6 +15,7 @@ from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
+    inference_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
 from megatron.training.config.training_config import TokenizerConfig
@@ -23,7 +24,7 @@ from megatron.training.config.training_config import TokenizerConfig
 @pytest.fixture
 def isolated_globals(monkeypatch):
     """Avoid changing services owned by the distributed test harness."""
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
+    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
         monkeypatch.setattr(global_vars, name, None)
 
 
@@ -72,15 +73,66 @@ def test_parse_only_prepares_args(monkeypatch, isolated_globals, experimental):
     services.assert_not_called()
 
 
-def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch, isolated_globals):
+@pytest.mark.parametrize("aliases", [None, False, True])
+def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolated_globals, aliases):
     args = _runtime_args()
+    # Sparse legacy namespaces must not acquire new checkpoint requirements.
+    if aliases is not None:
+        for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+            setattr(args, f"no_{name}", aliases)
+        args.ckpt_fully_parallel_save = aliases
+        args.ckpt_fully_parallel_load = aliases
+        args.profile = aliases
     initialize = Mock()
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
-    global_vars.set_global_variables(args)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    global_vars.set_global_variables(args, cfg)
     assert global_vars.get_args() is args
+    assert global_vars.get_run_config() is cfg
+    assert cfg.model is None
+    assert cfg.checkpoint.save_optim is (not aliases)
+    assert cfg.checkpoint.save_rng is (not aliases)
+    assert cfg.checkpoint.load_optim is (not aliases)
+    assert cfg.checkpoint.load_rng is (not aliases)
+    assert cfg.checkpoint.fully_parallel_save is (True if aliases is None else aliases)
+    assert cfg.checkpoint.fully_parallel_load is bool(aliases)
+    assert cfg.profiling.use_nsys_profiler is bool(aliases)
     initialize.assert_called_once_with(args, build_tokenizer=True)
     with pytest.raises(AssertionError, match="already initialized"):
-        global_vars.set_global_variables(args)
+        global_vars.set_global_variables(args, cfg)
+
+
+def test_explicit_training_bootstrap_preserves_config(monkeypatch, isolated_globals, run_config):
+    args = _runtime_args()
+    cfg = run_config
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    cfg.train.train_iters = 7
+    cfg.logger.log_interval = 3
+    initialize = Mock()
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
+
+    global_vars.set_global_variables(args, cfg, build_tokenizer=False)
+
+    assert global_vars.get_args() is args
+    assert global_vars.get_run_config() is cfg
+    assert global_vars.get_run_config().train.train_iters == 7
+    assert global_vars.get_run_config().logger.log_interval == 3
+    initialize.assert_called_once_with(args, build_tokenizer=False)
+
+
+def test_bootstrap_rejects_registered_config_before_setting_args(monkeypatch, isolated_globals):
+    args = _runtime_args()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    global_vars.set_run_config(cfg)
+    initialize = Mock()
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
+
+    with pytest.raises(AssertionError, match="run config is already initialized"):
+        global_vars.set_global_variables(args, cfg)
+
+    assert global_vars._GLOBAL_ARGS is None
+    assert global_vars.get_run_config() is cfg
+    initialize.assert_not_called()
 
 
 def test_parse_restores_checkpoint_args_before_validation_and_config(monkeypatch, isolated_globals):
@@ -156,11 +208,13 @@ def test_vocabulary_resolves_after_config_construction(
     initialize.assert_called_once_with(args)
 
 
-@pytest.mark.parametrize("args_only", [False, True])
-def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals, args_only):
+@pytest.mark.parametrize("use_bootstrap", [False, True])
+def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals, use_bootstrap):
     args = _runtime_args()
-    if not args_only:
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    if not use_bootstrap:
         global_vars.set_args(args)
+        global_vars.set_run_config(cfg)
     calls = []
     microbatches = Mock(side_effect=lambda **kwargs: calls.append("microbatches"))
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
@@ -191,8 +245,8 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
 
     monkeypatch.setattr(global_vars, "_set_train_state", record_train_state)
     assert global_vars._GLOBAL_TRAIN_STATE is None
-    if args_only:
-        global_vars.set_global_variables(args)
+    if use_bootstrap:
+        global_vars.set_global_variables(args, cfg)
     else:
         global_vars.initialize_runtime_services(args)
     assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
