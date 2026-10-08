@@ -73,7 +73,7 @@ class TensorAtomic(Shard):
     With ``fully_shard``, use ``TensorAtomic()`` in ``Placements`` and supply only
     ``fully_shard_context(parameter_to_owner=...)``. Each parameter group derives
     its tensor owners from that mapping and passes them to
-    ``GlobalLayout.build_for_tensor_atomic``. Ownership is encoded by the layout's
+    ``layout_builder.build_for_tensor_atomic``. Ownership is encoded by the layout's
     offsets; this placement stores no owner assignments.
     """
 
