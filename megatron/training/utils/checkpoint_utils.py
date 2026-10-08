@@ -17,12 +17,12 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.msc_utils import MultiStorageClientFeature
-from megatron.training.config.utils import (
+from megatron.training.config.instantiate_utils import (
     _DISALLOWED_CANONICAL_TARGETS,
-    _reject_unsafe_target_name,
     InstantiationException,
-    sanitize_dataclass_config,
+    _reject_unsafe_target_name,
 )
+from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.state import TrainState
 from megatron.training.utils.common_utils import print_rank_0
 

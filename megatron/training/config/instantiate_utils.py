@@ -555,6 +555,7 @@ def _resolve_target(
 ) -> type | Callable[..., Any] | object:
     """Resolve target string, type or callable into type or callable."""
     if isinstance(target, str):
+        _reject_unsafe_target_name(target=target, full_key=full_key)
         # Security: check allowlist BEFORE importing to prevent
         # arbitrary code execution from untrusted _target_ strings.
         if not target_allowlist.is_allowed(target):
@@ -569,6 +570,7 @@ def _resolve_target(
             if full_key:
                 msg += f"\nfull_key: {full_key}"
             raise InstantiationException(msg)
+        requested = target
         try:
             target = _locate(target)
         except Exception as e:
@@ -576,6 +578,10 @@ def _resolve_target(
             if full_key:
                 msg += f"\nfull_key: {full_key}"
             raise InstantiationException(msg) from e
+        # An allowed-looking name may resolve to a loader living in a disallowed module.
+        resolved_name = f"{getattr(target, '__module__', '')}.{getattr(target, '__qualname__', '')}"
+        if resolved_name != requested:
+            _reject_unsafe_target_name(target=resolved_name, full_key=full_key)
     if check_callable and not callable(target):
         msg = f"Expected a callable target, got '{target}' of type '{type(target).__name__}'"
         if full_key:

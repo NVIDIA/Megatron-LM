@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import yaml
 
+from megatron.training.config.instantiate_utils import InstantiationException
 from megatron.training.utils.checkpoint_utils import (
     CONFIG_FILE,
     apply_run_config_backward_compat,
@@ -254,6 +255,80 @@ class TestReadRunConfigDistributed:
         ):
             with pytest.raises(RuntimeError, match="boom"):
                 read_run_config(str(missing_path))
+
+
+class TestReadRunConfigTargetValidation:
+    """``read_run_config`` rejects unsafe ``_target_`` entries before compat code resolves them."""
+
+    @staticmethod
+    def _write(tmp_path, data):
+        path = tmp_path / "run_config.yaml"
+        path.write_text(yaml.safe_dump(data))
+        return str(path)
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "transformers.dynamic_module_utils.get_class_in_module",
+            "transformers.models.auto.tokenization_auto.AutoTokenizer.from_pretrained",
+            "transformers.pipelines.pipeline",
+            "torch.serialization.load",
+        ],
+    )
+    def test_rejects_unsafe_targets_before_compat_import(self, tmp_path, target):
+        path = self._write(tmp_path, {"model": {"layers": [{"_target_": target, "_call_": False}]}})
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=False),
+            mock.patch(
+                "megatron.training.utils.checkpoint_utils.apply_run_config_backward_compat"
+            ) as compat,
+        ):
+            with pytest.raises(InstantiationException, match=r"model\.layers\[0\]"):
+                read_run_config(path)
+
+        compat.assert_not_called()
+
+    def test_distributed_rank0_broadcasts_validation_failure(self, tmp_path):
+        path = self._write(tmp_path, {"model": {"_target_": "transformers.pipeline"}})
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("megatron.training.utils.checkpoint_utils.safe_get_rank", return_value=0),
+            mock.patch("megatron.training.utils.checkpoint_utils.safe_get_world_size", return_value=1),
+            mock.patch("megatron.training.utils.checkpoint_utils.print_rank_0"),
+            mock.patch("torch.distributed.broadcast_object_list") as broadcast,
+        ):
+            with pytest.raises(RuntimeError, match="transformers.pipeline"):
+                read_run_config(path)
+
+        broadcast.assert_called_once()
+
+    def test_preserves_benign_legacy_config(self, tmp_path, _allow_local_targets):
+        path = self._write(
+            tmp_path,
+            {"model": {"_target_": f"{_LegacyConfig.__module__}.{_LegacyConfig.__qualname__}", "removed": "old"}},
+        )
+
+        with mock.patch("torch.distributed.is_initialized", return_value=False):
+            config = read_run_config(path)
+
+        assert "removed" not in config["model"]
+
+    def test_rejects_unsafe_target_in_field_compat_would_discard(self, tmp_path, _allow_local_targets):
+        path = self._write(
+            tmp_path,
+            {
+                "model": {
+                    "_target_": f"{_LegacyConfig.__module__}.{_LegacyConfig.__qualname__}",
+                    "removed": {"_target_": "transformers.pipeline"},
+                }
+            },
+        )
+
+        with mock.patch("torch.distributed.is_initialized", return_value=False):
+            with pytest.raises(InstantiationException, match="model.removed"):
+                read_run_config(path)
 
 
 class TestApplyRunConfigBackwardCompat:
