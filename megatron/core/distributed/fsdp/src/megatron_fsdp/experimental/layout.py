@@ -32,6 +32,15 @@ Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
+class TensorRange:
+    """Contiguous global element range occupied by one logical tensor."""
+
+    start: int
+    end: int
+    tensor_id: int
+
+
+@dataclasses.dataclass(frozen=True)
 class GlobalLayout:
     """Global tensor layout in element coordinates.
 
