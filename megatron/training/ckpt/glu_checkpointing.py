@@ -27,6 +27,19 @@ def _config_value(config, name, default=None):
 
 
 def _interleave_sizes(config):
+    # Core/Bridge configs store the resolved flag; MLM saves CLI activation flags.
+    # Match the CLI builder's precedence: squared_relu takes priority over quick_geglu.
+    gated_linear_unit = (
+        _config_value(config, "gated_linear_unit", False)
+        or _config_value(config, "swiglu", False)
+        or (
+            _config_value(config, "quick_geglu", False)
+            and not _config_value(config, "squared_relu", False)
+        )
+        or _config_value(config, "activation_func") == "swiglu"
+    )
+    if not gated_linear_unit:
+        return {"routed": None, "shared": None}
     sizes = {
         'routed': _config_value(config, 'moe_mlp_glu_interleave_size'),
         'shared': (

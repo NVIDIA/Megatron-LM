@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Import one canonical checkpoint into real DDP MoE models with either GLU layout."""
+"""Import canonical checkpoints into real DDP MoE models with active or inactive GLU layouts."""
 
 import sys
 
@@ -61,7 +61,16 @@ def _enable_native_glu_fusion(monkeypatch):
 
 
 def _setup_model(
-    case, directory, *, single_weight, single_bias, interleave, use_op_fuser, precision, load
+    case,
+    directory,
+    *,
+    single_weight,
+    single_bias,
+    interleave,
+    use_op_fuser,
+    precision,
+    load,
+    gated=True,
 ):
     args = case.create_test_args(
         precision=precision,
@@ -72,6 +81,8 @@ def _setup_model(
     )
     args.add_bias_linear = True
     args.add_qkv_bias = True
+    args.swiglu = gated
+    args.bias_gelu_fusion = False
     args.bias_swiglu_fusion = False
     args.bias_dropout_fusion = False
     args.moe_single_grouped_bias = single_bias
@@ -105,6 +116,7 @@ def _setup_model(
         assert linear.single_grouped_weight == single_weight
         assert linear.single_grouped_bias == single_bias
     assert experts._with_fused_impl == use_op_fuser
+    assert experts.config.gated_linear_unit == gated
     assert not experts.config.bias_activation_fusion
     if load:
         # setup_model_and_optimizer calls the real loader once, including master initialization.
@@ -114,12 +126,13 @@ def _setup_model(
     return model, optimizer, scheduler, experts
 
 
-def _canonical_parameters():
+def _canonical_parameters(*, gated=True):
     """Independent, nonzero values; no production layout helper builds this oracle."""
     generator = torch.Generator().manual_seed(1729)
+    fc1_rows = 512 if gated else 256
     return {
-        "linear_fc1.weight": (0.08 * torch.randn(2, 512, 256, generator=generator)).bfloat16(),
-        "linear_fc1.bias": torch.linspace(-0.4, 0.6, 2 * 512).reshape(2, 512).bfloat16(),
+        "linear_fc1.weight": (0.08 * torch.randn(2, fc1_rows, 256, generator=generator)).bfloat16(),
+        "linear_fc1.bias": torch.linspace(-0.4, 0.6, 2 * fc1_rows).reshape(2, fc1_rows).bfloat16(),
         "linear_fc2.weight": (0.05 * torch.randn(2, 256, 256, generator=generator)).bfloat16(),
         "linear_fc2.bias": torch.linspace(-0.2, 0.3, 2 * 256).reshape(2, 256).bfloat16(),
     }
@@ -161,6 +174,41 @@ def _expected_runtime(canonical, interleave):
 def _assert_parameters(experts, expected):
     for name, tensor in expected.items():
         torch.testing.assert_close(_read_parameter(experts, name), tensor, rtol=0, atol=0)
+
+
+def _assert_checkpoint_parameters(directory, iteration, canonical):
+    # Inspect actual disk tensors; save/load must not cancel a layout bug.
+    checkpoint_dir = checkpointing.get_checkpoint_name(directory, iteration, return_base_dir=True)
+    disk = dist_checkpointing.load_plain_tensors(checkpoint_dir)
+    for name, expected in canonical.items():
+        matching = [value for key, value in disk.items() if key.endswith(f"experts.{name}")]
+        assert len(matching) == 1, (name, list(disk))
+        torch.testing.assert_close(matching[0].cpu().reshape_as(expected), expected, rtol=0, atol=0)
+
+
+def _save_canonical_checkpoint(case, directory, canonical, *, gated=True):
+    model, optimizer, scheduler, experts = _setup_model(
+        case,
+        directory,
+        single_weight=False,
+        single_bias=False,
+        interleave=None,
+        use_op_fuser=False,
+        precision="bf16",
+        load=False,
+        gated=gated,
+    )
+    with torch.no_grad():
+        for name, tensor in canonical.items():
+            layer, parameter = name.split(".")
+            for idx, value in enumerate(tensor):
+                getattr(getattr(experts, layer), f"{parameter}{idx}").copy_(value)
+    optimizer.reload_model_params()
+    force_param_sync(model, optimizer=optimizer)
+    _assert_parameters(experts, canonical)
+    checkpointing.save_checkpoint(1, model, optimizer, scheduler, 0)
+    torch.distributed.barrier()
+    _assert_checkpoint_parameters(directory, 1, canonical)
 
 
 def _forward(case, model, experts):
@@ -283,37 +331,7 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         _enable_native_glu_fusion(monkeypatch)
     canonical = _canonical_parameters()
     with TempNamedDir(tmp_path_dist_ckpt / "canonical_glu_checkpoint", sync=True) as directory:
-        model, optimizer, scheduler, experts = _setup_model(
-            moe_case,
-            directory,
-            single_weight=False,
-            single_bias=False,
-            interleave=None,
-            use_op_fuser=False,
-            precision="bf16",
-            load=False,
-        )
-        with torch.no_grad():
-            for name, tensor in canonical.items():
-                layer, parameter = name.split(".")
-                for idx, value in enumerate(tensor):
-                    getattr(getattr(experts, layer), f"{parameter}{idx}").copy_(value)
-        optimizer.reload_model_params()
-        force_param_sync(model, optimizer=optimizer)
-        _assert_parameters(experts, canonical)
-        checkpointing.save_checkpoint(1, model, optimizer, scheduler, 0)
-        torch.distributed.barrier()
-
-        # Inspect actual disk tensors before testing the loader. Save/load cannot cancel a bug.
-        checkpoint_dir = checkpointing.get_checkpoint_name(directory, 1, return_base_dir=True)
-        disk = dist_checkpointing.load_plain_tensors(checkpoint_dir)
-        for name, expected in canonical.items():
-            matching = [value for key, value in disk.items() if key.endswith(f"experts.{name}")]
-            assert len(matching) == 1, (name, list(disk))
-            torch.testing.assert_close(
-                matching[0].cpu().reshape_as(expected), expected, rtol=0, atol=0
-            )
-        del disk, experts, model, optimizer, scheduler
+        _save_canonical_checkpoint(moe_case, directory, canonical)
 
         model, optimizer, scheduler, experts = _setup_model(
             moe_case,
@@ -369,3 +387,55 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         assert not torch.allclose(
             wrong_output, reference_output, rtol=tolerance, atol=tolerance
         ), "The negative control must detect the original missing GLU checkpoint conversion."
+
+
+@pytest.mark.parametrize("single_weight", [False, True], ids=["indexed-weight", "single-weight"])
+@pytest.mark.parametrize("single_bias", [False, True], ids=["indexed-bias", "single-bias"])
+def test_non_glu_checkpoint_ignores_interleave_size(
+    moe_case, tmp_path_dist_ckpt, single_weight, single_bias
+):
+    """An inactive GLU setting must not reorder ordinary GELU FC1 weights or biases.
+
+    Real DDP models load the same independent checkpoint with interleave unset or 32.
+    Check exact parameters and forward/loss parity, then inspect the saved disk tensors.
+    FC1 has 256 rows: divisible by 2 * 32, so the missing GLU guard silently permutes it.
+    """
+    canonical = _canonical_parameters(gated=False)
+    with TempNamedDir(tmp_path_dist_ckpt / "non_glu_checkpoint", sync=True) as directory:
+        _save_canonical_checkpoint(moe_case, directory, canonical, gated=False)
+        model, optimizer, scheduler, experts = _setup_model(
+            moe_case,
+            directory,
+            single_weight=single_weight,
+            single_bias=single_bias,
+            interleave=None,
+            use_op_fuser=False,
+            precision="bf16",
+            load=True,
+            gated=False,
+        )
+        _assert_parameters(experts, canonical)
+        assert experts.config.activation_func is torch.nn.functional.gelu
+        reference_output, reference_losses = _forward(moe_case, model, experts)
+        del experts, model, optimizer, scheduler
+
+        model, optimizer, scheduler, experts = _setup_model(
+            moe_case,
+            directory,
+            single_weight=single_weight,
+            single_bias=single_bias,
+            interleave=32,
+            use_op_fuser=False,
+            precision="bf16",
+            load=True,
+            gated=False,
+        )
+        _assert_parameters(experts, canonical)
+        actual_output, actual_losses = _forward(moe_case, model, experts)
+        torch.testing.assert_close(actual_output, reference_output, rtol=0, atol=0)
+        torch.testing.assert_close(actual_losses, reference_losses, rtol=0, atol=0)
+
+        checkpointing.save_checkpoint(2, model, optimizer, scheduler, 0)
+        torch.distributed.barrier()
+        _assert_checkpoint_parameters(directory, 2, canonical)
+        _assert_parameters(experts, canonical)

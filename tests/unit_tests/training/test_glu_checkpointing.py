@@ -24,6 +24,7 @@ SHARED = "decoder.layers.0.mlp.shared_experts.linear_fc1."
 
 def _args(routed=None, shared=None, tp=1, etp=1):
     return Namespace(
+        swiglu=True,
         moe_mlp_glu_interleave_size=routed,
         moe_shared_expert_glu_interleave_size=shared,
         use_grouped_gemm_for_shared_expert=shared is not None,
@@ -245,6 +246,109 @@ def test_non_grouped_shared_expert_ignores_inactive_interleave_setting():
     assert saved.keys() == checkpoint.keys()
     assert saved["model"][SHARED + "weight"] is weight
     validate_glu_optimizer_layout({"args": args}, _args(), loading_optimizer=True)
+
+
+@pytest.mark.parametrize("single_weight", [False, True])
+@pytest.mark.parametrize("single_bias", [False, True])
+def test_non_glu_checkpoint_keeps_fc1_rows_despite_inactive_sizes(single_weight, single_bias):
+    """A stale interleave setting must not alter ordinary, ungated FC1 projections."""
+    args = _args(routed=2, shared=2)
+    args.swiglu = False
+    tensors = _fc1_state(_canonical((3, 8, 3)), _canonical((3, 8)) + 1, single_weight, single_bias)
+    tensors.update({SHARED + "weight": _canonical((8, 3)), SHARED + "bias": _canonical((8,))})
+    snapshots = {key: tensor.clone() for key, tensor in tensors.items()}
+    checkpoint = {"model": tensors, "args": args}
+
+    # Check both directions independently: a round trip could hide two wrong permutations.
+    for converted in (
+        prepare_glu_checkpoint_for_load(checkpoint, args),
+        prepare_glu_checkpoint_for_save(checkpoint, args),
+    ):
+        assert converted.keys() == checkpoint.keys()
+        for key, original in tensors.items():
+            assert converted["model"][key] is original
+            torch.testing.assert_close(original, snapshots[key], rtol=0, atol=0)
+
+    no_interleave = _args(tp=2, etp=2)
+    no_interleave.swiglu = False
+    validate_glu_optimizer_layout(checkpoint, no_interleave, loading_optimizer=True)
+    validate_glu_optimizer_layout({"args": no_interleave}, args, loading_optimizer=True)
+    for ckpt_format in ("torch_dcp", "fsdp_dtensor"):
+        validate_glu_checkpoint_backend(
+            args, ckpt_format=ckpt_format, skip_load_to_model_and_opt=True
+        )
+
+
+@pytest.mark.parametrize("config_format", ["dict", "namespace"])
+@pytest.mark.parametrize(
+    "activation_flags,checkpoint_config_key",
+    [
+        pytest.param({"swiglu": True}, "args", id="mlm-cli-swiglu"),
+        pytest.param({"quick_geglu": True}, "args", id="mlm-cli-quick-geglu"),
+        pytest.param({"gated_linear_unit": True}, "cfg", id="core-bridge-gated-config"),
+        pytest.param({"activation_func": "swiglu"}, "cfg", id="string-swiglu-config"),
+    ],
+)
+def test_saved_activation_configs_enable_glu_conversion_and_guards(
+    config_format, activation_flags, checkpoint_config_key
+):
+    config = vars(_args(routed=2, shared=2))
+    del config["swiglu"]
+    config.update(activation_flags)
+    if config_format == "namespace":
+        config = Namespace(**config)
+    tensors = {ROUTED + "weight0": _canonical((8, 3)), SHARED + "bias": _canonical((8,))}
+    checkpoint = {"model": tensors}
+    if checkpoint_config_key == "args":
+        checkpoint["args"] = config
+    else:
+        checkpoint["cfg"] = {"model": config}
+
+    loaded = prepare_glu_checkpoint_for_load(checkpoint, config)
+    for key, tensor in tensors.items():
+        torch.testing.assert_close(loaded["model"][key], _interleaved(tensor, 2), rtol=0, atol=0)
+    saved = prepare_glu_checkpoint_for_save(loaded, config)
+    for key, tensor in tensors.items():
+        torch.testing.assert_close(saved["model"][key], tensor, rtol=0, atol=0)
+
+    # Resolve the saved activation flags as well as the current config on optimizer resume.
+    validate_glu_optimizer_layout(checkpoint, _args(routed=2, shared=2), loading_optimizer=True)
+    with pytest.raises(ValueError):
+        validate_glu_optimizer_layout(checkpoint, _args(), loading_optimizer=True)
+    with pytest.raises(NotImplementedError):
+        validate_glu_checkpoint_backend(config, ckpt_format="fsdp_dtensor")
+
+
+@pytest.mark.parametrize("config_format", ["dict", "namespace"])
+@pytest.mark.parametrize(
+    "activation_flags",
+    [
+        pytest.param(
+            {"quick_geglu": True, "squared_relu": True}, id="mlm-cli-squared-relu-precedence"
+        ),
+        pytest.param(
+            {"gated_linear_unit": False, "activation_func": torch.nn.functional.silu},
+            id="ungated-silu-callable",
+        ),
+    ],
+)
+def test_ungated_activation_configs_do_not_infer_glu(config_format, activation_flags):
+    config = vars(_args(routed=2, shared=2))
+    del config["swiglu"]
+    config.update(activation_flags)
+    if config_format == "namespace":
+        config = Namespace(**config)
+    tensors = {ROUTED + "weight0": _canonical((8, 3)), SHARED + "bias": _canonical((8,))}
+    checkpoint = {"model": tensors, "args": config}
+
+    for converted in (
+        prepare_glu_checkpoint_for_load(checkpoint, config),
+        prepare_glu_checkpoint_for_save(checkpoint, config),
+    ):
+        for key, tensor in tensors.items():
+            assert converted["model"][key] is tensor
+    validate_glu_optimizer_layout(checkpoint, _args(), loading_optimizer=True)
+    validate_glu_checkpoint_backend(config, ckpt_format="fsdp_dtensor")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
