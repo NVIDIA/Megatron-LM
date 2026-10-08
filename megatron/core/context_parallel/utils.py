@@ -147,6 +147,7 @@ def _build_packed_seq_params(
     tokens_per_sample: int | None,
     use_logical_qkv_seqlens: bool = False,
     pad_between_seqs: bool | None = None,
+    tp_cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> PackedSeqParams | None:
     """Build packed sequence metadata for one physical CP layout."""
     cu_seqlens = batch.get('cu_seqlens')
@@ -176,6 +177,7 @@ def _build_packed_seq_params(
         max_seqlen_kv=max_seqlen,
         local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
         cp_group=batch.get('hybrid_cp_group'),
+        tp_cp_group=tp_cp_group,
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
         pad_between_seqs=pad_between_seqs,
@@ -263,6 +265,7 @@ def get_batches_on_this_cp_rank(
                 tokens_per_sample,
                 use_logical_qkv_seqlens=layout == "zigzag",
                 pad_between_seqs=(zigzag_metadata.pad_between_seqs if layout == "zigzag" else None),
+                tp_cp_group=tp_cp_group if is_hybrid_cp else None,
             )
             for layout, layout_batch in batches_by_layout.items()
         }
@@ -320,7 +323,11 @@ def get_batches_on_this_cp_rank(
     # view rather than deriving one layout's metadata from the other.
     packed_seq_params_by_layout = {
         layout: _build_packed_seq_params(
-            batches_by_layout[layout], layout, cp_size, tokens_per_sample
+            batches_by_layout[layout],
+            layout,
+            cp_size,
+            tokens_per_sample,
+            tp_cp_group=tp_cp_group if is_hybrid_cp else None,
         )
         for layout in requested_layouts
     }

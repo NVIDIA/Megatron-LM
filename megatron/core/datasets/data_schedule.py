@@ -807,6 +807,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = int(batch['local_cp_size'].item()) if dynamic_cp else None
     runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size) if dynamic_cp else None
+    runtime_tp_cp_group = (
+        _sequence_parallel_tp_cp_group(
+            config, tp_group, dynamic_cp, local_cp_size, dynamic_tp_cp_group_func, tp_cp_group
+        )
+        if dynamic_cp and config is not None
+        else None
+    )
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -818,6 +825,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=runtime_cp_group,
+        tp_cp_group=runtime_tp_cp_group,
         total_tokens=int(cu_seqlens_padded[-1].item()),
         pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
     )

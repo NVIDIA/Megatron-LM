@@ -13,7 +13,6 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 from torch import Tensor, nn
 
-from megatron.core import parallel_state
 from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -33,7 +32,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
@@ -476,9 +475,7 @@ class HybridStack(MegatronModule):
 
         runtime_tp_cp_group = self.tp_cp_group
         if self.config.sequence_parallel and self.tp_group.size() > 1:
-            runtime_tp_cp_group = parallel_state.get_dynamic_tensor_data_context_parallel_group(
-                group_size=packed_seq_params.local_cp_size
-            )
+            runtime_tp_cp_group = resolve_tp_cp_group(self.tp_cp_group, packed_seq_params)
 
         return runtime_cp_group, ContextParallelLayoutManager(
             layer_layouts=self.layer_cp_layouts,

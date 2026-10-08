@@ -20,7 +20,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -2443,9 +2443,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             and self.sequence_parallel
             and self.tp_group.size() > 1
         ):
-            runtime_tp_cp_group = parallel_state.get_dynamic_tensor_data_context_parallel_group(
-                group_size=packed_seq_params.local_cp_size
-            )
+            runtime_tp_cp_group = resolve_tp_cp_group(self.tp_cp_group, packed_seq_params)
         requires_conversion = runtime_cp_group.size() > 1 and source_layout != target_layout
 
         if requires_conversion:

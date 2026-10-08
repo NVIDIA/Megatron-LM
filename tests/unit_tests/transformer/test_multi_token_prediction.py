@@ -3858,11 +3858,9 @@ class TestMultiTokenPredictionHybrid:
         model.mtp.prepare_cp_layout = types.MethodType(
             MultiTokenPredictionBlock.prepare_cp_layout, model.mtp
         )
-        monkeypatch.setattr(
-            "megatron.core.transformer.multi_token_prediction.parallel_state."
-            "get_dynamic_tensor_data_context_parallel_group",
-            lambda *, group_size: runtime_tp_cp_group,
-        )
+        # The batch fetch attaches the runtime TP x CP group to each layout's packed params.
+        contiguous_packed_seq_params.tp_cp_group = runtime_tp_cp_group
+        zigzag_packed_seq_params.tp_cp_group = runtime_tp_cp_group
 
         def convert_cp_layout_spy(
             layer_hidden_states,

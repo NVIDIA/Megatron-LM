@@ -958,6 +958,41 @@ def test_dynamic_cp_group_resolution_rejects_inconsistent_metadata(
         _resolve_dynamic_cp_group_for_batch({"local_cp_size": local_cp_size}, group_func)
 
 
+@pytest.mark.parametrize("is_hybrid_cp", [True, False])
+def test_layout_views_carry_the_runtime_tp_cp_group_under_dynamic_cp(is_hybrid_cp):
+    singleton = _mock_group(1)
+    tp_cp_group = object()
+    tokens = torch.arange(8).view(1, 8)
+    batch = {
+        "tokens": tokens,
+        "labels": tokens + 1,
+        "loss_mask": torch.ones(1, 8),
+        "position_ids": tokens.clone(),
+        "cu_seqlens": torch.tensor([[0, 8]], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([[0, 8]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+        "local_cp_size": torch.tensor([1], dtype=torch.int32) if is_hybrid_cp else None,
+        "hybrid_cp_group": singleton if is_hybrid_cp else None,
+    }
+
+    with (
+        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
+        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="contiguous",
+            is_hybrid_cp=is_hybrid_cp,
+            cp_group=singleton,
+            additional_layouts={"zigzag"},
+            tp_cp_group=tp_cp_group,
+        )
+
+    for layout in ("contiguous", "zigzag"):
+        expected = tp_cp_group if is_hybrid_cp else None
+        assert cp_batch.get_packed_seq_params(layout).tp_cp_group is expected
+
+
 def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors():
     runtime_cp_group = MagicMock()
     runtime_cp_group.size.return_value = 2

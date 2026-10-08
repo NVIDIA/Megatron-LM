@@ -179,6 +179,58 @@ def test_scheduler_builds_static_cp_layout_views(cp_size, linear_cp_layout):
     torch.testing.assert_close(cp_batch.get_batch("zigzag")["tokens"], expected_zigzag.view(1, -1))
 
 
+@pytest.mark.parametrize("sequence_parallel", [True, False])
+def test_packed_params_carry_the_runtime_tp_cp_group(sequence_parallel):
+    """Under dynamic CP with SP, layout conversion needs the TP x runtime-CP group per microbatch."""
+
+    class _Group:
+        def __init__(self, size, rank=0):
+            self._size = size
+            self._rank = rank
+
+        def size(self):
+            return self._size
+
+        def rank(self):
+            return self._rank
+
+    runtime_cp_group, runtime_tp_cp_group = _Group(1), object()
+    pg_collection = SimpleNamespace(tp=_Group(2), pp=_Group(1), cp=_Group(1))
+    config = SimpleNamespace(sequence_parallel=sequence_parallel)
+    tokens = torch.arange(8, dtype=torch.int64)
+    batch = {
+        "tokens": tokens.clone(),
+        "labels": tokens.clone() + 100,
+        "loss_mask": torch.ones(8, dtype=torch.float32),
+        "position_ids": tokens.clone(),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+        "local_cp_size": torch.tensor([1], dtype=torch.int32),
+    }
+
+    with (
+        patch("torch.cuda.current_device", return_value=torch.device("cpu")),
+        patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
+        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
+        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
+        patch("megatron.core.datasets.data_schedule.broadcast_tensor"),
+        patch("megatron.core.datasets.data_schedule_utils.broadcast_tensor"),
+    ):
+        *_, packed_seq_params, _ = get_batch_on_this_rank_for_sequence_packing(
+            iter([batch]),
+            dynamic_cp=True,
+            pg_collection=pg_collection,
+            config=config,
+            dynamic_cp_group_func=lambda group_size: runtime_cp_group,
+            dynamic_tp_cp_group_func=lambda group_size: runtime_tp_cp_group,
+        )
+
+    assert packed_seq_params.cp_group is runtime_cp_group
+    expected = runtime_tp_cp_group if sequence_parallel else None
+    assert packed_seq_params.tp_cp_group is expected
+
+
 def test_scheduler_requires_a_data_iterator_on_tp_rank_zero():
     scheduler = DpBalancedScheduler(
         max_seqlen_per_dp_cp_rank=8, cp_size=1, dp_size=1, microbatch_group_size_per_vp_stage=None
