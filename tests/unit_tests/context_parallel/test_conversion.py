@@ -18,6 +18,7 @@ from megatron.core.context_parallel.routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -362,9 +363,9 @@ def test_finalize_packed_seq_params_uses_caller_group_with_dynamic_override(monk
         "megatron.core.context_parallel.routes.prebuild_thd_cp_partition_routes", fake_prebuild
     )
 
-    static_packed_seq_params = SimpleNamespace(cp_group=None)
-    dynamic_packed_seq_params = SimpleNamespace(cp_group=dynamic_cp_group)
-    no_group_packed_seq_params = SimpleNamespace(cp_group=None)
+    static_packed_seq_params = PackedSeqParams(cp_group=None)
+    dynamic_packed_seq_params = PackedSeqParams(cp_group=dynamic_cp_group)
+    no_group_packed_seq_params = PackedSeqParams(cp_group=None)
 
     assert (
         finalize_packed_seq_params(
