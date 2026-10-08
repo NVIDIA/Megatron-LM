@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FlashInfer RNG integration and the remaining upstream batch-layout limitation."""
+"""FlashInfer request-local RNG integration and batch-independent replay."""
 
 from types import SimpleNamespace
 
@@ -126,12 +126,8 @@ def test_speculative_seed_rejected(token_mapping):
 
 
 @pytest.mark.parametrize("top_k,top_p", [(0, 0.0), (0, 0.8), (64, 0.0), (64, 0.8)])
-@pytest.mark.xfail(
-    strict=True,
-    reason="FlashInfer still includes the output row in Philox; keep the engine seed guard",
-)
 def test_request_seed_survives_batch_reordering(top_k, top_p):
-    """Remove this xfail and the engine guard only after the upstream RNG fix/bump."""
+    """Logical draws survive reordering, compaction, and singleton batches."""
     seeds = list(range(32))
     ctx = context(seeds, [17] * 32, top_k, top_p)
     reordered = context(seeds[::-1], [17] * 32, top_k, top_p)
@@ -140,3 +136,6 @@ def test_request_seed_survives_batch_reordering(top_k, top_p):
     expected = draw(sampler, logits, ctx)
     actual = draw(sampler, logits.flip(0), reordered).flip(0)
     assert torch.equal(actual, expected)
+    for rows in ([23, 2, 11], [23]):
+        compacted = context([seeds[row] for row in rows], [17] * len(rows), top_k, top_p)
+        assert torch.equal(draw(sampler, logits[rows], compacted), expected[rows])

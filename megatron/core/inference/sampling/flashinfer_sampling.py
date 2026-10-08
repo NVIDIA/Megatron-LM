@@ -26,11 +26,10 @@ class FlashInferSampling(Sampling):
     and the joint kernel only for genuinely mixed batches.
     The dispatch flags are read from the pinned CPU sampling metadata.
 
-    Request-local seed/offset tensors require FlashInfer's per-row RNG fix
-    (flashinfer-ai/flashinfer#5745). The engine still rejects request-local seeds
-    for this backend until FlashInfer also removes output-row dependence from
-    its Philox subsequences. Wiring these arguments alone does not guarantee
-    replay across batch compaction or reordering.
+    Request-local seed/offset tensors require FlashInfer's per-row RNG fixes:
+    per-output tensor indexing and batch-independent Philox subsequences. These
+    draws follow the request seed and token position across batch compaction
+    and reordering without advancing the shared generator.
 
     The sampler runs eagerly. Its kernel choice is data-dependent (it varies with
     which filters the batch uses), so it cannot be captured in a CUDA graph; running

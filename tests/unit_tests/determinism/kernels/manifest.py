@@ -688,8 +688,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         training_path=False,
         tests=(K + "test_flashinfer_sampling.py",),
-        notes="Per-row seed/offset replay and shared RNG isolation. Batch reordering remains "
-        "an explicit upstream blocker; the engine rejects request-local FlashInfer seeds.",
+        notes="Per-row seed/offset replay across batch layouts and shared RNG isolation. "
+        "Requires FlashInfer with batch-independent per-row Philox subsequences.",
     ),
     KernelEntry(
         name="inference_tp_layers",
