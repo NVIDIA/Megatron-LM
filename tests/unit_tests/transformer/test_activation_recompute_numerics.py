@@ -30,7 +30,7 @@ from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.global_vars import destroy_global_vars, set_global_variables, set_run_config
+from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -197,8 +197,7 @@ class TestActivationRecomputeNumerics:
             raise ValueError(f"Unknown precision test case: {precision}")
 
         validate_args(args)
-        set_global_variables(args, False)
-        set_run_config(pretrain_cfg_container_from_args(args))
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     @staticmethod
