@@ -302,11 +302,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # projects configs to symbols or synthesizes a pattern string.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             PipelineSplit,
-            Symbols,
             parse_hybrid_layer_config_list,
             parse_hybrid_pattern,
+            select_pipeline_segment,
             select_pipeline_segment_from_config_list,
-            select_pipeline_segment_with_logical_offset,
         )
 
         self.mtp_pattern = None
@@ -385,9 +384,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
                 **logging_pg_kwargs,
             )
-            # Config lists have no bracketed groups, so logical and physical offsets agree.
-            logical_layer_offset = layer_offset
-            transformer_sharded_keys = False
         else:
             parsed_pattern = parse_hybrid_pattern(self.hybrid_layer_pattern)
             self.mtp_pattern = parsed_pattern.mtp_pattern
@@ -413,24 +409,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM') "
                     "or hybrid_layer_config_list with MTPSplit markers."
                 )
-            # Bracketed-group patterns give every logical layer the structure of a
-            # transformer layer, so their checkpoints are made key-compatible with
-            # GPTModel. Derived from the full pattern rather than this rank's segment so
-            # every PP stage agrees on the naming. Ungrouped patterns use the HybridModel
-            # checkpoint keys.
-            transformer_sharded_keys = Symbols.GROUP_START in (parsed_pattern.main_pattern or '')
-            # Bracketed groups (e.g. ``[M*E]``) count as one logical layer for checkpoint
-            # keys but several physical layers for layer numbering, so track both offsets.
-            layer_config_list, layer_offset, logical_layer_offset = (
-                select_pipeline_segment_with_logical_offset(
-                    parsed_pattern.main_pattern or '',
-                    self.config,
-                    self.pg_collection.pp,
-                    vp_stage,
-                    first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-                    last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-                    **logging_pg_kwargs,
-                )
+            layer_config_list, layer_offset = select_pipeline_segment(
+                parsed_pattern.main_pattern or '',
+                self.config,
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+                **logging_pg_kwargs,
             )
 
         # Validate the full architecture, including MTP heads on other pipeline stages.
@@ -559,8 +545,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
-            logical_layer_offset=logical_layer_offset,
-            transformer_sharded_keys=transformer_sharded_keys,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,

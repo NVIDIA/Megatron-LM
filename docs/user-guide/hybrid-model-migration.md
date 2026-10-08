@@ -73,12 +73,11 @@ treated as a new architecture and benchmarked independently.
 
 Square brackets group consecutive layers into one logical layer, for example
 `[*E][*E]` or `M[M*E]`. HybridModel builds each group as one nested
-`HybridStack`, and the group occupies a single layer index in checkpoint keys:
-`[*-]` stores its attention and MLP under one `layers.<i>.` prefix, as a GPT
-transformer block does. Adding or removing brackets therefore changes the
-checkpoint keys of the affected layers. Each symbol inside a group still counts
-as one layer for layer numbering, so layer-indexed settings such as FP8 layer
-ranges and hash-routed MoE thresholds are unchanged.
+`HybridStack`. Groups change how layers execute, not what is stored: every layer
+keeps the layer number and distributed-checkpoint key it has in the pattern
+without brackets, so a `torch_dist` checkpoint saved with `[*E][*E]` loads into
+a model built with `*E*E`, and the reverse. Layer-indexed settings such as FP8
+layer ranges and hash-routed MoE thresholds are also unchanged.
 
 Use groups with MoE expert-parallel communication overlap
 (`--overlap-moe-expert-parallel-comm`). The overlap schedule interleaves one
@@ -91,8 +90,6 @@ Groups have the following constraints:
 - A group cannot be empty or nested, cannot span a `|` pipeline boundary, and
   cannot appear in an MTP pattern.
 - An MoE layer must be the last layer of its group.
-- The layers of a group must use different checkpoint namespaces: at most one
-  Mamba layer, one attention or GDN layer, and one MLP or MoE layer.
 - Groups cannot be combined with mHC connections, wide residual streams, or MoE
   shortcut connections.
 
