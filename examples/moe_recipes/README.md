@@ -2,7 +2,7 @@
 
 This directory contains self-contained MoE training recipes. Each YAML file includes:
 
-- `DEPENDENCIES`: PyTorch base image and Dockerfile content used for the recipe.
+- `DEPENDENCIES`: Base image and Dockerfile or qualified runtime artifact requirements.
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
 
@@ -21,6 +21,31 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td rowspan="3"><a href="glm5_2/README.md">GLM-5.2</a></td>
+      <td><a href="glm5_2/gb300/mxfp8_THD4K_256GPU_TP1PP4EP64CP64_full_cg_mok.yaml">GB300 MXFP8 THD 4K</a></td>
+      <td>256</td>
+      <td>1/4/64/64/1 (effective CP1)</td>
+      <td>1/2048/4096</td>
+      <td>MoK; full CG; fixed realized dynamic CP; repeated MTP7; selective layernorm recompute</td>
+      <td>See workload provenance</td>
+    </tr>
+    <tr>
+      <td><a href="glm5_2/gb300/mxfp8_THD128K_256GPU_TP1PP4EP64CP64_full_cg_mok.yaml">GB300 MXFP8 THD 128K</a></td>
+      <td>256</td>
+      <td>1/4/64/64/1 (effective CP32)</td>
+      <td>1/64/131072</td>
+      <td>MoK; full CG; fixed realized dynamic CP; repeated MTP7; selective layernorm recompute</td>
+      <td>See workload provenance</td>
+    </tr>
+    <tr>
+      <td><a href="glm5_2/gb300/mxfp8_THD1M_256GPU_TP1PP4EP64CP64_full_cg_mok.yaml">GB300 MXFP8 THD 1M</a></td>
+      <td>256</td>
+      <td>1/4/64/64/1 (effective CP64)</td>
+      <td>1/8/1048576</td>
+      <td>MoK; full CG; fixed realized dynamic CP; repeated MTP7; full uniform1 recompute</td>
+      <td>See workload provenance</td>
+    </tr>
     <tr>
       <td>DeepSeek-V4-Pro</td>
       <td><a href="deepseek_v4_pro/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
