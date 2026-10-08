@@ -469,6 +469,7 @@ class TestHybridModel:
             layout_state = SimpleNamespace(
                 prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
                 finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
+                get_layer_padding_mask=lambda index, default, masks_by_layout: default,
             )
             monkeypatch.setattr(
                 decoder,
