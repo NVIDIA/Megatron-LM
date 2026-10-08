@@ -1,13 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""CPU tests for owner assignment and packing, with P2P simulated in-process."""
-
-from types import SimpleNamespace
+"""Distributed tests for owner assignment and packing with real device meshes."""
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import Shard
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
     GroupOwnerLayout,
@@ -18,18 +24,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_plannin
 )
 
 
-def _mock_mesh(ranks, this_rank=None):
-    """Supply mesh metadata without initializing a process group for packing tests."""
-    rank_tensor = torch.tensor(ranks)
-    return SimpleNamespace(
-        mesh=rank_tensor,
-        ndim=rank_tensor.ndim,
-        size=lambda axis=None: rank_tensor.numel() if axis is None else rank_tensor.size(axis),
-        get_rank=lambda: ranks[0] if this_rank is None else this_rank,
-    )
-
-
-def _layout(shapes, offsets, size, dp_size):
+def _layout(
+    shapes: list[tuple[int, ...]], offsets: list[int], size: int, dp_size: int
+) -> GlobalLayout:
+    """Use explicit offsets so expected shard geometry is independent of packing."""
     return GlobalLayout(
         tensor_shapes=tuple(torch.Size(shape) for shape in shapes),
         tensor_to_offset=tuple(offsets),
@@ -38,20 +36,8 @@ def _layout(shapes, offsets, size, dp_size):
     )
 
 
-def _mock_group(layout, mesh):
-    """Supply only the group fields used by the owner-layout factory."""
-    return SimpleNamespace(
-        mesh=mesh,
-        main_weight=SimpleNamespace(layout=layout),
-        fsdp_parameters=tuple(
-            SimpleNamespace(sharded=nn.Parameter(torch.empty(shape)))
-            for shape in layout.tensor_shapes
-        ),
-    )
-
-
 @pytest.mark.parametrize(
-    'shapes, offsets, size, ranks, indices, expected',
+    "shapes, offsets, size, ranks, indices, expected",
     [
         # Equally expensive boundary tensors balance across their holders.
         ([(6, 4), (6, 4)], [0, 24], 48, [0, 1, 2], [0, 1], {0: 0, 1: 1}),
@@ -65,28 +51,48 @@ def _mock_group(layout, mesh):
         ([(4, 2)], [8], 16, [1, 3], [0], {0: 3}),
         # The local tensor's cost biases the boundary tensor toward the other holder.
         ([(2, 2), (8, 8)], [0, 8], 80, [1, 3], [0, 1], {0: 1, 1: 3}),
+        # Local work must count first even when the boundary tensor appears first.
+        ([(2, 2), (8, 8)], [0, 8], 80, [1, 3], [1, 0], {0: 1, 1: 3}),
         ([(4,)], [0], 8, [1, 3], [], {}),
     ],
 )
-def test_assign_owner_work(shapes, offsets, size, ranks, indices, expected):
-    assert (
-        assign_owner_work(_layout(shapes, offsets, size, len(ranks)), _mock_mesh(ranks), indices)
-        == expected
-    )
+def test_assign_owner_work(shapes, offsets, size, ranks, indices, expected, distributed_setup):
+    """Balance tensors on the specified mesh using a single-pass iterable of indices."""
+    if distributed_setup.world_size <= max(ranks):
+        pytest.skip(f"Mesh {ranks} requires at least {max(ranks) + 1} ranks.")
+    mesh = DeviceMesh(distributed_setup.device.type, ranks)
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the test mesh.")
+    layout = _layout(shapes, offsets, size, mesh.size())
+    assert assign_owner_work(layout, mesh, iter(indices)) == expected
 
 
-def test_assign_owner_work_requires_a_nonempty_shard():
-    with pytest.raises(RuntimeError, match='No eligible owner for tensor 0'):
-        assign_owner_work(_layout([(0, 2)], [0], 8, 2), _mock_mesh([1, 3]), [0])
+def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    with pytest.raises(RuntimeError, match="No eligible owner for tensor 0"):
+        assign_owner_work(_layout([(0, 2)], [0], 4 * mesh.size(), mesh.size()), mesh, [0])
 
 
 def test_ns_cost_uses_full_shape():
     assert ns_cost_fn(5)(torch.Size((2, 3, 4))) == 24 * (2 * 5 + 1)
 
 
-def test_group_owner_layout_reuses_dbuffer_layout():
-    layout = _layout([(6, 3), (4,), (4, 2)], [0, 18, 22], 36, 3)
-    group = _mock_group(layout, _mock_mesh([1, 3, 5]))
+def test_group_owner_layout_reuses_dbuffer_layout(distributed_setup):
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    module = nn.ParameterList(
+        nn.Parameter(torch.zeros(shape, device=distributed_setup.device))
+        for shape in [(6, 3), (4,), (4, 2)]
+    )
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(
+            module,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+            ),
+        )
+    (group,) = module.parameter_groups
+    layout = group.main_weight.layout
     plan = GroupOwnerLayout.from_group(group)
     assert plan.mesh is group.mesh
     assert plan.layout is layout
@@ -94,9 +100,21 @@ def test_group_owner_layout_reuses_dbuffer_layout():
     assert plan.owners == assign_owner_work(layout, group.mesh, [0, 2])
 
 
-def test_group_owner_layout_custom_eligibility_and_cost():
-    layout = _layout([(6, 3), (4, 2), (2, 2)], [0, 18, 26], 36, 3)
-    group = _mock_group(layout, _mock_mesh([4, 1, 7]))
+def test_group_owner_layout_custom_eligibility_and_cost(distributed_setup):
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    module = nn.ParameterList(
+        nn.Parameter(torch.zeros(shape, device=distributed_setup.device))
+        for shape in [(6, 3), (4, 2), (2, 2)]
+    )
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(
+            module,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+            ),
+        )
+    (group,) = module.parameter_groups
     seen_shapes = []
 
     def cost(shape):
@@ -104,32 +122,47 @@ def test_group_owner_layout_custom_eligibility_and_cost():
         return shape.numel()
 
     plan = GroupOwnerLayout.from_group(group, cost_fn=cost, eligible_fn=lambda p: p.numel() >= 8)
-    assert plan.layout is layout
+    assert plan.layout is group.main_weight.layout
     assert set(plan.owners) == {0, 1}
     assert seen_shapes == [torch.Size((6, 3)), torch.Size((4, 2))]
 
 
-def _simulate_p2p(plans):
-    """Deliver each packed peer buffer to its destination's receive dictionary."""
-    received = {rank: {} for rank in plans}
-    for src, plan in plans.items():
-        for dest, buffer in plan.send_buffers.items():
-            received[dest][src] = buffer.clone()
-    for rank, plan in plans.items():
-        assert {src: buffer.numel() for src, buffer in received[rank].items()} == plan.recv_sizes
+def _exchange_buffers(
+    plan: OwnerGatherPlan | OwnerScatterPlan, device: torch.device
+) -> dict[int, torch.Tensor]:
+    """Exchange packed buffers using the plan's global peer ranks and receive sizes."""
+    received = {
+        src: torch.empty(numel, dtype=torch.float32, device=device)
+        for src, numel in plan.recv_sizes.items()
+    }
+    ops = [dist.P2POp(dist.irecv, buffer, src) for src, buffer in received.items()]
+    ops.extend(dist.P2POp(dist.isend, buffer, dest) for dest, buffer in plan.send_buffers.items())
+    if ops:
+        for request in dist.batch_isend_irecv(ops):
+            request.wait()
     return received
 
 
-@pytest.mark.parametrize('ranks', [(0, 1, 2), (4, 1, 7)])
-def test_pack_gather_scatter_round_trip(ranks):
+@pytest.mark.parametrize("ranks", [(0, 1, 2), (4, 1, 7)])
+def test_pack_gather_scatter_round_trip(ranks, distributed_setup):
     """Reconstruct full tensors and scatter changed results using global peer ranks.
 
     The hand-written shard slices check geometry independently of the range helpers.
     The last tensor is fully local, and the buffer includes trailing padding.
     """
+    if distributed_setup.world_size <= max(ranks):
+        pytest.skip(f"Mesh {ranks} requires at least {max(ranks) + 1} ranks.")
+    device = distributed_setup.device
+    mesh = DeviceMesh(device.type, ranks)
+    # Initialize WORLD on every rank before a subset uses it for batched P2P.
+    dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the test mesh.")
+    rank = mesh.get_rank()
+    index = ranks.index(rank)
     layout = _layout([(6, 3), (4, 2), (2, 2)], [0, 18, 26], 36, 3)
     fulls = {
-        i: torch.arange(shape.numel(), dtype=torch.float32).view(shape) + 100 * i
+        i: torch.arange(shape.numel(), dtype=torch.float32, device=device).view(shape) + 100 * i
         for i, shape in enumerate(layout.tensor_shapes)
     }
     slices = [
@@ -137,71 +170,71 @@ def test_pack_gather_scatter_round_trip(ranks):
         {0: slice(12, 18), 1: slice(0, 6)},
         {1: slice(6, 8), 2: slice(0, 4)},
     ]
-    owner_plans = {}
-    gather_plans = {}
-    for rank, local_slices in zip(ranks, slices):
-        mesh = _mock_mesh(ranks, rank)
-        owners = assign_owner_work(layout, mesh, range(3))
-        assert owners == {i: ranks[i] for i in range(3)}
-        # Deliberately reverse dictionary order; packing must follow tensor indices.
-        plan = GroupOwnerLayout(mesh, layout, dict(reversed(list(owners.items()))))
-        owner_plans[rank] = plan
-        shards = {i: fulls[i].flatten()[part].clone() for i, part in local_slices.items()}
-        gather_plans[rank] = OwnerGatherPlan.pack(plan, shards)
+    local_slices = slices[index]
+    owners = assign_owner_work(layout, mesh, range(3))
+    assert owners == {i: ranks[i] for i in range(3)}
+    # Deliberately reverse dictionary order; packing must follow tensor indices.
+    plan = GroupOwnerLayout(mesh, layout, dict(reversed(list(owners.items()))))
+    shards = {i: fulls[i].flatten()[part].clone() for i, part in local_slices.items()}
+    gather = OwnerGatherPlan.pack(plan, shards)
+    assert gather.recv_sizes == [{ranks[1]: 6}, {ranks[2]: 2}, {}][index]
+    gathered = _exchange_buffers(gather, device)
+    full = gather.reconstruct_full(index, gathered)
+    torch.testing.assert_close(full, fulls[index].flatten(), atol=0, rtol=0)
 
-    gathered = _simulate_p2p(gather_plans)
-    assert gather_plans[ranks[0]].recv_sizes == {ranks[1]: 6}
-    assert gather_plans[ranks[2]].recv_sizes == {}
-    scatter_plans = {}
-    for i, rank in enumerate(ranks):
-        full = gather_plans[rank].reconstruct_full(i, gathered[rank])
-        torch.testing.assert_close(full, fulls[i].flatten(), atol=0, rtol=0)
-        scatter_plans[rank] = OwnerScatterPlan.pack(
-            owner_plans[rank], {i: (full + 1).view(fulls[i].shape)}
-        )
-
-    scattered = _simulate_p2p(scatter_plans)
-    for rank, local_slices in zip(ranks, slices):
-        results = scatter_plans[rank].unpack(scattered[rank])
-        assert set(results) == {i for i in local_slices if owner_plans[rank].owners[i] != rank}
-        for i, result in results.items():
-            expected = fulls[i].flatten()[local_slices[i]] + 1
-            torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    scatter = OwnerScatterPlan.pack(plan, {index: (full + 1).view(fulls[index].shape)})
+    scattered = _exchange_buffers(scatter, device)
+    results = scatter.unpack(scattered)
+    assert set(results) == {i for i in local_slices if owners[i] != rank}
+    for i, result in results.items():
+        expected = fulls[i].flatten()[local_slices[i]] + 1
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
-def test_pack_preserves_buffer_order_on_2d_mesh():
+def test_pack_preserves_buffer_order_on_2d_mesh(distributed_setup):
+    if distributed_setup.world_size < 4:
+        pytest.skip("The 2D mesh requires at least 4 ranks.")
+    device = distributed_setup.device
+    mesh = DeviceMesh(device.type, [[3, 1], [0, 2]])
+    # Initialize WORLD on every rank before a subset uses it for batched P2P.
+    dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the test mesh.")
     layout = _layout([(8, 4)], [0], 32, 4)
-    full = torch.arange(32, dtype=torch.float32)
+    full = torch.arange(32, dtype=torch.float32, device=device)
     # Reverse-axis sharding orders the chunks as ranks 3, 0, 1, 2.
     offsets = {3: 0, 0: 8, 1: 16, 2: 24}
-    owner_plans = {}
-    gather_plans = {}
-    for rank, offset in offsets.items():
-        mesh = _mock_mesh([[3, 1], [0, 2]], rank)
-        owners = assign_owner_work(layout, mesh, [0])
-        assert owners == {0: 3}
-        plan = GroupOwnerLayout(mesh, layout, owners)
-        owner_plans[rank] = plan
-        gather_plans[rank] = OwnerGatherPlan.pack(plan, {0: full[offset : offset + 8]})
-    received = _simulate_p2p(gather_plans)
-    torch.testing.assert_close(gather_plans[3].reconstruct_full(0, received[3]), full)
+    rank = mesh.get_rank()
+    offset = offsets[rank]
+    owners = assign_owner_work(layout, mesh, [0])
+    assert owners == {0: 3}
+    plan = GroupOwnerLayout(mesh, layout, owners)
+    gather = OwnerGatherPlan.pack(plan, {0: full[offset : offset + 8]})
+    received = _exchange_buffers(gather, device)
+    if rank == 3:
+        torch.testing.assert_close(gather.reconstruct_full(0, received), full)
 
-    scatter_plans = {
-        rank: OwnerScatterPlan.pack(plan, {0: full + 1} if rank == 3 else {})
-        for rank, plan in owner_plans.items()
-    }
-    received = _simulate_p2p(scatter_plans)
-    for rank, plan in scatter_plans.items():
-        result = plan.unpack(received[rank])
-        if rank == 3:
-            assert result == {}
-        else:
-            offset = offsets[rank]
-            torch.testing.assert_close(result[0], full[offset : offset + 8] + 1)
+    scatter = OwnerScatterPlan.pack(plan, {0: full + 1} if rank == 3 else {})
+    received = _exchange_buffers(scatter, device)
+    result = scatter.unpack(received)
+    if rank == 3:
+        assert result == {}
+    else:
+        torch.testing.assert_close(result[0], full[offset : offset + 8] + 1)
 
 
-def test_pack_with_no_eligible_params():
-    group = _mock_group(_layout([(16,)], [0], 16, 2), _mock_mesh([1, 3]))
+def test_pack_with_no_eligible_params(distributed_setup):
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    module = nn.ParameterList([nn.Parameter(torch.zeros(16, device=distributed_setup.device))])
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(
+            module,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+            ),
+        )
+    (group,) = module.parameter_groups
     plan = GroupOwnerLayout.from_group(group)
     assert plan.layout is group.main_weight.layout
     assert plan.owners == {}
