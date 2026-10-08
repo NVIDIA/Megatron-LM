@@ -46,9 +46,7 @@ def test_omitted_collection_warns_and_uses_global_groups(mocker, explicit_groups
     )
     mocker.patch('torch.distributed.is_initialized', return_value=True)
     kwargs = {'pg_collection': None} if pass_none else {}
-    with pytest.warns(
-        DeprecationWarning, match='LanguageModule was called without `pg_collection`'
-    ):
+    with pytest.warns(FutureWarning, match='LanguageModule was called without `pg_collection`'):
         model = LanguageModule(config(), **kwargs)
     global_groups.assert_called_once_with()
     assert model.pg_collection is explicit_groups
