@@ -852,10 +852,9 @@ def _get_megatron_emerging_optimizer(
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
-    # The DistOpt-vs-LayerWise buffer split only happens when DDP was wrapped
-    # with ``use_distributed_optimizer=True`` (i.e. the layout-based path); in
-    # legacy ping-pong mode all params share one unpadded DDP buffer that
-    # DistOpt cannot manage, so we keep non-Muon params inside LayerWise.
+    # Both LayerWise layouts keep a DistOpt buffer for non-Muon parameters. Only compact
+    # Muon buffers receive a local DDP config with use_distributed_optimizer=False.
+    # Direct construction without DistOpt-capable DDP buffers retains the legacy fallback.
     ddp_uses_distributed_optimizer = (
         bool(getattr(model_chunks[0], 'ddp_config', None))
         and model_chunks[0].ddp_config.use_distributed_optimizer
@@ -868,8 +867,7 @@ def _get_megatron_emerging_optimizer(
         assert ddp_config.num_distributed_optimizer_instances == 1, (
             "Layer-wise + DistributedOptimizer split path does not yet support "
             "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
+            "is hardcoded to 0 in this path."
         )
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
@@ -950,9 +948,7 @@ def _get_megatron_emerging_optimizer(
                         "Non-emerging expert-parallel param groups are not yet "
                         "supported on the layer-wise + DistributedOptimizer "
                         "path: they need a separate DistOpt instance with the "
-                        "expert-DP process group, which is not wired up yet. "
-                        "Disable use_layer_wise_param_layout to fall back to "
-                        "the legacy LayerWise ping-pong path for MoE models."
+                        "expert-DP process group, which is not wired up yet."
                     )
                 fallback_config.use_distributed_optimizer = True
                 result = _get_megatron_optimizer_based_on_param_groups(

@@ -1797,6 +1797,28 @@ def validate_args(args, defaults={}):
         "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
     )
 
+    if args.use_layer_wise_distributed_optimizer:
+        assert args.num_distributed_optimizer_instances == 1, (
+            "LayerWise Muon with sibling Adam DistributedOptimizer requires "
+            "num_distributed_optimizer_instances == 1."
+        )
+        if not args.use_layer_wise_param_layout:
+            # Compact gather supports whole plain MXFP8/blockwise parameters. Preserve
+            # the existing padded path's capabilities and the MXFP8 opt-in semantics.
+            assert not getattr(args, 'fp4_param_gather', False), (
+                "Compact LayerWise parameter gather does not support NVFP4 parameters."
+            )
+            if args.fp8_param_gather:
+                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
+                    "Compact LayerWise FP8 parameter gather supports only mxfp8 and "
+                    f"blockwise recipes; got {args.fp8_recipe!r}."
+                )
+                if args.fp8_recipe == 'mxfp8':
+                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                        "Compact LayerWise MXFP8 parameter gather requires "
+                        "--reuse-grad-buf-for-mxfp8-param-ag."
+                    )
+
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
@@ -3113,14 +3135,12 @@ def _add_distributed_args(parser):
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',
-                       help='Opt out of the precomputed LayerWise param layout. When set, '
-                       'falls back to the legacy LayerWise ping-pong path: all params '
-                       '(including non-Muon embeddings, biases, layernorm) live in a single '
-                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-                       'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
-                       'and so will not match legacy-path loss curves bit-for-bit.')
+                       help='Use compact LayerWise (Muon) buffers instead of shard-aligned '
+                       'padding. Muon gradients use all-reduce and parameters use whole-parameter '
+                       'all-gather. Sibling Adam parameters retain DistributedOptimizer sharding '
+                       'with either layout. FP8 gather staging is independent of this toggle. '
+                       'The layouts can produce different reduction ordering and are not '
+                       'guaranteed to match loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
