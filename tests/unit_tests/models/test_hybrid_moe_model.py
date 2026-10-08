@@ -354,7 +354,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_mup": False,
     "use_ring_exchange_p2p": False,
     "use_te_activation_func": False,
-    "use_te_rng_tracker": False,
+    # RNGConfig now propagates the fixture's te_rng_tracker=True; the old
+    # args adapter missed this differently named field and left it False.
+    "use_te_rng_tracker": True,
     "variable_seq_lengths": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
