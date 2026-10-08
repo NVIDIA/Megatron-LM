@@ -21,6 +21,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -119,6 +120,25 @@ def _require_te_tanh_clamp_support(config) -> None:
         "Transformer Engine providing ops.ScaledTanhSReLU(tanh_clamp_scale=...). Upgrade "
         "Transformer Engine, or unset use_transformer_engine_op_fuser to use the unfused path."
     )
+
+
+def _paged_stash_group_start(
+    hidden_states: torch.Tensor, probs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mark the start of the expert layer group for paged stashing.
+
+    The schedule hook is an identity autograd Function, whose output autograd derives with
+    ``view_as``. A Transformer Engine GroupedTensor, the expert input under MXFP8 token dispatch,
+    does not support that, so the hook then goes on the probs: they feed the same fused op, so
+    the hook still runs before its forward and after its backward.
+    """
+    if not is_grouped_tensor(hidden_states):
+        return paged_stash_group_start(hidden_states), probs
+    assert probs.requires_grad or not torch.is_grad_enabled(), (
+        "Paged stashing with a GroupedTensor expert input needs probs that require grad, to run "
+        "the schedule hook in backward."
+    )
+    return hidden_states, paged_stash_group_start(probs)
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -858,7 +878,9 @@ class TEGroupedMLP(MegatronModule):
         # if the number of tokens is 0, pad the hidden states to 256
 
         if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            permuted_local_hidden_states, permuted_probs = _paged_stash_group_start(
+                permuted_local_hidden_states, permuted_probs
+            )
             max_num_tokens = permuted_local_hidden_states.shape[0]
             # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
             # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
