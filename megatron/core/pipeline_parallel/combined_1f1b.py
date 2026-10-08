@@ -1,5 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Combined 1F1B schedules for fine-grained expert-parallel overlap.
+
+The schedule decomposes a model chunk into nodes and co-schedules forward and
+backward nodes from different microbatches on compute and communication streams.
+"""
+
 import contextlib
 from contextlib import nullcontext
 from typing import List, Union
@@ -380,12 +386,6 @@ def combined_forward_backward_step(
         with context_manager:  # autocast context
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
-            )
-            from megatron.core.models.gpt.gpt_model import GPTModel
-
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
             )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True

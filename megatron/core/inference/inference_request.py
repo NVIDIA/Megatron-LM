@@ -380,6 +380,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+    num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -740,6 +741,7 @@ class DynamicInferenceRequestRecord:
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
+            num_cached_tokens=self.requests[0].num_cached_tokens,
         )
 
         return request

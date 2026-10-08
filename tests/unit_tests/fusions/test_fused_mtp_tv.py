@@ -26,8 +26,21 @@ def _run_tv_and_gradient(function, draft_data, target_logits, grad_output):
     return output.detach(), draft_logits.grad.detach()
 
 
+def _assert_fp16_gradient_close(actual_grad, reference_grad):
+    assert actual_grad.dtype == torch.float16
+    actual_fp32 = actual_grad.float()
+    reference_fp32 = reference_grad.float()
+    # Allow two FP16 subnormal ULPs without masking small full-vocabulary gradients.
+    torch.testing.assert_close(actual_fp32, reference_fp32, rtol=1e-3, atol=2**-23)
+    reference_norm = torch.linalg.vector_norm(reference_fp32)
+    assert reference_norm > 0
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(actual_fp32), reference_norm, rtol=2e-3, atol=0
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("vocab_size", [257, 154880])
 def test_fused_mtp_tv_matches_native_forward_and_backward(dtype, vocab_size):
     """Cover an odd block tail and GLM-5.2's production vocabulary."""
@@ -51,10 +64,41 @@ def test_fused_mtp_tv_matches_native_forward_and_backward(dtype, vocab_size):
         _native_tv_distance, draft_data, target_logits, grad_output
     )
 
-    rtol = 3e-3 if dtype == torch.bfloat16 else 1e-5
-    atol = 3e-3 if dtype == torch.bfloat16 else 1e-6
-    torch.testing.assert_close(actual, reference, rtol=rtol, atol=atol)
-    torch.testing.assert_close(actual_grad, reference_grad, rtol=rtol, atol=atol)
+    if dtype == torch.float16:
+        torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+        _assert_fp16_gradient_close(actual_grad, reference_grad)
+    else:
+        rtol = 3e-3 if dtype == torch.bfloat16 else 1e-5
+        atol = 3e-3 if dtype == torch.bfloat16 else 1e-6
+        torch.testing.assert_close(actual, reference, rtol=rtol, atol=atol)
+        torch.testing.assert_close(actual_grad, reference_grad, rtol=rtol, atol=atol)
+    assert target_logits.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_mtp_tv_fp16_applies_upstream_scale_before_gradient_cast():
+    """Small full-vocabulary gradients retain FP32 loss scaling before the FP16 store."""
+    torch.manual_seed(1235)
+    draft_data = torch.randn(2, 154880, device="cuda", dtype=torch.float16)
+    target_logits = torch.randn_like(draft_data, requires_grad=True)
+    grad_output = torch.tensor([1e-3, -2e-3], device="cuda", dtype=torch.float32)
+    loss_scale = 65536.0
+
+    assert fused_mtp_tv_unavailable_reason(draft_data, target_logits) is None
+    actual, actual_grad = _run_tv_and_gradient(
+        lambda draft, target: vocab_parallel_tv_distance(
+            draft, target, logits_are_vocab_sharded=False
+        ),
+        draft_data,
+        target_logits,
+        grad_output * loss_scale,
+    )
+    reference, reference_grad = _run_tv_and_gradient(
+        _native_tv_distance, draft_data.float(), target_logits, grad_output
+    )
+
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+    _assert_fp16_gradient_close(actual_grad, reference_grad * loss_scale)
     assert target_logits.grad is None
 
 
@@ -192,7 +236,7 @@ def test_fused_mtp_tv_saves_only_compact_full_vocab_metadata():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_fused_mtp_tv_is_deterministic(dtype):
     """Repeated launches of the same implementation are bitwise stable."""
     torch.manual_seed(2026)

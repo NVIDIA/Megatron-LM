@@ -107,7 +107,10 @@ def test_dp_dimension_controls_dense_microbatch_contract():
     assert ps.dp_cp_rank == 5
 
 
-def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
+def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
     ps = ParallelState(ep_size=1, ep_rank=0)
@@ -127,3 +130,89 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
 
     combined.sum().backward()
     torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
+
+
+def test_ep_token_dispatcher_sums_scores_for_duplicate_experts(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+
+    ps = ParallelState(ep_size=1, ep_rank=0)
+    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
+    hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
+    topk_indices = torch.tensor([[1, 1, 2], [0, 2, 0]])
+    topk_scores = torch.tensor([[0.2, 0.3, 0.5], [0.1, 0.4, 0.5]], requires_grad=True)
+
+    _, tokens_per_expert, dispatched_probs = dispatcher.dispatch(
+        hidden, topk_scores, topk_indices
+    )
+
+    torch.testing.assert_close(tokens_per_expert, torch.tensor([1, 1, 2]))
+    torch.testing.assert_close(dispatched_probs, torch.tensor([0.6, 0.5, 0.5, 0.4]))
+    dispatched_probs.sum().backward()
+    torch.testing.assert_close(topk_scores.grad, torch.ones_like(topk_scores))
+
+
+def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
+    monkeypatch,
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import dispatcher as dispatcher_module
+
+    def fake_all_gather(output, local_counts, group):
+        del group
+        output.zero_()
+        output[: local_counts.numel()].copy_(local_counts)
+
+    monkeypatch.setattr(dispatcher_module.dist, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(dispatcher_module.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(
+        dispatcher_module._AllToAll,
+        "apply",
+        staticmethod(lambda tensor, input_splits, output_splits, group: tensor),
+    )
+
+    dispatcher = dispatcher_module.TokenDispatcher(
+        num_experts=4,
+        hidden_size=2,
+        ps=ParallelState(ep_size=2, ep_rank=0, ep_group=object()),
+        use_deepep=False,
+    )
+    hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
+    topk_indices = torch.tensor([[1, 1, 0], [0, 1, 0]])
+    topk_scores = torch.tensor([[0.2, 0.3, 0.5], [0.1, 0.4, 0.5]])
+
+    _, tokens_per_expert, dispatched_probs = dispatcher._dispatch_alltoall(
+        hidden, topk_scores, topk_indices
+    )
+
+    torch.testing.assert_close(tokens_per_expert, torch.tensor([2, 2]))
+    torch.testing.assert_close(dispatched_probs, torch.tensor([0.5, 0.6, 0.5, 0.4]))
+
+
+def test_deepep_dispatch_finish_sums_scores_for_duplicate_experts(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+
+    dispatcher = TokenDispatcher(
+        num_experts=3,
+        hidden_size=2,
+        ps=ParallelState(ep_size=1, ep_rank=0),
+        use_deepep=False,
+    )
+    recv_hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
+    recv_indices = torch.tensor([[1, 1, 2], [0, 2, 0]])
+    recv_probs = torch.tensor([[0.2, 0.3, 0.5], [0.1, 0.4, 0.5]], requires_grad=True)
+
+    _, tokens_per_expert, dispatched_probs = dispatcher._finish_deepep_dispatch(
+        recv_hidden, recv_indices, recv_probs, [1, 1, 2]
+    )
+
+    torch.testing.assert_close(tokens_per_expert, torch.tensor([1, 1, 2]))
+    torch.testing.assert_close(dispatched_probs, torch.tensor([0.6, 0.5, 0.5, 0.4]))
+    dispatched_probs.sum().backward()
+    torch.testing.assert_close(recv_probs.grad, torch.ones_like(recv_probs))

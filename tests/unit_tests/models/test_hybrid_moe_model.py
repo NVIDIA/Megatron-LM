@@ -93,11 +93,13 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_cp_balance_indexer": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
+    "dsa_indexer_precision": "bf16",
     "dsa_indexer_rope_interleaved": False,
     "dsa_indexer_rotate_activation": True,
     "dsa_indexer_scoring_relu": True,
@@ -114,6 +116,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_cuda_graph": False,
     "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
+    "ep_overlap_use_scheduled_tensor_release": False,
     "experimental_attention_variant": None,
     "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
@@ -204,14 +207,19 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_flex_dispatcher_num_sms": None,
     "moe_grad_scale_func": None,
     "moe_grouped_gemm": True,
+    "moe_use_grouped_tensor": False,
     "moe_hybridep_num_sms": None,
     "moe_hybridep_num_sms_preprocessing": 108,
     "moe_hybridep_num_blocks_permute": None,
     "moe_hybridep_num_blocks_unpermute": None,
+    "moe_hybridep_routing_map_mode": "indices",
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
+    "moe_latent_up_projection_rmsnorm": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_megakernel_backend": None,
+    "moe_megakernel_backend_config": None,
     "moe_n_hash_layers": 0,
     "moe_ncclep_static_shape": False,
     "moe_ncclep_use_symm_mem": False,
@@ -235,6 +243,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_padding_for_fp8": False,
     "moe_router_padding_for_quantization": False,
     "moe_router_pre_softmax": False,
+    "moe_router_qb_num_bins": 1000,
+    "moe_router_quantile_balancing_estimation_scope": "global_batch",
     "moe_router_score_function": "sigmoid",
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
@@ -304,6 +314,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "rotary_base_per_layer": None,
     "rotary_interleaved": False,
     "sequence_parallel": True,
+    "situ_glu_beta1": 4.0,
+    "situ_glu_beta2": 25.0,
     "softmax_scale": None,
     "softmax_type": "vanilla",
     "symmetric_ar_type": None,
@@ -338,6 +350,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_te_activation_func": False,
     "use_te_rng_tracker": False,
     "variable_seq_lengths": False,
+    "pipeline_p2p_fixed_shape": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
@@ -647,6 +660,7 @@ class TestHybridMoEModel:
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        padding_mask = torch.ones_like(input_ids, dtype=torch.bool)
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
@@ -655,6 +669,7 @@ class TestHybridMoEModel:
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             runtime_gather_output=True,
         )
 

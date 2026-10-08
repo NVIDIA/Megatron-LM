@@ -15,6 +15,7 @@ _HF_FIELDS = frozenset(
         "num_key_value_heads",
         "head_dim",
         "vocab_size",
+        "intermediate_size",
         "rms_norm_eps",
         "max_position_embeddings",
         "router_aux_loss_coef",
@@ -42,14 +43,16 @@ _HF_FIELDS = frozenset(
 
 @dataclass
 class Qwen35Config:
-    """Pure Qwen3.5-35B-A3B architecture parameters."""
+    """Qwen3.5 architecture parameters."""
 
+    model_type: str = "qwen3_5_moe"
     num_hidden_layers: int = 40
     hidden_size: int = 2048
     num_attention_heads: int = 16
     num_key_value_heads: int = 2
     head_dim: int = 256
     vocab_size: int = 248320
+    intermediate_size: int | None = None
     rms_norm_eps: float = 1e-6
     max_position_embeddings: int = 262144
     router_aux_loss_coef: float = 0.001
@@ -70,6 +73,7 @@ class Qwen35Config:
     partial_rotary_factor: float = 0.25
     rope_theta: float = 10_000_000.0
     mrope_section: list[int] | None = None
+    hf_text_prefix: str = "model.language_model"
     num_nextn_predict_layers: int = 0
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_dedicated_embeddings: bool = False
@@ -83,6 +87,10 @@ class Qwen35Config:
     @property
     def rotary_dim(self) -> int:
         return int(self.head_dim * self.partial_rotary_factor)
+
+    @property
+    def is_moe(self) -> bool:
+        return self.model_type == "qwen3_5_moe"
 
     @property
     def full_attn_qkv_size(self) -> int:
@@ -145,6 +153,15 @@ class Qwen35Config:
         _check(self.head_dim > 0, f"head_dim must be > 0, got {self.head_dim}")
         _check(self.vocab_size > 0, f"vocab_size must be > 0, got {self.vocab_size}")
         _check(
+            self.hf_text_prefix in {"model", "model.language_model"},
+            "hf_text_prefix must be 'model' or 'model.language_model', "
+            f"got {self.hf_text_prefix!r}",
+        )
+        _check(
+            self.model_type in {"qwen3_5", "qwen3_5_moe"},
+            f"model_type must be qwen3_5 or qwen3_5_moe, got {self.model_type!r}",
+        )
+        _check(
             self.num_attention_heads >= 1,
             f"num_attention_heads must be >= 1, got {self.num_attention_heads}",
         )
@@ -153,20 +170,28 @@ class Qwen35Config:
             f"num_attention_heads({self.num_attention_heads}) must be divisible by "
             f"num_key_value_heads({self.num_key_value_heads})",
         )
-        _check(self.num_experts >= 1, f"num_experts must be >= 1, got {self.num_experts}")
-        _check(
-            1 <= self.num_experts_per_tok <= self.num_experts,
-            f"num_experts_per_tok({self.num_experts_per_tok}) must be in "
-            f"[1, num_experts({self.num_experts})]",
-        )
-        _check(
-            self.moe_intermediate_size > 0,
-            f"moe_intermediate_size must be > 0, got {self.moe_intermediate_size}",
-        )
-        _check(
-            self.shared_expert_intermediate_size > 0,
-            f"shared_expert_intermediate_size must be > 0, got {self.shared_expert_intermediate_size}",
-        )
+        if self.is_moe:
+            _check(self.num_experts >= 1, f"num_experts must be >= 1, got {self.num_experts}")
+            _check(
+                1 <= self.num_experts_per_tok <= self.num_experts,
+                f"num_experts_per_tok({self.num_experts_per_tok}) must be in "
+                f"[1, num_experts({self.num_experts})]",
+            )
+            _check(
+                self.moe_intermediate_size > 0,
+                f"moe_intermediate_size must be > 0, got {self.moe_intermediate_size}",
+            )
+            _check(
+                self.shared_expert_intermediate_size > 0,
+                f"shared_expert_intermediate_size must be > 0, "
+                f"got {self.shared_expert_intermediate_size}",
+            )
+        else:
+            _check(
+                self.intermediate_size is not None and self.intermediate_size > 0,
+                f"intermediate_size must be > 0 for dense Qwen3.5, "
+                f"got {self.intermediate_size}",
+            )
         _check(
             self.linear_num_key_heads >= 1,
             f"linear_num_key_heads must be >= 1, got {self.linear_num_key_heads}",
@@ -230,9 +255,17 @@ class Qwen35Config:
 
     @classmethod
     def _from_hf_dict(cls, hf: dict, **overrides) -> Qwen35Config:
-        if "text_config" in hf and isinstance(hf["text_config"], dict):
-            hf = hf["text_config"]
+        model_type = hf.get("model_type")
+        if model_type not in {"qwen3_5", "qwen3_5_moe"}:
+            raise ValueError(f"Unsupported Qwen3.5 model_type: {model_type!r}")
+
+        text_hf = hf.get("text_config")
+        is_composite = isinstance(text_hf, dict)
+        if is_composite:
+            hf = text_hf
         kwargs = {k: v for k, v in hf.items() if k in _HF_FIELDS}
+        kwargs["model_type"] = model_type
+        kwargs["hf_text_prefix"] = "model.language_model" if is_composite else "model"
         mtp_num_hidden_layers = kwargs.pop("mtp_num_hidden_layers", None)
         if kwargs.get("num_nextn_predict_layers") is None and mtp_num_hidden_layers is not None:
             kwargs["num_nextn_predict_layers"] = int(mtp_num_hidden_layers)

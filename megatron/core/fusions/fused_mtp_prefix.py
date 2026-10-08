@@ -95,10 +95,10 @@ def fused_mtp_prefix_unavailable_reason(acceptances: Tensor) -> Optional[str]:
         return "Triton is not available"
     if not acceptances.is_cuda:
         return "acceptances are not a CUDA tensor"
-    # The fused TV primitive produces FP32 acceptance probabilities for both
-    # BF16 and FP32 logits. Keep this internal contract narrow instead of
-    # introducing different BF16 prefix-rounding semantics that production
-    # cannot exercise.
+    # The fused TV primitive produces FP32 acceptance probabilities for FP16,
+    # BF16, and FP32 logits. Keep this internal contract narrow instead of
+    # introducing different low-precision prefix-rounding semantics that
+    # production cannot exercise.
     if acceptances.dtype != torch.float32:
         return f"acceptance dtype {acceptances.dtype} is not supported"
     if acceptances.ndim == 0 or acceptances.size(0) == 0:

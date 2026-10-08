@@ -43,6 +43,7 @@ _LAZY_LINEAR_EXPORTS = {
     "VanillaColumnParallelLinear",
     "VocabParallelEmbedding",
     "VocabParallelOutput",
+    "all_gather_last_dim_with_grad_reduce",
     "pad_vocab_for_tp",
 }
 
@@ -66,6 +67,7 @@ __all__ = [
     "VanillaColumnParallelLinear",
     "VocabParallelEmbedding",
     "VocabParallelOutput",
+    "all_gather_last_dim_with_grad_reduce",
     "build_pipeline_chunk_layout",
     "forward_backward_pipelining",
     "gather_for_non_sp_head",

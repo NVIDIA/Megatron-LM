@@ -145,9 +145,6 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
-# Reduce memory usage by NCCL
-export NCCL_MAX_NCHANNELS=1
-export NCCL_NVLS_ENABLE=0
 export ONE_LOGGER_JOB_CATEGORY=test
 
 # Run a pytest command. On marker-driven platforms a bucket can legitimately

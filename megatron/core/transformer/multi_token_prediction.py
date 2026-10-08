@@ -1787,7 +1787,6 @@ def _process_mtp_e2e_tv_loss(
 
     if is_training:
         collect_acceptance = MTPLossLoggingHelper.should_collect_acceptance()
-        avg_group = dp_cp_group
         for mtp_layer_number in range(config.mtp_num_layers):
             correct = None
             total = None
@@ -1801,7 +1800,7 @@ def _process_mtp_e2e_tv_loss(
                 config.mtp_num_layers,
                 correct=correct,
                 total=total,
-                avg_group=avg_group,
+                avg_group=dp_cp_group,
                 calculate_per_token_loss=config.calculate_per_token_loss,
             )
 
@@ -1865,6 +1864,7 @@ def process_mtp_loss(
         sequence_roll_context (Optional[MTPSequenceRollContext]): Layout-specific
             metadata shared by MTP rolls in this microbatch.
         dp_cp_group (Optional[ProcessGroup]): Data and context parallelism process group.
+            Training callers that omit it use the default MPU group for either objective.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -1908,6 +1908,10 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum() if config.calculate_per_token_loss else None
+
+    if is_training and dp_cp_group is None:
+        # Migration fallback for training callers that omit the logging group.
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     if config.mtp_loss_type == "e2e_tv":
         assert output_weight is not None
@@ -1984,7 +1988,7 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 correct=correct,
                 total=total,
-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                avg_group=dp_cp_group,
                 calculate_per_token_loss=config.calculate_per_token_loss,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
@@ -2041,10 +2045,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
+        hash_moe_layer_threshold: int | None = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Global Hybrid layer-number threshold used
+                to select hash-routed MoE layers in the nested HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -2184,6 +2191,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 mtp_layer_number=self.layer_number,
+                hash_moe_layer_threshold=hash_moe_layer_threshold,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -2523,8 +2531,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
     ):
-        """Forward through ``_proj_and_transformer_layer`` with activation
-        recomputation.
+        """Forward a legacy GPT MTP layer with activation recomputation.
 
         Mirrors ``transformer_block._checkpointed_forward``:
 
@@ -2543,6 +2550,9 @@ class MultiTokenPredictionLayer(MegatronModule):
           context entered before ``te_checkpoint``; see the
           ``outer_quantization_context`` block below.
         """
+        assert (
+            self.mtp_layer_pattern is None
+        ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
         def custom_forward(
             hidden_states,
@@ -2641,9 +2651,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
+            # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
@@ -2735,7 +2743,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             roll_depth=roll_depth,
         )
 
-        if self.config.recompute_granularity == 'full' and self.training:
+        # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
+        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
+        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+        use_outer_recompute = (
+            self.config.recompute_granularity == 'full'
+            and self.training
+            and self.mtp_layer_pattern is None
+        )
+        if use_outer_recompute:
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -2882,10 +2898,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        hash_moe_layer_threshold: int | None = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Global Hybrid layer-number threshold passed
+                to each nested MTP HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -2907,6 +2926,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
+        self.hash_moe_layer_threshold = hash_moe_layer_threshold
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
         self.name = name
 
@@ -2974,6 +2994,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
+                    hash_moe_layer_threshold=self.hash_moe_layer_threshold,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module

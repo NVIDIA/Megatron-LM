@@ -204,7 +204,7 @@ def fused_mtp_tv_unavailable_reason(  # pylint: disable=too-many-return-statemen
         return "draft and target logits are on different devices"
     if not draft_logits.is_cuda:
         return "logits are not CUDA tensors"
-    if draft_logits.dtype not in (torch.bfloat16, torch.float32):
+    if draft_logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return f"draft dtype {draft_logits.dtype} is not supported"
     if target_logits.dtype != draft_logits.dtype:
         return "draft and target logits have different dtypes"

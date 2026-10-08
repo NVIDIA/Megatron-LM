@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
+requires = ["setuptools>=80", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -83,7 +83,7 @@ mlm = [
 ]
 
 dev = [
-    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
     "nvidia-resiliency-ext==0.6.0",
     "tqdm",
@@ -91,7 +91,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api>=1.33.1,<2",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention[tilelang]==0.5.1",
@@ -117,7 +117,7 @@ lts = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api>=1.33.1,<2",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "megatron-energon[av_decode]~=6.0",
@@ -128,6 +128,20 @@ lts = [
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers; python_version >= '3.12'",
+]
+
+### Module-level extras consumed by `docker/Dockerfile.ci.lts`.               ###
+### They must stay defined on every branch that carries that Dockerfile, or   ###
+### the LTS image build fails with "Extra `...` is not defined in the         ###
+### project's `optional-dependencies` table".                                 ###
+te = [
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
+]
+
+ssm = [
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "flash-linear-attention==0.5.1",
 ]
 
 [dependency-groups]
@@ -155,7 +169,7 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0,>=77.0.0",
+    "setuptools>=80",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
@@ -225,7 +239,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
-nvidia-cudnn-frontend = { git = "https://github.com/NVIDIA/cudnn-frontend.git", rev = "0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" }
+nvidia-cudnn-frontend = { git = "https://github.com/NVIDIA/cudnn-frontend.git", rev = "develop" }
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }

@@ -42,6 +42,19 @@ def _ordered_topk_from_routing_map(
     return topk_scores, topk_indices
 
 
+def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
+    if (
+        router_replay is not None
+        and router_replay.router_replay_action
+        in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD)
+    ):
+        raise RuntimeError(
+            "R3 router aux loss must be disabled: replay dispatches the supplied "
+            "expert indices, but the auxiliary load statistic is computed from "
+            "the native routing map."
+        )
+
+
 class TopKRouter(nn.Module):
     """TopK gating with optional high-precision router logits/probabilities."""
 
@@ -127,6 +140,7 @@ class TopKRouter(nn.Module):
             and torch.is_grad_enabled()
         )
         if apply_aux_loss:
+            _reject_aux_loss_during_replay(self.router_replay)
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
             )
@@ -161,6 +175,8 @@ class SigmoidTopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
+        router_dtype: torch.dtype | None = None,
+        expert_bias_persistent: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -173,32 +189,60 @@ class SigmoidTopKRouter(nn.Module):
         self.aux_loss_coeff = getattr(config, "aux_loss_alpha", 0.0)
         self.scaling_factor = config.routed_scaling_factor
         self.score_function = getattr(config, "scoring_func", "sigmoid")
+        num_groups = getattr(config, "n_group", None)
+        self.num_groups = num_groups if num_groups and num_groups > 1 else None
+        self.group_topk = (
+            getattr(config, "topk_group", None) if self.num_groups is not None else None
+        )
         self.router_bias_rate = router_bias_rate
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
+        self.router_dtype = router_dtype
         self.router_replay: RouterReplay | None = None
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(
             "expert_bias",
             torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=False,
+            persistent=expert_bias_persistent,
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.expert_bias.data = self.expert_bias.data.float()
+        return self
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate(x)
+        logits = (
+            self.gate(x)
+            if self.router_dtype is None
+            else router_gating_linear(
+                x,
+                self.gate.weight,
+                None,
+                self.router_dtype,
+            )
+        )
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
+        routing_kwargs = {}
+        if self.num_groups is not None and self.group_topk is not None:
+            routing_kwargs = {
+                "num_groups": self.num_groups,
+                "group_topk": self.group_topk,
+            }
         probs_dense, routing_map = topk_routing_with_score_function(
             logits,
             self.topk,
+            use_pre_softmax=self.use_pre_softmax,
             score_function=self.score_function,
             expert_bias=self.expert_bias.to(logits.dtype),
             scaling_factor=(self.scaling_factor or None),
             fused=self.moe_router_fusion,
+            **routing_kwargs,
         )
         topk_scores, topk_indices = _ordered_topk_from_routing_map(
             probs_dense, routing_map, self.topk
@@ -222,6 +266,7 @@ class SigmoidTopKRouter(nn.Module):
             and torch.is_grad_enabled()
         )
         if apply_aux_loss:
+            _reject_aux_loss_during_replay(self.router_replay)
             _, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
             )

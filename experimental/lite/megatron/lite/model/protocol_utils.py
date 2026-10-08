@@ -36,6 +36,16 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
+def router_replay_roots(chunk) -> list:
+    """Select decoder layers for R3, excluding MTP-only routers."""
+    model = getattr(chunk, "model", chunk)
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return [chunk]
+    values = getattr(layers, "values", None)
+    return list(values()) if callable(values) else list(layers)
+
+
 def _model_attribute(model, name: str):
     """Read an attribute through optional distributed model wrappers."""
 
@@ -277,25 +287,28 @@ def pack_routed_experts(
 def pack_r3_replay_mask(
     model, batch: PackedBatch, *, contiguous: bool = False
 ) -> torch.Tensor:
-    """Build and pack the causal R3 mask from a full-sequence loss mask.
+    """Pack VERL's token-level R3 replay mask for local routers.
 
-    Every row before the final token can influence a response-token logprob.
-    The final row has no consumed next-token logit and stays on native routing.
-    Sequences without response tokens are not replayed.
+    The rollout producer owns the response-token semantics.  In particular, a
+    sequence without response tokens is an all-false row and must not be
+    converted into a causal replay mask here.
     """
+
+    if batch.r3_replay_mask is None:
+        raise ValueError("R3 replay requires PackedBatch.r3_replay_mask.")
 
     rows = []
     offset = 0
     for length_tensor in batch.seq_lens:
         length = int(length_tensor.item())
-        has_response = True
-        if batch.loss_mask is not None:
-            has_response = bool(batch.loss_mask[offset : offset + length].sum().item())
-        row = torch.zeros(length, dtype=torch.long, device=batch.input_ids.device)
-        if has_response and length > 1:
-            row[:-1] = 1
+        row = batch.r3_replay_mask[offset : offset + length]
+        if row.numel() != length:
+            raise ValueError("r3_replay_mask must have one entry for every packed token.")
+        row = row.to(device=batch.input_ids.device, dtype=torch.long)
         rows.append(row[:, None, None])
         offset += length
+    if batch.r3_replay_mask.numel() != offset:
+        raise ValueError("r3_replay_mask must have one entry for every packed token.")
     nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
     return pack_routed_experts(model, batch, nested, contiguous=contiguous)[0][
         :, 0
@@ -338,8 +351,37 @@ def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs:
         kwargs["return_log_probs"] = loss_context.return_log_probs
 
 
+def _resolve_cross_entropy_fusion(model) -> bool:
+    """Read the ``cross_entropy_fusion`` flag through any module wrappers.
+
+    ``set_cross_entropy_fusion`` runs at build time on the bare model chunks;
+    by the time ``_forward_step`` runs, the runtime has wrapped each chunk in a
+    data-parallel container. Megatron's ``_BaseDataParallel`` keeps the wrapped
+    module in ``self.module`` and does not proxy unknown attributes to it, so a
+    plain ``getattr(wrapper, "cross_entropy_fusion")`` misses the attribute
+    entirely and silently falls back to the default.
+
+    The consequence was invisible: the flag was set correctly, appeared as
+    ``True`` in every config dump, and the model still took the unfused branch —
+    materialising the full ``[tokens, vocab/tp]`` logits and upcasting them to
+    fp32. Walk the ``.module`` chain instead, checking each level's own
+    ``__dict__`` so an attribute on an inner chunk is found no matter how many
+    wrappers were added.
+    """
+
+    seen: set[int] = set()
+    current = model
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        own = getattr(current, "__dict__", None)
+        if isinstance(own, dict) and "cross_entropy_fusion" in own:
+            return bool(own["cross_entropy_fusion"])
+        current = getattr(current, "module", None)
+    return False
+
+
 def add_cross_entropy_fusion(kwargs: dict[str, Any], model) -> None:
-    kwargs["use_fused_kernels"] = bool(getattr(model, "cross_entropy_fusion", False))
+    kwargs["use_fused_kernels"] = _resolve_cross_entropy_fusion(model)
 
 
 def set_cross_entropy_fusion(chunks: list, enabled: bool) -> None:

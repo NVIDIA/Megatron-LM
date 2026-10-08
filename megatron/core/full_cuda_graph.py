@@ -8,6 +8,7 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.transformer.experimental_attention_variant import dsa_logging
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,10 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        # Shallow-copy so callers may replace or remove top-level entries to tailor the
+        # batch to their pipeline stage without mutating the cached static buffer. Nested
+        # containers and the tensors themselves are still shared with the buffer.
+        return StaticBufferLoader.static_buffers[stage][microbatch].copy()
 
 
 class FullCudaGraphWrapper:
@@ -213,6 +217,14 @@ class FullCudaGraphWrapper:
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
+            captures_dsa_metric_writes = dsa_logging.get_dsa_metric_tracker_size(model) > 0
+            if (
+                captures_dsa_metric_writes
+                and dsa_logging.DSAIndexerLossLoggingHelper.tracker.get("agreed_size") is None
+            ):
+                raise RuntimeError(
+                    "DSA metric tracker must be initialized before CUDA Graph capture."
+                )
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)

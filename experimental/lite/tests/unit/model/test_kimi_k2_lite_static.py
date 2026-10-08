@@ -9,7 +9,7 @@ import pytest
 
 
 def test_kimi_k2_lite_registry_resolves():
-    from megatron.lite.model.registry import (
+    from megatron.lite.model.registry import (  # isort: skip
         get_train_runtime_module,
         resolve_model_type_from_hf,
         resolve_runtime_model_name,
@@ -65,7 +65,14 @@ def test_kimi_k2_config_reads_hf_fields():
 
 
 def test_kimi_k2_lite_does_not_import_wrappers_or_sibling_models():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
+    root = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "kimi_k2"
+        / "lite"
+    )
     forbidden = (
         "megatron.lite.model.qwen3_5",
         "megatron.lite.model.qwen3_moe",
@@ -82,7 +89,14 @@ def test_kimi_k2_lite_does_not_import_wrappers_or_sibling_models():
 
 
 def test_kimi_k2_lite_implementation_files_stay_small():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
+    root = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "kimi_k2"
+        / "lite"
+    )
     for name in ("model.py", "protocol.py", "checkpoint.py"):
         line_count = len((root / name).read_text().splitlines())
         assert line_count < 1000, f"{name} has {line_count} lines"
@@ -96,17 +110,29 @@ def test_kimi_k2_lite_uses_shared_mla_primitive():
     mla_text = primitive_mla.read_text()
 
     assert (
-        "from megatron.lite.primitive.modules.attention import MultiLatentAttention" in model_text
+        "from megatron.lite.primitive.modules.attention import MultiLatentAttention"
+        in model_text
     )
     assert not (model_root / "mla.py").exists()
     assert "class MultiLatentAttention" not in model_text
     assert "class MultiLatentAttention" in mla_text
     assert "megatron.core" not in mla_text
-    assert "KimiK2SigmoidTopKRouter" in model_text
+    assert (
+        "from megatron.lite.primitive.modules.router import SigmoidTopKRouter"
+        in model_text
+    )
+    assert "KimiK2SigmoidTopKRouter" not in model_text
 
 
 def test_kimi_k2_lite_optimizer_names_are_current():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
+    root = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "kimi_k2"
+        / "lite"
+    )
     protocol_text = (root / "protocol.py").read_text()
 
     assert 'optimizer: str | None = "dist_opt"' in protocol_text
@@ -158,7 +184,10 @@ def test_kimi_k2_impl_config_accepts_runtime_mtp_fields():
 
 
 def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
-    from megatron.lite.primitive.parallel import ParallelState, build_pipeline_chunk_layout
+    from megatron.lite.primitive.parallel import (  # isort: skip
+        ParallelState,
+        build_pipeline_chunk_layout,
+    )
 
     model_text = (
         Path(__file__).resolve().parents[3]
@@ -197,7 +226,8 @@ def test_kimi_k2_checkpoint_exports_hf_names():
 
     from megatron.lite.model.kimi_k2.config import KimiK2Config
     from megatron.lite.model.kimi_k2.lite import protocol
-    from megatron.lite.model.kimi_k2.lite.checkpoint import (
+
+    from megatron.lite.model.kimi_k2.lite.checkpoint import (  # isort: skip
         KimiK2WeightSpec,
         export_hf_weights,
         save_hf_weights,
@@ -233,6 +263,17 @@ def test_kimi_k2_checkpoint_exports_hf_names():
     assert spec.tp_spec("layers.1.moe.experts.fc1.weight0") == (0, 1)
     assert spec.expert_global_id("layers.1.moe.experts.fc2.weight1") == 1
 
+    load_map = spec.weight_map()
+    assert load_map["layers.0.mlp.gate_up.linear.weight"] == [
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+    ]
+    assert load_map["layers.1.moe.experts.fc1.weight1"] == [
+        "model.layers.1.mlp.experts.1.gate_proj.weight",
+        "model.layers.1.mlp.experts.1.up_proj.weight",
+    ]
+    assert load_map["mtp.layers.0.enorm.weight"] == ["model.layers.2.enorm.weight"]
+
     gate_up = torch.arange(8 * 8, dtype=torch.float32).view(8, 8)
     exported = dict(spec.native_to_hf("layers.1.moe.experts.fc1.weight0", gate_up))
     assert set(exported) == {
@@ -240,12 +281,10 @@ def test_kimi_k2_checkpoint_exports_hf_names():
         "model.layers.1.mlp.experts.0.up_proj.weight",
     }
     torch.testing.assert_close(
-        exported["model.layers.1.mlp.experts.0.gate_proj.weight"],
-        gate_up[:4],
+        exported["model.layers.1.mlp.experts.0.gate_proj.weight"], gate_up[:4]
     )
     torch.testing.assert_close(
-        exported["model.layers.1.mlp.experts.0.up_proj.weight"],
-        gate_up[4:],
+        exported["model.layers.1.mlp.experts.0.up_proj.weight"], gate_up[4:]
     )
 
     bias = torch.arange(2, dtype=torch.float32)
@@ -262,7 +301,9 @@ def test_kimi_k2_checkpoint_exports_hf_names():
         ("model.layers.2.shared_head.norm.weight", bias)
     ]
     mtp_export = dict(
-        spec.native_to_hf("mtp.layers.0.transformer_layer.mlp.gate_up.linear.weight", gate_up)
+        spec.native_to_hf(
+            "mtp.layers.0.transformer_layer.mlp.gate_up.linear.weight", gate_up
+        )
     )
     assert set(mtp_export) == {
         "model.layers.2.mlp.gate_proj.weight",
@@ -275,18 +316,19 @@ def test_kimi_k2_fp8_checkpoint_dequant_cpu_path():
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch float8_e4m3fn is required for this smoke.")
 
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _dequant_fp8_weight
+    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
 
-    class Reader:
-        index = {"w_scale_inv": "fake.safetensors"}
-
-        @staticmethod
-        def get_tensor(name):
-            assert name == "w_scale_inv"
-            return torch.full((1, 1), 2.0, dtype=torch.float32)
-
-    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.float32).to(torch.float8_e4m3fn)
-    out = _dequant_fp8_weight(Reader(), "w", weight)
+    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    tensors = {"w": weight, "w_scale_inv": torch.full((1, 1), 2.0, dtype=torch.float32)}
+    reader = object.__new__(SafeTensorReader)
+    reader.device = torch.device("cpu")
+    reader._cached_request = None
+    reader._cached_tensor = None
+    reader.has_tensor = lambda name: name in tensors
+    reader._get_raw_tensor = lambda name, device: tensors[name].to(device)
+    out = reader.get_tensor("w")
 
     torch.testing.assert_close(out, weight.float() * 2.0)
 
@@ -294,7 +336,7 @@ def test_kimi_k2_fp8_checkpoint_dequant_cpu_path():
 def test_kimi_k2_int4_checkpoint_dequant_cpu_path():
     torch = pytest.importorskip("torch")
 
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _get
+    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
 
     values = torch.tensor([[-8, -7, -1, 0, 1, 2, 6, 7, -8, 7]], dtype=torch.int8)
     unsigned = (values + 8).to(torch.int32)
@@ -304,37 +346,32 @@ def test_kimi_k2_int4_checkpoint_dequant_cpu_path():
     for offset in range(2):
         packed[:, 1] |= unsigned[:, 8 + offset] << (4 * offset)
 
-    class Reader:
-        index = {
-            "w_packed": "fake.safetensors",
-            "w_scale": "fake.safetensors",
-            "w_shape": "fake.safetensors",
-        }
-
-        @staticmethod
-        def get_tensor(name):
-            return {
-                "w_packed": packed,
-                "w_scale": torch.tensor([[0.5, 2.0]], dtype=torch.float32),
-                "w_shape": torch.tensor([1, 10], dtype=torch.int64),
-            }[name]
-
-    out = _get(Reader(), "w")
-    expected = torch.cat([values[:, :5].float() * 0.5, values[:, 5:].float() * 2.0], dim=1)
+    tensors = {
+        "w_packed": packed,
+        "w_scale": torch.tensor([[0.5, 2.0]], dtype=torch.float32),
+        "w_shape": torch.tensor([1, 10], dtype=torch.int64),
+    }
+    reader = object.__new__(SafeTensorReader)
+    reader.device = torch.device("cpu")
+    reader._cached_request = None
+    reader._cached_tensor = None
+    reader.has_tensor = lambda name: name in tensors
+    reader._get_raw_tensor = lambda name, device: tensors[name].to(device)
+    out = reader.get_tensor("w")
+    expected = torch.cat(
+        [values[:, :5].float() * 0.5, values[:, 5:].float() * 2.0], dim=1
+    )
 
     torch.testing.assert_close(out, expected)
 
 
 def test_kimi_k2_real_checkpoint_prefix_helpers():
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _lm_head_name, _text_prefix
+    from megatron.lite.model.kimi_k2.lite.checkpoint import KimiK2WeightSpec
 
-    class Reader:
-        index = {
-            "language_model.model.embed_tokens.weight": "fake.safetensors",
-            "language_model.lm_head.weight": "fake.safetensors",
-        }
-
-    prefix = _text_prefix(Reader())
-
-    assert prefix == "language_model.model"
-    assert _lm_head_name(Reader(), prefix) == "language_model.lm_head.weight"
+    spec = KimiK2WeightSpec(object())
+    assert "language_model.model.embed_tokens.weight" in spec.hf_name_candidates(
+        "embed.embedding.weight", "model.embed_tokens.weight"
+    )
+    assert "language_model.lm_head.weight" in spec.hf_name_candidates(
+        "head.col.linear.weight", "lm_head.weight"
+    )

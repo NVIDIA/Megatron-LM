@@ -388,7 +388,7 @@ def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
 
 
 def core_transformer_config_from_args(args, config_class=None):
-    from megatron.core.activations import squared_relu
+    from megatron.core.activations import situlu, squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
     from megatron.core.quantization.utils import (
         kitchen_quantization_recipe_config,
@@ -427,17 +427,23 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
+    use_situ_glu = getattr(args, 'situ_glu', False)
+    if use_situ_glu:
+        kw_args['activation_func'] = situlu
+        kw_args['gated_linear_unit'] = True
+        kw_args['use_te_activation_func'] = True
+        kw_args['bias_activation_fusion'] = False
+    elif args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['activation_func'] = squared_relu
     elif args.quick_geglu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
@@ -560,8 +566,18 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
-def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
-    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+def gpt_config_from_args(
+    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type | None = None
+) -> Any:
+    """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
+
+    `model_config_cls` lets callers reuse this arg-derivation logic for subclasses
+    that only override metadata, such as `ModelOptModelConfig`.
+    """
+    if model_config_cls is None:
+        model_config_cls = GPTModelConfig
+    else:
+        assert issubclass(model_config_cls, GPTModelConfig)
 
     kwargs = {}
     if config is None:
@@ -602,11 +618,21 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = Non
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return GPTModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
-def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
-    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+def hybrid_config_from_args(
+    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type | None = None
+) -> Any:
+    """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
+
+    `model_config_cls` lets callers reuse this arg-derivation logic for subclasses
+    that only override metadata, such as `ModelOptHybridModelConfig`.
+    """
+    if model_config_cls is None:
+        model_config_cls = HybridModelConfig
+    else:
+        assert issubclass(model_config_cls, HybridModelConfig)
 
     kwargs = {}
     if config is None:
@@ -652,7 +678,7 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = 
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return HybridModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:

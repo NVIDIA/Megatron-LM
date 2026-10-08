@@ -20,6 +20,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -41,13 +42,53 @@ def reset_full_cuda_graph_state():
     """Keep the full-iteration wrapper's class state isolated per test."""
     _reset_full_cuda_graph_state()
     MTPLossLoggingHelper.tracker = {}
+    DSAIndexerLossLoggingHelper.tracker = {}
     yield
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     _reset_full_cuda_graph_state()
     MTPLossLoggingHelper.tracker = {}
+    DSAIndexerLossLoggingHelper.tracker = {}
     Utils.destroy_model_parallel()
     gc.collect()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="StaticBufferLoader stages inputs on the GPU"
+)
+def test_static_buffer_loader_isolates_cached_batch_structure():
+    loader = StaticBufferLoader()
+    first_inputs = {
+        'tokens': torch.ones(2, 4),
+        'labels': torch.ones(2, 4),
+        'loss_mask': torch.ones(2, 4),
+    }
+
+    first_batch = loader(first_inputs, 'training', 0)
+    cached_batch = StaticBufferLoader.static_buffers['training'][0]
+
+    assert first_batch is not cached_batch
+    assert first_batch['labels'] is cached_batch['labels']
+    assert first_batch['loss_mask'] is cached_batch['loss_mask']
+
+    # Pipeline stages replace unused fields in place. This must not replace the
+    # corresponding tensors in the loader's static buffer.
+    first_batch['labels'] = None
+    first_batch['loss_mask'] = None
+
+    second_inputs = {
+        'tokens': torch.full((2, 4), 2.0),
+        'labels': torch.full((2, 4), 3.0),
+        'loss_mask': torch.full((2, 4), 4.0),
+    }
+    second_batch = loader(second_inputs, 'training', 0)
+
+    assert second_batch is not cached_batch
+    assert second_batch['labels'] is cached_batch['labels']
+    assert second_batch['loss_mask'] is cached_batch['loss_mask']
+    torch.testing.assert_close(second_batch['tokens'], second_inputs['tokens'].cuda())
+    torch.testing.assert_close(second_batch['labels'], second_inputs['labels'].cuda())
+    torch.testing.assert_close(second_batch['loss_mask'], second_inputs['loss_mask'].cuda())
 
 
 @pytest.mark.skipif(
@@ -122,6 +163,61 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         print(losses_reduced)
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+def test_full_cuda_graph_capture_counts_dsa_metric_once():
+    """Capture records the DSA write; replay preserves prior state and executes it once."""
+    initialize_rng_tracker(force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    values = torch.full((1,), 7.0, device="cuda")
+    DSAIndexerLossLoggingHelper.tracker = {
+        "values": values,
+        "agreed_size": 1,
+        "reduce_group": None,
+        "avg_group": None,
+    }
+    reduce_group = object()
+    avg_group = object()
+
+    def forward_backward_func(**kwargs):
+        del kwargs
+        DSAIndexerLossLoggingHelper.tracker["reduce_group"] = reduce_group
+        DSAIndexerLossLoggingHelper.tracker["avg_group"] = avg_group
+        DSAIndexerLossLoggingHelper.tracker["values"].add_(1.0)
+        return [DSAIndexerLossLoggingHelper.tracker["values"]]
+
+    model = torch.nn.Linear(1, 1).cuda()
+    model.logs_dsa_indexer_loss = True
+    model.layer_number = 1
+    wrapped = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=0)
+    result = wrapped(
+        data_iterator=[iter([{"tokens": torch.ones(1)}])],
+        model=[model],
+        num_microbatches=1,
+        seq_length=1,
+        forward_only=True,
+    )
+
+    assert DSAIndexerLossLoggingHelper.tracker["values"] is values
+    torch.testing.assert_close(values, torch.full_like(values, 8.0))
+    torch.testing.assert_close(result[0], torch.full_like(result[0], 8.0))
+    assert DSAIndexerLossLoggingHelper.tracker["reduce_group"] is reduce_group
+    assert DSAIndexerLossLoggingHelper.tracker["avg_group"] is avg_group
+
+
+def test_full_cuda_graph_capture_requires_initialized_dsa_tracker():
+    """A custom full-iteration caller cannot lazily allocate storage during capture."""
+    model = torch.nn.Module()
+    model.logs_dsa_indexer_loss = True
+    model.layer_number = 1
+    wrapped = FullCudaGraphWrapper(lambda **_kwargs: pytest.fail("capture started"), 0)
+    wrapped.data_read = lambda *_args: []
+
+    with pytest.raises(RuntimeError, match="initialized before CUDA Graph capture"):
+        wrapped(
+            data_iterator=[], model=[model], num_microbatches=1, seq_length=1, forward_only=True
+        )
 
 
 @pytest.mark.skipif(

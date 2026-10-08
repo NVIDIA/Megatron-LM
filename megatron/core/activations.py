@@ -21,3 +21,20 @@ def quick_gelu(x: torch.Tensor) -> torch.Tensor:
 def fast_gelu(x: torch.Tensor) -> torch.Tensor:
     """Fast GELU activation"""
     return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
+
+
+@jit_fuser
+def situlu(x: torch.Tensor, beta1: float = 4.0, beta2: float = 25.0) -> torch.Tensor:
+    """Apply SiTU-GLU to contiguous gate/up halves of an FC1 output.
+
+    This is the slow PyTorch reference and config marker until PyTorch provides
+    a dedicated ``torch.nn.functional.situlu``-style operation. Unary
+    ``F.silu`` is not equivalent because SiTU-GLU transforms both branches.
+    """
+    input_dtype = x.dtype
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = gate.float()
+    up = up.float()
+    gate = beta1 * torch.tanh(gate / beta1) * torch.sigmoid(gate)
+    up = beta2 * torch.tanh(up / beta2)
+    return (gate * up).to(input_dtype)

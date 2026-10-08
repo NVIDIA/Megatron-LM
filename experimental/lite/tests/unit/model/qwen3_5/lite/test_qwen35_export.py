@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -6,11 +7,15 @@ import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    PLACEMENT_FN,
     Qwen35WeightSpec,
     _merge_full_attn_qkvg,
     _merge_gate_up_tp_shards,
     _merge_linear_attn_conv1d_tp_shards,
     _merge_linear_attn_in_proj_tp_shards,
+    _tp_linear_attn_conv1d,
+    _tp_linear_attn_in_proj,
+    _tp_linear_attn_state,
     export_hf_weights,
 )
 from megatron.lite.model.qwen3_5.lite.protocol import ImplConfig
@@ -36,6 +41,14 @@ def _tiny_config() -> Qwen35Config:
         linear_conv_kernel_dim=2,
         layer_types=["full_attention"],
         partial_rotary_factor=1.0,
+    )
+
+
+def _tiny_dense_config() -> Qwen35Config:
+    return replace(
+        _tiny_config(),
+        model_type="qwen3_5",
+        intermediate_size=12,
     )
 
 
@@ -345,6 +358,91 @@ def test_qwen35_export_maps_top_level_and_layer_norm_names() -> None:
         assert torch.equal(exported[hf_name], tensor)
 
 
+def test_qwen35_dense_load_and_export_map_gated_mlp_weights() -> None:
+    cfg = _tiny_dense_config()
+    spec = Qwen35WeightSpec(cfg)
+    weight_map = spec.weight_map()
+    gate = torch.arange(cfg.intermediate_size * cfg.hidden_size).reshape(
+        cfg.intermediate_size, cfg.hidden_size
+    )
+    up = gate + 1000
+    down = torch.arange(cfg.hidden_size * cfg.intermediate_size).reshape(
+        cfg.hidden_size, cfg.intermediate_size
+    )
+
+    assert weight_map["layers.0.mlp.gate_up.linear.layer_norm_weight"] == [
+        "model.language_model.layers.0.post_attention_layernorm.weight"
+    ]
+    assert weight_map["layers.0.mlp.gate_up.linear.weight"] == [
+        "model.language_model.layers.0.mlp.gate_proj.weight",
+        "model.language_model.layers.0.mlp.up_proj.weight",
+    ]
+    assert weight_map["layers.0.mlp.down.linear.weight"] == [
+        "model.language_model.layers.0.mlp.down_proj.weight"
+    ]
+    assert not any(".moe." in name for name in weight_map)
+
+    gate_up = spec.hf_to_native("layers.0.mlp.gate_up.linear.weight", [gate, up])
+    exported = dict(spec.native_to_hf("layers.0.mlp.gate_up.linear.weight", gate_up))
+    exported.update(spec.native_to_hf("layers.0.mlp.down.linear.weight", down))
+
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.gate_proj.weight"], gate
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.up_proj.weight"], up
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.down_proj.weight"], down
+    )
+
+
+def test_qwen35_hf_text_prefix_selects_composite_and_standalone_names() -> None:
+    composite = Qwen35WeightSpec(
+        replace(_tiny_dense_config(), hf_text_prefix="model.language_model")
+    )
+    standalone = Qwen35WeightSpec(
+        replace(_tiny_dense_config(), hf_text_prefix="model")
+    )
+    native_name = "layers.0.mlp.down.linear.weight"
+    tensor = torch.arange(12)
+
+    assert composite.weight_map()[native_name] == [
+        "model.language_model.layers.0.mlp.down_proj.weight"
+    ]
+    assert standalone.weight_map()[native_name] == [
+        "model.layers.0.mlp.down_proj.weight"
+    ]
+    assert set(dict(composite.native_to_hf(native_name, tensor))) == {
+        "model.language_model.layers.0.mlp.down_proj.weight"
+    }
+    assert set(dict(standalone.native_to_hf(native_name, tensor))) == {
+        "model.layers.0.mlp.down_proj.weight"
+    }
+
+
+def test_qwen35_dense_mlp_tp_specs_and_placements() -> None:
+    spec = Qwen35WeightSpec(_tiny_dense_config())
+    gate_up = "layers.0.mlp.gate_up.linear.weight"
+    down = "layers.0.mlp.down.linear.weight"
+    gate = torch.arange(48).reshape(6, 8)
+    up = gate + 1000
+    shards = [
+        torch.cat([gate.chunk(2)[rank], up.chunk(2)[rank]], dim=0)
+        for rank in range(2)
+    ]
+
+    assert type(PLACEMENT_FN(gate_up)[-1]).__name__ == "Shard"
+    assert PLACEMENT_FN(gate_up)[-1].dim == 0
+    assert type(PLACEMENT_FN(down)[-1]).__name__ == "Shard"
+    assert PLACEMENT_FN(down)[-1].dim == 1
+    assert spec.tp_spec(gate_up) == (0, 0)
+    assert spec.tp_spec(down) == (1, 0)
+    assert torch.equal(
+        spec.merge_dense_shards(gate_up, shards), torch.cat([gate, up], dim=0)
+    )
+
+
 def test_qwen35_export_unpacks_full_attention_q_gate() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
@@ -368,6 +466,43 @@ def test_qwen35_export_unpacks_full_attention_q_gate() -> None:
     assert torch.equal(exported["model.language_model.layers.0.self_attn.q_proj.weight"], q_gate)
     assert torch.equal(exported["model.language_model.layers.0.self_attn.k_proj.weight"], key)
     assert torch.equal(exported["model.language_model.layers.0.self_attn.v_proj.weight"], value)
+
+
+def test_qwen35_full_attention_tp4_shards_roundtrip_with_two_kv_heads() -> None:
+    cfg = _tiny_config()
+    cfg.num_attention_heads = 8
+    cfg.num_key_value_heads = 2
+    hidden = cfg.hidden_size
+    q_gate = torch.arange(cfg.num_attention_heads * 2 * cfg.head_dim * hidden).reshape(
+        -1, hidden
+    )
+    key = torch.arange(
+        q_gate.numel(), q_gate.numel() + cfg.num_key_value_heads * cfg.head_dim * hidden
+    ).reshape(-1, hidden)
+    value = torch.arange(
+        key[-1, -1] + 1,
+        key[-1, -1] + 1 + cfg.num_key_value_heads * cfg.head_dim * hidden,
+    ).reshape(-1, hidden)
+
+    packed = _merge_full_attn_qkvg(q_gate, key, value, cfg=cfg)
+    tp4_shards = packed.chunk(4, dim=0)
+    gathered = torch.cat(tp4_shards, dim=0)
+    exported = dict(
+        Qwen35WeightSpec(cfg).native_to_hf(
+            "layers.0.full_attn.qkv.linear.weight", gathered
+        )
+    )
+
+    assert all(shard.shape == tp4_shards[0].shape for shard in tp4_shards)
+    assert torch.equal(
+        exported["model.language_model.layers.0.self_attn.q_proj.weight"], q_gate
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.self_attn.k_proj.weight"], key
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.self_attn.v_proj.weight"], value
+    )
 
 
 def test_qwen35_export_maps_linear_attention_to_hf_checkpoint_names() -> None:
@@ -448,6 +583,71 @@ def test_qwen35_export_reorders_linear_attention_conv1d_tp_shards() -> None:
     merged = _merge_linear_attn_conv1d_tp_shards(shards, cfg=cfg)
 
     assert torch.equal(merged, full)
+
+
+def test_qwen35_linear_attention_tp4_replicated_heads_roundtrip() -> None:
+    cfg = _tiny_config()
+    hidden = cfg.hidden_size
+    qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    parts = [
+        torch.arange(offset, offset + rows * hidden).reshape(rows, hidden)
+        for offset, rows in zip(
+            (0, 100, 200, 300, 400, 500),
+            (qk_dim, qk_dim, v_dim, v_dim, cfg.linear_num_value_heads, cfg.linear_num_value_heads),
+            strict=True,
+        )
+    ]
+    full_in_proj = torch.cat(parts, dim=0)
+    parallel_states = [SimpleNamespace(tp_size=4, tp_rank=rank) for rank in range(4)]
+    in_proj_shards = [
+        _tp_linear_attn_in_proj(*parts, cfg=cfg, ps=ps) for ps in parallel_states
+    ]
+
+    conv_parts = [
+        torch.arange(offset, offset + rows * cfg.linear_conv_kernel_dim, dtype=torch.float32).reshape(
+            rows, 1, cfg.linear_conv_kernel_dim
+        )
+        for offset, rows in zip((0, 100, 200), (qk_dim, qk_dim, v_dim), strict=True)
+    ]
+    full_conv = torch.cat(conv_parts, dim=0)
+    conv_shards = [
+        _tp_linear_attn_conv1d(full_conv, cfg=cfg, ps=ps) for ps in parallel_states
+    ]
+
+    assert all(shard.shape == (5, hidden) for shard in in_proj_shards)
+    assert torch.equal(
+        _merge_linear_attn_in_proj_tp_shards(in_proj_shards, cfg=cfg), full_in_proj
+    )
+    assert all(shard.shape == (3, 1, cfg.linear_conv_kernel_dim) for shard in conv_shards)
+    assert torch.equal(
+        _merge_linear_attn_conv1d_tp_shards(conv_shards, cfg=cfg), full_conv
+    )
+
+
+def test_qwen35_linear_attention_state_is_tp_replicated() -> None:
+    spec = Qwen35WeightSpec(_tiny_config())
+
+    assert type(PLACEMENT_FN("layers.0.linear_attn.dt_bias")[-1]).__name__ == "Replicate"
+    assert type(PLACEMENT_FN("layers.0.linear_attn.A_log")[-1]).__name__ == "Replicate"
+    assert spec.tp_spec("layers.0.linear_attn.dt_bias") is None
+    assert spec.tp_spec("layers.0.linear_attn.A_log") is None
+
+
+def test_qwen35_linear_attention_state_load_matches_head_layout() -> None:
+    state = torch.arange(8)
+    replicated_cfg = _tiny_config()
+    sharded_cfg = replace(
+        replicated_cfg, linear_num_key_heads=8, linear_num_value_heads=8
+    )
+    ps = SimpleNamespace(tp_size=4, tp_rank=2)
+
+    assert torch.equal(
+        _tp_linear_attn_state(state, cfg=replicated_cfg, ps=ps), state
+    )
+    assert torch.equal(
+        _tp_linear_attn_state(state, cfg=sharded_cfg, ps=ps), state.chunk(4)[2]
+    )
 
 
 def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:

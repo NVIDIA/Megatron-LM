@@ -458,6 +458,53 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert config.cuda_graph_modules == [CudaGraphModule.attn]
 
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize(
+        "recompute_modules", [["mhc"], ["mhc", "mla_up_proj"], ["mla_up_proj", "mhc"]]
+    )
+    def test_config_enables_mhc_split_with_optional_mla_recompute(
+        self, is_hybrid_model, recompute_modules, packed, monkeypatch
+    ):
+        packing_kwargs = {}
+        if packed:
+            import megatron.core.transformer.transformer_config as config_module
+
+            monkeypatch.setattr(config_module, "is_te_min_version", lambda _version: True)
+            packing_kwargs = dict(
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=32,
+                thd_max_packed_sequences=2,
+                pad_packed_seq_alignment="max",
+            )
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                is_hybrid_model=is_hybrid_model,
+                multi_latent_attention=True,
+                recompute_modules=recompute_modules,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                mhc_recompute_attn_cuda_graph_split=True,
+                **packing_kwargs,
+            )
+        )
+        assert uses_mhc_recompute_attn_cuda_graph_split(config)
+
+    @pytest.mark.parametrize("extra_module", ["core_attn", "layernorm"])
+    def test_config_split_rejects_other_recompute_modules(self, extra_module):
+        with pytest.raises(ValueError, match="recompute_modules"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    recompute_modules=["mhc", "mla_up_proj", extra_module],
+                    multi_latent_attention=True,
+                    cuda_graph_impl="transformer_engine",
+                    cuda_graph_modules=[CudaGraphModule.attn],
+                    mhc_recompute_attn_cuda_graph_split=True,
+                    hidden_dropout=0.0,
+                    attention_dropout=0.0,
+                )
+            )
+
     @pytest.mark.parametrize(
         ("cuda_graph_modules", "recompute_modules"),
         [

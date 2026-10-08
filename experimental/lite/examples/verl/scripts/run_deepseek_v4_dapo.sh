@@ -27,6 +27,11 @@ ROLLOUT_WEIGHT_BITS="${ROLLOUT_WEIGHT_BITS:-8}"
 # the actor when recomputing log-probs. Disable only for parity/debug A/B runs.
 ENABLE_R3="${ENABLE_R3:-True}"
 
+# Training-side QAT: keep this independent from rollout quantization so
+# ENABLE_QAT=False/True forms a controlled train/inference-consistency A/B.
+# DS4's validated QAT/export pairing is MXFP4, selected by weight bits 4.
+ENABLE_QAT="${ENABLE_QAT:-False}"
+
 # ---------------------------------------------------------------------------
 # Run inputs and geometry
 # ---------------------------------------------------------------------------
@@ -130,12 +135,33 @@ case "${ENABLE_R3,,}" in
     ;;
 esac
 
+case "${ENABLE_QAT,,}" in
+  true|1|yes|on)
+    QAT_ENABLED=true
+    QAT_TAG=on
+    ;;
+  false|0|no|off)
+    QAT_ENABLED=false
+    QAT_TAG=off
+    ;;
+  *)
+    echo "ENABLE_QAT must be a boolean, got ${ENABLE_QAT}" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${QAT_ENABLED}" == true && "${ROLLOUT_WEIGHT_BITS}" != 4 ]]; then
+  echo "ENABLE_QAT requires ROLLOUT_WEIGHT_BITS=4 (MXFP4 rollout)." >&2
+  exit 2
+fi
+
 : "${TRAIN_FILES:?set TRAIN_FILES or DAPO_DATA_DIR}"
 : "${VAL_FILES:?set VAL_FILES or DAPO_DATA_DIR}"
 
 MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 DEFAULT_RUN_NAME="ds4_dapo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}"
 DEFAULT_RUN_NAME+="_rtp${ROLLOUT_TP}_w${ROLLOUT_WEIGHT_BITS}_r3${R3_TAG}"
+DEFAULT_RUN_NAME+="_qat${QAT_TAG}"
 RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
 CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
@@ -235,7 +261,15 @@ ACTOR=(
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True"
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True"
   "actor_rollout_ref.actor.engine.router_replay_mode=${ROUTER_REPLAY_MODE}"
+  "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=${QAT_ENABLED}"
 )
+
+if [[ "${QAT_ENABLED}" == true ]]; then
+  ACTOR+=(
+    "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+    "++actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
+  )
+fi
 
 if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
   ACTOR+=(
@@ -336,9 +370,14 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
+  "${COMMAND[@]}" --cfg job --resolve
+  exit 0
+fi
+
 python3 "${VALIDATOR}" environment
 
-echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 r3=${ENABLE_R3}"
+echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 qat=${ENABLE_QAT} r3=${ENABLE_R3}"
 echo "[ds4-dapo] train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"
 
 set +e

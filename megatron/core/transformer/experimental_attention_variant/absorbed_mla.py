@@ -35,7 +35,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -417,6 +417,16 @@ class AbsorbedMLASelfAttention(Attention):
                 name=(name + ".linear_v_up_proj") if name is not None else None,
             )
 
+        q_up_proj = self.linear_q_proj if self.config.q_lora_rank is None else self.linear_q_up_proj
+        q_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+            self.config.num_attention_heads,
+            (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim),
+        )
+        if self._uses_combined_kv_up_projection:
+            self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+                self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
+            )
+
         if self.config.q_lora_rank is not None:
             self.q_layernorm = build_module(
                 layer_classes["q_layernorm"],
@@ -450,6 +460,9 @@ class AbsorbedMLASelfAttention(Attention):
         ), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        # Retain this microbatch's group when the up-projection checkpoint replays
+        # after forward restores pg_collection.cp or another microbatch changes it.
+        effective_cp_group = self.pg_collection.cp
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -609,8 +622,8 @@ class AbsorbedMLASelfAttention(Attention):
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
 
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = effective_cp_group.rank()
+                cp_size = effective_cp_group.size()
                 q_absorbed = fused_mla_rope_concat(
                     q_absorbed,
                     q_pos_emb,
@@ -636,7 +649,7 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif not thd_packed_seq or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or get_pg_size(effective_cp_group) == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -668,7 +681,7 @@ class AbsorbedMLASelfAttention(Attention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=effective_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_max_seqlen_q,
                 )
@@ -679,7 +692,7 @@ class AbsorbedMLASelfAttention(Attention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=effective_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_max_seqlen_kv,
                 )
@@ -831,6 +844,8 @@ class AbsorbedMLASelfAttention(Attention):
     ):
         """Forward method with selective activation checkpointing."""
 
+        effective_cp_group = self.pg_collection.cp
+
         def custom_forward(*inputs):
             q_absorbed = inputs[0]
             k_compressed = inputs[1]
@@ -840,19 +855,23 @@ class AbsorbedMLASelfAttention(Attention):
             up_v_weight = inputs[5]
             attn_mask_type = inputs[6]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                q_absorbed,
-                k_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=up_v_weight,
-                position_ids=position_ids,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=packed_seq_params,
-            )
-            return output_
+            original_cp_group = self.pg_collection.cp
+            self.pg_collection.cp = effective_cp_group
+            try:
+                return self.core_attention(
+                    q_absorbed,
+                    k_compressed,
+                    value=None,
+                    attention_mask=attention_mask,
+                    x=hidden_states,
+                    qr=q_compressed,
+                    up_v_weight=up_v_weight,
+                    position_ids=position_ids,
+                    attn_mask_type=attn_mask_type,
+                    packed_seq_params=packed_seq_params,
+                )
+            finally:
+                self.pg_collection.cp = original_cp_group
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type

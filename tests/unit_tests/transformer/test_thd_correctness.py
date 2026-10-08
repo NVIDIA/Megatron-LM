@@ -20,6 +20,7 @@ Check Levels
 - similarity:  All parallelism configs, real TE attention, similarity checks
 """
 
+import gc
 import os
 from dataclasses import dataclass
 from typing import List
@@ -594,6 +595,11 @@ def assert_close(name, a, b, bitwise):
 @pytest.mark.parametrize("tc", TEST_CASES, ids=lambda tc: tc.name)
 def test_thd_format(tc: TestCase):
     """Compare THD vs SBHD format outputs and gradients."""
+    # Keep this large parametrized test independent of allocator state left by
+    # earlier CUDA-graph tests in the shared transformer unit-test process.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     H, seqlens = tc.hidden_size, tc.seqlens
     tp_size, cp_size, sp = tc.tp_size, tc.cp_size, tc.sp_enabled
     B = len(seqlens)

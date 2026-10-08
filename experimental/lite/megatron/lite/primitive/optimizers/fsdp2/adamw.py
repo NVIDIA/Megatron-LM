@@ -11,6 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from megatron.lite.primitive.optimizers.fsdp2.grad_clip import fused_sq_sum
+
 
 def local_grad_sq_sum(
     params: Iterable[nn.Parameter],
@@ -18,18 +20,19 @@ def local_grad_sq_sum(
     dtype: torch.dtype,
     default_device: torch.device | None = None,
 ) -> torch.Tensor:
-    total: torch.Tensor | None = None
+    grads: list[torch.Tensor] = []
+    device: torch.device | None = None
     for param in params:
         grad = param.grad
         if grad is None:
             continue
-        grad = to_local_tensor(grad)
-        if total is None:
-            total = torch.zeros((), device=grad.device, dtype=dtype)
-        total += grad.detach().to(dtype).pow(2).sum()
-    if total is None:
+        grad = to_local_tensor(grad).detach()
+        if device is None:
+            device = grad.device
+        grads.append(grad)
+    if device is None:
         return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
-    return total
+    return fused_sq_sum(grads, dtype=dtype, device=device)
 
 
 def to_local_tensor(tensor):
@@ -189,6 +192,14 @@ class FP32AdamW:
     def step(self) -> None:
         self._step_param_groups()
 
+    @torch.no_grad()
+    def reload_model_params(self) -> None:
+        """Refresh FP32 masters after model weights are loaded or initialized."""
+        for param in self.params:
+            master = to_local_tensor(self.state[param]["master_param"])
+            model_param = to_local_tensor(param.detach())
+            master.copy_(model_param.to(device=master.device, dtype=master.dtype))
+
     def _step_param_groups(self) -> None:
         self.step_count += 1
         beta1, beta2 = self.betas
@@ -219,10 +230,11 @@ class FP32AdamW:
                 self._copy_master_to_param(param, master)
 
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
+        # No .to(float32): add_()/addcmul_() promote into the FP32 accumulators, so a
+        # full-size cast here would only cost peak memory.
         if self.cpu_update:
-            grad = to_local_tensor(grad)
-            return grad.detach().to(device=master.device, dtype=torch.float32)
-        return grad.detach().to(dtype=torch.float32)
+            return to_local_tensor(grad).detach().to(device=master.device)
+        return grad.detach()
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
         model_dtype = self._model_param_dtype(param)

@@ -30,6 +30,7 @@ from megatron.core.transformer.multi_token_prediction import (
     ContiguousPackedSeqRollPlan,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
     _mtp_logits_are_vocab_sharded,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
@@ -1072,30 +1073,40 @@ class TestMultiTokenPrediction:
             rolled_loss_mask, torch.tensor([[1, 0, 1, 0, 0, 0]], dtype=torch.float32)
         )
 
-    def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(self):
-        """When labels and input_ids are both None, MTP loss is skipped (early return)."""
+    @pytest.mark.parametrize("mtp_loss_type", ["cross_entropy", "e2e_tv"])
+    @pytest.mark.parametrize("is_training", [False, True])
+    def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(
+        self, monkeypatch, mtp_loss_type, is_training
+    ):
+        """Missing labels and input_ids skip both loss computation and the group lookup."""
         config = TransformerConfig(
-            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+            hidden_size=8,
+            num_layers=2,
+            num_attention_heads=2,
+            mtp_num_layers=1,
+            mtp_loss_type=mtp_loss_type,
+            mtp_detach_heads=True,
         )
         hidden_states = torch.ones(2, 1, 4)
-        called = {'value': False}
 
-        def output_layer(hidden, weight=None, runtime_gather_output=None):
-            return hidden.clone(), None
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("MTP loss and logging group lookup should have been skipped")
 
-        def compute_language_model_loss(mtp_labels, mtp_logits):
-            called['value'] = True
-            return torch.ones_like(mtp_labels, dtype=mtp_logits.dtype)
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction.parallel_state."
+            "get_data_parallel_group",
+            fail_if_called,
+        )
 
         out = process_mtp_loss(
             hidden_states=hidden_states,
             labels=None,
             loss_mask=None,
-            output_layer=output_layer,
+            output_layer=fail_if_called,
             output_weight=None,
             runtime_gather_output=None,
-            is_training=False,
-            compute_language_model_loss=compute_language_model_loss,
+            is_training=is_training,
+            compute_language_model_loss=fail_if_called,
             config=config,
             cp_group=None,
             packed_seq_params=None,
@@ -1103,8 +1114,8 @@ class TestMultiTokenPrediction:
         )
 
         # First chunk is returned unchanged and the loss is never computed.
-        assert not called['value']
         assert torch.equal(out, torch.chunk(hidden_states, 2, dim=0)[0])
+        assert "loss_sums" not in MTPLossLoggingHelper.tracker
 
     @pytest.mark.parametrize(
         ("fuse_linear_cross_entropy", "acceptance_consumer"), [(False, False), (True, True)]
@@ -1177,6 +1188,72 @@ class TestMultiTokenPrediction:
 
         assert "loss_sums" in MTPLossLoggingHelper.tracker
         assert "acceptance_counts" not in MTPLossLoggingHelper.tracker
+
+    @pytest.mark.parametrize("mtp_loss_type", ["cross_entropy", "e2e_tv"])
+    @pytest.mark.parametrize("provide_dp_cp_group", [False, True])
+    @pytest.mark.parametrize("is_training", [False, True])
+    def test_process_mtp_loss_logging_uses_dp_cp_group(
+        self, monkeypatch, mtp_loss_type, provide_dp_cp_group, is_training
+    ):
+        """Both objectives honor explicit logging groups or use MPU during training."""
+        config = TransformerConfig(
+            hidden_size=8,
+            num_layers=2,
+            num_attention_heads=2,
+            mtp_num_layers=2,
+            mtp_loss_type=mtp_loss_type,
+            mtp_detach_heads=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, device="cuda"
+        )
+        supplied_group = object()
+        fallback_group = object()
+        fallback_lookups = []
+
+        def default_dp_cp_group(**kwargs):
+            assert is_training and not provide_dp_cp_group
+            assert kwargs == {"with_context_parallel": True}
+            fallback_lookups.append(kwargs)
+            return fallback_group
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return torch.matmul(hidden, weight.t()), None
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction.parallel_state."
+            "get_data_parallel_group",
+            default_dp_cp_group,
+        )
+        monkeypatch.setattr(MTPLossLoggingHelper, "tracker", {})
+        MTPLossLoggingHelper.configure_acceptance_collection(enabled=True)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.zeros(1, seq_len, dtype=torch.long, device="cuda"),
+            loss_mask=torch.ones(1, seq_len, device="cuda"),
+            output_layer=output_layer,
+            output_weight=torch.eye(config.hidden_size, device="cuda"),
+            runtime_gather_output=True,
+            is_training=is_training,
+            compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                labels, dtype=logits.dtype
+            ),
+            config=config,
+            dp_cp_group=supplied_group if provide_dp_cp_group else None,
+        )
+
+        uses_fallback = is_training and not provide_dp_cp_group
+        assert len(fallback_lookups) == int(uses_fallback)
+        if is_training:
+            expected_group = supplied_group if provide_dp_cp_group else fallback_group
+            assert MTPLossLoggingHelper.tracker["avg_group"] is expected_group
+            assert MTPLossLoggingHelper.tracker["acceptance_avg_group"] is expected_group
+            assert MTPLossLoggingHelper.tracker["loss_sums"].numel() == config.mtp_num_layers
+        else:
+            assert "loss_sums" not in MTPLossLoggingHelper.tracker
+            assert "acceptance_counts" not in MTPLossLoggingHelper.tracker
 
     def test_process_mtp_loss_derives_labels_from_input_ids(self):
         """When labels is None (RL), labels are derived from input_ids by rolling left.
@@ -2242,6 +2319,74 @@ class TestMultiTokenPredictionHybrid:
             loss.backward()
             for name, param in mamba_model[0].named_parameters():
                 assert param.main_grad is not None
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    def test_full_recompute_with_multi_layer_chunks_mamba(self):
+        """Hybrid MTP chunks are recomputed once without an outer MTP checkpoint."""
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            full_recompute=True,
+        )
+        # The main pattern has four symbols and each MTP pattern has two. A chunk
+        # size larger than both should checkpoint each nested HybridStack once.
+        args.recompute_num_layers = 8
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        mtp_layers = [
+            module
+            for module in unwrap_model(model[0]).modules()
+            if isinstance(module, MultiTokenPredictionLayer)
+        ]
+        assert len(mtp_layers) == args.mtp_num_layers
+
+        inner_layer_forward_counts = {}
+
+        def count_inner_layer_forward(module, _inputs, _output):
+            inner_layer_forward_counts[module] += 1
+
+        hook_handles = []
+        for mtp_layer in mtp_layers:
+            for inner_layer in mtp_layer.mtp_model_layer.layers:
+                inner_layer_forward_counts[inner_layer] = 0
+                hook_handles.append(inner_layer.register_forward_hook(count_inner_layer_forward))
+
+        try:
+            output = model[0].forward(
+                input_ids=batch['tokens'],
+                position_ids=batch['position_ids'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['labels'],
+                loss_mask=batch['loss_mask'],
+            )
+            output.mean().backward()
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        # Each nested layer runs once in the original forward and once when its HybridStack
+        # chunk is recomputed in backward. An outer MTP checkpoint would add a third execution.
+        assert inner_layer_forward_counts
+        assert all(count == 2 for count in inner_layer_forward_counts.values())
+
+        for name, param in model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     def test_attention_mask_validation_mamba(self):

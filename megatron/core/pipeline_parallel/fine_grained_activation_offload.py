@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
+
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
@@ -599,10 +601,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -918,18 +918,10 @@ class ChunkOffloadHandler:
         return self._max_group_size == 0
 
     def finish_all_groups(self, name=None) -> bool:
-        """Finish all groups."""
+        """Return whether this handler has no remaining group named ``name``."""
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # TODO: check if this is correct
-        # Mark it as finished when there are no groups to offload or reload
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-        ):
-            return True
         assert name is not None, "Name is required"
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
@@ -989,6 +981,8 @@ class ChunkOffloadHandler:
         if not self._can_manage_tensor_for_offload(tensor):
             return False
         if _te_do_not_offload(tensor):
+            return False
+        if is_checkpoint_without_output_tensor(tensor):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
@@ -1333,8 +1327,10 @@ def fine_grained_offloading_group_start(tensor, name=None):
 
 class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
-    Identity operation that marks the end of a layer group for offload synchronization.
-    Triggers offload during forward and synchronizes reload during backward.
+    Identity operation that marks a Transformer Engine per-callable capture boundary.
+
+    This is inserted by ``_te_cuda_graph_capture``; MCore local and full-iteration
+    CUDA graph runners do not use this callback-based boundary.
     """
 
     @staticmethod
@@ -1345,13 +1341,27 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Record the backward event and wait for the h2d stream on cuda graph stream."""
+        """Queue the event and H2D join at the current TE callable's GraphTask tail."""
         debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
-        mgr = PipelineOffloadManager.get_instance()
-        # This event connects TE's graph stream with the reload stream so
-        # backward consumers do not race H2D reloads launched outside the graph.
-        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
+
+        def record_backward_completion():
+            mgr = PipelineOffloadManager.get_instance()
+            current_stream = torch.cuda.current_stream()
+            # TE uses this external event to synchronize the main stream after
+            # replay. Record it only after the entire GraphTask, including all
+            # requested parameter and input gradients, has completed. The following
+            # H2D join remains after the event so next-group reload can overlap
+            # main-stream work while still belonging to the captured graph.
+            current_stream.record_event(mgr.cuda_graph_event)
+            current_stream.wait_stream(mgr.h2d_stream)
+
+        # TE warms up and captures every callable with a separate autograd.backward(),
+        # so this callback runs before that callable's backward capture context closes.
+        # Its CUDA commands become the tail of that callable's backward graph; normal
+        # training replay calls bwd_graph.replay() and does not run this Python callback
+        # again. Keep backward_record's node on this outer per-callable boundary: moving
+        # it into a reentrant checkpoint would instead target the inner GraphTask tail.
+        torch.autograd.Variable._execution_engine.queue_callback(record_backward_completion)
         return (grad_output,)
 
 

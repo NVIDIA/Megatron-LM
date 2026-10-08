@@ -178,6 +178,29 @@ def test_cast_preserves_layout_and_casts_values(distributed_setup):
     )
 
 
+def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
+    """DBuffer.cast writes casted values into an existing destination buffer."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=buffer.layout.tensor_shapes,
+        dtype=torch.bfloat16,
+        device=distributed_setup.device,
+    )
+    destination_data_ptr = destination.local_buffer.data_ptr()
+
+    result = buffer.cast(torch.bfloat16, out=destination)
+
+    assert result is destination
+    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    _assert_dbuffer_local_tensors_close(
+        destination, [tensor.to(dtype=torch.bfloat16) for tensor in tensors]
+    )
+
+
 def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup):
     """DBuffer storage can be released and reallocated without replacing existing views."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))

@@ -165,6 +165,12 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'core_attention')
         assert hasattr(attn, 'q_layernorm')
         assert hasattr(attn, 'kv_layernorm')
+        assert attn.linear_q_up_proj.weight.qkv_layout.num_groups == config.num_attention_heads
+        assert attn.linear_q_up_proj.weight.qkv_layout.projection_split_shapes == (
+            config.qk_head_dim,
+            config.qk_pos_emb_head_dim,
+        )
+        assert getattr(attn.linear_kv_proj.weight, 'qkv_layout', None) is None
 
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""
