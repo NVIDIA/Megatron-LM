@@ -85,6 +85,23 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
         parameter_group.sync_model_weight_from_main_weight()
 
 
+def _uses_fused_wgrad(
+    owning_module: nn.Module, fqns: Iterable[str], parameter: nn.Parameter
+) -> bool:
+    """Return whether Transformer Engine writes this parameter's gradient through ``main_grad``.
+
+    TE modules built with ``fuse_wgrad_accumulation=True`` write the gradients of their GEMM
+    weights, which are 2-D, into ``weight.main_grad``. Their other parameters, such as LayerNorm
+    weights and biases, still receive gradients through autograd.
+    """
+    if parameter.dim() != 2:
+        return False
+    return any(
+        getattr(get_parameter_owner(owning_module, fqn)[0], "fuse_wgrad_accumulation", False)
+        for fqn in fqns
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class FsdpParameter:
     """One physical parameter and its FSDP runtime representations."""
@@ -124,6 +141,10 @@ class FsdpParameterGroup:
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    # Aligned with fsdp_parameters: True where a TE module writes the gradient into main_grad.
+    fused_wgrad_mask: tuple[bool, ...]
+    # Reduce-scatter input for the backward in progress when this group has fused parameters.
+    _fused_grad_buffer: DBuffer | None
 
     def __init__(
         self,
@@ -164,6 +185,11 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.fused_wgrad_mask = tuple(
+            self.requires_grad and _uses_fused_wgrad(owning_module, fqns, parameter)
+            for parameter, fqns in parameter_to_fqns.items()
+        )
+        self._fused_grad_buffer = None
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -182,12 +208,22 @@ class FsdpParameterGroup:
             mixed_precision_policy,
             use_symmetric_memory,
         )
+        if self.has_fused_wgrad and not isinstance(self.model_weight, DBuffer):
+            raise ValueError(
+                "Transformer Engine wgrad fusion with MXFP8 parameters is not supported by "
+                "MFSDP v2 yet."
+            )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
         # _build_fsdp_parameters() creates views into this storage, which requires a valid
         # storage size. Release it only after construction; a later unshard reallocates it.
         self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
+
+    @property
+    def has_fused_wgrad(self) -> bool:
+        """Whether a Transformer Engine module writes any of this group's gradients."""
+        return any(self.fused_wgrad_mask)
 
     @staticmethod
     def _collect_parameter_metadata(
@@ -518,10 +554,57 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
+
+    def prepare_fused_grad_buffer(self) -> None:
+        """Allocate this backward's reduce-scatter input and expose fused views as ``main_grad``.
+
+        Runs on the current (compute) stream before the owning module's backward. Transformer
+        Engine accumulates into ``main_grad``, so the buffer is zeroed. Later calls in the same
+        backward are no-ops.
+        """
+        if not self.has_fused_wgrad or self._fused_grad_buffer is not None:
+            return
+        with self._symmetric_memory_context():
+            buffer = DBuffer(
+                mesh=self.mesh,
+                placements=[Partial("avg")] * self.mesh.ndim,
+                layout=self.main_weight.layout,
+                dtype=self.dtype,
+                device=self.main_weight.device,
+            )
+        buffer.local_buffer.zero_()
+        for index, (fsdp_parameter, fused) in enumerate(
+            zip(self.fsdp_parameters, self.fused_wgrad_mask)
+        ):
+            if fused:
+                fsdp_parameter.unsharded.main_grad = buffer.get_tensor_view(index)
+        self._fused_grad_buffer = buffer
+
+    def take_fused_grad_buffer(self) -> DBuffer:
+        """Finish this backward's fused buffer and return it for the reduce-scatter.
+
+        Adds autograd gradients, for parameters Transformer Engine does not write, into their
+        views and removes ``main_grad`` from fused parameters so it exists only during backward.
+        """
+        buffer = self._fused_grad_buffer
+        if buffer is None:
+            raise RuntimeError("The fused gradient buffer was not prepared before backward.")
+        self._fused_grad_buffer = None
+        for index, (fsdp_parameter, fused) in enumerate(
+            zip(self.fsdp_parameters, self.fused_wgrad_mask)
+        ):
+            parameter = fsdp_parameter.unsharded
+            if fused:
+                del parameter.main_grad
+            if parameter.grad is not None:
+                buffer.get_tensor_view(index).add_(parameter.grad)
+                parameter.grad = None
+            elif not fused:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+        return buffer
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False
