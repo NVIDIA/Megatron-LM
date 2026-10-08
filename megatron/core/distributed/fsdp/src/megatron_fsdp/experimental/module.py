@@ -312,6 +312,12 @@ class FsdpModule:
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
+
+        Raises:
+            NotImplementedError: During backward, if the module owns only frozen
+                parameters and its full-backward hook receives no input gradients.
+                Raised before invoking ``post_backward_hook``; parameterless modules
+                are unaffected.
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
