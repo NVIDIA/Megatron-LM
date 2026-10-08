@@ -107,11 +107,13 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         cp_group = grid.create_pg("cp")
         tp_group = grid.create_pg("tp")
         dp_cp_group = grid.create_pg(["cp", "dp"])
-        embd_group_ranks = parallel_state.default_embedding_ranks(
-            torch.distributed.get_process_group_ranks(pp_group)
-        )
-        embd_group = torch.distributed.new_group(
-            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
+        # Every world rank must create all embedding groups in the same order.
+        embd_rank_groups = [
+            parallel_state.default_embedding_ranks(pp_ranks)
+            for pp_ranks in grid.get_rank_enum("pp")
+        ]
+        embd_group, _ = torch.distributed.new_subgroups_by_enumeration(
+            embd_rank_groups, timeout=timedelta(minutes=30)
         )
 
         # Create model with custom process groups

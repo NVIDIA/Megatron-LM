@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -352,7 +353,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_mup": False,
     "use_ring_exchange_p2p": False,
     "use_te_activation_func": False,
-    "use_te_rng_tracker": False,
+    # RNGConfig now propagates the fixture's te_rng_tracker=True; the old
+    # args adapter missed this differently named field and left it False.
+    "use_te_rng_tracker": True,
     "variable_seq_lengths": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
@@ -579,7 +582,7 @@ class TestHybridMoEModel:
         args.vocab_size = 131072
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def setup_method(self, method):

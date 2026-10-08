@@ -1225,6 +1225,9 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 stop_words=stop,
+                detokenize_stop_sequence=bool(
+                    _get_non_none(req, "include_stop_str_in_output", False)
+                ),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
@@ -1494,6 +1497,11 @@ try:
             is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
             if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
                 content = ""
+            elif not normalized_tool_calls and not message_text and "reasoning" in metadata:
+                # Match vLLM's reasoning-only response. Some agent clients distinguish
+                # absent final content from an empty assistant message and otherwise
+                # continue the episode after a reasoning-only completion.
+                content = None
             else:
                 content = message_text if message_text is not None else ""
 

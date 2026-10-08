@@ -264,6 +264,42 @@ def test_decode_ssm_preserves_batch_invariant_token_padding(
     assert bias is None
 
 
+class _NonContiguousDecodeSSM(_FakeSSM):
+    """Returns a non-contiguous `[N, S, d]`, as the GDP decode kernel does."""
+
+    def ssm_decode(self, zxBCdt, *args, **kwargs):
+        y = super().ssm_decode(zxBCdt, *args, **kwargs)
+        return y.transpose(0, 1).contiguous().transpose(0, 1)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 1, 3])
+def test_decode_ssm_flattens_non_contiguous_output(num_speculative_tokens):
+    """A non-contiguous decode output is flattened request-major, then token."""
+    num_requests = 5
+    seq_len = 1 + num_speculative_tokens
+    token_count = num_requests * seq_len
+    projected = torch.arange(token_count * 4, dtype=torch.float32).reshape(token_count, 1, 4)
+    mixer = _NonContiguousDecodeSSM(projected)
+
+    context = types.SimpleNamespace(
+        batch_invariant_mode=False,
+        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
+        num_speculative_tokens=num_speculative_tokens,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=token_count, prefill_req_count=0, decode_req_count=num_requests
+        ),
+        mamba_metadata=types.SimpleNamespace(
+            batch_indices_decode=torch.arange(num_requests, dtype=torch.int32)
+        ),
+        padding_slice=slice(token_count, token_count),
+    )
+
+    output, _ = mixer.ssm_dynamic_inference(torch.empty(0), context)
+
+    assert output.shape == (token_count, 1, 2)
+    assert torch.equal(output, projected[..., :2])
+
+
 class TestGDPDynamicInference:
     """Static/dynamic GDP inference equivalence against a full-sequence forward.
 

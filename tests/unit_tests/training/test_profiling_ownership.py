@@ -2,6 +2,7 @@
 
 """Behavioral ownership checks without starting an actual profiler."""
 
+import sys
 from argparse import ArgumentParser
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
@@ -88,7 +89,8 @@ def inline_profiler(monkeypatch, run_config):
     def start(config, *, iteration=0, rank=0, tensorboard_dir=None):
         run_config.profiling = config
         args.iteration = iteration
-        args.tensorboard_dir = tensorboard_dir
+        args.tensorboard_dir = "stale"
+        run_config.logger.tensorboard_dir = tensorboard_dir
         monkeypatch.setattr(training.torch.distributed, "get_rank", lambda: rank)
         with pytest.raises(BeforeTrainStep):
             training.train(
@@ -105,6 +107,29 @@ def inline_profiler(monkeypatch, run_config):
             )
 
     return start
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_workload_inspector_uses_profiling_config(monkeypatch, inline_profiler, enabled):
+    options = ["--run-workload-inspector-server"] if enabled else []
+    _, config = cli_config(*options)
+    assert config.run_workload_inspector_server is enabled
+    assert not config.use_nsys_profiler
+    assert not config.use_pytorch_profiler
+    server = Mock()
+    monkeypatch.setitem(
+        sys.modules, "workload_inspector.utils.webserver", SimpleNamespace(run_server=server)
+    )
+    thread = Mock()
+    monkeypatch.setattr("threading.Thread", thread)
+
+    inline_profiler(config)
+
+    if enabled:
+        thread.assert_called_once_with(target=server, daemon=True, args=(0,))
+        thread.return_value.start.assert_called_once_with()
+    else:
+        thread.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -397,6 +422,7 @@ def test_training_log_memory_snapshot_without_profiling_args(
     from megatron.training import training
 
     args, config = cli_config("--log-interval", "1", "--micro-batch-size", "1")
+    run_config.logger.log_interval = 1
     run_config.profiling = config
     config.record_memory_history = enabled
     config.profile_ranks = ranks
