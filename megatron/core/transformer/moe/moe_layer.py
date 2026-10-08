@@ -30,6 +30,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -661,6 +662,11 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if not self.training and isinstance(
+                self.token_dispatcher, InferenceAllGatherDispatcherBase
+            ):
+                # The latent projection consumes model-dtype activations.
+                output = output.to(self.config.params_dtype)
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
@@ -676,6 +682,14 @@ class MoELayer(BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
+        if (
+            not self.training
+            and isinstance(self.token_dispatcher, InferenceAllGatherDispatcherBase)
+            and not self.config.fp32_residual_connection
+        ):
+            # Round once after the shared/routed addition. FP32 residuals opt
+            # into retaining the result through the following residual update.
+            output = output.to(self.config.params_dtype)
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):

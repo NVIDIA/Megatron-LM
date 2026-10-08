@@ -137,10 +137,9 @@ def _fused_moe_kernel(
 ):
     """Fused MoE grouped GEMM with indirect token addressing.
 
-    Body mirrors vLLM's `fused_moe_kernel` verbatim except for the
-    `FUSE_SQUARED_RELU` branch (Megatron applies relu+square in fp32 on
-    the accumulator before the bf16 cast — strictly more accurate than
-    upstream's separate post-FC1 activation kernel).
+    Adapted from vLLM's `fused_moe_kernel`. Megatron applies squared ReLU
+    directly to the FP32 FC1 accumulator before its BF16 store. FC2 can
+    instead store FP32, preserving its accumulator for the weighted sum.
 
     Grid is sized host-side from `num_tokens_hint` (the typical-case token
     count), not the worst-case buffer length, so launch overhead at decode
@@ -225,7 +224,9 @@ def _fused_moe_kernel(
                 moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
                 accumulator *= moe_weight[:, None]
 
-            accumulator = accumulator.to(tl.bfloat16)
+            # FC1 stores BF16 activations. Ordinary FC2 retains its FP32
+            # accumulator until routing weights and the expert sum are applied.
+            accumulator = accumulator.to(c_ptr.dtype.element_ty)
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
             c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
@@ -299,7 +300,9 @@ class VllmFusedMoeBuffers:
                 num_valid * fc1_output_size, dtype=torch.bfloat16, device=device
             ),
             'intermediate3': torch.empty(
-                num_valid * hidden_size, dtype=torch.bfloat16, device=device
+                num_valid * hidden_size,
+                dtype=torch.bfloat16 if batch_invariant.enabled() else torch.float32,
+                device=device,
             ),
             'sorted_token_ids': torch.empty(max_sorted_worst, dtype=torch.int32, device=device),
             'expert_ids': torch.empty(max_blocks_worst, dtype=torch.int32, device=device),
@@ -839,11 +842,16 @@ def vllm_fused_moe(
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
     # already applied routing weights at the activation to match training;
-    # ordinary inference applies them in the reduction kernel.
+    # ordinary inference applies them in the reduction kernel. Keep FC2 in
+    # FP32 through that multiply and sum: rounding either before weighting
+    # (old Megatron) or after weighting (vLLM) discards useful accumulator bits.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
     intermediate3 = VllmFusedMoeBuffers.get(
-        "intermediate3", (num_valid, K), hidden_states.dtype, hidden_states.device
+        "intermediate3",
+        (num_valid, K),
+        hidden_states.dtype if batch_invariant_mode else torch.float32,
+        hidden_states.device,
     )
     _invoke_fused_moe_kernel(
         intermediate1,

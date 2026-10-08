@@ -46,20 +46,34 @@ except ImportError:
     HAVE_TE = False
 
 
-def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
+def _te_rms_norm_kernel(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: Optional[torch.dtype] = None
+):
+    output_dtype = x.dtype if output_dtype is None else output_dtype
+    if x.dtype == torch.float32 and output_dtype != torch.float32:
+        from megatron.core.fusions.fused_inference_rms_norm import fp32_residual_rms_norm
+
+        return fp32_residual_rms_norm(x, weight, eps, output_dtype=output_dtype)
     # Use the same RMSNorm kernel as the training recompute.
     if is_batch_invariant_mode_enabled() and get_batch_invariant_backend() != "te_native":
         # te_native keeps the native TE RMSNorm: the 64-multiple alignment
         # discipline holds its M%32 reduction bit-class constant, so kernel
         # substitution is unnecessary (and native is faster).
-        return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
+        return rmsnorm_batch_invariant(x, weight, eps).to(output_dtype)
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
-        x, weight, eps, None, None, TE_DType[x.dtype], 16, False  # sm-margin  # zero centered gamma
+        x,
+        weight,
+        eps,
+        None,
+        None,
+        TE_DType[output_dtype],
+        16,
+        False,  # sm-margin  # zero centered gamma
     )
     out = out.view(*x_shape[:-1], -1)
-    return out.to(x.dtype)
+    return out.to(output_dtype)
 
 
 def _apply_linear(
@@ -210,7 +224,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         symm_mem_buffer_dims = list(x.size())
         symm_mem_buffer_dims[0] *= self.tp_size
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
-        symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
+        symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=self.config.params_dtype)
         return symm_mem_buffer
 
     def _all_gather(self, x: torch.Tensor, symm_mem_buffer: dict) -> None:
@@ -257,10 +271,17 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            x = _te_rms_norm_kernel(
+                x=x,
+                weight=self.layer_norm_weight,
+                eps=self.eps,
+                output_dtype=self.config.params_dtype,
+            )
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
+        # Normalized activations use the projection input dtype even when the
+        # residual stream is FP32. Size symmetric storage for those activations.
         symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
         is_in_fused_mode = (
             self.skip_norm_and_all_gather
@@ -270,7 +291,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if is_in_fused_mode:
             x = symm_mem_buffer["tensor"]
         else:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            x = _te_rms_norm_kernel(
+                x=x,
+                weight=self.layer_norm_weight,
+                eps=self.eps,
+                output_dtype=self.config.params_dtype,
+            )
             x = self._all_gather(x, symm_mem_buffer)
 
         x = _apply_linear(x, self.weight, self.config)

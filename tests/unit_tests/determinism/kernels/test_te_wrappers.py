@@ -606,3 +606,70 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
     assert_replays_bit_exact(
         fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
     )
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_opted_in_te_and_projection_norms_return_model_dtype(weight_dtype, monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.extensions.transformer_engine import TENorm
+    from megatron.core.fusions.fused_inference_rms_norm import fp32_residual_rms_norm
+    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+    from megatron.core.tensor_parallel.inference_layers import (
+        InferenceLayerNormColumnParallelLinear,
+        _te_rms_norm_kernel,
+    )
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=1,
+        normalization="RMSNorm",
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp32_residual_connection=True,
+    )
+    norm = TENorm(config=config, hidden_size=128).cuda().eval()
+    norm.to(dtype=weight_dtype)
+    x = torch.randn(4, 1, 128, device="cuda")
+    with torch.no_grad():
+        expected = fp32_residual_rms_norm(
+            x, norm.weight, norm.eps, output_dtype=config.params_dtype
+        )
+        torch.testing.assert_close(norm(x), expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            _te_rms_norm_kernel(x, norm.weight, norm.eps, output_dtype=config.params_dtype),
+            expected,
+            rtol=0,
+            atol=0,
+        )
+        assert_replays_bit_exact(norm, (x,), backward=False, what="opted-in residual norm")
+        # Exercise the actual inference norm+projection branch with mixed
+        # residual/norm/GEMM dtypes, without requiring a TP communicator.
+        projection = SimpleNamespace(
+            training=False,
+            tp_size=1,
+            layer_norm_weight=norm.weight,
+            eps=norm.eps,
+            weight=torch.randn(64, 128, device="cuda", dtype=torch.bfloat16),
+            config=config,
+        )
+        output, bias = InferenceLayerNormColumnParallelLinear.forward(projection, x)
+        assert bias is None
+        torch.testing.assert_close(output, expected @ projection.weight.T, rtol=0, atol=0)
+        projection.tp_size = 2
+        projection.tp_group = None
+        monkeypatch.setattr(
+            SymmetricMemoryManager,
+            "get_buffer",
+            lambda *args, **kwargs: SimpleNamespace(
+                maybe_get_tensor=lambda shape, dtype: torch.empty(shape, dtype=dtype, device="cuda")
+            ),
+        )
+        buffer = InferenceLayerNormColumnParallelLinear._maybe_allocate_symmetric_buffer(
+            projection, x
+        )
+        assert buffer.dtype == config.params_dtype
+        assert buffer.shape == (8, 1, 128)
+    assert expected.dtype == torch.bfloat16

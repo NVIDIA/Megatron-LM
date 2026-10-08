@@ -144,7 +144,15 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
     def _prepare_mixer_input(self, hidden_states: Tensor) -> Tensor:
         """Convert a branch input to parameter precision and normalize it."""
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+        # In inference, the explicit norm (or the mixer's fused input norm)
+        # must see the unrounded residual. It casts only its normalized output
+        # to the parameter dtype consumed by the projection.
+        if (
+            self.training
+            or not self.config.fp32_residual_connection
+            or self.config.transformer_impl != "inference_optimized"
+        ):
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         return apply_module(self.norm)(hidden_states)
 
     def _prepare_residual(self, hidden_states: Tensor) -> Tensor:
