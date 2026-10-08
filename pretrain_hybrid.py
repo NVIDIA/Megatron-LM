@@ -120,6 +120,11 @@ def get_batch(data_iterator, vp_stage=None):
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
+            dynamic_cp_group_func=mpu.get_dynamic_data_context_parallel_groups,
+            dynamic_tp_cp_group_func=mpu.get_dynamic_tensor_data_context_parallel_group,
+            tp_cp_group=(
+                mpu.get_tensor_and_context_parallel_group() if config.sequence_parallel else None
+            ),
             return_context_parallel_batch=True,
         )
 

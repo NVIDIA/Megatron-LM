@@ -2858,9 +2858,6 @@ def get_batch_on_this_cp_rank(
         to this CP rank.
     """
 
-    if cp_group is None:
-        cp_group = parallel_state.get_context_parallel_group()
-
     if is_hybrid_cp:
         cp_group = _resolve_dynamic_cp_group_for_batch(batch, hybrid_cp_group_func)
 
