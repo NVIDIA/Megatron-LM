@@ -40,7 +40,11 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from pretrain_gpt import loss_func
 
 
@@ -250,10 +254,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     Returns:
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
     """
+    cfg = get_run_config()
     args = get_args()
 
     config = MultimodalDatasetConfig(
-        random_seed=args.seed,
+        random_seed=cfg.rng.seed,
         split=args.split,
         sequence_length=args.dataloader_seq_length,
         tokenizer=get_tokenizer(),
