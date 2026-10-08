@@ -4,9 +4,17 @@
 import triton
 import triton.language as tl
 
+# Default copy/pop launch sizes for non-Rubin GPUs: elements each program copies
+# per inner-loop iteration, and the maximum number of programs per launch.
 GLOBAL_BLOCK_SIZE = 1024
+GLOBAL_MAX_BLOCKS = 2048
 
-__all__ = ["GLOBAL_BLOCK_SIZE", "paged_stash_copy_kernel", "paged_stash_pop_kernel"]
+__all__ = [
+    "GLOBAL_BLOCK_SIZE",
+    "GLOBAL_MAX_BLOCKS",
+    "paged_stash_copy_kernel",
+    "paged_stash_pop_kernel",
+]
 
 
 @triton.jit
