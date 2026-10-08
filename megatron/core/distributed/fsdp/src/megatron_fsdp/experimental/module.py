@@ -36,10 +36,10 @@ from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
     FsdpParameterGroup,
-    Phase,
     effective_dtype,
     get_containing_parameter_group,
 )
+from .phase import Phase
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -296,8 +296,8 @@ class FsdpModule:
 
         Args:
             phase: In what phase this module runs. None unshards for every phase.
-            prefetch: Whether to also prefetch successors in the module order of a
-                FORWARD or BACKWARD ``phase``.
+            prefetch: Whether to also prefetch successors in the module order of
+                ``phase``, which must then be FORWARD or BACKWARD.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -313,17 +313,22 @@ class FsdpModule:
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
-            context = self.context
             if not prefetch:
                 return
-            if phase is Phase.FORWARD:
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
-                )
-            elif phase is Phase.BACKWARD:
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
+            context = self.context
+            match phase:
+                case Phase.FORWARD:
+                    self._prefetch_parameter_groups(
+                        context.forward_order, self._schedule_policy.forward_prefetch_size
+                    )
+                case Phase.BACKWARD:
+                    self._prefetch_parameter_groups(
+                        context.backward_order, self._schedule_policy.backward_prefetch_size
+                    )
+                case _:
+                    raise ValueError(
+                        f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
+                    )
 
     def _prefetch_parameter_groups(
         self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
