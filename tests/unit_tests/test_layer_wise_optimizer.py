@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from types import SimpleNamespace
@@ -94,6 +94,7 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=0.0,
         overlap_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
         use_layer_wise_param_layout=False,
     )
 
@@ -101,6 +102,63 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
 
     assert optimizer._managed_optimizer_state_offload_child_indices() == ()
     LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_layerwise_initializes_effective_ddp_sync_config(monkeypatch, overlap):
+    """Muon uses its owned bucket policy, excluding sibling DistOpt settings."""
+
+    class FakeWrappedOptimizer:
+        def __init__(self, optimizer, config, grad_scaler, init_state_fn):
+            self.optimizer = optimizer
+            self.config = config
+            self._optimizer_state_offloader = None
+
+    def fake_shard_params(self, optimizers, full_param_layouts=None, model_chunks=None):
+        self.dp_cp_params_list = []
+        self.expt_dp_params_list = []
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",
+        FakeWrappedOptimizer,
+    )
+    monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
+    metadata_calls = []
+    monkeypatch.setattr(
+        LayerWiseDistributedOptimizer,
+        "set_bucket_layerwise_params_list",
+        lambda self, chunks: metadata_calls.append(chunks),
+    )
+    config = OptimizerConfig(
+        bf16=True, overlap_param_gather=not overlap, use_layer_wise_param_layout=False
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=False, overlap_param_gather=overlap
+    )
+    sibling_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, overlap_param_gather=overlap
+    )
+    layerwise_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=True)
+    sibling_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=False)
+    layerwise_group = SimpleNamespace(
+        ddp_config=ddp_config, buckets=[SimpleNamespace(params_list=[layerwise_param])]
+    )
+    sibling_group = SimpleNamespace(
+        ddp_config=sibling_config, buckets=[SimpleNamespace(params_list=[sibling_param])]
+    )
+    chunks = [
+        SimpleNamespace(
+            ddp_config=sibling_config,
+            bucket_groups=[sibling_group, layerwise_group],
+            expert_parallel_bucket_groups=[],
+        )
+    ]
+    optimizer = LayerWiseDistributedOptimizer([object()], config, model_chunks=chunks)
+
+    assert optimizer.ddp_config is ddp_config
+    assert optimizer.overlap_param_gather is overlap
+    assert optimizer.layerwise_param_sync_via_bucket_group is overlap
+    assert metadata_calls == ([chunks] if overlap else [])
 
 
 def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
@@ -135,6 +193,7 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=1.0,
         overlap_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
         use_layer_wise_param_layout=False,
     )
 

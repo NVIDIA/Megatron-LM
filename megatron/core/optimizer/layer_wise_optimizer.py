@@ -554,6 +554,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+        # Compact LayerWise buffers override the model-level DistOpt setting.
+        # Their bucket groups own the effective parameter-sync policy; sibling
+        # Adam buckets may still use DistOpt and must not select Muon's sync path.
+        self.ddp_config = next(
+            (
+                group.ddp_config
+                for chunk in model_chunks or []
+                for group in chunk.bucket_groups + chunk.expert_parallel_bucket_groups
+                if group.buckets and _bucket_is_managed_by_layer_wise_optimizer(group.buckets[0])
+            ),
+            None,
+        )
         self.decouple_ddp_layout = not config.use_layer_wise_param_layout
 
         # The data-parallel groups this optimizer shards parameters over. Cached here so the
