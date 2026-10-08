@@ -66,6 +66,8 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
+    _localize_qkv_split_shapes,
+    _qkv_split_groups_are_complete,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
@@ -768,6 +770,10 @@ def _get_megatron_emerging_optimizer(
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
+    if config.muon_split_qkv_per_head and not config.muon_split_qkv:
+        raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
+    if config.muon_split_mla_qkv and not config.muon_split_qkv:
+        raise ValueError("muon_split_mla_qkv requires muon_split_qkv=True")
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -776,29 +782,86 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
-        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                if param.shape[0] % sum(qkv_split_shapes) == 0:
-                    param.is_qkv = True
-                    param.qkv_split_shapes = qkv_split_shapes
+            qkv_layout = getattr(param, 'qkv_layout', None)
+            if qkv_layout is not None and qkv_layout.is_mla and not config.muon_split_mla_qkv:
+                # MLA up-projections are opt-in; keep whole-matrix orthogonalization by default.
+                continue
+            if (qkv_layout is not None or 'linear_qkv.weight' in name) and len(param.shape) == 2:
+                if qkv_layout is not None:
+                    qkv_split_shapes = _get_qkv_split_shapes(
+                        qkv_layout, split_qkv_per_head=config.muon_split_qkv_per_head
+                    )
+                    logical_split_shapes = (
+                        qkv_split_shapes
+                        if config.muon_split_qkv_per_head
+                        else qkv_split_shapes * qkv_layout.num_groups
+                    )
                 else:
+                    # Backward compatibility for custom QKV modules that do not annotate
+                    # their weight with the owning attention layer's logical layout.
+                    qkv_split_shapes = _get_qkv_split_shapes(
+                        model_chunk.config, split_qkv_per_head=config.muon_split_qkv_per_head
+                    )
+                    logical_split_shapes = (
+                        qkv_split_shapes
+                        if config.muon_split_qkv_per_head
+                        else qkv_split_shapes * model_chunk.config.num_query_groups
+                    )
+
+                tp_group = (
+                    pg_collection.expt_tp
+                    if getattr(param, 'expert_tp', False)
+                    else pg_collection.tp
+                )
+                tp_size = get_pg_size(tp_group)
+                tp_rank = get_pg_rank(tp_group)
+
+                expected_logical_rows = param.shape[0] * tp_size
+                if expected_logical_rows != sum(logical_split_shapes):
                     log_single_rank(
                         logger,
                         logging.DEBUG,
                         f"Emerging optimizer QKV split skipped for {name}: "
-                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                        f"logical_rows={sum(logical_split_shapes)}, "
+                        f"local_rows={param.shape[0]}, tp_size={tp_size}",
+                    )
+                    param.is_qkv = False
+                    param.qkv_split_shapes = None
+                    param.qkv_split_shapes_global = None
+                    param.qkv_split_groups_are_complete = False
+                    param.qkv_split_heads_are_complete = False
+                    continue
+
+                param.is_qkv = True
+                param.qkv_split_shapes_global = logical_split_shapes
+                local_start = tp_rank * param.shape[0]
+                if config.muon_split_qkv_per_head:
+                    param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
+                        _localize_qkv_split_shapes(
+                            qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
+                        )
+                    )
+                else:
+                    param.qkv_split_shapes = qkv_split_shapes
+                    param.qkv_split_groups_are_complete = _qkv_split_groups_are_complete(
+                        qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
+    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
+    # deep-copy the registry defaults before rewriting so we never mutate shared state.
+    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    if eopt_name in ('muon', 'adaptive_muon'):
+        for override in default_param_overrides.values():
+            if override.get('optimizer') in ('adam', 'lion'):
+                override['optimizer'] = config.muon_scalar_optimizer
+    config_overrides.update(default_param_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
@@ -831,7 +894,10 @@ def _get_megatron_emerging_optimizer(
             "fall back to the legacy LayerWise ping-pong path."
         )
     if use_separate_distributed_optimizer and any(
-        opt_name not in _EMERGING_OPTIMIZERS
+        # A separate DistributedOptimizer with byte-level sharding handles any group
+        # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
+        # e.g., Muon). This includes scalar optimizers like Adam or Lion.
+        not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
@@ -870,7 +936,10 @@ def _get_megatron_emerging_optimizer(
 
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
-        if opt_name in _EMERGING_OPTIMIZERS:
+        # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
+        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
+        # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
+        if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
@@ -895,7 +964,7 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             if use_separate_distributed_optimizer:
-                # Route non-emerging params through a real DistributedOptimizer
+                # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.
                 for group in groups:
                     assert not group['is_expert_parallel'], (

@@ -201,6 +201,19 @@ class InferenceClient:
         """Sends UNPAUSE to all engines. No synchronization needed."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
+    def start_cuda_profiler(self) -> None:
+        """Sends START_CUDA_PROFILER to all engines via coordinator.
+
+        Each engine calls ``torch.cuda.profiler.start()`` (cudaProfilerStart) on
+        its next loop iteration, so an outer ``nsys profile --capture-range=
+        cudaProfilerApi`` begins recording. No synchronization needed.
+        """
+        self._send_signal_to_engines(Headers.START_CUDA_PROFILER)
+
+    def stop_cuda_profiler(self) -> None:
+        """Sends STOP_CUDA_PROFILER to all engines (cudaProfilerStop)."""
+        self._send_signal_to_engines(Headers.STOP_CUDA_PROFILER)
+
     def set_generation_epoch(self, generation_epoch: int):
         """Sends a signal to stamp all in-flight requests with the given generation epoch.
 

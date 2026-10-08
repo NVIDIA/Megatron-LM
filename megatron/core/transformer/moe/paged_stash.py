@@ -7,8 +7,10 @@ from typing import Any
 import torch
 
 from megatron.core._rank_utils import log_single_rank
+from megatron.core.extensions.transformer_engine import is_grouped_tensor_marked
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 from megatron.core.transformer.cuda_graph_config import is_whole_moe_cuda_graph_scope
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
@@ -20,12 +22,6 @@ from megatron.core.utils import get_attr_wrapped_model
 logger = logging.getLogger(__name__)
 
 SCALE_INV_BLOCK_SIZE = 32
-_RECOMPUTE_MANAGED_TENSOR_ATTR = '_mcore_paged_stash_recompute_managed'
-
-
-def mark_paged_stash_recompute_managed(tensor: torch.Tensor) -> None:
-    """Mark a tensor whose storage is released and restored by activation recomputation."""
-    setattr(tensor, _RECOMPUTE_MANAGED_TENSOR_ATTR, True)
 
 
 class PagedStashBuffer:
@@ -930,15 +926,13 @@ class PagedStashManager:
         # CheckpointWithoutOutput intentionally releases the storage of its output after the
         # following module has saved it, then restores that same StorageImpl during backward
         # recomputation. Paged stashing must not take ownership of such a tensor in between.
-        if getattr(tensor, _RECOMPUTE_MANAGED_TENSOR_ATTR, False):
+        # This check is storage-level because TE GroupedLinear saves reshape/split views of
+        # activation inputs, and Python tensor attributes do not survive those view operations.
+        if is_checkpoint_without_output_tensor(tensor):
             return tensor
 
         # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
-        if (
-            self.max_num_tokens is None
-            or tensor.dim() == 0
-            or not hasattr(tensor, 'grouped_tensor_scale_inv')
-        ):
+        if self.max_num_tokens is None or tensor.dim() == 0 or not is_grouped_tensor_marked(tensor):
             return tensor
 
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"

@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
@@ -276,7 +277,14 @@ class SharedExpertMLP(MLP):
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if self.activation_func is situlu:
+                    intermediate_parallel = situlu(
+                        intermediate_parallel,
+                        self.config.situ_glu_beta1,
+                        self.config.situ_glu_beta2,
+                    )
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
             elif self.config.bias_activation_fusion:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
@@ -301,6 +309,8 @@ class SharedExpertMLP(MLP):
                 if self.config.gated_linear_unit:
 
                     def glu(x):
+                        if self.config.activation_func is situlu:
+                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
@@ -417,12 +427,17 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"{self.__class__.__name__} does not support add_bias_linear=True; "
                 "the CuTeGEMM fused kernel requires bias-free linear layers."
             )
-        if not self.config.gated_linear_unit or self.config.activation_func != F.silu:
+        if not self.config.gated_linear_unit or self.config.activation_func not in (F.silu, situlu):
             raise ValueError(
-                f"{self.__class__.__name__} requires SwiGLU activation "
-                "(activation_func=F.silu, gated_linear_unit=True) for the CuTeGEMM "
+                f"{self.__class__.__name__} requires SwiGLU or SiTU-GLU activation "
+                "with gated_linear_unit=True for the CuTeGEMM "
                 f"fused kernel, but got activation_func={self.config.activation_func}, "
                 f"gated_linear_unit={self.config.gated_linear_unit}."
+            )
+        if self.config.activation_func is situlu and not hasattr(te.pytorch.ops, "ScaledSiTUGLU"):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine with "
+                "pytorch.ops.ScaledSiTUGLU for SiTU-GLU."
             )
         if self.config.moe_shared_expert_glu_interleave_size is None:
             raise ValueError(
@@ -483,7 +498,16 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
-        ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
+        if self.config.activation_func is situlu:
+            ops.append(
+                te.pytorch.ops.ScaledSiTUGLU(
+                    glu_interleave_size=glu_interleave_size,
+                    beta1=self.config.situ_glu_beta1,
+                    beta2=self.config.situ_glu_beta2,
+                )
+            )
+        else:
+            ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
 
         fc2_weight = self.linear_fc2.weight
         op = te.pytorch.ops.GroupedLinear(

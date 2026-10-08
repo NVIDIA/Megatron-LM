@@ -64,7 +64,6 @@ def make_coordinator_direct(
     n_ranks = data_parallel_size
     coordinator._hash_table = {}
     coordinator._hash_assignment_counter = 0
-    coordinator._round_robin_idx = 0
 
     sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
     coordinator.identity_to_rank_index = {

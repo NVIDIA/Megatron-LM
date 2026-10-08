@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -42,7 +42,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.paged_stash import (
     get_paged_stash_context,
-    mark_paged_stash_recompute_managed,
     paged_stash_group_commit,
     paged_stash_group_start,
 )
@@ -304,8 +303,9 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    @staticmethod
-    def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
+    def _apply_packed_bias(
+        self, intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
+    ):
         """Apply a packed expert bias without reading token counts on the host."""
         # TODO: get rid of the .float() by having fused kernel compute in FP32
         shape = intermediate_parallel.shape
@@ -313,13 +313,10 @@ class TEGroupedMLP(MegatronModule):
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
         flat_probs = permuted_probs.reshape(-1, 1).float()
-        paged_stash_marked = hasattr(intermediate_parallel, "grouped_tensor_scale_inv") or hasattr(
-            permuted_probs, "grouped_tensor_scale_inv"
-        )
-        if paged_stash_marked:
+        if self.config.moe_paged_stash:
             # The multiply below saves these two token-shaped operands. The additive output
             # operand is not saved by autograd and does not need a marker.
-            mark_grouped_tensor(flat_probs)
+            self._mark_paged_stash_tensors(flat_probs)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -337,12 +334,11 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
-        if paged_stash_marked:
-            mark_grouped_tensor(bias_per_token)
+        if self.config.moe_paged_stash:
+            self._mark_paged_stash_tensors(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
-    @staticmethod
-    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
+    def _apply_bias(self, intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
 
@@ -350,7 +346,7 @@ class TEGroupedMLP(MegatronModule):
         # GroupedTensor [num_experts, hidden_size]. The grouped-tensor backend also provides
         # tokens_per_expert as a tensor on the same device.
         if isinstance(bias_parallel, torch.Tensor) and isinstance(tokens_per_expert, torch.Tensor):
-            return TEGroupedMLP._apply_packed_bias(
+            return self._apply_packed_bias(
                 intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
             )
 
@@ -423,13 +419,14 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
+        # Check activation: SwiGLU, SiTU-GLU, quick GEGLU, or weighted squared ReLU.
         # Clamped SwiGLU (e.g. DSv4) routes through ScaledClampedQGeGLU with
         # alpha=1.0, since the cuDNN geglu kernel is a superset of swiglu.
         # Use config.activation_func instead of self.activation_func because when
         # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
         use_glu_fusion = self.config.gated_linear_unit and self.config.activation_func in (
             F.silu,
+            situlu,
             quick_gelu,
         )
         use_srelu_fusion = (
@@ -443,7 +440,14 @@ class TEGroupedMLP(MegatronModule):
                 f"(gated_linear_unit={self.config.gated_linear_unit}, "
                 f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu})"
             )
-        if self.config.activation_func == F.silu:
+        if use_glu_fusion and self.activation_recompute:
+            return _unsupported(
+                "Transformer Engine scaled GLU ops do not support activation recompute"
+            )
+        if self.config.activation_func == situlu:
+            if not hasattr(te_ops, "ScaledSiTUGLU"):
+                return _unsupported("SiTU-GLU needs ScaledSiTUGLU")
+        elif self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
                 if not is_te_min_version("2.17.0.dev0"):
                     return _unsupported("clamped SwiGLU needs TE >= 2.17.0.dev0")
@@ -546,14 +550,20 @@ class TEGroupedMLP(MegatronModule):
         )
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU, clamped GeGLU, or SReLU).
+        # Activation and post-multiply probs (SwiGLU, SiTU-GLU, clamped GeGLU, or SReLU).
         # TE's ScaledClampedQGeGLU computes sigmoid(alpha * x) * x, so
         # alpha=1.702 gives quick_gelu and alpha=1.0 gives silu/swiglu.
         # With cuDNN FE >= 1.24.0 the alpha, limit and offset are
         # forwarded as runtime params to the cuDNN kernel.
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
-        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
+        if self.config.activation_func is situlu and self.config.gated_linear_unit:
+            op = te.pytorch.ops.ScaledSiTUGLU(
+                glu_interleave_size=glu_interleave,
+                beta1=self.config.situ_glu_beta1,
+                beta2=self.config.situ_glu_beta2,
+            )
+        elif self.config.activation_func == F.silu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 qgeglu_kwargs = {
@@ -621,7 +631,8 @@ class TEGroupedMLP(MegatronModule):
                 op = te.pytorch.ops.ScaledSReLU()
         else:
             raise RuntimeError(
-                "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
+                "_make_fused_ops expected SwiGLU, SiTU-GLU, quick_gelu, or weighted "
+                "squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
         ops.append(op)
@@ -699,11 +710,33 @@ class TEGroupedMLP(MegatronModule):
 
         return forward_post_hook
 
-    def _mark_paged_stash_tensors(self, *tensors: Optional[torch.Tensor]) -> None:
+    def _mark_paged_stash_tensors(self, *tensors: torch.Tensor | None) -> None:
         """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
         if not self.config.moe_paged_stash:
             return
-        mark_grouped_tensor(*tensors)
+        tensors_to_mark = tuple(tensor for tensor in tensors if tensor is not None)
+        if tensors_to_mark:
+            mark_grouped_tensor(*tensors_to_mark)
+
+    def _get_paged_stash_scope(self, permuted_local_hidden_states, tokens_per_expert):
+        """Start a paged-stash group and return the input and saved-tensor context."""
+        if not self.config.moe_paged_stash:
+            return permuted_local_hidden_states, nullcontext()
+
+        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+        max_num_tokens = permuted_local_hidden_states.shape[0]
+        # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+        # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+        cap_factor = self.config.moe_expert_rank_capacity_factor
+        avg_num_tokens = (
+            int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+        )
+        return permuted_local_hidden_states, get_paged_stash_context(
+            name="grouped_mlp",
+            max_num_tokens=max_num_tokens,
+            num_tokens_tensor=tokens_per_expert.sum(),
+            avg_num_tokens=avg_num_tokens,
+        )
 
     def _fused_forward(
         self,
@@ -768,25 +801,9 @@ class TEGroupedMLP(MegatronModule):
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
@@ -875,7 +892,14 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = self._remove_glu_interleaving(
                         intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                     )
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if self.activation_func is situlu:
+                    intermediate_parallel = situlu(
+                        intermediate_parallel,
+                        self.config.situ_glu_beta1,
+                        self.config.situ_glu_beta2,
+                    )
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
                     intermediate_parallel = intermediate_parallel * permuted_probs
@@ -920,6 +944,8 @@ class TEGroupedMLP(MegatronModule):
                             x = self._remove_glu_interleaving(
                                 x, self.config.moe_mlp_glu_interleave_size
                             )
+                        if self.config.activation_func is situlu:
+                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
@@ -942,8 +968,6 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
-            if self.config.moe_paged_stash:
-                mark_paged_stash_recompute_managed(bias_act_output)
         else:
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
@@ -1025,25 +1049,9 @@ class TEGroupedMLP(MegatronModule):
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         with stash_context:
             output = self._unfused_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs

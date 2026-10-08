@@ -221,6 +221,11 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_kv = None
 
         if cp_size_chunkwise > 1:
+            if build_cp_context is None:
+                raise ImportError(
+                    "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
+                    "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
+                )
             if cu_seqlens_q is None:
                 cache_key = (seq_len_global, batch)
                 cached = self._chunkwise_cp_context_cache.get(cache_key)

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Entrypoints for saving and loading the distributed checkpoints.
 
@@ -326,7 +326,7 @@ def load_content_metadata(
 def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
     """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
     verify_checkpoint(checkpoint_dir)
-    TorchDistSaveShardedStrategy.remove_sharded_tensors(checkpoint_dir, key_prefix)
+    TorchDistLoadShardedStrategy().remove_sharded_tensors(checkpoint_dir, key_prefix)
 
 
 def save(
