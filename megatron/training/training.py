@@ -620,11 +620,7 @@ def _num_dsa_indexer_layers(
         mtp_num_layers=mtp_num_layers,
         mtp_use_repeated_layer=mtp_use_repeated_layer,
     )
-    if (
-        mtp_use_repeated_layer
-        and mtp_num_layers > 0
-        and mtp_shares_sparse_attention_index
-    ):
+    if mtp_use_repeated_layer and mtp_num_layers > 0 and mtp_shares_sparse_attention_index:
         layer_numbers = layer_numbers[: num_decoder_layers + 1]
     return sum(computes_index(layer_number) for layer_number in layer_numbers)
 
