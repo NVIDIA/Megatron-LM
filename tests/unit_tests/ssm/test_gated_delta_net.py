@@ -1509,7 +1509,7 @@ def _have_cudnn_frontend_min_version(min_version: str = "1.29.0") -> bool:
 )
 @pytest.mark.parametrize("head_dim", [32, 128])
 def test_parallel_gated_delta_net_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, gdn_kernel_backend, head_dim
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, gdn_kernel_backend, head_dim, run_config
 ):
     if gdn_kernel_backend == "fla" and not HAVE_FLA:
         pytest.skip("FLA is not installed.")
@@ -1573,7 +1573,9 @@ def test_parallel_gated_delta_net_correctness(
     [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
 )
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
-def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+def test_parallel_gated_delta_net2_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, run_config
+):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
