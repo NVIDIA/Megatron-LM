@@ -7,7 +7,7 @@ are listed below. Configuration checks on CPU do not qualify a parallel topology
 
 ## GPU validation status
 
-The 2026-10-06/07 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
+The 2026-10-06/07/08 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
 Engine 2.20.2, FLA 0.5.1 and cuDNN 9.19.0. These public-package container runs
 do not replace upstream CI.
 
@@ -32,7 +32,7 @@ from pretrained CP, which remains unqualified.
 | Reduced model, two ranks: PP | 12 passed on each rank; fused/unfused |
 | Reduced model, PP+VPP | 12 passed on each rank with native unbatched P2P; fused/unfused |
 | Reduced model, CP | 12 passed on each rank with FlashAttention 2.8.3; fused/unfused |
-| Reduced model, four-rank combinations | Not run |
+| Reduced model, four ranks | 96 passed, zero skipped on each rank; all eight topologies, including TP+SP+CP and TP+SP+PP, with fused/unfused pre-GDR |
 | Pretrained Qwen3.5-0.8B, one rank | All 8 comparison arms passed; 24 optimizer updates |
 | Pretrained Qwen, fused pre-GDR on one rank | All 8 arms passed, also across norm recomputation settings; 24 optimizer updates; every pre-reset pool count is zero |
 | Pretrained Qwen, DP on two ranks | All 8 arms passed on each rank; replicas have distinct losses and identical reduced gradients, weights and Adam states |
@@ -72,8 +72,13 @@ the prepared messages JSONL has SHA-256
 `94f22b43be94403da5519036c05a40575bb1eed698606c0a7323fa14736ad1f5`.
 Data contents and model weights are not included in the repository.
 
-The reduced-model two-rank suite passes all 72 applicable cases on each rank,
-with 24 four-rank cases skipped. Its CP attention uses head dimension 64.
+The earlier reduced-model two-rank suite passes all 72 applicable cases on each
+rank, with 24 four-rank cases skipped. The 2026-10-08 four-rank run completes all
+96 cases on each rank with zero skips and launcher exit code 0. It covers
+fractions 0/0.5/1 and norm recomputation off/on for both pre-GDR variants in DP,
+TP, TP+SP, CP, PP, PP+VPP, TP+SP+CP and TP+SP+PP. Four ranks also exercise DP=4
+in the DP case and DP=2 alongside each topology with one two-way parallel factor.
+The reduced model's CP attention uses head dimension 64.
 The pretrained Qwen CP failure occurs in the disabled baseline with head
 dimension 256. TE 2.20.2 disables FlashAttention 2 for head dimensions above 192
 on SM86, and its fused CP backend rejects this head dimension. The unfused
@@ -192,6 +197,17 @@ The shared-manager changes also pass all nine existing GPT/MoE CUDA Graph offloa
 cases on one A6000. These cover attention/MLA and expert groups, fractions 0/0.5/1
 and delayed/non-delayed offload. This is regression coverage for the existing
 graph path; GDN offloading still rejects CUDA graphs at configuration time.
+
+The four-rank reduced-model run uses physical A6000 GPUs 1/3/4/5 at checkout
+`5176d49bb0bdd885f6f69575fa8c39295c22b2bb`, with the same production runtime and
+test source as `2f1ee4f2e3dd6d909d08981338f5879632131139`. Each rank passes all
+96 cases, including the 24 TP+SP+CP and TP+SP+PP cases that required four ranks.
+Independent inspection of every rank log confirms 12 cases per topology and
+zero skips. The launcher returns 0 after explicit process-group cleanup.
+These are correctness comparisons, with all pre-reset pool counts zero; they
+provide no four-rank memory/runtime measurements. Other jobs began using the
+selected GPUs during the run, and the pretrained four-rank comparisons could
+not start after the reduced-model run released its devices.
 
 ## Complete-Qwen A6000 measurements
 
@@ -427,7 +443,10 @@ commands below assume those GPUs are already the visible devices in the containe
 The `--confcutdir` option omits unrelated root dataset-download fixtures. The
 reduced-model CP cases require a compatible attention backend; this A6000 run
 adds FlashAttention 2.8.3 to the environment.
-When omitting the root conftest, also restore its NCCL session defaults below.
+When omitting the root conftest, also restore its NCCL session defaults and
+explicit process-group cleanup below. An isolated run reported all assertions
+passed but remained in NCCL teardown at interpreter exit; the cleanup-aware
+invocation completed with exit code 0.
 The expanded multi-topology suite stalled near device capacity without the
 single-channel limit; these flags match the repository's unit-test configuration.
 
@@ -436,19 +455,34 @@ single-channel limit; these flags match the repository's unit-test configuration
 export NCCL_MAX_NCHANNELS=1
 export NCCL_NVLS_ENABLE=0
 
+# Keep the root conftest's session cleanup in this isolated test invocation.
+cat > /tmp/gdn-training-tests.py <<'PY'
+import sys
+
+import pytest
+import torch
+
+status = pytest.main(sys.argv[1:])
+if torch.distributed.is_initialized():
+    torch.cuda.synchronize()
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    torch.distributed.destroy_process_group()
+sys.exit(status)
+PY
+
 # One rank: 12 cases run and 84 topology cases skip.
 uv run python -m torch.distributed.run --standalone --nproc-per-node=1 \
-  -m pytest -q --confcutdir=tests/unit_tests/ssm \
+  /tmp/gdn-training-tests.py -q --confcutdir=tests/unit_tests/ssm \
   tests/unit_tests/ssm/test_gdn_offload_training.py
 
 # Two ranks: 72 cases run and 24 topology cases skip on each rank.
 uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
-  -m pytest -q --confcutdir=tests/unit_tests/ssm \
+  /tmp/gdn-training-tests.py -q --confcutdir=tests/unit_tests/ssm \
   tests/unit_tests/ssm/test_gdn_offload_training.py
 
 # Four ranks: all 96 cases run on each rank.
 uv run python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  -m pytest -q --confcutdir=tests/unit_tests/ssm \
+  /tmp/gdn-training-tests.py -q --confcutdir=tests/unit_tests/ssm \
   tests/unit_tests/ssm/test_gdn_offload_training.py
 ```
 
@@ -562,7 +596,8 @@ The same entry point accepts `--tp 2`, `--tp 2 --sp`, `--cp 2`, `--pp 2`,
 counts in the table above. Use four or more microbatches for PP/VPP. DP is the
 remaining world-size factor. The status table lists the GPU-qualified
 configurations, including plain TP and plain PP. Pretrained CP and four-rank
-combinations remain unqualified. Reduced-model results are listed separately.
+combinations remain unqualified. The reduced-model four-rank matrix passes all
+96 cases per rank; its results do not qualify the pretrained architecture.
 
 ## Acceptance for additional pretrained configurations
 
