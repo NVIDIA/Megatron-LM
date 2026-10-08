@@ -3,7 +3,7 @@
 import asyncio
 import random
 import string
-from typing import AsyncGenerator, List, Union
+from typing import AsyncGenerator, List
 from unittest import mock
 
 import pytest
@@ -12,11 +12,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequestRecord,
-    InferenceRequest,
-    Status,
-)
+from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -181,6 +177,7 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
         self.mock_tokenizer.detokenize.return_value = ''.join(
             random.choices(string.ascii_letters, k=random.randint(4, 10))
         )
+        self.mock_tokenizer.eod = self.vocab_size
         assert hasattr(self.static_engine, 'dynamic_engine'), "Dynamic engine not initialized"
         assert (
             self.static_engine.legacy is False
@@ -191,10 +188,9 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 prompts = ["" for i in range(batch_size)]
             else:
                 prompts = ["sample" * (i + 1) for i in range(batch_size)]
-            results: List[Union[InferenceRequest, DynamicInferenceRequestRecord]] = (
-                self.static_engine.generate(
-                    prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
-                )
+            self.mock_tokenizer.detokenize.reset_mock()
+            results: List[InferenceRequest] = self.static_engine.generate(
+                prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
             )
 
             assert len(results) == batch_size
@@ -207,6 +203,7 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 ), f"Status should be completed but its {result.status}"
                 assert result.generated_length > 0, f"Generated length should be greater than zero"
                 assert result.generated_text is not None, f'Generated text should not be None'
+            assert self.mock_tokenizer.detokenize.call_count == batch_size
 
     @pytest.mark.asyncio
     async def test_streaming(self):

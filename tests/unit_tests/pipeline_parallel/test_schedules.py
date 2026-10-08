@@ -108,6 +108,15 @@ def test_deallocate_output_tensor():
     assert out.nelement() == 6
 
 
+def test_deallocate_output_tensor_rejects_view():
+    """The view guard is back: pseudo-freeing a view reclaims nothing."""
+    base = torch.arange(6.0, requires_grad=True)
+    out = base.view(2, 3)
+    assert out._base is base
+    with pytest.raises(AssertionError, match="counter-productive"):
+        schedule.deallocate_output_tensor(out, deallocate_pipeline_outputs=True)
+
+
 @contextmanager
 def _no_sync():
     yield
@@ -425,7 +434,8 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
     )
 
 
-def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
+@pytest.mark.parametrize("variant", ["dsa", "dsv4_hybrid"])
+def test_indexer_loss_scale_defaults_from_variant_without_mutating_config(variant):
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
     )
@@ -433,7 +443,7 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
     config = SimpleNamespace(
         calculate_per_token_loss=True,
         experimental_attention_variant_loss_scale_func=None,
-        experimental_attention_variant='dsa',
+        experimental_attention_variant=variant,
         grad_scale_func=lambda tensor: tensor * 7.0,
         num_moe_experts=None,
         mtp_num_layers=None,
@@ -662,7 +672,7 @@ def test_schedule_enables_grad_sync_on_first_stage(
         def __init__(self):
             self.config = config
             if is_multimodule:
-                self.rank_module_map = {"llm": SimpleNamespace()}
+                self.rank_module_map = {"llm": SimpleNamespace(bridge_comms_as_dest_module=[])}
 
         def is_module_pp_first_stage(self, _module_name):
             return module_first_stage

@@ -4,9 +4,6 @@ ENV_VARS:
   # run_ci_test.sh always exports this (yq prints "null" for a missing key,
   # which fails determinism.py's validator), so it must be set explicitly.
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  # Golden values come from Megatron-FSDP v1, a different implementation, so
-  # they're only approximately equal to v2's output.
-  NON_DETERMINSTIC_RESULTS: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
   NCCL_DEBUG: VERSION

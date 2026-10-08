@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
@@ -28,9 +29,14 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
+    MTPControllerMixin,
+)
 from megatron.core.inference.utils import (
     InferenceMode,
+    detokenize_tokens,
     get_attention_mask,
+    model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
@@ -41,7 +47,6 @@ from megatron.core.transformer.moe.router_replay import RouterReplay, RouterRepl
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
-    accepts_parameter,
     get_asyncio_loop,
     get_model_config,
     get_pg_size,
@@ -61,9 +66,6 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
-from megatron.core.inference.text_generation_controllers.mtp_inference_mixin import (
-    MTPInferenceMixin,
-)
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
@@ -209,7 +211,7 @@ class _AsyncScheduleLogProbsTransfer:
 
 
 # pylint: disable=line-too-long
-class TextGenerationController(MTPInferenceMixin):
+class TextGenerationController(MTPControllerMixin):
     """The text generation controller (the main sampling loop)
 
     This class tokenizes the input, runs inference, samples from logits, and detokenizes the output.
@@ -220,11 +222,17 @@ class TextGenerationController(MTPInferenceMixin):
         tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
     """
 
+    # Model-declared EOS ids beyond the per-request `termination_id`, in two forms:
+    # this set for scalar `in` checks, `extra_eos_token_id_tensor` (a cached view of
+    # it) for batched `torch.isin`. Empty => the model declares a single eos.
+    extra_eos_token_id_set: frozenset = frozenset()
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
+        self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         pg_collection = inference_config.pg_collection
@@ -244,6 +252,23 @@ class TextGenerationController(MTPInferenceMixin):
             self.vocab_size = unwrapped_model.language_model.vocab_size
         else:
             self.vocab_size = unwrapped_model.vocab_size
+
+        if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
+            language_model = (
+                unwrapped_model.language_model
+                if isinstance(unwrapped_model, LLaVAModel)
+                else unwrapped_model
+            )
+            if language_model.position_embedding_type != "none":
+                raise ValueError(
+                    "MTP KV caching requires position_embedding_type='none'; positional "
+                    "embeddings are not supported."
+                )
+            if language_model.config.multi_latent_attention:
+                # MLA constructs its own RoPE/YaRN, independently of the model's position type.
+                raise ValueError(
+                    "MTP KV caching does not support MLA's rotary position embeddings."
+                )
 
         # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
         # unique generation seed (avoids identical samples when the same prompt is
@@ -361,6 +386,64 @@ class TextGenerationController(MTPInferenceMixin):
 
         self._init_mtp_sampling_tensors()
 
+    def _build_extra_eos_token_id_set(self, tokenizer) -> frozenset:
+        """Build the model-level EOS token-id set used for termination.
+
+        Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+        `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+        read off the tokenizer if present (HF tokenizers attach it; other tokenizers
+        won't).
+
+        Returns empty when there is at most one eos id: the per-request `termination_id`
+        already covers that case, so behavior is unchanged and a client that deliberately
+        narrowed `termination_id` is not silently widened back to `tokenizer.eod`.
+        """
+        ids = model_eos_token_ids(tokenizer)
+        result = ids if len(ids) > 1 else frozenset()
+        is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if is_rank0:
+            eod = getattr(tokenizer, "eod", None)
+            gen_cfg = getattr(tokenizer, "generation_config", None)
+            gen_cfg_eos = gen_cfg.get("eos_token_id") if isinstance(gen_cfg, dict) else None
+            logging.info(
+                "Inference termination EOS ids: tokenizer.eod=%s, "
+                "generation_config.eos_token_id=%s -> eos set=%s (multi-eos active=%s)",
+                eod,
+                gen_cfg_eos,
+                sorted(ids),
+                bool(result),
+            )
+        return result
+
+    @functools.cached_property
+    def extra_eos_token_id_tensor(self) -> Optional[Tensor]:
+        """`extra_eos_token_id_set` as a CPU tensor, to match `sampled_tokens_cpu`.
+
+        None when the set is empty, the signal the per-step checks use to skip `isin`.
+        """
+        if not self.extra_eos_token_id_set:
+            return None
+        return torch.tensor(sorted(self.extra_eos_token_id_set), dtype=torch.long)
+
+    def terminating_token_ids(self, termination_id: Optional[int]) -> frozenset:
+        """Token ids that end generation for a request with this `termination_id`.
+
+        The CPU-side counterpart of the `extra_eos_token_id_tensor` check, for the
+        termination sites that work on Python ints rather than a batched tensor:
+        the engine's mid-speculative-block scan and the disaggregated handoff
+        admission check. Returns an empty set when termination is disabled
+        (`ignore_eos`, i.e. `termination_id` of -1 or None).
+
+        Args:
+            termination_id (Optional[int]): The request's own termination id.
+
+        Returns:
+            frozenset: Terminating token ids, empty when termination is disabled.
+        """
+        if termination_id is None or termination_id < 0:
+            return frozenset()
+        return self.extra_eos_token_id_set | {termination_id}
+
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -406,14 +489,9 @@ class TextGenerationController(MTPInferenceMixin):
         Returns:
             str: The detokenized string.
         """
-        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
-            while tokens and tokens[-1] == tokenizer.eod:
-                tokens = tokens[:-1]
-
-        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
-            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
-        else:
-            return tokenizer.detokenize(tokens)
+        return detokenize_tokens(
+            tokenizer, tokens, remove_EOD=remove_EOD, skip_special_tokens=skip_special_tokens
+        )
 
     def detokenize_generations(
         self,
@@ -874,6 +952,7 @@ class TextGenerationController(MTPInferenceMixin):
             num_speculative_tokens=self.num_speculative_tokens,
             block_size_tokens=context.block_size_tokens,
             num_active_requests=active_request_count,
+            keep_extra_blocks=context.enable_mtp_kv_cache,
         )
 
         # Mamba speculative rewind stays on GPU because it mutates GPU-resident
@@ -1091,6 +1170,21 @@ class TextGenerationController(MTPInferenceMixin):
             no_top_p=no_top_p,
             output=self._sampled_tokens_cuda[:n],
         )
+
+    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
+        """Use the known next prompt token for a partial chunk's selected logprob."""
+        context = self.inference_wrapped_model.inference_context
+        if context.chunked_prefill_request_id == -1:
+            return
+
+        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
+        active_idx = context_idx - context.paused_request_count
+        active_request_count = context.total_request_count - context.paused_request_count
+        assert 0 <= active_idx < active_request_count
+        assert active_idx == active_request_count - 1
+        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -1617,7 +1711,10 @@ class TextGenerationController(MTPInferenceMixin):
 
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
-            blocks = context.request_to_kv_block_ids[finished_idx]
+            # Only token-bearing blocks belong to the transferred prompt. Draft lookahead
+            # stays owned by this context until normal request cleanup releases it.
+            committed_blocks = int(context.get_committed_kv_block_counts(finished_idx).item())
+            blocks = context.request_to_kv_block_ids[finished_idx, :committed_blocks]
             valid_blocks = [int(block) for block in blocks.tolist() if block != -1]
             if valid_blocks:
                 finished_block_ids[request_id] = valid_blocks
@@ -1683,10 +1780,21 @@ class TextGenerationController(MTPInferenceMixin):
         # Request finished if termination_id or length >= max_sequence_length.
         # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
         # active_request_metadata is CPU-pinned.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        # Also terminate on any of the model's declared EOS tokens. The per-request
+        # `termination_id` is a single id (default `tokenizer.eod`), but a model may
+        # declare several (`generation_config.eos_token_id` list, e.g. [2, 11]).
+        # Gated by `termination_enabled` so `ignore_eos` (termination_id == -1) still
+        # never stops. The tensor is None when the model declares a single eos.
+        if self.extra_eos_token_id_tensor is not None:
+            termination_hit |= termination_enabled & torch.isin(
+                sampled_tokens_cpu, self.extra_eos_token_id_tensor
+            )
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         # Apply stop words detected during the previous engine bookkeeping step.
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
@@ -1708,7 +1816,9 @@ class TextGenerationController(MTPInferenceMixin):
         if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
-                blocks = context.request_to_kv_block_ids[fidx]
+                # Draft-only lookahead has no main-model routing to reconstruct.
+                committed_blocks = int(context.get_committed_kv_block_counts(fidx).item())
+                blocks = context.request_to_kv_block_ids[fidx, :committed_blocks]
                 valid = blocks[blocks >= 0].tolist()
                 if valid:
                     finished_routing_block_ids[req_id] = valid
@@ -1768,7 +1878,7 @@ class TextGenerationController(MTPInferenceMixin):
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
-        """Compact pending logits and sampling metadata into survivor order.
+        """Compact pending logits and all active-request metadata into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
@@ -1815,9 +1925,9 @@ class TextGenerationController(MTPInferenceMixin):
         survivor_count = survivor_idxs.numel()
         survivor_idxs_cpu = survivor_idxs.to("cpu")
         survivor_idxs_cuda = survivor_idxs.to(gpu_view.temperature.device)
-        for label in ("temperature", "top_k", "top_p"):
-            compacted_metadata = context.active_request_metadata[label][survivor_idxs_cpu]
-            context.active_request_metadata[label][:survivor_count].copy_(compacted_metadata)
+        for metadata in context.active_request_metadata.values():
+            compacted_metadata = metadata[survivor_idxs_cpu]
+            metadata[:survivor_count].copy_(compacted_metadata)
         compacted_temperature = gpu_view.temperature[survivor_idxs_cuda].contiguous()
         compacted_top_k = gpu_view.top_k[survivor_idxs_cuda].contiguous()
         compacted_top_p = gpu_view.top_p[survivor_idxs_cuda].contiguous()
@@ -1939,9 +2049,20 @@ class TextGenerationController(MTPInferenceMixin):
         active_request_ids = context.request_ids[active_request_slice].long()
 
         max_sequence_lengths = context.get_max_sequence_lengths()
-        active_request_mask = (
-            sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
-        ).byte() & torch.less(resolved_sequence_lengths, max_sequence_lengths).byte()
+        # Mirror the synchronous path's termination check. A plain `!=` against the
+        # single per-request termination_id misses the model's other declared eos
+        # tokens (generation_config.eos_token_id may be a list, e.g. [2, 11]), which
+        # is why async-scheduled runs generated straight through `</s>`.
+        termination_ids = context.request_metadata["termination_id"][active_request_slice]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        if self.extra_eos_token_id_tensor is not None:
+            termination_hit |= termination_enabled & torch.isin(
+                sampled_tokens_cpu, self.extra_eos_token_id_tensor
+            )
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            resolved_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
@@ -1977,6 +2098,7 @@ class TextGenerationController(MTPInferenceMixin):
 
         range_push("sampling")
         self._dynamic_step_sample_logits()
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
@@ -2029,6 +2151,7 @@ class TextGenerationController(MTPInferenceMixin):
             torch.int64
         )
         self._compute_serial_mtp_and_sample(base_position=base_position)
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         accepted_tokens_gpu = (
@@ -2958,6 +3081,8 @@ class TextGenerationController(MTPInferenceMixin):
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
+                # No separate MTP rewind: the draft loop re-derives its start from the (rewound)
+                # main KV offsets, so rejected drafts are naturally overwritten next step.
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
@@ -2976,6 +3101,8 @@ class TextGenerationController(MTPInferenceMixin):
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+
+            self._replace_partial_prefill_sample_with_prompt_token()
 
             log_probs = None
             top_n_logprobs = None
