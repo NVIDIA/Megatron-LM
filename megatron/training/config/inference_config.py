@@ -124,6 +124,15 @@ class InferenceSetupConfig:
     """Set unified memory usage within the dynamic inference context. The levels are: 0) no unified
     memory, 1) allocate `memory_buffer` in unified memory."""
 
+    kv_cache_management_mode: Literal["persist", "offload", "recompute"] = "persist"
+    """What the engine does with the KV cache (and Mamba states) while it is suspended:
+    persist keeps it on GPU, offload moves it to CPU and restores it on resume,
+    recompute frees it and recomputes it on resume."""
+
+    static_kv_memory_pointers: bool = False
+    """Keep the KV cache at fixed device addresses across suspend/resume, so CUDA graphs that
+    reference it stay valid and are not recaptured."""
+
     inference_dynamic_batching_cuda_graph_mixed_prefill_count: int = 16
     """Number of mixed prefill requests to capture in a cuda graph."""
 
@@ -272,14 +281,40 @@ class InferenceSetupConfig:
     inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
     """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
+    def validate(self) -> None:
+        """Check the KV-cache suspend/resume policy before an engine is built from it."""
+        mode = self.kv_cache_management_mode
+        static_pointers = self.static_kv_memory_pointers
+        uvm = self.inference_dynamic_batching_unified_memory_level > 0
+        if mode == "offload":
+            # Recapturing CUDA graphs runs dummy forward passes that corrupt the preserved KV data.
+            if not static_pointers:
+                raise ValueError(
+                    "--inference-kv-cache-management-mode=offload requires "
+                    "--inference-static-kv-memory-pointers"
+                )
+            # UVM keeps the buffer resident across the switch; there is nothing to offload.
+            if uvm:
+                raise ValueError(
+                    "--inference-kv-cache-management-mode=offload is incompatible with UVM"
+                )
+        if static_pointers and mode != "persist" and not uvm:
+            # Fixed addresses for a cache that leaves GPU memory need a backing mechanism.
+            try:
+                import torch_memory_saver  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "Static KV memory pointers require UVM or torch_memory_saver when the KV cache "
+                    "does not persist. Use --inference-kv-cache-management-mode=persist, "
+                    "--inference-dynamic-batching-unified-memory-level 1, or install "
+                    "torch_memory_saver."
+                ) from None
+
     def to_inference_config(
         self,
         model: "MegatronModule",
         *,
         pg_collection: Any = None,
-        kv_cache_management_mode: str = "persist",
-        static_kv_memory_pointers: bool = False,
-        enable_cuda_graphs: bool = True,
         metrics_writer: Any = None,
         verbose: bool = True,
     ) -> "InferenceConfig":
@@ -287,24 +322,16 @@ class InferenceSetupConfig:
 
         This is the bridge from the declarative inference settings to the runtime engine
         config consumed by the dynamic inference context/engine. It supplies the fields that
-        depend on the built model (max sequence length, Mamba state config, process groups)
-        and the cross-cutting values that do not live on this declarative config.
+        depend on the built model (max sequence length, Mamba state config, process groups,
+        whether CUDA graphs are captured at all) and the runtime metrics writer; every policy
+        value comes from this config, which is validated first.
 
         Args:
             model: The (possibly wrapped) model to run inference with. Used to derive the
-                effective max sequence length, the Mamba inference state config, and the
-                process group collection when ``pg_collection`` is not provided.
+                effective max sequence length, the Mamba inference state config, the CUDA-graph
+                scope, and the process group collection when ``pg_collection`` is not provided.
             pg_collection: Process groups for distributed execution. Defaults to the
                 model's ``pg_collection`` attribute when None.
-            kv_cache_management_mode: How large tensors are handled on suspend/resume
-                ("persist"/"offload"/"recompute"). Sourced from the RL arg
-                ``rl_kv_cache_management_mode`` at the call site.
-            static_kv_memory_pointers: Whether the KV cache stays at fixed addresses across
-                suspend/resume. Sourced from the RL arg ``rl_persist_cuda_graphs`` (not part
-                of the inference argument group).
-            enable_cuda_graphs: When False, ``num_cuda_graphs`` is forced to None (no capture).
-                Callers typically pass ``inference_cuda_graph_scope != none``; derived, not a
-                 1:1 args field.
             metrics_writer: Optional wandb module for inference metric logging.
             verbose: Whether the context logs detailed configuration at initialization.
 
@@ -322,7 +349,13 @@ class InferenceSetupConfig:
             PrefixCachingEvictionPolicy,
             mtp_layer_types_from_model,
         )
+        from megatron.core.transformer.enums import InferenceCudaGraphScope
         from megatron.core.utils import get_attr_wrapped_model
+
+        self.validate()
+
+        model_config = get_attr_wrapped_model(model, "config")
+        enable_cuda_graphs = model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.none
 
         # Effective max sequence length depends on the model's position embedding type.
         position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
@@ -363,7 +396,7 @@ class InferenceSetupConfig:
             max_requests=self.inference_dynamic_batching_max_requests,
             max_tokens=self.inference_dynamic_batching_max_tokens,
             unified_memory_level=self.inference_dynamic_batching_unified_memory_level,
-            kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
+            kv_cache_management_mode=KVCacheManagementMode(self.kv_cache_management_mode),
             cuda_graph_mixed_prefill_count=(
                 self.inference_dynamic_batching_cuda_graph_mixed_prefill_count
             ),
@@ -373,7 +406,7 @@ class InferenceSetupConfig:
             use_cuda_graphs_for_non_decode_steps=not self.decode_only_cuda_graphs,
             cuda_graph_all_prefills=self.inference_cuda_graph_all_prefills,
             cuda_graph_max_tokens=self.inference_cuda_graph_max_tokens,
-            static_kv_memory_pointers=static_kv_memory_pointers,
+            static_kv_memory_pointers=self.static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
             mtp_layer_type_list=mtp_layer_types_from_model(model),
