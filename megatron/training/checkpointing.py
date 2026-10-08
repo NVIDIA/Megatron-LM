@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -1146,11 +1147,12 @@ def save_checkpoint(
             train_state = get_train_state()
             train_state_dict = None
             if train_state is not None:
-                train_state.release = release
-                train_state_dict = train_state.state_dict()
-                train_state_dict["floating_point_operations_so_far"] = torch.tensor(
-                    num_floating_point_operations_so_far, dtype=torch.float64
-                )
+                # Snapshot the requested checkpoint without changing the running state.
+                checkpoint_train_state = copy.deepcopy(train_state)
+                checkpoint_train_state.iteration = iteration
+                checkpoint_train_state.release = release
+                checkpoint_train_state.num_floating_point_operations_so_far = num_floating_point_operations_so_far
+                train_state_dict = checkpoint_train_state.state_dict()
 
             def iter_finalize_fn():
                 cfg = get_run_config()
