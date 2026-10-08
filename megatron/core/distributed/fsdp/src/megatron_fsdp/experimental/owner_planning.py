@@ -1,32 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""
-Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`RowAtomic` layout.
+"""Owner assignment and P2P packing for MFSDP v2's all-`RowAtomic` layout.
 
-- `ParameterLayout` describes how a single parameter's flat element range is split across the DP
-  group under MFSDP v2's all-`RowAtomic` layout.
-- `ParameterLayout.from_group` builds `{tensor_index: layout}` for eligible parameters in an
-  `FsdpParameterGroup`, keyed by each parameter's index within the group.
-- `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
-  function.
-- `GroupOwnerLayout.from_group` builds a data structure capturing the per-group owner layout upon
-  the above.
-- `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` take the `GroupOwnerLayout` plus this rank's data
-  and build the flat P2P send/recv buffers,
-- `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full flat tensor on the
-  owner, and
-- `OwnerScatterPlan.unpack` extracts this rank's flat result shards from the received buffers.
+Tensor shapes and shard ranges come from the group's existing `GlobalLayout`.
+Owner assignments and peer dictionaries use global process ranks.
 """
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Self
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from .layout import non_leading_numel
+from .layout import GlobalLayout, non_leading_numel
 from .parameter_group import FsdpParameterGroup
+from .placement import RowAtomic
+from .range import Range, intersect_ranges
 
 
 def select_ge_2d_params(param: torch.Tensor) -> bool:
@@ -34,176 +24,77 @@ def select_ge_2d_params(param: torch.Tensor) -> bool:
     return param.ndim >= 2
 
 
-@dataclasses.dataclass(frozen=True)
-class ParameterLayout:
-    """How a single parameter's flat element range splits across the DP group.
+def get_rank_ranges(layout: GlobalLayout, mesh: DeviceMesh) -> dict[int, Range]:
+    """Return all-RowAtomic buffer ranges keyed by global rank, in buffer order."""
+    placements = (RowAtomic(),) * mesh.ndim
+    ranges = {
+        rank: layout.get_rank_range(mesh, placements, rank) for rank in mesh.mesh.flatten().tolist()
+    }
+    return dict(sorted(ranges.items(), key=lambda item: item[1].start))
 
-    MFSDP v2's all-`RowAtomic` layout gives each rank one contiguous global element range
-    per parameter, in rank order, so rank `r` holds `[offset, offset + count)` where `offset`
-    is the sum of the previous ranks' counts. A rank with `count == 0` holds no elements
-    of this parameter.
 
-    Attributes:
-        full_shape: The parameter's global shape.
-        flat_counts: Per-rank element count; `0` means the rank holds no elements.
+def ns_cost_fn(num_ns_steps: int) -> Callable[[torch.Size], int]:
+    """Estimate Newton-Schulz work from a tensor's full shape.
+
+    Uses `numel * (min(rows, cols) * num_steps + 1)` with the DBuffer's
+    leading-dim view `(shape[0], shape[1:].numel())`.
     """
 
-    full_shape: torch.Size
-    flat_counts: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if len(self.flat_counts) == 0:
-            raise ValueError("ParameterLayout requires at least one rank.")
-        if sum(self.flat_counts) != self.full_shape.numel():
-            raise ValueError(
-                f"ParameterLayout flat_counts sum {sum(self.flat_counts)} != full_shape "
-                f"numel {self.full_shape.numel()}."
-            )
-
-    @classmethod
-    def from_group(
-        cls, group: FsdpParameterGroup, *, eligible_fn: Callable[[torch.Tensor], bool] | None = None
-    ) -> dict[int, Self]:
-        """Build `{tensor_index: layout}` for eligible parameters in an `FsdpParameterGroup`.
-
-        Keys are the parameters' indices within `group.fsdp_parameters` (their tensor indices in the
-        DBuffer layout). Parameters not selected by `eligible_fn` are absent from the returned dict.
-
-        Args:
-            group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
-            eligible_fn: Predicate selecting which parameters participate in owner-compute
-                orthogonalization. Takes a parameter tensor as input and return whether the
-                parameter is supposed to be included. When `None`, defaults to matching ≥2D tensors
-                (`param.ndim >= 2`).
-        """
-        if eligible_fn is None:
-            eligible_fn = select_ge_2d_params
-
-        mesh = group.mesh
-        layout = group.main_weight.layout
-        dp_size = mesh.size()
-        rank_flat_shard_size = layout.size // dp_size
-
-        result: dict[int, Self] = {}
-        for tensor_index, fsdp_parameter in enumerate(group.fsdp_parameters):
-            param = fsdp_parameter.sharded
-            if not eligible_fn(param):
-                continue
-
-            full_shape = layout.tensor_shapes[tensor_index]
-            tensor_flat_offset = layout.tensor_to_offset[tensor_index]
-            tensor_end = tensor_flat_offset + full_shape.numel()
-
-            flat_counts: list[int] = []
-            for rank in range(dp_size):
-                rank_start = rank * rank_flat_shard_size
-                rank_end = rank_start + rank_flat_shard_size
-                overlap_start = max(tensor_flat_offset, rank_start)
-                overlap_end = min(tensor_end, rank_end)
-                flat_counts.append(max(0, overlap_end - overlap_start))
-
-            param_layout = cls(full_shape=torch.Size(full_shape), flat_counts=tuple(flat_counts))
-            result[tensor_index] = param_layout
-        return result
-
-    @property
-    def dp_size(self) -> int:
-        """Number of ranks in the DP group for this parameter."""
-        return len(self.flat_counts)
-
-    def full_numel(self) -> int:
-        """Return the total number of elements in the full (unsharded) parameter."""
-        return self.full_shape.numel()
-
-    def rank_offset(self, rank: int) -> int:
-        """Return the starting offset of `rank`'s shard within the flat parameter."""
-        return sum(self.flat_counts[:rank])
-
-    def rank_numel(self, rank: int) -> int:
-        """Return the number of elements `rank` holds."""
-        return self.flat_counts[rank]
-
-    def owner_candidates(self) -> tuple[int, ...]:
-        """Return the ranks that hold a non-empty shard of this parameter."""
-        return tuple(r for r, count in enumerate(self.flat_counts) if count > 0)
-
-    def is_boundary(self) -> bool:
-        """True if more than one rank holds a non-empty shard of this parameter."""
-        return len(self.owner_candidates()) > 1
-
-
-def ns_cost_fn(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
-    """Cost function matching the Newton-Schulz orthogonalization compute estimate for the given
-    number of Newton-Schulz iterations/steps.
-
-    `numel * (min(rows, cols) * num_steps + 1)` under the DBuffer's leading-dim view (`(shape[0],
-    shape[1:].numel())`).
-    """
-
-    def cost_fn(layout: ParameterLayout) -> int:
-        shape = layout.full_shape
+    def cost_fn(shape: torch.Size) -> int:
         short_dim = min(shape[0], non_leading_numel(shape))
-        return layout.full_numel() * (short_dim * num_ns_steps + 1)
+        return shape.numel() * (short_dim * num_ns_steps + 1)
 
     return cost_fn
 
 
 def assign_owner_work(
-    layouts: dict[int, ParameterLayout], cost_fn: Callable[[ParameterLayout], float] | None = None
+    layout: GlobalLayout,
+    mesh: DeviceMesh,
+    tensor_indices: Iterable[int],
+    cost_fn: Callable[[torch.Size], float] | None = None,
 ) -> dict[int, int]:
-    """Assign one owner rank to each parameter, keyed by tensor index.
+    """Assign each participating tensor to a global rank holding part of it.
 
-    Non-boundary parameters are assigned to their original rank (the only rank holding their
-    elements, so no communication is needed) and their cost counts toward that rank's running total
-    cost. Boundary parameters are processed in descending cost order and each is greedily given to
-    its eligible rank with the smallest running cost total.
+    Fully local tensors stay with their sole holder and count toward its load.
+    Boundary tensors are processed in descending cost order and assigned to their
+    least-loaded holder. Ties follow buffer order.
 
     Args:
-        layouts: Parameter layouts keyed by each parameter's tensor index in its
-            `FsdpParameterGroup`.
-        cost_fn: Callable that returns a positive cost estimate for a given parameter layout. The
-            greedy balancer minimizes the maximum running cost total across ranks, so the cost
-            should reflect the relative compute weight of owning each parameter (e.g., an
-            orthogonalization cost estimate). When `None`, defaults to a compute estimate for
-            orthogonalization via Newton-Schulz with 5 iterations/steps.
-
-    Returns:
-        Mapping from tensor index to owner rank.
+        layout: The group's DBuffer layout, including padding and ineligible tensors.
+        mesh: The device mesh across which the buffer is all-RowAtomic sharded.
+        tensor_indices: Indices of participating tensors in `layout`.
+        cost_fn: Positive cost estimate from a tensor's full shape. Defaults to
+            Newton-Schulz with five iterations.
     """
     if cost_fn is None:
         cost_fn = ns_cost_fn(num_ns_steps=5)
 
     assignments: dict[int, int] = {}
-    if not layouts:
-        return assignments
-    dp_size = next(iter(layouts.values())).dp_size
-    running: dict[int, float] = {r: 0.0 for r in range(dp_size)}
-    # Non-boundary parameters are assigned to their sole holder; account for their cost.
-    for tensor_index, layout in layouts.items():
-        if layout.is_boundary():
-            continue
-        (holder,) = layout.owner_candidates()
-        assignments[tensor_index] = holder
-        running[holder] += cost_fn(layout)
-    # Sort boundary params by descending cost (longest processing time first).
-    boundary_costs = sorted(
-        (
-            (tensor_index, cost_fn(layout))
-            for tensor_index, layout in layouts.items()
-            if layout.is_boundary()
-        ),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    for tensor_index, cost in boundary_costs:
-        layout = layouts[tensor_index]
-        candidates = layout.owner_candidates()
+    rank_ranges = get_rank_ranges(layout, mesh)
+    running = {rank: 0.0 for rank in rank_ranges}
+    boundary = []
+    for tensor_index in tensor_indices:
+        candidates = tuple(
+            rank
+            for rank, buffer_range in rank_ranges.items()
+            if intersect_ranges(layout.get_tensor_range(tensor_index), buffer_range).numel > 0
+        )
+        shape = layout.tensor_shapes[tensor_index]
         if not candidates:
             raise RuntimeError(
-                f"No eligible owner for tensor {tensor_index} with shape {layout.full_shape}; "
+                f"No eligible owner for tensor {tensor_index} with shape {shape}; "
                 "no rank owns a shard."
             )
-        owner = min(candidates, key=lambda r: running[r])
+        cost = cost_fn(shape)
+        if len(candidates) == 1:
+            (holder,) = candidates
+            assignments[tensor_index] = holder
+            running[holder] += cost
+        else:
+            boundary.append((tensor_index, cost, candidates))
+
+    for tensor_index, cost, candidates in sorted(boundary, key=lambda item: item[1], reverse=True):
+        owner = min(candidates, key=lambda rank: running[rank])
         assignments[tensor_index] = owner
         running[owner] += cost
     return assignments
@@ -211,23 +102,17 @@ def assign_owner_work(
 
 @dataclasses.dataclass(frozen=True)
 class GroupOwnerLayout:
-    """Owner layout for one `FsdpParameterGroup`: its params and their owner ranks.
-
-    The layouts and assignments are step-independent in the general case, so the owner layout may be
-    cached across optimizer steps.
-
-    The `tensor_index` used here refers to the parameter's/tensor's index in the
-    `FsdpParameterGroup`.
+    """A group's shared buffer layout and owner assignments.
 
     Attributes:
-        group: The FSDP parameter group the layouts and owners refer to.
-        layouts: `{tensor_index: layout}` for the participating parameters.
-        owners: `{tensor_index: owner_rank}` with an entry for every participating parameter. Ranks
-            are indices into the group's mesh.
+        mesh: The device mesh over which the buffer is all-RowAtomic sharded.
+        layout: The existing `DBuffer.layout`, including all tensors in the group.
+        owners: Participating tensor index to owner global process rank. These keys
+            identify the participating tensors; no filtered layout copy is stored.
     """
 
-    group: FsdpParameterGroup
-    layouts: dict[int, ParameterLayout]
+    mesh: DeviceMesh
+    layout: GlobalLayout
     owners: dict[int, int]
 
     @classmethod
@@ -235,28 +120,22 @@ class GroupOwnerLayout:
         cls,
         group: FsdpParameterGroup,
         *,
-        cost_fn: Callable[[ParameterLayout], float] | None = None,
+        cost_fn: Callable[[torch.Size], float] | None = None,
         eligible_fn: Callable[[torch.Tensor], bool] | None = None,
     ) -> Self:
-        """Build the owner layout for one group.
+        """Select participating parameters and balance their owner assignments.
 
-        Args:
-            group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
-            cost_fn: Cost estimate per parameter layout used to balance owner assignments across
-                ranks. When `None`, defaults to a compute estimate for orthogonalization via
-                Newton-Schulz with 5 iterations/steps. See also `assign_owner_work`.
-            eligible_fn: Predicate selecting which parameters participate in owner-compute
-                orthogonalization. When `None`, defaults to matching ≥2D tensors. See also
-                `ParameterLayout.from_group`.
+        `eligible_fn` defaults to selecting ≥2D parameters. `cost_fn` receives
+        full tensor shapes; see `assign_owner_work` for the default estimate.
         """
-        layouts = ParameterLayout.from_group(group, eligible_fn=eligible_fn)
-        owners = assign_owner_work(layouts, cost_fn)
-        return cls(group=group, layouts=layouts, owners=owners)
-
-    @property
-    def mesh(self) -> DeviceMesh:
-        """Device mesh of the group."""
-        return self.group.mesh
+        if eligible_fn is None:
+            eligible_fn = select_ge_2d_params
+        tensor_indices = (
+            i for i, param in enumerate(group.fsdp_parameters) if eligible_fn(param.sharded)
+        )
+        layout = group.main_weight.layout
+        owners = assign_owner_work(layout, group.mesh, tensor_indices, cost_fn)
+        return cls(mesh=group.mesh, layout=layout, owners=owners)
 
 
 @dataclasses.dataclass
@@ -265,8 +144,7 @@ class OwnerGatherPlan:
 
     The owner keeps its own shard locally (no self-send), so it only receives from the other
     shard-holding ranks. `reconstruct_full` reconstructs each owned tensor by concatenating the
-    per-rank shards in rank order (i.e., global element order).
-
+    per-rank shards in buffer order.
 
     Example:
 
@@ -275,50 +153,57 @@ class OwnerGatherPlan:
 
     # Assume:
     torch.distributed.get_world_size() == 2
-    torch.distributed.get_rank() == 0  # We're observing from rank 0
+    torch.distributed.get_rank() == 0  # We're observing from rank 0.
+    mesh.mesh.tolist() == [0, 1]  # Global process ranks.
     param_0: torch.Tensor
     param_1: torch.Tensor
     # Params are in this order as observed by MFSDP.
     model.param_groups == [{"params": [param_0, param_1]}]
-    # Both params are owned by rank 1 (was previously determined using `GroupOwnerLayout`).
-    param_0.owner == 1
-    param_1.owner == 1
-
     param_0.shape == (6, 4)  # Global shape.
     param_1.shape == (4, 4)  # Global shape.
-    param_0.local_shard.shape == (3, 4)  # Rank 0 has shard indexed by `[0:3, ...]`.
-    param_1.local_shard.shape == (2, 4)  # Rank 0 has shard indexed by `[0:2, ...]`.
-    param_0.local_shard.numel == 12
-    param_1.local_shard.numel == 8
+    layout.tensor_to_offset == (0, 24)
+    layout.size == 40
+    # The buffer, rather than each parameter separately, is split evenly:
+    # rank 0 holds [0, 20); rank 1 holds [20, 40).
+    # Choose rank 1 as both owners for this example. It holds part of param_0
+    # and all of param_1; these are explicit assignments, not the default balancer's output.
+    owner_layout = GroupOwnerLayout(mesh=mesh, layout=layout, owners={0: 1, 1: 1})
 
-    owner_gather_plan.send_buffers == {1: tensor(20)}  # 12 + 8 = 20 elements
-    # `owner_gather_plan.send_buffers[1]` represents the following in its packed flat buffer:
-    #   +--------------------+-------------------+
-    #   | param_0 (12 elems) | param_1 (8 elems) |
-    #   +--------------------+-------------------+
-    #                 byte order: -->
+    param_0.local_shard.shape == (5, 4)  # Rank 0 holds param_0[0:5, ...].
+    param_1.local_shard.shape == (0, 4)  # Rank 0 holds none of param_1.
+    param_0.local_shard.numel() == 20
+    param_1.local_shard.numel() == 0
 
-    # Rank 0 owns nothing
+    owner_gather_plan.send_buffers == {1: tensor(20)}  # 20 elements from param_0.
+    # `owner_gather_plan.send_buffers[1]` represents the following flat buffer:
+    #   +--------------------+
+    #   | param_0 (20 elems) |
+    #   +--------------------+
+    #      element order: -->
+
+    # Rank 0 owns nothing.
     owner_gather_plan.recv_sizes == {}
     owner_gather_plan.own_shards == {}
     owner_gather_plan.recv_offsets == {}
 
     # ---
 
-    # Same settings as above, now observing from rank 1 (the owner):
+    # Same settings as above, now observing from rank 1 (the owner):
     torch.distributed.get_rank() == 1
 
-    param_0.local_shard.shape == (3, 4)  # Rank 1 has shard indexed by `[3:6, ...]`.
-    param_1.local_shard.shape == (2, 4)  # Rank 1 has shard indexed by `[2:4, ...]`.
+    param_0.local_shard.shape == (1, 4)  # Rank 1 holds param_0[5:6, ...].
+    param_1.local_shard.shape == (4, 4)  # Rank 1 holds all of param_1.
 
     send_buffers = {}  # Rank 1 owns everything.
-    recv_sizes = {0: 20}  # 12 + 8 = 20 elements from rank 0
-    # Rank 1's own shards, flattened (views):
+    recv_sizes = {0: 20}  # 20 elements from rank 0.
+    # Rank 1's own shards, flattened (views):
     own_shards = {0: param_0.local_shard.view(-1), 1: param_1.local_shard.view(-1)}
     recv_offsets = {
-        (0, 0): 0,  # `param_0` (tensor index 0) from rank 0: offset 0
-        (1, 0): 12,  # `param_1` (tensor index 1) from rank 0: offset 12
+        (0, 0): 0,  # `param_0` (tensor index 0) from rank 0: offset 0.
+        # No entry for param_1: it is fully local to rank 1.
     }
+    # Reconstruct param_0 from the received 20 elements followed by its own 4.
+    # Reconstruct param_1 directly from its own 16 elements, without communication.
     ```
 
     Attributes:
@@ -333,7 +218,9 @@ class OwnerGatherPlan:
             holds elements.
     """
 
-    layouts: dict[int, ParameterLayout]
+    layout: GlobalLayout
+    # Global rank -> buffer offset/length, ordered by buffer offset.
+    rank_ranges: dict[int, Range]
     this_rank: int
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
@@ -350,23 +237,27 @@ class OwnerGatherPlan:
                 it holds elements of. Shards may be passed in any shape.
         """
         mesh = owner_layout.mesh
-        dp_size = mesh.size()
-        this_rank = mesh.get_local_rank()
-        layouts = owner_layout.layouts
+        this_rank = mesh.get_rank()
+        layout = owner_layout.layout
+        rank_ranges = get_rank_ranges(layout, mesh)
         owners = owner_layout.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
-        for tensor_index, layout in layouts.items():
+        for tensor_index in sorted(owners):
             owner = owners[tensor_index]
             if owner != this_rank:
-                send_numel = layout.rank_numel(this_rank)
+                send_numel = intersect_ranges(
+                    layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
+                ).numel
                 if send_numel > 0:
                     send_sizes[owner] = send_sizes.get(owner, 0) + send_numel
                 continue
-            for src in range(dp_size):
+            for src in rank_ranges:
                 if src == this_rank:
                     continue
-                recv_numel = layout.rank_numel(src)
+                recv_numel = intersect_ranges(
+                    layout.get_tensor_range(tensor_index), rank_ranges[src]
+                ).numel
                 if recv_numel > 0:
                     recv_sizes[src] = recv_sizes.get(src, 0) + recv_numel
 
@@ -381,12 +272,14 @@ class OwnerGatherPlan:
         # Fill each owner's send buffer in tensor-index order.
         cursors: dict[int, int] = {owner: 0 for owner in send_buffers}
         own_shards: dict[int, torch.Tensor] = {}
-        for tensor_index in layouts:
+        for tensor_index in sorted(owners):
             owner = owners[tensor_index]
             if owner == this_rank:
                 own_shards[tensor_index] = local_shards[tensor_index].flatten()
                 continue
-            numel = layouts[tensor_index].rank_numel(this_rank)
+            numel = intersect_ranges(
+                layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
+            ).numel
             if numel == 0:
                 continue
             shard = local_shards[tensor_index]
@@ -396,21 +289,24 @@ class OwnerGatherPlan:
 
         # Per (owned param, src) recv offset within the recv buffer from src.
         recv_offsets: dict[tuple[int, int], int] = {}
-        for src in range(dp_size):
+        for src in rank_ranges:
             if src == this_rank:
                 continue
             offset = 0
-            for tensor_index, layout in layouts.items():
+            for tensor_index in sorted(owners):
                 if owners[tensor_index] != this_rank:
                     continue
-                numel = layout.rank_numel(src)
+                numel = intersect_ranges(
+                    layout.get_tensor_range(tensor_index), rank_ranges[src]
+                ).numel
                 if numel == 0:
                     continue
                 recv_offsets[(tensor_index, src)] = offset
                 offset += numel
 
         return cls(
-            layouts=dict(layouts),
+            layout=layout,
+            rank_ranges=rank_ranges,
             this_rank=this_rank,
             send_buffers=send_buffers,
             recv_sizes=recv_sizes,
@@ -423,23 +319,21 @@ class OwnerGatherPlan:
     ) -> torch.Tensor:
         """Reconstruct the full flat tensor for one owned parameter from its per-rank shards.
 
-        Concatenates the per-rank shards in rank order (i.e., global element order). Results can be
+        Concatenates the per-rank shards in buffer order. Results can be
         `view`ed into the desired shape. For a parameter only this rank holds elements of, the own
         flat shard is returned directly.
 
         Args:
-            param_index: Tensor index of the parameter (a key of the `layouts` dict passed to
-                `pack`).
+            param_index: Tensor index of an owned parameter in the group layout.
             recv_buffers: Per-source-rank received buffer (only sources that sent).
         """
-        layout = self.layouts[param_index]
         shards: list[torch.Tensor] = []
-        for src in range(layout.dp_size):
+        for src, buffer_range in self.rank_ranges.items():
             if src == self.this_rank:
                 shards.append(self.own_shards[param_index])
                 continue
 
-            numel = layout.rank_numel(src)
+            numel = intersect_ranges(self.layout.get_tensor_range(param_index), buffer_range).numel
             if numel == 0:
                 continue
 
@@ -469,7 +363,9 @@ class OwnerScatterPlan:
             rank holds elements.
     """
 
-    layouts: dict[int, ParameterLayout]
+    layout: GlobalLayout
+    # Global rank -> buffer offset/length, ordered by buffer offset.
+    rank_ranges: dict[int, Range]
     this_rank: int
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
@@ -485,23 +381,27 @@ class OwnerScatterPlan:
                 any shape.
         """
         mesh = owner_layout.mesh
-        dp_size = mesh.size()
-        this_rank = mesh.get_local_rank()
-        layouts = owner_layout.layouts
+        this_rank = mesh.get_rank()
+        layout = owner_layout.layout
+        rank_ranges = get_rank_ranges(layout, mesh)
         owners = owner_layout.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
-        for tensor_index, layout in layouts.items():
+        for tensor_index in sorted(owners):
             owner = owners[tensor_index]
             if owner == this_rank:
-                for dest in range(dp_size):
+                for dest in rank_ranges:
                     if dest == this_rank:
                         continue
-                    numel = layout.rank_numel(dest)
+                    numel = intersect_ranges(
+                        layout.get_tensor_range(tensor_index), rank_ranges[dest]
+                    ).numel
                     if numel > 0:
                         send_sizes[dest] = send_sizes.get(dest, 0) + numel
                 continue
-            numel = layout.rank_numel(this_rank)
+            numel = intersect_ranges(
+                layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
+            ).numel
             if numel > 0:
                 recv_sizes[owner] = recv_sizes.get(owner, 0) + numel
 
@@ -515,37 +415,43 @@ class OwnerScatterPlan:
 
         # Fill each destination's send buffer in tensor-index order.
         cursors: dict[int, int] = {dest: 0 for dest in send_buffers}
-        for tensor_index, layout in layouts.items():
+        for tensor_index in sorted(owners):
             if owners[tensor_index] != this_rank:
                 continue
             flat = full_results[tensor_index].flatten()
-            for dest in range(dp_size):
+            for dest in rank_ranges:
                 if dest == this_rank:
                     continue
-                numel = layout.rank_numel(dest)
+                shard_range = intersect_ranges(
+                    layout.get_tensor_range(tensor_index), rank_ranges[dest]
+                )
+                numel = shard_range.numel
+                offset = shard_range.start - layout.tensor_to_offset[tensor_index]
                 if numel == 0:
                     continue
-                offset = layout.rank_offset(dest)
                 buf = send_buffers[dest]
                 buf[cursors[dest] : cursors[dest] + numel].copy_(flat[offset : offset + numel])
                 cursors[dest] += numel
 
         recv_offsets: dict[tuple[int, int], int] = {}
-        for owner in range(dp_size):
+        for owner in rank_ranges:
             if owner == this_rank:
                 continue
             offset = 0
-            for tensor_index, layout in layouts.items():
+            for tensor_index in sorted(owners):
                 if owners[tensor_index] != owner:
                     continue
-                numel = layout.rank_numel(this_rank)
+                numel = intersect_ranges(
+                    layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
+                ).numel
                 if numel == 0:
                     continue
                 recv_offsets[(tensor_index, owner)] = offset
                 offset += numel
 
         return cls(
-            layouts=dict(layouts),
+            layout=layout,
+            rank_ranges=rank_ranges,
             this_rank=this_rank,
             send_buffers=send_buffers,
             recv_sizes=recv_sizes,
@@ -564,8 +470,9 @@ class OwnerScatterPlan:
         """
         results: dict[int, torch.Tensor] = {}
         for (tensor_index, owner), offset in self.recv_offsets.items():
-            layout = self.layouts[tensor_index]
-            numel = layout.rank_numel(self.this_rank)
+            numel = intersect_ranges(
+                self.layout.get_tensor_range(tensor_index), self.rank_ranges[self.this_rank]
+            ).numel
             buf = recv_buffers[owner]
             results[tensor_index] = buf[offset : offset + numel]
         return results
