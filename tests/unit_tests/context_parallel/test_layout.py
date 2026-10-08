@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
 
@@ -13,6 +13,7 @@ from megatron.core.context_parallel import (
     THDCPLayoutPlan,
     build_thd_cp_layout_plan,
     contiguous_to_zigzag,
+    convert_cp_layout,
     zigzag_to_contiguous,
 )
 from megatron.core.context_parallel.layout import (
@@ -20,7 +21,9 @@ from megatron.core.context_parallel.layout import (
     _build_layout_redistribution_plan,
     _build_thd_cp_layout_plan_from_rank_order_indices,
     _build_thd_zigzag_metadata,
+    _get_layout_parallel_context,
     _local_segment_ids,
+    _segments_per_rank,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
@@ -91,18 +94,18 @@ def test_layout_conversion_coalesces_layout_runs(monkeypatch):
     calls = []
 
     def fake_contiguous_to_zigzag(
-        hidden_states, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+        input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
     ):
         calls.append(("to_zigzag", cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan))
-        return hidden_states + 1
+        return input_ + 1
 
     def fake_zigzag_to_contiguous(
-        hidden_states, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+        input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
     ):
         calls.append(
             ("to_contiguous", cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan)
         )
-        return hidden_states + 2
+        return input_ + 2
 
     monkeypatch.setattr(
         context_parallel_layout_module, "contiguous_to_zigzag", fake_contiguous_to_zigzag
@@ -178,6 +181,64 @@ def test_prebuilt_packed_layout_state_is_reused():
     assert state.zigzag_packed_seq_params is zigzag_params
 
 
+def test_layout_conversion_noops_without_cp_group():
+    hidden_states = torch.randn(4, 2, 8)
+
+    assert contiguous_to_zigzag(input_=hidden_states) is hidden_states
+    assert zigzag_to_contiguous(input_=hidden_states) is hidden_states
+    assert (
+        convert_cp_layout(input_=hidden_states, source_layout="contiguous", target_layout="zigzag")
+        is hidden_states
+    )
+
+
+def test_sequence_parallel_without_tp_group_uses_cp_group():
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+
+    context = _get_layout_parallel_context(
+        cp_group=cp_group, sequence_parallel=True, tp_group=None, tp_cp_group=None
+    )
+
+    assert context.cp_size == 2
+    assert context.cp_rank == 1
+    assert context.tp_size == 1
+    assert context.tp_rank == 0
+    assert context.communication_group is cp_group
+    assert context.group_rank_by_logical_rank == (0, 1)
+
+
+def test_full_iteration_cuda_graph_rejects_thd_layout_conversion():
+    manager = ContextParallelLayoutManager(
+        layer_layouts=("zigzag",),
+        boundary_layout="contiguous",
+        sequence_parallel=False,
+        cp_group=SimpleNamespace(size=lambda: 2),
+        tp_group=None,
+        tp_cp_group=None,
+        cuda_graph_impl="full_iteration",
+    )
+
+    with pytest.raises(ValueError, match="Full-iteration CUDA graph.*THD CP layout conversion"):
+        manager.build_forward_state(packed_seq_params=None, thd_plan=object())
+
+
+def test_full_iteration_cuda_graph_allows_sbhd_layout_conversion():
+    manager = ContextParallelLayoutManager(
+        layer_layouts=("zigzag",),
+        boundary_layout="contiguous",
+        sequence_parallel=False,
+        cp_group=SimpleNamespace(size=lambda: 2),
+        tp_group=None,
+        tp_cp_group=None,
+        cuda_graph_impl="full_iteration",
+    )
+
+    state = manager.build_forward_state(packed_seq_params=None)
+
+    assert state is not None
+    assert state.thd_plan is None
+
+
 @pytest.mark.parametrize(
     ("cp_global_ranks", "tp_global_ranks", "current_global_rank", "expected"),
     [
@@ -201,59 +262,64 @@ def test_group_rank_mapping_handles_parallel_rank_order(
 
 
 @pytest.mark.parametrize(
-    ("cp_size", "tp_size"), [(2, 1), (3, 2), (4, 4)], ids=["cp2", "cp3-tp2", "cp4-tp4"]
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
 )
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("contiguous", "zigzag"), ("zigzag", "contiguous")]
+    ("cp_size", "tp_size", "group_rank_by_logical_rank"),
+    [
+        (2, 1, (0, 1)),
+        (3, 1, (0, 1, 2)),
+        (2, 2, (0, 2, 1, 3)),
+        (2, 4, tuple(range(8))),
+        (3, 2, tuple(range(6))),
+        (4, 4, tuple(range(16))),
+    ],
 )
-def test_layout_redistribution_plan_restores_target_segments(
-    cp_size, tp_size, source_layout, target_layout
+def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
+    source_layout, target_layout, cp_size, tp_size, group_rank_by_logical_rank
 ):
     group_size = cp_size * tp_size
-    sent_by_rank = []
-    for source_logical_rank in range(group_size):
-        source_cp_rank, source_tp_rank = divmod(source_logical_rank, tp_size)
-        plan = _build_layout_redistribution_plan(
-            source_layout,
-            target_layout,
-            cp_size,
-            source_cp_rank,
-            tp_size=tp_size,
-            tp_rank=source_tp_rank,
-        )
-        source_ids = _local_segment_ids(
-            source_layout, cp_size, source_cp_rank, tp_size=tp_size, tp_rank=source_tp_rank
-        )
-        send_ids = [source_ids[slot] for slot in plan.send_slots]
-        offset = 0
-        destinations = []
-        for target_rank, count in enumerate(plan.input_segment_counts):
-            destinations.extend(
-                (target_rank, segment_id) for segment_id in send_ids[offset : offset + count]
-            )
-            offset += count
-        sent_by_rank.append(destinations)
+    plans = [None] * group_size
+    sends = [[None] * group_size for _ in range(group_size)]
 
-    for target_logical_rank in range(group_size):
-        target_cp_rank, target_tp_rank = divmod(target_logical_rank, tp_size)
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        cp_rank, tp_rank = divmod(logical_rank, tp_size)
+        source_ids = _local_segment_ids(
+            layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+        )
         plan = _build_layout_redistribution_plan(
-            source_layout,
-            target_layout,
-            cp_size,
-            target_cp_rank,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
             tp_size=tp_size,
-            tp_rank=target_tp_rank,
+            tp_rank=tp_rank,
+            group_rank_by_logical_rank=group_rank_by_logical_rank,
         )
-        received = [
+        plans[group_rank] = plan
+        packed_ids = tuple(source_ids[slot] for slot in plan.send_slots)
+        offset = 0
+        for destination, count in enumerate(plan.input_segment_counts):
+            sends[group_rank][destination] = packed_ids[offset : offset + count]
+            offset += count
+
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        cp_rank, tp_rank = divmod(logical_rank, tp_size)
+        plan = plans[group_rank]
+        received_ids = tuple(
             segment_id
-            for source_entries in sent_by_rank
-            for destination, segment_id in source_entries
-            if destination == target_logical_rank
-        ]
-        actual = tuple(received[index] for index in plan.receive_permutation)
-        assert actual == _local_segment_ids(
-            target_layout, cp_size, target_cp_rank, tp_size=tp_size, tp_rank=target_tp_rank
+            for source_group_rank in range(group_size)
+            for segment_id in sends[source_group_rank][group_rank]
         )
+        output_ids = tuple(received_ids[index] for index in plan.receive_permutation)
+        assert output_ids == _local_segment_ids(
+            layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+        )
+
+
+def test_sbhd_layout_redistribution_rejects_odd_tensor_parallel_size():
+    with pytest.raises(ValueError, match="even tensor-parallel size"):
+        _segments_per_rank(tp_size=3)
 
 
 def test_thd_zigzag_layout_pads_uneven_sequences():
@@ -425,7 +491,11 @@ def test_layout_all_to_all_round_trip_and_backward(tp_size, cp_size):
         ).requires_grad_(True)
 
         zigzag = contiguous_to_zigzag(
-            contiguous, cp_group, sequence_parallel, tp_group, tp_cp_group
+            input_=contiguous,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
         )
         zigzag_ids = _local_segment_ids(
             "zigzag", cp_size, cp_rank, tp_size=tp_size, tp_rank=tp_rank
@@ -438,7 +508,13 @@ def test_layout_all_to_all_round_trip_and_backward(tp_size, cp_size):
         )
         torch.testing.assert_close(zigzag, expected_zigzag)
 
-        restored = zigzag_to_contiguous(zigzag, cp_group, sequence_parallel, tp_group, tp_cp_group)
+        restored = zigzag_to_contiguous(
+            input_=zigzag,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+        )
         torch.testing.assert_close(restored, contiguous)
         restored.sum().backward()
         torch.testing.assert_close(contiguous.grad, torch.ones_like(contiguous))
@@ -480,15 +556,20 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
         metadata = _build_thd_zigzag_metadata(cu_seqlens, None, cp_size, tp_size)
         assert metadata.pad_between_seqs
         plan = build_thd_cp_layout_plan(
-            metadata.rank_order_indices,
-            total_tokens,
-            cp_group,
+            rank_order_indices=metadata.rank_order_indices,
+            source_token_count=total_tokens,
+            cp_group=cp_group,
             sequence_parallel=sequence_parallel,
             tp_group=tp_group,
             tp_cp_group=tp_cp_group,
         )
         zigzag = contiguous_to_zigzag(
-            contiguous, cp_group, sequence_parallel, tp_group, tp_cp_group, plan
+            input_=contiguous,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            thd_plan=plan,
         )
         expected = global_values.new_zeros(
             (plan.zigzag_local_token_count, *global_values.shape[1:])
@@ -503,7 +584,12 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
         torch.testing.assert_close(zigzag, expected)
 
         restored = zigzag_to_contiguous(
-            zigzag, cp_group, sequence_parallel, tp_group, tp_cp_group, plan
+            input_=zigzag,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            thd_plan=plan,
         )
         torch.testing.assert_close(restored, contiguous)
         restored.sum().backward()

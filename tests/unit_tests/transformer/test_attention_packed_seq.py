@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
@@ -30,6 +30,15 @@ def test_resolve_runtime_cp_group(runtime_cp_size):
     packed_seq_params = PackedSeqParams(local_cp_size=runtime_cp_size, cp_group=runtime_group)
 
     assert resolve_cp_group(static_group, packed_seq_params) is runtime_group
+
+
+@pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
+def test_resolve_explicit_cp_group_without_runtime_size(runtime_cp_size):
+    static_group = _MockCPGroup(8)
+    runtime_group = _MockCPGroup(runtime_cp_size)
+    assert resolve_cp_group(static_group, PackedSeqParams(cp_group=runtime_group)) is runtime_group
+    assert resolve_cp_group(static_group, PackedSeqParams()) is static_group
+    assert resolve_cp_group(static_group) is static_group
 
 
 def test_resolve_runtime_cp_group_requires_matching_group():
@@ -338,7 +347,8 @@ class TestAttentionDynamicContextParallel:
         assert captured and all(group is singleton_group for group in captured)
         assert self.parallel_attention.pg_collection.cp is build_time_group
 
-    def test_te_cp_stream_lazily_created_for_runtime_cp_group(self, monkeypatch):
+    @pytest.mark.parametrize("declare_size", [False, True])
+    def test_te_cp_stream_lazily_created_for_runtime_cp_group(self, monkeypatch, declare_size):
         import transformer_engine.pytorch as te_pytorch
 
         from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -375,7 +385,7 @@ class TestAttentionDynamicContextParallel:
         packed_seq_params = make_test_packed_seq_params(32)
         runtime_group = self._runtime_cp_group(size=2)
         packed_seq_params.cp_group = runtime_group
-        packed_seq_params.local_cp_size = 2
+        packed_seq_params.local_cp_size = 2 if declare_size else None
 
         core_attention(
             query,
@@ -391,7 +401,10 @@ class TestAttentionDynamicContextParallel:
         assert captured[-1] == (None, None, None)
         assert isinstance(TEDotProductAttention.cp_stream, torch.cuda.Stream)
 
-    def test_te_disables_cp_communication_for_singleton_runtime_group(self, monkeypatch):
+    @pytest.mark.parametrize("declare_size", [False, True])
+    def test_te_disables_cp_communication_for_singleton_runtime_group(
+        self, monkeypatch, declare_size
+    ):
         import transformer_engine.pytorch as te_pytorch
 
         from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -424,7 +437,7 @@ class TestAttentionDynamicContextParallel:
         singleton_group = self._runtime_cp_group(size=1)
         packed_seq_params = make_test_packed_seq_params(32)
         packed_seq_params.cp_group = singleton_group
-        packed_seq_params.local_cp_size = 1
+        packed_seq_params.local_cp_size = 1 if declare_size else None
 
         core_attention(
             query,
@@ -440,7 +453,8 @@ class TestAttentionDynamicContextParallel:
         assert all(call == (None, None, None) for call in captured)
         assert TEDotProductAttention.cp_stream is None
 
-    def test_te_restores_build_time_cp_state_when_forward_raises(self, monkeypatch):
+    @pytest.mark.parametrize("declare_size", [False, True])
+    def test_te_restores_build_time_cp_state_when_forward_raises(self, monkeypatch, declare_size):
         import transformer_engine.pytorch as te_pytorch
 
         from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -469,7 +483,7 @@ class TestAttentionDynamicContextParallel:
         runtime_group = self._runtime_cp_group(size=2)
         packed_seq_params = make_test_packed_seq_params(32)
         packed_seq_params.cp_group = runtime_group
-        packed_seq_params.local_cp_size = 2
+        packed_seq_params.local_cp_size = 2 if declare_size else None
 
         with pytest.raises(RuntimeError, match="synthetic TE failure"):
             core_attention(

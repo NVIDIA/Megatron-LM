@@ -23,13 +23,17 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
-from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
+from megatron.core.context_parallel import (
+    ContextParallelBatch,
+    finalize_packed_seq_params,
+    get_batches_on_this_cp_rank,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -116,7 +120,7 @@ def get_batch(data_iterator, vp_stage=None):
             packed_seq_params,
             padding_mask,
         ) = get_batch_on_this_rank_for_sequence_packing(
-            data_iterator,
+            data_iterator=data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
                 layout=config.pipeline_model_parallel_layout,
@@ -125,10 +129,16 @@ def get_batch(data_iterator, vp_stage=None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            config=config,
+        )
+        # Scheduler batches have one physical view, so module adapters own conversion.
+        # Managed batches below already prebuild their layout plan in the batch builder.
+        finalize_packed_seq_params(
+            packed_seq_params=packed_seq_params, cp_group=get_context_parallel_group()
         )
         return ContextParallelBatch.from_single_layout(
-            config.linear_cp_layout,
-            {
+            layout=config.cp_partition_mode,
+            batch={
                 "tokens": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
@@ -136,7 +146,7 @@ def get_batch(data_iterator, vp_stage=None):
                 "position_ids": position_ids,
                 "padding_mask": padding_mask,
             },
-            packed_seq_params,
+            packed_seq_params=packed_seq_params,
         )
 
     cp_size = args.context_parallel_size
@@ -205,7 +215,7 @@ def get_batch(data_iterator, vp_stage=None):
     if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
         additional_layouts.add(config.attention_cp_layout)
     return get_batches_on_this_cp_rank(
-        batch,
+        batch=batch,
         boundary_layout=config.linear_cp_layout,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
@@ -518,8 +528,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:

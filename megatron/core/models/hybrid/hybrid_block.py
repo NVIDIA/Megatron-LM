@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -174,9 +174,12 @@ class HybridStack(MegatronModule):
         # MTP consumes the decoder readout and shifted-token embedding at hidden_size.
         # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
         self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
-        boundary_layout = (
-            self.config.linear_cp_layout if boundary_layout is None else boundary_layout
-        )
+        if boundary_layout is None:
+            boundary_layout = (
+                self.config.cp_partition_mode
+                if self.config.sequence_packing_scheduler is not None
+                else self.config.linear_cp_layout
+            )
         self.mtp_layer_number = mtp_layer_number
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
@@ -198,16 +201,16 @@ class HybridStack(MegatronModule):
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
-        self._cp_layout_manager = None
-        if self.cp_group.size() > 1:
-            layer_layouts = tuple(
-                (
-                    layer_config.attention_cp_layout
-                    if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
-                    else layer_config.linear_cp_layout
-                )
-                for layer_config in self.layer_config_list
+        layer_layouts = tuple(
+            (
+                layer_config.attention_cp_layout
+                if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
+                else layer_config.linear_cp_layout
             )
+            for layer_config in self.layer_config_list
+        )
+        self._cp_layout_manager = None
+        if self.cp_group.size() > 1 and self.config.sequence_packing_scheduler is None:
             self._cp_layout_manager = ContextParallelLayoutManager(
                 layer_layouts=layer_layouts,
                 boundary_layout=boundary_layout,
@@ -215,7 +218,16 @@ class HybridStack(MegatronModule):
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
+                cuda_graph_impl=self.config.cuda_graph_impl,
             )
+        # Main's manager is an optimization layered on #6387's module-local adapters. Tell the
+        # adapters which physical layout the manager supplies so they do not convert twice. The
+        # sequence-packing scheduler has one boundary view, so module adapters own conversion.
+        module_input_layouts = (
+            layer_layouts
+            if self._cp_layout_manager is not None
+            else ((boundary_layout,) * len(self.layer_config_list))
+        )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
@@ -362,6 +374,9 @@ class HybridStack(MegatronModule):
                     "wide-residual layer classes; "
                     f"layer {layer_number} constructed {type(layer).__name__}."
                 )
+            if hasattr(layer, "self_attention"):
+                layer.self_attention._cp_input_partition_mode = module_input_layouts[i]
+
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)

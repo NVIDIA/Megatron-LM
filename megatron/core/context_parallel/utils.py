@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Context-parallel batch partitioning helpers."""
 
@@ -10,6 +10,7 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
+from .partition import get_cp_partition_indices, partition_batch
 
 
 @dataclass(eq=False)
@@ -33,6 +34,8 @@ class ContextParallelBatch:
         cls, layout: CPLayout, batch: Dict[str, Any], packed_seq_params: PackedSeqParams | None
     ) -> "ContextParallelBatch":
         """Wrap an already-partitioned batch that has one physical CP layout."""
+        if packed_seq_params is not None:
+            packed_seq_params.cp_partition_mode = layout
         return cls(
             boundary_layout=layout,
             batches_by_layout={layout: batch},
@@ -59,7 +62,7 @@ def _get_batch_on_this_cp_rank_contiguous(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids')
+    sequence_keys = ('tokens', 'labels', 'loss_mask', 'padding_mask', 'position_ids')
     if cp_size == 1:
         return batch
 
@@ -89,8 +92,11 @@ def _get_batch_on_this_cp_rank_contiguous(
                 "can be redistributed to zigzag attention, "
                 f"got {val.shape[seq_dim]} and CP size {cp_size} for {key!r}."
             )
-        local_seq_len = val.shape[seq_dim] // cp_size
-        batch[key] = val.narrow(seq_dim, cp_rank * local_seq_len, local_seq_len).contiguous()
+        partition = get_cp_partition_indices(
+            None, val.shape[seq_dim], cp_size, cp_rank, "contiguous"
+        )
+        partition_batch(batch, (key,), partition, seq_dim=seq_dim)
+        batch[key] = batch[key].contiguous()
 
     return batch
 
@@ -178,6 +184,7 @@ def _build_packed_seq_params(
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
         pad_between_seqs=pad_between_seqs,
+        cp_partition_mode=layout,
     )
 
 
@@ -234,7 +241,7 @@ def get_batches_on_this_cp_rank(
 
         batches_by_layout = {
             "zigzag": _get_batch_on_this_cp_rank_padded_zigzag(
-                dict(batch),
+                batch=dict(batch),
                 cp_group=cp_group,
                 rank_order_indices=zigzag_metadata.rank_order_indices,
                 target_cu_seqlens_padded=zigzag_metadata.cu_seqlens_padded,
@@ -242,14 +249,14 @@ def get_batches_on_this_cp_rank(
         }
         if build_thd_plan:
             batches_by_layout["contiguous"] = get_batch_on_this_cp_rank(
-                dict(batch), is_hybrid_cp=False, cp_group=cp_group, use_contiguous_cp=True
+                batch=dict(batch), is_hybrid_cp=False, cp_group=cp_group, use_contiguous_cp=True
             )
         packed_seq_params_by_layout = {
             layout: _build_packed_seq_params(
-                layout_batch,
-                layout,
-                cp_size,
-                tokens_per_sample,
+                batch=layout_batch,
+                layout=layout,
+                cp_size=cp_size,
+                tokens_per_sample=tokens_per_sample,
                 use_logical_qkv_seqlens=layout == "zigzag",
                 pad_between_seqs=(zigzag_metadata.pad_between_seqs if layout == "zigzag" else None),
             )
@@ -263,12 +270,12 @@ def get_batches_on_this_cp_rank(
             assert contiguous_packed_seq_params is not None
             assert contiguous_packed_seq_params.total_tokens is not None
             thd_plan = build_thd_cp_layout_plan(
-                zigzag_metadata.rank_order_indices,
-                contiguous_packed_seq_params.total_tokens,
-                cp_group,
-                sequence_parallel,
-                tp_group,
-                tp_cp_group,
+                rank_order_indices=zigzag_metadata.rank_order_indices,
+                source_token_count=contiguous_packed_seq_params.total_tokens,
+                cp_group=cp_group,
+                sequence_parallel=sequence_parallel,
+                tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
             )
         return ContextParallelBatch(
             boundary_layout=boundary_layout,
@@ -285,7 +292,7 @@ def get_batches_on_this_cp_rank(
         # Copy the dictionary because the CP sharder replaces sequence-valued entries in place.
         batches_by_layout = {
             layout: get_batch_on_this_cp_rank(
-                dict(batch),
+                batch=dict(batch),
                 is_hybrid_cp=is_hybrid_cp,
                 cp_group=cp_group,
                 hybrid_cp_group_func=hybrid_cp_group_func,
@@ -302,7 +309,10 @@ def get_batches_on_this_cp_rank(
     # view rather than deriving one layout's metadata from the other.
     packed_seq_params_by_layout = {
         layout: _build_packed_seq_params(
-            batches_by_layout[layout], layout, cp_size, tokens_per_sample
+            batch=batches_by_layout[layout],
+            layout=layout,
+            cp_size=cp_size,
+            tokens_per_sample=tokens_per_sample,
         )
         for layout in requested_layouts
     }

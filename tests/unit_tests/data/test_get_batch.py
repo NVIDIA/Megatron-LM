@@ -998,13 +998,17 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
-def test_sequence_packing_batch_uses_context_parallel_batch_interface():
+@pytest.mark.parametrize("cp_partition_mode", ["zigzag", "contiguous"])
+def test_sequence_packing_batch_uses_context_parallel_batch_interface(cp_partition_mode):
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
     loss_mask = torch.ones(1, 2)
     position_ids = torch.tensor([[0, 1]])
     padding_mask = torch.zeros(1, 2, dtype=torch.bool)
-    packed_seq_params = PackedSeqParams(qkv_format="thd")
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32)
+    )
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
     scheduler_batch = (
         tokens,
         labels,
@@ -1020,28 +1024,35 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        cp_partition_mode=cp_partition_mode,
     )
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
         patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
+        patch.object(pretrain_hybrid, "get_context_parallel_group", return_value=cp_group),
         patch.object(
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
             return_value=scheduler_batch,
-        ),
+        ) as mock_get_scheduler_batch,
     ):
         cp_batch = get_batch(None)
 
-    assert set(cp_batch.batches_by_layout) == {"zigzag"}
+    assert set(cp_batch.batches_by_layout) == {cp_partition_mode}
+    assert cp_batch.boundary_layout == cp_partition_mode
     assert cp_batch.get_packed_seq_params() is packed_seq_params
+    assert packed_seq_params.cp_partition_mode == cp_partition_mode
+    assert packed_seq_params.cp_partition_route is not None
+    assert sum(packed_seq_params.cp_partition_route.contiguous_split_sizes) == tokens.numel()
     batch = cp_batch.get_batch()
     assert batch["tokens"] is tokens
     assert batch["labels"] is labels
     assert batch["loss_mask"] is loss_mask
     assert batch["position_ids"] is position_ids
     assert batch["padding_mask"] is padding_mask
+    assert mock_get_scheduler_batch.call_args.kwargs["config"] is config
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -1284,7 +1295,7 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
-@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("seq_length", [1024])
 @pytest.mark.parametrize("create_attention_mask", [False])
 def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
@@ -1398,7 +1409,12 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert hybrid_cp_group is not None
     else:
         assert cu_seqlens_padded is None
-        assert hybrid_cp_group is None
+
+    assert hybrid_cp_group is not None
+    assert hybrid_cp_group.size() == cp_size
+    metadata = cp_batch.get_packed_seq_params()
+    assert metadata.local_cp_size == cp_size
+    assert metadata.cp_group is hybrid_cp_group
 
     Utils.destroy_model_parallel()
 
@@ -1520,3 +1536,49 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
     assert max_seqlen.numel() == 1
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_hybrid_forward_reuses_padded_layout_plan(monkeypatch, cp_rank):
+    """Manager batches must not build equal-length module routes for their padded views."""
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
+    tokens = torch.arange(12).reshape(1, 12)
+    batch = {
+        "tokens": tokens,
+        "labels": tokens + 1,
+        "loss_mask": torch.ones_like(tokens),
+        "position_ids": tokens,
+        "cu_seqlens": torch.tensor([[0, 6, 12]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([6], dtype=torch.int32),
+    }
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=cp_rank),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="contiguous",
+            is_hybrid_cp=False,
+            cp_group=cp_group,
+            additional_layouts=("zigzag",),
+        )
+    plan = cp_batch.thd_plan
+    assert plan.contiguous_local_token_count == 6
+    assert plan.zigzag_local_token_count == 8
+    monkeypatch.setattr(pretrain_hybrid, "get_batch", lambda *_args: cp_batch)
+    monkeypatch.setattr(pretrain_hybrid, "get_context_parallel_group", lambda: cp_group)
+    monkeypatch.setattr(pretrain_hybrid, "get_attr_wrapped_model", lambda *_args: None)
+    monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock())
+    monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
+    monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", MagicMock())
+    model = MagicMock(return_value=torch.tensor(1.0))
+
+    output, _ = pretrain_hybrid.forward_step(None, model)
+
+    assert output is model.return_value
+    assert model.call_args.kwargs["cp_batch"].thd_plan is plan
+    assert model.call_args.kwargs["packed_seq_params"] is cp_batch.get_packed_seq_params()
+    assert all(
+        params.cp_partition_route is None
+        for params in cp_batch.packed_seq_params_by_layout.values()
+    )

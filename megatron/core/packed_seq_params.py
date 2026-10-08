@@ -1,10 +1,13 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from megatron.core.context_parallel import ThdCpRoute
 
 
 @dataclass
@@ -12,6 +15,10 @@ class PackedSeqParams:
     '''
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
+
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
+    Metadata annotation helpers update the current partition mode in-place while
+    preserving the route identity.
     '''
 
     qkv_format: str = None
@@ -30,6 +37,8 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
 
     def __post_init__(self):
@@ -74,16 +83,24 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+    static_cp_group: Optional[dist.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams] = None,
 ) -> Optional[dist.ProcessGroup]:
-    """Resolve and validate the context-parallel group for this microbatch."""
-    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-        assert (
-            packed_seq_params.cp_group is not None
-        ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
-        assert packed_seq_params.cp_group.size() == packed_seq_params.local_cp_size, (
-            "packed_seq_params.cp_group size must match local_cp_size: "
-            f"{packed_seq_params.cp_group.size()} != {packed_seq_params.local_cp_size}"
-        )
-        return packed_seq_params.cp_group
+    """Prefer an explicit runtime CP group and validate a declared runtime size.
+
+    A runtime group can also be supplied without ``local_cp_size``. When the
+    size is declared, it must match the group, including singleton groups for
+    microbatches with CP disabled.
+    """
+    if packed_seq_params is not None:
+        if packed_seq_params.local_cp_size is not None:
+            assert (
+                packed_seq_params.cp_group is not None
+            ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
+            assert packed_seq_params.cp_group.size() == packed_seq_params.local_cp_size, (
+                "packed_seq_params.cp_group size must match local_cp_size: "
+                f"{packed_seq_params.cp_group.size()} != {packed_seq_params.local_cp_size}"
+            )
+        if packed_seq_params.cp_group is not None:
+            return packed_seq_params.cp_group
     return static_cp_group

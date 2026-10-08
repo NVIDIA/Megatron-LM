@@ -1,10 +1,65 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, List
+from typing import Dict, List, Literal, Optional, Sequence
 
 import torch
 
+from megatron.core.context_parallel.partition import get_cp_partition_indices, partition_batch
 from megatron.core.rerun_state_machine import RerunDataIterator
+
+
+def get_cp_slice_for_thd(
+    batch,
+    cp_group,
+    keys: Optional[Sequence[str]] = None,
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag",
+    partition_total_tokens: Optional[int] = None,
+):
+    """Partition sequence data for context parallelism in THD format.
+
+    ``zigzag`` uses TE's THD partitioned indices. ``contiguous`` splits the flattened rows into
+    ``cp_size`` equal slices and assigns one slice to each rank. Only keys present in the batch
+    are sliced.
+
+    Args:
+        batch: Dictionary with packed sequence data.
+        cp_group: Context-parallel process group.
+        keys: Sequence data keys to slice. Defaults to the original THD data tensors.
+        cp_partition_mode: How to assign packed rows to CP ranks.
+        partition_total_tokens: Optional total used to tail-pad tensors selected by ``keys``
+            before slicing. Existing cu_seqlens metadata is left unchanged.
+    """
+    cp_size = cp_group.size()
+    if cp_size <= 1 and partition_total_tokens is None:
+        return
+    cp_rank = cp_group.rank()
+    cu_seqlens = batch["cu_seqlens_padded"]
+    total_tokens = (
+        int(cu_seqlens[-1].item())
+        if partition_total_tokens is None
+        else int(partition_total_tokens)
+    )
+    if keys is None:
+        keys = ('tokens', 'position_ids', 'labels', 'loss_mask')
+    if partition_total_tokens is not None:
+        for key in keys:
+            if key not in batch or batch[key] is None:
+                continue
+            pad_len = total_tokens - batch[key].numel()
+            if pad_len < 0:
+                raise RuntimeError(
+                    f"partition_total_tokens={total_tokens} is smaller than {key} length "
+                    f"{batch[key].numel()}."
+                )
+            if pad_len > 0:
+                pad_value = True if key == 'padding_mask' else 0
+                batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
+    if cp_size <= 1:
+        return
+    partition = get_cp_partition_indices(
+        cu_seqlens, total_tokens, cp_size, cp_rank, cp_partition_mode
+    )
+    partition_batch(batch, keys, partition, seq_dim=0)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
