@@ -24,15 +24,6 @@ def select_ge_2d_params(param: torch.Tensor) -> bool:
     return param.ndim >= 2
 
 
-def get_rank_ranges(layout: GlobalLayout, mesh: DeviceMesh) -> dict[int, Range]:
-    """Return all-RowAtomic buffer ranges keyed by global rank, in buffer order."""
-    placements = (RowAtomic(),) * mesh.ndim
-    ranges = {
-        rank: layout.get_rank_range(mesh, placements, rank) for rank in mesh.mesh.flatten().tolist()
-    }
-    return dict(sorted(ranges.items(), key=lambda item: item[1].start))
-
-
 def ns_cost_fn(num_ns_steps: int) -> Callable[[torch.Size], int]:
     """Estimate Newton-Schulz work from a tensor's full shape.
 
@@ -69,16 +60,22 @@ def assign_owner_work(
     if cost_fn is None:
         cost_fn = ns_cost_fn(num_ns_steps=5)
 
+    tensor_indices = tuple(tensor_indices)
+    candidates_by_tensor: dict[int, list[tuple[int, int]]] = {i: [] for i in tensor_indices}
+    running: dict[int, float] = {}
+    placements = (RowAtomic(),) * mesh.ndim
+    for rank in mesh.mesh.flatten().tolist():
+        buffer_range = layout.get_rank_range(mesh, placements, rank)
+        running[rank] = 0.0
+        for tensor_index, holders in candidates_by_tensor.items():
+            if intersect_ranges(layout.get_tensor_range(tensor_index), buffer_range).numel > 0:
+                holders.append((buffer_range.start, rank))
+
     assignments: dict[int, int] = {}
-    rank_ranges = get_rank_ranges(layout, mesh)
-    running = {rank: 0.0 for rank in rank_ranges}
     boundary = []
     for tensor_index in tensor_indices:
-        candidates = tuple(
-            rank
-            for rank, buffer_range in rank_ranges.items()
-            if intersect_ranges(layout.get_tensor_range(tensor_index), buffer_range).numel > 0
-        )
+        # Offset order, rather than global rank order, determines load-balancing ties.
+        candidates = [rank for _, rank in sorted(candidates_by_tensor[tensor_index])]
         shape = layout.tensor_shapes[tensor_index]
         if not candidates:
             raise RuntimeError(
@@ -239,27 +236,40 @@ class OwnerGatherPlan:
         mesh = owner_layout.mesh
         this_rank = mesh.get_rank()
         layout = owner_layout.layout
-        rank_ranges = get_rank_ranges(layout, mesh)
+        placements = (RowAtomic(),) * mesh.ndim
         owners = owner_layout.owners
-        send_sizes: dict[int, int] = {}
+        tensor_indices = sorted(owners)
+        owned_indices = [i for i in tensor_indices if owners[i] == this_rank]
+
+        # Query each source once and compute both its receive size and offsets.
+        rank_ranges: dict[int, Range] = {}
         recv_sizes: dict[int, int] = {}
-        for tensor_index in sorted(owners):
-            owner = owners[tensor_index]
-            if owner != this_rank:
-                send_numel = intersect_ranges(
-                    layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
-                ).numel
-                if send_numel > 0:
-                    send_sizes[owner] = send_sizes.get(owner, 0) + send_numel
+        recv_offsets: dict[tuple[int, int], int] = {}
+        for src in mesh.mesh.flatten().tolist():
+            buffer_range = layout.get_rank_range(mesh, placements, src)
+            rank_ranges[src] = buffer_range
+            if src == this_rank:
                 continue
-            for src in rank_ranges:
-                if src == this_rank:
-                    continue
-                recv_numel = intersect_ranges(
-                    layout.get_tensor_range(tensor_index), rank_ranges[src]
-                ).numel
-                if recv_numel > 0:
-                    recv_sizes[src] = recv_sizes.get(src, 0) + recv_numel
+            offset = 0
+            for tensor_index in owned_indices:
+                numel = intersect_ranges(layout.get_tensor_range(tensor_index), buffer_range).numel
+                if numel > 0:
+                    recv_offsets[(tensor_index, src)] = offset
+                    offset += numel
+            if offset > 0:
+                recv_sizes[src] = offset
+
+        # Reconstruction concatenates shards in buffer order, including on multi-axis meshes.
+        rank_ranges = dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
+        local_range = rank_ranges[this_rank]
+        send_sizes: dict[int, int] = {}
+        for tensor_index in tensor_indices:
+            owner = owners[tensor_index]
+            if owner == this_rank:
+                continue
+            numel = intersect_ranges(layout.get_tensor_range(tensor_index), local_range).numel
+            if numel > 0:
+                send_sizes[owner] = send_sizes.get(owner, 0) + numel
 
         send_buffers: dict[int, torch.Tensor] = {}
         if send_sizes:
@@ -272,37 +282,18 @@ class OwnerGatherPlan:
         # Fill each owner's send buffer in tensor-index order.
         cursors: dict[int, int] = {owner: 0 for owner in send_buffers}
         own_shards: dict[int, torch.Tensor] = {}
-        for tensor_index in sorted(owners):
+        for tensor_index in tensor_indices:
             owner = owners[tensor_index]
             if owner == this_rank:
                 own_shards[tensor_index] = local_shards[tensor_index].flatten()
                 continue
-            numel = intersect_ranges(
-                layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
-            ).numel
+            numel = intersect_ranges(layout.get_tensor_range(tensor_index), local_range).numel
             if numel == 0:
                 continue
             shard = local_shards[tensor_index]
             buf = send_buffers[owner]
             buf[cursors[owner] : cursors[owner] + numel].copy_(shard.flatten())
             cursors[owner] += numel
-
-        # Per (owned param, src) recv offset within the recv buffer from src.
-        recv_offsets: dict[tuple[int, int], int] = {}
-        for src in rank_ranges:
-            if src == this_rank:
-                continue
-            offset = 0
-            for tensor_index in sorted(owners):
-                if owners[tensor_index] != this_rank:
-                    continue
-                numel = intersect_ranges(
-                    layout.get_tensor_range(tensor_index), rank_ranges[src]
-                ).numel
-                if numel == 0:
-                    continue
-                recv_offsets[(tensor_index, src)] = offset
-                offset += numel
 
         return cls(
             layout=layout,
@@ -327,13 +318,14 @@ class OwnerGatherPlan:
             param_index: Tensor index of an owned parameter in the group layout.
             recv_buffers: Per-source-rank received buffer (only sources that sent).
         """
+        tensor_range = self.layout.get_tensor_range(param_index)
         shards: list[torch.Tensor] = []
         for src, buffer_range in self.rank_ranges.items():
             if src == self.this_rank:
                 shards.append(self.own_shards[param_index])
                 continue
 
-            numel = intersect_ranges(self.layout.get_tensor_range(param_index), buffer_range).numel
+            numel = intersect_ranges(tensor_range, buffer_range).numel
             if numel == 0:
                 continue
 
@@ -364,9 +356,7 @@ class OwnerScatterPlan:
     """
 
     layout: GlobalLayout
-    # Global rank -> buffer offset/length, ordered by buffer offset.
-    rank_ranges: dict[int, Range]
-    this_rank: int
+    local_range: Range
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
     recv_offsets: dict[tuple[int, int], int]
@@ -383,76 +373,46 @@ class OwnerScatterPlan:
         mesh = owner_layout.mesh
         this_rank = mesh.get_rank()
         layout = owner_layout.layout
-        rank_ranges = get_rank_ranges(layout, mesh)
+        placements = (RowAtomic(),) * mesh.ndim
+        local_range = layout.get_local_range(mesh, placements)
         owners = owner_layout.owners
-        send_sizes: dict[int, int] = {}
+        tensor_indices = sorted(owners)
+        flat_results = {
+            i: full_results[i].flatten() for i in tensor_indices if owners[i] == this_rank
+        }
+
+        # Query each destination once and pack its shards in tensor-index order.
+        send_buffers: dict[int, torch.Tensor] = {}
+        for dest in mesh.mesh.flatten().tolist():
+            if dest == this_rank:
+                continue
+            buffer_range = layout.get_rank_range(mesh, placements, dest)
+            chunks: list[torch.Tensor] = []
+            for tensor_index, flat in flat_results.items():
+                tensor_range = layout.get_tensor_range(tensor_index)
+                shard_range = intersect_ranges(tensor_range, buffer_range)
+                if shard_range.numel > 0:
+                    offset = shard_range.start - tensor_range.start
+                    chunks.append(flat.narrow(0, offset, shard_range.numel))
+            if chunks:
+                send_buffers[dest] = torch.cat(chunks)
+
+        # Compute each owner's receive size and offsets together from our local range.
         recv_sizes: dict[int, int] = {}
-        for tensor_index in sorted(owners):
+        recv_offsets: dict[tuple[int, int], int] = {}
+        for tensor_index in tensor_indices:
             owner = owners[tensor_index]
             if owner == this_rank:
-                for dest in rank_ranges:
-                    if dest == this_rank:
-                        continue
-                    numel = intersect_ranges(
-                        layout.get_tensor_range(tensor_index), rank_ranges[dest]
-                    ).numel
-                    if numel > 0:
-                        send_sizes[dest] = send_sizes.get(dest, 0) + numel
                 continue
-            numel = intersect_ranges(
-                layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
-            ).numel
+            numel = intersect_ranges(layout.get_tensor_range(tensor_index), local_range).numel
             if numel > 0:
-                recv_sizes[owner] = recv_sizes.get(owner, 0) + numel
-
-        send_buffers: dict[int, torch.Tensor] = {}
-        if send_sizes:
-            first_result = next(iter(full_results.values()))
-            for dest, size in send_sizes.items():
-                send_buffers[dest] = torch.empty(
-                    size, dtype=first_result.dtype, device=first_result.device
-                )
-
-        # Fill each destination's send buffer in tensor-index order.
-        cursors: dict[int, int] = {dest: 0 for dest in send_buffers}
-        for tensor_index in sorted(owners):
-            if owners[tensor_index] != this_rank:
-                continue
-            flat = full_results[tensor_index].flatten()
-            for dest in rank_ranges:
-                if dest == this_rank:
-                    continue
-                shard_range = intersect_ranges(
-                    layout.get_tensor_range(tensor_index), rank_ranges[dest]
-                )
-                numel = shard_range.numel
-                offset = shard_range.start - layout.tensor_to_offset[tensor_index]
-                if numel == 0:
-                    continue
-                buf = send_buffers[dest]
-                buf[cursors[dest] : cursors[dest] + numel].copy_(flat[offset : offset + numel])
-                cursors[dest] += numel
-
-        recv_offsets: dict[tuple[int, int], int] = {}
-        for owner in rank_ranges:
-            if owner == this_rank:
-                continue
-            offset = 0
-            for tensor_index in sorted(owners):
-                if owners[tensor_index] != owner:
-                    continue
-                numel = intersect_ranges(
-                    layout.get_tensor_range(tensor_index), rank_ranges[this_rank]
-                ).numel
-                if numel == 0:
-                    continue
+                offset = recv_sizes.get(owner, 0)
                 recv_offsets[(tensor_index, owner)] = offset
-                offset += numel
+                recv_sizes[owner] = offset + numel
 
         return cls(
             layout=layout,
-            rank_ranges=rank_ranges,
-            this_rank=this_rank,
+            local_range=local_range,
             send_buffers=send_buffers,
             recv_sizes=recv_sizes,
             recv_offsets=recv_offsets,
@@ -471,7 +431,7 @@ class OwnerScatterPlan:
         results: dict[int, torch.Tensor] = {}
         for (tensor_index, owner), offset in self.recv_offsets.items():
             numel = intersect_ranges(
-                self.layout.get_tensor_range(tensor_index), self.rank_ranges[self.this_rank]
+                self.layout.get_tensor_range(tensor_index), self.local_range
             ).numel
             buf = recv_buffers[owner]
             results[tensor_index] = buf[offset : offset + numel]
