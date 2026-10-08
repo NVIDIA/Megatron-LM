@@ -5,11 +5,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-from torch.distributed.tensor import Replicate
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    get_containing_parameter_group,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
@@ -238,33 +234,6 @@ def _copy_embedding_grad_back(orig_grad, full_grad):
     orig_grad._local_tensor.copy_(full_grad[local_slice])
 
 
-def _allreduce_fsdp_embedding_grad(weight, orig_grad, embd_group) -> None:
-    """Reduce embedding gradients across stages using their MFSDP storage layout."""
-    if HAVE_DTENSOR and isinstance(orig_grad, DTensor):
-        full_grad = _full_embedding_grad(orig_grad)
-        torch.distributed.all_reduce(full_grad, group=embd_group)
-        _copy_embedding_grad_back(orig_grad, full_grad)
-        return
-
-    parameter_group = get_containing_parameter_group(weight)
-    assert parameter_group is not None, "Missing MFSDP embedding gradient layout."
-    grad_buffer = parameter_group.pre_optimizer_main_grad
-    assert grad_buffer is not None, "Missing MFSDP embedding gradient buffer."
-    assert not any(
-        placement.is_partial() for placement in grad_buffer.placements
-    ), "MFSDP embedding synchronization requires finalized gradients."
-    parameter_index = next(
-        index
-        for index, parameter in enumerate(parameter_group.fsdp_parameters)
-        if parameter.sharded is weight
-    )
-    full_buffer = grad_buffer.redistribute([Replicate() for _ in grad_buffer.placements])
-    full_grad = full_buffer.get_tensor_view(parameter_index)
-    torch.distributed.all_reduce(full_grad, group=embd_group)
-    local_grad = full_buffer.view(grad_buffer.placements).get_tensor_view(parameter_index)
-    orig_grad.copy_(local_grad)
-
-
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
     embd_group: torch.distributed.ProcessGroup,
@@ -313,17 +282,20 @@ def _allreduce_embedding_grad(
 
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
-        if orig_grad is None and skip_if_none:
-            return
         if ddp_config.use_megatron_fsdp:
-            _allreduce_fsdp_embedding_grad(weight, orig_grad, embd_group)
-            return
-        grad = _unshard_if_dtensor(orig_grad)
+            # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
+            # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
+            grad = _full_embedding_grad(orig_grad)
+        else:
+            grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        if ddp_config.use_megatron_fsdp:
+            _copy_embedding_grad_back(orig_grad, grad)
+        else:
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(
