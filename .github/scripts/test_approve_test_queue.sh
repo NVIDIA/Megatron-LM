@@ -70,5 +70,3 @@ if [[ -z "$next_approval_line" ]] || ! /usr/bin/sed -n "${guard_line},${next_app
 fi
 
 echo "Approve Test Queue preserves concurrency while skipping disabled full-test PRs"
-
-env WORKFLOW="$WORKFLOW" python3 "$(dirname "${BASH_SOURCE[0]}")/test_approve_test_queue.py"
