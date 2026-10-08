@@ -50,6 +50,11 @@ def test_global_layout_normalizes_iterables(as_iterable):
     assert layout.tensor_to_offset == (0, 8)
     assert layout.rank_to_offset == (0, 8)
     assert hash(layout) == hash(GlobalLayout([[2, 4], [1, 4]], [0, 8], 12, [0, 8]))
+    assert layout == GlobalLayout([[2, 4], [1, 4]], [0, 8], 12, [0, 8])
+    assert layout != GlobalLayout([[2, 4], [1, 4]], [0, 8], 16, [0, 8])
+    for name in ("tensor_shapes", "tensor_to_offset", "size", "rank_to_offset"):
+        with pytest.raises(AttributeError):
+            setattr(layout, name, getattr(layout, name))
 
 
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
