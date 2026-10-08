@@ -2121,6 +2121,20 @@ class GTPShardedParam(torch.nn.Parameter):
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
+        # Native autograd producers (notably embeddings) return the parameter
+        # dtype even when DDP accumulates gradients in FP32. Honor main_grad's
+        # precision before scaling and communication, as non-GTP DDP does.
+        # Upcasting only in main_grad.add_ would retain the RS's BF16 rounding.
+        wgrads = list(wgrads)
+        for index, (weight, gradient) in enumerate(zip(self._weights, wgrads)):
+            if weight.main_grad.dtype == torch.float32 and gradient.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                promoted = _wgrad_pool_get(tuple(gradient.shape), torch.float32, gradient.device)
+                promoted.copy_(gradient)
+                wgrads[index] = promoted
+
         # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
         self._prescale_wgrads_for_mean_rs(wgrads)
 
