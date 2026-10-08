@@ -64,6 +64,8 @@ global parallel grid; Megatron-Core is moving to explicit passing via `ProcessGr
   it while existing callers migrate.
 - **Bug fixes may leave existing calls alone.** Process-group plumbing changes belong in their own
   PR.
+- **CI enforces this.** The "Process group usage check" job fails a PR that adds a global read in
+  `megatron/core`. See [The CI check](parallel-state-deprecation.md#the-ci-check).
 
 Full guidance, including the tier breakdown and reviewer notes:
 [parallel-state-deprecation.md](parallel-state-deprecation.md).

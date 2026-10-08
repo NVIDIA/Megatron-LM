@@ -94,5 +94,103 @@ plumbing changes in their own PR so the fix can be reviewed and reverted indepen
 `parallel_state.py` itself, `process_groups_config.py`, bootstrap code that materializes a
 collection from the globals, tests, and explicitly commented migration fallbacks.
 
+**Using Megatron Core with your own parallel grid?** Build a `ProcessGroupCollection` for that
+grid and pass it in. See
+[Building a `ProcessGroupCollection` for your own grid](process-group-collection.md).
+
 This guidance applies to `megatron/core`. It does not apply to `megatron/training` or other
 training-loop code unless a change explicitly opts in.
+
+## The CI check
+
+The "Process group usage check" CI job runs `tools/check_process_group_usage.py`. It fails a PR
+that adds a read of the global grid anywhere in `megatron/core`.
+
+Existing reads are listed in `tools/process_group_usage_allowlist.json`. An entry records the
+file, the enclosing function or class, and the accessor, but not the line number, so code can move
+within its function without changing the allowlist. Each call has its own entry: a second
+identical call in the same function is a new read.
+
+The check counts calls to:
+
+- tier-1 and tier-2 accessors: `parallel_state` functions whose names start with `get_` and end
+  in `_group`, `_groups`, `_gloo`, `_rank`, `_ranks`, or `_world_size`. It follows calls made
+  through `parallel_state`, `mpu`, an `import ... as` alias, or a direct
+  `from megatron.core.parallel_state import ...`.
+- `ProcessGroupCollection.use_mpu_process_groups()`.
+
+It does not count:
+
+- functions that are not deprecated, such as `initialize_model_parallel`,
+  `destroy_model_parallel`, `is_initialized`, and `get_nccl_options` (it also skips
+  `get_all_ranks` by name);
+- tier-3 predicates and tier-4 state, such as `is_pipeline_first_stage()`, the virtual-pipeline
+  rank and size, and `get_global_memory_buffer()`;
+- code in `parallel_state.py` and `process_groups_config.py`, or outside `megatron/core`;
+- reads through an assigned alias (`grid = parallel_state`) or a dynamic lookup
+  (`getattr(parallel_state, name)`).
+
+The check is syntactic. Reviewers still look for reads it cannot see.
+
+### When the check fails
+
+The job lists each new read with its location, the enclosing scope, and the accessor, for
+example `megatron/core/foo.py:12  my_func:accessor:parallel_state.get_tensor_model_parallel_group`.
+
+- **New code:** take the group from the caller and pass it through. Switching to
+  `use_mpu_process_groups()` does not help; the check counts the shim too.
+- **Moved code:** a read that moves to another function or file, or whose function is renamed,
+  is reported as new. If the read cannot be removed in the same PR, edit the allowlist by hand:
+  replace the old entry with the new one. Point it out in the PR description so that a reviewer
+  approves the entry. `--update` cannot do this; it refuses to run while there is a new read.
+
+### When you remove reads
+
+The check also fails when an allowlisted read no longer exists. Refresh the allowlist and commit
+it with your change:
+
+```bash
+python tools/check_process_group_usage.py --update
+```
+
+`--update` only removes stale entries. It never adds one.
+
+### Run it locally
+
+The checker needs only the Python standard library:
+
+```bash
+python tools/check_process_group_usage.py           # the CI check
+python tools/check_process_group_usage.py --stats   # count reads without checking the allowlist
+python tests/unit_tests/test_check_process_group_usage.py   # the checker's own tests
+```
+
+## Where this is going
+
+The goal is that code in `megatron/core` receives its process groups from the caller, and
+`parallel_state` only sets up and tears down the standard grid. Removing the `parallel_state`
+module itself is not planned.
+
+The steps are:
+
+1. **Migrate the readers.** Components in `megatron/core` take their groups from the caller. The
+   CI check keeps new reads out while this happens.
+2. **Add a builder.** A function built on `HyperCommGrid` returns the `ProcessGroupCollection` for
+   the standard grid without setting any globals.
+3. **Make `initialize_model_parallel` a thin wrapper.** It calls the builder and registers the
+   result in `parallel_state`, so existing callers keep working.
+4. **Move the callers.** Training loops, Megatron Bridge, examples, and tests build or receive a
+   collection and pass it in.
+5. **Retire the global registration.** The module-level groups and their `get_*()` accessors
+   are deprecated, then removed.
+
+Steps 1 to 4 do not change how `initialize_model_parallel`, `destroy_model_parallel`, and
+`is_initialized` behave for their callers. Step 5 is not part of this migration; it is a later
+change that will be announced separately.
+
+A component that stops reading the globals may keep a fallback for existing callers that do not
+pass a collection yet. Such a fallback emits a deprecation warning for at least one release and is
+then removed. After that, the component requires the collection or group from its caller.
+
+For current status, see the tracking issue
+[#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307).
