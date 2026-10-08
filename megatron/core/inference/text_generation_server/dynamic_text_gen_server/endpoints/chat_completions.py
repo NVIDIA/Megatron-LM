@@ -1227,6 +1227,9 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 stop_words=stop,
                 stop_token_ids=req.get("stop_token_ids"),
+                detokenize_stop_sequence=bool(
+                    _get_non_none(req, "include_stop_str_in_output", False)
+                ),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,

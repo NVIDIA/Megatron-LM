@@ -282,6 +282,7 @@ _DEFAULT_FIELDS = {
     "skip_prompt_log_probs": True,
     "num_tokens_to_generate": None,
     "stop_words": None,
+    "detokenize_stop_sequence": False,
     "add_BOS": False,
     "termination_id": None,
     "streaming_interval": 1,
@@ -311,6 +312,7 @@ _COMPLETIONS_DEFAULTS = {
                 "max_completion_tokens": None,
                 "n": None,
                 "stop": None,
+                "include_stop_str_in_output": None,
                 "add_BOS": None,
                 "ignore_eos": None,
                 "streaming_interval": None,
@@ -321,7 +323,13 @@ _COMPLETIONS_DEFAULTS = {
         ),
         pytest.param(
             COMPLETIONS_PATH,
-            {"logprobs": None, "echo": None, "stop": None, "ignore_eos": None},
+            {
+                "logprobs": None,
+                "echo": None,
+                "stop": None,
+                "include_stop_str_in_output": None,
+                "ignore_eos": None,
+            },
             {},
             _COMPLETIONS_DEFAULTS,
             id="completions-null-fields-mean-default",
@@ -457,6 +465,7 @@ _REQUEST_CONTROLLED_FIELDS = {
     "num_tokens_to_generate",
     "stop_words",
     "stop_token_ids",
+    "detokenize_stop_sequence",
     "termination_id",
     "streaming_interval",
 }
@@ -474,7 +483,6 @@ _ENGINE_OWNED_FIELDS = {
     "return_prompt_top_n_logprobs",
     "return_segments",
     "num_tokens_total",
-    "detokenize_stop_sequence",
     "streaming",
     "do_kv_handoff",
 }
@@ -490,6 +498,7 @@ _EVERY_FIELD_REQUEST = {
     "max_tokens": 200,
     "stop": ["END"],
     "stop_token_ids": [7],
+    "include_stop_str_in_output": True,
     "add_BOS": True,
     "ignore_eos": True,
     "streaming_interval": 3,
@@ -520,6 +529,56 @@ async def test_every_sampling_params_field_is_classified(path):
     for name in _ENGINE_OWNED_FIELDS:
         assert getattr(sampling_params, name) == getattr(defaults, name), name
     assert {name: getattr(sampling_params, name) for name in frontend_owned} == frontend_owned
+
+
+class _StoppingClient(ReplyingClient):
+    """Ends each generation on ``stop_tokens`` and trims them the way the engine does.
+
+    The engine drops a matched stop word from generated_tokens unless the submitted request keeps
+    it, but always leaves a trailing EOD for the frontend to strip.
+    """
+
+    def __init__(self, stop_tokens, *, is_stop_word):
+        super().__init__()
+        self.stop_tokens = stop_tokens
+        self.is_stop_word = is_stop_word
+
+    def add_request_with_id(self, prompt_tokens, sampling_params, **kwargs):
+        generated_tokens = [12, *self.stop_tokens]
+        if self.is_stop_word and not sampling_params.detokenize_stop_sequence:
+            generated_tokens = generated_tokens[: -len(self.stop_tokens)]
+        self.replies = [completed_reply("req-0", prompt_tokens, generated_tokens)]
+        return super().add_request_with_id(prompt_tokens, sampling_params, **kwargs)
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize(
+    ("stop_tokens", "is_stop_word", "body"),
+    [
+        pytest.param([13], True, {"stop": ["<13>"]}, id="stop-word"),
+        pytest.param([Tokenizer.eod], False, {}, id="eod"),
+    ],
+)
+@pytest.mark.parametrize("include_stop_str_in_output", [True, False])
+async def test_include_stop_str_in_output_keeps_the_stop_sequence_in_the_response(
+    path, stop_tokens, is_stop_word, body, include_stop_str_in_output
+):
+    client = _StoppingClient(stop_tokens, is_stop_word=is_stop_word)
+    app = build_app(path, client)
+
+    response = await app.test_client().post(
+        path,
+        json={**BODIES[path], **body, "include_stop_str_in_output": include_stop_str_in_output},
+    )
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    (sampling_params,) = client.sampling_params
+    assert sampling_params.detokenize_stop_sequence is include_stop_str_in_output
+    choice = (await response.get_json())["choices"][0]
+    text = choice["message"]["content"] if path == CHAT_PATH else choice["text"]
+    stop_text = "".join(f"<{tok}>" for tok in stop_tokens)
+    assert text == ("<12>" + stop_text if include_stop_str_in_output else "<12>")
 
 
 # --- failures before a response is formatted ---------------------------------
