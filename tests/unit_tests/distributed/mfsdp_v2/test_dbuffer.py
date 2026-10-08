@@ -14,6 +14,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import (
     GlobalLayout,
+    Range,
     intersect_ranges,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
@@ -56,9 +57,11 @@ def test_layout_get_rank_range_uses_global_rank(distributed_setup, placement, ex
     )
 
     for rank, expected in zip((1, 3), expected_ranges, strict=True):
-        assert layout.get_rank_range(mesh, [placement], rank) == expected
+        assert layout.get_rank_range(mesh, [placement], rank) == Range(*expected)
     if mesh.get_coordinate() is not None:
-        assert layout.get_local_range(mesh, [placement]) == expected_ranges[mesh.get_local_rank()]
+        assert layout.get_local_range(mesh, [placement]) == Range(
+            *expected_ranges[mesh.get_local_rank()]
+        )
 
     for rank in (-1, 0, 2, distributed_setup.world_size):
         with pytest.raises(ValueError, match="Global rank .* is not in the device mesh"):
@@ -83,10 +86,10 @@ def test_layout_get_rank_range_on_2d_mesh(distributed_setup, placements, expecte
     layout = GlobalLayout.build_for_row_atomic([torch.Size((8, 4))], dp_size=mesh.size())
 
     for rank, expected in zip((0, 2, 1, 3), expected_ranges, strict=True):
-        assert layout.get_rank_range(mesh, iter(placements), rank) == expected
+        assert layout.get_rank_range(mesh, iter(placements), rank) == Range(*expected)
     if (coordinate := mesh.get_coordinate()) is not None:
         rank = coordinate[0] * mesh.size(1) + coordinate[1]
-        assert layout.get_local_range(mesh, iter(placements)) == expected_ranges[rank]
+        assert layout.get_local_range(mesh, iter(placements)) == Range(*expected_ranges[rank])
 
 
 @pytest.mark.parametrize(
@@ -116,10 +119,10 @@ def test_tensor_intersections(shapes, offsets, size, dp_size, expected):
     for i, ranges in enumerate(expected):
         assert [
             intersect_ranges(
-                layout.get_tensor_range(i), (rank * (size // dp_size), size // dp_size)
+                layout.get_tensor_range(i), Range(rank * (size // dp_size), size // dp_size)
             )
             for rank in range(dp_size)
-        ] == ranges
+        ] == [Range(*expected) for expected in ranges]
 
 
 @pytest.mark.parametrize(
@@ -141,9 +144,29 @@ def test_layout_get_rank_range_with_uneven_segments(distributed_setup, placement
         tensor_owners=[0, 1, 2],
     )
     for rank, expected in zip((0, 2, 1, 3), expected_ranges, strict=True):
-        assert layout.get_rank_range(mesh, placements, rank) == expected
+        assert layout.get_rank_range(mesh, placements, rank) == Range(*expected)
         if rank == mesh.get_rank():
-            assert layout.get_local_range(mesh, placements) == expected
+            assert layout.get_local_range(mesh, placements) == Range(*expected)
+
+
+@pytest.mark.parametrize(
+    ("offsets", "message"),
+    [
+        ((-2, 4), "Tensor 0 offset -2 is negative."),
+        ((6, 0), "Tensor 0 range [6, 10) exceeds layout size 8."),
+        ((4, 2), "Global layout tensors overlap: tensor 1 [2, 6) and tensor 0 [4, 8)."),
+    ],
+)
+def test_layout_range_validation_preserves_tensor_ids(offsets, message):
+    """Range validation reports the original tensor IDs after sorting by start."""
+    with pytest.raises(AssertionError) as error:
+        GlobalLayout(
+            tensor_shapes=(torch.Size((2, 2)), torch.Size((2, 2))),
+            tensor_to_offset=offsets,
+            size=8,
+            rank_to_offset=(0, 4),
+        )
+    assert str(error.value) == message
 
 
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
@@ -1095,7 +1118,7 @@ def test_get_local_range_rejects_mesh_size_mismatch(distributed_setup):
 
     layout = GlobalLayout.build_for_row_atomic([torch.Size((4, 4)), torch.Size((2, 4))], dp_size=2)
     assert layout.rank_to_offset == (0, 12)
-    assert layout.get_local_range(mesh, [Replicate()]) == (0, 24)
+    assert layout.get_local_range(mesh, [Replicate()]) == Range(0, 24)
     with pytest.raises(ValueError, match="built for 2 shards"):
         layout.get_local_range(mesh, [RowAtomic()])
 
@@ -1104,7 +1127,7 @@ def test_get_local_range_rejects_mesh_size_mismatch(distributed_setup):
     layout = GlobalLayout.build_for_row_atomic([torch.Size((8, 4))], dp_size=8)
     assert layout.rank_to_offset == tuple(range(0, 32, 4))
     rank = mesh.get_local_rank(0)
-    assert layout.get_local_range(mesh, [RowAtomic()]) == (rank * 8, 8)
+    assert layout.get_local_range(mesh, [RowAtomic()]) == Range(rank * 8, 8)
 
 
 def test_replicate_placement_with_tensor_atomic_layout(distributed_setup):
