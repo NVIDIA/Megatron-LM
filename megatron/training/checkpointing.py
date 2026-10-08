@@ -839,6 +839,16 @@ def save_checkpoint(
             else mpu.get_expert_data_parallel_rank()
         )
 
+    train_state = get_train_state()
+    train_state_dict = None
+    if train_state is not None:
+        # Snapshot before dispatching any save; serialization types belong to TrainState.
+        checkpoint_train_state = copy.deepcopy(train_state)
+        checkpoint_train_state.iteration = iteration
+        checkpoint_train_state.release = release
+        checkpoint_train_state.num_floating_point_operations_so_far = num_floating_point_operations_so_far
+        train_state_dict = checkpoint_train_state.state_dict()
+
     # Collect args, model, RNG.
     # For LEGACY checkpoints, every unique (tp_rank, ep_rank) shard must be written by
     # exactly one rank. Neither dp_rank==0 nor edp_rank==0 alone covers all shards when
@@ -1045,6 +1055,8 @@ def save_checkpoint(
                         f"Local checkpointing does not support optimizer sharding type '{sharded_sd_metadata['distrib_optim_sharding_type']}'. "
                         "Don't use '--dist-ckpt-optim-fully-reshardable' when saving local checkpoints."
                     )
+                if train_state_dict is not None:
+                    state_dict['train_state_metadata'] = train_state_dict
                 algo = args.non_persistent_local_ckpt_algo
                 cached_metadata = None
                 if (
@@ -1143,16 +1155,6 @@ def save_checkpoint(
             )
             gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
             gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
-
-            train_state = get_train_state()
-            train_state_dict = None
-            if train_state is not None:
-                # Snapshot the requested checkpoint without changing the running state.
-                checkpoint_train_state = copy.deepcopy(train_state)
-                checkpoint_train_state.iteration = iteration
-                checkpoint_train_state.release = release
-                checkpoint_train_state.num_floating_point_operations_so_far = num_floating_point_operations_so_far
-                train_state_dict = checkpoint_train_state.state_dict()
 
             def iter_finalize_fn():
                 cfg = get_run_config()
@@ -3104,7 +3106,15 @@ def load_checkpoint(
         state_dict['model'] = dtensor_state_dict
 
     ckpt_train_state = None
-    if ckpt_type != CheckpointType.LOCAL:
+    if ckpt_type == CheckpointType.LOCAL:
+        from megatron.training.state import TrainState
+
+        # Local checkpoints carry TrainState in their common payload, not a sidecar.
+        # Older local checkpoints fall back to the legacy state_dict/args path below.
+        if 'train_state_metadata' in state_dict:
+            ckpt_train_state = TrainState()
+            ckpt_train_state.load_state_dict(state_dict['train_state_metadata'])
+    else:
         # Legacy checkpoint_name points to an mp_rank_*/model_optim_rng.pt file.
         checkpoint_dir = (
             os.path.dirname(os.path.dirname(checkpoint_name))
