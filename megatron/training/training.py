@@ -188,13 +188,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -838,6 +838,65 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _dsv4_attention_flops(args, layer_counts, total_tokens, seqlen_squared_sum):
+    """Estimate DSv4 W/C/H attention FLOPs, including projections and compressors.
+
+    Uses the model-FLOPs convention: multiply/add counts as two
+    operations and forward plus backward as three passes. Window and capped
+    Top-K work are token-linear; HCA and indexer scoring use the real sequence
+    length squared sum. Packed Top-K saturation uses the token-weighted mean
+    length, since these batch statistics do not retain individual document lengths.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    if total_tokens == 0:
+        return 0
+    window_layers = layer_counts[Symbols.WINDOW]
+    csa_layers = layer_counts[Symbols.CSA]
+    hca_layers = layer_counts[Symbols.HCA]
+    attention_layers = window_layers + csa_layers + hca_layers
+    hidden = args.hidden_size
+    heads = args.num_attention_heads
+    head_dim = args.v_head_dim
+    q_rank = args.q_lora_rank
+    output_rank = args.output_projection_lora_rank
+    output_groups = args.output_projection_groups
+    window = args.csa_window_size
+    sequence_length = seqlen_squared_sum / total_tokens
+
+    # Read v_head_dim directly: DSv4 derives qk_head_dim on the layer config,
+    # so the raw argument namespace may still carry the ordinary MLA default.
+    query_projection = q_rank * (hidden + heads * head_dim + 1)
+    kv_projection = hidden * head_dim + head_dim
+    output_projection = heads * head_dim * output_rank + output_groups * output_rank * hidden
+    token_term = attention_layers * (query_projection + kv_projection + output_projection)
+    token_term += attention_layers * heads * window * head_dim * 2
+
+    # Ratio-4 compression overlaps two windows; ratio-128 uses one.
+    token_term += csa_layers * hidden * (2 * head_dim) * 2
+    token_term += hca_layers * hidden * head_dim * 2
+    core_term = hca_layers * heads * head_dim / 128
+
+    if csa_layers:
+        if getattr(args, "csa_dense_mode", False):
+            # Dense CSA attends to all compressed keys and has no indexer.
+            core_term += csa_layers * heads * head_dim / 4
+        else:
+            indexer_heads = args.dsa_indexer_n_heads
+            indexer_dim = args.dsa_indexer_head_dim
+            topk = min(args.dsa_indexer_topk, sequence_length // 4)
+            average_compressed_keys = topk * (1 - topk * 4 / (2 * sequence_length))
+            token_term += csa_layers * heads * average_compressed_keys * head_dim * 2
+            token_term += csa_layers * (
+                hidden * (2 * indexer_dim) * 2
+                + q_rank * indexer_heads * indexer_dim
+                + hidden * indexer_heads
+            )
+            core_term += csa_layers * indexer_heads * indexer_dim / 4
+
+    return 6 * (token_term * total_tokens + core_term * seqlen_squared_sum)
+
+
 def num_floating_point_operations(
     args,
     batch_size,
@@ -1384,18 +1443,25 @@ def num_floating_point_operations(
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
+            parse_hybrid_pattern,
         )
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+                layer_counts
             )
         )
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
+        has_dsv4_attention = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
+        if has_dsv4_attention:
+            # The static C/H/W specs select DSv4 even when the CLI variant is
+            # inferred only on TransformerConfig. The pattern also owns MTP depth.
+            mtp_num_layers = parse_hybrid_pattern(args.hybrid_layer_pattern).mtp_num_depths
         # Compute hybrid model FLOPs.
-        return int(hybrid_flops(
+        flops = hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -1430,7 +1496,16 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-        ))
+        )
+        if has_dsv4_attention:
+            flops += _dsv4_attention_flops(
+                args, layer_counts, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+            )
+            # MTP normalization and the concatenated embedding/hidden projection.
+            flops += 6 * mtp_num_layers * (
+                3 * args.hidden_size + 2 * args.hidden_size ** 2
+            ) * total_real_tokens_in_batch
+        return int(flops)
     else:
         # Compute standard Transformer model FLOPs.
         return int(transformer_flops())
