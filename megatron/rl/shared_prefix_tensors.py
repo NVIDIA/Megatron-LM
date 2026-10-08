@@ -373,17 +373,12 @@ def materialize_shared_prefix_layout(
             layout.physical_padding_positions, device=device
         ),
     )
-    required_width = max(layout.token_gather_columns) + 1
-    gather_input_ids = input_ids
-    if required_width > sequence_width:
-        gather_input_ids = torch.nn.functional.pad(
-            input_ids, (0, required_width - sequence_width), value=0
-        )
-    packed_input_ids = gather_input_ids[
-        indices.token_gather_rows, indices.token_gather_columns
-    ].clone()
-    if indices.physical_padding_positions.numel():
-        packed_input_ids[indices.physical_padding_positions] = 0
+    packed_input_ids = _gather_token_aligned_tensor(
+        input_ids,
+        indices=indices,
+        required_width=max(layout.token_gather_columns) + 1,
+        padding_value=0,
+    )
     return SharedPrefixTensorBin(
         layout=layout,
         packed_input_ids=packed_input_ids,
@@ -415,13 +410,27 @@ def materialize_shared_prefix_token_aligned_tensor(
     if source.shape[0] <= int(indices.token_gather_rows.max().item()):
         raise ValueError("shared-prefix token-aligned source is missing a referenced row")
 
-    required_width = int(indices.token_gather_columns.max().item()) + 1
-    gather_source = source
+    return _gather_token_aligned_tensor(
+        source,
+        indices=indices,
+        required_width=int(indices.token_gather_columns.max().item()) + 1,
+        padding_value=padding_value,
+    )
+
+
+def _gather_token_aligned_tensor(
+    source: torch.Tensor,
+    *,
+    indices: SharedPrefixTensorIndices,
+    required_width: int,
+    padding_value: int | float,
+) -> torch.Tensor:
+    """Apply the same physical gather and tail-padding rule to tokens and metadata."""
     if required_width > source.shape[1]:
-        gather_source = torch.nn.functional.pad(
+        source = torch.nn.functional.pad(
             source, (0, required_width - source.shape[1]), value=padding_value
         )
-    packed = gather_source[indices.token_gather_rows, indices.token_gather_columns].clone()
+    packed = source[indices.token_gather_rows, indices.token_gather_columns].clone()
     if indices.physical_padding_positions.numel():
         packed[indices.physical_padding_positions] = padding_value
     return packed
@@ -461,32 +470,12 @@ def build_shared_prefix_tensor_plan(
         TypeError: If a group ID is neither ``str`` nor ``None``.
         ValueError: If tensor shapes, lengths, or planner limits are invalid.
     """
-    lengths_cpu, prompt_lengths_cpu = _validate_batch_inputs(
+    rows = build_shared_prefix_rows(
         input_ids=input_ids,
         input_lengths=input_lengths,
         prompt_lengths=prompt_lengths,
         group_ids=group_ids,
     )
-    input_ids_cpu = input_ids.detach().cpu()
-    rows: list[SharedPrefixRow] = []
-    for row_index, group_id in enumerate(group_ids):
-        if group_id is not None and not isinstance(group_id, str):
-            raise TypeError(
-                f"group_ids[{row_index}] must be str or None, got " f"{type(group_id).__name__}"
-            )
-        prompt_length = int(prompt_lengths_cpu[row_index].item())
-        input_length = int(lengths_cpu[row_index].item())
-        prompt_token_ids = tuple(
-            int(token) for token in input_ids_cpu[row_index, :prompt_length].tolist()
-        )
-        rows.append(
-            SharedPrefixRow(
-                row_index=row_index,
-                group_id=group_id,
-                prompt_token_ids=prompt_token_ids,
-                completion_length=input_length - prompt_length,
-            )
-        )
 
     plan = plan_shared_prefix_bins(
         rows,
@@ -510,9 +499,9 @@ def build_shared_prefix_tensor_plan(
 
 def _validate_input_ids(input_ids: torch.Tensor) -> None:
     """Validate the source token tensor without changing its device or dtype."""
-    if input_ids.ndim != 2:
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
         raise ValueError(
-            f"input_ids must have shape [batch, sequence], got {tuple(input_ids.shape)}"
+            f"input_ids must have shape [batch, sequence], got {getattr(input_ids, "shape", None)}"
         )
     if input_ids.is_floating_point() or input_ids.is_complex() or input_ids.dtype == torch.bool:
         raise ValueError(f"input_ids must have an integer dtype, got {input_ids.dtype}")
@@ -528,7 +517,7 @@ def _validate_batch_inputs(
     """Validate conventional batch metadata and return CPU integer lengths."""
     _validate_input_ids(input_ids)
     batch_size, sequence_width = input_ids.shape
-    if isinstance(group_ids, str):
+    if isinstance(group_ids, (str, bytes)):
         raise TypeError("group_ids must be a sequence of per-row IDs, not one string")
     if len(group_ids) != batch_size:
         raise ValueError(f"group_ids must have {batch_size} entries, got {len(group_ids)}")
@@ -548,8 +537,10 @@ def _validate_length_vector(
     lengths: torch.Tensor, *, name: str, batch_size: int, sequence_width: int
 ) -> torch.Tensor:
     """Validate and copy one source-length vector to CPU long."""
-    if lengths.ndim != 1 or lengths.numel() != batch_size:
-        raise ValueError(f"{name} must have shape [{batch_size}], got {tuple(lengths.shape)}")
+    if not isinstance(lengths, torch.Tensor) or lengths.ndim != 1 or lengths.numel() != batch_size:
+        raise ValueError(
+            f"{name} must have shape [{batch_size}], got {getattr(lengths, "shape", None)}"
+        )
     if lengths.is_floating_point() or lengths.is_complex() or lengths.dtype == torch.bool:
         raise ValueError(f"{name} must have an integer dtype, got {lengths.dtype}")
     lengths_cpu = lengths.detach().cpu().to(torch.long)
@@ -573,39 +564,19 @@ def build_shared_prefix_rows(
     group_ids: Sequence[str | None],
 ) -> list[SharedPrefixRow]:
     """Build validated CPU planner rows from conventional batch tensors."""
-    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
-        raise ValueError("shared-prefix input_ids must have shape [batch, sequence]")
-    if not isinstance(input_lengths, torch.Tensor) or input_lengths.ndim != 1:
-        raise ValueError("shared-prefix input_lengths must have shape [batch]")
-    if not isinstance(prompt_lengths, torch.Tensor) or prompt_lengths.ndim != 1:
-        raise ValueError("shared-prefix prompt lengths must have shape [batch]")
-    if isinstance(group_ids, (str, bytes)):
-        raise TypeError("shared-prefix group IDs must be a per-row sequence")
-    if (
-        input_lengths.numel() != input_ids.shape[0]
-        or prompt_lengths.numel() != input_ids.shape[0]
-        or len(group_ids) != input_ids.shape[0]
-    ):
-        raise ValueError("shared-prefix metadata must have one entry per input row")
-
-    # One host copy of the token matrix (the exact prompt tuples need it) and
-    # one ``.tolist()`` per length vector. The former per-row ``.item()`` calls
-    # ran on these CPU copies, so they were pure Python overhead proportional
-    # to the local batch rather than device syncs; the values are unchanged.
+    lengths_cpu, prompt_lengths_cpu = _validate_batch_inputs(
+        input_ids=input_ids,
+        input_lengths=input_lengths,
+        prompt_lengths=prompt_lengths,
+        group_ids=group_ids,
+    )
     input_ids_cpu = input_ids.detach().cpu()
-    input_length_values = input_lengths.detach().cpu().to(torch.long).tolist()
-    prompt_length_values = prompt_lengths.detach().cpu().to(torch.long).tolist()
-    sequence_width = input_ids.shape[1]
+    input_length_values = lengths_cpu.tolist()
+    prompt_length_values = prompt_lengths_cpu.tolist()
     rows: list[SharedPrefixRow] = []
     for row_index, (input_length, prompt_length) in enumerate(
         zip(input_length_values, prompt_length_values, strict=True)
     ):
-        input_length = int(input_length)
-        prompt_length = int(prompt_length)
-        if input_length < 0 or input_length > sequence_width:
-            raise ValueError(f"input length for row {row_index} is outside input_ids width")
-        if prompt_length < 0 or prompt_length > input_length:
-            raise ValueError(f"prompt length for row {row_index} must be within its input length")
         group_id = group_ids[row_index]
         if group_id is not None and not isinstance(group_id, str):
             raise TypeError(f"shared-prefix group ID for row {row_index} must be str or None")

@@ -21,6 +21,11 @@ star. RoPE positions restart at the original prompt length for each completion.
 The layout also records physical padding, logical lengths, and CP token ownership.
 Backward accumulates the completion contributions into shared prompt activations.
 
+`PackedTreeLayout` also describes deeper trees and supplies ancestry-aware reference
+masks. The fused hybrid attention/Mamba adapter still lowers only contiguous stars
+and forests with unpadded prompt roots; deeper layouts fail explicitly. See the
+[tree descriptor contracts](../../tests/unit_tests/rl/test_tree_layout.py).
+
 TP sequence parallelism and CP zigzag ownership use the caller's process groups.
 The fused attention path exchanges the required sequence/head shards and retains
 an independent causal domain for each completion. This is an execution layout;
@@ -78,18 +83,28 @@ default-off experimental controls. The former changes the ordinary attention/Mam
 numerical backend and must not be treated as a requirement for enabling the shared
 layout. Neither is qualified merely because the shared-prefix model runs.
 
+The deferred Triton variants `NRL_SP_FUSED_KV_GATHER`,
+`NRL_SP_FUSED_BACKWARD_GLUE`, and `NRL_SP_FUSED_DQ_ASSEMBLY` are unsupported
+opt-ins. They default to disabled; enabling any of them raises an explicit error.
+
 ## Validation status
 
-This current-main port has syntax, static-interface, and isolated CPU contract
-checks for layout accounting, branch copy gradients, frozen-router gradients, and
-recompute observation scope. These checks do not execute CUDA, Triton,
-FlashAttention, Transformer Engine, distributed CP/TP/EP, or the full model.
+Four-rank portable checks pass for packing/tensors, NeMo AST planner contracts,
+five CPU MTP/branch fixtures, 300 packing replays, and registry import contracts;
+see the [tree contracts](../../tests/unit_tests/rl/test_tree_layout.py) and
+[tensor contracts](../../tests/unit_tests/rl/test_shared_prefix_tensors.py).
+CUDA reference attention passes 40 multi-level cases. Standalone CP1 BF16/FP16
+FlashAttention checks pass 128 deterministic cases and 96 default comparisons per
+rank, with byte-identical outputs and Q/K/V gradients. This evidence does not
+qualify full hybrid-model or distributed CP/TP/EP execution.
 
-A previous production revision completed training and checkpoint evaluations.
-That is evidence for that revision and configuration, not GPU qualification of this
-port.
-
-Before promotion: run native distributed tests and kernel replay coverage,
-exercise matched packing and loss masks, validate MTP and expert
-statistics, and run a bounded training/evaluation qualification. New kernel files
-also require registration and replay tests in the upstream determinism manifest.
+Full current-PR GRPO has no completed optimizer update, and matched dense/shared
+gradient, full-model MTP/MoE, and bounded training/evaluation qualification remain
+outstanding. A Mamba recurrence simplification remains excluded because 11 of 36
+native gradient cases fail the required numerical gate. The registered attention replay tests pass 126 cases per rank on four GB200 GPUs,
+including real NCCL CP1/2/4, stream contention, numerical references, and import
+guards. This qualifies standalone attention, not full hybrid-model training.
+Full PR quality checks and coverage/native replay for the 12 remaining kernel
+determinism obligations remain draft gates; see the
+[kernel manifest](../../tests/unit_tests/determinism/kernels/manifest.py) and
+[determinism testing requirements](determinism/testing.md).

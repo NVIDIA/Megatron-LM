@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from collections.abc import Iterator
 from contextlib import nullcontext
 from typing import Literal, Optional
 
@@ -231,44 +230,6 @@ def _shared_prefix_mtp_branch_indices(
     return tuple(star_indices), tuple(dense_positions)
 
 
-def _iter_shared_prefix_mtp_branches(
-    global_hidden_states: Tensor,
-    global_input_ids: Tensor,
-    global_loss_mask: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
-    *,
-    cp_size: int = 1,
-    cp_rank: int = 0,
-) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
-    """Yield independent dense MTP branches from one canonical star.
-
-    The main Hybrid stack can share its prompt, but MTP shifts future tokens and
-    therefore needs a conventional sequence boundary per completion.  This is the
-    per-branch reference form of ``_pack_shared_prefix_mtp_branches``: the
-    production forward packs every branch into one sequence, while tests use
-    this iterator to check that packing against branch-by-branch reconstruction.
-    When CP is enabled, global-star indices are composed directly with that
-    branch's zigzag CP ownership so the full dense branch is never allocated.
-    """
-    _validate_shared_prefix_mtp_star(
-        global_hidden_states,
-        global_input_ids,
-        global_loss_mask,
-        layout,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-    )
-    star_indices, _ = _shared_prefix_mtp_branch_indices(
-        layout, global_hidden_states.device, cp_size=cp_size, cp_rank=cp_rank
-    )
-    for indices in star_indices:
-        yield (
-            global_hidden_states.index_select(0, indices),
-            global_input_ids.index_select(1, indices),
-            global_loss_mask.index_select(1, indices),
-        )
-
-
 def _pack_shared_prefix_mtp_branches(
     global_hidden_states: Tensor,
     global_input_ids: Tensor,
@@ -283,9 +244,8 @@ def _pack_shared_prefix_mtp_branches(
     Returns ``(hidden_states, input_ids, loss_mask, position_ids)`` for the
     branch-major concatenation ``[prompt + completion_1 | ... | prompt +
     completion_G]`` in this rank's CP-local order, gathered with exactly one
-    ``index_select`` per tensor.  The result equals the concatenation of
-    ``_iter_shared_prefix_mtp_branches`` for the same CP rank; ``position_ids``
-    restart at zero for every branch, exactly as a conventional dense batch.
+    ``index_select`` per tensor. Positions restart at zero for every branch,
+    exactly as in a conventional dense batch.
     """
     _validate_shared_prefix_mtp_star(
         global_hidden_states,
@@ -304,20 +264,6 @@ def _pack_shared_prefix_mtp_branches(
         global_input_ids.index_select(1, packed_indices),
         global_loss_mask.index_select(1, packed_indices),
         torch.cat(dense_positions).unsqueeze(0),
-    )
-
-
-def _reconstruct_shared_prefix_mtp_branches(
-    global_hidden_states: Tensor,
-    global_input_ids: Tensor,
-    global_loss_mask: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
-) -> tuple[tuple[Tensor, Tensor, Tensor], ...]:
-    """Materialize the iterator for focused reconstruction/parity tests."""
-    return tuple(
-        _iter_shared_prefix_mtp_branches(
-            global_hidden_states, global_input_ids, global_loss_mask, layout
-        )
     )
 
 

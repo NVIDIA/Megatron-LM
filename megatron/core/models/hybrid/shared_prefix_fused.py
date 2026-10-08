@@ -13,19 +13,17 @@ examples/shared_prefix_attention). Public entry points:
 - ``flash_composed_forest_attention(q, k, v, forest)`` — multi-group star forests
   (``[(offset, prefix_len, completion_lens), ...]``), fused into one plan.
 
-Env knobs (defaults tuned on GB200): NRL_SP_CHAINFIRST (hybrid chain plan), NRL_SP_QSLICE
-(zero-copy q views), NRL_SP_STREAMS (stream overlap), and NRL_SP_COMBINE (cross-pass
-consolidation, default off). Experimental Triton KV gather, backward glue, and dQ assembly have
-separate, default-off opt-ins so each can be parity-qualified independently.
+Env knobs: NRL_SP_CHAINFIRST (hybrid chain plan), NRL_SP_QSLICE (zero-copy q views),
+and NRL_SP_STREAMS (stream overlap). Unqualified Triton KV gather, backward glue,
+and dQ assembly are deferred; their former opt-ins fail explicitly.
 NRL_SP_DETERMINISTIC_BACKWARD is a default-off diagnostic that selects FlashAttention's
-deterministic backward. The retained Triton LSE merge is production-disabled pending a full-model
-corruption fix.
+deterministic backward. The eager LSE merge is used in production. The legacy NRL_SP_FUSED_MERGE opt-in fails
+closed because its removed Triton implementation has known full-model corruption.
 GB200 net vs block-diagonal at equal work: star-like/balanced trees 1.59x training / 1.56x
 logprob; deep branched trees 1.00x / 1.01x at a 1.10x FLOP ceiling (91-92% kernel efficiency).
 """
 
 import os
-from contextlib import nullcontext
 from itertools import pairwise
 from typing import List
 
@@ -33,26 +31,12 @@ import torch
 
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
 
-# --- Optimization: plan caching + fused (Triton) LSE merge ------------------------------------
-# The fused kernel's overhead vs raw flash is NOT attention math; it is (a) rebuilding the pass
-# plan (pure-Python node loops + Python-int index lists -> H2D copies) on EVERY call -- the same
-# bin layout recurs across all ~50 layers of a step -- and (b) the eager online-softmax merge,
-# which upcasts every pass output to fp32 and round-trips full [total, np, hn] tensors through
-# memory several times per forward. (a) is fixed by an LRU plan cache keyed on the node arrays;
-# (b) by a single Triton kernel that reads each pass's output/LSE once and writes the merged
-# output (+ final LSE) once, fp32 math in-register, bf16 out. The LSE merge is fail-closed below;
-# other Triton optimizations have independent default-off gates and automatically fall back when
-# Triton is unavailable.
-try:
-    import triton
-    import triton.language as tl
-
-    HAVE_TRITON = True
-except ImportError:
-    HAVE_TRITON = False
+# Cache pass plans because the same packed layout recurs across model layers.
+# Unqualified Triton gather/backward variants are deferred from this production slice.
 
 
-# Default OFF in this production copy: the Triton merge kernel is bit-correct in isolation
+# Retain the legacy environment guard after removing the unusable Triton merge.
+# The removed kernel was bit-correct in isolation
 # (kernel-vs-eager 3e-4 on captured in-model pass tensors) but nondeterministically corrupts
 # the cross-pass rows when run inside the full HybridModel process (0.2-0.3 rel logits error,
 # Heisenbug: any sync/instrumentation in the pass region masks it; streams/tile-config/
@@ -71,17 +55,16 @@ def _resolve_fused_merge_setting():
 
 
 def _resolve_experimental_triton_setting(env_name):
-    """Resolve a default-off opt-in for one independently parity-qualified Triton path.
-
-    These kernels are intentionally experimental. Reject ambiguous values so a launcher typo
-    cannot silently turn one on before its target topology has passed numerical parity.
-    """
+    """Fail explicitly if a deferred experimental attention variant is requested."""
     value = os.environ.get(env_name, "0")
     normalized = value.lower()
     if normalized in ("", "0", "false"):
         return False
     if normalized in ("1", "true"):
-        return True
+        raise RuntimeError(
+            f"{env_name} is deferred from the production shared-prefix port; "
+            "use the default eager attention path"
+        )
     raise RuntimeError(f"{env_name} must be one of 0, 1, false, or true; got {value!r}")
 
 
@@ -102,274 +85,24 @@ def _resolve_deterministic_backward_setting():
     )
 
 
-_SP_FUSED_MERGE = _resolve_fused_merge_setting()
-_SP_FUSED_KV_GATHER = _resolve_experimental_triton_setting("NRL_SP_FUSED_KV_GATHER")
-_SP_FUSED_BACKWARD_GLUE = _resolve_experimental_triton_setting("NRL_SP_FUSED_BACKWARD_GLUE")
-_SP_FUSED_DQ_ASSEMBLY = _resolve_experimental_triton_setting("NRL_SP_FUSED_DQ_ASSEMBLY")
+_resolve_fused_merge_setting()
+_resolve_experimental_triton_setting("NRL_SP_FUSED_KV_GATHER")
+_resolve_experimental_triton_setting("NRL_SP_FUSED_BACKWARD_GLUE")
+_resolve_experimental_triton_setting("NRL_SP_FUSED_DQ_ASSEMBLY")
 _SP_DETERMINISTIC_BACKWARD = _resolve_deterministic_backward_setting()
-# merge/dq-assembly kernel tile config (swept on GB200; override for other parts)
-_SP_MERGE_BT = int(os.environ.get("NRL_SP_MERGE_BT", "16"))
-_SP_MERGE_WARPS = int(os.environ.get("NRL_SP_MERGE_WARPS", "8"))
+for _deferred_option in ("NRL_SP_MERGE_BT", "NRL_SP_MERGE_WARPS"):
+    if _deferred_option in os.environ:
+        raise RuntimeError(
+            f"{_deferred_option} configures deferred Triton attention assembly; "
+            "remove it to use the default eager attention path"
+        )
 
 _PLAN_CACHE: dict = {}
 _PLAN_CACHE_MAX = 128
 
 
-if HAVE_TRITON:
-
-    @triton.jit
-    def _sp_merge_fwd_kernel(
-        o0,
-        o1,
-        o2,
-        o3,
-        o4,
-        o5,
-        o6,  # pass outputs, [rows_p, np, HN] (dtype of q)
-        l0,
-        l1,
-        l2,
-        l3,
-        l4,
-        l5,
-        l6,  # pass LSEs, fp32 [np, rows_p]
-        i0,
-        i1,
-        i2,
-        i3,
-        i4,
-        i5,
-        i6,  # int32 [total]: token -> row in pass (or -1)
-        r0,
-        r1,
-        r2,
-        r3,
-        r4,
-        r5,
-        r6,  # rows_p per pass (for LSE stride)
-        out_ptr,  # merged output [total, np, HN] (dtype of q)
-        lsef_ptr,  # final LSE fp32 [np, total]
-        n_passes,
-        total,
-        np_: tl.constexpr,
-        HN: tl.constexpr,
-        BLOCK_T: tl.constexpr,
-    ):
-        # One program merges a BLOCK_T-token tile for one head: amortizes scheduling over
-        # 524k-programs-of-tiny-work (the v1 grid), keeps o loads coalesced along HN, and gives
-        # the compiler ILP across the tile. [BLOCK_T, HN] fp32 tile state.
-        tb = tl.program_id(0)
-        h = tl.program_id(1)
-        t = tb * BLOCK_T + tl.arange(0, BLOCK_T)
-        tmask = t < total
-        offs = tl.arange(0, HN)
-        m = tl.full([BLOCK_T], float("-inf"), dtype=tl.float32)
-        s = tl.zeros([BLOCK_T], dtype=tl.float32)
-        acc = tl.zeros([BLOCK_T, HN], dtype=tl.float32)
-        for p in tl.static_range(7):
-            if p < n_passes:
-                if p == 0:
-                    idx_ptr, o_ptr, l_ptr, rows = i0, o0, l0, r0
-                elif p == 1:
-                    idx_ptr, o_ptr, l_ptr, rows = i1, o1, l1, r1
-                elif p == 2:
-                    idx_ptr, o_ptr, l_ptr, rows = i2, o2, l2, r2
-                elif p == 3:
-                    idx_ptr, o_ptr, l_ptr, rows = i3, o3, l3, r3
-                elif p == 4:
-                    idx_ptr, o_ptr, l_ptr, rows = i4, o4, l4, r4
-                elif p == 5:
-                    idx_ptr, o_ptr, l_ptr, rows = i5, o5, l5, r5
-                else:
-                    idx_ptr, o_ptr, l_ptr, rows = i6, o6, l6, r6
-                r = tl.load(idx_ptr + t, mask=tmask, other=-1)
-                hit = (r >= 0) & tmask
-                lse = tl.load(l_ptr + h * rows + r, mask=hit, other=float("-inf"))
-                o = tl.load(
-                    o_ptr + (r[:, None] * np_ + h) * HN + offs[None, :],
-                    mask=hit[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                m_new = tl.maximum(m, lse)
-                m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-                scale_old = tl.where(m == float("-inf"), 0.0, tl.exp(m - m_safe))
-                w = tl.where(hit, tl.exp(lse - m_safe), 0.0)
-                acc = acc * scale_old[:, None] + o * w[:, None]
-                s = s * scale_old + w
-                m = m_new
-        out = acc / tl.where(s == 0.0, 1.0, s)[:, None]
-        tl.store(
-            out_ptr + (t[:, None] * np_ + h) * HN + offs[None, :],
-            out.to(out_ptr.dtype.element_ty),
-            mask=tmask[:, None],
-        )
-        tl.store(lsef_ptr + h * total + t, m + tl.log(s), mask=tmask)
-
-
-if HAVE_TRITON:
-
-    @triton.jit
-    def _sp_scale_gather_kernel(
-        do_ptr,  # [total, np, HN] upstream grad (q dtype)
-        lse_ptr,  # fp32 [np, rows] this pass's LSE
-        lsef_ptr,  # fp32 [np, total] merged LSE
-        qidx_ptr,  # int64 [rows] pass-row -> token (identity pass passes arange)
-        dox_ptr,  # out [rows, np, HN] (q dtype): w * do[qidx]
-        rows,
-        total,
-        np_: tl.constexpr,
-        HN: tl.constexpr,
-    ):
-        rb = tl.program_id(0)
-        h = tl.program_id(1)
-        BLOCK_R: tl.constexpr = 16
-        r = rb * BLOCK_R + tl.arange(0, BLOCK_R)
-        rmask = r < rows
-        offs = tl.arange(0, HN)
-        t = tl.load(qidx_ptr + r, mask=rmask, other=0)
-        lse_p = tl.load(lse_ptr + h * rows + r, mask=rmask, other=0.0)
-        w = tl.exp(lse_p - tl.load(lsef_ptr + h * total + t, mask=rmask, other=0.0))
-        # zero-K padding rows (q-slice cross pass) report LSE=+inf: their weight must be 0,
-        # not inf, so their (zero) flash grads stay zero instead of turning NaN.
-        w = tl.where(lse_p > 1e30, 0.0, w)
-        do = tl.load(
-            do_ptr + (t[:, None] * np_ + h) * HN + offs[None, :], mask=rmask[:, None], other=0.0
-        ).to(tl.float32)
-        tl.store(
-            dox_ptr + (r[:, None] * np_ + h) * HN + offs[None, :],
-            (do * w[:, None]).to(dox_ptr.dtype.element_ty),
-            mask=rmask[:, None],
-        )
-
-    @triton.jit
-    def _sp_scatter_accum_kernel(
-        dst_ptr,  # fp32 [total, n, HN] accumulator
-        src_ptr,  # [rows, n, HN] pass grad (q dtype)
-        idx_ptr,  # int64 [rows] pass-row -> token
-        n_rows,
-        n_: tl.constexpr,
-        HN: tl.constexpr,
-    ):
-        rb = tl.program_id(0)
-        h = tl.program_id(1)
-        BLOCK_R: tl.constexpr = 16
-        r = rb * BLOCK_R + tl.arange(0, BLOCK_R)
-        rmask = r < n_rows
-        offs = tl.arange(0, HN)
-        t = tl.load(idx_ptr + r, mask=rmask, other=0)
-        add = tl.load(
-            src_ptr + (r[:, None] * n_ + h) * HN + offs[None, :], mask=rmask[:, None], other=0.0
-        ).to(tl.float32)
-        # atomic: with the consolidated cross pass a deep token owns one row PER ancestor level,
-        # so multiple programs may target the same destination row.
-        tl.atomic_add(
-            dst_ptr + (t[:, None] * n_ + h) * HN + offs[None, :], add, mask=rmask[:, None]
-        )
-
-
-if HAVE_TRITON:
-
-    @triton.jit
-    def _sp_dq_merge_kernel(
-        d0,
-        d1,
-        d2,
-        d3,
-        d4,
-        d5,
-        d6,  # per-pass dq contributions [rows_p, np, HN] (q dtype)
-        i0,
-        i1,
-        i2,
-        i3,
-        i4,
-        i5,
-        i6,  # int32 [total]: token -> row in pass (or -1)
-        out_ptr,  # final dq [total, np, HN] (q dtype)
-        n_passes,
-        total,
-        np_: tl.constexpr,
-        HN: tl.constexpr,
-        BLOCK_T: tl.constexpr,
-    ):
-        # opt10: dq final assembly as a gather-side sum over slots (mirror of the fwd merge,
-        # minus the LSE weighting — each pass's dqx is already its finished contribution).
-        # Replaces the fp32 [total, np, HN] accumulator + per-pass scatter/adds + final cast:
-        # every dqx is read once, dq written once, fp32 math in-register.
-        tb = tl.program_id(0)
-        h = tl.program_id(1)
-        t = tb * BLOCK_T + tl.arange(0, BLOCK_T)
-        tmask = t < total
-        offs = tl.arange(0, HN)
-        acc = tl.zeros([BLOCK_T, HN], dtype=tl.float32)
-        for p in tl.static_range(7):
-            if p < n_passes:
-                if p == 0:
-                    idx_ptr, d_ptr = i0, d0
-                elif p == 1:
-                    idx_ptr, d_ptr = i1, d1
-                elif p == 2:
-                    idx_ptr, d_ptr = i2, d2
-                elif p == 3:
-                    idx_ptr, d_ptr = i3, d3
-                elif p == 4:
-                    idx_ptr, d_ptr = i4, d4
-                elif p == 5:
-                    idx_ptr, d_ptr = i5, d5
-                else:
-                    idx_ptr, d_ptr = i6, d6
-                r = tl.load(idx_ptr + t, mask=tmask, other=-1)
-                hit = (r >= 0) & tmask
-                acc += tl.load(
-                    d_ptr + (r[:, None] * np_ + h) * HN + offs[None, :],
-                    mask=hit[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-        tl.store(
-            out_ptr + (t[:, None] * np_ + h) * HN + offs[None, :],
-            acc.to(out_ptr.dtype.element_ty),
-            mask=tmask[:, None],
-        )
-
-    @triton.jit
-    def _sp_gather_kv_kernel(
-        k_ptr,
-        v_ptr,  # [total, ng, HN] sources (q dtype)
-        idx_ptr,  # int64 [rows] pass-row -> token
-        kx_ptr,
-        vx_ptr,  # [rows, ng, HN] destinations
-        k_stride_t,
-        k_stride_h,
-        k_stride_d,
-        v_stride_t,
-        v_stride_h,
-        v_stride_d,
-        ng: tl.constexpr,
-        HN: tl.constexpr,
-    ):
-        r = tl.program_id(0)
-        h = tl.program_id(1)
-        offs = tl.arange(0, HN)
-        t = tl.load(idx_ptr + r)
-        tl.store(
-            kx_ptr + (r * ng + h) * HN + offs,
-            tl.load(k_ptr + t * k_stride_t + h * k_stride_h + offs * k_stride_d),
-        )
-        tl.store(
-            vx_ptr + (r * ng + h) * HN + offs,
-            tl.load(v_ptr + t * v_stride_t + h * v_stride_h + offs * v_stride_d),
-        )
-
-
-# Round-3: overlap the independent per-pass flash calls on side CUDA streams (they only join at
-# the LSE merge / the gradient scatters), and gather K+V through one fused kernel into
-# plan-cached workspace buffers (no per-call allocations, one index read for both tensors).
-# NRL_SP_STREAMS=0 disables the stream overlap (kernels still fused).
+# Overlap the independent per-pass FlashAttention calls on side CUDA streams.
 _SP_STREAMS = os.environ.get("NRL_SP_STREAMS", "1") not in ("0", "", "false", "False")
-# Consolidate all per-level cross passes into one flash call (any depth => 2 flash calls total).
-# Requires the Triton merge path (the eager merge cannot handle a token owning multiple rows of
-# one pass); plans are cached per effective mode so runtime flag flips stay correct.
-_SP_COMBINE_CROSS = os.environ.get("NRL_SP_COMBINE", "1") not in ("0", "", "false", "False")
 _SP_STREAM_POOL: List = []
 _SP_STREAM_POOL_N = 4
 
@@ -382,54 +115,9 @@ def _sp_streams():
     return _SP_STREAM_POOL
 
 
-def _sp_fused_kv_gather_effective():
-    return HAVE_TRITON and _SP_FUSED_KV_GATHER
-
-
-def _sp_fused_backward_glue_effective():
-    return HAVE_TRITON and _SP_FUSED_BACKWARD_GLUE
-
-
-def _sp_fused_dq_assembly_effective(slot_pass):
-    # The kernel has seven statically-unrolled slot arguments. Deeper trees must retain the
-    # eager accumulator instead of tripping the kernel's assertion after an explicit opt-in.
-    return HAVE_TRITON and _SP_FUSED_DQ_ASSEMBLY and len(slot_pass) <= 7
-
-
 def _gather_kv(k, v, k_idx):
-    """Fused K+V gather (one index read, both tensors) via Triton.
-
-    K/V commonly arrive as strided views of Megatron's interleaved mixed-QKV projection, so the
-    source strides must be explicit. Treating them as packed ``[total, ng, hn]`` tensors silently
-    reads neighboring Q/K fields on cross-attention passes. The outputs are newly allocated and
-    contiguous; the non-Triton path falls back to two stride-aware ``index_select`` calls.
-    """
-    if _sp_fused_kv_gather_effective():
-        rows = k_idx.numel()
-        ng, hn = k.shape[1], k.shape[2]
-        kx = torch.empty(rows, ng, hn, dtype=k.dtype, device=k.device)
-        vx = torch.empty(rows, ng, hn, dtype=v.dtype, device=v.device)
-        _sp_gather_kv_kernel[(rows, ng)](
-            k,
-            v,
-            k_idx,
-            kx,
-            vx,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            ng=ng,
-            HN=hn,
-        )
-        return kx, vx
+    """Gather strided interleaved K/V projections into independent contiguous tensors."""
     return k.index_select(0, k_idx), v.index_select(0, k_idx)
-
-
-def _sp_combine_effective():
-    return _SP_COMBINE_CROSS and HAVE_TRITON and _SP_FUSED_MERGE
 
 
 def _plan_key(node_start, node_len, node_parent, device, *, full_context: bool = False):
@@ -438,7 +126,6 @@ def _plan_key(node_start, node_len, node_parent, device, *, full_context: bool =
         tuple(int(x) for x in node_len),
         tuple(int(x) for x in node_parent),
         str(device),
-        _sp_combine_effective(),
         _SP_CHAINFIRST,
         _SP_QSLICE,
         full_context,
@@ -483,11 +170,7 @@ def _validate_forest_dfs_preorder(node_start, node_len, node_parent):
 def _forest_attention_plan_cached(
     node_start, node_len, node_parent, device, *, full_context: bool = False
 ):
-    """Cached ``(total, passes, inv_maps)`` for a bin layout. The same layout is reused by every
-    attention layer of the step (and often across steps), so the Python plan construction and the
-    token->pass-row inverse maps (for the fused merge) are built once. ``inv_maps[p]`` is an int32
-    ``[total]`` tensor mapping token -> its row in pass ``p`` (-1 if the token is not a query of
-    that pass; pass 0 -- the self pass -- is the identity)."""
+    """Cache the exact pass plan reused across attention layers and training steps."""
     _validate_forest_dfs_preorder(node_start, node_len, node_parent)
     key = _plan_key(node_start, node_len, node_parent, device, full_context=full_context)
     hit = _PLAN_CACHE.get(key)
@@ -501,139 +184,11 @@ def _forest_attention_plan_cached(
     if plan is None:
         plan = _forest_attention_plan(node_start, node_len, node_parent, device)
     total, passes = plan
-    # never consolidate slice-form cross passes: combining would re-materialize the q gather
-    # (and its backward scatter) that the _QSlice views exist to avoid.
-    if (
-        _sp_combine_effective()
-        and len(passes) > 2
-        and not any(isinstance(p[0], _QSlice) for p in passes)
-    ):
-        # Consolidate every per-depth-level cross pass into ONE flash_varlen call: varlen just
-        # needs per-sequence contiguous q/k slices, and each (ancestor-span <- descendant-run)
-        # pair is one sequence regardless of which level it came from. Any tree then costs
-        # exactly 2 flash calls (self + cross) instead of depth+1 -- fewer launches, bigger
-        # kernels. The merge/backward kernels are unchanged: they operate per SLOT (a token's
-        # entry at one ancestor level), and cross slots simply share the combined pass's
-        # output/LSE tensors with different row maps.
-        self_pass = passes[0]
-        qpos_parts, kpos_parts, cuq, cuk = [], [], [0], [0]
-        level_row_start = []  # row offset of each level's block in the combined pass
-        for q_idx, k_idx, cu_q, cu_k, _mxq, _mxk, _c in passes[1:]:
-            level_row_start.append(cuq[-1])
-            qpos_parts.append(q_idx)
-            kpos_parts.append(k_idx)
-            base_q, base_k = cuq[-1], cuk[-1]
-            cuq.extend((cu_q[1:].to(torch.long) + base_q).tolist())
-            cuk.extend((cu_k[1:].to(torch.long) + base_k).tolist())
-        qpos = torch.cat(qpos_parts)
-        kpos = torch.cat(kpos_parts)
-        mxq = max(cuq[i + 1] - cuq[i] for i in range(len(cuq) - 1))
-        mxk = max(cuk[i + 1] - cuk[i] for i in range(len(cuk) - 1))
-        combined = (
-            qpos,
-            kpos,
-            torch.tensor(cuq, dtype=torch.int32, device=device),
-            torch.tensor(cuk, dtype=torch.int32, device=device),
-            mxq,
-            mxk,
-            False,
-        )
-        # slots: slot 0 = self pass; slot j>=1 = the level-(j-1) rows INSIDE the combined pass.
-        slot_pass = [0] + [1] * (len(passes) - 1)
-        slot_inv = [torch.arange(total, dtype=torch.int32, device=device)]
-        for li, (q_idx, *_rest) in enumerate(passes[1:]):
-            inv = torch.full((total,), -1, dtype=torch.int32, device=device)
-            inv[q_idx] = (
-                torch.arange(q_idx.numel(), dtype=torch.int32, device=device) + level_row_start[li]
-            )
-            slot_inv.append(inv)
-        passes = [self_pass, combined]
-        identity = torch.arange(total, dtype=torch.long, device=device)
-        qidx64 = [identity, qpos]
-        entry = (total, passes, slot_inv, qidx64, slot_pass)
-    else:
-        inv_maps, qidx64 = [], []
-        identity = torch.arange(total, dtype=torch.long, device=device)
-        for q_idx, *_rest in passes:
-            if q_idx is None:
-                inv = torch.arange(total, dtype=torch.int32, device=device)
-                qidx64.append(identity)
-            elif isinstance(q_idx, _QSlice):
-                # row r of the pass <-> token lo+r; gap tokens are padding rows, not queries.
-                inv = torch.full((total,), -1, dtype=torch.int32, device=device)
-                inv[q_idx.lo : q_idx.hi] = torch.arange(
-                    q_idx.hi - q_idx.lo, dtype=torch.int32, device=device
-                )
-                for g0, g1 in q_idx.gaps:
-                    inv[g0:g1] = -1
-                qidx64.append(torch.arange(q_idx.lo, q_idx.hi, dtype=torch.long, device=device))
-            else:
-                inv = torch.full((total,), -1, dtype=torch.int32, device=device)
-                inv[q_idx] = torch.arange(q_idx.numel(), dtype=torch.int32, device=device)
-                qidx64.append(q_idx)
-            inv_maps.append(inv)
-        entry = (total, passes, inv_maps, qidx64, list(range(len(passes))))
+    entry = (total, passes)
     if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
         _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
     _PLAN_CACHE[key] = entry
     return entry
-
-
-def _merge_passes_triton(slot_pass, inv_maps, outs, lses, total, np_, hn, dtype, device):
-    """One-kernel online-softmax merge across SLOTS. A slot is one attended-set contribution for
-    a token (its own node, or one ancestor level); ``slot_pass[s]`` says which pass's output/LSE
-    tensors slot ``s`` reads (with the consolidated cross pass, every cross slot shares pass 1's
-    tensors under a different row map). Returns (o_merged [total, np, hn] in ``dtype``, lse_final
-    fp32 [np, total])."""
-    MAXP = 7
-    n = len(slot_pass)
-    assert n <= MAXP, f"fused merge supports <= {MAXP} slots (got {n}); deepen tl.static_range"
-    outs = [o.contiguous() for o in outs]
-    lses = [l.contiguous() for l in lses]
-    o_args, l_args, i_args, r_args = [], [], [], []
-    for s in range(MAXP):
-        p = slot_pass[s] if s < n else slot_pass[0]
-        o_args.append(outs[p])
-        l_args.append(lses[p])
-        i_args.append(inv_maps[s] if s < n else inv_maps[0])
-        r_args.append(lses[p].shape[1])
-    out = torch.empty(total, np_, hn, dtype=dtype, device=device)
-    lse_final = torch.empty(np_, total, dtype=torch.float32, device=device)
-    bt, wp = _SP_MERGE_BT, _SP_MERGE_WARPS
-    _sp_merge_fwd_kernel[((total + bt - 1) // bt, np_)](
-        *o_args,
-        *l_args,
-        *i_args,
-        *r_args,
-        out,
-        lse_final,
-        n,
-        total,
-        np_=np_,
-        HN=hn,
-        BLOCK_T=bt,
-        num_warps=wp,
-    )
-    return out, lse_final
-
-
-def _merge_dq_triton(slot_pass, inv_maps, dqxs, total, np_, hn, dtype, device):
-    """dq final assembly across slots: dq[t] = sum over slots s of dqxs[slot_pass[s]][inv_s[t]].
-    One kernel, dqx tensors read once, dq written once in ``dtype`` (no fp32 accumulator)."""
-    MAXP = 7
-    n = len(slot_pass)
-    assert n <= MAXP
-    d_args, i_args = [], []
-    for s in range(MAXP):
-        p = slot_pass[s] if s < n else slot_pass[0]
-        d_args.append(dqxs[p])
-        i_args.append(inv_maps[s] if s < n else inv_maps[0])
-    dq = torch.empty(total, np_, hn, dtype=dtype, device=device)
-    bt, wp = _SP_MERGE_BT, _SP_MERGE_WARPS
-    _sp_dq_merge_kernel[((total + bt - 1) // bt, np_)](
-        *d_args, *i_args, dq, n, total, np_=np_, HN=hn, BLOCK_T=bt, num_warps=wp
-    )
-    return dq
 
 
 # Chain-first plan (NRL_SP_CHAINFIRST=1, default on, auto-fallback): when the layout emits each
@@ -651,8 +206,7 @@ _SP_CHAINFIRST = os.environ.get("NRL_SP_CHAINFIRST", "1") not in ("0", "", "fals
 # per tree: branches+siblings all sit after the spine), pass a zero-copy VIEW q[lo:hi] to flash
 # instead of index_select (on branched_mc that gather+scatter round-trips ~176MB per fwd+bwd).
 # Gaps between trees in multi-tree bins are covered by zero-length-K padding sequences: flash
-# returns out=0 / dq=0 / LSE=+inf for those rows (probe-verified), the merge excludes them via
-# inv=-1, and the backward scale kernel guards LSE=+inf -> weight 0.
+# returns out=0 / dq=0 / LSE=+inf for those rows; eager merge and backward use weight 0.
 _SP_QSLICE = os.environ.get("NRL_SP_QSLICE", "1") not in ("0", "", "false", "False")
 
 
@@ -932,7 +486,7 @@ class _ComposedForestAttn(torch.autograd.Function):
         """Evaluate independent causal and ancestor passes, then merge their softmax outputs."""
         from flash_attn import flash_attn_varlen_func
 
-        total, passes, inv_maps, qidx64, slot_pass = _forest_attention_plan_cached(
+        total, passes = _forest_attention_plan_cached(
             node_start, node_len, node_parent, q.device, full_context=full_context
         )
         np_, hn = q.shape[1], q.shape[2]
@@ -996,56 +550,42 @@ class _ComposedForestAttn(torch.autograd.Function):
                 )  # o [Σq, np, hn], lse [np, Σq]
                 outs[i], lses[i] = o, lse
 
-        if _SP_FUSED_MERGE and HAVE_TRITON and len(slot_pass) <= 7:
-            # single-kernel online-softmax merge: reads each pass output/LSE once, writes the
-            # merged output + final LSE once (fp32 in-register), replacing the eager fp32
-            # upcast/mul/index_add round-trips below.
-            o_merged, lse_final = _merge_passes_triton(
-                slot_pass, inv_maps, outs, lses, total, np_, hn, q.dtype, q.device
-            )
-        else:
-            # merged LSE per (head, token): logsumexp over every pass the token queries in.
-            lse_final = torch.full(
-                (np_, total), float("-inf"), device=q.device, dtype=torch.float32
-            )
-            for (q_idx, *_), lse in zip(passes, lses):
-                ls = lse.float()
-                if isinstance(q_idx, _QSlice):
-                    # zero-K padding rows report LSE=+inf: neutralize before merging.
-                    ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
-                    lse_final[:, q_idx.lo : q_idx.hi] = torch.logaddexp(
-                        lse_final[:, q_idx.lo : q_idx.hi], ls
-                    )
-                elif q_idx is None:
-                    lse_final = torch.logaddexp(lse_final, ls)
-                else:
-                    lse_final[:, q_idx] = torch.logaddexp(lse_final[:, q_idx], ls)
-            # merged output: sum_pass w_pass * o_pass, w_pass = exp(lse_pass - lse_final).
-            o_merged = torch.zeros(total, np_, hn, device=q.device, dtype=torch.float32)
-            for (q_idx, *_), o, lse in zip(passes, outs, lses):
-                ls = lse.float()
-                if isinstance(q_idx, _QSlice):
-                    ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
-                    lf = lse_final[:, q_idx.lo : q_idx.hi]
-                    contrib = torch.exp(ls - lf).transpose(0, 1).unsqueeze(-1) * o.float()
-                    o_merged[q_idx.lo : q_idx.hi] += contrib
-                    continue
-                lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
+        lse_final = torch.full((np_, total), float("-inf"), device=q.device, dtype=torch.float32)
+        for (q_idx, *_), lse in zip(passes, lses):
+            ls = lse.float()
+            if isinstance(q_idx, _QSlice):
+                # zero-K padding rows report LSE=+inf: neutralize before merging.
+                ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
+                lse_final[:, q_idx.lo : q_idx.hi] = torch.logaddexp(
+                    lse_final[:, q_idx.lo : q_idx.hi], ls
+                )
+            elif q_idx is None:
+                lse_final = torch.logaddexp(lse_final, ls)
+            else:
+                lse_final[:, q_idx] = torch.logaddexp(lse_final[:, q_idx], ls)
+        # merged output: sum_pass w_pass * o_pass, w_pass = exp(lse_pass - lse_final).
+        o_merged = torch.zeros(total, np_, hn, device=q.device, dtype=torch.float32)
+        for (q_idx, *_), o, lse in zip(passes, outs, lses):
+            ls = lse.float()
+            if isinstance(q_idx, _QSlice):
+                ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
+                lf = lse_final[:, q_idx.lo : q_idx.hi]
                 contrib = torch.exp(ls - lf).transpose(0, 1).unsqueeze(-1) * o.float()
-                if q_idx is None:
-                    o_merged = o_merged + contrib
-                else:
-                    o_merged.index_add_(0, q_idx, contrib)
-            o_merged = o_merged.to(q.dtype)
+                o_merged[q_idx.lo : q_idx.hi] += contrib
+                continue
+            lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
+            contrib = torch.exp(ls - lf).transpose(0, 1).unsqueeze(-1) * o.float()
+            if q_idx is None:
+                o_merged = o_merged + contrib
+            else:
+                o_merged.index_add_(0, q_idx, contrib)
+        o_merged = o_merged.to(q.dtype)
 
         ctx.save_for_backward(q, k, v, o_merged)
         ctx.passes = passes
         ctx.lses = lses
         ctx.lse_final = lse_final
         ctx.scale = scale
-        ctx.qidx64 = qidx64
-        ctx.inv_maps = inv_maps
-        ctx.slot_pass = slot_pass
         return o_merged
 
     @staticmethod
@@ -1057,131 +597,7 @@ class _ComposedForestAttn(torch.autograd.Function):
         lse_final, scale = ctx.lse_final, ctx.scale
         do = do.contiguous()
         total, np_, hn = q.shape[0], q.shape[1], q.shape[2]
-        have_cached_row_maps = getattr(ctx, "qidx64", None) is not None
-        # Fused glue initializes KV gradients from an identity self pass. A full-context
-        # plan gathers repeated ancestor KV in its first pass and needs the general scatter.
-        use_backward_glue = (
-            _sp_fused_backward_glue_effective()
-            and have_cached_row_maps
-            and ctx.passes[0][1] is None
-        )
-        use_dq_assembly = _sp_fused_dq_assembly_effective(ctx.slot_pass) and have_cached_row_maps
-
-        if use_backward_glue:
-            # Fused backward glue: (a) per-pass dout scaling w*do fused with the query gather in
-            # one kernel (the eager path materialized an fp32 exp/mul chain + an index_select per
-            # pass); (b) the self pass (always pass 0, identity indices over all tokens) INITIALIZES
-            # the fp32 accumulators instead of zeros+add; cross passes scatter-accumulate through a
-            # cast-fused kernel (no per-pass .float() temporaries). The flash calls are unchanged
-            # -- the exact-backward trick (merged o substituted for the pass output) is preserved.
-            ng = k.shape[1]
-            streams = _sp_streams()
-            cur = torch.cuda.current_stream()
-            results = [None] * len(ctx.passes)
-            join = [None] * len(ctx.passes)
-            ev_in = None
-            if streams is not None and len(ctx.passes) > 1:
-                ev_in = torch.cuda.Event()
-                ev_in.record(cur)
-            for i, ((q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal), lse) in enumerate(
-                zip(ctx.passes, ctx.lses)
-            ):
-                st = None if ev_in is None else streams[i % len(streams)]
-                stream_ctx = torch.cuda.stream(st) if st is not None else nullcontext()
-                if st is not None:
-                    st.wait_event(ev_in)
-                with stream_ctx:
-                    qidx = ctx.qidx64[i]
-                    rows = qidx.numel()
-                    qx = _sel_rows(q, q_idx)
-                    if k_idx is None:
-                        kx, vx = k, v
-                    else:
-                        kx, vx = _gather_kv(k, v, k_idx)
-                    ox = _sel_rows(o_merged, q_idx)
-                    dox = torch.empty(rows, np_, hn, dtype=q.dtype, device=q.device)
-                    _sp_scale_gather_kernel[((rows + 15) // 16, np_)](
-                        do, lse.contiguous(), lse_final, qidx, dox, rows, total, np_=np_, HN=hn
-                    )
-                    dqx, dkx, dvx = (
-                        torch.empty_like(qx),
-                        torch.empty_like(kx),
-                        torch.empty_like(vx),
-                    )
-                    _flash_attn_varlen_backward(
-                        dox,
-                        qx,
-                        kx,
-                        vx,
-                        ox,
-                        lse,
-                        dqx,
-                        dkx,
-                        dvx,
-                        cu_q,
-                        cu_k,
-                        mxq,
-                        mxk,
-                        0.0,
-                        scale,
-                        causal,
-                        -1,
-                        -1,
-                        0.0,
-                        None,
-                        _SP_DETERMINISTIC_BACKWARD,
-                        None,
-                        False,
-                    )
-                    results[i] = (dqx, dkx, dvx, qidx, k_idx, rows, q_idx)
-                    if st is not None:
-                        dqx.record_stream(cur)
-                        dkx.record_stream(cur)
-                        dvx.record_stream(cur)
-                        ev = torch.cuda.Event()
-                        ev.record(st)
-                        join[i] = ev
-            # k/v accumulate in pass order on the current stream (scatters are read-modify-write
-            # on shared fp32 accumulators, ng=8 so the buffers are small); dq is assembled by one
-            # gather-side merge kernel over all pass contributions (opt10) once every pass joins.
-            dk = dv = None
-            dqxs = [None] * len(ctx.passes)
-            for i, res in enumerate(results):
-                if join[i] is not None:
-                    cur.wait_event(join[i])
-                dqx, dkx, dvx, qidx, k_idx, rows, q_idx = res
-                dqxs[i] = dqx
-                if i == 0:
-                    # self pass: identity over all tokens -> direct init, no zeros/scatter.
-                    dk = dkx.float()
-                    dv = dvx.float()
-                else:
-                    kro = k_idx.numel()
-                    _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](
-                        dk, dkx, k_idx, kro, n_=ng, HN=hn
-                    )
-                    _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](
-                        dv, dvx, k_idx, kro, n_=ng, HN=hn
-                    )
-            if use_dq_assembly:
-                dq = _merge_dq_triton(
-                    ctx.slot_pass, ctx.inv_maps, dqxs, total, np_, hn, q.dtype, q.device
-                )
-            else:
-                dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-                for dqx, result in zip(dqxs, results):
-                    q_idx = result[-1]
-                    if q_idx is None:
-                        dq += dqx.float()
-                    elif isinstance(q_idx, _QSlice):
-                        dq[q_idx.lo : q_idx.hi] += dqx.float()
-                    else:
-                        dq.index_add_(0, q_idx, dqx.float())
-                dq = dq.to(q.dtype)
-            return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None, None, None
-
-        dq = None if use_dq_assembly else torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-        dqxs = [] if use_dq_assembly else None
+        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
         dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
         for (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal), lse in zip(ctx.passes, ctx.lses):
@@ -1228,27 +644,19 @@ class _ComposedForestAttn(torch.autograd.Function):
                 None,
                 False,
             )
-            if use_dq_assembly:
-                dqxs.append(dqx)
+            if q_idx is None:
+                dq += dqx.float()
+            elif isinstance(q_idx, _QSlice):
+                dq[q_idx.lo : q_idx.hi] += dqx.float()
             else:
-                if q_idx is None:
-                    dq += dqx.float()
-                elif isinstance(q_idx, _QSlice):
-                    dq[q_idx.lo : q_idx.hi] += dqx.float()
-                else:
-                    dq.index_add_(0, q_idx, dqx.float())
+                dq.index_add_(0, q_idx, dqx.float())
             if k_idx is None:
                 dk += dkx.float()
                 dv += dvx.float()
             else:
                 dk.index_add_(0, k_idx, dkx.float())
                 dv.index_add_(0, k_idx, dvx.float())
-        if use_dq_assembly:
-            dq = _merge_dq_triton(
-                ctx.slot_pass, ctx.inv_maps, dqxs, total, np_, hn, q.dtype, q.device
-            )
-        else:
-            dq = dq.to(q.dtype)
+        dq = dq.to(q.dtype)
         return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None, None, None
 
 

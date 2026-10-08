@@ -103,6 +103,30 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    # Shared-prefix composed attention and its dense sequence-relative CP adapter.
+    KernelEntry(
+        name="shared_prefix_composed_attention",
+        sources=("megatron/core/models/hybrid/shared_prefix_fused.py",),
+        tests=(K + "test_shared_prefix_attention.py",),
+        kind="external-lib",
+        notes="Native FlashAttention varlen forward/private backward, eager online-softmax merge "
+        "and Q/K/V index_add accumulation. Exact output/gradient replay explicitly selects "
+        "NRL_SP_DETERMINISTIC_BACKWARD=1 AND deterministic Torch algorithms; default backward "
+        "has independent numerical checks without an exact-replay claim. CP1/2/4 tests use "
+        "real NCCL all-to-all, including replicated GQA KV heads. Deferred Triton opt-ins "
+        "are checked by executing the actual module import guards.",
+    ),
+    KernelEntry(
+        name="sequence_relative_dense_cp_attention",
+        sources=("megatron/core/models/hybrid/sequence_relative_attention.py",),
+        tests=(K + "test_shared_prefix_attention.py",),
+        kind="dispatch",
+        notes="Real FlashAttention deterministic varlen forward/backward through the public "
+        "sequence_relative_attention_forward dispatch and real NCCL all-to-all at CP1/2/4. "
+        "Replay covers Q/K/V gradients, packed CP-group override, padded/unpadded boundaries, "
+        "MHA and replicated GQA; independent FP32 per-sequence causal reference checks "
+        "numerical dispatch. This adapter defines a separate baseline from stock TE ring.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",

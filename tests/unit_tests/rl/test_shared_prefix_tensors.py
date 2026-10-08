@@ -23,6 +23,7 @@ from megatron.rl.shared_prefix_packing import (
     build_shared_prefix_layout,
 )
 from megatron.rl.shared_prefix_tensors import (
+    build_shared_prefix_rows,
     build_shared_prefix_tensor_plan,
     build_star_attention_allow_mask,
     get_shared_prefix_context_parallel_indices,
@@ -501,3 +502,19 @@ def test_tensor_plan_rejects_invalid_batch_metadata(
             group_ids=group_ids,
             bin_capacity=8,
         )
+
+
+@pytest.mark.parametrize("field", ["input_ids", "input_lengths", "prompt_lengths"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64, torch.bool])
+def test_row_builder_rejects_noninteger_tokens_and_lengths(field, dtype):
+    batch = {
+        "input_ids": torch.tensor([[2, 3, 4, 5], [2, 3, 6, 7]]),
+        "input_lengths": torch.tensor([4, 4]),
+        "prompt_lengths": torch.tensor([2, 2]),
+        "group_ids": ["g", "g"],
+    }
+    batch[field] = batch[field].to(dtype)
+    if dtype == torch.float32:
+        batch[field] += 0.25
+    with pytest.raises(ValueError, match="integer dtype"):
+        build_shared_prefix_rows(**batch)
