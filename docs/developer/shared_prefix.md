@@ -5,6 +5,13 @@ several completions. A caller supplies `shared_prefix_layout` to `HybridModel.fo
 Without that argument, the ordinary model path, input-ID handling, quantization
 initialization, and default execution settings remain in place.
 
+Reusable packing lives in `megatron.rl`, alongside this model execution path:
+row/star/forest planning, group sharding and slots, tensor materialization,
+TP/CP geometry, real-row alignment, and dense-bin reconstruction. See the
+[packing API and integration contract](../../megatron/rl/shared_prefix.md).
+Callers retain their configuration, batch transport, distributed coordination,
+and RL objective. NeMo RL uses adapters to this implementation.
+
 ## Layout and attention
 
 A star stores `[prompt, completion_1, ..., completion_G]` once. A forest packs
