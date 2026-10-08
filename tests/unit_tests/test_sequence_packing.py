@@ -11,6 +11,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
+    DpBalancedScheduler,
     _build_thd_padding_mask,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
@@ -120,6 +121,76 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
         torch.testing.assert_close(
             cp_batch.get_batch("zigzag")["tokens"], tokens[[0, 1, 6, 7]].view(1, -1)
         )
+
+
+@pytest.mark.parametrize("linear_cp_layout", ["contiguous", "zigzag"])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_scheduler_builds_static_cp_layout_views(cp_size, linear_cp_layout):
+    """Without dynamic CP the views are sharded over the static CP group (no local_cp_size)."""
+
+    class _Group:
+        def __init__(self, size, rank=0):
+            self._size = size
+            self._rank = rank
+
+        def size(self):
+            return self._size
+
+        def rank(self):
+            return self._rank
+
+    static_cp_group = _Group(cp_size)
+    pg_collection = SimpleNamespace(tp=_Group(1), pp=_Group(1), cp=static_cp_group)
+    config = SimpleNamespace(
+        linear_cp_layout=linear_cp_layout, attention_cp_layout="zigzag", sequence_parallel=False
+    )
+    tokens = torch.arange(8, dtype=torch.int64)
+    batch = {
+        "tokens": tokens.clone(),
+        "labels": tokens.clone() + 100,
+        "loss_mask": torch.ones(8, dtype=torch.float32),
+        "position_ids": tokens.clone(),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+    }
+
+    with (
+        patch("torch.cuda.current_device", return_value=torch.device("cpu")),
+        patch("torch.distributed.get_process_group_ranks", return_value=[0]),
+        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
+        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
+        patch("megatron.core.datasets.data_schedule.broadcast_tensor"),
+    ):
+        cp_batch = get_batch_on_this_rank_for_sequence_packing(
+            iter([batch]),
+            dynamic_cp=False,
+            pg_collection=pg_collection,
+            config=config,
+            return_context_parallel_batch=True,
+        )
+
+    assert set(cp_batch.batches_by_layout) == {linear_cp_layout, "zigzag"}
+    assert cp_batch.get_packed_seq_params("zigzag").local_cp_size is None
+    if linear_cp_layout == "contiguous":
+        expected_contiguous = tokens[: 8 // cp_size].view(1, -1)
+        torch.testing.assert_close(cp_batch.get_batch("contiguous")["tokens"], expected_contiguous)
+    expected_zigzag = tokens[[0, 1, 6, 7]] if cp_size == 2 else tokens
+    torch.testing.assert_close(cp_batch.get_batch("zigzag")["tokens"], expected_zigzag.view(1, -1))
+
+
+def test_scheduler_requires_a_data_iterator_on_tp_rank_zero():
+    scheduler = DpBalancedScheduler(
+        max_seqlen_per_dp_cp_rank=8, cp_size=1, dp_size=1, microbatch_group_size_per_vp_stage=None
+    )
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    config = SimpleNamespace(
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
+    with pytest.raises(ValueError, match="data iterator on TP rank 0"):
+        scheduler.run(None, 1, group, group, group, group, torch.device("cpu"), config)
 
 
 def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
@@ -503,8 +574,15 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             assert (
                 sum(sequence_lengths) == args.seq_length
             ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
-            data_iterator = iter(
-                MockVariableLengthSequencePackingDataIterator(
+            # Like the scheduler, hand each PP stage only the fields it consumes.
+            unowned_keys = set()
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                unowned_keys.update(('tokens', 'position_ids'))
+            if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                unowned_keys.update(('labels', 'loss_mask'))
+            data_iterator = (
+                {key: value for key, value in sample.items() if key not in unowned_keys}
+                for sample in MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
                     sequence_lengths=sequence_lengths,  # Variable lengths, sum=8192
                     local_cp_size=local_cp_size,

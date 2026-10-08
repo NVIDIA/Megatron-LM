@@ -287,6 +287,12 @@ class DpBalancedScheduler(BasePackingScheduler):
                     ):
                         vpp_needs_data[vp_stage] = True
 
+        if data_iterator is None and tp_group.rank() == 0:
+            raise ValueError(
+                "Sequence packing needs a data iterator on TP rank 0 of every pipeline stage; "
+                "build the packed dataset on all pipeline stages."
+            )
+
         if data_iterator is not None:
             assert tp_group.rank() == 0, "Only TP rank 0 should have a packed data iterator"
 
@@ -605,7 +611,6 @@ def get_batch_on_this_rank_for_sequence_packing(
         vp_stage is None or vp_stage == vpp_size - 1
     )
 
-    is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
 
     # data_iterator should return a batch including the following keys.
@@ -662,9 +667,12 @@ def get_batch_on_this_rank_for_sequence_packing(
                 tex is not None
             ), "Transformer Engine is required to use Context Parallel with THD format data."
             index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            # The scheduler keeps only the fields this stage consumes (see batch_keys).
             cp_slice_keys = ['padding_mask']
-            if is_first_or_last_stage or mtp_on_this_rank:
-                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+            if is_first_stage or mtp_on_this_rank:
+                cp_slice_keys.extend(['tokens', 'position_ids'])
+            if is_last_stage or mtp_on_this_rank:
+                cp_slice_keys.extend(['labels', 'loss_mask'])
             for key in cp_slice_keys:
                 batch[key] = batch[key].index_select(0, index)
 
@@ -773,13 +781,15 @@ def get_batch_on_this_rank_for_sequence_packing(
             cp_group=runtime_cp_group,
             additional_layouts=additional_layouts,
             hybrid_cp_group_func=dynamic_cp_group_func,
+            # Scheduled THD batches carry 1-D cu_seqlens for the whole packed microbatch.
+            use_per_sequence_balancing=True,
             sequence_parallel=config.sequence_parallel,
             tp_group=tp_group,
             tp_cp_group=_sequence_parallel_tp_cp_group(
                 config,
                 tp_group,
                 dynamic_cp,
-                int(batch['local_cp_size'].item()),
+                int(batch['local_cp_size'].item()) if dynamic_cp else None,
                 dynamic_tp_cp_group_func,
                 tp_cp_group,
             ),
