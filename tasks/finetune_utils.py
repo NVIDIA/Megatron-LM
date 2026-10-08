@@ -10,7 +10,7 @@ import torch
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args, get_timers, print_rank_0
+from megatron.training import get_args, get_timers, get_train_state, print_rank_0
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import get_run_config
 from megatron.training.training import (
@@ -152,6 +152,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     """Train the model."""
     cfg = get_run_config()
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
     assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
@@ -164,9 +165,9 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     losses_dict_sum = {}
 
     # Starting epoch and iteration
-    start_epoch = args.iteration // args.train_iters_per_epoch
-    start_iteration = args.iteration % args.train_iters_per_epoch
-    iteration = args.iteration
+    start_epoch = train_state.iteration // args.train_iters_per_epoch
+    start_iteration = train_state.iteration % args.train_iters_per_epoch
+    iteration = train_state.iteration
 
     # Memory reporting flag.
     report_memory_flag = True
@@ -250,6 +251,7 @@ def finetune(train_valid_datasets_provider, model_provider,
              task_collate_fn=None):
     """Main finetune function used across all tasks."""
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
     # Train and validation data loaders.
@@ -278,7 +280,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
     timers('pretrained checkpoint', log_level=0).start(barrier=True)
-    if args.iteration == 0 and args.pretrained_checkpoint is not None:
+    if train_state.iteration == 0 and args.pretrained_checkpoint is not None:
         original_load = args.load
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng
