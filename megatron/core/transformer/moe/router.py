@@ -12,6 +12,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.fused_router_chain import (
+    fused_router_chain_applicable,
+    fused_sigmoid_router_chain,
+)
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
@@ -887,6 +891,14 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+        # Experiment line "fuse": the whole sigmoid group-limited routing + seq-aux-loss chain as
+        # ONE autograd Function (forward 3 kernels + 1 all-reduce, backward 1 kernel) where it
+        # applies; every other configuration takes the eager path below unchanged.
+        if self.config.moe_fused_router_chain and self._fused_router_chain_applies(
+            logits, bsz, padding_mask, input_ids, packed_seq_params
+        ):
+            return self._fused_router_chain(logits, bsz)
+
         # Calculate probs and routing_map for token dispatching
         if self.is_hash_layer:
             assert input_ids is not None, (
@@ -1005,6 +1017,74 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
+        return probs, routing_map
+
+    def _fused_router_chain_applies(self, logits, bsz, padding_mask, input_ids, packed_seq_params):
+        """The fused chain's scope (fail closed to the eager path): sigmoid scores, seq_aux_loss
+        balancing alone (no plain / global aux loss, no z-loss), no hash / sinkhorn / quantile /
+        replay routing, no capacity factor, no padding mask, no packed sequences, micro batch 1,
+        power-of-two experts / groups / topk, CUDA logits with Triton present."""
+        if (
+            self.is_hash_layer
+            or self.routing_type != "seq_aux_loss"
+            or self.use_quantile_balancing
+            or self.router_replay is not None
+            or self.config.moe_z_loss_coeff is not None
+            or self.config.moe_expert_capacity_factor is not None
+            or padding_mask is not None
+            or input_ids is not None
+            or packed_seq_params is not None
+        ):
+            return False
+        return fused_router_chain_applicable(
+            logits,
+            self.topk,
+            self.config.moe_router_num_groups,
+            self.config.moe_router_group_topk,
+            self.score_function,
+            bsz,
+        )
+
+    def _fused_router_chain(self, logits, bsz):
+        """The fused chain: probs and routing map from the Function, the aux loss attached and
+        logged exactly as ``_apply_seq_aux_loss`` attaches the eager one, the expert bias
+        counts updated as for the eager path."""
+        compute_aux = self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled()
+        seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss") if compute_aux else 0.0
+        aux_loss_groups = self._get_aux_loss_groups(None)
+        # The bool routing map, not the dense top-k indices: the dispatcher then recovers the
+        # slot order with the same torch.topk over the probs as the eager path, so the k expert
+        # outputs are combined in the same order (the Function's own slot order is by biased
+        # score; the two A/B runs with dense indices reproduced the eager lm loss to 1e-5 only,
+        # the sum order of the DeepEP combine differing).  The dense form stays available
+        # (FusedSigmoidRouterChain's ``dense_indices``) for the dispatcher's fused-index path.
+        dense_indices = False
+        probs, routing_map, aux_loss = fused_sigmoid_router_chain(
+            logits,
+            self.expert_bias,
+            self.topk,
+            self.config.moe_router_num_groups,
+            self.config.moe_router_group_topk,
+            self.config.moe_router_topk_scaling_factor,
+            seq_aux_loss_coeff,
+            aux_loss_groups.loss_reduce_groups,
+            dense_indices,
+        )
+        if seq_aux_loss_coeff:
+            local_num_tokens = logits.shape[0]
+            probs = self.attach_and_log_load_balancing_loss(
+                probs,
+                seq_aux_loss_coeff,
+                aux_loss / bsz,
+                "seq_load_balancing_loss",
+                aux_loss_groups.metric_reduce_group,
+                avg_group=aux_loss_groups.metric_avg_group,
+                needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
+                valid_token_count=local_num_tokens * bsz,
+                aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
+                aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+            )
+        self._apply_expert_bias(routing_map, padding_mask=None)
         return probs, routing_map
 
     def reset_global_aux_loss_tracker(self):
