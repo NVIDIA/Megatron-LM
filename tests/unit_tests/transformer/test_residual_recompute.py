@@ -859,6 +859,9 @@ class TestResidualStreamRecomputeIntegration:
                 self.finalized_hidden_states = hidden_states + 1.0
                 return self.finalized_hidden_states
 
+            def get_layer_padding_mask(self, layer_index, default, padding_masks_by_layout):
+                return default
+
         cp_layout_state = _RecordingCPLayoutState()
 
         class _RecordingCPLayoutManager:
