@@ -79,3 +79,17 @@ explicit sequence dimension. Their adapters retain padding policy and mask handl
 in particular, dense attention-mask query rows remain zigzag. Per-document zigzag
 selection uses a shared Transformer Engine wrapper after the adapter has prepared
 aligned sequence boundaries.
+
+For split attention execution, the pre/core stage returns its tensor directly when
+no layout conversion is needed. Otherwise it pairs that tensor with the return-layout
+converter for that call. Pass this result unchanged into `forward_post_core_attn`:
+the output projection, offload, and recomputation bookkeeping run before the CP
+conversion restores the input layout. No converter is stored on the module, so
+interleaved calls keep independent layout state. Ordinary `forward` still returns
+`(output, bias)`.
+
+Runtime CP metadata follows the Dynamic-CP group contract: when `local_cp_size` is
+set, `cp_group` must have that size, including a singleton group for CP=1. An explicit
+`cp_group` also takes precedence when `local_cp_size` is omitted. TE temporarily binds
+the resolved group for each forward and restores its previous group on exit; singleton
+metadata disables CP communication in TE without changing the shared model groups.

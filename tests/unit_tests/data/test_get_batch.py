@@ -1295,7 +1295,7 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
-@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("seq_length", [1024])
 @pytest.mark.parametrize("create_attention_mask", [False])
 def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
@@ -1409,7 +1409,12 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert hybrid_cp_group is not None
     else:
         assert cu_seqlens_padded is None
-        assert hybrid_cp_group is None
+
+    assert hybrid_cp_group is not None
+    assert hybrid_cp_group.size() == cp_size
+    metadata = cp_batch.get_packed_seq_params()
+    assert metadata.local_cp_size == cp_size
+    assert metadata.cp_group is hybrid_cp_group
 
     Utils.destroy_model_parallel()
 

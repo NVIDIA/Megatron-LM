@@ -2373,7 +2373,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self, packed_seq_params: Optional[PackedSeqParams]
     ):
         """Bind TE to one microbatch's CP group and restore it on every exit path."""
-        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+        if packed_seq_params is None or (
+            packed_seq_params.local_cp_size is None and packed_seq_params.cp_group is None
+        ):
             yield
             return
 

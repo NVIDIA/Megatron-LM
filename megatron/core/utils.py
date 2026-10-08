@@ -2832,12 +2832,14 @@ def get_batch_on_this_cp_rank(
         assert (
             batch['local_cp_size'] is not None
         ), "local_cp_size is required for hybrid context parallel"
+        hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
         if batch['local_cp_size'].item() > 1:
-            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
             batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
                 batch, cp_group=hybrid_cp_group
             )
-            batch["hybrid_cp_group"] = hybrid_cp_group
+        # Keep the singleton group in CP-off metadata so RoPE and TE resolve
+        # the same runtime size instead of falling back to the build-time group.
+        batch["hybrid_cp_group"] = hybrid_cp_group
     else:
         batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch
