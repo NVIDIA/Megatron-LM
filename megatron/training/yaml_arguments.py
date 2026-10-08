@@ -28,6 +28,7 @@ from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.argument_utils import (
     _mfsdp_v2_disables_pipeline_output_dealloc,
+    _model_rng_config,
     _triton_autotune_config_from_args,
 )
 
@@ -415,6 +416,7 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
+    rng = _model_rng_config(args)
     # Read the distributed-init args before the rebind below hides them.
     disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
     # Combine transfomer config with model parallel args
@@ -449,9 +451,11 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
-        return MLATransformerConfig(**kw_args)
+        config = MLATransformerConfig(**kw_args)
     else:
-        return TransformerConfig(**kw_args)
+        config = TransformerConfig(**kw_args)
+    rng.finalize_model_config(config)
+    return config
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")

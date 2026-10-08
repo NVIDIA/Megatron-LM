@@ -79,6 +79,9 @@ def initialize_megatron(
 
     args = get_args()
 
+    cfg = get_run_config()
+    cfg.validate()
+
     # set logging level
     setup_logging()
 
@@ -118,6 +121,7 @@ def initialize_megatron(
 
     # torch.distributed initialization
     def finish_mpu_init():
+        cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed(
@@ -138,12 +142,12 @@ def initialize_megatron(
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
-            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            print_rank_0("> setting random seeds to {} ...".format(cfg.rng.seed))
             _set_random_seed(
-                args.seed,
-                args.data_parallel_random_init,
-                args.te_rng_tracker,
-                args.inference_rng_tracker,
+                cfg.rng.seed,
+                cfg.rng.data_parallel_random_init,
+                cfg.rng.te_rng_tracker,
+                cfg.rng.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
