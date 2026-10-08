@@ -179,7 +179,10 @@ def test_cuda_seeded_sampling_distribution():
     assert abs((sampled == 1).float().mean().item() - 0.8) < 0.02
 
 
-@pytest.mark.parametrize("backend,speculative", [("flashinfer", 0), ("torch", 2), ("torch", 0)])
+@pytest.mark.parametrize(
+    "backend,speculative",
+    [("unsupported", 0), ("flashinfer", 2), ("flashinfer", 0), ("torch", 2), ("torch", 0)],
+)
 @pytest.mark.asyncio
 async def test_unsupported_seed_returns_failed_request(backend, speculative):
     from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine

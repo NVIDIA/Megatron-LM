@@ -1901,8 +1901,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         seed_error = None
         if request.sampling_params.seed is not None:
-            if self.context.config.sampling_backend != "torch":
-                seed_error = "Request-local seeds require sampling_backend='torch'"
+            if self.context.config.sampling_backend not in ("torch", "flashinfer"):
+                seed_error = "Request-local seeds require torch or flashinfer sampling"
             elif self.context.config.num_speculative_tokens:
                 seed_error = "Request-local seeds do not yet support speculative decoding"
             elif "seed" not in self.context.request_metadata:
