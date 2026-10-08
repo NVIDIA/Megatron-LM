@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -32,11 +32,7 @@ from megatron.core.tensor_parallel.gtp_utils import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import (
-    cat_with_oom_fallback,
-    ensure_metadata_has_dp_cp_group,
-    sharded_state_dict_default,
-)
+from megatron.core.transformer.utils import cat_with_oom_fallback, ensure_metadata_has_dp_cp_group, sharded_state_dict_default
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
