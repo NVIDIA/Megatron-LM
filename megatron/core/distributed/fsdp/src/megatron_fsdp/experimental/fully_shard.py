@@ -27,6 +27,10 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule, current_fully_shard_context
 from .schedule import SchedulePolicy
 
+# TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
+# Scope management and shared runtime state are separate responsibilities (SRP):
+# https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html
+# Keep this alias for now to avoid changing callers and limit this PR's scope.
 fully_shard_context = FsdpContext
 
 MeshAxis = int | str
