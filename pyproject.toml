@@ -120,6 +120,18 @@ dev = [
 
 inference = [
     "torch-memory-saver",
+    # Dynamic text generation server and data-parallel inference coordinator.
+    # These are imported behind try/except, so a missing package only surfaces at runtime.
+    "hypercorn",
+    "msgpack",
+    "orjson",
+    "pyzmq",
+    "quart",
+    # flashinfer-jit-cache ships pre-compiled CUTLASS MoE kernels and must match
+    # flashinfer-python exactly; bump both together. The wheels are CUDA-major
+    # specific and only published on flashinfer.ai (cu130 to match the dev image).
+    "flashinfer-python==0.6.16.post3; sys_platform == 'linux'",
+    "flashinfer-jit-cache==0.6.16.post3; sys_platform == 'linux'",
 ]
 
 otel = [
@@ -263,6 +275,12 @@ fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-tr
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
 torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "9bc9a442e6d108c7b7903def199896a005143aaf" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
