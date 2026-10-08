@@ -96,8 +96,8 @@ def test_group_owner_layout_reuses_dbuffer_layout(distributed_setup):
     plan = GroupOwnerLayout.from_group(group)
     assert plan.mesh is group.mesh
     assert plan.layout is layout
-    assert set(plan.owners) == {0, 2}
-    assert plan.owners == assign_owner_work(layout, group.mesh, [0, 2])
+    assert set(plan.tensor_to_owner) == {0, 2}
+    assert plan.tensor_to_owner == assign_owner_work(layout, group.mesh, [0, 2])
 
 
 def test_group_owner_layout_custom_eligibility_and_cost(distributed_setup):
@@ -123,7 +123,7 @@ def test_group_owner_layout_custom_eligibility_and_cost(distributed_setup):
 
     plan = GroupOwnerLayout.from_group(group, cost_fn=cost, eligible_fn=lambda p: p.numel() >= 8)
     assert plan.layout is group.main_weight.layout
-    assert set(plan.owners) == {0, 1}
+    assert set(plan.tensor_to_owner) == {0, 1}
     assert seen_shapes == [torch.Size((6, 3)), torch.Size((4, 2))]
 
 
@@ -171,10 +171,10 @@ def test_pack_gather_scatter_round_trip(ranks, distributed_setup):
         {1: slice(6, 8), 2: slice(0, 4)},
     ]
     local_slices = slices[index]
-    owners = assign_owner_work(layout, mesh, range(3))
-    assert owners == {i: ranks[i] for i in range(3)}
+    tensor_to_owner = assign_owner_work(layout, mesh, range(3))
+    assert tensor_to_owner == {i: ranks[i] for i in range(3)}
     # Deliberately reverse dictionary order; packing must follow tensor indices.
-    plan = GroupOwnerLayout(mesh, layout, dict(reversed(list(owners.items()))))
+    plan = GroupOwnerLayout(mesh, layout, dict(reversed(list(tensor_to_owner.items()))))
     shards = {i: fulls[i].flatten()[part].clone() for i, part in local_slices.items()}
     gather = OwnerGatherPlan.pack(plan, shards)
     assert gather.recv_sizes == [{ranks[1]: 6}, {ranks[2]: 2}, {}][index]
@@ -185,7 +185,7 @@ def test_pack_gather_scatter_round_trip(ranks, distributed_setup):
     scatter = OwnerScatterPlan.pack(plan, {index: (full + 1).view(fulls[index].shape)})
     scattered = _exchange_buffers(scatter, device)
     results = scatter.unpack(scattered)
-    assert set(results) == {i for i in local_slices if owners[i] != rank}
+    assert set(results) == {i for i in local_slices if tensor_to_owner[i] != rank}
     for i, result in results.items():
         expected = fulls[i].flatten()[local_slices[i]] + 1
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
@@ -206,9 +206,9 @@ def test_pack_preserves_buffer_order_on_2d_mesh(distributed_setup):
     offsets = {3: 0, 0: 8, 1: 16, 2: 24}
     rank = mesh.get_rank()
     offset = offsets[rank]
-    owners = assign_owner_work(layout, mesh, [0])
-    assert owners == {0: 3}
-    plan = GroupOwnerLayout(mesh, layout, owners)
+    tensor_to_owner = assign_owner_work(layout, mesh, [0])
+    assert tensor_to_owner == {0: 3}
+    plan = GroupOwnerLayout(mesh, layout, tensor_to_owner)
     gather = OwnerGatherPlan.pack(plan, {0: full[offset : offset + 8]})
     received = _exchange_buffers(gather, device)
     if rank == 3:
@@ -237,7 +237,7 @@ def test_pack_with_no_eligible_params(distributed_setup):
     (group,) = module.parameter_groups
     plan = GroupOwnerLayout.from_group(group)
     assert plan.layout is group.main_weight.layout
-    assert plan.owners == {}
+    assert plan.tensor_to_owner == {}
     gather = OwnerGatherPlan.pack(plan, {})
     assert gather.send_buffers == {}
     assert gather.recv_sizes == {}
