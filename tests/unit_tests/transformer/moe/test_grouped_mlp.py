@@ -1944,3 +1944,141 @@ class TestTEGroupedMLP:
 
         ratio = (peak(tight) / peak(loose).clamp_min(1e-6)).item()
         assert 16.0 < ratio < 256.0, ratio
+
+
+class _RecordingCheckpoint:
+    """Stand-in for tensor_parallel.CheckpointWithoutOutput that records its use.
+
+    checkpoint() runs the function eagerly so the forward still produces real
+    outputs, while construction and discard calls are counted so a test can assert
+    whether the moe_act checkpoint path was taken at all.
+    """
+
+    instances: list = []
+
+    def __init__(self, *args, **kwargs):
+        self.discard_calls = 0
+        type(self).instances.append(self)
+
+    def checkpoint(self, run_function, *args):
+        return run_function(*args)
+
+    def discard_output_and_register_recompute(self, hook_tensor):
+        self.discard_calls += 1
+
+
+class _DoublingGroupedLinear(torch.nn.Module):
+    """Minimal stand-in for TEGroupedLinear returning (output, bias)."""
+
+    def forward(self, hidden_states, tokens_per_expert):
+        return hidden_states * 2.0, None
+
+
+def _build_moe_act_recompute_module():
+    """TEGroupedMLP wired for the unfused moe_act path with recompute enabled.
+
+    Built via __new__ to skip TEGroupedMLP.__init__, which would require TE, CUDA and
+    an initialized distributed group. nn.Module.__init__ still has to run so that
+    submodules can be assigned and so that module.training is set to True, which the
+    grad-disabled test relies on.
+    """
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._with_fused_impl = False
+    module._use_grouped_tensor = False
+    module.offload_expert_fc1 = False
+    module.offload_moe_act = False
+    # The flag under test: moe_act selective recompute is configured on.
+    module.activation_recompute = True
+    module.activation_func = F.gelu
+    module.linear_fc1 = _DoublingGroupedLinear()
+    module.linear_fc2 = _DoublingGroupedLinear()
+    module.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        moe_router_padding_for_quantization=False,
+        moe_token_dispatcher_type=None,
+        moe_flex_dispatcher_backend=None,
+        moe_use_grouped_tensor=False,
+        moe_permute_fusion=False,
+        moe_apply_probs_on_input=False,
+        moe_mlp_glu_interleave_size=None,
+        moe_router_topk=1,
+        delay_offload_until_cuda_graph=False,
+        gated_linear_unit=False,
+        use_te_activation_func=False,
+        bias_activation_fusion=False,
+        use_fused_weighted_squared_relu=False,
+        # Every activation_func_* field read by bias_act_func is defined here, including
+        # ones only reached on branches this stub does not take, so that a future edit to
+        # a neighbouring branch fails on the assertion rather than on AttributeError.
+        activation_func=F.gelu,
+        activation_func_clamp_value=None,
+        activation_func_fp8_input_store=False,
+        activation_func_tanh_clamp_scale=None,
+        activation_func_tanh_clamp_scale_linear=None,
+        glu_linear_offset=0.0,
+    )
+    return module
+
+
+def _run_moe_act_forward(monkeypatch):
+    """Run TEGroupedMLP.forward with CheckpointWithoutOutput swapped for a spy."""
+    _RecordingCheckpoint.instances = []
+    monkeypatch.setattr(
+        experts_module.tensor_parallel, "CheckpointWithoutOutput", _RecordingCheckpoint
+    )
+    module = _build_moe_act_recompute_module()
+    hidden_states = torch.ones(4, 8, requires_grad=True)
+    tokens_per_expert = torch.tensor([2, 2])
+    permuted_probs = torch.ones(4)
+
+    output, _ = module.forward(hidden_states, tokens_per_expert, permuted_probs)
+    return output, _RecordingCheckpoint.instances, module
+
+
+def test_moe_act_recompute_is_set_up_when_grad_enabled(monkeypatch):
+    """With grad enabled, the moe_act checkpoint is created and its recompute registered."""
+    with torch.enable_grad():
+        output, instances, _ = _run_moe_act_forward(monkeypatch)
+
+    assert len(instances) == 1, "expected exactly one CheckpointWithoutOutput to be constructed"
+    assert instances[0].discard_calls == 1, (
+        "discard_output_and_register_recompute must be called so the discarded "
+        "activation has a recompute hook"
+    )
+    assert output.requires_grad
+
+
+def test_moe_act_recompute_is_skipped_when_grad_disabled(monkeypatch):
+    """Under torch.no_grad() the checkpoint must not be set up.
+
+    CheckpointWithoutOutput discards the activation and relies on a grad hook to
+    recompute it. With grad disabled the output does not require grad, so the hook is
+    never registered and the discard is left without its counterpart. Guarding on
+    self.training is not enough: when "moe" is also in recompute_modules,
+    CheckpointFunction invokes this same forward once under no_grad and again under
+    enable_grad during backward, and self.training is True in both cases.
+    """
+    with torch.no_grad():
+        output, instances, module = _run_moe_act_forward(monkeypatch)
+
+    assert instances == [], (
+        "CheckpointWithoutOutput must not be constructed under torch.no_grad(); "
+        "its recompute hook cannot be registered and the discard would be orphaned"
+    )
+    assert not output.requires_grad
+    # The module is still in train mode here, so a `self.training` guard would have
+    # taken the checkpoint path. Only torch.is_grad_enabled() separates the two passes.
+    assert module.training is True
+    assert module.activation_recompute is True
+
+
+def test_moe_act_recompute_paths_are_numerically_equivalent(monkeypatch):
+    """Skipping the checkpoint under no_grad must not change the forward result."""
+    with torch.enable_grad():
+        grad_output, _, _ = _run_moe_act_forward(monkeypatch)
+    with torch.no_grad():
+        nograd_output, _, _ = _run_moe_act_forward(monkeypatch)
+
+    torch.testing.assert_close(grad_output.detach(), nograd_output)

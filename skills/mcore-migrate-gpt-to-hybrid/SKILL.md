@@ -1,8 +1,7 @@
 ---
 name: mcore-migrate-gpt-to-hybrid
-description: Migration guide for moving Megatron Core GPTModel checkpoints, model providers, training commands, and layer mappings to HybridModel, including the mechanical steps for transferring an existing pretrain_gpt.py launch script.
+description: Migration guide for moving Megatron Core GPTModel checkpoints, model providers, training commands, and layer mappings to HybridModel, including the mechanical steps for transferring an existing pretrain_gpt.py launch script. Use when migrating or reviewing a GPTModel checkpoint or training workflow for HybridModel; transferring an existing pretrain_gpt.py script, sbatch, or launcher to pretrain_hybrid.py; choosing or reviewing a hybrid layer pattern; running gpt_hybrid_conversion.py; loading a converted checkpoint; diagnosing GPT-to-Hybrid migration issues; 'migrate GPTModel to HybridModel', 'convert GPT checkpoint to HybridModel', 'hybrid layer pattern'.
 license: Apache-2.0
-when_to_use: Migrating or reviewing a GPTModel checkpoint or training workflow for HybridModel; transferring an existing pretrain_gpt.py script, sbatch, or launcher to pretrain_hybrid.py; choosing or reviewing a hybrid layer pattern; running gpt_hybrid_conversion.py; loading a converted checkpoint; diagnosing GPT-to-Hybrid migration issues; 'migrate GPTModel to HybridModel', 'convert GPT checkpoint to HybridModel', 'hybrid layer pattern'.
 metadata:
   author: Philip Petrakian <ppetrakian@nvidia.com>
 ---
