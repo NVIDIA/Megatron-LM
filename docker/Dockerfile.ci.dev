@@ -16,8 +16,6 @@ ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
-    # Remove the Nsight Systems EFA metrics plugin to address CVE-2026-27143.
-    rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
     apt-get update
     apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime
     apt-get clean
@@ -311,6 +309,9 @@ RUN export HOME=/home/nemo-runtime \
     rmdir /tmp/regent-cache/.nonroot-mkdir-probe
 
 USER root
+
+# Remove the Nsight Systems EFA metrics plugin to address CVE-2026-27143.
+RUN rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
 
 ##### For NVIDIANS only #####
 FROM main AS jet
