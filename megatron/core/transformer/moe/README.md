@@ -577,7 +577,8 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | Argument | Description | Default |
 |----------|-------------|---------|
 | --moe-router-load-balancing-type | Load balancing: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, quantile_balancing, none | aux_loss |
-| --moe-router-quantile-balancing-estimation-scope | Quantile population; dev supports global_batch | global_batch |
+| --moe-router-quantile-balancing-estimation-scope | Quantile population: global_batch histogram (default), or micro_batch exact estimator | global_batch |
+| --moe-router-quantile-balancing-ema | EMA coefficient for micro_batch exact QB | 0.0 |
 | --moe-router-qb-num-bins | Uniform histogram bins per expert for global-batch quantile balancing | 1000 |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |

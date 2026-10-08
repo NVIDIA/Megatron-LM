@@ -40,11 +40,13 @@ def _fake_ddp(align_param_gather=False, hooks_enabled=True):
 
 class TestParamReadinessProtocol:
     def test_no_marker_is_a_noop(self):
+        """A parameter no backend owns must be readable without any callback."""
         param = torch.nn.Parameter(torch.zeros(2))
         assert not hasattr(param, PARAM_READY_CALLBACK_ATTR)
-        ensure_params_ready([param])
+        ensure_params_ready([param])  # must not raise
 
     def test_callbacks_are_deduplicated_per_bucket(self):
+        """Backends share one callback per bucket, so it must fire once per call, in order."""
         calls = []
         shared = lambda: calls.append("shared")  # noqa: E731
         other = lambda: calls.append("other")  # noqa: E731
@@ -81,8 +83,10 @@ class TestBucketParamReadiness:
         ready_callback = _BucketParamReadyCallback(ddp, bucket_group)
 
         ready_callback()
-        ready_callback()
+        assert bucket_group.finished == [False]
 
+        # Already published this iteration: no second collective.
+        ready_callback()
         assert bucket_group.finished == [False]
 
     def test_align_param_gather_skips_next_bucket_dispatch(self):
@@ -110,6 +114,70 @@ class TestBucketParamReadiness:
         _BucketParamReadyCallback(ddp, bucket_group)()
 
         assert bucket_group.finished == [True]
+
+    def test_cuda_graph_capture_defers_publication_until_replay(self, monkeypatch):
+        ddp = _fake_ddp()
+        bucket_group = _FakeBucketGroup()
+        ready_callback = _BucketParamReadyCallback(ddp, bucket_group)
+        param = torch.nn.Parameter(torch.zeros(1))
+        setattr(param, PARAM_READY_CALLBACK_ATTR, ready_callback)
+        capturing = [True]
+        monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: capturing[0])
+
+        ensure_params_ready([param])
+        assert bucket_group.finished == []
+        assert not bucket_group.param_gather_dispatched
+
+        capturing[0] = False
+        ensure_params_ready([param])
+        assert bucket_group.finished == [False]
+        assert bucket_group.param_gather_dispatched
+
+    def test_in_flight_gather_is_drained(self):
+        ddp = _fake_ddp()
+        bucket_group = _FakeBucketGroup()
+        bucket_group.param_gather_dispatched = True
+        bucket_group.param_gather_handle = object()
+
+        _BucketParamReadyCallback(ddp, bucket_group)()
+        assert bucket_group.finished == [False]
+
+    def test_disabled_forward_hooks_do_not_start_a_gather(self):
+        """With the pre-hooks removed the caller drives param sync; starting one here could
+        gather into a buffer it is actively using."""
+        ddp = _fake_ddp(hooks_enabled=False)
+        bucket_group = _FakeBucketGroup()
+        _BucketParamReadyCallback(ddp, bucket_group)()
+        assert bucket_group.finished == []
+
+    def test_in_flight_gather_is_drained_even_with_hooks_disabled(self):
+        """``disable_forward_pre_hook(param_sync=False)`` leaves hooks removed without a force
+        sync, so an outstanding all-gather still has to be drained before the buffer is read --
+        but without chaining the next bucket's dispatch, which is the caller's schedule now."""
+        ddp = _fake_ddp(hooks_enabled=False)
+        bucket_group = _FakeBucketGroup()
+        bucket_group.param_gather_dispatched = True
+        bucket_group.param_gather_handle = object()
+
+        _BucketParamReadyCallback(ddp, bucket_group)()
+        assert bucket_group.finished == [True]  # drained, next dispatch skipped
+
+    def test_dead_bucket_group_is_a_noop(self):
+        """The bucket group is held weakly so the callback, which lives on parameters that
+        outlive DDP, cannot retain the bucket-group graph."""
+        ddp = _fake_ddp()
+        ready_callback = _BucketParamReadyCallback(ddp, _FakeBucketGroup())
+        assert ready_callback._bucket_group() is None
+        ready_callback()  # must not raise
+
+    def test_dead_ddp_is_a_noop(self):
+        """The callback holds DDP weakly, so a collected DDP must not resurrect work."""
+        bucket_group = _FakeBucketGroup()
+        ready_callback = _BucketParamReadyCallback(_fake_ddp(), bucket_group)
+        # No strong reference above, so the referent is already gone.
+        assert ready_callback._ddp() is None
+        ready_callback()
+        assert bucket_group.finished == []
 
 
 class TestDSAFineGrainedReadiness:

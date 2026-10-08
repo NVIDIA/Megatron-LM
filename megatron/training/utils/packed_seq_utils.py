@@ -39,7 +39,7 @@ def prepare_packed_seq_params(
         capacity = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
     prebuild_balanced_layouts(
         packed_seq_params,
-        cp_group=packed_seq_params.cp_group,
+        cp_group=(packed_seq_params.cp_singleton_group or packed_seq_params.cp_group),
         pad_alignment=config.pad_packed_seq_alignment,
         capacity=capacity,
         graphs_enabled=cuda_graph_captures_attention(config),

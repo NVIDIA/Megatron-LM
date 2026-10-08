@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import megatron.core.transformer.moe.fused_a2a as fused_a2a
 import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
@@ -12,14 +13,18 @@ from megatron.core import config, parallel_state
 from megatron.core.extensions.transformer_engine import (
     fused_topk_with_score_function_supports_topk_indices,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
     HYBRIDEP_TOKEN_ALIGNMENT,
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
@@ -33,7 +38,27 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+    is_op_fuser_available,
+)
+
+
+def test_pad_routing_map_does_not_modify_input():
+    routing_map = torch.tensor(
+        [[True, False], [False, True], [False, False], [False, False]], dtype=torch.bool
+    )
+    original = routing_map.clone()
+    original_version = routing_map._version
+
+    padded = pad_routing_map(routing_map, pad_multiple=2)
+
+    assert torch.equal(routing_map, original)
+    assert routing_map._version == original_version
+    assert torch.equal(padded.sum(dim=0), torch.tensor([2, 2]))
 
 
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
@@ -125,56 +150,6 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
-
-
-def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
-    manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(
-        moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
-    )
-    manager.group = object()
-    manager.num_experts = 2
-    manager.router_topk = 1
-    manager.moe_expert_rank_capacity_factor = None
-    manager.drop_and_pad = False
-
-    routing_map = torch.tensor([[True, False], [False, False]])
-    probs = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
-
-    manager.setup_metadata(routing_map, probs)
-
-    assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
-
-
-def test_hybridep_dense_input_requires_backend_support(monkeypatch):
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
-    manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(
-        moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
-    )
-    manager.group = object()
-    manager.num_experts = 4
-    manager.router_topk = 2
-    manager.moe_expert_rank_capacity_factor = None
-    manager.drop_and_pad = False
-
-    with pytest.raises(RuntimeError, match="does not support dense topk_idx metadata"):
-        manager.setup_metadata(torch.tensor([[0, 2]], dtype=torch.int16), torch.ones(1, 4))
-
-
-def test_flex_dense_metadata_preserves_invalid_routes():
-    dispatcher = object.__new__(MoEFlexTokenDispatcher)
-    dispatcher.tp_size = 2
-    dispatcher.ep_size = 2
-    dispatcher.num_local_experts = 2
-    routing_map = torch.tensor([[0, -1], [3, 1]], dtype=torch.int16)
-    probs = torch.ones((2, 4))
-
-    expanded_routes, _ = dispatcher._initialize_metadata(routing_map, probs)
-
-    expected = torch.tensor([[0, 2, -1, -1], [5, 7, 1, 3]], dtype=torch.int16)
-    assert torch.equal(expanded_routes, expected)
 
 
 @pytest.mark.parametrize("manager_cls", [_DeepepManager, _DeepepV2Manager, _NCCLEPManager])
@@ -296,6 +271,14 @@ class MoEModelTestContainer:
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_hybridep_routing_map_mode=kwargs.get("moe_hybridep_routing_map_mode", "bool"),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
+            moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
+            moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
+            moe_combine_bwd_dtype=kwargs.get("moe_combine_bwd_dtype", 'bf16'),
+            use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
+            gated_linear_unit=kwargs.get("gated_linear_unit", False),
+            activation_func=kwargs.get("activation_func", F.gelu),
+            fp8=kwargs.get("fp8", None),
+            fp8_recipe=kwargs.get("fp8_recipe", "delayed"),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
@@ -303,14 +286,20 @@ class MoEModelTestContainer:
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(
+        new_config = dataclasses.replace(self.config, **kargs)
+        if new_config.use_transformer_engine_op_fuser:
+            # op-fuser needs the TE grouped-MLP experts (they accept output_buffer/grad_input_buffer
+            # for the ncclEP zero-copy path); the local spec yields SequentialMLP, which does not.
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=new_config.num_moe_experts, moe_grouped_gemm=new_config.moe_grouped_gemm
+            ).submodules.mlp
+        else:
+            mlp_spec = get_gpt_layer_local_submodules(
                 num_experts=self.config.num_moe_experts,
                 moe_grouped_gemm=self.config.moe_grouped_gemm,
             ).mlp
-        )
+        submodules = get_submodules(mlp_spec)
         assert isinstance(submodules, MoESubmodules)
-        new_config = dataclasses.replace(self.config, **kargs)
         moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
@@ -361,6 +350,72 @@ class MoEModelTestContainer:
         torch.testing.assert_close(
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
+
+    @pytest.mark.internal
+    def moe_layer_variant_parity_test(self, variant="zero_copy"):
+        """Full MoE-layer fwd+bwd, reference vs IO-variant (identical weights), asserting parity.
+
+        variant="zero_copy": ncclEP zero-copy OFF then ON. Runs the real op-fuser experts so
+        fc2-out/fc1-dgrad are written straight into the symm combine/dispatch buffers (verified
+        via is_symm_backed) -- the pure permute/unpermute harness cannot exercise this path.
+        variant="mxfp8_wire": bf16 wire then MXFP8 dispatch-fwd/combine-bwd wire. The recv
+        payload is an opaque carrier the op-fuser grouped GEMM rebuilds, so the tolerance is
+        quantization-sized, not exactness-sized."""
+        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+        from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
+
+        torch.manual_seed(42)
+        x = torch.randn((32, 8, self.config.hidden_size), dtype=self.test_dtype).cuda()
+
+        def run(layer):
+            inp = x.clone().detach().requires_grad_(True)
+            out, _ = layer(inp)  # full fwd: dispatch -> op-fuser experts -> combine
+            out.sum().backward()  # bwd: dispatch-bwd reads the symm grad buffer
+            return out.detach(), inp.grad.detach()
+
+        def reset_ep():
+            # zero_copy mode is fixed at ep_bootstrap (process-global); finalize + drop the shared
+            # symm classvars so the next layer re-bootstraps in the other mode.
+            nccl_ep_finalize()
+            _NCCLEPManager._zc_fwd_token_buf = None
+            _NCCLEPManager._zc_bwd_token_buf = None
+            _NCCLEPManager._zc_recv_topk_weights_buf = None
+
+        if variant == "zero_copy":
+            variant_overrides = dict(moe_ncclep_zero_copy=True)
+            rtol = atol = 1e-2
+        else:
+            assert variant == "mxfp8_wire", f"unknown variant {variant!r}"
+            variant_overrides = dict(moe_dispatch_fwd_dtype='mxfp8', moe_combine_bwd_dtype='mxfp8')
+            rtol = atol = 2e-1
+
+        ref_layer = self.new_moe_layer()
+        out_ref, grad_ref = run(ref_layer)
+
+        reset_ep()
+        var_layer = self.new_moe_layer(**variant_overrides)
+        var_layer.load_state_dict(ref_layer.state_dict())  # identical weights
+        out_var, grad_var = run(var_layer)
+
+        if variant == "zero_copy":
+            from transformer_engine.pytorch.ep import is_symm_backed
+
+            # the combine forward buffer must be an allocated, registered symm window
+            # (zero-copy engaged)
+            fwd_buf = _NCCLEPManager._zc_fwd_token_buf
+            assert fwd_buf is not None, "zero-copy forward symm buffer was not allocated"
+            assert is_symm_backed(fwd_buf), "zero-copy forward buffer is not symm-mem-backed"
+        else:
+            # the quant recipes must have reached the dispatch manager (config -> manager wiring);
+            # manager -> EpBuffer wiring hard-fails inside fused_dispatch when TE lacks support.
+            manager = var_layer.token_dispatcher._comm_manager
+            assert manager.dispatch_fwd_quant_recipe is not None
+            assert manager.combine_bwd_quant_recipe is not None
+        reset_ep()
+
+        assert not torch.isnan(out_var).any() and not torch.isnan(grad_var).any()
+        torch.testing.assert_close(out_var, out_ref, rtol=rtol, atol=atol)
+        torch.testing.assert_close(grad_var, grad_ref, rtol=rtol, atol=atol)
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -628,10 +683,54 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
-def is_nccl_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
 
-    return HAVE_TE_EP
+    local_num_tokens = 17
+    max_num_tokens_across_ep = 70
+    padded_num_tokens = (
+        max_num_tokens_across_ep + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
+    )
+    routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
+    probs = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.float32)
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is manager.group
+        tensor.fill_(max_num_tokens_across_ep)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager._original_num_tokens == local_num_tokens
+    assert manager._padded_num_tokens == padded_num_tokens
+    assert manager.routing_map.shape == (padded_num_tokens, manager.num_experts)
+    assert manager.token_probs.shape == (padded_num_tokens, manager.num_experts)
+    torch.testing.assert_close(manager.routing_map[:local_num_tokens], routing_map)
+    torch.testing.assert_close(manager.token_probs[:local_num_tokens], probs)
+    assert not manager.routing_map[local_num_tokens:].any()
+    assert not manager.token_probs[local_num_tokens:].any()
 
 
 def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
@@ -643,6 +742,289 @@ def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
         pytest.skip("Hybrid EP is not available")
     if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():
         pytest.skip("NCCL EP is not available")
+
+
+def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="indices"
+    )
+    manager.group = object()
+    manager.num_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
+
+    routing_map = torch.tensor([[True, False], [False, False]])
+    probs = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
+
+
+def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch):
+    """Dense ids must follow the bool map even when probs are nonzero outside the selected
+    routes (direct callers and the dispatcher test helper pass full-width weights); a topk over
+    probs would pick expert 1 here and drop the token's only real route."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="indices"
+    )
+    manager.group = object()
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
+
+    routing_map = torch.tensor(
+        [[True, False, False, True], [False, True, False, False], [False, False, False, False]]
+    )
+    probs = torch.tensor([[0.1, 0.5, 0.3, 0.1], [0.25, 0.25, 0.25, 0.25], [0.7, 0.1, 0.1, 0.1]])
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager.topk_idx.dtype == torch.int16
+    routes = [sorted(row[row >= 0].tolist()) for row in manager.topk_idx]
+    assert routes == [[0, 3], [1], []]
+    assert (manager.topk_idx[1] == -1).sum() == 1 and (manager.topk_idx[2] == -1).all()
+    # Full-width probs are passed through untouched for HybridEP to gather by index.
+    assert torch.equal(manager.token_probs, probs)
+
+
+@pytest.mark.parametrize("flex", [False, True])
+def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex):
+    """MoELayer.preprocess hands the batch-first mask to the flex dispatcher (whose backend
+    decides whether padded rows are excluded); the other dispatchers keep their 3-arg call."""
+    calls = []
+
+    class _FlexSpy(MoEFlexTokenDispatcher):
+        def __init__(self):
+            pass
+
+        def dispatch_preprocess(self, hidden_states, routing_map, probs, padding_mask=None):
+            calls.append(padding_mask)
+            return hidden_states, probs
+
+    class _OtherSpy:
+        def dispatch_preprocess(self, hidden_states, routing_map, probs):
+            calls.append("no-mask")
+            return hidden_states, probs
+
+    layer = object.__new__(MoELayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = SimpleNamespace(cuda_graph_impl="local", moe_latent_size=None)
+    layer.shared_expert_overlap = False
+    layer.token_dispatcher = _FlexSpy() if flex else _OtherSpy()
+    hidden_states = torch.zeros(4, 8)
+    probs = torch.zeros(4, 2)
+    routing_map = torch.zeros(4, 2, dtype=torch.bool)
+    padding_mask = torch.tensor([[False, True], [False, False]])
+
+    layer.preprocess(hidden_states, probs, routing_map, padding_mask)
+
+    if flex:
+        assert len(calls) == 1 and calls[0] is padding_mask
+    else:
+        assert calls == ["no-mask"]
+
+
+def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
+    """Dropless HybridEP drops padded tokens in the dispatcher (the router keeps them routed):
+    padding rows lose their routes and weights, valid rows are untouched. The mask arrives
+    batch-first [b, s] and is transposed to the sequence-first token order."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="bool"
+    )
+    manager.group = object()
+    manager.num_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = False
+    manager.use_dense_routing_for_bool_map = False
+
+    # s=2, b=2 -> 4 tokens in sequence-first order (s0b0, s0b1, s1b0, s1b1).
+    routing_map = torch.tensor([[True, False], [False, True], [True, False], [False, True]])
+    probs = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
+    # Batch-first mask: sample 1 has its second position padded -> token s1b1.
+    padding_mask = torch.tensor([[False, False], [False, True]])
+
+    manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+
+    expected_map = routing_map.clone()
+    expected_map[3] = False
+    assert torch.equal(manager.routing_map, expected_map)
+    # Dropless setup_metadata leaves tokens_per_expert to dispatch(); count from the map.
+    assert torch.equal(manager.routing_map.sum(dim=0), torch.tensor([2, 1]))
+    assert torch.count_nonzero(manager.token_probs[3]) == 0
+    torch.testing.assert_close(manager.token_probs[:3], probs[:3])
+
+
+def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
+    """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
+    topk assignments); the indices-mode topk reconstruction would drop the padded assignments
+    while tokens_per_expert still declares the full capacity, so the bool map must be kept."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    num_tokens, num_experts, topk, capacity_factor = 64, 2, 1, 2.0
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False,
+        moe_hybridep_routing_map_mode="indices",
+        moe_router_topk=topk,
+    )
+    manager.group = SimpleNamespace(size=lambda: 1)
+    manager.num_experts = num_experts
+    manager.num_local_experts = num_experts
+    manager.router_topk = topk
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = capacity_factor
+    manager.drop_and_pad = True
+    manager.dense_routing_supported = True
+    # Pad-to-capacity keeps the bool map even in "indices" mode.
+    manager.use_dense_routing_for_bool_map = False
+
+    # Every token picked expert 0; pad-to-capacity fills expert 1 with the same tokens.
+    capacity = get_capacity(num_tokens * topk, num_experts, capacity_factor)
+    assert capacity == num_tokens
+    routing_map = torch.ones(num_tokens, num_experts, dtype=torch.bool)
+    probs = torch.zeros(num_tokens, num_experts)
+    probs[:, 0] = 1.0
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager.topk_idx is None
+    assert torch.equal(manager.routing_map.sum(dim=0), torch.tensor([capacity, capacity]))
+    assert torch.equal(manager.tokens_per_expert, torch.tensor([capacity, capacity]))
+
+
+def test_hybridep_dense_input_requires_backend_support(monkeypatch):
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="indices"
+    )
+    manager.group = object()
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.use_dense_routing_for_bool_map = (
+        manager.dense_routing_supported
+        and manager.config.moe_hybridep_routing_map_mode == "indices"
+    )
+
+    with pytest.raises(RuntimeError, match="does not support dense topk_idx metadata"):
+        manager.setup_metadata(torch.tensor([[0, 2]], dtype=torch.int16), torch.ones(1, 4))
+
+
+def test_flex_dense_metadata_preserves_invalid_routes():
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.tp_size = 2
+    dispatcher.ep_size = 2
+    dispatcher.num_local_experts = 2
+    # HybridEP dense indices come with full-width [num_tokens, num_experts] probs.
+    dispatcher.config = SimpleNamespace(moe_flex_dispatcher_backend="hybridep")
+    routing_map = torch.tensor([[0, -1], [3, 1]], dtype=torch.int16)
+    probs = torch.ones((2, 4))
+
+    expanded_routes, expanded_probs = dispatcher._initialize_metadata(routing_map, probs)
+
+    expected = torch.tensor([[0, 2, -1, -1], [5, 7, 1, 3]], dtype=torch.int16)
+    assert torch.equal(expanded_routes, expected)
+    # Full-width probs keep the [num_tokens, world_size, num_local_experts] expansion.
+    assert expanded_probs.shape == (2, 4, 2)
+
+
+@pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+def test_flex_dense_metadata_keeps_full_width_probs(backend):
+    """deepep/ncclep: dense indices arrive with the router's full-width probs, which are expanded
+    like a bool map; the backend manager selects the per-route weights afterwards."""
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.tp_size = 2
+    dispatcher.ep_size = 2
+    dispatcher.num_local_experts = 2
+    dispatcher.config = SimpleNamespace(moe_flex_dispatcher_backend=backend)
+    routing_map = torch.tensor([[0, 3], [3, 1]], dtype=torch.int64)
+    probs = torch.tensor([[0.6, 0.0, 0.0, 0.4], [0.0, 0.3, 0.0, 0.7]])
+
+    expanded_routes, expanded_probs = dispatcher._initialize_metadata(routing_map, probs)
+
+    assert torch.equal(expanded_routes, torch.tensor([[0, 2, 5, 7], [5, 7, 1, 3]]))
+    # [num_tokens, world_size, num_local_experts], one copy per expert-TP rank.
+    assert expanded_probs.shape == (2, 4, 2)
+    torch.testing.assert_close(expanded_probs[:, 0, :], torch.tensor([[0.6, 0.0], [0.0, 0.3]]))
+    torch.testing.assert_close(expanded_probs[:, 2, :], torch.tensor([[0.0, 0.4], [0.0, 0.7]]))
+
+
+@pytest.mark.parametrize("manager_cls", [_DeepepManager, _NCCLEPManager])
+def test_dense_required_manager_selects_weights_at_dense_indices(manager_cls):
+    """The manager, not the router, gathers the per-route weights from the full-width probs;
+    -1 routes get zero weight."""
+    manager = object.__new__(manager_cls)
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.capacity_factor = None
+    manager.config = SimpleNamespace(moe_expert_capacity_factor=None)
+    routing_map = torch.tensor([[0, 3], [2, -1]], dtype=torch.int64)
+    probs = torch.tensor([[0.6, 0.1, 0.1, 0.4], [0.2, 0.2, 0.7, 0.9]])
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager.token_indices.dtype == torch.int64
+    assert torch.equal(manager.token_indices, routing_map)
+    torch.testing.assert_close(manager.token_probs, torch.tensor([[0.6, 0.4], [0.7, 0.0]]))
+
+
+def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
+    class FakeHybridEPBuffer:
+        def __init__(self):
+            self.kwargs = None
+
+        def dispatch_with_permute(self, **kwargs):
+            self.kwargs = kwargs
+            return (
+                kwargs["hidden"],
+                kwargs["probs"],
+                None,
+                torch.ones(2, dtype=torch.int32),
+                ("handle",),
+            )
+
+    fake_buffer = FakeHybridEPBuffer()
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", fake_buffer)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    hidden = torch.randn(2, 4)
+    probs = torch.randn(2, 4)
+    topk_idx = torch.tensor([[0, 1], [2, 3]], dtype=torch.int16)
+
+    fused_a2a.HybridEPDispatch.forward(
+        SimpleNamespace(), hidden, None, probs, object(), 2, topk_idx=topk_idx, num_of_experts=4
+    )
+
+    assert fake_buffer.kwargs["topk_idx"] is topk_idx
+    assert fake_buffer.kwargs["num_of_experts"] == 4
+    assert "routing_map" not in fake_buffer.kwargs
+    assert "dense_routing" not in fake_buffer.kwargs
 
 
 @pytest.mark.skipif(
@@ -660,14 +1042,21 @@ class TestFlexDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("routing_map_mode", ["bool", "indices"])
-    def test_hybridep_routing_map_modes_forward_backward(self, routing_map_mode):
+    @pytest.mark.parametrize("moe_router_fusion", [True, False])
+    def test_hybridep_routing_map_modes_forward_backward(self, routing_map_mode, moe_router_fusion):
+        """With router fusion the router hands HybridEP dense ids directly; without it the router
+        emits a bool map and indices mode must rebuild the ids from that map (the test helper's
+        uniform full-width probs would otherwise select unrouted experts)."""
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
-        if routing_map_mode == "indices" and (
-            not fused_topk_with_score_function_supports_topk_indices
-            or not HAVE_HYBRIDEP_DENSE_ROUTING
+        if routing_map_mode == "indices" and not HAVE_HYBRIDEP_DENSE_ROUTING:
+            pytest.skip("Dense HybridEP routing API is not available")
+        if (
+            routing_map_mode == "indices"
+            and moe_router_fusion
+            and not fused_topk_with_score_function_supports_topk_indices
         ):
-            pytest.skip("Dense TE/HybridEP routing APIs are not available")
+            pytest.skip("Dense TE fused top-k routing API is not available")
 
         container = MoEModelTestContainer(
             tp_size=1,
@@ -677,7 +1066,7 @@ class TestFlexDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",
-            moe_router_fusion=True,
+            moe_router_fusion=moe_router_fusion,
             moe_flex_dispatcher_backend="hybridep",
             moe_hybridep_routing_map_mode=routing_map_mode,
             hidden_size=1024,
@@ -687,9 +1076,12 @@ class TestFlexDispatcher:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.parametrize("backend", ["deepep", "deepepv2", "ncclep"])
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
     def test_dense_required_backend_forward_backward(self, backend):
-        skip_if_flex_backend_unavailable(backend)
+        if backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if backend == "ncclep" and not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
         if not fused_topk_with_score_function_supports_topk_indices:
             pytest.skip("Dense TE routing output is not available")
 
@@ -703,7 +1095,6 @@ class TestFlexDispatcher:
             moe_token_dispatcher_type="flex",
             moe_router_fusion=True,
             moe_flex_dispatcher_backend=backend,
-            moe_expert_rank_capacity_factor=8.0 if backend == "ncclep" else None,
             hidden_size=1024,
             test_dtype=torch.bfloat16,
         )
@@ -745,18 +1136,52 @@ class TestFlexDispatcher:
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
-            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS (device-side
-            # em_scan check -> CUDA launch failure), so size it generously: small token counts have
-            # high routing-imbalance variance and a tight factor traps. The staging buffer is tiny
-            # at this model size, so a large factor costs little.
-            moe_expert_rank_capacity_factor=(
-                8.0 if moe_flex_dispatcher_backend == "ncclep" else None
-            ),
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()
         # reset experimental flag to False
         config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
+    )
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    @pytest.mark.parametrize(
+        "variant", ["zero_copy", pytest.param("mxfp8_wire", marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_forward_backward_variant_parity(self, tp_size, ep_size, variant):
+        # The op-fuser needs tp=1 and a SwiGLU activation. Parity: the variant IO path must match
+        # the plain staged/eager path.
+        # zero_copy requires a capacity factor (fixed symm buffers), which requires BOTH op-fuser
+        # and grouped_gemm; bf16 so no fp8/Blackwell dependency.
+        # mxfp8_wire runs eager (the validated fp8-wire mode) and needs a TE build with EpBuffer
+        # quant recipes plus MXFP8 hardware.
+        if variant == "zero_copy" and not is_nccl_ep_zero_copy_available():
+            pytest.skip("NCCL EP zero-copy TE API is not available")
+        if variant == "mxfp8_wire" and not is_nccl_ep_fp8_dispatch_available():
+            pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS; size generously.
+            moe_expert_rank_capacity_factor=8.0 if variant == "zero_copy" else None,
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+        )
+        container.moe_layer_variant_parity_test(variant)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

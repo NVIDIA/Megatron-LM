@@ -31,6 +31,8 @@ from tests.unit_tests.dist_checkpointing.models.common import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 
 def initialize_gpt_model(
     seed,
@@ -211,7 +213,9 @@ def create_args():
         ),  # mtp in the second last stage with no other layers
     ],
 )
-def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
+def test_forward_vpp(
+    create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp, run_config
+):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     args = create_args
@@ -221,6 +225,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
+    args.save_tokenizer_assets = False
     set_args(args)
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):

@@ -109,17 +109,18 @@ class GPUResourceManager:
                 "Could not determine nvidia-nvshmem-cu12 package version for NVSHMEM safety check."
             )
 
-        # Recommend a conservative CTA limit for stability when team counts grow.
+        # This path can hang during initialization when the CTA limit is higher.
         max_ctas = os.environ.get("NVSHMEM_MAX_CTAS")
         if max_ctas != "2":
-            logger.warning(
-                "Recommended NVSHMEM_MAX_CTAS=2 for this path. Current value is %r.", max_ctas
+            raise RuntimeError(
+                "NVSHMEM_MAX_CTAS must be set to '2' for the NVSHMEM copy service; "
+                f"got {max_ctas!r}."
             )
 
         # torch.distributed must be initialized before calling this
         if not dist.is_initialized():
             raise RuntimeError(
-                "torch.distributed must be initialized before " "GPUResourceManager.init()"
+                "torch.distributed must be initialized before GPUResourceManager.init()"
             )
 
         # Get current CUDA device (already set by caller based on LOCAL_RANK)

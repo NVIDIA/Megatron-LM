@@ -13,7 +13,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -367,6 +367,7 @@ class TransformerLayerNode(ScheduleNode):
             free_input=free_input,
             name=name,
             tensor_release=tensor_release,
+            ncclep_zero_copy=config.moe_ncclep_zero_copy,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state
@@ -651,6 +652,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
                 mhc_recompute_manager=None,
+                padding_mask: Optional[Tensor] = None,
             ):
                 attention_kwargs = dict(
                     hidden_states=hidden_states,
@@ -660,6 +662,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     rotary_pos_sin=rotary_pos_sin,
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
+                    padding_mask=padding_mask,
                 )
                 if is_hyper_connection_layer:
                     attention_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
@@ -669,7 +672,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if is_mhc_layer:
                     nvtx_range_push(suffix="mlp_hyper_connection")
                     hidden_states, mlp_h_res, mlp_hc_h_post, residual = layer.mlp_hyper_connection(
-                        hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                        hidden_states,
+                        mhc_recompute_manager=mhc_recompute_manager,
+                        return_residual=True,
                     )
                     nvtx_range_pop(suffix="mlp_hyper_connection")
                 else:
@@ -682,7 +687,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if checkpoint_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        ckpt_manager=mhc_recompute_manager
+                        ckpt_manager=mhc_recompute_manager,
+                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual,
                     )
                     with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
@@ -697,23 +703,19 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
                 # the layernorm returns (normalized_output, residual). Unpack
                 # and use the fused residual for the downstream BDA connection.
-                if isinstance(pre_mlp_layernorm_output, tuple):
-                    if len(pre_mlp_layernorm_output) != 2:
-                        raise ValueError(
-                            f"When the output of pre_mlp_layernorm is a tuple, it is "
-                            f"expected to have 2 elements (output, residual), but "
-                            f"got {len(pre_mlp_layernorm_output)}"
-                        )
+                if layer._pre_mlp_layernorm_returns_residual:
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
                     if not is_mhc_layer:
                         residual = hidden_states
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                if padding_mask is None:
+                    padding_mask = node.chunk_state.padding_mask
                 probs, routing_map = layer.mlp.route(
-                    pre_mlp_layernorm_output, padding_mask=node.chunk_state.padding_mask
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
                 )
                 local_tokens, probs = layer.mlp.preprocess(
-                    pre_mlp_layernorm_output, probs, routing_map
+                    pre_mlp_layernorm_output, probs, routing_map, padding_mask
                 )
                 if is_mhc_layer:
                     return (
@@ -734,6 +736,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             rotary_pos_sin=node.chunk_state.rotary_pos_sin,
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
+            padding_mask=getattr(node.chunk_state, "padding_mask", None),
         )
         if is_hyper_connection_layer and (
             not using_cuda_graph_replay
@@ -787,6 +790,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+
+        if enable_ncclep and layer.config.moe_ncclep_zero_copy:
+            # Insert an identity node as the sole consumer of the dispatch output, so the
+            # dispatch-backward gets the symm buffer instead of a non-symm AccumulateGrad clone.
+            # Must stay inside this node's graph segment (before the next node detaches it).
+            dispatched_tokens = StageDispatchBwdGrad.apply(dispatched_tokens, token_dispatcher)
 
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process

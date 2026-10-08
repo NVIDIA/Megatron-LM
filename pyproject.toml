@@ -18,7 +18,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "megatron-core"
 dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
@@ -70,6 +70,8 @@ training = [
     "wandb",
     "transformers",
     "accelerate",
+    "omegaconf",
+    "gigatoken",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -80,27 +82,26 @@ mlm = [
     "wandb",
     "transformers",
     "accelerate",
+    "omegaconf",
+    "gigatoken",
 ]
 
 dev = [
     "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
-    "nvidia-resiliency-ext==0.6.0",
+    "transformer-engine[pytorch,core_cu13]",
+    "nvidia-resiliency-ext==0.7.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
-    "multi-storage-client~=0.27",
+    "multi-storage-client~=0.50",
     "opentelemetry-api>=1.33.1,<2",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
-    "flash-linear-attention[tilelang]==0.5.1",
-    "tilelang==0.1.12",
-    "apache-tvm-ffi==0.1.11",
+    "nemo-lens",
+    "nvtx~=0.2",
     "megatron-energon[av_decode]~=7.0",
     "av",
+    "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]",
+    "nvidia-cudnn-frontend[cutedsl]==1.29.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -109,39 +110,38 @@ dev = [
     "quart",
     "hypercorn",
     "openai[aiohttp]",
+    "orjson",
+    "fast-hadamard-transform",
+    "zstandard",
 ]
 
-lts = [
-    "tqdm",
-    "einops~=0.8",
-    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
-    "multi-storage-client~=0.27",
-    "opentelemetry-api>=1.33.1,<2",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
-    "megatron-energon[av_decode]~=6.0",
-    "av",
-    "flashinfer-python>=0.5.0,<0.7.0",
-    "wget",
-    "onnxscript",
-    "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
-    "datasets",
-    "emerging_optimizers; python_version >= '3.12'",
+inference = [
+    "torch-memory-saver",
 ]
+
+otel = [
+    "nemo-lens[sdk]",
+]
+
+### 'lts' extra is deprecated                                                   ###
+### LTS Python dependencies are now pinned directly in docker/Dockerfile.ci.lts ###
+### so this pyproject.toml can host meaningful module-level extras without      ###
+### colliding with the LTS pin set. Kept as an empty alias for one release      ###
+### cycle so `pip install megatron-core[lts]` does not error out.               ###
+lts = []
 
 ### Module-level extras consumed by `docker/Dockerfile.ci.lts`.               ###
 ### They must stay defined on every branch that carries that Dockerfile, or   ###
 ### the LTS image build fails with "Extra `...` is not defined in the         ###
 ### project's `optional-dependencies` table".                                 ###
 te = [
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
+    "transformer-engine[pytorch,core_cu13]",
 ]
 
 ssm = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "flash-linear-attention==0.5.1",
+    "flash-linear-attention[tilelang]==0.5.1",
 ]
 
 [dependency-groups]
@@ -149,8 +149,9 @@ test = [
     "coverage",
     "nltk",
     "wrapt",
-    "pytest==8.3.5",
+    "pytest==9.1.1",
     "pytest-mock",
+    "mock",
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
@@ -160,6 +161,9 @@ test = [
     "pyyaml",
     "nemo-run",
 ]
+# GitHub CI installs Testmon at runtime for baseline and selective test modes.
+# Testmon remains inactive unless pytest receives a --testmon option.
+testmon = ["pytest-testmon==2.2.0"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -175,7 +179,8 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",              # for TE
+    "nvidia-cudnn-frontend>=1.29.0",  # for TE
+    "nvidia-mathdx",                  # for TE
 ]
 linting = [
     "ruff~=0.9.0",
@@ -185,20 +190,25 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
+batch_invariant = ["deep_gemm", "fast-hadamard-transform"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm", "fast-hadamard-transform"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
+# CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
+constraint-dependencies = ["quack-kernels>=0.6.5"]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
+    "deep_gemm",
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
-conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
+# The Mamba revision retained from main pins an older TileLang/TVM FFI family.
+# Override those transitive constraints for cuDNN Frontend 1.28 compatibility.
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch, 
 # torchvision, and triton.
@@ -206,9 +216,15 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    "tilelang==0.1.12",
+    "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
+
+# Static metadata from the immutable source revisions below. This avoids executing
+# CUDA extension builds merely to discover dependencies during lock resolution.
+# Keep each record aligned with its source pyproject.toml/setup.py when updating pins.
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"
@@ -217,16 +233,20 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.14.0+f031cf87"
+version = "2.20.2+6ea2a74a"
 requires-dist = [
-    "einops",
-    "importlib-metadata",
-    "nvdlfw-inspect",
-    "onnx",
-    "onnxscript",
+    # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
+    # RunnablePassthrough() instantiation, which is imported transitively in
+    # downstream consumers (e.g. Megatron-Bridge via nvidia-resiliency-ext).
+    "pydantic<2.14",
+    "importlib-metadata>=1.0",
     "packaging",
-    "pydantic",
-    "torch",
+    "torch>=2.1",
+    "einops",
+    "onnxscript",
+    "onnx",
+    "nvdlfw-inspect",
+    "nvidia-cudnn-frontend>=1.29.0",
 ]
 
 [[tool.uv.dependency-metadata]]
@@ -234,21 +254,62 @@ name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
 
+[[tool.uv.dependency-metadata]]
+name = "nemo-run"
+version = "0.11.0+e393539"
+requires-dist = ["inquirerpy>=0.3.4", "catalogue>=2.0.10", "fabric>=3.2.2", "fiddle>=0.3.0", "torchx>=0.7.0", "typer>=0.12.3", "rich>=13.7.1", "jinja2>=3.1.4", "networkx >= 3.3", "omegaconf>=2.3.0", "leptonai>=0.26.6", "toml", "skypilot[kubernetes]>=0.10.0; extra == 'skypilot'", "skypilot[all]>=0.10.0; extra == 'skypilot-all'", "kubernetes; extra == 'ray'", "ray[default]>=2.49.2; extra == 'ray'", "kubernetes; extra == 'kubeflow'"]
+requires-python = ">= 3.10"
+provides-extras = ["skypilot", "skypilot-all", "ray", "kubeflow"]
+
+[[tool.uv.dependency-metadata]]
+name = "nemo-lens"
+version = "0.2.0+b85578f"
+requires-dist = ["opentelemetry-api>=1.20.0", "opentelemetry-sdk>=1.20.0; extra == 'sdk'", "opentelemetry-exporter-otlp-proto-grpc>=1.20.0; extra == 'sdk'", "opentelemetry-exporter-otlp-proto-http>=1.20.0; extra == 'sdk'", "nemo-lens[sdk]; extra == 'fastapi'", "opentelemetry-instrumentation-fastapi>=0.40b0; extra == 'fastapi'", "nemo-lens[sdk]; extra == 'aiohttp'", "opentelemetry-instrumentation-aiohttp-client>=0.40b0; extra == 'aiohttp'"]
+requires-python = ">=3.12"
+provides-extras = ["sdk", "fastapi", "aiohttp"]
+
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.2.post1"
+requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi<=0.1.9", "quack-kernels>=0.3.4", "triton>=3.5.0", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0", "causal-conv1d>=1.2.0; extra == 'causal-conv1d'", "pytest; extra == 'dev'"]
+requires-python = ">= 3.9"
+provides-extras = ["causal-conv1d", "dev"]
+
+[[tool.uv.dependency-metadata]]
+name = "emerging-optimizers"
+version = "0.3.0"
+requires-dist = ["torch", "absl-py"]
+requires-python = ">=3.12"
+
+[[tool.uv.dependency-metadata]]
+name = "deep-gemm"
+version = "2.5.0+local"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "torch-memory-saver"
+version = "0.0.10b1"
+requires-dist = []
+requires-python = ">=3.9"
+
 [tool.uv.sources]
 
 flash_mla = [
-    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" },
 ]
-nvidia-cudnn-frontend = { git = "https://github.com/NVIDIA/cudnn-frontend.git", rev = "develop" }
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
-nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
+deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "714dd1a4a980f7937a74343d19a8eba4fe321480" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "6ea2a74a9e98c99e6d7b164a33775cc457520027" }
+nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "e3935393a290aed1822af52139b4b8ee270fed1f" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
+torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "9bc9a442e6d108c7b7903def199896a005143aaf" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters
-py_version = 310                                                           # python 3.10 as a target version
+py_version = 312                                                           # python 3.10 as a target version
 known_first_party = ["megatron"]                                           # FIRSTPARTY section
 known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
@@ -287,10 +348,11 @@ omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
+    "/opt/megatron-lm/_remote_module_non_scriptable",
     # These fused paths are mostly Triton DSL kernels and PyTorch
     # autograd-engine callbacks. The CUDA code is exercised by unit tests,
     # but coverage.py cannot reliably trace those execution contexts.
-    "*/megatron/core/fusions/*",
+    "/opt/megatron-lm/megatron/core/fusions/*",
 ]
 parallel = true
 sigterm = false

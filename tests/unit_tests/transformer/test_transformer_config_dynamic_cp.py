@@ -10,7 +10,13 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig, T
 
 
 def _make_config(**overrides):
-    kwargs = dict(num_layers=2, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True)
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        max_seqlen_per_dp_cp_rank=128,
+    )
     variant = overrides.get("experimental_attention_variant")
     if variant in ("gdn", "kda"):
         kwargs.update(
@@ -89,13 +95,14 @@ def test_cp_layout_compatibility(cp_config, overrides, error):
 @pytest.mark.parametrize("variant", ["gdn", "kda"])
 @pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise", "invalid", None])
 def test_gdn_cp_mode(cp_config, variant, linear_cp_mode):
-    error = linear_cp_mode not in ("headwise", "chunkwise")
+    error = linear_cp_mode not in ("headwise", "chunkwise", None)
     with (
         pytest.raises(ValueError, match="linear_cp_mode must be either") if error else nullcontext()
     ):
-        _make_config(
+        config = _make_config(
             **cp_config, experimental_attention_variant=variant, linear_cp_mode=linear_cp_mode
         )
+        assert config.linear_cp_mode == (linear_cp_mode or "chunkwise")
 
 
 @pytest.mark.parametrize("variant", ["gdn", "kda"])

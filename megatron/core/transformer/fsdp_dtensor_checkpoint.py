@@ -44,9 +44,31 @@ except ImportError:
     HAVE_MEGATRON_FSDP = False
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.validation import StrictHandling, parse_strict_flag
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
+
+
+def _strip_wrapper_prefixes(path):
+    """Strip DDP/FSDP wrapper prefixes (module., model.) from a module or state dict path."""
+    parts = path.split('.')
+    while parts and parts[0] in ('module', 'model'):
+        parts = parts[1:]
+    return '.'.join(parts)
+
+
+def _intersect_slice(s1, s2):
+    """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
+    start = max(s1.start, s2.start)
+    stop = min(s1.stop, s2.stop)
+    return slice(0, 0) if start >= stop else slice(start, stop)
+
+
+def _shift_slice(s, offset):
+    """Move a step-1 slice by ``offset``, e.g. to rebase it onto a shard's local storage."""
+    return slice(s.start + offset, s.stop + offset)
 
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
@@ -215,21 +237,16 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # layers have gated_linear_unit=False while language decoder layers
     # have gated_linear_unit=True.
     # ------------------------------------------------------------------
-    def _strip_wrappers(path):
-        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
-        parts = path.split('.')
-        while parts and parts[0] in ('module', 'model'):
-            parts = parts[1:]
-        return '.'.join(parts)
-
     _layer_glu = {}
     for name, module in model.named_modules():
         if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrappers(name)] = getattr(module.config, 'gated_linear_unit', False)
+            _layer_glu[_strip_wrapper_prefixes(name)] = getattr(
+                module.config, 'gated_linear_unit', False
+            )
 
     def _key_in_glu_layer(key):
         """Return True if *key* belongs to a TransformerLayer with gated_linear_unit=True."""
-        norm_key = _strip_wrappers(key)
+        norm_key = _strip_wrapper_prefixes(key)
         best_glu, best_len = None, -1
         for layer_path, uses_glu in _layer_glu.items():
             if norm_key.startswith(layer_path + '.') and len(layer_path) > best_len:
@@ -237,17 +254,6 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if best_glu is None:
             return True  # no TransformerLayer found — assume GLU for backward compat
         return best_glu
-
-    def intersection(s1, s2):
-        # Only works for step=1
-        start = max(s1.start, s2.start)
-        stop = min(s1.stop, s2.stop)
-        if start >= stop:
-            return slice(0, 0)  # Empty slice if no intersection
-        return slice(start, stop)
-
-    def offset_slice(s, offset):
-        return slice(s.start + offset, s.stop + offset)
 
     def is_swiglu_key(key):
         """
@@ -319,10 +325,10 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             )
             local_tensor = data
         weight_w = local_tensor.view(-1)[
-            offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
+            _shift_slice(_intersect_slice(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
         weight_v = local_tensor.view(-1)[
-            offset_slice(intersection(fsdp_slice, v_slice), -fsdp_slice.start)
+            _shift_slice(_intersect_slice(fsdp_slice, v_slice), -fsdp_slice.start)
         ]
         weight_w = weight_w.reshape(view_shape)
         weight_v = weight_v.reshape(view_shape)
@@ -413,10 +419,15 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     return model_state_dict, optimizer_state_dict
 
 
-def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
+def handle_gdn_in_state_dict(
+    model, model_state_dict, optimizer_state_dict, *, checkpoint_keys=None, checkpoint_tp_size=None
+):
     """Handle GDN (Gated DeltaNet) fused projections in model and optimizer state dicts.
 
-    GDN layers fuse query/key/value/gate/beta/alpha projections into a single
+    GDN-family layers publish their variant-specific projection names and TP-local
+    section sizes. GDN1 uses query/key/value/z/beta/alpha, KDA uses
+    query/key/value/g/gate, and GDN2 uses query/key/value/z/f/b/w.
+    These layers fuse their input projections into a single
     ``in_proj.weight`` ColumnParallelLinear, and query/key/value into ``conv1d``
     (weight + optional bias).  For FSDP checkpoints these fused tensors must be
     split back into their constituent sub-tensors so that each can be
@@ -437,13 +448,6 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     GDN_IN_PROJ_NAMES = ["query", "key", "value", "z", "beta", "alpha"]
     GDN_CONV1D_NAMES = ["query", "key", "value"]
 
-    def _strip_wrappers(path):
-        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
-        parts = path.split('.')
-        while parts and parts[0] in ('module', 'model'):
-            parts = parts[1:]
-        return '.'.join(parts)
-
     # ------------------------------------------------------------------
     # Build per-GDN-module split-size map by walking the model tree.
     # GDN modules are identified by the presence of qk_dim / v_dim /
@@ -457,8 +461,25 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         qk = mod.qk_dim // tp
         v = mod.v_dim // tp
         nvh = mod.num_value_heads // tp
-        _gdn_info[_strip_wrappers(name)] = {
-            'in_proj_sizes': [qk, qk, v, v, nvh, nvh],
+        in_proj_names = getattr(mod, 'in_proj_split_names', None)
+        in_proj_sizes = getattr(mod, 'in_proj_split_sections', None)
+        if in_proj_names is None and in_proj_sizes is None:
+            # Compatibility with older GDN modules that predate the family metadata.
+            in_proj_names = GDN_IN_PROJ_NAMES
+            in_proj_sizes = [qk, qk, v, v, nvh, nvh]
+        elif in_proj_names is None or in_proj_sizes is None:
+            raise ValueError("GDN-family checkpoint splitting requires both names and sections.")
+        if (
+            len(in_proj_names) != len(in_proj_sizes)
+            or len(set(in_proj_names)) != len(in_proj_names)
+            or any(size <= 0 for size in in_proj_sizes)
+            or sum(in_proj_sizes) != mod.in_proj_dim // tp
+        ):
+            raise ValueError(f"Invalid GDN-family in_proj checkpoint split metadata for {name}.")
+        _gdn_info[_strip_wrapper_prefixes(name)] = {
+            'in_proj_sizes': list(in_proj_sizes),
+            'in_proj_names': list(in_proj_names),
+            'tp_size': tp,
             'conv1d_sizes': [qk, qk, v],
         }
 
@@ -468,24 +489,40 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     def _match_gdn_key(key):
         """Return (split_sizes, sub_names, split_dim) if *key* is a GDN fused
         parameter that needs splitting, else ``None``."""
-        norm = _strip_wrappers(key)
+        norm = _strip_wrapper_prefixes(key)
         for gdn_path, info in _gdn_info.items():
             if not norm.startswith(gdn_path + '.'):
                 continue
             rel = norm[len(gdn_path) + 1 :]
             if rel == 'in_proj.weight':
-                return info['in_proj_sizes'], GDN_IN_PROJ_NAMES, 0
+                return info['in_proj_sizes'], info['in_proj_names'], 0
             if rel in ('conv1d.weight', 'conv1d.bias'):
                 return info['conv1d_sizes'], GDN_CONV1D_NAMES, 0
         return None
 
-    def intersection(s1, s2):
-        start = max(s1.start, s2.start)
-        stop = min(s1.stop, s2.stop)
-        return slice(0, 0) if start >= stop else slice(start, stop)
+    mtp_paths = get_mtp_inner_layer_paths(model) if checkpoint_keys is not None else []
 
-    def offset_slice(s, offset):
-        return slice(s.start + offset, s.stop + offset)
+    def keep_legacy_fused_key(key, names, *, optimizer=False):
+        """Read older unsplit FSDP checkpoints without changing their tensor namespace."""
+        if checkpoint_keys is None:
+            return False
+        disk_key = next(iter(rename_mtp_inner_layer_keys({key: None}, mtp_paths)))
+        prefix = ("optimizer.state." if optimizer else "model.") + disk_key
+        suffix = ".exp_avg" if optimizer else ""
+        keep_fused = prefix + suffix in checkpoint_keys and not any(
+            prefix + "." + name + suffix in checkpoint_keys for name in names
+        )
+        if keep_fused and checkpoint_tp_size is not None:
+            normalized_key = _strip_wrapper_prefixes(key)
+            for path, info in _gdn_info.items():
+                if normalized_key.startswith(path + '.') and info['tp_size'] != checkpoint_tp_size:
+                    raise RuntimeError(
+                        "Legacy fused GDN-family FSDP checkpoints require the saved "
+                        "tensor-parallel "
+                        "size. Load and save once at the original TP size to produce component "
+                        "keys before resharding."
+                    )
+        return keep_fused
 
     def split_gdn_fused(data, dist_param, split_sizes, split_dim):
         """Split a fused GDN projection DTensor into per-component DTensors.
@@ -547,8 +584,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             comp_flat = s * elems_per_unit
             comp_slice = slice(flat_offset, flat_offset + comp_flat)
 
-            shard = intersection(fsdp_slice, comp_slice)
-            comp_data = local_tensor.view(-1)[offset_slice(shard, -fsdp_slice.start)]
+            shard = _intersect_slice(fsdp_slice, comp_slice)
+            comp_data = local_tensor.view(-1)[_shift_slice(shard, -fsdp_slice.start)]
 
             comp_view = list(view_shape)
             comp_view[split_dim] = -1
@@ -580,6 +617,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
+        if keep_legacy_fused_key(key, names):
+            continue
         dist_param = model.get_parameter(f"module.{key}")
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
@@ -605,6 +644,9 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     new_opt_state[key] = opt_state[key]
                     continue
                 sizes, names, dim = match
+                if keep_legacy_fused_key(key, names, optimizer=True):
+                    new_opt_state[key] = opt_state[key]
+                    continue
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
@@ -613,6 +655,296 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
             optimizer_state_dict["state"] = new_opt_state
+
+    return model_state_dict, optimizer_state_dict
+
+
+def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False, split_dim=0):
+    """Split a fused Megatron-FSDP parameter along ``split_dim`` into per-section DTensors.
+
+    ``split_sizes`` are given in full, tensor-parallel-unsharded units along ``split_dim``
+    (so they can be taken straight from the module config) and are scaled down to this
+    rank's TP shard internally.
+
+    The returned DTensors alias the fused parameter's storage, so a save reads the fused
+    values and an in-place load writes back into the fused parameter.
+
+    Same flat-slice arithmetic as :func:`handle_swiglu_in_state_dict`, generalized from an
+    even two-way split to arbitrary section sizes.
+    """
+    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    fsdp_slice = dist_param.megatron_fsdp_slice
+    dist_index = dist_param.megatron_fsdp_dist_index
+    tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=is_expert_param)
+
+    per_tp_rank_shape = list(data.shape)
+    if is_mcore_tensor_model_parallel(dist_param):
+        tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
+        assert tp_dim is not None, "Tensor model parallel dimension not found"
+        per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
+
+    total_full = sum(split_sizes)
+    assert data.shape[split_dim] == total_full, (
+        f"Fused parameter is {data.shape[split_dim]} wide along dim {split_dim}, "
+        f"but the requested sections sum to {total_full}"
+    )
+
+    local_total = per_tp_rank_shape[split_dim]
+    local_sizes = []
+    for size in split_sizes:
+        assert (size * local_total) % total_full == 0, (
+            f"Section of size {size} does not divide evenly across the tensor-parallel "
+            f"group (fused dim {total_full} -> {local_total} on this rank)"
+        )
+        local_sizes.append(size * local_total // total_full)
+
+    data_size = 1
+    for dim_size in per_tp_rank_shape:
+        data_size *= dim_size
+    elems_per_unit = data_size // local_total
+
+    local_tensor = data.to_local()
+    view_shape = list(per_tp_rank_shape)
+    view_shape[split_dim] = -1
+
+    results = []
+    flat_offset = 0
+    for local_size in local_sizes:
+        section_numel = local_size * elems_per_unit
+        section_slice = slice(flat_offset, flat_offset + section_numel)
+
+        shard = _intersect_slice(fsdp_slice, section_slice)
+        section_data = local_tensor.view(-1)[_shift_slice(shard, -fsdp_slice.start)]
+        section_data = section_data.reshape(view_shape)
+
+        # A meta tensor carries the unsharded shape and TP attributes of the section.
+        meta_shape = list(per_tp_rank_shape)
+        meta_shape[split_dim] = local_size
+        section_meta = torch.empty(*meta_shape, device="meta")
+        copy_tensor_model_parallel_attributes(section_meta, dist_param)
+
+        results.append(
+            make_fsdp_dtensor(
+                section_data.data,
+                section_meta,
+                dist_index=dist_index,
+                is_expert_param=is_expert_param,
+                run_check=True,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+        )
+        flat_offset += section_numel
+
+    return results
+
+
+# The single down-projection registered by FusedMLASelfAttention, and the two separate
+# projections registered by the unfused MLASelfAttention it replaces.
+MLA_FUSED_DOWN_PROJ = 'linear_qkv_down_proj'
+MLA_UNFUSED_DOWN_PROJS = ('linear_q_down_proj', 'linear_kv_down_proj')
+
+
+def get_mla_fused_down_proj_splits(model):
+    """Map each FusedMLASelfAttention module path to its ``[q, kv]`` down-proj split sizes.
+
+    Sizes match ``FusedMLASelfAttention.sharded_state_dict`` and are expressed in full,
+    tensor-parallel-unsharded units. Returns an empty dict for unfused models.
+    """
+    splits = {}
+    for name, mod in model.named_modules():
+        if not hasattr(mod, MLA_FUSED_DOWN_PROJ):
+            continue
+        config = mod.config
+        splits[_strip_wrapper_prefixes(name)] = [
+            config.q_lora_rank,
+            config.kv_lora_rank + config.qk_pos_emb_head_dim,
+        ]
+    return splits
+
+
+def match_mla_fused_down_proj_key(key, fused_splits):
+    """Match a state dict key against the fused MLA down-projections in ``fused_splits``.
+
+    Returns ``(wrapper, attention_path, split_sizes, leaf)`` where ``wrapper`` is the
+    stripped ``module.``/``model.`` prefix and ``leaf`` is the part after the fused module
+    name, or ``None`` when the key is not a fused down-projection.
+    """
+    norm = _strip_wrapper_prefixes(key)
+    for attention_path, split_sizes in fused_splits.items():
+        fused_prefix = f'{attention_path}.{MLA_FUSED_DOWN_PROJ}.'
+        if norm.startswith(fused_prefix):
+            wrapper = key[: len(key) - len(norm)]
+            return wrapper, attention_path, split_sizes, norm[len(fused_prefix) :]
+    return None
+
+
+def absorbed_input_layernorm_key(wrapper, attention_path, leaf):
+    """Rewrite a ``layer_norm_*`` leaf absorbed by the fused down-proj to ``input_layernorm.*``.
+
+    With ``fuse_input_layernorm``, the fused module owns the layer's input layernorm as
+    ``layer_norm_weight``/``layer_norm_bias``; on disk it lives one level up under
+    ``input_layernorm``, per the layer spec's ``sharded_state_dict_keys_map``.
+    """
+    assert '.' in attention_path, (
+        f"Cannot locate the transformer layer owning {attention_path}.{leaf}; expected the "
+        f"attention module to be nested inside it."
+    )
+    layer_path = attention_path.rsplit('.', 1)[0]
+    return f'{wrapper}{layer_path}.input_layernorm.{leaf[len("layer_norm_"):]}'
+
+
+def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Rewrite a fused MLA down-projection into the unfused layout used on disk.
+
+    ``mla_down_proj_fusion=True`` swaps ``MLASelfAttention`` for ``FusedMLASelfAttention``,
+    replacing ``linear_q_down_proj`` and ``linear_kv_down_proj`` with a single
+    ``linear_qkv_down_proj`` holding their row-concatenation, and on the Transformer Engine
+    backend also absorbing the layer's ``input_layernorm`` into it as ``layer_norm_*``.
+
+    ``FusedMLASelfAttention.sharded_state_dict`` hides both changes from ``torch_dist``
+    checkpoints so fused and unfused runs share one on-disk format. The Megatron-FSDP path
+    builds its keys from ``named_parameters()`` and never calls ``sharded_state_dict``, so
+    the same remapping is applied here.
+
+    No-op for unfused models.
+    """
+    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    fused_splits = get_mla_fused_down_proj_splits(model)
+    if not fused_splits:
+        return model_state_dict, optimizer_state_dict
+
+    rewritten = 0
+
+    model_state_dict = model_state_dict.copy()
+    for key in list(model_state_dict.keys()):
+        match = match_mla_fused_down_proj_key(key, fused_splits)
+        if match is None:
+            continue
+        wrapper, attention_path, split_sizes, leaf = match
+
+        if leaf.endswith('_extra_state'):
+            # Not a tensor; handle_fp8_extra_state_case drops these beforehand.
+            continue
+
+        if leaf.startswith('layer_norm_'):
+            new_key = absorbed_input_layernorm_key(wrapper, attention_path, leaf)
+            model_state_dict[new_key] = model_state_dict.pop(key)
+            rewritten += 1
+            continue
+
+        sections = split_fused_fsdp_param(
+            model_state_dict[key], model.get_parameter(f'module.{key}'), split_sizes
+        )
+        for proj_name, section in zip(MLA_UNFUSED_DOWN_PROJS, sections):
+            model_state_dict[f'{wrapper}{attention_path}.{proj_name}.{leaf}'] = section
+        del model_state_dict[key]
+        rewritten += 1
+
+    if rewritten:
+        logger.info(
+            f"[MLA] Rewrote {rewritten} fused {MLA_FUSED_DOWN_PROJ} key(s) across "
+            f"{len(fused_splits)} attention module(s) into the unfused layout."
+        )
+
+    if optimizer_state_dict is not None and len(optimizer_state_dict.get("state", {})) != 0:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        optimizer_state = optimizer_state_dict["state"]
+        new_optimizer_state = {}
+        for key in list(optimizer_state.keys()):
+            match = match_mla_fused_down_proj_key(key, fused_splits)
+            if match is None:
+                new_optimizer_state[key] = optimizer_state[key]
+                continue
+            wrapper, attention_path, split_sizes, leaf = match
+
+            if leaf.startswith('layer_norm_'):
+                # Absorbed input layernorm: moved, not split.
+                new_key = absorbed_input_layernorm_key(wrapper, attention_path, leaf)
+                new_optimizer_state[new_key] = optimizer_state[key]
+                continue
+
+            new_keys = [
+                f'{wrapper}{attention_path}.{proj_name}.{leaf}'
+                for proj_name in MLA_UNFUSED_DOWN_PROJS
+            ]
+            for new_key in new_keys:
+                new_optimizer_state[new_key] = optimizer_state[key].copy()
+            dist_param = model.get_parameter(key[len("module.") :])
+            for subkey in ["exp_avg", "exp_avg_sq"]:
+                sections = split_fused_fsdp_param(
+                    optimizer_state[key][subkey], dist_param, split_sizes
+                )
+                for new_key, section in zip(new_keys, sections):
+                    new_optimizer_state[new_key][subkey] = section
+        optimizer_state_dict["state"] = new_optimizer_state
+
+    return model_state_dict, optimizer_state_dict
+
+
+# MCore renamed MultiTokenPredictionLayer's inner transformer layer; checkpoints keep the
+# original name.
+MTP_INNER_LAYER = 'mtp_model_layer'
+MTP_INNER_LAYER_CHECKPOINT_NAME = 'transformer_layer'
+
+
+def get_mtp_inner_layer_paths(model):
+    """Paths of MTP layers whose inner layer is renamed on disk.
+
+    Mamba MTP layers (``mtp_layer_pattern`` set) are excluded, matching
+    ``MultiTokenPredictionLayer.sharded_state_dict``: for them ``mtp_model_layer`` is
+    already the native checkpoint name.
+    """
+    return [
+        _strip_wrapper_prefixes(name)
+        for name, mod in model.named_modules()
+        if hasattr(mod, MTP_INNER_LAYER) and getattr(mod, 'mtp_layer_pattern', None) is None
+    ]
+
+
+def rename_mtp_inner_layer_keys(state_dict, mtp_layer_paths):
+    """Rename ``mtp_model_layer.*`` keys to ``transformer_layer.*`` under ``mtp_layer_paths``."""
+    state_dict = state_dict.copy()
+    for key in list(state_dict.keys()):
+        norm = _strip_wrapper_prefixes(key)
+        for mtp_path in mtp_layer_paths:
+            current_prefix = f'{mtp_path}.{MTP_INNER_LAYER}.'
+            if not norm.startswith(current_prefix):
+                continue
+            wrapper = key[: len(key) - len(norm)]
+            leaf = norm[len(current_prefix) :]
+            new_key = f'{wrapper}{mtp_path}.{MTP_INNER_LAYER_CHECKPOINT_NAME}.{leaf}'
+            state_dict[new_key] = state_dict.pop(key)
+            break
+    return state_dict
+
+
+def handle_mtp_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Rename MTP inner-layer keys to the ``transformer_layer`` name used on disk.
+
+    ``MultiTokenPredictionLayer.sharded_state_dict`` remaps ``mtp_model_layer.*`` back to
+    ``transformer_layer.*`` so GPT MTP checkpoints written before the rename keep loading.
+    The Megatron-FSDP path never calls ``sharded_state_dict``, so the same mapping is
+    applied here.
+
+    No-op for models without MTP layers.
+    """
+    mtp_layer_paths = get_mtp_inner_layer_paths(model)
+    if not mtp_layer_paths:
+        return model_state_dict, optimizer_state_dict
+
+    model_state_dict = rename_mtp_inner_layer_keys(model_state_dict, mtp_layer_paths)
+    logger.info(
+        f"[MTP] Renamed {MTP_INNER_LAYER} -> {MTP_INNER_LAYER_CHECKPOINT_NAME} for "
+        f"{len(mtp_layer_paths)} MTP layer(s)."
+    )
+
+    if optimizer_state_dict is not None and len(optimizer_state_dict.get("state", {})) != 0:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        optimizer_state_dict["state"] = rename_mtp_inner_layer_keys(
+            optimizer_state_dict["state"], mtp_layer_paths
+        )
 
     return model_state_dict, optimizer_state_dict
 
@@ -677,6 +1009,108 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict, limit=100):
         load_shape = v_load.shape if hasattr(v_load, "shape") else type(v_load)
         if meta_shape != load_shape:
             logger.info(f"  {k}: meta shape={meta_shape}, load shape={load_shape}")
+
+
+# Top-level sections holding model weights: "model" for a single chunk, "model0", "model1",
+# ... with virtual pipeline parallelism.
+_MODEL_SECTION_PATTERN = re.compile(r'^model\d*\.')
+
+
+def get_unexpected_model_keys(state_dict_metadata, load_state_dict):
+    """Model weights this rank requests that the checkpoint does not contain.
+
+    "Unexpected" follows :class:`~megatron.core.dist_checkpointing.validation.StrictHandling`:
+    keys accessed locally but absent from the checkpoint. The opposite direction (keys the
+    checkpoint holds that this rank does not request) is *not* reported, because that is
+    normal under pipeline, tensor and expert parallelism where every rank loads a subset of
+    the global checkpoint.
+
+    Only the ``model`` sections are inspected, so optimizer and RNG state that is
+    intentionally absent does not count. Transformer Engine ``_extra_state`` entries are
+    skipped because they are dropped from both sides before saving and loading.
+    """
+    metadata_keys = set(flatten_state_dict(state_dict_metadata).keys())
+    return {
+        key
+        for key in flatten_state_dict(load_state_dict)
+        if _MODEL_SECTION_PATTERN.match(key)
+        and not key.endswith('._extra_state')
+        and key not in metadata_keys
+    }
+
+
+def validate_fsdp_dtensor_model_load(
+    state_dict_metadata,
+    load_state_dict,
+    checkpoint_path,
+    strict=StrictHandling.RAISE_UNEXPECTED,
+    max_reported=20,
+):
+    """Report model weights that an ``fsdp_dtensor`` load cannot supply.
+
+    Torch DCP loads with ``allow_partial_load=True`` skip such keys silently, leaving those
+    parameters at their initialized values. That does not crash; it surfaces much later as
+    a convergence regression, so by default fail here instead.
+
+    Only "unexpected" keys are determined (see :func:`get_unexpected_model_keys`), so the
+    ``*_ALL`` variants of ``strict`` behave like their ``*_UNEXPECTED`` counterparts;
+    identifying genuinely "missing" keys would require exchanging key sets across ranks.
+
+    ``ASSUME_OK_UNEXPECTED`` is treated as ``RAISE_UNEXPECTED`` here. It means "rely on the
+    underlying strategy to raise", which a partial DCP load never does, and it exists to skip
+    the extra disk access an explicit check normally costs — but the caller already holds the
+    checkpoint metadata, so this check is free. Use ``IGNORE_ALL`` to actually skip it.
+
+    Args:
+        state_dict_metadata: ``state_dict_metadata`` from the checkpoint's DCP metadata.
+        load_state_dict: state dict this rank is about to load into.
+        checkpoint_path: checkpoint location, for the error message.
+        strict (StrictHandling): how to handle a mismatch. Defaults to raising.
+        max_reported (int): cap on the number of keys named in the message.
+
+    Returns:
+        Set[str]: the unexpected model keys, empty when ``strict`` disables the check.
+
+    Raises:
+        CheckpointingException: if ``strict`` is a ``RAISE_*`` value and keys are missing.
+    """
+    strict = parse_strict_flag(strict)
+    if strict is StrictHandling.IGNORE_ALL:
+        return set()
+
+    unexpected_keys = get_unexpected_model_keys(state_dict_metadata, load_state_dict)
+    if not unexpected_keys or strict in (
+        StrictHandling.RETURN_UNEXPECTED,
+        StrictHandling.RETURN_ALL,
+    ):
+        return unexpected_keys
+
+    reported = sorted(unexpected_keys)
+    truncated = (
+        f'\n  ... and {len(reported) - max_reported} more' if len(reported) > max_reported else ''
+    )
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    message = (
+        f"Megatron-FSDP checkpoint load is incomplete: rank {rank} requests "
+        f"{len(reported)} model parameter(s) not present in the checkpoint at "
+        f"{checkpoint_path}, which would silently keep their initialized values.\n"
+        + '\n'.join(f'  {key}' for key in reported[:max_reported])
+        + truncated
+        + "\nThe model's parameter names have diverged from the checkpoint's, typically "
+        "because of a fused vs. unfused module variant or a renamed submodule. "
+        "fsdp_dtensor checkpoints bypass sharded_state_dict(), so key remapping "
+        "implemented there does not apply; add the mapping to "
+        "preprocess_fsdp_dtensor_state_dict instead."
+    )
+
+    if strict in (
+        StrictHandling.ASSUME_OK_UNEXPECTED,
+        StrictHandling.RAISE_UNEXPECTED,
+        StrictHandling.RAISE_ALL,
+    ):
+        raise CheckpointingException(message)
+    logger.warning(message)
+    return unexpected_keys
 
 
 def validate_loaded_state_dict(state_dict, checkpoint_path):

@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_timers, print_rank_0
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import get_run_config
 from megatron.training.training import (
     evaluate_and_print_results,
     setup_model_and_optimizer,
@@ -161,6 +162,7 @@ def _train(
     end_of_epoch_callback,
 ):
     """Train the model."""
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
@@ -208,7 +210,7 @@ def _train(
 
             # Logging.
             params_norm = None
-            if args.log_params_norm:
+            if cfg.logger.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(
                 losses_dict,

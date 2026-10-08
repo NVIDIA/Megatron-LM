@@ -53,7 +53,8 @@ RL_LOGGABLE_TIMER_NAMES = [
     # Rollout collection breakdown
     "rl/inference-setup",
     "rl/collect-rollouts",
-    "rl/sync-rollouts",
+    "rl/sync-rollout-state",
+    "rl/sync-request-ledger",
     "rl/suspend-engine",
     # Optimizer offload/restore
     "rl/offload-optimizer-before-inference",
@@ -116,7 +117,7 @@ TIMER_HIERARCHY = {
     "rl/rollout-collection": [
         "rl/inference-setup",
         "rl/collect-rollouts",
-        "rl/sync-rollouts",
+        "rl/sync-rollout-state",
         "rl/suspend-engine",
         "rl/offload-optimizer-before-inference",
         "rl/restore-optimizer-after-inference",
@@ -535,7 +536,7 @@ class RLProfiler:
         phases["training"] = get_max("forward-backward")
 
         # Wait/sync time (proxy for load imbalance)
-        phases["sync_wait"] = get_max("rl/suspend-engine") + get_max("rl/sync-rollouts")
+        phases["sync_wait"] = get_max("rl/suspend-engine") + get_max("rl/sync-rollout-state")
 
         return phases
 
@@ -843,7 +844,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         ],
         "Logprobs Computation": ["rl/compute-old-logprobs", "rl/compute-ref-logprobs"],
         "Training": ["forward-backward"],
-        "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
+        "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollout-state"],
     }
 
     for phase_name, timer_list in phases.items():

@@ -322,7 +322,6 @@ def _write_jsonl(tmp_path: Path, rows):
 
 def test_low_level_loads_jsonl_alpaca(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -341,7 +340,6 @@ def test_low_level_loads_jsonl_alpaca(tmp_path):
 
 def test_low_level_loads_jsonl_sharegpt(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -360,7 +358,6 @@ def test_low_level_loads_jsonl_sharegpt(tmp_path):
 
 def test_low_level_loads_jsonl_messages(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -380,9 +377,8 @@ def test_low_level_loads_jsonl_messages(tmp_path):
 
 def test_low_level_jsonl_heterogeneous_columns(tmp_path):
     """Real datasets often mix rows that have / lack an optional field. Our
-    pandas-based loader must accept the union schema without ``CastError``."""
+    loader must accept the union schema without ``CastError``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     rows = [{"instruction": "a", "output": "x"}] * 100 + [
         {"instruction": "b", "output": "y", "file": "extra"}
     ] * 100
@@ -396,7 +392,6 @@ def test_low_level_jsonl_heterogeneous_columns(tmp_path):
 
 def test_low_level_rejects_unknown_schema(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(tmp_path, [{"foo": "bar"}])
     with pytest.raises(ValueError, match="cannot infer schema"):
         VarlenLowLevelDataset(path)
@@ -406,7 +401,6 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     """Pretrain-text corpora (Dolma / OLMo midtraining) typically have
     ``text`` + extra fields like ``id`` / ``url`` / ``metadata``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -978,6 +972,40 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
         # The DCP scheduler calls next(data_iterator) num_microbatches times;
+        # each loader step must therefore be one local microbatch, not all
+        # local samples from the global batch.
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+def test_packing_scheduler_dataloader_yields_microbatches():
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        num_microbatches = 3
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        n = gbs * 2
+        cfg = _make_config(tok, seq_length=64, dp=dp, cp=1)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(
+            _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
+        )
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # The packing scheduler calls next(data_iterator) num_microbatches times;
         # each loader step must therefore be one local microbatch, not all
         # local samples from the global batch.
         assert isinstance(batch, list)

@@ -17,8 +17,10 @@ from transformers import AutoModel
 from examples.multimodal.model import model_provider
 from examples.multimodal.multimodal_args import add_multimodal_extra_args
 from megatron.training import get_model
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -51,7 +53,9 @@ def run_mcore_vision(model_path):
         f"--pretrained-checkpoint={model_path}",
     ]
 
-    parse_and_validate_args(extra_args_provider=add_multimodal_extra_args)
+    args = parse_and_validate_args(extra_args_provider=add_multimodal_extra_args)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
     initialize_megatron()
 
     def wrapped_model_provider(pre_process, post_process):
