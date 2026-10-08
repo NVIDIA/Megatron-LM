@@ -774,42 +774,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if has_cross_attention or has_attention == has_mlp:
             return None
 
-        if has_attention:
-            output_with_bias, attn_norm_manager, residual = (
-                layer._forward_self_attention_output_with_bias(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    packed_seq_params=packed_seq_params,
-                    sequence_len_offset=sequence_len_offset,
-                    mhc_recompute_manager=mhc_recompute_manager,
-                )
-            )
-            output_with_bias = layer._group_offload_output_with_bias(
-                output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
-            )
-            return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
-
-        output_with_bias, residual = layer._forward_mlp_output_with_bias(
-            hidden_states,
+        output_with_bias = layer._forward_hybrid_branch_output_with_bias(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
             inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            sequence_len_offset=sequence_len_offset,
+            packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
             input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
             mhc_recompute_manager=mhc_recompute_manager,
         )
-        # This fast path bypasses TransformerLayer._forward_post_mlp(), which normally
-        # discards the selective pre-MLP layernorm checkpoint before MLP backward.
-        if layer.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
-        ):
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
-        if layer.mlp_norm_manager is not None:
-            output_with_bias = layer._group_offload_output_with_bias(
-                output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
-            )
-            layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
     def forward(
@@ -942,20 +917,13 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 class AttnResHybridLayer(MegatronModule):
     """Attention-residual wrapper for hybrid stack entries.
 
-    Wraps ANY hybrid entry (Mamba/GDN/KDA/attention/MLP/MoE — each entry is one
-    depth sublayer) with the AttnRes depth aggregation::
+    Split TransformerLayer entries run a raw attention or MLP branch on the
+    depth aggregate, then apply bias/dropout directly to the running partial
+    sum. This preserves BF16 rounding semantics and the inner module's hooks.
 
-        partial = None if block-start else hidden_states
-        h = AttentionResidual(sources [+ partial])
-        output = inner_layer(h, ...)   # inner adds its local residual to h
-        delta = output - h             # exact sublayer contribution
-        new_partial = delta (+ partial)
-
-    The delta reconstruction is exact because every hybrid entry computes
-    ``output = input + dropout(f(norm(input)) + bias)``, and both fused
-    residual norms and fp32 residual connections are rejected by the AttnRes
-    config validation. This mirrors HyperConnectionHybridLayer's generic inner
-    call — including the checkpoint-key nesting under ``inner_layer.``.
+    Other entry types retain the generic residual-difference path. Unlike a
+    raw branch, subtracting the aggregate from a rounded residual output can
+    introduce low-precision cancellation error.
     """
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule):
@@ -1005,6 +973,14 @@ class AttnResHybridLayer(MegatronModule):
         values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
         aggregated = self.attn_res(values)
 
+        raw_branch = (
+            isinstance(self.inner_layer, TransformerLayer)
+            and isinstance(self.inner_layer.cross_attention, IdentityOp)
+            and (
+                isinstance(self.inner_layer.self_attention, IdentityOp)
+                != isinstance(self.inner_layer.mlp, IdentityOp)
+            )
+        )
         if isinstance(self.inner_layer, TransformerLayer):
             output = self.inner_layer(
                 hidden_states=aggregated,
@@ -1016,6 +992,7 @@ class AttnResHybridLayer(MegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_attn_res_wrapper=True,
+                **({"_hybrid_attn_res_partial": partial} if raw_branch else {}),
             )
         else:
             # Non-transformer entries (e.g. MambaLayer) accept only the common
@@ -1029,9 +1006,12 @@ class AttnResHybridLayer(MegatronModule):
         if isinstance(output, tuple):
             output = output[0]
 
+        if raw_branch:
+            return output
+
         nvtx_range_push(msg="attn_res.hybrid_delta")
         # The inner entry added its local residual to `aggregated`; subtracting
-        # it back recovers exactly dropout(f(norm(h)) + bias).
+        # it back approximates dropout(f(norm(h)) + bias) for generic entries.
         delta = output - aggregated
         new_partial = delta if partial is None else partial + delta
         nvtx_range_pop(msg="attn_res.hybrid_delta")
