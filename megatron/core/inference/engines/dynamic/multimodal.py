@@ -16,9 +16,9 @@ from megatron.core.inference.inference_request import (
     compute_media_cache_key,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
-from .dynamic_engine_requests import _weight_scoped_salt
+from .requests import _weight_scoped_salt
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -143,6 +143,7 @@ class _VisionCacheEntry:
     video_fps: Optional[List[float]] = None
 
 
+@internal_api
 class MultimodalRequestMixin:
     """VLM request preparation and vision-embedding caching for `DynamicInferenceEngine`."""
 
