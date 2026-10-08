@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""train_step forwards p2p_communicator and schedule pg_collection to forward_backward_func."""
+"""Training-loop process-group plumbing tests."""
 
+import ast
+import inspect
+import textwrap
 from types import SimpleNamespace
 from unittest import mock
 
@@ -132,3 +135,81 @@ def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
         _run(model=model, optimizer=optimizer)
 
     optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+
+
+def test_gpu_sniff_uses_explicit_model_groups_without_mpu():
+    from megatron.training import gpu_sniff_test
+
+    groups = SimpleNamespace(ep=object(), dp=object(), tp=object())
+    with (
+        mock.patch.object(training_mod.ProcessGroupCollection, "use_mpu_process_groups") as mpu,
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod, "print_datetime"),
+        mock.patch.object(gpu_sniff_test, "run_gpu_sniff_test") as run,
+    ):
+        training_mod._run_gpu_sniff_test("startup", pg_collection=groups)
+
+    mpu.assert_not_called()
+    run.assert_called_once_with("startup", pg_collection=groups)
+
+
+def test_gpu_sniff_preserves_mpu_fallback_for_legacy_callers():
+    from megatron.training import gpu_sniff_test
+
+    groups = object()
+    with (
+        mock.patch.object(
+            training_mod.ProcessGroupCollection, "use_mpu_process_groups", return_value=groups
+        ) as mpu,
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod, "print_datetime"),
+        mock.patch.object(gpu_sniff_test, "run_gpu_sniff_test") as run,
+    ):
+        training_mod._run_gpu_sniff_test("legacy")
+
+    mpu.assert_called_once_with(required_pgs=["ep", "dp", "tp"])
+    assert run.call_args.kwargs["pg_collection"] is groups
+
+
+def test_periodic_gpu_sniff_uses_wrapped_model_groups():
+    groups = object()
+    model = [SimpleNamespace(module=SimpleNamespace(pg_collection=groups))]
+    args = SimpleNamespace(
+        train_sync_interval=None,
+        log_interval=1,
+        log_straggler=False,
+        check_weight_hash_across_dp_replicas_interval=None,
+        adlr_autoresume=False,
+        profile=False,
+        gpu_sniff_test_interval=10,
+        manual_gc=False,
+    )
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "_run_gpu_sniff_test") as run,
+    ):
+        training_mod.post_training_step_callbacks(model, None, None, 9, None, 0)
+        run.assert_not_called()
+        training_mod.post_training_step_callbacks(model, None, None, 10, None, 0)
+
+    run.assert_called_once_with("iteration      10", pg_collection=groups)
+
+
+def test_startup_gpu_sniff_uses_model_groups():
+    train_source = textwrap.dedent(inspect.getsource(training_mod.train))
+    train_tree = ast.parse(train_source)
+    startup_call = next(
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_run_gpu_sniff_test"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "before training"
+    )
+    pg_keyword = next(
+        keyword for keyword in startup_call.keywords if keyword.arg == "pg_collection"
+    )
+    assert isinstance(pg_keyword.value, ast.Name)
+    assert pg_keyword.value.id == "model_pg_collection"
