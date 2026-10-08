@@ -407,7 +407,9 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
         moe_shortcut_post_norm=True,
         is_hybrid_model=True,
         use_fused_weighted_squared_relu=True,
-        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm"],
+        wide_residual=object(),
+        residual_stream_recompute_num_layers=4,
+        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm", "residual_stream"],
         offload_modules=["core_attn", "shortcut_post_norm"],
     )
 
@@ -430,6 +432,8 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
     assert config.moe_shortcut_post_norm is False
     assert config.is_hybrid_model is False
     assert config.use_fused_weighted_squared_relu is False
+    assert config.wide_residual is None
+    assert config.residual_stream_recompute_num_layers is None
     assert config.recompute_modules == ["moe_act"]
     assert config.offload_modules == ["core_attn"]
 
@@ -470,6 +474,7 @@ def test_modality_configs_do_not_inherit_language_fp32_residuals():
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import mamba_stack_spec
     from megatron.core.models.mamba.mamba_model import MambaModel
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
@@ -483,6 +488,19 @@ def test_language_model_spec_builds_mamba():
     assert spec.params["config"].expert_tensor_parallel_size == 2
     assert spec.params["max_sequence_length"] == args.seq_length
     assert spec.params["logit_dtype"] is None
+    assert spec.params["mamba_stack_spec"] is mamba_stack_spec
+
+
+def test_language_model_spec_selects_static_wide_residual_stack():
+    """Wide-residual language configs select the matching static HybridStack spec."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L) + ["--wide-residual", "3"])
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["config"].wide_residual.num_streams == 3
+    assert spec.params["mamba_stack_spec"] is wide_residual_hybrid_stack_spec
 
 
 @pytest.mark.parametrize(

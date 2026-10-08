@@ -213,7 +213,9 @@ def create_args():
         ),  # mtp in the second last stage with no other layers
     ],
 )
-def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
+def test_forward_vpp(
+    create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp, run_config
+):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     args = create_args

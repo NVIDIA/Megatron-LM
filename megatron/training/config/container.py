@@ -23,6 +23,7 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -47,6 +48,9 @@ class ConfigContainerBase:
 
     def validate(self) -> None:
         """Run each sub-config's explicit validation before runtime initialization."""
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            rng.finalize_model_config(getattr(self, "model", None))
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)
@@ -262,6 +266,7 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
