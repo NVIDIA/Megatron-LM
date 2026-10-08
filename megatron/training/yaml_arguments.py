@@ -7,8 +7,9 @@ import dataclasses
 import json
 import os
 import re
-import torch
 import types
+
+import torch
 
 try:
     import yaml
@@ -22,8 +23,13 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.activations import squared_relu
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.training.argument_utils import (
+    _mfsdp_v2_disables_pipeline_output_dealloc,
+    _model_rng_config,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -406,13 +412,16 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
+    rng = _model_rng_config(args)
+    # Read the distributed-init args before the rebind below hides them.
+    disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
     
     # Hardcoded 
-    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['deallocate_pipeline_outputs'] = not disable_pipeline_output_dealloc
     kw_args['pipeline_dtype'] = kw_args['params_dtype']
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
     
@@ -422,8 +431,6 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     elif args.activation_func == "squaredrelu":
-        def squared_relu(x):
-            return torch.pow(F.relu(x), 2)
         kw_args['activation_func'] = squared_relu
     elif args.activation_func == "gelu":
         kw_args['activation_func'] = F.gelu
@@ -440,9 +447,11 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
-        return MLATransformerConfig(**kw_args)
+        config = MLATransformerConfig(**kw_args)
     else:
-        return TransformerConfig(**kw_args)
+        config = TransformerConfig(**kw_args)
+    rng.finalize_model_config(config)
+    return config
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
@@ -461,4 +470,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

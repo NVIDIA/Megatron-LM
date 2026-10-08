@@ -105,8 +105,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ inputs.is-maintainer && matrix.cloud == 'aws-h100' && 'nvidia-ci-aws-cpu'
+          || inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
+          || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      # GitHub dev CI runs on Hopper and Blackwell; other callers retain the Dockerfile default.
+      NVTE_CUDA_ARCHS: "90;100"
+      # Compile each TE source's GPU targets concurrently; the Dockerfile default keeps TE's serial
+      # nvcc --threads 1. CI-Events' megatron-lm build profiles pass the same value to keep hitting
+      # this cache.
+      NVTE_BUILD_THREADS_PER_JOB: "4"
+      # Opt-in nvcc threads for the DeepEP extensions (3 = their GPU targets) and the single nvcc
+      # call that builds nccl_m2n; the Dockerfile defaults keep nvcc's own. CI-Events passes the same.
+      DEEPEP_NVCC_THREADS: "3"
+      NCCL_M2N_NVCC_THREADS: "8"
     permissions:
       contents: read
       id-token: write
@@ -243,6 +257,8 @@ jobs:
               docker/.ngc_version.dev
               docker/common/install_nccl.sh
               docker/common/install_nccl_m2n.sh
+              docker/common/install_mok.sh
+              docker/patches/mok.patch
               docker/patches/deepep.patch
               docker/patches/deepep-nvshmem.patch
               megatron/core/__init__.py
@@ -266,6 +282,13 @@ jobs:
                 "build-arg:FROM_IMAGE_NAME=$FROM_IMAGE_NAME" \
                 "build-arg:IMAGE_TYPE=$IMAGE_TYPE" \
                 "automatic-build-arg:TARGETARCH=$TARGET_ARCH"
+              if [ "$CACHE_VARIANT" != "lts" ]; then
+                printf '%s\n' \
+                  "build-arg:NVTE_CUDA_ARCHS=$NVTE_CUDA_ARCHS" \
+                  "build-arg:NVTE_BUILD_THREADS_PER_JOB=$NVTE_BUILD_THREADS_PER_JOB" \
+                  "build-arg:DEEPEP_NVCC_THREADS=$DEEPEP_NVCC_THREADS" \
+                  "build-arg:NCCL_M2N_NVCC_THREADS=$NCCL_M2N_NVCC_THREADS"
+              fi
               sha256sum "${BUILD_INPUTS[@]}"
             } | sha256sum | cut -c1-32
           )
@@ -290,6 +313,12 @@ jobs:
           echo "key=$CACHE_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "target-build-hash=$TARGET_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        if: inputs.is-maintainer && (matrix.cloud == 'aws-h100' || matrix.cloud == 'gb-gpu')
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        env:
+          AWS_REGION: ${{ matrix.cloud == 'gb-gpu' && 'us-east-2' || 'us-east-1' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
@@ -331,6 +360,10 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
+            ${{ !inputs.lts && format('NVTE_CUDA_ARCHS={0}', env.NVTE_CUDA_ARCHS) || '' }}
+            ${{ !inputs.lts && format('NVTE_BUILD_THREADS_PER_JOB={0}', env.NVTE_BUILD_THREADS_PER_JOB) || '' }}
+            ${{ !inputs.lts && format('DEEPEP_NVCC_THREADS={0}', env.DEEPEP_NVCC_THREADS) || '' }}
+            ${{ !inputs.lts && format('NCCL_M2N_NVCC_THREADS={0}', env.NCCL_M2N_NVCC_THREADS) || '' }}
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false

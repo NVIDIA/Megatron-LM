@@ -35,6 +35,8 @@ from tests.unit_tests.dist_checkpointing import (
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
 
@@ -675,7 +677,15 @@ def _test_parallel_attention_correctness(
 @pytest.mark.parametrize("qk_layernorm", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt, sequence_packing, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
+    tmp_path_dist_ckpt,
+    sequence_packing,
+    apply_rope_fusion,
+    tp,
+    sp,
+    cp,
+    qk_layernorm,
+    output_gate,
+    run_config,
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
@@ -711,7 +721,7 @@ def test_parallel_attention_correctness(
 @pytest.mark.parametrize("sp", [True, False])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness_num_query_groups_less_than_tp_size(
-    tmp_path_dist_ckpt, sp, output_gate
+    tmp_path_dist_ckpt, sp, output_gate, run_config
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
