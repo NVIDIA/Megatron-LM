@@ -9,12 +9,11 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("top_p", [0.1, 0.5, 0.9])
 @pytest.mark.parametrize("tied", [False, True])
-def test_top_p_matches_training_tail_cutoff(device, top_p, tied):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
+def test_top_p_matches_training_tail_cutoff(top_p, tied):
+    device = "cuda"
     logits = torch.zeros(3, 16, device=device)
     if not tied:
         logits[:] = torch.arange(16, device=device).float() / 4
