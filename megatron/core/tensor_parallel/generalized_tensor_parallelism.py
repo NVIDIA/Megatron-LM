@@ -505,6 +505,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    pad_for_alignment=None,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -519,6 +520,9 @@ def configure_gtp_remat_from_recipe(
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
         pad_for_alignment=resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8),
     )
+    # An explicit override takes precedence over the shared recipe defaults.
+    if pad_for_alignment is not None:
+        update_gtp_config(pad_for_alignment=pad_for_alignment)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
