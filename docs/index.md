@@ -76,6 +76,7 @@ user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers
+developer/gdn_ew_fusion
 ```
 
 ```{toctree}
@@ -91,7 +92,6 @@ mcore-inference-user-guide
 :hidden:
 :caption: Observability
 
-user-guide/observability/index
 user-guide/observability/configuration
 user-guide/observability/span-groups
 user-guide/observability/metrics
@@ -108,7 +108,6 @@ developer/contribute
 developer/submit
 developer/oncall
 developer/generate_docs
-developer/gdn_ew_fusion
 ```
 
 ```{toctree}
