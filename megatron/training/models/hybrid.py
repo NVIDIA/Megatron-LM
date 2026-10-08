@@ -115,6 +115,27 @@ class HybridModelConfig(ModelConfig):
             self.transformer.finalize()
 
 
+def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
+    """Return the configured stack spec, or the default one for the transformer config."""
+    if model_config.hybrid_stack_spec is not None:
+        return model_config.hybrid_stack_spec
+    use_wide_residual = model_config.transformer.wide_residual is not None
+    if model_config.transformer.transformer_impl == "inference_optimized":
+        return (
+            wide_residual_hybrid_inference_stack_spec
+            if use_wide_residual
+            else hybrid_inference_stack_spec
+        )
+    if model_config.restore_modelopt_state:
+        if use_wide_residual:
+            raise NotImplementedError(
+                "wide_residual does not support ModelOpt HybridStack specs because they "
+                "do not statically construct wide-residual layer classes."
+            )
+        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
+    return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
+
+
 class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
     """Builder to construct Megatron Core Hybrid models.
 
@@ -153,30 +174,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Note:
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
-        hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        use_wide_residual = self._model_config.transformer.wide_residual is not None
-        if hybrid_stack_spec is None:
-            if self._model_config.transformer.transformer_impl == "inference_optimized":
-                hybrid_stack_spec = (
-                    wide_residual_hybrid_inference_stack_spec
-                    if use_wide_residual
-                    else hybrid_inference_stack_spec
-                )
-            elif self._model_config.restore_modelopt_state:
-                if use_wide_residual:
-                    raise NotImplementedError(
-                        "wide_residual does not support ModelOpt HybridStack specs because they "
-                        "do not statically construct wide-residual layer classes."
-                    )
-                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False, remap_te_layernorm=False
-                )
-            else:
-                hybrid_stack_spec = (
-                    wide_residual_hybrid_stack_spec
-                    if use_wide_residual
-                    else default_hybrid_stack_spec
-                )
+        hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (
             self._model_config.vocab_size is not None

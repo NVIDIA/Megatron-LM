@@ -127,7 +127,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 # Same routing inputs as the eager MoELayer.forward path: the padding mask is
                 # consumed by the router (dropless HybridEP excludes padded tokens).
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
+                probs, routing_map = layer.mlp.route(
+                    pre_mlp_layernorm_output, padding_mask, packed_seq_params=packed_seq_params
+                )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map, padding_mask
                 )

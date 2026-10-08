@@ -3588,35 +3588,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
 
-                # Flash-attn guard: if this chunk would leave exactly 1 token for the
-                # final chunk, reduce by 1 (or defer if we only have 1 computed token).
-                # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
-                # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
-                if not batch_invariant_mamba_prefill and remaining_len - prefill_chunk_length == 1:
-                    if computed_chunk > 1:
-                        prefill_chunk_length -= 1
-                    else:
-                        can_schedule = False
-                        break
-
-                # add_request recomputes the skip for this exact chunk and applies a
-                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
-                # 2 tokens (tight budget late in a batched step, or a prompt that is
-                # all-but-one cached) that clamp shrinks the skip and grows the computed
-                # count by up to one block, which can exceed the token budget
-                # (TokenOverflowError). Only then re-derive the exact effective length
-                # add_request will use and defer on overflow (a later full-budget step
-                # admits the request). For >= 2 computed tokens add_request computes
-                # exactly this chunk, which already fits the budget.
-                if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    actual_effective = self.context._compute_prefix_match(
-                        req, prefill_chunk_length
-                    ).effective_prefill_chunk_length
-                    if self.context.active_token_count + actual_effective > self.context.max_tokens:
-                        can_schedule = False
-                        break
-
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:

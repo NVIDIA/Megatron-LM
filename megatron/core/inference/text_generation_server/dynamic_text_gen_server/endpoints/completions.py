@@ -189,6 +189,7 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
+                detokenize_stop_sequence=bool(req.get("include_stop_str_in_output", False)),
                 termination_id=-1 if ignore_eos else None,
                 streaming_interval=int(req.get("streaming_interval", 1)),
             )
@@ -236,6 +237,7 @@ try:
                     skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                     num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                     stop_words=sampling_params.stop_words,
+                    detokenize_stop_sequence=sampling_params.detokenize_stop_sequence,
                     termination_id=sampling_params.termination_id,
                     # This endpoint always echoes prompt_token_ids in its response, so
                     # keep the prompt tokens on the payload (default is now to drop them).
