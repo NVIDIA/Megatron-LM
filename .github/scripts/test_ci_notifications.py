@@ -48,7 +48,7 @@ class TestScheduledNotification(unittest.TestCase):
             self.notify,
         )
         self.assertIn("needs-json: ${{ toJSON(needs) }}", self.notify)
-        self.assertIn("webhook: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}", self.notify)
+        self.assertIn("webhook: ${{ secrets.SLACK_WEBHOOK }}", self.notify)
         self.assertNotIn("checkout", self.notify)
         self.assertNotIn("run:", self.notify)
 
