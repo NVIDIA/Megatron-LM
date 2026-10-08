@@ -2057,6 +2057,15 @@ class TERowParallelLinear(TELinear):
         self._tp_group = tp_group
         gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
+        # Without TP there is no reduction to wait for, so TE can add the bias in the GEMM epilogue.
+        if (
+            config.row_parallel_bias_gemm_fusion
+            and skip_bias_add
+            and not is_expert
+            and get_pg_size(tp_group) == 1
+        ):
+            skip_bias_add = False
+
         super().__init__(
             input_size=input_size,
             output_size=output_size,

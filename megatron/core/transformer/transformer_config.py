@@ -565,6 +565,10 @@ class TransformerConfig(ModelParallelConfig):
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
     """If True, uses bias dropout fusion."""
 
+    row_parallel_bias_gemm_fusion: bool = False
+    """If True and the tensor parallel size is 1, row-parallel TE linear layers add their bias in
+    the GEMM epilogue instead of returning it for the bias-dropout-add."""
+
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
 
