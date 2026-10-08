@@ -30,6 +30,19 @@ Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
+class Range:
+    """Contiguous element range in a caller-defined coordinate system."""
+
+    start: int
+    numel: int
+
+    @property
+    def end(self) -> int:
+        """Exclusive end of the range."""
+        return self.start + self.numel
+
+
+@dataclasses.dataclass(frozen=True)
 class GlobalLayout:
     """Global tensor layout in element coordinates.
 
@@ -272,14 +285,6 @@ class GlobalLayout:
     def __post_init__(self) -> None:
         """Validate offsets are in bounds and tensor ranges do not overlap."""
 
-        @dataclasses.dataclass(frozen=True)
-        class TensorRange:
-            """Contiguous global element range occupied by one logical tensor."""
-
-            start: int
-            end: int
-            tensor_id: int
-
         if self.size < 0:
             raise AssertionError(f"Global layout size {self.size} is negative.")
         if len(self.tensor_shapes) != len(self.tensor_to_offset):
@@ -295,32 +300,31 @@ class GlobalLayout:
         if any(a > b for a, b in zip(offsets, offsets[1:])):
             raise AssertionError(f"rank_to_offset must be non-decreasing, got {offsets}.")
 
-        tensor_ranges: list[TensorRange] = []
-        for tensor_id, (shape, start) in enumerate(
-            zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
-        ):
-            if start < 0:
-                raise AssertionError(f"Tensor {tensor_id} offset {start} is negative.")
-
-            end = start + shape.numel()
-            if end > self.size:
+        tensor_ranges = [
+            (tensor_id, self.get_tensor_range(tensor_id))
+            for tensor_id in range(len(self.tensor_shapes))
+        ]
+        for tensor_id, tensor_range in tensor_ranges:
+            if tensor_range.start < 0:
+                raise AssertionError(f"Tensor {tensor_id} offset {tensor_range.start} is negative.")
+            if tensor_range.end > self.size:
                 raise AssertionError(
-                    f"Tensor {tensor_id} range [{start}, {end}) exceeds "
+                    f"Tensor {tensor_id} range [{tensor_range.start}, {tensor_range.end}) exceeds "
                     f"layout size {self.size}."
                 )
-            tensor_ranges.append(TensorRange(start, end, tensor_id))
 
-        previous_range: TensorRange | None = None
-        for current_range in sorted(tensor_ranges, key=lambda tensor_range: tensor_range.start):
-            if previous_range is not None and current_range.start < previous_range.end:
+        ordered_ranges = sorted(tensor_ranges, key=lambda item: item[1].start)
+        for (previous_id, previous_range), (current_id, current_range) in itertools.pairwise(
+            ordered_ranges
+        ):
+            if current_range.start < previous_range.end:
                 raise AssertionError(
                     "Global layout tensors overlap: "
-                    f"tensor {previous_range.tensor_id} "
+                    f"tensor {previous_id} "
                     f"[{previous_range.start}, {previous_range.end}) and "
-                    f"tensor {current_range.tensor_id} "
+                    f"tensor {current_id} "
                     f"[{current_range.start}, {current_range.end})."
                 )
-            previous_range = current_range
 
     def validate_for_row_atomic(self, *, block_size: int = 1) -> None:
         """Check equal-size shards and row/block alignment from the actual offsets."""
@@ -382,10 +386,8 @@ class GlobalLayout:
         """Whether every rank's segment has the same numel."""
         return len({self.rank_size(rank) for rank in range(self.dp_size)}) == 1
 
-    def get_rank_range(
-        self, mesh: DeviceMesh, placements: Iterable[Placement], rank: int
-    ) -> tuple[int, int]:
-        """Return the global buffer element offset and length for a global process rank.
+    def get_rank_range(self, mesh: DeviceMesh, placements: Iterable[Placement], rank: int) -> Range:
+        """Return the global buffer element range for a global process rank.
 
         Args:
             mesh: The device mesh defining the distribution.
@@ -416,26 +418,26 @@ class GlobalLayout:
         first = shard_index * segments_per_rank
         last = first + segments_per_rank - 1
         start = self.rank_to_offset[first]
-        return start, self.rank_to_offset[last] + self.rank_size(last) - start
+        return Range(start, self.rank_to_offset[last] + self.rank_size(last) - start)
 
-    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
-        """Return this rank's local element offset and length for ``placements``."""
+    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> Range:
+        """Return this rank's element range in the global buffer for ``placements``."""
         return self.get_rank_range(mesh, placements, mesh.get_rank())
 
-    def get_tensor_range(self, tensor_index: int) -> tuple[int, int]:
-        """Return the full tensor's element offset and length in the global buffer."""
-        return self.tensor_to_offset[tensor_index], self.tensor_shapes[tensor_index].numel()
+    def get_tensor_range(self, tensor_index: int) -> Range:
+        """Return the full tensor's element range in the global buffer."""
+        return Range(self.tensor_to_offset[tensor_index], self.tensor_shapes[tensor_index].numel())
 
 
-def intersect_ranges(first: tuple[int, int], second: tuple[int, int]) -> tuple[int, int]:
-    """Intersect two (offset, length) ranges in the same coordinate system.
+def intersect_ranges(first: Range, second: Range) -> Range:
+    """Intersect two element ranges in the same coordinate system.
 
     Return the later starting offset and the overlap length, or zero length when
     the ranges do not overlap.
     """
-    start = max(first[0], second[0])
-    end = min(first[0] + first[1], second[0] + second[1])
-    return start, max(0, end - start)
+    start = max(first.start, second.start)
+    end = min(first.end, second.end)
+    return Range(start, max(0, end - start))
 
 
 def non_leading_numel(shape: torch.Size) -> int:
