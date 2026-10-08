@@ -3,7 +3,7 @@ name: pr-review
 description: Review rubric for the `/review` pull-request command. The formal reviewer reads it as a file and it is not an interactive skill — do not load it to answer questions or to review code outside that command.
 license: Apache-2.0
 disable-model-invocation: true
-user_invocable: false
+user-invocable: false
 ---
 
 # PR Review

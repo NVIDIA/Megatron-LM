@@ -1,9 +1,8 @@
 ---
 name: mcore-split-pr
-description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups. Use when user asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
+description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups. Use when user asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'. Takes a PR URL or number as its argument.
 license: Apache-2.0
-user_invocable: true
-argument: "PR URL or number"
+user-invocable: true
 metadata:
   author: Philip Petrakian <ppetrakian@nvidia.com>
 ---

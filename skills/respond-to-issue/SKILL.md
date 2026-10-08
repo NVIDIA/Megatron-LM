@@ -1,8 +1,7 @@
 ---
 name: respond-to-issue
-description: Research and draft a response to a GitHub issue or question from an external contributor. Use when user shares a GitHub issue URL or asks to respond to a community question; 'respond to this issue', 'draft a reply', 'answer this GitHub question'.
-user_invocable: true
-argument: "<github-issue-url-or-number>"
+description: Research and draft a response to a GitHub issue or question from an external contributor. Use when user shares a GitHub issue URL or asks to respond to a community question; 'respond to this issue', 'draft a reply', 'answer this GitHub question'. Takes a GitHub issue URL or number as its argument.
+user-invocable: true
 ---
 
 # Respond to GitHub Issue
