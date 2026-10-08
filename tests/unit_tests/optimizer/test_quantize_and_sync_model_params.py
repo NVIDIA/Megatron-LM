@@ -27,6 +27,9 @@ class _FakeModelChunk:
         self._log = log
         self._name = name
 
+    def finish_pending_param_sync(self):
+        self._log.append(('finish', self._name))
+
     def zero_grad_buffer(self):
         self._log.append(('zero', self._name))
 
@@ -85,6 +88,8 @@ def test_every_optimizer_stages_before_the_gather():
     optimizer.quantize_and_sync_model_params_from_main_params()
 
     order = [entry[0] for entry in log]
+    assert order.index('finish') < order.index('stage'), log
+    assert log.count(('finish', 'chunk_a')) == 1, log
     assert max(i for i, k in enumerate(order) if k == 'stage') < order.index('sync'), log
 
 

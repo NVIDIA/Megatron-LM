@@ -590,7 +590,7 @@ class TestGTPFp8ParamGather:
         The reference disables grouped-tensor execution and the TE op fuser; the target enables
         both. Everything else is identical: MXFP8 primary weights, parameter gather, grad-buffer
         reuse, padded LayerWise layout, and overlap. The target therefore reaches
-        ``_stage_layerwise_mxfp8_params`` through the fused implementation's forwarded pre-hooks.
+        ``_stage_layerwise_fp8_params`` through the fused implementation's forwarded pre-hooks.
         """
         if Utils.world_size != 4:
             pytest.skip("Requires exactly 4 torchrun ranks for EP2 x EDP2")
