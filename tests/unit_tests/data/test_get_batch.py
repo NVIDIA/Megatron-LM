@@ -10,7 +10,7 @@ import torch
 
 import pretrain_hybrid
 from megatron.core import mpu
-from megatron.core.context_parallel import get_batches_on_this_cp_rank
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.context_parallel.utils import (
     _build_packed_seq_params,
     _get_batch_on_this_cp_rank_contiguous,
@@ -59,6 +59,9 @@ def initialize_test_environment(
     args.context_parallel_size = cp_size
     args.hybrid_context_parallel = hybrid_context_parallel
     args.max_seqlen_per_cp_rank = max_seqlen_per_cp_rank
+    if hybrid_context_parallel:
+        # The deprecated flag selects dynamic CP, whose packing scheduler needs a capacity.
+        args.max_seqlen_per_dp_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
     args.micro_batch_size = micro_batch_size
     args.create_attention_mask_in_dataloader = create_attention_mask
@@ -1029,27 +1032,16 @@ def create_pretrain_data_iterator(
 
 
 def test_sequence_packing_batch_uses_context_parallel_batch_interface():
-    tokens = torch.tensor([[1, 2]])
-    labels = torch.tensor([[2, 3]])
-    loss_mask = torch.ones(1, 2)
-    position_ids = torch.tensor([[0, 1]])
-    padding_mask = torch.zeros(1, 2, dtype=torch.bool)
-    packed_seq_params = PackedSeqParams(qkv_format="thd")
-    scheduler_batch = (
-        tokens,
-        labels,
-        loss_mask,
-        None,
-        position_ids,
-        packed_seq_params,
-        padding_mask,
+    cp_batch = ContextParallelBatch.from_single_layout(
+        "zigzag", {"tokens": torch.tensor([[1, 2]])}, PackedSeqParams(qkv_format="thd")
     )
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
     config = SimpleNamespace(
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        sequence_parallel=False,
     )
 
     with (
@@ -1057,21 +1049,16 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
-            pretrain_hybrid,
-            "get_batch_on_this_rank_for_sequence_packing",
-            return_value=scheduler_batch,
-        ),
+            pretrain_hybrid, "get_batch_on_this_rank_for_sequence_packing", return_value=cp_batch
+        ) as fetch,
     ):
-        cp_batch = get_batch(None)
+        assert get_batch(None) is cp_batch
 
-    assert set(cp_batch.batches_by_layout) == {"zigzag"}
-    assert cp_batch.get_packed_seq_params() is packed_seq_params
-    batch = cp_batch.get_batch()
-    assert batch["tokens"] is tokens
-    assert batch["labels"] is labels
-    assert batch["loss_mask"] is loss_mask
-    assert batch["position_ids"] is position_ids
-    assert batch["padding_mask"] is padding_mask
+    # The scheduler fetch builds the layout-keyed batch views itself.
+    kwargs = fetch.call_args.kwargs
+    assert kwargs["return_context_parallel_batch"] is True
+    assert kwargs["config"] is config
+    assert kwargs["dynamic_cp"] is False
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -1266,6 +1253,7 @@ def test_pretrain_batch(
 
 
 def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
+    """One packed microbatch in the scheduler's THD format (1-D tensors, CUDA)."""
     # Pack n_seqs equal-length sequences; total length must be divisible by 2 * cp_size for CP splitting
     n_seqs = max(2, 2 * cp_size)
     align = max(1, 2 * cp_size)
@@ -1274,28 +1262,20 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
         seq_len_each = align
     total_seq_len = n_seqs * seq_len_each
 
-    text = torch.randint(0, 10000, (1, total_seq_len + 1), dtype=torch.int64)
-    tokens = text[:, :-1].contiguous()  # (1, total_seq_len)
-    labels = text[:, 1:].contiguous()  # (1, total_seq_len)
-    loss_mask = torch.ones((1, total_seq_len), dtype=torch.float32)
+    device = torch.device("cuda", torch.cuda.current_device())
+    text = torch.randint(0, 10000, (total_seq_len + 1,), dtype=torch.int64, device=device)
+    tokens = text[:-1].contiguous()  # (total_seq_len,)
+    labels = text[1:].contiguous()  # (total_seq_len,)
+    loss_mask = torch.ones((total_seq_len,), dtype=torch.float32, device=device)
     position_ids = torch.cat(
-        [torch.arange(seq_len_each, dtype=torch.int64) for _ in range(n_seqs)]
-    ).unsqueeze(
-        0
-    )  # (1, total_seq_len)
+        [torch.arange(seq_len_each, dtype=torch.int64, device=device) for _ in range(n_seqs)]
+    )  # (total_seq_len,)
 
-    cu_seqlens = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.int32),
-            torch.cumsum(torch.tensor([seq_len_each] * n_seqs, dtype=torch.int64), dim=0).to(
-                torch.int32
-            ),
-        ]
-    ).unsqueeze(
-        0
-    )  # (1, n_seqs + 1) — dataloader always carries a batch dim
-    max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32)
-    local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32)
+    cu_seqlens = torch.arange(
+        0, total_seq_len + 1, seq_len_each, dtype=torch.int32, device=device
+    )  # (n_seqs + 1,)
+    max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32, device=device)
+    local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32, device=device)
 
     batch = {
         "tokens": tokens,
@@ -1303,12 +1283,10 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
         "loss_mask": loss_mask,
         "position_ids": position_ids,
         "cu_seqlens": cu_seqlens,
+        "cu_seqlens_padded": cu_seqlens.clone(),
         "max_seqlen": max_seqlen,
         "local_cp_size": local_cp_size_tensor,
     }
-
-    if cp_size > 1:
-        batch["cu_seqlens_padded"] = cu_seqlens.clone()
 
     return iter([batch])
 
@@ -1352,7 +1330,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         max_seqlen,
         position_ids,
         tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    ) = [batch.get(key) for key in pretrain_hybrid.BATCH_KEYS]
 
     # Presence checks
     assert tokens is not None
@@ -1400,14 +1378,13 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
     assert loss_mask.sum().item() == seq_len_per_rank
 
-    # cu_seqlens: 2-D int32 (1, n_seqs + 1) after flatten_batch_for_packed_sequences.
+    # cu_seqlens: 1-D int32 (n_seqs + 1,) describing the full packed microbatch (THD).
     assert cu_seqlens.shape == (
-        1,
         n_seqs + 1,
-    ), f"Expected cu_seqlens shape (1, {n_seqs + 1}), got {cu_seqlens.shape}"
+    ), f"Expected cu_seqlens shape ({n_seqs + 1},), got {cu_seqlens.shape}"
     assert cu_seqlens.dtype == torch.int32
-    assert cu_seqlens[0, 0].item() == 0
-    assert cu_seqlens[0, -1].item() == total_seq_len
+    assert cu_seqlens[0].item() == 0
+    assert cu_seqlens[-1].item() == total_seq_len
 
     # max_seqlen: scalar int32 equal to the per-sequence length in the iterator
     assert max_seqlen.shape == (1,)
@@ -1419,16 +1396,15 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert local_cp_size.dtype == torch.int32
     assert local_cp_size.item() == cp_size
 
-    if cp_size > 1:
-        assert cu_seqlens_padded is not None
-        assert cu_seqlens_padded.shape == (1, n_seqs + 1)
-        assert cu_seqlens_padded.dtype == torch.int32
-        assert cu_seqlens_padded[0, 0].item() == 0
-        assert cu_seqlens_padded[0, -1].item() == total_seq_len
-        assert hybrid_cp_group is not None
-    else:
-        assert cu_seqlens_padded is None
-        assert hybrid_cp_group is None
+    assert cu_seqlens_padded is not None
+    cu_seqlens_padded = cu_seqlens_padded.reshape(-1)
+    assert cu_seqlens_padded.shape == (n_seqs + 1,)
+    assert cu_seqlens_padded.dtype == torch.int32
+    assert cu_seqlens_padded[0].item() == 0
+    assert cu_seqlens_padded[-1].item() == total_seq_len
+    # Dynamic CP resolves the runtime CP group the scheduler chose for this microbatch.
+    assert hybrid_cp_group is not None
+    assert hybrid_cp_group.size() == cp_size
 
     Utils.destroy_model_parallel()
 
