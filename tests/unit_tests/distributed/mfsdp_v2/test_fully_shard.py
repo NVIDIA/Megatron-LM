@@ -219,8 +219,8 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
-    """TE's callback, not AccumulateGrad, completes MFSDP backward."""
+def test_rejects_delayed_te_weight_gradient(distributed_setup):
+    """Default automatic synchronization rejects weight gradients produced after autograd."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -242,10 +242,8 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
     assert model.weight.grad is None
     assert model.phase is FsdpModule.Phase.BACKWARD
 
-    model.backward_dw()
-
-    assert model.weight.grad is not None
-    assert model.phase is FsdpModule.Phase.RESTING
+    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
+        model.backward_dw()
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
