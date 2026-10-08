@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
+
+from megatron.rl.tree_layout import PackedTreeLayout
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +95,7 @@ class SharedPrefixLayout:
     completion_scatter_columns: tuple[int, ...]
     physical_completion_lengths: tuple[int, ...] = ()
     physical_padding_positions: tuple[int, ...] = ()
+    tree_layout: PackedTreeLayout = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         physical_lengths = self.physical_completion_lengths or self.completion_lengths
@@ -108,6 +111,14 @@ class SharedPrefixLayout:
                 "physical completion lengths cannot be shorter than logical completions"
             )
         object.__setattr__(self, "physical_completion_lengths", physical_lengths)
+        tree = PackedTreeLayout.from_shared_prefix(
+            self.prompt_length, physical_lengths, logical_completion_lens=self.completion_lengths
+        )
+        if len(self.row_indices) != len(physical_lengths):
+            raise ValueError("each completion node must own one source row")
+        if self.branch_starts != tree.node_start[1:]:
+            raise ValueError("shared-prefix branches must be positive and contiguous")
+        object.__setattr__(self, "tree_layout", tree)
 
     def iter_roots(self) -> Iterator[tuple[int, SharedPrefixLayout]]:
         """Yield independent roots with their canonical physical offsets."""
@@ -126,7 +137,7 @@ class SharedPrefixLayout:
     @property
     def physical_total_length(self) -> int:
         """Prompt-once length including each branch's ordinary packing tail."""
-        return self.prompt_length + sum(self.physical_completion_lengths)
+        return self.tree_layout.total_len
 
     @property
     def tokens_saved(self) -> int:
@@ -172,8 +183,13 @@ class SharedPrefixForestLayout:
             offset += root.physical_total_length
 
     @cached_property
+    def tree_layout(self) -> PackedTreeLayout:
+        """Canonical multi-level descriptor, with globally rebased node parents."""
+        return PackedTreeLayout.concat(tuple(root.tree_layout for root in self.roots))
+
+    @cached_property
     def physical_total_length(self) -> int:
-        return sum(root.physical_total_length for root in self.roots)
+        return self.tree_layout.total_len
 
     @cached_property
     def total_length(self) -> int:
@@ -201,7 +217,7 @@ class SharedPrefixForestLayout:
 
     @cached_property
     def position_ids(self) -> tuple[int, ...]:
-        return tuple(value for root in self.roots for value in root.position_ids)
+        return self.tree_layout.position_ids()
 
     @cached_property
     def token_gather_rows(self) -> tuple[int, ...]:
@@ -410,43 +426,40 @@ def build_shared_prefix_layout(
     prompt_length = first.prompt_length
     token_gather_rows = [first.row_index] * prompt_length
     token_gather_columns = list(range(prompt_length))
-    position_ids = list(range(prompt_length))
-    branch_starts: list[int] = []
     completion_positions: list[int] = []
     predecessor_positions: list[int] = []
     completion_scatter_rows: list[int] = []
     completion_scatter_columns: list[int] = []
-    physical_completion_lengths: list[int] = []
-    physical_padding_positions: list[int] = []
-    packed_offset = prompt_length
-
-    for row in rows:
-        padded_row_length = (
+    physical_completion_lengths = tuple(
+        (
             (row.total_length + sequence_length_pad_multiple - 1)
             // sequence_length_pad_multiple
             * sequence_length_pad_multiple
         )
-        physical_completion_length = padded_row_length - prompt_length
-        physical_completion_lengths.append(physical_completion_length)
-        branch_starts.append(packed_offset)
+        - prompt_length
+        for row in rows
+    )
+    tree = PackedTreeLayout.from_shared_prefix(
+        prompt_length,
+        physical_completion_lengths,
+        logical_completion_lens=tuple(row.completion_length for row in rows),
+    )
+    for row, packed_offset, physical_completion_length, first_predecessor in zip(
+        rows, tree.node_start[1:], tree.node_len[1:], tree.first_predecessors()[1:], strict=True
+    ):
         token_gather_rows.extend([row.row_index] * physical_completion_length)
         token_gather_columns.extend(
             range(prompt_length, prompt_length + physical_completion_length)
         )
-        position_ids.extend(range(prompt_length, prompt_length + physical_completion_length))
         for completion_offset in range(row.completion_length):
             packed_position = packed_offset + completion_offset
             predecessor_position = (
-                prompt_length - 1 if completion_offset == 0 else packed_position - 1
+                first_predecessor if completion_offset == 0 else packed_position - 1
             )
             completion_positions.append(packed_position)
             predecessor_positions.append(predecessor_position)
             completion_scatter_rows.append(row.row_index)
             completion_scatter_columns.append(prompt_length + completion_offset - 1)
-        physical_padding_positions.extend(
-            range(packed_offset + row.completion_length, packed_offset + physical_completion_length)
-        )
-        packed_offset += physical_completion_length
 
     return SharedPrefixLayout(
         group_id=group_id,
@@ -454,16 +467,16 @@ def build_shared_prefix_layout(
         row_indices=tuple(row.row_index for row in rows),
         completion_lengths=tuple(row.completion_length for row in rows),
         total_length=prompt_length + sum(row.completion_length for row in rows),
-        branch_starts=tuple(branch_starts),
-        position_ids=tuple(position_ids),
+        branch_starts=tree.node_start[1:],
+        position_ids=tree.position_ids(),
         token_gather_rows=tuple(token_gather_rows),
         token_gather_columns=tuple(token_gather_columns),
         completion_positions=tuple(completion_positions),
         predecessor_positions=tuple(predecessor_positions),
         completion_scatter_rows=tuple(completion_scatter_rows),
         completion_scatter_columns=tuple(completion_scatter_columns),
-        physical_completion_lengths=tuple(physical_completion_lengths),
-        physical_padding_positions=tuple(physical_padding_positions),
+        physical_completion_lengths=physical_completion_lengths,
+        physical_padding_positions=tree.padding_positions(),
     )
 
 

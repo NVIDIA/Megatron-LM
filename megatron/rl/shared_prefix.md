@@ -5,19 +5,59 @@ ordinary Python row metadata and tensors; it has no dependency on NeMo RL,
 Ray, TransferQueue, a tokenizer, or a training configuration object. The
 attention and Mamba execution kernels remain in `megatron.core`.
 
-The supported data representation is a star, or a forest of independent stars.
-This ownership move does not add arbitrary-depth trajectory-tree execution.
+The canonical data representation is `tree_layout.PackedTreeLayout`: contiguous
+token spans with parent indices, supporting multiple roots and arbitrary depth.
+The current planner emits stars or forests of independent stars, and the fused
+attention/Mamba execution backend supports these shapes. Arbitrary-depth
+trajectory-tree execution still requires backend work.
 Rows share a prefix only when their group identities **and exact prompt token
 sequences** match. Single-completion groups remain conventional dense units.
 The representation is independent of the RL objective: GRPO and PPO adapters
 can supply the same row contract without changing their losses or advantages.
 
+## Multi-level representation and execution boundary
+
+`SharedPrefixLayout.tree_layout` and `SharedPrefixForestLayout.tree_layout`
+expose the canonical descriptor. The star builder derives positions, first-token
+predecessors and padding from it; forest composition rebases parent indices;
+the reference attention mask uses ancestry; model-input lowering reads its
+node spans. Source-row gather/scatter and MTP loss-group metadata remain in the
+packing wrappers.
+
+For example, a prompt followed by a shared continuation and two independent
+answers is a three-level tree:
+
+```python
+from megatron.rl.tree_layout import PackedTreeLayout
+
+tree = PackedTreeLayout(
+    node_start=(0, 2, 6, 8),
+    node_len=(2, 4, 2, 3),
+    node_parent=(-1, 0, 1, 1),
+    logical_node_len=(2, 2, 2, 3),
+)
+assert tree.path_token_indices(2) == (0, 1, 2, 3, 6, 7)
+assert tree.first_predecessors()[2] == 3  # excludes parent padding at 4, 5
+```
+
+`build_tree_attention_allow_mask` is a correctness oracle for these deeper
+trees. It permits real ancestor tokens and causal tokens within the same node,
+and isolates sibling branches and unrelated roots. Its use does **not** qualify
+deeper fused attention or recurrent execution. The current Hybrid adapter calls
+`iter_star_roots()`, which rejects deeper trees, interleaved star storage and
+padded prompt roots before invoking the existing kernels. Future generalized
+tree execution can reuse the descriptor, path and predecessor contracts while
+adding backend support and generalized source-row/loss mappings.
+
 ## Modules
 
+- `tree_layout`: immutable multi-level token-span forests; ancestry, logical
+  positions, predecessor indices, dense path reconstruction, and parent rebasing.
+  It has no Torch or model-runtime dependency.
 - `shared_prefix_packing`: immutable row, star and forest layouts; exact-prefix
   matching; physical padding; group subdivision and forest packing.
 - `shared_prefix_tensors`: conventional-batch row construction; token gathering,
-  completion/predecessor/scatter maps; reference causal masks; TP/CP alignment
+  completion/predecessor/scatter maps; generic tree reference causal masks; TP/CP alignment
   and zigzag context-parallel tensor shards. Dense masks are reference oracles;
   production callers can set `materialize_attention_mask=False`.
 - `shared_prefix_metadata`: group-coherent sharding, stable inverse row order,

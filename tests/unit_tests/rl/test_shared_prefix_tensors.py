@@ -427,25 +427,23 @@ def test_materializer_rejects_a_layout_past_the_unpadded_row() -> None:
         )
 
 
-def test_mask_builder_rejects_noncontiguous_branch_spans() -> None:
-    invalid = SharedPrefixLayout(
-        group_id="g",
-        prompt_token_ids=(1, 2),
-        row_indices=(0, 1),
-        completion_lengths=(1, 1),
-        total_length=4,
-        branch_starts=(2, 2),
-        position_ids=(0, 1, 2, 2),
-        token_gather_rows=(0, 0, 0, 1),
-        token_gather_columns=(0, 1, 2, 2),
-        completion_positions=(2, 3),
-        predecessor_positions=(1, 1),
-        completion_scatter_rows=(0, 1),
-        completion_scatter_columns=(1, 1),
-    )
-
+def test_layout_rejects_noncontiguous_branch_spans_before_materialization() -> None:
     with pytest.raises(ValueError, match="positive and contiguous"):
-        build_star_attention_allow_mask(invalid)
+        SharedPrefixLayout(
+            group_id="g",
+            prompt_token_ids=(1, 2),
+            row_indices=(0, 1),
+            completion_lengths=(1, 1),
+            total_length=4,
+            branch_starts=(2, 2),
+            position_ids=(0, 1, 2, 2),
+            token_gather_rows=(0, 0, 0, 1),
+            token_gather_columns=(0, 1, 2, 2),
+            completion_positions=(2, 3),
+            predecessor_positions=(1, 1),
+            completion_scatter_rows=(0, 1),
+            completion_scatter_columns=(1, 1),
+        )
 
 
 @pytest.mark.parametrize(

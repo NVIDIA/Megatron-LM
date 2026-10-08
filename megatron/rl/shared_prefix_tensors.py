@@ -28,6 +28,7 @@ from megatron.rl.shared_prefix_packing import (
     SharedPrefixRow,
     plan_shared_prefix_bins,
 )
+from megatron.rl.tree_layout import PackedTreeLayout
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,69 +260,36 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     )
 
 
+def build_tree_attention_allow_mask(
+    layout: PackedTreeLayout, *, device: torch.device | str | None = None
+) -> torch.Tensor:
+    """Reference causal attention for arbitrary-depth token-span trees.
+
+    Queries can see their own causal node history and real tokens in strict
+    ancestor nodes. Ancestor padding, sibling branches, and other roots are
+    invisible. Each physical padding query retains self-attention, avoiding an
+    empty row. This quadratic oracle does not enable deeper fused execution.
+    """
+    node_ids = torch.tensor(layout.segment_ids(), dtype=torch.long, device=device)
+    ancestry = torch.zeros((layout.num_nodes, layout.num_nodes), dtype=torch.bool, device=device)
+    for node in range(layout.num_nodes):
+        ancestry[node, list(layout.ancestors(node))] = True
+    positions = torch.arange(layout.total_len, device=device)
+    real_keys = torch.ones(layout.total_len, dtype=torch.bool, device=device)
+    real_keys[list(layout.padding_positions())] = False
+    same_node = node_ids[:, None] == node_ids[None, :]
+    causal = positions[None, :] <= positions[:, None]
+    ancestor_keys = ancestry[node_ids[:, None], node_ids[None, :]] & real_keys[None, :]
+    return (same_node & causal) | ancestor_keys
+
+
 def build_star_attention_allow_mask(
     layout: SharedPrefixLayout | SharedPrefixForestLayout,
     *,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """Materialize the exact dense causal allow-mask for a star or forest.
-
-    Prompt queries attend causally within the prompt. A completion query attends
-    every prompt token and causally within its own suffix, but never a sibling
-    completion. Self-attention is included.
-
-    Args:
-        layout: Exact-prompt star or independent-root forest to lower.
-        device: Device for the returned boolean tensor. Defaults to CPU.
-
-    Returns:
-        Boolean ``[layout.physical_total_length, layout.physical_total_length]``
-        allow-mask.
-
-    Raises:
-        ValueError: If the layout's branch spans do not exactly cover its packed
-            completion region.
-    """
-    if isinstance(layout, SharedPrefixForestLayout):
-        return torch.block_diag(
-            *(build_star_attention_allow_mask(root, device=device) for root in layout.roots)
-        )
-    if layout.prompt_length < 1 or not layout.row_indices:
-        raise ValueError("a shared-prefix star requires a prompt and at least one row")
-    if len(layout.branch_starts) != len(layout.physical_completion_lengths):
-        raise ValueError("branch_starts and physical_completion_lengths must have equal length")
-
-    mask_device = torch.device("cpu") if device is None else torch.device(device)
-    segment_ids = torch.zeros(layout.physical_total_length, dtype=torch.long, device=mask_device)
-
-    expected_start = layout.prompt_length
-    for branch_id, (branch_start, completion_length) in enumerate(
-        zip(layout.branch_starts, layout.physical_completion_lengths, strict=True), start=1
-    ):
-        if branch_start != expected_start or completion_length < 1:
-            raise ValueError(
-                "shared-prefix branches must be positive and contiguous; "
-                f"expected start {expected_start}, got start {branch_start} "
-                f"with length {completion_length}"
-            )
-        branch_end = branch_start + completion_length
-        segment_ids[branch_start:branch_end] = branch_id
-        expected_start = branch_end
-    if expected_start != layout.physical_total_length:
-        raise ValueError(
-            "shared-prefix branch spans do not cover physical_total_length: "
-            f"covered {expected_start}, total {layout.physical_total_length}"
-        )
-
-    packed_positions = torch.arange(layout.physical_total_length, device=mask_device)
-    query_positions = packed_positions[:, None]
-    key_positions = packed_positions[None, :]
-    query_segments = segment_ids[:, None]
-    key_segments = segment_ids[None, :]
-    causal = key_positions <= query_positions
-    key_is_prompt = key_segments == 0
-    same_segment = query_segments == key_segments
-    return causal & (key_is_prompt | same_segment)
+    """Compatibility entry point for the star/forest tree reference mask."""
+    return build_tree_attention_allow_mask(layout.tree_layout, device=device)
 
 
 def materialize_shared_prefix_layout(
