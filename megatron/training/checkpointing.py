@@ -63,7 +63,11 @@ from megatron.core.utils import (
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
-from megatron.training.utils.checkpoint_utils import get_checkpoint_train_state_filename, file_exists, read_train_state
+from megatron.training.utils.checkpoint_utils import (
+    file_exists,
+    get_checkpoint_train_state_filename,
+    read_train_state,
+)
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -1174,7 +1178,9 @@ def save_checkpoint(
                     return_base_dir=True,
                 )
                 if iteration > 0:
-                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                    from megatron.training.utils.checkpoint_utils import (
+                        get_checkpoint_run_config_filename,
+                    )
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -1318,9 +1324,9 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from megatron.training.distillation import get_logits_saver
-
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
+        from megatron.training.distillation import get_logits_saver
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
