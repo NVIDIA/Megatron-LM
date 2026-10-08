@@ -179,15 +179,16 @@ def test_cuda_seeded_sampling_distribution():
     assert abs((sampled == 1).float().mean().item() - 0.8) < 0.02
 
 
-@pytest.mark.parametrize("backend,speculative", [("flashinfer", 0), ("torch", 2), ("torch", 0)])
+@pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+@pytest.mark.parametrize("speculative,has_seed_metadata", [(0, False), (2, True), (0, True)])
 @pytest.mark.asyncio
-async def test_unsupported_seed_returns_failed_request(backend, speculative):
+async def test_seed_request_admission(backend, speculative, has_seed_metadata):
     from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 
     engine = object.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(
         config=SimpleNamespace(sampling_backend=backend, num_speculative_tokens=speculative),
-        request_metadata={},
+        request_metadata={"seed": torch.empty(0)} if has_seed_metadata else {},
         max_sequence_length=16,
         max_tokens=16,
         num_speculative_tokens=speculative,
@@ -212,6 +213,13 @@ async def test_unsupported_seed_returns_failed_request(backend, speculative):
         sampling_params=SamplingParams(seed=42, termination_id=0, num_tokens_to_generate=1),
     )
     future = engine._add_request(req)
+    if has_seed_metadata and not speculative:
+        assert not future.done()
+        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
+        assert engine.waiting_request_ids == [1]
+        assert engine.failed_request_ids == []
+        engine._send_requests_to_coordinator.assert_not_called()
+        return
     assert future.done()
     result = await future
     assert result.status == Status.FAILED

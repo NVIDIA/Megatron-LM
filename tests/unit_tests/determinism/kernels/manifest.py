@@ -687,9 +687,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/inference/sampling/flashinfer_sampling.py",),
         kind="dispatch",
         training_path=False,
-        exempt_reason="FlashInfer top-k / top-p sampling kernels driven by an explicit torch.Generator "
-        "with deterministic=True; a seed-restore replay test needs flashinfer in the unit-test "
-        "container and is tracked as a follow-up.",
+        tests=(K + "test_flashinfer_sampling.py",),
+        notes="Per-row seed/offset replay across batch layouts and shared RNG isolation. "
+        "Requires FlashInfer with batch-independent per-row Philox subsequences.",
     ),
     KernelEntry(
         name="inference_tp_layers",
