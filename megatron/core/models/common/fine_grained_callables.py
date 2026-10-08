@@ -40,13 +40,31 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_layer_callables(layer.mtp_model_layer)
-    is_moe, _ = get_layer_moe_metadata(layer.mtp_model_layer)
+    return wrap_mtp_layer_callables(layer, forward_funcs, backward_dw)
+
+
+def wrap_mtp_layer_callables(
+    layer, forward_funcs, backward_dw, *, pre_process: bool = True, post_process: bool = True
+):
+    """Attach the MTP depth boundaries to an inner layer's schedule callables.
+
+    A hybrid depth can contain several logical layers. Only its first layer
+    embeds/projects the inputs, and only its last layer normalizes and saves
+    the depth output for the prediction head.
+    """
     pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
-    assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
+            # Rolling inputs belong to the depth chain. The model's loss/head
+            # postprocess still needs the original token IDs and masks.
+            node.chunk_state.mtp_original_inputs = (
+                node.chunk_state.input_ids,
+                node.chunk_state.position_ids,
+                node.chunk_state.padding_mask,
+                node.chunk_state.mtp_input_mask,
+            )
             # Apply the main decoder's final_norm if this VPP chunk owns it but
             # holds no main HybridStack layers — without this, ``_maybe_apply_final_norm``
             # never fires for the main path and the unnormalized hidden_states feed
@@ -78,6 +96,8 @@ def build_mtp_layer_callables(layer):
             # twice; node.backward_impl merges their gradients into this slot.
             node.chunk_state.mtp_hidden_states = [node.detach(chunk) for chunk in chunks]
             hidden_states = chunks[offset]
+            if layer.config.mtp_detach_heads:
+                hidden_states = hidden_states.detach()
 
         input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
             layer._get_embeddings(
@@ -116,10 +136,23 @@ def build_mtp_layer_callables(layer):
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
         hidden_states = layer._postprocess(hidden_states)
-        node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
+            node.chunk_state.mtp_hidden_states.append(hidden_states)
             hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
             node.chunk_state.mtp_hidden_states = None
+            (
+                node.chunk_state.input_ids,
+                node.chunk_state.position_ids,
+                node.chunk_state.padding_mask,
+                node.chunk_state.mtp_input_mask,
+            ) = node.chunk_state.mtp_original_inputs
+            node.chunk_state.mtp_original_inputs = None
+        else:
+            # The next depth consumes the returned tensor through a schedule
+            # boundary. The prediction head is a second consumer: keep its
+            # detached leaf so node.backward_impl adds both gradients before
+            # traversing this depth's final norm exactly once.
+            node.chunk_state.mtp_hidden_states.append(node.detach(hidden_states))
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):
@@ -136,11 +169,15 @@ def build_mtp_layer_callables(layer):
     # Build forward and backward callable functions.
     # pre_dispatch_func already has rng context (rolled into
     # submodule_mtp_pre_dispatch_forward), so it does not need to be wrapped.
-    pre_dispatch_func = submodule_mtp_pre_dispatch_forward
+    pre_dispatch_func = (
+        submodule_mtp_pre_dispatch_forward
+        if pre_process
+        else partial(rng_context_wrapper, pre_dispatch_forward)
+    )
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
-    mtp_post_process_func = submodule_mtp_postprocess_forward
+    mtp_post_process_func = submodule_mtp_postprocess_forward if post_process else None
 
     forward_funcs = [
         pre_dispatch_func,
@@ -149,11 +186,11 @@ def build_mtp_layer_callables(layer):
         combine_func,
         mtp_post_process_func,
     ]
-    pre_dispatch_bwd = backward_dw["pre_dispatch_computation"]
-    if isinstance(pre_dispatch_bwd, list):
-        pre_dispatch_bwd.append(layer.eh_proj)
-    else:
-        backward_dw["pre_dispatch_computation"] = [pre_dispatch_bwd, layer.eh_proj]
+    if pre_process:
+        pre_dispatch_bwd = backward_dw.get("pre_dispatch_computation", [])
+        if not isinstance(pre_dispatch_bwd, list):
+            pre_dispatch_bwd = [pre_dispatch_bwd]
+        backward_dw["pre_dispatch_computation"] = [*pre_dispatch_bwd, layer.eh_proj]
 
     return forward_funcs, backward_dw
 

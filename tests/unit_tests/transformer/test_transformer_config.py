@@ -7,7 +7,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 
-def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
+def _make_overlap_config(mtp_num_layers: int | None, **kwargs) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,
         hidden_size=128,
@@ -18,20 +18,31 @@ def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
         overlap_moe_expert_parallel_comm=True,
         bf16=True,
         mtp_num_layers=mtp_num_layers,
+        **kwargs,
     )
 
 
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2, 4])
 def test_ep_a2a_overlap_accepts_supported_mtp_layer_counts(mtp_num_layers: int | None):
     config = _make_overlap_config(mtp_num_layers)
 
     assert config.mtp_num_layers == mtp_num_layers
 
 
-@pytest.mark.parametrize("mtp_num_layers", [-1, 2])
-def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int):
-    with pytest.raises(AssertionError, match="MTP supports at most one layer"):
-        _make_overlap_config(mtp_num_layers)
+def test_ep_a2a_overlap_rejects_negative_mtp_layer_count():
+    with pytest.raises(AssertionError, match="mtp_num_layers must be nonnegative"):
+        _make_overlap_config(-1)
+
+
+def test_ep_a2a_overlap_preserves_single_repeated_mtp_depth():
+    config = _make_overlap_config(1, mtp_use_repeated_layer=True)
+    assert config.mtp_use_repeated_layer
+
+
+@pytest.mark.parametrize("option", ["mtp_hsm", "mtp_use_repeated_layer"])
+def test_ep_a2a_overlap_rejects_unsupported_mtp_depth_schedules(option):
+    with pytest.raises(AssertionError, match=f"EP overlap does not support {option}"):
+        _make_overlap_config(2, **{option: True})
 
 
 def test_batch_invariant_backend_rejects_unknown_value_at_construction():
