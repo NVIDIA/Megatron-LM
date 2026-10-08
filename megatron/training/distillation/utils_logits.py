@@ -35,6 +35,7 @@ except ImportError:
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.training import get_args
 from megatron.training.utils import get_blend_and_blend_per_split
+from megatron.training.global_vars import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     stream itself: ``seed``, ``sequence_length``, ``train_samples`` (with a
     fall-back to ``train_iters * global_batch_size``), and the data ``blend``.
     """
+    cfg = get_run_config()
     args = get_args()
     train_samples = getattr(args, 'train_samples', None)
     if train_samples is None:
@@ -202,7 +204,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
             train_samples = int(train_iters) * int(global_batch_size)
 
     identifiers = OrderedDict()
-    identifiers["seed"] = getattr(args, 'seed', None)
+    identifiers["seed"] = cfg.rng.seed
     identifiers["sequence_length"] = getattr(args, 'seq_length', None)
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(args)
