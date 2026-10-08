@@ -4,6 +4,8 @@
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
 import inspect
+import math
+import os
 from typing import Callable, Optional
 
 from megatron.core.utils import internal_api
@@ -295,8 +297,36 @@ except ImportError:
 _hybrid_ep_buffer = None
 
 
-# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
-HYBRIDEP_TOKEN_ALIGNMENT = 64
+def _hybrid_ep_token_alignment() -> int:
+    """Honor the chunk sizes used by the installed DeepEP JIT kernels."""
+    chunks = [64]
+    for name in ("NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API", "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API"):
+        chunk = int(os.environ.get(name, "64"))
+        if chunk <= 0:
+            raise ValueError(f"{name} must be positive, got {chunk}")
+        chunks.append(chunk)
+    return math.lcm(*chunks)
+
+
+HYBRIDEP_TOKEN_ALIGNMENT = _hybrid_ep_token_alignment()
+
+
+def _align_hybrid_ep_capacity(num_tokens: int) -> int:
+    return num_tokens + (-num_tokens % HYBRIDEP_TOKEN_ALIGNMENT)
+
+
+def _reserve_hybrid_ep_capacity(buffer, num_tokens: int) -> None:
+    # DeepEP's per-call update rounds to 16, which can violate the combine
+    # kernel's 128-token chunk requirement after a ragged input grows the buffer.
+    # Advance only the capacity bound; real token counts, routing and losses
+    # remain unchanged. DeepEP's normal update_buffer then performs allocation.
+    config = buffer.configurer.buffer_config
+    capacity = _align_hybrid_ep_capacity(max(num_tokens, config.max_num_of_tokens_per_rank))
+    if capacity > config.max_num_of_tokens_per_rank:
+        # HybridEP allocates through the CUDA driver, outside Torch's allocator.
+        # Release unused cached blocks before growth; live activations stay intact.
+        torch.cuda.empty_cache()
+    config.max_num_of_tokens_per_rank = capacity
 
 
 def init_hybrid_ep_buffer(
@@ -354,10 +384,12 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     if num_sms_preprocessing_api is not None:
         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
+    # Initial raw CUDA allocation also cannot reclaim Torch's unused cache.
+    torch.cuda.empty_cache()
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=num_tokens,
+        max_num_of_tokens_per_rank=_align_hybrid_ep_capacity(num_tokens),
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
         **kwargs,
@@ -429,6 +461,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
                 num_sms_preprocessing_api,
             )
+        _reserve_hybrid_ep_capacity(_hybrid_ep_buffer, x.shape[-2])
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
