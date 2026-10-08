@@ -212,7 +212,7 @@ jobs:
             Read `.claude/skills/nightly-sync/SKILL.md` for the detailed
             merge strategy, CI architecture, failure investigation procedures,
             and known issues. Also read `.claude/skills/build-and-test/SKILL.md`
-            and `CLAUDE.md` for general CI and contribution guidelines.
+            and `AGENTS.md` for general CI and contribution guidelines.
 
             ## Hard Constraints
 

@@ -368,7 +368,7 @@ jobs:
             changed and a short plain-text `reason` explaining the observed conflict or failure.
           claude_args: |
             --permission-mode dontAsk
-            --allowedTools "Bash,Read(/AGENTS.md),Read(/CLAUDE.md),Read(/skills/**),Read(/.claude-fix-steer.txt),Read(/pr-head/**),Read(${{ runner.temp }}/claude-fix-ci/**),Edit(/pr-head/**)"
+            --allowedTools "Bash,Read(/AGENTS.md),Read(/skills/**),Read(/.claude-fix-steer.txt),Read(/pr-head/**),Read(${{ runner.temp }}/claude-fix-ci/**),Edit(/pr-head/**)"
             --model "${{ inputs.model }}"
             --max-turns 100
             --json-schema '{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":500},"reason":{"type":"string","minLength":1,"maxLength":500}},"required":["summary","reason"],"additionalProperties":false}'
