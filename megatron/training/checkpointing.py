@@ -1336,9 +1336,9 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
-
         from megatron.training.distillation import get_logits_saver
+
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
