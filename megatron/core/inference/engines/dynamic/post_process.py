@@ -12,10 +12,12 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.utils import internal_api
 
-from .dynamic_engine_requests import RequestEntry
+from .requests import RequestEntry
 
 
+@internal_api
 # pylint: disable=line-too-long
 class StepPostProcessingMixin:
     """Per-step request post-processing for `DynamicInferenceEngine`."""
