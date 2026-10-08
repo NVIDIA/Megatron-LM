@@ -738,6 +738,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
 
+    @staticmethod
+    def _check_fp8_param_gather_consistency(config: OptimizerConfig, ddp_config) -> None:
+        """Fail if the optimizer config took the precision-aware path for FP8 params,
+        but the DDP config did not. The precision-aware optimizer
+        is not supported for quantized params.
+        """
+        if (
+            ddp_config.fp8_param_gather
+            and not config.fp8_param_gather
+            and config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and config.fp8_recipe not in (None, "delayed")
+            and config.main_params_dtype == torch.float32
+            and not config.optimizer_cpu_offload
+        ):
+            raise ValueError(
+                "ddp_config.fp8_param_gather=True but OptimizerConfig.fp8_param_gather=False "
+                f"with fp8_recipe={config.fp8_recipe!r} and --use-precision-aware-optimizer. "
+                "Quantized params need MCore-managed FP32 main params, so set "
+                "OptimizerConfig.fp8_param_gather=True to match the DDP config."
+            )
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -814,6 +835,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
+
+        self._check_fp8_param_gather_consistency(config, self.ddp_config)
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
