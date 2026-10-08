@@ -201,9 +201,9 @@ def get_batches_on_this_cp_rank(
     may request additional physical views when different consumers need different layouts. The
     boundary view is always included and is the default returned by ``ContextParallelBatch``.
 
-    Packed non-hybrid CP batches need special handling when layout conversion requires a padded
-    zigzag view or the standard sharder would balance the flattened sample instead of each
-    sequence. The same rank ordering is used to build the zigzag batch tensors and their
+    Packed CP batches need special handling when layout conversion requires a padded zigzag
+    view, when the standard sharder would balance the flattened sample instead of each sequence,
+    or under dynamic CP, whose runtime group is resolved from ``local_cp_size``. The same rank ordering is used to build the zigzag batch tensors and their
     ``PackedSeqParams``. When both layouts are requested, it also defines the
     activation-conversion plan. All other cases use the standard batch sharder.
     """
