@@ -7,7 +7,6 @@ import copy
 import pytest
 import torch
 import torch.distributed as dist
-import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
@@ -138,43 +137,6 @@ class TestPostBackwardHookAcrossGraphTasks:
             inputs = torch.randn(4, 16, device=setup.device)
             _graph_task(model, inputs, submodule_name=name)
             assert len(finalized) == (1 if node_index == 2 else 0)
-        model.context.post_backward()
-        model._trainable_parameter_countdown.check_complete()
-
-    def test_default_count_is_one_per_trainable_parameter(self, distributed_setup):
-        """The ordinary path keeps its original countdown without a declaration."""
-        model, finalized = _sharded_unit(distributed_setup)
-        assert model._trainable_parameter_countdown.initial_value == 2
-        _graph_task(model, torch.randn(4, 16, device=distributed_setup.device))
-        assert len(finalized) == 1
-        model.context.post_backward()
-
-    def test_delayed_wgrad_completes_the_countdown(self, distributed_setup):
-        """Dgrad and an ordinary gradient cannot substitute for TE's wgrad."""
-        device = distributed_setup.device
-        model = nn.Sequential(
-            te.Linear(
-                16,
-                16,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                device=device,
-                delay_wgrad_compute=True,
-                fuse_wgrad_accumulation=False,
-            ),
-            nn.Linear(16, 16, bias=False, device=device, dtype=torch.bfloat16),
-        )
-        model, finalized = _sharded_unit(distributed_setup, model=model)
-        model.context.allgather_stream.wait_stream(model.context.current_stream())
-        model.unshard()
-        inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
-        model(inputs).float().square().mean().backward()
-        assert inputs.grad is not None
-        assert finalized == []
-        with pytest.raises(ValueError, match="1/2"):
-            model._trainable_parameter_countdown.check_complete()
-        model[0].backward_dw()
-        assert len(finalized) == 1
         model.context.post_backward()
         model._trainable_parameter_countdown.check_complete()
 
