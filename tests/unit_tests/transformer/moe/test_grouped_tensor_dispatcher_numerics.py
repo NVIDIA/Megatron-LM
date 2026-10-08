@@ -56,6 +56,27 @@ def _allow_nondeterministic_grouped_dbias():
         yield
 
 
+@pytest.fixture(scope="class")
+def grouped_tensor_parallel():
+    """Own the common topology and reusable communication buffers for selected cases."""
+    if not torch.distributed.is_available() or Utils.world_size < 2:
+        pytest.skip("Distributed dispatcher tests must be launched with torchrun")
+    reset_hybrid_ep_buffer()
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, expert_model_parallel_size=Utils.world_size
+        )
+        yield
+    finally:
+        # Every case creates and seeds fresh models. Only the communication resources
+        # survive between cases, including when pytest selects a single parameter.
+        try:
+            torch.cuda.synchronize()
+            reset_hybrid_ep_buffer()
+        finally:
+            Utils.destroy_model_parallel()
+
+
 _ALIGN_SIZE = 256
 _HIDDEN_SIZE = 256
 _MOE_FFN_HIDDEN_SIZE = 256
@@ -256,9 +277,6 @@ def _run_numerical_parity_case(
 ) -> None:
     """Compare grouped-tensor execution with the old path on the same dispatcher."""
     ep_size = _require_test_environment(dispatcher)
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, expert_model_parallel_size=ep_size
-    )
     mcore_config.ENABLE_EXPERIMENTAL = True
 
     _set_random_seed(seed_=1234, data_parallel_random_init=False)
@@ -433,9 +451,6 @@ def _run_padding_lifecycle_case(dispatcher: str, monkeypatch) -> None:
     # EP spans the whole torchrun world so every tested dispatcher performs real communication.
     # TP remains one to keep the independently reconstructed local-expert counts unambiguous.
     ep_size = _require_test_environment(dispatcher)
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, expert_model_parallel_size=ep_size
-    )
     mcore_config.ENABLE_EXPERIMENTAL = True
 
     # Use the strictest parameter layout. If packed weight and packed bias reach the native
@@ -507,6 +522,7 @@ def _run_padding_lifecycle_case(dispatcher: str, monkeypatch) -> None:
     assert torch.isfinite(hidden_states.grad).all()
 
 
+@pytest.mark.usefixtures("grouped_tensor_parallel")
 class TestGroupedTensorDispatcherNumerics:
     """Distributed numerical and padding coverage for grouped-tensor dispatchers."""
 
@@ -520,10 +536,13 @@ class TestGroupedTensorDispatcherNumerics:
 
     def teardown_method(self, method):
         try:
-            mcore_config.ENABLE_EXPERIMENTAL = self._previous_experimental
-            reset_hybrid_ep_buffer()
-            Utils.destroy_model_parallel()
+            # Drain each case before reusing the buffer, including after an assertion
+            # failure. NCCL-EP alignment is per-context, unlike the HybridEP buffer.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            nccl_ep_release_context()
         finally:
+            mcore_config.ENABLE_EXPERIMENTAL = self._previous_experimental
             if self._old_single_param_env is None:
                 os.environ.pop("NVTE_GROUPED_LINEAR_SINGLE_PARAM", None)
             else:
