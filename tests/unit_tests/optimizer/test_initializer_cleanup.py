@@ -145,6 +145,9 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
             use_distributed_optimizer=False,
             overlap_param_gather=False,
             param_sync_via_bucket_group=False,
+            use_layer_wise_param_layout=False,
+            fp8_param_gather=False,
+            reuse_grad_buf_for_mxfp8_param_ag=False,
         )
         model.weights = torch.nn.ParameterList(
             [_parameter(device='cuda') for _ in range(2 * torch.distributed.get_world_size())]
@@ -163,6 +166,11 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         optimizer = get_megatron_optimizer(
             config, [model], pg_collection=pg_collection, use_gloo_process_groups=False
         )
+        # A bare module has a buffers() method, not DDP layout metadata. Preserve
+        # direct LayerWise construction and its synchronous parameter-gather fallback.
+        assert optimizer._build_param_sort_keys([model]) is None
+        assert not optimizer.use_buffer_param_sync
+        assert not optimizer.layerwise_param_sync_via_bucket_group
 
         owned = [
             param
