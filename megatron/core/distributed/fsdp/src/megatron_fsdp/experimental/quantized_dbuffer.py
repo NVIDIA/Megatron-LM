@@ -14,6 +14,7 @@
 
 """Transformer Engine MXFP8 distributed buffers composed from physical planes."""
 
+import functools
 from collections.abc import Iterable
 
 import torch
@@ -34,13 +35,13 @@ from .layout import GlobalLayout, Shape
 from .placement import BlockAtomic, RowAtomic
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
-_MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
-_COMPUTE_QUANTIZERS = {
-    (True, False): MXFP8Quantizer(_MXFP8_DTYPE, rowwise=True, columnwise=False),
-    (False, True): MXFP8Quantizer(_MXFP8_DTYPE, rowwise=False, columnwise=True),
-    (True, True): _MXFP8_QUANTIZER,
-}
 _MXFP8_BLOCK_SIZE = 32
+
+
+@functools.cache
+def _get_quantizer(*, rowwise: bool, columnwise: bool) -> MXFP8Quantizer:
+    """Return a shared MXFP8 quantizer with the given usages."""
+    return MXFP8Quantizer(_MXFP8_DTYPE, rowwise=rowwise, columnwise=columnwise)
 
 
 def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
@@ -92,7 +93,7 @@ def _block_atomic_to_flat(placements: Iterable[Placement]) -> tuple[Placement, .
 
 def _pad_rowwise_scale(scale: torch.Tensor) -> torch.Tensor:
     """Pad rowwise scales to TE's physical allocation shape."""
-    shape = _MXFP8_QUANTIZER.get_scale_shape(
+    shape = _get_quantizer(rowwise=True, columnwise=True).get_scale_shape(
         (scale.shape[0], scale.shape[1] * _MXFP8_BLOCK_SIZE), columnwise=False
     )
     if scale.shape == shape:
@@ -102,7 +103,7 @@ def _pad_rowwise_scale(scale: torch.Tensor) -> torch.Tensor:
 
 def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
     """Pad columnwise scales to TE's physical allocation shape."""
-    shape = _MXFP8_QUANTIZER.get_scale_shape(
+    shape = _get_quantizer(rowwise=True, columnwise=True).get_scale_shape(
         (scale.shape[0] * _MXFP8_BLOCK_SIZE, scale.shape[1]), columnwise=True
     )
     if scale.shape == shape:
@@ -197,12 +198,12 @@ class QuantizedDBuffer:
         return result
 
     @property
-    def has_rowwise(self) -> bool:
+    def is_rowwise_allocated(self) -> bool:
         """Whether rowwise data and scales are allocated."""
         return self.rowwise_data.is_allocated and self.rowwise_scale.is_allocated
 
     @property
-    def has_columnwise(self) -> bool:
+    def is_columnwise_allocated(self) -> bool:
         """Whether columnwise data and scales are allocated."""
         return self.columnwise_data.is_allocated and self.columnwise_scale.is_allocated
 
@@ -212,7 +213,7 @@ class QuantizedDBuffer:
         Released planes are omitted, so the view never reads storage that
         ``release_storage()`` freed.
         """
-        rowwise, columnwise = self.has_rowwise, self.has_columnwise
+        rowwise, columnwise = self.is_rowwise_allocated, self.is_columnwise_allocated
         if not (rowwise or columnwise):
             raise RuntimeError("QuantizedDBuffer has no allocated rowwise or columnwise planes.")
         rowwise_data = self.rowwise_data.get_tensor_view(index) if rowwise else None
@@ -228,7 +229,7 @@ class QuantizedDBuffer:
                 self.columnwise_scale.get_tensor_view(index) if columnwise else None
             ),
             fp8_dtype=_MXFP8_DTYPE,
-            quantizer=_COMPUTE_QUANTIZERS[(rowwise, columnwise)],
+            quantizer=_get_quantizer(rowwise=rowwise, columnwise=columnwise),
             with_gemm_swizzled_scales=False,
             device=data.device,
         )
@@ -313,7 +314,7 @@ class QuantizedDBuffer:
         new_placements = tuple(new_placements)
         if out is None:
             if not (rowwise and columnwise):
-                raise ValueError("redistribute() without `out` requires every plane.")
+                raise NotImplementedError("redistribute() without `out` requires every plane.")
             return self._from_planes(
                 self.rowwise_data.redistribute(new_placements),
                 self.columnwise_data.redistribute(new_placements),

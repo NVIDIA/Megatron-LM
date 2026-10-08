@@ -173,14 +173,12 @@ class DBuffer:
 
     @property
     def is_allocated(self) -> bool:
-        """Whether backing storage covers the local buffer.
+        """Whether the local buffer has backing storage.
 
         ``release_storage()`` clears this and ``reallocate_storage()`` restores it.
         Empty local buffers are always allocated.
         """
-        buffer = self.local_buffer
-        required_nbytes = (buffer.storage_offset() + buffer.numel()) * buffer.element_size()
-        return buffer.untyped_storage().nbytes() >= required_nbytes
+        return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
 
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""

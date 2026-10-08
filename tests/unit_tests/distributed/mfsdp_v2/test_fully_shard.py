@@ -22,7 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import Phase
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     RowAtomic,
     TensorAtomic,

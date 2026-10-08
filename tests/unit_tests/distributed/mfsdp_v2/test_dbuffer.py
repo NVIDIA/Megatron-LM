@@ -255,6 +255,34 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
 
 
+def test_is_allocated_follows_storage_release(distributed_setup):
+    """is_allocated tracks release and reallocation; empty local buffers count as allocated."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("An empty local buffer requires at least two ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    # Rank 0 owns the only tensor, so every other rank has an empty local buffer.
+    buffer = DBuffer(
+        mesh=mesh,
+        placements=[TensorAtomic()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            [torch.Size((4, 4))], dp_size=mesh.size(), tensor_owners=(0,)
+        ),
+        dtype=torch.float32,
+        device=distributed_setup.device,
+    )
+    is_empty = mesh.get_local_rank() != 0
+    assert (buffer.local_buffer.numel() == 0) == is_empty
+    assert buffer.is_allocated
+
+    buffer.release_storage()
+    # An empty local buffer has no storage to release.
+    assert buffer.is_allocated == is_empty
+
+    buffer.reallocate_storage()
+    assert buffer.is_allocated
+
+
 def test_from_local_reuses_required_local_buffer(distributed_setup):
     """DBuffer.from_local reuses caller-provided local storage without allocation."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
