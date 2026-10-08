@@ -14,10 +14,9 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
-import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Literal, cast
+from typing import cast
 from weakref import ref
 
 import torch
@@ -31,6 +30,7 @@ from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .phase import Phase
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -167,13 +167,6 @@ class FsdpContext:
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
-    class Phase(enum.Enum):
-        """Lifecycle phase of this FsdpModule."""
-
-        RESTING = enum.auto()
-        FORWARD = enum.auto()
-        BACKWARD = enum.auto()
-
     # Name relative to the root FSDP module from named_modules().
     # Root uses "" and None means uninitialized.
     _name: str | None
@@ -211,7 +204,7 @@ class FsdpModule:
         self._is_root = False
         self._name = None
         self._unshard_event = None
-        self._phase = FsdpModule.Phase.RESTING
+        self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
@@ -269,10 +262,10 @@ class FsdpModule:
     def phase(self, phase: Phase) -> None:
         """Transition this module between its valid lifecycle phases."""
         allowed_transitions = {
-            (FsdpModule.Phase.RESTING, FsdpModule.Phase.FORWARD),
-            (FsdpModule.Phase.FORWARD, FsdpModule.Phase.RESTING),
-            (FsdpModule.Phase.RESTING, FsdpModule.Phase.BACKWARD),
-            (FsdpModule.Phase.BACKWARD, FsdpModule.Phase.RESTING),
+            (Phase.RESTING, Phase.FORWARD),
+            (Phase.FORWARD, Phase.RESTING),
+            (Phase.RESTING, Phase.BACKWARD),
+            (Phase.BACKWARD, Phase.RESTING),
         }
         if (self._phase, phase) not in allowed_transitions:
             raise RuntimeError(f"Invalid FSDP module phase transition: {self._phase} -> {phase}.")
@@ -394,9 +387,9 @@ class FsdpModule:
         context.ensure_finalized()
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
-        if self.phase is not FsdpModule.Phase.BACKWARD:
-            self.phase = FsdpModule.Phase.FORWARD
+        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        if self.phase is not Phase.BACKWARD:
+            self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
         # post_forward and pre_backward -> post_backward), so they keep explicit
         # push/pop instead of a single context scope.
@@ -405,10 +398,15 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
+
+        Args:
+            phase: In what phase this module runs. None unshards for every phase.
+            prefetch: Whether to also prefetch successors in the module order of
+                ``phase``, which must then be FORWARD or BACKWARD.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -418,53 +416,70 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
-            self._unshard_parameter_groups()
+            self._unshard_parameter_groups(phase)
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
+            if not prefetch:
+                return
             context = self.context
-            if prefetch == "forward":
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
-                )
-            elif prefetch == "backward":
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
+            match phase:
+                case Phase.FORWARD:
+                    self._prefetch_parameter_groups(
+                        context.forward_order, self._schedule_policy.forward_prefetch_size
+                    )
+                case Phase.BACKWARD:
+                    self._prefetch_parameter_groups(
+                        context.backward_order, self._schedule_policy.backward_prefetch_size
+                    )
+                case _:
+                    raise ValueError(
+                        f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
+                    )
 
     def _prefetch_parameter_groups(
         self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
     ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget."""
+        """Prefetch successors from ``order`` according to this module's budget.
+
+        Successors are unsharded for this module's phase, which is the compute they
+        run next in ``order``.
+        """
         next_module = order.next_item(self)
         if prefetch_size is None:
             if next_module is not None:
-                next_module._unshard_parameter_groups()
+                next_module._unshard_parameter_groups(self.phase)
             return
 
         prefetched_size = 0
         while next_module is not None and prefetched_size < prefetch_size:
-            next_module._unshard_parameter_groups()
+            next_module._unshard_parameter_groups(self.phase)
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self) -> None:
-        """Unshard this FsdpModule's parameter groups on the all-gather stream.
+    def _unshard_parameter_groups(self, phase: Phase | None) -> None:
+        """Unshard parameter groups for compute in ``phase`` on the all-gather stream.
 
-        If ``_unshard_event`` is already set, this FsdpModule was already
-        unsharded or prefetched and this method is a no-op. Otherwise, this
-        method records ``_unshard_event`` after materialization so compute
-        can wait without depending on later release work.
+        If they were already unsharded or prefetched for that phase, this method
+        is a no-op, so compute keeps waiting on the existing event instead of on
+        later prefetches. Otherwise, it materializes the missing weights and
+        records ``_unshard_event`` so compute can wait without depending on
+        later release work.
         """
-        if self._unshard_event is not None:
+        if self._unshard_event is not None and not any(
+            group.needs_unshard(phase) for group in self._parameter_groups
+        ):
+            # Skip only if this module was unsharded since its last reshard and no group
+            # lacks what ``phase`` reads. MXFP8 groups can still lack planes, e.g. during
+            # recomputation, which needs rowwise planes after backward gathered columnwise.
             return
 
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard_parameters(phase)
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -472,11 +487,11 @@ class FsdpModule:
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
-        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if not is_recomputing:
             self.reshard()
-        if self.phase is FsdpModule.Phase.FORWARD:
-            self.phase = FsdpModule.Phase.RESTING
+        if self.phase is Phase.FORWARD:
+            self.phase = Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def reshard(self) -> None:
@@ -504,7 +519,7 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        self.phase = FsdpModule.Phase.BACKWARD
+        self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
@@ -519,13 +534,13 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        self.unshard(Phase.BACKWARD, prefetch=True)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
         self._reduce_gradient_groups()
-        self.phase = FsdpModule.Phase.RESTING
+        self.phase = Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
