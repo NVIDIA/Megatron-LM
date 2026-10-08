@@ -38,6 +38,15 @@ def ns_cost_fn(num_ns_steps: int) -> Callable[[torch.Size], int]:
     return cost_fn
 
 
+@dataclasses.dataclass(frozen=True)
+class _OwnerWork:
+    """A tensor's compute cost and eligible owner ranks in buffer order."""
+
+    tensor_index: int
+    cost: float
+    candidates: list[int]
+
+
 def assign_owner_work(
     layout: GlobalLayout,
     mesh: DeviceMesh,
@@ -46,8 +55,8 @@ def assign_owner_work(
 ) -> dict[int, int]:
     """Assign each participating tensor to a global rank holding part of it.
 
-    Fully local tensors stay with their sole holder and count toward its load.
-    Boundary tensors are processed in descending cost order and assigned to their
+    Tensors with a single candidate are assigned first, followed by tensors with
+    multiple candidates in descending cost order. Each tensor is assigned to its
     least-loaded holder. Ties follow buffer order.
 
     Args:
@@ -60,40 +69,37 @@ def assign_owner_work(
     if cost_fn is None:
         cost_fn = ns_cost_fn(num_ns_steps=5)
 
-    tensor_indices = tuple(tensor_indices)
-    candidates_by_tensor: dict[int, list[tuple[int, int]]] = {i: [] for i in tensor_indices}
-    running: dict[int, float] = {}
     placements = (RowAtomic(),) * mesh.ndim
-    for rank in mesh.mesh.flatten().tolist():
-        buffer_range = layout.get_rank_range(mesh, placements, rank)
-        running[rank] = 0.0
-        for tensor_index, holders in candidates_by_tensor.items():
-            if intersect_ranges(layout.get_tensor_range(tensor_index), buffer_range).numel > 0:
-                holders.append((buffer_range.start, rank))
+    rank_ranges = {
+        rank: layout.get_rank_range(mesh, placements, rank) for rank in mesh.mesh.flatten().tolist()
+    }
+    # Offset order, rather than global rank order, determines load-balancing ties.
+    ranks_in_buffer_order = sorted(rank_ranges, key=lambda rank: (rank_ranges[rank].start, rank))
 
-    assignments: dict[int, int] = {}
-    boundary = []
+    work_items: list[_OwnerWork] = []
     for tensor_index in tensor_indices:
-        # Offset order, rather than global rank order, determines load-balancing ties.
-        candidates = [rank for _, rank in sorted(candidates_by_tensor[tensor_index])]
+        tensor_range = layout.get_tensor_range(tensor_index)
+        candidates = [
+            rank
+            for rank in ranks_in_buffer_order
+            if intersect_ranges(tensor_range, rank_ranges[rank]).numel > 0
+        ]
         shape = layout.tensor_shapes[tensor_index]
         if not candidates:
             raise RuntimeError(
                 f"No eligible owner for tensor {tensor_index} with shape {shape}; "
                 "no rank owns a shard."
             )
-        cost = cost_fn(shape)
-        if len(candidates) == 1:
-            (holder,) = candidates
-            assignments[tensor_index] = holder
-            running[holder] += cost
-        else:
-            boundary.append((tensor_index, cost, candidates))
+        work_items.append(_OwnerWork(tensor_index, cost_fn(shape), candidates))
 
-    for tensor_index, cost, candidates in sorted(boundary, key=lambda item: item[1], reverse=True):
-        owner = min(candidates, key=lambda rank: running[rank])
-        assignments[tensor_index] = owner
-        running[owner] += cost
+    work_items.sort(key=lambda item: (len(item.candidates) > 1, -item.cost))
+
+    running_cost: dict[int, float] = {rank: 0.0 for rank in rank_ranges}
+    assignments: dict[int, int] = {}
+    for item in work_items:
+        owner = min(item.candidates, key=lambda rank: running_cost[rank])
+        assignments[item.tensor_index] = owner
+        running_cost[owner] += item.cost
     return assignments
 
 
