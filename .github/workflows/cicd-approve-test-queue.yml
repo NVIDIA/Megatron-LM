@@ -162,7 +162,7 @@ jobs:
                   for run in response.json()["workflow_runs"]:
                       runs[run["id"]] = run
                   if "next" not in response.links:
-                      return list(runs.values())
+                      return {"workflow_runs": list(runs.values())}
                   page += 1
 
           def is_internal_contributor(pr_info):
@@ -243,14 +243,16 @@ jobs:
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
-          queued_workflow_runs = get_workflow_runs("queued")
-          if queued_workflow_runs is None:
+          queued_resp = get_workflow_runs("queued")
+          if queued_resp is None:
               print("Failed to fetch queued workflow runs after retries, exiting")
               exit(1)
-          in_progress_workflow_runs = get_workflow_runs("in_progress")
-          if in_progress_workflow_runs is None:
+          queued_workflow_runs = queued_resp.get("workflow_runs", [])
+          in_progress_resp = get_workflow_runs("in_progress")
+          if in_progress_resp is None:
               print("Failed to fetch in-progress workflow runs after retries, exiting")
               exit(1)
+          in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
 
           # The functional-test slot is global across all branch/contributor queues.
           functional_test_workflow_running = any(
@@ -288,10 +290,11 @@ jobs:
 
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
-          pending_workflows = get_workflow_runs("waiting")
-          if pending_workflows is None:
+          waiting_resp = get_workflow_runs("waiting")
+          if waiting_resp is None:
               print("Failed to fetch waiting workflow runs after retries, exiting")
               exit(1)
+          pending_workflows = waiting_resp.get("workflow_runs", [])
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows
