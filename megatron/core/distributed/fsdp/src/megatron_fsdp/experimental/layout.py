@@ -40,7 +40,7 @@ class GlobalLayout:
         rank_to_offset: Global element offset of each rank segment's first element
             (``dp_size`` entries). Segment ``k`` spans ``rank_to_offset[k]`` up to the
             next entry, or ``size`` for the last segment; see ``rank_size``. On a 1-D
-            mesh ``k`` is the rank; on a multi-axis mesh ``get_local_range`` maps the ranks
+            mesh ``k`` is the rank; on a multi-axis mesh ``get_rank_range`` maps the ranks
             of the Shard axes to ``k``. Segment sizes are equal (``size // dp_size``) for
             ``RowAtomic`` / ``BlockAtomic``; generally uneven for ``TensorAtomic``.
     """
@@ -382,8 +382,20 @@ class GlobalLayout:
         """Whether every rank's segment has the same numel."""
         return len({self.rank_size(rank) for rank in range(self.dp_size)}) == 1
 
-    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
-        """Return this rank's local element ``(offset, numel)`` for ``placements``."""
+    def get_rank_range(
+        self, mesh: DeviceMesh, placements: Iterable[Placement], rank: int
+    ) -> tuple[int, int]:
+        """Return the global buffer element offset and length for a global process rank.
+
+        Args:
+            mesh: The device mesh defining the distribution.
+            placements: Per-mesh-axis placements.
+            rank: Global process rank belonging to ``mesh``.
+        """
+        coordinates = (mesh.mesh == rank).nonzero(as_tuple=False)
+        if coordinates.size(0) == 0:
+            raise ValueError(f"Global rank {rank} is not in the device mesh.")
+        coordinate = coordinates[0].tolist()
         placements = tuple(placements)
         # Innermost Shard axis is the most significant digit of the shard index.
         shard_index = 0
@@ -393,7 +405,7 @@ class GlobalLayout:
             if not isinstance(placements[axis], Shard):
                 continue
             shard_axes.append(axis)
-            shard_index = shard_index * mesh.size(axis) + mesh.get_local_rank(axis)
+            shard_index = shard_index * mesh.size(axis) + coordinate[axis]
             num_shards *= mesh.size(axis)
         if self.dp_size % num_shards != 0:
             raise ValueError(
@@ -405,6 +417,25 @@ class GlobalLayout:
         last = first + segments_per_rank - 1
         start = self.rank_to_offset[first]
         return start, self.rank_to_offset[last] + self.rank_size(last) - start
+
+    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
+        """Return this rank's local element offset and length for ``placements``."""
+        return self.get_rank_range(mesh, placements, mesh.get_rank())
+
+    def get_tensor_range(self, tensor_index: int) -> tuple[int, int]:
+        """Return the full tensor's element offset and length in the global buffer."""
+        return self.tensor_to_offset[tensor_index], self.tensor_shapes[tensor_index].numel()
+
+
+def intersect_ranges(first: tuple[int, int], second: tuple[int, int]) -> tuple[int, int]:
+    """Intersect two (offset, length) ranges in the same coordinate system.
+
+    Return the later starting offset and the overlap length, or zero length when
+    the ranges do not overlap.
+    """
+    start = max(first[0], second[0])
+    end = min(first[0] + first[1], second[0] + second[1])
+    return start, max(0, end - start)
 
 
 def non_leading_numel(shape: torch.Size) -> int:
