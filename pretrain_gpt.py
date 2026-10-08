@@ -414,7 +414,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or args.sequence_packing_scheduler is not None:
+        # Every pipeline stage runs the packing scheduler on its own copy of the data.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,

@@ -5737,9 +5737,9 @@ def evaluate(
                         )
                     )
                 except StopIteration:
-                    # Keep integration hooks and timers balanced when a finite
-                    # validation iterator ends between scheduled global batches.
-                    ft_integration.on_eval_step_end()
+                    # A finite validation iterator can end between scheduled global batches;
+                    # restore the timers the scheduler detached. No eval step has started yet,
+                    # so the fault-tolerance step hooks stay balanced.
                     config.timers = get_timers()
                     break
             else:
