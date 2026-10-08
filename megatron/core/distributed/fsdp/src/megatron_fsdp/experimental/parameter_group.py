@@ -14,7 +14,6 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
-import enum
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -33,6 +32,7 @@ from . import layout_builder
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
+from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, TensorAtomic
 
 if HAVE_TE:
@@ -84,14 +84,6 @@ class FsdpParameter:
     fqns: tuple[str, ...]
     sharded: nn.Parameter
     unsharded: nn.Parameter
-
-
-class Phase(enum.Enum):
-    """Lifecycle phase of an FsdpModule."""
-
-    RESTING = enum.auto()
-    FORWARD = enum.auto()
-    BACKWARD = enum.auto()
 
 
 class FsdpParameterGroup:
@@ -453,8 +445,8 @@ class FsdpParameterGroup:
         unsharded_model_weight = self._unsharded_model_weight
         # Forward GEMMs read rowwise planes; backward data-gradient GEMMs read columnwise planes.
         return (
-            phase is not Phase.BACKWARD and not unsharded_model_weight.has_rowwise,
-            phase is not Phase.FORWARD and not unsharded_model_weight.has_columnwise,
+            phase is not Phase.BACKWARD and not unsharded_model_weight.is_rowwise_allocated,
+            phase is not Phase.FORWARD and not unsharded_model_weight.is_columnwise_allocated,
         )
 
     def needs_unshard(self, phase: Phase | None = None) -> bool:

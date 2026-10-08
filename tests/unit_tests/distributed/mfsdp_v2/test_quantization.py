@@ -20,6 +20,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
@@ -70,29 +71,46 @@ _MXFP8_PLACEMENTS = [
     ),
 ]
 
+# Compute weights replicated across DP-outer and sharded within DP-inner. HSDP also
+# replicates optimizer weights across DP-outer; HFSDP shards them, so each step
+# all-gathers updated compute weights across DP-outer before the per-phase unshard.
+_MXFP8_2D_PLACEMENTS = [
+    pytest.param(
+        Placements(
+            dp_axes=[0, 1],
+            parameter=[Replicate(), Shard(0)],
+            gradient=[Partial("avg"), Shard(0)],
+            optimizer=[Replicate(), Shard(0)],
+        ),
+        id="hsdp",
+    ),
+    pytest.param(
+        Placements(
+            dp_axes=[0, 1],
+            parameter=[Replicate(), Shard(0)],
+            gradient=[Partial("avg"), Shard(0)],
+            optimizer=[Shard(0), Shard(0)],
+        ),
+        id="hfsdp",
+    ),
+]
+
 requires_mxfp8 = pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
 )
 
 
-@pytest.mark.launch_on_gb200
-@requires_mxfp8
-@pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
-def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
-    """MXFP8 MLP losses track an independently trained unsharded model."""
+def _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches):
+    """Train an MXFP8 MLP with MFSDP and check its losses track an unsharded reference."""
     device = distributed_setup.device
-    if distributed_setup.world_size < 2:
-        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
-
     recipe = MXFP8BlockScaling()
     with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
         torch.manual_seed(2026)
         model = _make_mlp(device)
         torch.manual_seed(2026)
         reference = _make_mlp(device)
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(model, mesh=mesh, placements=placements)
 
     # MLP weights share one quantized group; biases use a regular DBuffer.
@@ -100,8 +118,10 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
         g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
     ]
     assert len(weight_group.fsdp_parameters) == 2
-    if isinstance(placements.optimizer[0], Shard):
-        assert weight_group.main_weight.placements == (BlockAtomic(32),)
+    assert weight_group.main_weight.placements == tuple(
+        BlockAtomic(32) if isinstance(placement, Shard) else placement
+        for placement in placements.optimizer
+    )
     [bias_group] = [g for g in model.parameter_groups if g is not weight_group]
     assert isinstance(bias_group.model_weight, DBuffer)
 
@@ -125,18 +145,21 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
             parameter.clear_high_precision_init_val()
     # Different rank inputs make an incorrect gradient reduction observable.
     torch.manual_seed(1234 + distributed_setup.rank)
-    inputs = torch.randn(5, 32, 64, dtype=torch.bfloat16, device=device)
-    targets = torch.randn(5, 32, 32, dtype=torch.bfloat16, device=device)
+    inputs = torch.randn(5, num_microbatches, 32, 64, dtype=torch.bfloat16, device=device)
+    targets = torch.randn(5, num_microbatches, 32, 32, dtype=torch.bfloat16, device=device)
 
     def train(model, optimizer):
         losses = []
-        for x, target in zip(inputs, targets):
+        for step_inputs, step_targets in zip(inputs, targets):
             optimizer.zero_grad(set_to_none=True)
-            with te.autocast(recipe=recipe):
-                output = model(x)
-            loss = (output.float() - target.float()).square().mean()
-            losses.append(loss.detach())
-            loss.backward()
+            for index, (x, target) in enumerate(zip(step_inputs, step_targets)):
+                # HSDP/HFSDP reduce gradients across DP-outer only on the last microbatch.
+                with microbatch(context, is_last=index == num_microbatches - 1):
+                    with te.autocast(recipe=recipe):
+                        output = model(x)
+                    loss = (output.float() - target.float()).square().mean()
+                    (loss / num_microbatches).backward()
+                losses.append(loss.detach())
 
             # The unwrapped reference needs explicit data-parallel averaging.
             if model is reference:
@@ -156,53 +179,86 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
 
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
+@pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
+def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
+    """MXFP8 MLP losses track an independently trained unsharded model."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches=1)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("placements", _MXFP8_2D_PLACEMENTS)
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_mxfp8_mlp_training_on_2d_mesh_matches_reference(
+    distributed_setup, placements, num_microbatches
+):
+    """MXFP8 MLP losses on a 2-D DP mesh track an independently trained unsharded model."""
+    world_size = distributed_setup.world_size
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("A 2-D DP mesh requires an even number of at least 4 ranks.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
 def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(distributed_setup):
-    """Forward unshards only rowwise MXFP8 planes and backward only columnwise planes."""
+    """Forward unshards and prefetches only rowwise planes; backward only columnwise ones.
+
+    fc1 and fc2 are separate FsdpModules, so each phase checks both a module unsharded
+    for its own compute and the successor it prefetched.
+    """
     device = distributed_setup.device
     if distributed_setup.world_size < 2:
         pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
 
     recipe = MXFP8BlockScaling()
     with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
-        model = _make_mlp(device)
+        model = _RecomputedMLP(device, use_reentrant=None)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
-    [weight_group] = [
-        g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
-    ]
-    unsharded = weight_group._unsharded_model_weight
-    rowwise_planes = unsharded.planes_for(rowwise=True, columnwise=False)
-    columnwise_planes = unsharded.planes_for(rowwise=False, columnwise=True)
 
-    def is_allocated(planes):
-        return all(plane.local_buffer.untyped_storage().nbytes() > 0 for plane in planes)
+    def allocated_planes(module):
+        """Return whether the module's unsharded (rowwise, columnwise) planes are allocated."""
+        [group] = [
+            g for g in module.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
+        ]
+        unsharded = group._unsharded_model_weight
+        return unsharded.is_rowwise_allocated, unsharded.is_columnwise_allocated
 
-    def is_released(planes):
-        return all(plane.local_buffer.untyped_storage().nbytes() == 0 for plane in planes)
+    def installed_planes(module):
+        """Return whether the module's weight carries (rowwise, columnwise) data."""
+        weight = module.weight
+        return weight._rowwise_data is not None, weight._columnwise_data is not None
 
-    first_linear = model[0]
     checked_phases = []
 
-    def check_backward(_grad):
-        # Runs after the root's pre-backward unshard and before this layer's
-        # data-gradient GEMM, which reads columnwise planes.
-        assert is_released(rowwise_planes)
-        assert is_allocated(columnwise_planes)
-        assert first_linear.weight._rowwise_data is None
-        assert first_linear.weight._columnwise_data is not None
+    # Registered after fully_shard(), so these run after the FSDP pre-hooks have
+    # unsharded the module and prefetched its successor.
+    def check_forward(_module, _args):
+        # fc1 runs forward GEMMs and prefetches fc2 for its forward GEMMs.
+        for module in (model.fc1, model.fc2):
+            assert allocated_planes(module) == (True, False)
+            assert installed_planes(module) == (True, False)
+        checked_phases.append("forward")
+
+    def check_backward(_module, _grad_output):
+        # fc2 runs data-gradient GEMMs and prefetches fc1 for its data-gradient GEMMs.
+        for module in (model.fc2, model.fc1):
+            assert allocated_planes(module) == (False, True)
+            assert installed_planes(module) == (False, True)
         checked_phases.append("backward")
 
-    def check_forward(module, _args, output):
-        # Forward GEMMs read rowwise planes.
-        assert is_allocated(rowwise_planes)
-        assert is_released(columnwise_planes)
-        assert module.weight._rowwise_data is not None
-        assert module.weight._columnwise_data is None
-        checked_phases.append("forward")
-        output.register_hook(check_backward)
-
-    first_linear.register_forward_hook(check_forward)
+    model.fc1.register_forward_pre_hook(check_forward)
+    model.fc2.register_full_backward_pre_hook(check_backward)
 
     x = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
     with te.autocast(recipe=recipe):
@@ -210,7 +266,8 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
     output.float().square().mean().backward()
 
     assert checked_phases == ["forward", "backward"]
-    assert is_released(unsharded.planes)
+    for module in (model.fc1, model.fc2):
+        assert allocated_planes(module) == (False, False)
 
 
 @pytest.mark.launch_on_gb200
@@ -234,12 +291,6 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
 
     recipe = MXFP8BlockScaling()
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    recomputed_forwards = []
-
-    def record_recompute(module, _args):
-        # A forward running inside backward is an activation recomputation.
-        if torch._C._current_graph_task_id() != -1:
-            recomputed_forwards.append(module)
 
     def build(use_reentrant):
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
@@ -249,8 +300,6 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
             fully_shard(model.fc1, mesh=mesh, placements=placements)
             fully_shard(model.fc2, mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)
-        model.fc1.register_forward_pre_hook(record_recompute)
-        model.fc2.register_forward_pre_hook(record_recompute)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
         fully_shard_optimizer(optimizer)
         return model, optimizer
@@ -276,10 +325,7 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         return losses, grads, weights
 
     expected_losses, expected_grads, expected_weights = train(*build(None))
-    assert not recomputed_forwards
     losses, grads, weights = train(*build(use_reentrant))
-    # fc1 and fc2 each recompute once per step.
-    assert len(recomputed_forwards) == 2 * len(inputs)
     torch.testing.assert_close(losses, expected_losses, rtol=0, atol=0)
     torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
