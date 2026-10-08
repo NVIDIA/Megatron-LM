@@ -127,6 +127,7 @@ def get_batch(
             config=cfg.model.transformer,
         )
 
+    kd_batch = None
     cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
@@ -146,11 +147,20 @@ def get_batch(
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return [None for _ in BATCH_KEYS]
+        empty_batch = [None for _ in BATCH_KEYS]
+        return (empty_batch, None) if getattr(args, "logits_load_inputs", False) else empty_batch
 
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if getattr(args, "logits_save_inputs", False):
+            from megatron.training.distillation.v3_runtime import capture_dump_batch
+
+            capture_dump_batch(batch, hybrid=False, vp_stage=vp_stage)
+        if getattr(args, "logits_load_inputs", False) and "_kd_sample_ids" in batch:
+            from megatron.training.distillation.v3_runtime import prepare_replay_batch
+
+            batch, kd_batch = prepare_replay_batch(batch, hybrid=False)
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -179,7 +189,7 @@ def get_batch(
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
-        return (
+        intermediate_batch = (
             None,
             batch['cu_seqlens'],
             batch['cu_seqlens_padded'],
@@ -191,6 +201,7 @@ def get_batch(
             None,
             None,
         )
+        return (intermediate_batch, None) if getattr(args, "logits_load_inputs", False) else intermediate_batch
 
     batch = get_batch_on_this_cp_rank(
         batch,
@@ -205,7 +216,12 @@ def get_batch(
     # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
     # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
     # the historical sorted(batch.keys()) order.
-    return [batch[key] for key in BATCH_KEYS]
+    result = [batch[key] for key in BATCH_KEYS]
+    if getattr(args, "logits_load_inputs", False):
+        from megatron.training.distillation.v3_runtime import broadcast_targets
+
+        return result, broadcast_targets(kd_batch, vp_stage=vp_stage)
+    return result
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -239,7 +255,8 @@ def _build_cached_logits_loss_func(
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None,
+    kd_batch=None,
 ):
     """Loss function.
 
@@ -256,7 +273,11 @@ def loss_func(
     """
     args = get_args()
 
-    if args.logits_load_dir is not None:
+    if getattr(args, "logits_load_inputs", False):
+        from megatron.training.distillation.v3_loss import paired_loss
+
+        loss, num_tokens, report = paired_loss(loss_mask, output_tensor, model, kd_batch)
+    elif args.logits_load_dir is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
@@ -331,6 +352,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
+        kd_batch = None
+        if getattr(args, "logits_load_inputs", False):
+            batch, kd_batch = batch
 
         # Only populated by the has_cu_seqlens (--sft) 10-tuple branch below;
         # stays None for the 6-/7-tuple (unpacked) batch shapes.
@@ -431,8 +455,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 padding_mask=padding_mask,
             )
 
+    if kd_batch is not None:
+        from megatron.training.distillation.v3_runtime import bind_student_logits
+
+        kd_batch = bind_student_logits(kd_batch)
+
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model, kd_batch=kd_batch)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):

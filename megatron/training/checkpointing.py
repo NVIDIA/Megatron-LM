@@ -1425,11 +1425,16 @@ def save_checkpoint(
             ):
 
                 def progress_finalize_fn():
+                    progress_iteration = iteration
+                    if getattr(args, "logits_save_inputs", False):
+                        from megatron.training.distillation.v3_runtime import durable_dump_iteration
+
+                        progress_iteration = durable_dump_iteration(logits_saver, iteration)
                     tracker_filename = get_checkpoint_tracker_filename(save_root)
                     with maybe_msc.open(tracker_filename, 'w') as f:
-                        f.write(str(iteration))
+                        f.write(str(progress_iteration))
                     print(f"  recorded logits-dump progress: iteration "
-                          f"{iteration} to {tracker_filename}", flush=True)
+                          f"{progress_iteration} to {tracker_filename}", flush=True)
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_logits_request = AsyncRequest(
@@ -1824,6 +1829,10 @@ def generate_state_dict(
     # Bridge) stay right when the live namespace and the run config disagree. The live namespace
     # is not written.
     state_dict = {}
+    if getattr(args, "logits_load_inputs", False):
+        from megatron.training.distillation.v3_runtime import checkpoint_replay_state
+
+        checkpoint_replay_state(args)
     state_dict['args'] = project_checkpoint_policy(
         args, checkpoint, **{name: value for name, value in saved_policy.items() if value is not None}
     )
@@ -3496,6 +3505,9 @@ def load_checkpoint(
                 current_train_state.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
             else:
                 print_rank_0('could not find runtime training state in the checkpoint ...')
+
+    if getattr(args, "logits_load_inputs", False) and "args" in state_dict and not finetune:
+        args.offline_kd_replay_state = getattr(checkpoint_args, "offline_kd_replay_state", None)
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The

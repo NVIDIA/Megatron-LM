@@ -1660,6 +1660,11 @@ def validate_args(args, defaults={}):
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
 
+    if args.logits_save_inputs or args.logits_load_inputs or args.logits_load_follow or args.logits_load_shuffle_shards:
+        from megatron.training.distillation.v3_runtime import validate_options
+
+        validate_options(args)
+
     if args.logits_save_dir is not None:
         assert args.async_save, (
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
@@ -3649,6 +3654,8 @@ def _add_logits_distillation_args(parser):
     # -- Teacher saving --
     group.add_argument('--logits-save-dir', type=str, default=None,
                        help='Directory to save logits.')
+    group.add_argument('--logits-save-inputs', action='store_true',
+                       help='Write self-contained v3 caches with exact inputs and paired targets.')
     group.add_argument('--logits-save-top-k', type=int, default=128,
                        help='Number of top logits to save.')
     group.add_argument('--logits-save-top-p', type=float, default=None,
@@ -3666,6 +3673,18 @@ def _add_logits_distillation_args(parser):
     # -- Student loading --
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')
+    group.add_argument('--logits-load-inputs', action='store_true',
+                       help='Use a v3 cache as the training dataset and KD target source.')
+    group.add_argument('--logits-load-shuffle-shards', action='store_true',
+                       help='Permute complete teacher DP shard groups in a fixed v3 snapshot.')
+    group.add_argument('--logits-load-shuffle-seed', type=int, default=0,
+                       help='Seed for v3 shard-group order, independent of the teacher dataset seed.')
+    group.add_argument('--logits-load-follow', action='store_true',
+                       help='Wait for newly published v3 shard groups; incompatible with shuffling.')
+    group.add_argument('--logits-load-follow-timeout', type=float, default=1800,
+                       help='Maximum seconds to wait for the next complete v3 sample range.')
+    group.add_argument('--logits-load-follow-poll-interval', type=float, default=10,
+                       help='Seconds between fresh publication checks while following a teacher.')
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
                        help='Number of decode threads for cached-logits zstd '
                             'decompression and torch.load processing.')

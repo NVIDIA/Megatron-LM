@@ -1043,6 +1043,8 @@ def make_teacher_tar_dataset(
     """
     meta = peek_first_logprobs_metadata(logprobs_dir)
     fmt = (meta or {}).get("saver", {}).get("format_version", 1)
+    if (meta or {}).get("format_version") == 3 or fmt == 3:
+        raise ValueError("Self-contained v3 caches require --logits-load-inputs")
     cls: type = TeacherTarDataset if fmt >= 2 else LegacyTeacherTarDataset
     return cls(
         logprobs_dir,

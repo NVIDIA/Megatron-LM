@@ -9,6 +9,10 @@
 
 # Offline Logits Knowledge Distillation
 
+For caches that include training inputs and replace the student training dataloader,
+see [Offline KD V3: Paired Inputs and Targets](offline_logits_distillation_v3.md).
+This page describes the existing V1/V2 paths.
+
 Offline logits knowledge distillation (KD) trains a student model against a teacher's
 cached top-K token log-probabilities instead of running the teacher live. A separate
 teacher run saves top-K log-probs to disk once; any number of later student runs stream
