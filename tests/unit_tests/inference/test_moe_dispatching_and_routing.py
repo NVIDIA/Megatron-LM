@@ -801,11 +801,11 @@ class TestNVLSAllGatherVDispatcher:
             moe_shared_expert_intermediate_size=None,
             activation_func_tanh_clamp_scale=activation_clamp_scale,
             # The inference clamp kernels target the fused weighted_clamped_squared_relu.
-            # use_fused_weighted_squared_relu defaults to False, which would route the
-            # training branch through tanh_soft_clamp instead — that rounds the clamp to
-            # BF16 and is one ULP away. Only enabled for the clamped case so the unclamped
-            # parametrization keeps its existing coverage.
-            use_fused_weighted_squared_relu=activation_clamp_scale is not None,
+            # The inference squared-ReLU kernel reproduces the fused training op, so train
+            # with it. use_fused_weighted_squared_relu defaults to False, which rounds the
+            # square to BF16 first (and, when clamped, routes through tanh_soft_clamp,
+            # which rounds the clamp to BF16): one ULP away from the kernel either way.
+            use_fused_weighted_squared_relu=True,
             gated_linear_unit=mxfp8_swiglu,
             activation_func=(torch.nn.functional.silu if mxfp8_swiglu else squared_relu),
             bias_activation_fusion=mxfp8_swiglu,
