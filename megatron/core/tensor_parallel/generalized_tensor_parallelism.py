@@ -476,6 +476,27 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
+    # GTP stores contiguous rows of the logical [gate | up] weight. Unlike ordinary
+    # MLPs, grouped gated fc1 has no checkpoint wiring to gather before splitting
+    # gate/up, so reject EGTP for these modules.
+    for mod_name, mod in model.named_modules():
+        if not mod_name.endswith("linear_fc1"):
+            continue
+        cfg = getattr(mod, "config", None)
+        if cfg is None or not getattr(cfg, "gated_linear_unit", False):
+            continue
+        if getattr(mod, "weight", None) is not None:
+            continue
+        if any(
+            name.startswith("weight") and name[6:].isdigit() and is_gtp_param(param)
+            for name, param in mod.named_parameters(recurse=False)
+        ):
+            raise NotImplementedError(
+                f"{mod_name}: gated_linear_unit with EGTP-sharded grouped weights is not "
+                "supported: the logical-layout checkpoint wiring (transformer/mlp.py) only "
+                "covers non-grouped fc1. Disable EGTP for grouped gated fc1 or port the wiring."
+            )
+
 
 def configure_gtp_remat_from_recipe(
     *,
