@@ -1015,12 +1015,12 @@ class ChunkOffloadHandler:
         )
         # TODO: check if this is correct
         # Mark it as finished when there are no groups to offload or reload
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-        ):
-            return True
+        # if (
+        #     len(self._groups_to_reload) == 0
+        #     and len(self._groups_to_offload) == 0
+        #     and self._offloaded_group_index > 0
+        # ):
+        #     return True
         assert name is not None, "Name is required"
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
