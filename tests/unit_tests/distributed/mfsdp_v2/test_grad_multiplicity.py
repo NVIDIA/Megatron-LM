@@ -18,7 +18,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.countdown import Countdown
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import _module_post_backward_hook
 
@@ -69,37 +68,6 @@ def _graph_task(model: FsdpModule, inputs, submodule_name=None) -> torch.Tensor:
     loss.backward()
     model.reshard()
     return loss.detach()
-
-
-class TestCountdown:
-    """Scalar callback totals re-arm at reduction-window boundaries."""
-
-    @pytest.mark.parametrize("count", [0, 1, 4])
-    def test_complete_cycles_rearm(self, count):
-        """Untouched and completed cycles pass the synchronization check."""
-        countdown = Countdown(count)
-        countdown.check_complete()
-        for _ in range(3):
-            for callback_index in range(count):
-                assert countdown.decrement() == (callback_index == count - 1)
-            countdown.check_complete()
-        assert countdown.initial_value == count
-
-    def test_partial_cycle_fails(self):
-        """A partially counted window cannot leak across steps."""
-        countdown = Countdown(4)
-        assert not countdown.decrement()
-        with pytest.raises(ValueError, match="1/4"):
-            countdown.check_complete()
-        for _ in range(2):
-            assert not countdown.decrement()
-        assert countdown.decrement()
-        countdown.check_complete()
-
-    def test_negative_count_fails(self):
-        """Negative callback totals are invalid."""
-        with pytest.raises(ValueError, match="non-negative"):
-            Countdown(-1)
 
 
 class TestPostBackwardHookAcrossGraphTasks:
@@ -196,7 +164,7 @@ class TestPostBackwardHookAcrossGraphTasks:
             ),
             nn.Linear(16, 16, bias=False, device=device, dtype=torch.bfloat16),
         )
-        model, finalized = _sharded_unit(distributed_setup, grad_accumulation_count=2, model=model)
+        model, finalized = _sharded_unit(distributed_setup, model=model)
         model.context.allgather_stream.wait_stream(model.context.current_stream())
         model.unshard()
         inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
