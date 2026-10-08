@@ -28,6 +28,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_dispatch,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    hybrid_ep_local_combine_add,
     is_nccl_ep_bootstrapped,
     nccl_ep_combine,
     nccl_ep_dispatch,
@@ -1180,25 +1181,60 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
+    def _can_fuse_residual_into_combine(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> bool:
+        """With a single-rank group the combine is a local unpermute that can add the residual."""
+        dense_to_expert_map = self.handle[6]
+        num_tokens = residual.numel() // hidden_states.shape[-1]
+        return (
+            self.group.size() == 1
+            and not self.config.moe_permute_fusion_into_hybridep
+            and not self.drop_and_pad
+            and self._padded_num_tokens in (None, self._original_num_tokens)
+            and residual.dtype == hidden_states.dtype
+            and residual.is_contiguous()
+            and hidden_states.is_contiguous()
+            and torch.is_tensor(dense_to_expert_map)
+            and dense_to_expert_map.dtype == torch.int32
+            and dense_to_expert_map.dim() == 2
+            and dense_to_expert_map.shape[0] >= num_tokens
+        )
+
     def combine(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = hybrid_ep_combine(
-            x=hidden_states,
-            handle=self.handle,
-            num_permuted_tokens=self.num_permuted_tokens,
-            pad_multiple=self.pad_multiple,
-            fused=self.config.moe_permute_fusion_into_hybridep,
-        )
+        """Combine the expert outputs; ``residual``, if given, is added to the combined tokens."""
+        if residual is not None and self._can_fuse_residual_into_combine(hidden_states, residual):
+            hidden_states = hybrid_ep_local_combine_add(
+                hidden_states,
+                residual,
+                handle=self.handle,
+                num_permuted_tokens=self.num_permuted_tokens,
+                pad_multiple=self.pad_multiple,
+                topk=self.config.moe_router_topk,
+            )
+            residual = None
+        else:
+            hidden_states = hybrid_ep_combine(
+                x=hidden_states,
+                handle=self.handle,
+                num_permuted_tokens=self.num_permuted_tokens,
+                pad_multiple=self.pad_multiple,
+                fused=self.config.moe_permute_fusion_into_hybridep,
+            )
         if (
             self._padded_num_tokens is not None
             and self._original_num_tokens is not None
             and hidden_states.shape[0] > self._original_num_tokens
         ):
             hidden_states = hidden_states[: self._original_num_tokens]
+        if residual is not None:
+            hidden_states = hidden_states + residual.reshape(hidden_states.shape)
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
@@ -2008,11 +2044,17 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
 
+    @property
+    def supports_combine_residual(self) -> bool:
+        """Whether ``token_combine`` accepts a residual to add to the combined tokens."""
+        return isinstance(self._comm_manager, _HybridEPManager)
+
     def token_combine(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        residual: Optional[torch.Tensor] = None,
     ):
         """Executes fused un-permutation and communication using DeepEP kernels.
 
@@ -2022,6 +2064,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Expert outputs ready for combination
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
+            residual (torch.Tensor, optional): Added to the combined tokens, fused into the
+                combine where the backend allows. Requires ``supports_combine_residual``.
 
         Returns:
             Combined tokens after fused un-permutation and communication.
@@ -2030,6 +2074,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        if residual is not None:
+            assert self.supports_combine_residual, "residual requires the HybridEP backend"
+            return self._comm_manager.combine(
+                hidden_states, async_finish, allocate_on_comm_stream, residual=residual
+            )
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):

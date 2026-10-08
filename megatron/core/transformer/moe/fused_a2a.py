@@ -6,6 +6,7 @@
 import inspect
 from typing import Optional
 
+from megatron.core.fusions.fused_unpermute_add import fused_unpermute_add
 from megatron.core.utils import internal_api
 
 try:
@@ -515,6 +516,43 @@ class HybridEPCombine(torch.autograd.Function):
         return dispatched_hidden, None, None, None, None
 
 
+@internal_api
+class HybridEPLocalCombineAdd(torch.autograd.Function):
+    '''
+    HybridEP combine of a single-rank group (a local unpermute) fused with a residual add
+    '''
+
+    @staticmethod
+    def forward(ctx, x, residual, handle, num_permuted_tokens, pad_multiple, topk):
+        '''
+        Forward pass: sum the expert outputs of every token on top of its residual row
+        '''
+        # handle[5] / handle[6]: HybridEP's dense_chunk_layout / dense_to_expert_map.
+        out = fused_unpermute_add(
+            x, handle[6], handle[5][-1:], topk, add=residual.reshape(-1, x.shape[-1])
+        )
+        ctx.handle = handle
+        ctx.pad_multiple = pad_multiple
+        ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.residual_shape = residual.shape
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        '''
+        Backward pass: HybridEP's combine backward; the residual gradient passes through
+        '''
+        grad_out = grad_out.contiguous()
+        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+            hidden=grad_out,
+            scaling_factor=None,
+            handle=ctx.handle,
+            pad_multiple=ctx.pad_multiple,
+            num_permuted_tokens=ctx.num_permuted_tokens,
+        )
+        return dispatched_hidden, grad_out.view(ctx.residual_shape), None, None, None, None
+
+
 if HAVE_HYBRIDEP:
 
     @internal_api
@@ -602,9 +640,28 @@ if HAVE_HYBRIDEP:
         '''
         return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
 
+    @internal_api
+    def hybrid_ep_local_combine_add(x, residual, handle, num_permuted_tokens, pad_multiple, topk):
+        '''
+        HybridEP combine for a single-rank group fused with a residual add: returns
+        ``hybrid_ep_combine(x, ...) + residual`` with one rounding.
+
+        args:
+            x (torch.Tensor): Permuted expert outputs.
+            residual (torch.Tensor): Rows added to the combined tokens, one per token.
+            handle (EventHandle): Communication handle from dispatch operation.
+            num_permuted_tokens (int): As in ``hybrid_ep_combine``.
+            pad_multiple (int): As in ``hybrid_ep_combine``.
+            topk (int): Maximum number of experts a token is routed to.
+        '''
+        return HybridEPLocalCombineAdd.apply(
+            x, residual, handle, num_permuted_tokens, pad_multiple, topk
+        )
+
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
+    hybrid_ep_local_combine_add = None
 
 
 try:
