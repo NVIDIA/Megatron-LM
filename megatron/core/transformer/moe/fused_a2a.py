@@ -112,6 +112,7 @@ def get_elastic_buffer(
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             hidden=hidden,
             num_topk=num_topk,
+            deterministic=True,
         )
     return _elastic_buffer
 
