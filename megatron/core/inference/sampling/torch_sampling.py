@@ -13,6 +13,12 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_p,
 )
 
+# Triton is only required for request-local seeded draws.
+try:
+    from megatron.core.inference.sampling.request_seed_noise import fill_request_seed_noise
+except ImportError:
+    fill_request_seed_noise = None
+
 
 class TorchSampling(Sampling):
     """Sampling via a bucketed Gumbel-max (exponential-race) draw.
@@ -139,14 +145,14 @@ class TorchSampling(Sampling):
         if row_seeds is None:
             q.exponential_(generator=generator)
         else:
+            if fill_request_seed_noise is None:
+                raise ImportError("Request-local seeded sampling requires Triton")
             unseeded = [i for i, seed in enumerate(row_seeds) if seed is None]
             if unseeded:
                 indices = torch.tensor(unseeded, device=q.device, dtype=torch.long)
                 noise = torch.empty((len(unseeded), q.shape[1]), device=q.device, dtype=q.dtype)
                 noise.exponential_(generator=generator)
                 q.index_copy_(0, indices, noise)
-            from megatron.core.inference.sampling.request_seed_noise import fill_request_seed_noise
-
             fill_request_seed_noise(q, row_seeds, row_positions)
         sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
@@ -232,6 +238,8 @@ class TorchSampling(Sampling):
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
             output: Optional caller-owned destination tensor of shape `[n]`.
+            sequence_lengths: Positions of the pending logits, before async scheduling
+                advances the live context. Used by request-local sampling.
             eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
             cache_key: Accepted for API symmetry; ignored.
 

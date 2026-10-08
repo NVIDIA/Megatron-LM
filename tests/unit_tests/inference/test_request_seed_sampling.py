@@ -8,11 +8,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     Status,
 )
+from megatron.core.inference.sampling import torch_sampling
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 
@@ -182,8 +184,6 @@ def test_cuda_seeded_sampling_distribution():
 @pytest.mark.parametrize("backend,speculative", [("flashinfer", 0), ("torch", 2), ("torch", 0)])
 @pytest.mark.asyncio
 async def test_unsupported_seed_returns_failed_request(backend, speculative):
-    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
-
     engine = object.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(
         config=SimpleNamespace(sampling_backend=backend, num_speculative_tokens=speculative),
@@ -238,3 +238,15 @@ def test_seeded_cpu_sampling_rejected(top_k):
             row_seeds=[42],
             row_positions=[7],
         )
+
+
+@pytest.mark.parametrize("seed", [None, 123])
+def test_triton_only_required_for_seeded_sampling(monkeypatch, seed):
+    monkeypatch.setattr(torch_sampling, "fill_request_seed_noise", None)
+    logits = torch.zeros(1, 16, device="cuda")
+    kwargs = dict(generator=torch.Generator(device="cuda"), row_seeds=[seed])
+    if seed is None:
+        assert TorchSampling.sample_from_logits(logits, 1.0, 0, 0.0, **kwargs).shape == (1,)
+    else:
+        with pytest.raises(ImportError, match="requires Triton"):
+            TorchSampling.sample_from_logits(logits, 1.0, 0, 0.0, **kwargs)
