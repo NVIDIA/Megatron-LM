@@ -1901,6 +1901,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         seed_error = None
         if request.sampling_params.seed is not None:
+            # FlashInfer seed/offset wiring still needs batch-independent upstream
+            # Philox subsequences. Keep this guard until its replay regression passes.
             if self.context.config.sampling_backend != "torch":
                 seed_error = "Request-local seeds require sampling_backend='torch'"
             elif self.context.config.num_speculative_tokens:

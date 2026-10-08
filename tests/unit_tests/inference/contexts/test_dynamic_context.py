@@ -4318,7 +4318,8 @@ def test_flashinfer_sample_kernel_dispatch(
             temperature=torch.ones(n),
             top_k=torch.tensor(top_k, dtype=torch.int32),
             top_p=torch.tensor(top_p),
-        )
+        ),
+        active_request_metadata={},
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)
