@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from collections import Counter
+
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -32,6 +34,14 @@ def _module_post_backward_hook(module: FsdpModule) -> None:
     module._reduce_gradient_groups()
 
 
+def _register_unshard_hooks(module, owner: FsdpModule) -> None:
+    """Install the owning unit's forward and backward unshard hooks."""
+    module.register_forward_pre_hook(
+        _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
+    )
+    module.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+
+
 def reshard_fsdp_module(module: FsdpModule) -> None:
     """Reshard the FSDP module after fine-grained computation."""
     assert isinstance(module, FsdpModule), "Expected an FsdpModule."
@@ -50,11 +60,8 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
         if isinstance(submodule, FsdpModule):
             owner = submodule  # BEFORE registering: an FSDP unit owns itself
         owners.setdefault(submodule, owner)
-        if len(list(submodule.parameters(recurse=False))) > 0:
-            submodule.register_forward_pre_hook(
-                _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
-            )
-            submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+        if next(submodule.parameters(recurse=False), None) is not None:
+            _register_unshard_hooks(submodule, owner)
         for child in submodule.children():
             register_hooks(child, owner)
 
@@ -103,13 +110,10 @@ def _register_borrowed_weight_unshard_hooks(model, owners) -> None:
     owner = owners.get(getattr(embedding, 'word_embeddings', None) or embedding)
     if owner is None:
         return
-    output_layer.register_forward_pre_hook(
-        _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
-    )
-    output_layer.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+    _register_unshard_hooks(output_layer, owner)
 
 
-def _window_extras(model) -> list:
+def _window_extras(model) -> Counter[int]:
     """Extra backward contributions per weight for one backward window.
 
     A parameter accumulates its gradient once per schedule node that consumes it in its
@@ -131,25 +135,31 @@ def _window_extras(model) -> list:
     exactly when ``pipeline_model_parallel_size > 1``. At PP=1 the two loss nodes share
     one GraphTask and fire once between them.
 
-    Entries are ``(weight, extra contributions)``; the matcher sums every entry a
-    parameter matches.
+    Counts are keyed by weight identity, so aliases add without tensor equality checks.
     """
     tied = model.share_embeddings_and_output_weights and (model.pre_process or model.mtp_process)
-    mtp_depth = _active_mtp_layers(model)
+    mtp_depth = getattr(model.config, 'mtp_num_layers', None) or 0
+    if mtp_depth and not model.mtp_process:
+        mtp_depth = 0
+    assert mtp_depth in (0, 1), (
+        "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
+        "(transformer_config.py:3485-3489); per-parameter multiplicity does not "
+        f"model deeper MTP (got {mtp_depth})."
+    )
     interleaved = model.config.pipeline_model_parallel_size > 1
 
     embedding_weight = _resolve(model, 'embedding', 'word_embeddings', 'weight')
     # Group 1 consumes the embedding weight when tied, the projection's own otherwise.
     projection_weight = embedding_weight if tied else _resolve(model, 'output_layer', 'weight')
 
-    extras = []
-    if tied:
-        extras.append((embedding_weight, 1))
-    if mtp_depth:
-        extras.append((embedding_weight, mtp_depth))
+    extras = Counter()
+    if tied and embedding_weight is not None:
+        extras[id(embedding_weight)] += 1
+    if mtp_depth and embedding_weight is not None:
+        extras[id(embedding_weight)] += mtp_depth
     if mtp_depth and interleaved:
-        extras.extend(
-            (weight, 1)
+        extras.update(
+            id(weight)
             for weight in (
                 projection_weight,
                 *_mtp_layer_weights(model),
@@ -167,26 +177,6 @@ def _resolve(obj, *path):
         if obj is None:
             return None
     return obj
-
-
-def _active_mtp_layers(module) -> int:
-    """Return whether THIS pipeline stage runs MTP (0 or 1)."""
-    depth = getattr(module.config, 'mtp_num_layers', None) or 0
-    if depth == 0 or not module.mtp_process:
-        return 0
-    assert depth == 1, (
-        "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
-        "(transformer_config.py:3485-3489); per-parameter multiplicity does not "
-        f"model deeper MTP (got {depth})."
-    )
-    return 1
-
-
-def _matches_fsdp_parameter(fsdp_parameter, weight) -> bool:
-    """Return whether ``fsdp_parameter`` is ``weight``."""
-    if weight is None:
-        return False
-    return fsdp_parameter.unsharded is weight or fsdp_parameter.sharded is weight
 
 
 def _mtp_layer_weights(model):
@@ -208,7 +198,7 @@ def _mtp_layer_weights(model):
     )
 
 
-def _unit_grad_accumulation_count(unit: FsdpModule, extras: list) -> int:
+def _unit_grad_accumulation_count(unit: FsdpModule, extras: Counter[int]) -> int:
     """Total parameter-gradient callbacks per combined 1F1B reduction window.
 
     ``1`` per parameter plus every extra contribution of the weights it is
@@ -219,6 +209,9 @@ def _unit_grad_accumulation_count(unit: FsdpModule, extras: list) -> int:
     """
     return sum(
         1
-        + sum(count for weight, count in extras if _matches_fsdp_parameter(fsdp_parameter, weight))
+        + sum(
+            extras.get(identity, 0)
+            for identity in {id(fsdp_parameter.unsharded), id(fsdp_parameter.sharded)}
+        )
         for fsdp_parameter in unit._trainable_fsdp_parameters()
     )
