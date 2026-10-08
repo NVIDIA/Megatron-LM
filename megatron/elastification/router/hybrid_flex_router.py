@@ -312,7 +312,7 @@ class FlextronRouter(MegatronModule):
             ]
         self.gate_mamba = nn.Sequential(*gate_mamba_layer_list)
 
-    def mamba_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
+    def mamba_forward(self, iteration, budget_tensor, device, dtype, tau, hard_sample):
 
         # TODO @ataghibakhsh: check router out of sync on TP ranks
 
@@ -321,7 +321,7 @@ class FlextronRouter(MegatronModule):
         router_mamba_logits = self.gate_mamba[2](router_mamba_logits2)[0].flatten()
         # torch.distributed.all_reduce(router_mamba_logits, group=get_tensor_model_parallel_group(), op=torch.distributed.ReduceOp.AVG)
         if self.scaler is not None:
-            scale = self.scaler[args.curr_iteration].to(device=device, dtype=dtype)
+            scale = self.scaler[iteration].to(device=device, dtype=dtype)
 
         if self.config.flex_hetero_mamba:
             mamba_n = len(self.config.mamba_int_list)
@@ -335,7 +335,7 @@ class FlextronRouter(MegatronModule):
             else:
                 router_mamba_logits = scale * router_mamba_logits
             router_mamba_logits = self._dp_gumbel_softmax(
-                router_mamba_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
+                router_mamba_logits, tau=tau, hard=hard_sample, curr_iteration=iteration
             )
             _, choices_mamba = torch.topk(router_mamba_logits, 1, dim=-1)
             return (
@@ -357,12 +357,12 @@ class FlextronRouter(MegatronModule):
             else:
                 router_mamba_logits = scale * router_mamba_logits
             router_mamba_logits = self._dp_gumbel_softmax(
-                router_mamba_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
+                router_mamba_logits, tau=tau, hard=hard_sample, curr_iteration=iteration
             )
             _, choices_mamba = torch.topk(router_mamba_logits, 1, dim=-1)
             return (router_mamba_logits, self.config.mamba_int_list[choices_mamba.item()])
 
-    def mlp_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
+    def mlp_forward(self, iteration, budget_tensor, device, dtype, tau, hard_sample):
 
         # TODO @ataghibakhsh: check router out of sync on TP ranks
         router_mlp_logits1 = self.gate_mlp[0](budget_tensor)
@@ -370,7 +370,7 @@ class FlextronRouter(MegatronModule):
         router_mlp_logits = self.gate_mlp[2](router_mlp_logits2)[0].flatten()
         # torch.distributed.all_reduce(router_mlp_logits, group=get_tensor_model_parallel_group(), op=torch.distributed.ReduceOp.AVG)
         if self.scaler is not None:
-            scale = self.scaler[args.curr_iteration].to(device=device, dtype=dtype)
+            scale = self.scaler[iteration].to(device=device, dtype=dtype)
         if self.config.flex_hetero_ffn:
             mlp_n = len(self.config.mlp_int_list)
             router_mlp_logits = router_mlp_logits.reshape(-1, mlp_n)
@@ -383,7 +383,7 @@ class FlextronRouter(MegatronModule):
             else:
                 router_mlp_logits = scale * router_mlp_logits
             router_mlp_logits = self._dp_gumbel_softmax(
-                router_mlp_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
+                router_mlp_logits, tau=tau, hard=hard_sample, curr_iteration=iteration
             )
             _, choices_mlp = torch.topk(router_mlp_logits, 1, dim=-1)
             return (
@@ -405,18 +405,18 @@ class FlextronRouter(MegatronModule):
             else:
                 router_mlp_logits = scale * router_mlp_logits
             router_mlp_logits = self._dp_gumbel_softmax(
-                router_mlp_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
+                router_mlp_logits, tau=tau, hard=hard_sample, curr_iteration=iteration
             )
             _, choices_mlp = torch.topk(router_mlp_logits, 1, dim=-1)
             return (router_mlp_logits, self.config.mlp_int_list[choices_mlp.item()])
 
-    def moe_expert_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
+    def moe_expert_forward(self, iteration, budget_tensor, device, dtype, tau, hard_sample):
         router_moe_expert_logits1 = self.gate_moe_expert[0](budget_tensor)
         router_moe_expert_logits2 = self.gate_moe_expert[1](router_moe_expert_logits1[0])
         router_moe_expert_logits = self.gate_moe_expert[2](router_moe_expert_logits2)[0].flatten()
         # torch.distributed.all_reduce(router_moe_expert_logits, group=get_tensor_model_parallel_group(), op=torch.distributed.ReduceOp.AVG)
         if self.scaler is not None:
-            scale = self.scaler[args.curr_iteration].to(device=device, dtype=dtype)
+            scale = self.scaler[iteration].to(device=device, dtype=dtype)
         if self.config.flex_hetero_moe_expert:
             moe_expert_n = len(self.config.moe_expert_int_list)
             router_moe_expert_logits = router_moe_expert_logits.reshape(-1, moe_expert_n)
@@ -432,7 +432,7 @@ class FlextronRouter(MegatronModule):
                 router_moe_expert_logits,
                 tau=tau,
                 hard=hard_sample,
-                curr_iteration=args.curr_iteration,
+                curr_iteration=iteration,
             )
             _, choices_moe_expert = torch.topk(router_moe_expert_logits, 1, dim=-1)
             return (
@@ -457,7 +457,7 @@ class FlextronRouter(MegatronModule):
                 router_moe_expert_logits,
                 tau=tau,
                 hard=hard_sample,
-                curr_iteration=args.curr_iteration,
+                curr_iteration=iteration,
             )
             _, choices_moe_expert = torch.topk(router_moe_expert_logits, 1, dim=-1)
             return (
@@ -465,25 +465,25 @@ class FlextronRouter(MegatronModule):
                 self.config.moe_expert_int_list[choices_moe_expert.item()],
             )
 
-    def emb_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
+    def emb_forward(self, iteration, budget_tensor, device, dtype, tau, hard_sample):
 
         router_emb_logits1 = self.gate_emb[0](budget_tensor)
         router_emb_logits2 = self.gate_emb[1](router_emb_logits1[0])
         router_emb_logits = self.gate_emb[2](router_emb_logits2)[0].flatten()
         # torch.distributed.all_reduce(router_emb_logits, group=get_tensor_model_parallel_group(), op=torch.distributed.ReduceOp.AVG)
         if self.scaler is not None:
-            scale = self.scaler[args.curr_iteration].to(device=device, dtype=dtype)
+            scale = self.scaler[iteration].to(device=device, dtype=dtype)
             router_emb_logits = scale * router_emb_logits
 
         # router_emb_logits = F.gumbel_softmax(router_emb_logits, tau=tau, hard=hard_sample)
         router_emb_logits = self._dp_gumbel_softmax(
-            router_emb_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
+            router_emb_logits, tau=tau, hard=hard_sample, curr_iteration=iteration
         )
         _, choices_emb = torch.topk(router_emb_logits, 1, dim=-1)
 
         return (router_emb_logits, self.config.emb_int_list[choices_emb.item()])
 
-    def skipping_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
+    def skipping_forward(self, iteration, budget_tensor, device, dtype, tau, hard_sample):
 
         # for layer skipping, skipping MLP layers
         router_skip_layer_logits1 = self.gate_skip_layer[0](budget_tensor)
@@ -495,12 +495,12 @@ class FlextronRouter(MegatronModule):
         )
         if self.scaler is not None:
             router_skip_layer_logits = router_skip_layer_logits * self.scaler[
-                args.curr_iteration
+                iteration
             ].to(device=device, dtype=dtype)
 
         # router_skip_layer_logits = F.gumbel_softmax(router_skip_layer_logits, tau=tau, hard=hard_sample)
         router_skip_layer_logits = self._dp_gumbel_softmax(
-            router_skip_layer_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
+            router_skip_layer_logits, tau=tau, hard=hard_sample, curr_iteration=iteration
         )
         _, choices_skip_layer = torch.topk(router_skip_layer_logits, 1, dim=-1)
         if choices_skip_layer.item() != 0:
@@ -538,13 +538,17 @@ class FlextronRouter(MegatronModule):
 
     def forward(self, budget):
 
-        from megatron.training import get_args
+        from megatron.training import get_train_state
 
-        args = get_args()
+        train_state = get_train_state()
+        iteration = train_state.iteration
+        # Evaluation after training uses the schedule for the last executed step.
+        if not self.training and iteration > train_state.resume_iteration:
+            iteration -= 1
 
         hard_sample = random.random() > self.hard_sample_th
 
-        tau = self.get_curr_tau(args.curr_iteration)
+        tau = self.get_curr_tau(iteration)
 
         device, dtype = next(self.parameters()).device, next(self.parameters()).dtype
 
@@ -596,22 +600,22 @@ class FlextronRouter(MegatronModule):
             budget_tensor = budget_tensor.squeeze(0).flip(0)
 
         budget_tensor = budget_tensor.unsqueeze(0)
-        mlp_forward_outputs = self.mlp_forward(args, budget_tensor, device, dtype, tau, hard_sample)
+        mlp_forward_outputs = self.mlp_forward(iteration, budget_tensor, device, dtype, tau, hard_sample)
         mamba_forward_outputs = self.mamba_forward(
-            args, budget_tensor, device, dtype, tau, hard_sample
+            iteration, budget_tensor, device, dtype, tau, hard_sample
         )
         moe_expert_forward_outputs = self.moe_expert_forward(
-            args, budget_tensor, device, dtype, tau, hard_sample
+            iteration, budget_tensor, device, dtype, tau, hard_sample
         )
 
         if self.config.add_skipping:
             skipping_forward_outputs = self.skipping_forward(
-                args, budget_tensor, device, dtype, tau, hard_sample
+                iteration, budget_tensor, device, dtype, tau, hard_sample
             )
         else:
             skipping_forward_outputs = None
 
-        emb_forward_outputs = self.emb_forward(args, budget_tensor, device, dtype, tau, hard_sample)
+        emb_forward_outputs = self.emb_forward(iteration, budget_tensor, device, dtype, tau, hard_sample)
         self.fwd_pass_count += 1
         return (
             mlp_forward_outputs,
