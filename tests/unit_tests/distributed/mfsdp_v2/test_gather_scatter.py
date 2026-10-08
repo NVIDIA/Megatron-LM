@@ -5,31 +5,26 @@ Distributed tests for the `gather_scatter` module.
 
 These tests require `torchrun` (≥2 ranks and ≥1 GPU per rank). They create a `DBuffer` with known
 data, gather full tensors to the owners via P2P, verify correctness, then scatter the results back
-and verify the `DBuffer` is unchanged (identity round-trip).
+and verify that remote `DBuffer` views receive the changed results.
 """
 
 import os
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
 import torch
-import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.gather_scatter import (
     gather,
     scatter,
-    waiting_stream_scope,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
     GroupOwnerLayout,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    FsdpParameterGroup,
+    assign_owner_work,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import intersect_ranges
 
 
 def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
@@ -37,8 +32,10 @@ def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < 2 or torch.cuda.device_count() < world_size:
-        pytest.skip("Needs >=2 ranks and >=1 GPU per rank.")
+    if world_size < 2:
+        pytest.skip("Needs at least two ranks.")
+    if torch.cuda.is_available() and torch.cuda.device_count() < world_size:
+        pytest.skip("Needs at least one GPU per rank when using CUDA.")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     if torch.cuda.is_available():
@@ -63,27 +60,20 @@ def _make_dbuffer(
     )
 
 
-def _owner_layout(dbuffer: DBuffer, tensor_shapes: list[torch.Size]) -> GroupOwnerLayout:
-    """Build the `DBuffer`'s `GroupOwnerLayout`.
-
-    Mocks the minimal `FsdpParameterGroup` surface that `GroupOwnerLayout.from_group` reads: `mesh`,
-    `main_weight.layout`, and `fsdp_parameters` (default NS-5 cost balancing and default ≥2D
-    eligibility).
-    """
-    params = tuple(nn.Parameter(torch.empty(shape)) for shape in tensor_shapes)
-    group = SimpleNamespace(
-        mesh=dbuffer.mesh,
-        main_weight=SimpleNamespace(layout=dbuffer.layout),
-        fsdp_parameters=tuple(SimpleNamespace(sharded=param) for param in params),
+def _owner_layout(dbuffer: DBuffer) -> GroupOwnerLayout:
+    """Build owners directly from the DBuffer's existing layout and mesh."""
+    indices = [i for i, shape in enumerate(dbuffer.layout.tensor_shapes) if len(shape) >= 2]
+    tensor_to_owner = assign_owner_work(dbuffer.layout, dbuffer.mesh, indices)
+    return GroupOwnerLayout(
+        mesh=dbuffer.mesh, layout=dbuffer.layout, tensor_to_owner=tensor_to_owner
     )
-    return GroupOwnerLayout.from_group(cast(FsdpParameterGroup, group))
 
 
 def _known_full_tensors(
     dbuffer: DBuffer, owner_layout: GroupOwnerLayout, device: torch.device
 ) -> list[torch.Tensor]:
     """Fill this rank's local views with known data; return the distinct full tensors."""
-    this_rank = dbuffer.mesh.get_local_rank()
+    this_rank = dbuffer.mesh.get_rank()
     full_tensors = []
     for i, shape in enumerate(dbuffer.layout.tensor_shapes):
         full = (
@@ -92,10 +82,14 @@ def _known_full_tensors(
         full_tensors.append(full)
         local_view = dbuffer.get_tensor_view(i)
         if local_view.numel() > 0:
-            layout = owner_layout.layouts[i]
-            offset = layout.rank_offset(this_rank)
-            numel = layout.rank_numel(this_rank)
-            local_view.copy_(full.flatten()[offset : offset + numel].view(local_view.shape))
+            tensor_range = dbuffer.layout.get_tensor_range(i)
+            shard_range = intersect_ranges(
+                tensor_range, dbuffer.layout.get_rank_range(dbuffer.mesh, [RowAtomic()], this_rank)
+            )
+            offset = shard_range.start - tensor_range.start
+            local_view.copy_(
+                full.flatten()[offset : offset + shard_range.numel].view(local_view.shape)
+            )
     return full_tensors
 
 
@@ -104,50 +98,76 @@ def _nonempty_local_tensors(
 ) -> dict[int, torch.Tensor]:
     """The gather source dict: the `DBuffer`'s local views for held parameters."""
     return {
-        i: view for i in owner_layout.layouts if (view := dbuffer.get_tensor_view(i)).numel() > 0
+        i: view
+        for i in owner_layout.tensor_to_owner
+        if (view := dbuffer.get_tensor_view(i)).numel() > 0
     }
 
 
-def test_gather_scatter_round_trip():
-    """gather -> scatter identity round-trip: `DBuffer` data is unchanged.
-
-    One boundary and one non-boundary parameter: the owners reconstruct the full tensors, and
-    scattering them back into the `DBuffer`'s local views leaves the local buffer unchanged.
-    """
-    _, _, device, mesh = _setup()
+@pytest.mark.parametrize("subgroup", [False, True])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_gather_scatter_round_trip(subgroup, noncontiguous):
+    """Gather tensors and scatter changed results into the remote DBuffer views."""
+    rank, world_size, device, mesh = _setup()
+    if subgroup:
+        if world_size < 4:
+            pytest.skip("Needs four ranks to test the noncontiguous subgroup [1, 3].")
+        mesh = DeviceMesh(device.type, [1, 3])
+        if rank not in (1, 3):
+            return
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
     dbuffer = _make_dbuffer(mesh, device, tensor_shapes)
-    owner_layout = _owner_layout(dbuffer, tensor_shapes)
+    owner_layout = _owner_layout(dbuffer)
     full_tensors = _known_full_tensors(dbuffer, owner_layout, device)
-    this_rank = mesh.get_local_rank()
+    this_rank = mesh.get_rank()
 
     # --- Gather ---
-    owned = {i for i in owner_layout.layouts if owner_layout.owners[i] == this_rank}
+    owned = {i for i, owner in owner_layout.tensor_to_owner.items() if owner == this_rank}
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(_nonempty_local_tensors(dbuffer, owner_layout), destination, owner_layout=owner_layout)
+    source = _nonempty_local_tensors(dbuffer, owner_layout)
+    if noncontiguous:
+        source = {
+            i: torch.empty((*shard.shape, 2), dtype=shard.dtype, device=device)[..., 0].copy_(shard)
+            for i, shard in source.items()
+        }
+    gather(source, destination, owner_layout=owner_layout)
 
     # Owners got the correct full tensors; nothing else was written.
     for i in owned:
         torch.testing.assert_close(destination[i], full_tensors[i], atol=0, rtol=0)
     assert set(destination) == owned
 
-    # --- Scatter (identity: scatter the gathered full tensors back) ---
+    # Scatter changed results to ensure every remote destination is written.
+    for tensor in destination.values():
+        tensor.add_(1)
     # Destination = the `DBuffer`'s local views, the natural update-application site.
     held_not_owned = [
-        i for i in owner_layout.layouts if i not in owned and dbuffer.get_tensor_view(i).numel() > 0
+        i
+        for i in owner_layout.tensor_to_owner
+        if i not in owned and dbuffer.get_tensor_view(i).numel() > 0
     ]
     scatter_destination = {i: dbuffer.get_tensor_view(i) for i in held_not_owned}
-    original_local = dbuffer.local_buffer.clone()
     scatter(destination, scatter_destination, owner_layout=owner_layout)
 
-    # The `DBuffer` local buffer is unchanged (round-trip).
-    torch.testing.assert_close(dbuffer.local_buffer, original_local, atol=0, rtol=0)
+    for i in owner_layout.tensor_to_owner:
+        local_view = dbuffer.get_tensor_view(i)
+        if local_view.numel() == 0:
+            continue
+        tensor_range = dbuffer.layout.get_tensor_range(i)
+        shard_range = intersect_ranges(
+            tensor_range, dbuffer.layout.get_rank_range(mesh, [RowAtomic()], this_rank)
+        )
+        offset = shard_range.start - tensor_range.start
+        expected = full_tensors[i].flatten()[offset : offset + shard_range.numel]
+        if i in held_not_owned:
+            expected = expected + 1
+        torch.testing.assert_close(local_view.flatten(), expected, atol=0, rtol=0)
 
 
 def test_gather_scatter_with_stream():
-    """gather -> scatter inside `waiting_stream_scope` produces correct results.
+    """gather -> scatter on a separate stream with explicit waits produces correct results.
 
     The scatter destination is plain flat tensors (not `DBuffer` views), matching `scatter`'s
     caller-owned application contract.
@@ -158,17 +178,18 @@ def test_gather_scatter_with_stream():
 
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
     dbuffer = _make_dbuffer(mesh, device, tensor_shapes)
-    owner_layout = _owner_layout(dbuffer, tensor_shapes)
+    owner_layout = _owner_layout(dbuffer)
     full_tensors = _known_full_tensors(dbuffer, owner_layout, device)
-    this_rank = mesh.get_local_rank()
+    this_rank = mesh.get_rank()
 
     stream = torch.cuda.Stream(device=device)
 
-    owned = {i for i in owner_layout.layouts if owner_layout.owners[i] == this_rank}
+    owned = {i for i, owner in owner_layout.tensor_to_owner.items() if owner == this_rank}
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    with waiting_stream_scope(stream):
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
         gather(
             _nonempty_local_tensors(dbuffer, owner_layout), destination, owner_layout=owner_layout
         )
@@ -179,21 +200,24 @@ def test_gather_scatter_with_stream():
 
     # Scatter into plain flat result-shard tensors.
     held_not_owned = [
-        i for i in owner_layout.layouts if i not in owned and dbuffer.get_tensor_view(i).numel() > 0
+        i
+        for i in owner_layout.tensor_to_owner
+        if i not in owned and dbuffer.get_tensor_view(i).numel() > 0
     ]
     scatter_destination = {
-        i: torch.empty(
-            owner_layout.layouts[i].rank_numel(this_rank), dtype=torch.float32, device=device
-        )
+        i: torch.empty(dbuffer.get_tensor_view(i).numel(), dtype=torch.float32, device=device)
         for i in held_not_owned
     }
-    with waiting_stream_scope(stream):
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
         scatter(destination, scatter_destination, owner_layout=owner_layout)
     stream.synchronize()
 
     for i in held_not_owned:
-        layout = owner_layout.layouts[i]
-        offset = layout.rank_offset(this_rank)
-        numel = layout.rank_numel(this_rank)
-        expected = full_tensors[i].flatten()[offset : offset + numel]
+        tensor_range = dbuffer.layout.get_tensor_range(i)
+        shard_range = intersect_ranges(
+            tensor_range, dbuffer.layout.get_rank_range(mesh, [RowAtomic()], this_rank)
+        )
+        offset = shard_range.start - tensor_range.start
+        expected = full_tensors[i].flatten()[offset : offset + shard_range.numel]
         torch.testing.assert_close(scatter_destination[i], expected, atol=0, rtol=0)

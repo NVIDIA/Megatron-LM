@@ -10,35 +10,17 @@ Owner-compute P2P gather/scatter for MFSDP v2.
 Both take the caller-built `GroupOwnerLayout` (who owns which parameter, and which rank holds which
 flat range), operating on one set of parameters at a time.
 
-The caller's current CUDA stream is never blocked, so multiple param groups can be pipelined by
-executing the functions in different streams. The caller needs to wait on the streams before reading
-the results, with `waiting_stream_scope` supplying an abstraction.
+Operations run on the current CUDA stream. Multiple parameter groups can be pipelined by
+executing the functions in different streams. Callers explicitly wait for inputs to be ready on
+each stream and for results to be ready before consuming them on another stream.
 """
-
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
 
 from .owner_planning import GroupOwnerLayout
-
-
-@contextmanager
-def waiting_stream_scope(stream: torch.cuda.Stream) -> Iterator[None]:
-    """Create a context running PyTorch ops on `stream`, which waits on the caller's stream at
-    entry.
-
-    The caller's stream itself is never blocked; callers must wait on `stream` before reading
-    results produced inside the context.
-
-    Args:
-        stream: Which stream to use for PyTorch ops inside the context.
-    """
-    default_stream = torch.cuda.current_stream()
-    with torch.cuda.stream(stream):
-        stream.wait_stream(default_stream)
-        yield
+from .placement import RowAtomic
+from .range import intersect_ranges
 
 
 def gather(
@@ -51,10 +33,10 @@ def gather(
 
     All tensors in `source` must share dtype and device (as in a `DBuffer`), also across ranks.
 
-    For each participating parameter (a key of `owner_layout.layouts`):
+    For each participating parameter (a key of `owner_layout.tensor_to_owner`):
 
     - If this rank owns it, `destination[i]` is filled with the full flat tensor, reconstructed by
-      concatenating the per-rank chunks in rank order (i.e., global element order). Fully local
+      concatenating the per-rank chunks in buffer order. Fully local
       parameters (i.e., non-boundary parameters) are copied straight into `destination[i]`.
     - Otherwise, this rank's local chunk is sent to the owner.
 
@@ -68,10 +50,17 @@ def gather(
         owner_layout: The group's owner layout.
     """
     mesh = owner_layout.mesh
-    world_size = mesh.size()
-    this_rank = mesh.get_local_rank()
+    this_rank = mesh.get_rank()
+    layout = owner_layout.layout
+    rank_ranges = {
+        rank: layout.get_rank_range(mesh, [RowAtomic()] * mesh.ndim, rank)
+        for rank in mesh.mesh.flatten().tolist()
+    }
+    rank_ranges = dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
     group = mesh.get_group()
-    owned_tensor_indices = [i for i in owner_layout.layouts if owner_layout.owners[i] == this_rank]
+    owned_tensor_indices = [
+        i for i, owner in sorted(owner_layout.tensor_to_owner.items()) if owner == this_rank
+    ]
 
     # Allocate the flat recv buffers (one per (tensor index, source rank) pair).
     recv_chunks: dict[tuple[int, int], torch.Tensor] = {}
@@ -84,11 +73,10 @@ def gather(
             raise RuntimeError("`gather` needs at least one source chunk to infer dtype")
 
         for i in owned_tensor_indices:
-            layout = owner_layout.layouts[i]
-            for src_rank in range(world_size):
+            for src_rank in rank_ranges:
                 if src_rank == this_rank:
                     continue
-                numel = layout.rank_numel(src_rank)
+                numel = intersect_ranges(layout.get_tensor_range(i), rank_ranges[src_rank]).numel
                 if numel > 0:
                     recv_chunks[(i, src_rank)] = torch.empty(
                         numel, dtype=reference.dtype, device=reference.device
@@ -96,12 +84,14 @@ def gather(
 
     # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
     ops: list[dist.P2POp] = []
-    for i, layout in owner_layout.layouts.items():
-        owner_rank = owner_layout.owners[i]
+    for i, owner_rank in sorted(owner_layout.tensor_to_owner.items()):
         # Don't send already local or empty chunks.
-        if owner_rank == this_rank or layout.rank_numel(this_rank) == 0:
+        if (
+            owner_rank == this_rank
+            or intersect_ranges(layout.get_tensor_range(i), rank_ranges[this_rank]).numel == 0
+        ):
             continue
-        chunk = source[i]
+        chunk = source[i].flatten().contiguous()
         ops.append(dist.P2POp(dist.isend, chunk, peer=owner_rank, group=group))
     for (_, src_rank), buf in recv_chunks.items():
         ops.append(dist.P2POp(dist.irecv, buf, peer=src_rank, group=group))
@@ -113,7 +103,7 @@ def gather(
     # Reconstruct the full flat tensors for owned parameters into `destination`.
     for i in owned_tensor_indices:
         chunks: list[torch.Tensor] = []
-        for src_rank in range(world_size):
+        for src_rank in rank_ranges:
             if src_rank == this_rank:
                 chunk = source[i]
                 if chunk.numel() > 0:
@@ -138,7 +128,7 @@ def scatter(
     All tensors in `source` and `destination` must share dtype and device (as in a `DBuffer`), also
     across ranks.
 
-    For each participating parameter (a key of `owner_layout.layouts`):
+    For each participating parameter (a key of `owner_layout.tensor_to_owner`):
 
     - If this rank owns it, `source[i]` is flattened (a view on contiguous tensors) and each rank's
       shard is sliced out and sent to it directly. The owner keeps its own result chunk.
@@ -156,13 +146,19 @@ def scatter(
         owner_layout: The group's owner layout.
     """
     mesh = owner_layout.mesh
-    world_size = mesh.size()
-    this_rank = mesh.get_local_rank()
+    this_rank = mesh.get_rank()
+    layout = owner_layout.layout
+    rank_ranges = {
+        rank: layout.get_rank_range(mesh, [RowAtomic()] * mesh.ndim, rank)
+        for rank in mesh.mesh.flatten().tolist()
+    }
+    rank_ranges = dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
     group = mesh.get_group()
     held_tensor_indices = [
         i
-        for i in owner_layout.layouts
-        if owner_layout.owners[i] != this_rank and owner_layout.layouts[i].rank_numel(this_rank) > 0
+        for i, owner in sorted(owner_layout.tensor_to_owner.items())
+        if owner != this_rank
+        and intersect_ranges(layout.get_tensor_range(i), rank_ranges[this_rank]).numel > 0
     ]
 
     # Allocate the recv buffers.
@@ -176,29 +172,33 @@ def scatter(
             raise RuntimeError("`scatter` needs at least one tensor to infer dtype")
 
         for i in held_tensor_indices:
-            numel = owner_layout.layouts[i].rank_numel(this_rank)
+            numel = intersect_ranges(layout.get_tensor_range(i), rank_ranges[this_rank]).numel
             recv_chunks[i] = torch.empty(numel, dtype=reference.dtype, device=reference.device)
 
     # Build the P2P ops: send owned result chunks, receive the ones held here.
     ops: list[dist.P2POp] = []
-    for i in owner_layout.layouts:
+    for i, owner in sorted(owner_layout.tensor_to_owner.items()):
         # Don't send local chunks.
-        if owner_layout.owners[i] != this_rank:
+        if owner != this_rank:
             continue
         flat = source[i].flatten()
-        layout = owner_layout.layouts[i]
-        for dest in range(world_size):
+        for dest in rank_ranges:
             if dest == this_rank:
                 continue
-            numel = layout.rank_numel(dest)
+            shard_range = intersect_ranges(layout.get_tensor_range(i), rank_ranges[dest])
+            numel = shard_range.numel
+            offset = shard_range.start - layout.tensor_to_offset[i]
             if numel == 0:
                 continue
-            offset = layout.rank_offset(dest)
             ops.append(
                 dist.P2POp(dist.isend, flat[offset : offset + numel], peer=dest, group=group)
             )
     for i in held_tensor_indices:
-        ops.append(dist.P2POp(dist.irecv, recv_chunks[i], peer=owner_layout.owners[i], group=group))
+        ops.append(
+            dist.P2POp(
+                dist.irecv, recv_chunks[i], peer=owner_layout.tensor_to_owner[i], group=group
+            )
+        )
 
     works = dist.batch_isend_irecv(ops) if ops else []
     for work in works:
