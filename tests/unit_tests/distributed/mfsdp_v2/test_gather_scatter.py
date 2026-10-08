@@ -29,7 +29,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_plannin
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 
 
 def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
@@ -53,10 +53,10 @@ def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
 def _make_dbuffer(
     mesh: DeviceMesh, device: torch.device, tensor_shapes: list[torch.Size]
 ) -> DBuffer:
-    """Create a `DBuffer` with all-`Flat` placement."""
+    """Create a `DBuffer` with all-`RowAtomic` placement."""
     return DBuffer.empty(
         mesh=mesh,
-        placements=[Flat()],
+        placements=[RowAtomic()],
         tensor_shapes=tensor_shapes,
         dtype=torch.float32,
         device=device,
