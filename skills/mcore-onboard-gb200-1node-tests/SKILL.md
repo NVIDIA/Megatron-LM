@@ -1,8 +1,7 @@
 ---
 name: mcore-onboard-gb200-1node-tests
-description: Onboard 1-node GitHub MR functional tests for GB200 from existing mr-scoped 2-node tests.
+description: Onboard 1-node GitHub MR functional tests for GB200 from existing mr-scoped 2-node tests. Use when adding GB200 github-mr tests; creating single-node variants of existing tests; expanding CI coverage for GB200; 'add GB200 MR tests', 'onboard GB200 1-node', 'create single-node variant'.
 license: Apache-2.0
-when_to_use: Adding GB200 github-mr tests; creating single-node variants of existing tests; expanding CI coverage for GB200; 'add GB200 MR tests', 'onboard GB200 1-node', 'create single-node variant'.
 user_invocable: true
 argument: "[model-yaml]  # optional: gpt, moe, or both (default: both)"
 metadata:

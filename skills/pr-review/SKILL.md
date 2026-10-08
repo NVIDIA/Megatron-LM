@@ -16,9 +16,9 @@ It lives in `skills/` so the rubric can be diffed, reviewed and evolved like
 code instead of being buried in YAML, but it is deliberately inert: the
 frontmatter carries `disable-model-invocation: true`, so Claude Code drops it
 from the advertised skill list and refuses to auto-invoke it. Reading it by
-path, which is exactly what the reviewer does, still works. Do not add a
-`when_to_use:` field — that is the trigger text that would make it activate on
-its own.
+path, which is exactly what the reviewer does, still works. Do not add trigger
+text to the `description` field — that is what would make it activate on its
+own.
 
 ## Pick the depth
 
