@@ -96,15 +96,12 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
         patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
         patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
         patch("megatron.core.datasets.data_schedule.broadcast_tensor"),
-        patch(
-            "megatron.core.parallel_state.get_dynamic_data_context_parallel_groups",
-            return_value=runtime_cp_group,
-        ),
     ):
         cp_batch = get_batch_on_this_rank_for_sequence_packing(
             iter([batch]),
             dynamic_cp=True,
             pg_collection=pg_collection,
+            dynamic_cp_group_func=lambda group_size: runtime_cp_group,
             config=config,
             return_context_parallel_batch=True,
         )
@@ -524,6 +521,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             mtp_on_this_rank=False,
             vp_stage=None,
             dynamic_cp=dynamic_cp,
+            dynamic_cp_group_func=parallel_state.get_dynamic_data_context_parallel_groups,
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.
