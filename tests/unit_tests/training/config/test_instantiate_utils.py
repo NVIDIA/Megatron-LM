@@ -619,10 +619,14 @@ class TestRejectUnsafeTargetName:
     def test_allows_ordinary_target(self):
         _reject_unsafe_target_name(target=_target_qualname(TestClass), full_key="model.target")
 
-    @pytest.mark.parametrize("field", ["collate_impl", "hf_filter_lambda", "preprocess_fn", "process_example_fn"])
+    @pytest.mark.parametrize(
+        "field", ["collate_impl", "hf_filter_lambda", "preprocess_fn", "process_example_fn"]
+    )
     def test_rejects_callable_config_fields(self, field):
         with pytest.raises(InstantiationException, match="callable config field"):
-            _reject_unsafe_target_name(target=_target_qualname(test_function), full_key=f"dataset.{field}")
+            _reject_unsafe_target_name(
+                target=_target_qualname(test_function), full_key=f"dataset.{field}"
+            )
 
     def test_callable_field_check_uses_last_key_segment(self):
         with pytest.raises(InstantiationException, match="callable config field"):

@@ -23,10 +23,7 @@ _TARGET_ALLOWLIST_MUTATORS: tuple[str, ...] = (
     "disable",
     "enable",
 )
-_DISALLOWED_CANONICAL_TARGETS: set[str] = {
-    "numpy.load",
-    "torch.serialization.load",
-}
+_DISALLOWED_CANONICAL_TARGETS: set[str] = {"numpy.load", "torch.serialization.load"}
 _DISALLOWED_TARGETS: set[str] = {
     "megatron.bridge.models.conversion.auto_bridge.AutoBridge.from_hf_pretrained",
     "megatron.bridge.models.hf_pretrained.safe_config_loader.safe_load_config_with_retry",
@@ -50,7 +47,10 @@ _DISALLOWED_TARGETS: set[str] = {
     "torch.utils.cpp_extension.load",
     "torch.utils.cpp_extension.load_inline",
     "transformers.pipeline",
-    *{f"megatron.bridge.utils.instantiate_utils.target_allowlist.{method}" for method in _TARGET_ALLOWLIST_MUTATORS},
+    *{
+        f"megatron.bridge.utils.instantiate_utils.target_allowlist.{method}"
+        for method in _TARGET_ALLOWLIST_MUTATORS
+    },
     *{
         f"megatron.training.config.instantiate_utils.target_allowlist.{method}"
         for method in _TARGET_ALLOWLIST_MUTATORS
@@ -101,9 +101,7 @@ _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
     "signal.",
 )
 
-_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset({
-    "functools.partial",
-})
+_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset({"functools.partial"})
 
 
 class TargetAllowlist:
@@ -148,8 +146,7 @@ class TargetAllowlist:
     def disable(self) -> None:
         """Disable the allowlist check (allows all targets)."""
         logging.warning(
-            "Target allowlist has been disabled. "
-            "Arbitrary _target_ values will be permitted."
+            "Target allowlist has been disabled. " "Arbitrary _target_ values will be permitted."
         )
         self._enabled = False
 
@@ -174,10 +171,7 @@ target_allowlist = TargetAllowlist()
 
 
 def instantiate(
-    config: Any,
-    *args: Any,
-    mode: InstantiationMode = InstantiationMode.LENIENT,
-    **kwargs: Any,
+    config: Any, *args: Any, mode: InstantiationMode = InstantiationMode.LENIENT, **kwargs: Any
 ) -> Any:
     """Instantiate an object or callable from a config object.
 
@@ -239,7 +233,9 @@ def instantiate(
     if OmegaConf.is_dict(config):
         # Finalize config (convert targets to strings, merge with kwargs)
         config_copy = copy.deepcopy(config)
-        config_copy._set_flag(flags=["allow_objects", "struct", "readonly"], values=[True, False, False])
+        config_copy._set_flag(
+            flags=["allow_objects", "struct", "readonly"], values=[True, False, False]
+        )
         config_copy._set_parent(config._get_parent())
         config = config_copy
 
@@ -254,7 +250,9 @@ def instantiate(
     elif OmegaConf.is_list(config):
         # Finalize config (convert targets to strings, merge with kwargs)
         config_copy = copy.deepcopy(config)
-        config_copy._set_flag(flags=["allow_objects", "struct", "readonly"], values=[True, False, False])
+        config_copy._set_flag(
+            flags=["allow_objects", "struct", "readonly"], values=[True, False, False]
+        )
         config_copy._set_parent(config._get_parent())
         config = config_copy
 
@@ -263,18 +261,16 @@ def instantiate(
         _partial_ = kwargs.pop(_Keys.PARTIAL, False)
 
         if _partial_:
-            raise InstantiationException("The _partial_ keyword is not compatible with top-level list instantiation")
+            raise InstantiationException(
+                "The _partial_ keyword is not compatible with top-level list instantiation"
+            )
 
         return instantiate_node(config, *args, partial=_partial_, mode=mode)
     else:
-        raise InstantiationException(
-            dedent(
-                f"""\
+        raise InstantiationException(dedent(f"""\
                 Cannot instantiate config of type {type(config).__name__}.
                 Top level config must be an OmegaConf DictConfig/ListConfig object,
-                a plain dict/list, or a Structured Config class or instance."""
-            )
-        )
+                a plain dict/list, or a Structured Config class or instance."""))
 
 
 def instantiate_node(
@@ -345,7 +341,9 @@ def instantiate_node(
         exclude_keys = set(item.value for item in _Keys if item != _Keys.ARGS)
         if _is_target(node):
             should_call_target = node.get(_Keys.CALL, True)
-            _target_ = _resolve_target(node.get(_Keys.TARGET), full_key, check_callable=should_call_target)
+            _target_ = _resolve_target(
+                node.get(_Keys.TARGET), full_key, check_callable=should_call_target
+            )
             kwargs = {}
             is_partial = node.get(_Keys.PARTIAL, False) or partial
 
@@ -395,7 +393,10 @@ def _locate(path: str) -> Any:
     parts = [part for part in path.split(".")]
     for part in parts:
         if not len(part):
-            raise ValueError(f"Error loading '{path}': invalid dotstring." + "\nRelative imports are not supported.")
+            raise ValueError(
+                f"Error loading '{path}': invalid dotstring."
+                + "\nRelative imports are not supported."
+            )
     assert len(parts) > 0
 
     # Try importing from the most specific path first (back to front)
@@ -453,7 +454,10 @@ def _call_target(
         try:
             return functools.partial(_target_, *args, **kwargs)
         except Exception as e:
-            msg = f"Error in creating partial({_convert_target_to_string(_target_)}, ...) object:" + f"\n{repr(e)}"
+            msg = (
+                f"Error in creating partial({_convert_target_to_string(_target_)}, ...) object:"
+                + f"\n{repr(e)}"
+            )
             if full_key:
                 msg += f"\nfull_key: {full_key}"
             raise InstantiationException(msg) from e
@@ -512,7 +516,9 @@ def _filter_kwargs_for_target(
     target_str = _convert_target_to_string(target)
     if mode == InstantiationMode.LENIENT:
         # Warn and drop the unexpected keys
-        warning_msg = f"Dropping unexpected config keys for target '{target_str}': {sorted(unexpected)}"
+        warning_msg = (
+            f"Dropping unexpected config keys for target '{target_str}': {sorted(unexpected)}"
+        )
         if full_key:
             warning_msg += f"\nfull_key: {full_key}"
         logging.warning(warning_msg)
@@ -549,9 +555,7 @@ def _prepare_input_dict_or_list(d: dict[Any, Any] | list[Any]) -> Any:
 
 
 def _resolve_target(
-    target: str | type | Callable[..., Any],
-    full_key: str,
-    check_callable: bool = True,
+    target: str | type | Callable[..., Any], full_key: str, check_callable: bool = True
 ) -> type | Callable[..., Any] | object:
     """Resolve target string, type or callable into type or callable."""
     if isinstance(target, str):
@@ -617,7 +621,10 @@ def _reject_unsafe_target_name(*, target: str, full_key: str | int) -> None:
     if (
         target in _DISALLOWED_TARGETS
         or target.startswith(_DISALLOWED_TRANSFORMERS_PREFIXES)
-        or (target.startswith("transformers.") and target.rsplit(".", 1)[-1] in _DISALLOWED_TRANSFORMERS_METHODS)
+        or (
+            target.startswith("transformers.")
+            and target.rsplit(".", 1)[-1] in _DISALLOWED_TRANSFORMERS_METHODS
+        )
     ):
         raise InstantiationException(
             f"Instantiation of '{target}' is not allowed because it can bypass target validation."

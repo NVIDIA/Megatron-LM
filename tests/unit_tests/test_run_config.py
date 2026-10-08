@@ -295,7 +295,9 @@ class TestReadRunConfigTargetValidation:
         with (
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("megatron.training.utils.checkpoint_utils.safe_get_rank", return_value=0),
-            mock.patch("megatron.training.utils.checkpoint_utils.safe_get_world_size", return_value=1),
+            mock.patch(
+                "megatron.training.utils.checkpoint_utils.safe_get_world_size", return_value=1
+            ),
             mock.patch("megatron.training.utils.checkpoint_utils.print_rank_0"),
             mock.patch("torch.distributed.broadcast_object_list") as broadcast,
         ):
@@ -307,7 +309,12 @@ class TestReadRunConfigTargetValidation:
     def test_preserves_benign_legacy_config(self, tmp_path, _allow_local_targets):
         path = self._write(
             tmp_path,
-            {"model": {"_target_": f"{_LegacyConfig.__module__}.{_LegacyConfig.__qualname__}", "removed": "old"}},
+            {
+                "model": {
+                    "_target_": f"{_LegacyConfig.__module__}.{_LegacyConfig.__qualname__}",
+                    "removed": "old",
+                }
+            },
         )
 
         with mock.patch("torch.distributed.is_initialized", return_value=False):
@@ -315,7 +322,9 @@ class TestReadRunConfigTargetValidation:
 
         assert "removed" not in config["model"]
 
-    def test_rejects_unsafe_target_in_field_compat_would_discard(self, tmp_path, _allow_local_targets):
+    def test_rejects_unsafe_target_in_field_compat_would_discard(
+        self, tmp_path, _allow_local_targets
+    ):
         path = self._write(
             tmp_path,
             {

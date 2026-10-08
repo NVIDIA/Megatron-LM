@@ -87,9 +87,13 @@ def read_train_state(train_state_filename: str) -> TrainState:
             try:
                 if MultiStorageClientFeature.is_enabled():
                     msc = MultiStorageClientFeature.import_package()
-                    state_dict = msc.torch.load(train_state_filename, map_location="cpu", weights_only=True)
+                    state_dict = msc.torch.load(
+                        train_state_filename, map_location="cpu", weights_only=True
+                    )
                 else:
-                    state_dict = torch.load(train_state_filename, map_location="cpu", weights_only=True)
+                    state_dict = torch.load(
+                        train_state_filename, map_location="cpu", weights_only=True
+                    )
                 ts = TrainState()
                 ts.load_state_dict(state_dict)
                 state_obj[0] = ts
@@ -139,7 +143,9 @@ def _validate_run_config_targets(value: Any, path: str = "") -> None:
             full_key = f"{path}._target_" if path else "_target_"
             _reject_unsafe_target_name(target=target, full_key=path)
             if target in _DISALLOWED_CANONICAL_TARGETS:
-                raise InstantiationException(f"Instantiation of '{target}' is not allowed.\nfull_key: {full_key}")
+                raise InstantiationException(
+                    f"Instantiation of '{target}' is not allowed.\nfull_key: {full_key}"
+                )
         for key, child in value.items():
             if key != "_target_":
                 child_path = f"{path}.{key}" if path else str(key)
