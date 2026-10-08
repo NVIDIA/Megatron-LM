@@ -35,9 +35,9 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
-from .dynamic_engine_loop import EngineState
-from .dynamic_engine_requests import _PROMPT_PREPARATION_ERROR_FIELD
+from ..async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
+from .loop import EngineState
+from .requests import _PROMPT_PREPARATION_ERROR_FIELD
 
 try:
     import zmq
@@ -121,6 +121,7 @@ def _slice_merged_segments(segments, attr: str, start: int, end: int) -> list:
     return out
 
 
+@internal_api
 # pylint: disable=line-too-long
 class CoordinatorMixin:
     """ZMQ coordinator transport and EP/world consensus for `DynamicInferenceEngine`."""

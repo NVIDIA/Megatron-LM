@@ -757,7 +757,7 @@ def test_weight_scoped_salt_partitions_the_hash_space():
     Under PERSIST the prefix cache survives a refit, so without this a request
     admitted after new weights land can match KV the old weights computed.
     """
-    from megatron.core.inference.engines.dynamic_engine_requests import _weight_scoped_salt
+    from megatron.core.inference.engines.dynamic.requests import _weight_scoped_salt
 
     tokens = torch.arange(8, dtype=torch.int64)
     gen1 = compute_block_hashes_batched(
@@ -776,7 +776,7 @@ def test_weight_scoped_salt_partitions_the_hash_space():
 
 def test_weight_scoped_salt_is_inert_before_the_first_resume():
     """Epoch 0 hashes exactly as an unsalted engine did, media key and all."""
-    from megatron.core.inference.engines.dynamic_engine_requests import _weight_scoped_salt
+    from megatron.core.inference.engines.dynamic.requests import _weight_scoped_salt
 
     assert _weight_scoped_salt(0, None) is None
     assert _weight_scoped_salt(0, "img-1") == "img-1"
@@ -789,7 +789,7 @@ def test_weight_scoped_salt_is_inert_before_the_first_resume():
 
 def test_weight_scoped_salt_keeps_media_identity_distinct():
     """Within one generation, different media must still not share KV."""
-    from megatron.core.inference.engines.dynamic_engine_requests import _weight_scoped_salt
+    from megatron.core.inference.engines.dynamic.requests import _weight_scoped_salt
 
     tokens = torch.arange(8, dtype=torch.int64)
     a = compute_block_hashes_batched(
@@ -812,7 +812,7 @@ def test_text_request_hashes_are_scoped_to_the_weight_generation():
     common case; testing the helper alone would pass with the engine never
     applying it.
     """
-    from megatron.core.inference.engines.dynamic_engine_requests import _weight_scoped_salt
+    from megatron.core.inference.engines.dynamic.requests import _weight_scoped_salt
 
     tokens = list(range(8))
 

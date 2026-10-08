@@ -209,7 +209,7 @@ class TestInferenceWandbLogging:
             ), f"{field} should be float but is {type(stats[field])}"
 
     @pytest.mark.internal
-    @patch('megatron.core.inference.engines.dynamic_engine.HAVE_WANDB', True)
+    @patch('megatron.core.inference.engines.dynamic.engine.HAVE_WANDB', True)
     def test_engine_logging_step_interval_zero(self):
         """Test that no logging occurs when logging_step_interval is 0."""
         mock_wandb = Mock()
