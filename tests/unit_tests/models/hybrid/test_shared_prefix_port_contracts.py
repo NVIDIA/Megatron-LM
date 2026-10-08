@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextvars import ContextVar, copy_context
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -9,8 +11,183 @@ from megatron.core.models.hybrid.shared_prefix_layout import SharedPrefixLayout
 from megatron.core.ssm.mamba_branch_layout import merge_mamba_branches, pack_mamba_branches
 from megatron.core.tensor_observation import capture_tensor_observations, observe_tensor
 from megatron.core.tensor_parallel.random import _run_recompute_with_observation_suspended
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import router_gating_linear, router_gating_token_blocks
-from megatron.core.transformer.moe.router import _expert_bias_token_counts
+from megatron.core.transformer.moe.router import TopKRouter, _expert_bias_token_counts
+
+
+@pytest.mark.parametrize("shared_prefix", [False, True])
+def test_moe_route_preserves_packed_sequence_metadata_and_logical_counts(shared_prefix):
+    hidden_states = torch.randn(3, 2, 4)
+    padding_mask = torch.tensor([[False, False, True], [False, True, True]])
+    input_ids = torch.arange(6).reshape(2, 3)
+    packed_seq_params = object()
+    multiplicities = torch.tensor([3, 1, 0, 2, 0, 0]) if shared_prefix else None
+    captured = {}
+    expected = (torch.ones(6, 2), torch.ones(6, 4, dtype=torch.bool))
+
+    class RecordingRouter(torch.nn.Module):
+        def forward(self, hidden, mask, input_ids=None, packed_seq_params=None, **kwargs):
+            captured.update(
+                hidden=hidden,
+                mask=mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+                kwargs=kwargs,
+            )
+            return expected
+
+    layer = SimpleNamespace(
+        router=RecordingRouter(), config=SimpleNamespace(cuda_graph_impl="none")
+    )
+    actual = MoELayer.route(
+        layer,
+        hidden_states,
+        padding_mask,
+        input_ids,
+        packed_seq_params,
+        token_multiplicities=multiplicities,
+    )
+    assert actual[0] is expected[0]
+    assert actual[1] is expected[1]
+    assert captured["hidden"] is hidden_states
+    torch.testing.assert_close(captured["mask"], padding_mask.T)
+    assert captured["input_ids"] is input_ids
+    assert captured["packed_seq_params"] is packed_seq_params
+    if shared_prefix:
+        assert captured["kwargs"]["token_multiplicities"] is multiplicities
+    else:
+        assert captured["kwargs"] == {}
+
+
+def test_moe_forward_passes_both_routing_metadata_sources():
+    hidden_states = torch.randn(3, 1, 4)
+    padding_mask = torch.zeros(1, 3, dtype=torch.bool)
+    input_ids = torch.arange(3).unsqueeze(0)
+    packed_seq_params = object()
+    multiplicities = torch.tensor([2, 1, 1])
+    probs, routes = torch.ones(3, 2), torch.ones(3, 4, dtype=torch.bool)
+    layer = SimpleNamespace(
+        training=False,
+        select_token_dispatcher=Mock(),
+        _shared_prefix_token_multiplicities=multiplicities,
+        fwd_execution_map={"route": True},
+        shared_experts_compute=Mock(return_value=None),
+        route=Mock(return_value=(probs, routes)),
+        preprocess=Mock(return_value=(hidden_states, probs)),
+        moe_layer_recompute=False,
+    )
+    MoELayer.forward(
+        layer,
+        hidden_states,
+        intermediate_tensors={},
+        padding_mask=padding_mask,
+        input_ids=input_ids,
+        packed_seq_params=packed_seq_params,
+    )
+    layer.route.assert_called_once_with(
+        hidden_states,
+        padding_mask,
+        input_ids=input_ids,
+        packed_seq_params=packed_seq_params,
+        token_multiplicities=multiplicities,
+    )
+
+
+def test_router_forward_preserves_upstream_positional_packed_sequence_argument():
+    hidden_states = torch.randn(3, 1, 4)
+    padding_mask = torch.zeros(3, 1, dtype=torch.bool)
+    input_ids = torch.arange(3).unsqueeze(0)
+    packed_seq_params = object()
+    multiplicities = torch.tensor([2, 1, 1])
+    expected = (torch.ones(3, 2), torch.ones(3, 4, dtype=torch.bool))
+    router = SimpleNamespace(
+        _maintain_float32_expert_bias=Mock(),
+        apply_input_jitter=lambda value: value,
+        gating=lambda value: value,
+        config=SimpleNamespace(moe_router_force_load_balancing=False, moe_router_force_biased=None),
+        routing=Mock(return_value=expected),
+    )
+    with patch("megatron.core.transformer.moe.router.is_observing_tensor", return_value=False):
+        actual = TopKRouter.forward(
+            router,
+            hidden_states,
+            padding_mask,
+            input_ids,
+            packed_seq_params,
+            token_multiplicities=multiplicities,
+        )
+    assert actual[0] is expected[0]
+    assert actual[1] is expected[1]
+    router.routing.assert_called_once_with(
+        hidden_states,
+        padding_mask=padding_mask,
+        input_ids=input_ids,
+        packed_seq_params=packed_seq_params,
+        token_multiplicities=multiplicities,
+    )
+
+
+def test_router_routing_preserves_packed_aux_losses_and_logical_expert_counts():
+    logits = torch.randn(3, 1, 4)
+    padding_mask = torch.zeros(3, 1, dtype=torch.bool)
+    packed_seq_params = object()
+    multiplicities = torch.tensor([2, 1, 1])
+    probs, routes = torch.ones(3, 2), torch.ones(3, 4, dtype=torch.bool)
+    scores = logits.view(3, 4).softmax(dim=-1)
+    router = SimpleNamespace(
+        training=True,
+        config=SimpleNamespace(
+            num_moe_experts=4,
+            moe_num_hash_layers=0,
+            moe_expert_capacity_factor=None,
+            moe_router_pre_softmax=False,
+            moe_router_num_groups=None,
+            moe_router_group_topk=None,
+            moe_router_topk_scaling_factor=None,
+            moe_router_fusion=False,
+            moe_router_aux_loss_fusion=False,
+        ),
+        is_hash_layer=False,
+        routing_type="aux_loss",
+        topk=2,
+        score_function="softmax",
+        expert_bias=None,
+        router_replay=None,
+        apply_z_loss=lambda value, **kwargs: value,
+        _dense_route_indices_dtype=lambda: None,
+        is_aux_loss_enabled=lambda: True,
+        _apply_aux_loss=Mock(return_value=probs),
+        _apply_seq_aux_loss=Mock(return_value=probs),
+        _apply_global_aux_loss=Mock(return_value=probs),
+        _apply_expert_bias=Mock(),
+    )
+    with (
+        torch.enable_grad(),
+        patch("megatron.core.transformer.moe.router.is_observing_tensor", return_value=False),
+        patch(
+            "megatron.core.transformer.moe.router.topk_routing_with_score_function",
+            return_value=(probs, routes),
+        ),
+        patch(
+            "megatron.core.transformer.moe.router.compute_routing_scores_for_aux_loss",
+            return_value=(routes, scores),
+        ),
+    ):
+        TopKRouter.routing(
+            router,
+            logits,
+            padding_mask,
+            None,
+            packed_seq_params,
+            token_multiplicities=multiplicities,
+        )
+    assert router._apply_aux_loss.call_args.kwargs["packed_seq_params"] is packed_seq_params
+    assert router._apply_seq_aux_loss.call_args.kwargs["packed_seq_params"] is packed_seq_params
+    torch.testing.assert_close(
+        router._apply_expert_bias.call_args.kwargs["padding_mask"], padding_mask.reshape(-1)
+    )
+    assert router._apply_expert_bias.call_args.kwargs["token_multiplicities"] is multiplicities
 
 
 @pytest.mark.parametrize("dense_indices", [False, True])
