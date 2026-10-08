@@ -17,6 +17,7 @@
 import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from typing import Literal, cast
 from weakref import ref
 
@@ -33,6 +34,8 @@ from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
+
+_FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
 
 def _is_in_backward() -> bool:
@@ -98,7 +101,9 @@ class FsdpContext:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
-            raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
+            raise ValueError(
+                f"fully_shard_context/FsdpContext requires a CUDA device, got {device}."
+            )
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
@@ -111,6 +116,7 @@ class FsdpContext:
         self._registered_modules: list[FsdpModule] = []
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
+        self._context_token: Token[FsdpContext | None] | None = None
         self.allgather_stream = torch.cuda.Stream(device)
         if unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
@@ -118,6 +124,25 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
+
+    def __enter__(self) -> "FsdpContext":
+        """Activate this context for FSDP module construction."""
+        if _FSDP_CONTEXT.get() is not None:
+            raise RuntimeError("fully_shard_context does not support nesting.")
+        if self._is_finalized:
+            raise RuntimeError("Cannot enter fully_shard_context after construction is finalized.")
+        self._context_token = _FSDP_CONTEXT.set(self)
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
+        """Finalize successful construction and always clear the active scope."""
+        assert self._context_token is not None
+        try:
+            if exc_type is None:
+                self.finalize()
+        finally:
+            _FSDP_CONTEXT.reset(self._context_token)
+            self._context_token = None
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -209,6 +234,18 @@ class FsdpContext:
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+
+
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
 
 
 class FsdpModule:

@@ -18,17 +18,16 @@ import dataclasses
 import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from contextvars import ContextVar
 
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule
+from .module import FsdpContext, FsdpModule, current_fully_shard_context
 from .schedule import SchedulePolicy
 
-_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+fully_shard_context = FsdpContext
 
 MeshAxis = int | str
 
@@ -57,43 +56,6 @@ class Placements:
         ):
             if len(placements) != axis_count:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
-
-
-def current_fully_shard_context() -> FsdpContext | None:
-    """Return the innermost active ``fully_shard_context``, or ``None``.
-
-    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
-    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
-    active. Callers that must share one context -- for example per-chunk wrappers built by
-    a single wrap call -- use it to join the caller's ambient context instead of opening a
-    second one.
-    """
-    return _FSDP_CONTEXT.get()
-
-
-@contextmanager
-def fully_shard_context(**kwargs) -> Iterator[FsdpContext]:
-    """Construct FSDP modules that share runtime streams and prefetch orders.
-
-    Independent roots are ordered by their root-level ``fully_shard`` calls.
-    Construction must finish before any of the registered modules run forward.
-
-    Args:
-        **kwargs: Options forwarded to :class:`FsdpContext`.
-    """
-    if _FSDP_CONTEXT.get() is not None:
-        raise RuntimeError("fully_shard_context does not support nesting.")
-
-    context = FsdpContext(**kwargs)
-    token = _FSDP_CONTEXT.set(context)
-    try:
-        yield context
-    except Exception:
-        raise
-    else:
-        context.finalize()
-    finally:
-        _FSDP_CONTEXT.reset(token)
 
 
 def fully_shard(
@@ -135,7 +97,7 @@ def fully_shard(
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
-    context = _FSDP_CONTEXT.get()
+    context = current_fully_shard_context()
     if context is None:
         raise RuntimeError("fully_shard must run inside fully_shard_context.")
     for submodule in module.modules():
