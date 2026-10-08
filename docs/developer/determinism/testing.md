@@ -52,6 +52,37 @@ non-empty `tests` tuple or an explicit `exempt_reason` (for example a
 multi-rank NVLS collective that needs an NVLink peer group, or an allocator
 with no compute kernel). Exemptions are visible coverage debt, not silence.
 
+## Golden-value error diagnostics
+
+The functional comparison logs differences even when they pass tolerance. For
+each metric/check, it reports the check result, comparison precision, `atol`,
+`rtol`, and the number of samples outside tolerance. It shows the samples with
+the largest absolute and relative errors, plus the first sample outside
+tolerance if that sample is not already shown. Each sample includes its step,
+golden value, actual value, and allowed absolute error:
+
+- Absolute error: `abs(actual - golden)`.
+- Relative error: `abs(actual - golden) / abs(golden)`, also shown as a percentage.
+- Allowed absolute error: `atol + rtol * abs(golden)`.
+
+Relative error is undefined for a zero golden value and nonzero actual value;
+the absolute tolerance still applies. Non-finite or missing samples have
+undefined errors and are excluded from the finite-sample extrema.
+
+The diagnostics use the same precision and aggregation as the check. Exact
+checks honor the golden's precision marker, approximate checks retain their
+five-decimal comparison, and iteration-time errors compare unrounded medians
+over the selected steady-state samples. Existing tolerance, failure-budget,
+and legacy-placeholder policies are unchanged. In particular, an approximate
+check can pass with some samples outside tolerance; the report shows those
+outliers even when the check passes. Exact checks retain zero tolerance.
+
+A large error is a signal to investigate numerical correctness. A small
+historical-golden difference can also result from a valid change in reduction
+order. Use independent-reference correctness checks and same-implementation
+replay to assess the change before reviewing a golden refresh. Reporting an
+error never updates a golden value.
+
 ## How the requirement is enforced
 
 1. **Repository invariant** (`tests/unit_tests/determinism/kernels/test_manifest.py`,
@@ -66,8 +97,8 @@ with no compute kernel). Exemptions are visible coverage debt, not silence.
      one of its determinism tests. Override with the `determinism-exempt`
      PR label when the change cannot affect numerics (comment-only edits,
      refactors); the check then logs the exemption instead of failing.
-3. **Review**: the PR template checkbox and the `/claude review` prompt ask
-   for the test explicitly.
+3. **Review**: the PR template checkbox and the `/review` rubric
+   (`skills/pr-review/references/light.md`) ask for the test explicitly.
 
 The kernel bucket runs in the H100 unit-test recipe
 (`tests/test_utils/recipes/h100/unit-tests.yaml`). Hardware-specific
