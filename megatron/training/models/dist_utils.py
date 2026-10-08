@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 
@@ -62,7 +62,7 @@ def unimodal_build_distributed_models(
     1. Build virtual pipeline stages (one per VP rank, or a single stage if no VP)
     2. Apply ``pre_wrap_hook``
     3. Set tensor model parallel attributes on all parameters
-    4. Move model to GPU (unless using FSDP2 or CPU/meta-device initialization)
+    4. Move model to GPU, including CPU-initialized models (unless using FSDP2 or meta initialization)
     5. Apply mixed precision wrapper (e.g. ``Float16Module``)
     6. Materialize meta-device tensors if ``init_model_with_meta_device`` is set
     7. Optionally wrap with DDP/FSDP
@@ -181,8 +181,8 @@ def prepare_existing_model_chunks_for_distributed_training(
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
-    use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
+    # CPU initialization selects where values are created, not their training device.
+    if not use_torch_fsdp2 and not init_model_with_meta_device:
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
