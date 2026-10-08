@@ -74,7 +74,6 @@ def test_runtime_cp_gdn_module_replays(variant):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer import TransformerConfig
-    from tests.unit_tests.test_utilities import Utils
 
     if Utils.world_size < 4 or Utils.world_size % 4:
         pytest.skip("requires four distributed ranks")
@@ -154,7 +153,6 @@ def test_runtime_cp_ssm_conv_and_collectives_replay(kind):
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
     from megatron.core.ssm.mamba_context_parallel import MambaContextParallel
-    from tests.unit_tests.test_utilities import Utils
 
     if Utils.world_size < 4 or Utils.world_size % 4:
         pytest.skip("requires four distributed ranks")

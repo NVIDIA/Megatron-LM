@@ -59,21 +59,22 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         assert padding_mask is input_mask and padding_mask_by_layout is masks_by_layout
         return moe_mask
 
-    def route(shortcut_hidden, padding_mask, packed_seq_params):
+    def route(shortcut_hidden, padding_mask, packed_seq_params, recompute_context=None):
+        assert recompute_context is None
         assert padding_mask is (moe_mask if with_layout else input_mask)
         assert packed_seq_params is (moe_packed if with_layout else input_packed)
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden, padding_mask, packed_seq_params):
-        route(hidden, padding_mask, packed_seq_params)
-        return torch.zeros_like(hidden), None, hidden, ()
+    def shared(hidden_states, padding_mask, packed_seq_params, recompute_context=None):
+        route(hidden_states, padding_mask, packed_seq_params, recompute_context)
+        return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def attention(hidden_states, packed_seq_params, **kwargs):
         assert packed_seq_params is (attn_packed if with_layout else input_packed)
         return (hidden_states,)
 
     block = SimpleNamespace(
-        attn_layer=SimpleNamespace(
+        compute_layer=SimpleNamespace(
             config=object(),
             forward_pre_attn_and_core_attn=attention,
             forward_post_core_attn=lambda value: value,
@@ -88,6 +89,7 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         moe_layer_idx=9,
         overlap_mode=False,
         shortcut_pre_mlp_layernorm_checkpoint=None,
+        _read_shortcut_hidden=lambda value, recompute_context: value,
         _moe_router_preprocess=route,
         _moe_shared_experts=shared,
         _launch_dispatch=lambda value, probs, **kwargs: (value, probs),

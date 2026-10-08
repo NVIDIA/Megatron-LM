@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_inference_stack_spec,
     wide_residual_hybrid_stack_spec,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface,
     PipelineOffloadManager,
@@ -841,7 +842,8 @@ class TestResidualStreamRecomputeIntegration:
         ).cuda()
 
         events = []
-        boundary_packed_seq_params = object()
+        # HybridStack reads the runtime CP fields, so the boundary metadata must be real.
+        boundary_packed_seq_params = PackedSeqParams()
         layer_packed_seq_params = object()
 
         class _RecordingCPLayoutState:
