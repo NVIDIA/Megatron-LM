@@ -193,7 +193,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [mr, mr-github-broken] # https://github.com/NVIDIA/Megatron-LM/issues/7201
+        scope: [mr-broken, mr-github-broken] # https://github.com/NVIDIA/Megatron-LM/issues/7201
         platforms: [dgx_h100]
   - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
     products:
@@ -204,7 +204,7 @@ products:
     products:
       - environment: [dev]
         # https://github.com/NVIDIA/Megatron-LM/issues/7734
-        scope: [mr, mr-github-broken, mr-slim]
+        scope: [mr-broken, mr-github-broken, mr-slim-broken]
         platforms: [dgx_h100]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon]
     products:
