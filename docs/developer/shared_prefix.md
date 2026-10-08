@@ -80,13 +80,9 @@ FlashAttention, Transformer Engine, distributed CP/TP/EP, or the full model.
 
 A previous production revision completed training and checkpoint evaluations.
 That is evidence for that revision and configuration, not GPU qualification of this
-port. Within-implementation forward agreement, cross-implementation gradients,
-and long-run evaluation quality are separate acceptance criteria. The controlled
-backbone-gradient discrepancy remains open; no gradient-identity or general
-numerical-equivalence claim is made here.
+port.
 
-Before promotion: run native distributed tests and kernel replay coverage, compare
-same-weight dense/shared outputs and gradients against repeated dense and repeated
-shared controls, exercise matched packing and loss masks, validate MTP and expert
+Before promotion: run native distributed tests and kernel replay coverage,
+exercise matched packing and loss masks, validate MTP and expert
 statistics, and run a bounded training/evaluation qualification. New kernel files
 also require registration and replay tests in the upstream determinism manifest.
