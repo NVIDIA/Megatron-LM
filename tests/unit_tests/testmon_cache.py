@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import re
 import sqlite3
@@ -68,7 +69,7 @@ def is_tracked_package(name: str) -> bool:
 
 
 def runtime_identity() -> dict:
-    """Describe the exact interpreter and tracked packages inside the test container."""
+    """Describe the interpreter, world size, and tracked packages in the test container."""
     packages = sorted(
         [_normalized_name(name), distribution.version]
         for distribution in distributions()
@@ -84,6 +85,7 @@ def runtime_identity() -> dict:
         "machine": platform.machine(),
         "testmon": testmon_version,
         "packages": packages,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
     }
 
 

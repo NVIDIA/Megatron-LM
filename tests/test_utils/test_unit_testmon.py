@@ -36,7 +36,7 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0):
+def _invoke(project, cache, mode, phase="prod", rank=0, world_size=4):
     return subprocess.run(
         [
             sys.executable,
@@ -57,7 +57,7 @@ def _invoke(project, cache, mode, phase="prod", rank=0):
         env={
             **os.environ,
             "RANK": str(rank),
-            "WORLD_SIZE": "4",
+            "WORLD_SIZE": str(world_size),
             "PYTHONPATH": str(project),
             "PYTHONDONTWRITEBYTECODE": "1",
         },
@@ -207,6 +207,43 @@ def test_changed_dependency_is_selected_without_learning_or_execution(project, c
         selected = cache / ".testmon-work/prod/rank-0/selected-tests"
         assert selected.read_text().splitlines() == ["tests/test_app.py::test_active"]
         assert _snapshot(cache / "prod") == before
+
+
+def test_single_worker_baseline_and_dependency_selection(project, tmp_path):
+    cache = tmp_path / "single-worker-cache"
+    baseline = _invoke(project, cache, "baseline", world_size=1)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    metadata = json.loads((cache / "prod/metadata.json").read_text())
+    assert metadata["runtime"]["world_size"] == 1
+    before = _snapshot(cache / "prod")
+
+    selected = _invoke(project, cache, "select", world_size=1)
+    assert selected.returncode == 0, selected.stdout + selected.stderr
+    selection = cache / ".testmon-work/prod/rank-0/selected-tests"
+    assert selection.read_text() == ""
+
+    # Selection must find the affected case without executing its failing assertion.
+    (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    selected = _invoke(project, cache, "select", world_size=1)
+    assert selected.returncode == 0, selected.stdout + selected.stderr
+    assert selection.read_text().splitlines() == ["tests/test_app.py::test_active"]
+    assert _snapshot(cache / "prod") == before
+
+
+@pytest.mark.parametrize("producer_world_size,consumer_world_size", [(8, 1), (1, 8)])
+def test_selection_rejects_a_different_baseline_world_size(
+    project, tmp_path, producer_world_size, consumer_world_size
+):
+    cache = tmp_path / "world-size-cache"
+    baseline = _invoke(project, cache, "baseline", world_size=producer_world_size)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    before = _snapshot(cache / "prod")
+
+    selected = _invoke(project, cache, "select", world_size=consumer_world_size)
+    assert selected.returncode != 0
+    assert "Testmon runtime environment changed" in selected.stdout + selected.stderr
+    assert not (cache / ".testmon-work").exists()
+    assert _snapshot(cache / "prod") == before
 
 
 def test_new_test_file_is_discovered_from_old_baseline(project, cache):
