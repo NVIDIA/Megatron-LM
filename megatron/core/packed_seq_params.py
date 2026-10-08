@@ -26,6 +26,9 @@ class PackedSeqParams:
     # including a singleton group when CP is disabled for this microbatch.
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    # TP x CP group matching cp_group. Set with local_cp_size when sequence parallelism
+    # converts CP layouts over TP x CP.
+    tp_cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
     tokens_per_sample: int = None
@@ -87,3 +90,16 @@ def resolve_cp_group(
         )
         return packed_seq_params.cp_group
     return static_cp_group
+
+
+def resolve_tp_cp_group(
+    static_tp_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+) -> Optional[dist.ProcessGroup]:
+    """Resolve the TP x CP group matching this microbatch's context-parallel group."""
+    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        assert packed_seq_params.tp_cp_group is not None, (
+            "packed_seq_params.tp_cp_group must be set for runtime CP layout conversion "
+            "under sequence parallelism"
+        )
+        return packed_seq_params.tp_cp_group
+    return static_tp_cp_group
