@@ -121,6 +121,7 @@ from megatron.training.global_vars import (
     get_run_config,
     get_tensorboard_writer,
     get_tokenizer,
+    get_train_state,
     get_wandb_writer,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
@@ -794,6 +795,7 @@ def colocated_inference(
         Collected rollout groups (on rank 0) and the merged per-request metadata ledger.
     """
     args = get_args()
+    train_state = get_train_state()
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
@@ -850,7 +852,7 @@ def colocated_inference(
             if bank is not None:
                 agent = _get_or_create_rollout_agent(args.langrl_env_config)
                 if not runtime_state.bank_restored:
-                    restored_groups: GroupedRollouts = bank.recover(args.iteration)
+                    restored_groups: GroupedRollouts = bank.recover(train_state.resume_iteration)
                     total_restored_groups = agent.set_restored_groups(restored_groups)
                     runtime_state.bank_restored = True
                     if total_restored_groups:
@@ -858,9 +860,9 @@ def colocated_inference(
                             logger,
                             logging.INFO,
                             f"RolloutBank restored {total_restored_groups} completed groups from "
-                            f"disk at resume iteration {args.iteration}",
+                            f"disk at resume iteration {train_state.resume_iteration}",
                         )
-                bank.set_collection(args.curr_iteration)
+                bank.set_collection(train_state.iteration)
 
             with nvtx_range("rl/inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
@@ -879,7 +881,7 @@ def colocated_inference(
                     consumption_granularity=args.rl_consumption_granularity,
                     generation_lag=args.rl_generation_lag,
                     env_config_path=args.langrl_env_config,
-                    current_iteration=args.curr_iteration,
+                    current_iteration=train_state.iteration,
                 )
 
             # NOTE(jbarker): we need to double check this when using PP>1
@@ -889,7 +891,7 @@ def colocated_inference(
                     log_single_rank(
                         logger,
                         logging.INFO,
-                        f"Collecting rollouts, Iteration {args.curr_iteration}...",
+                        f"Collecting rollouts, Iteration {train_state.iteration}...",
                     )
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
@@ -901,7 +903,7 @@ def colocated_inference(
                     # these; once a checkpoint includes the update they are pruned.
                     if bank is not None:
                         bank.mark_consumed_many(
-                            (group.uid for group in rollouts), args.curr_iteration + 1
+                            (group.uid for group in rollouts), train_state.iteration + 1
                         )
                 else:
                     # Just set up space to collect the rollouts
@@ -935,6 +937,7 @@ def get_environment_rollouts(
         (GroupedRollouts, per-request metadata ledger)
     """
     args = get_args()
+    train_state = get_train_state()
     nvtx_range = get_nvtx_range()
     rank = torch.distributed.get_rank()
 
@@ -949,7 +952,7 @@ def get_environment_rollouts(
             logger,
             logging.INFO,
             f"Consuming {n_prompts} buffered rollout groups without inference, "
-            f"Iteration {args.curr_iteration}...",
+            f"Iteration {train_state.iteration}...",
         )
         loop = get_asyncio_loop()
         rollouts = [
@@ -977,7 +980,7 @@ def get_environment_rollouts(
         if rank == get_pg_rank(inference_pg_collection.tp):
             with open(
                 lang_rl_log_dir
-                + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
+                + f'/rollouts_rank{rank}_iteration{train_state.iteration}_'
                 + f'{Path(args.langrl_env_config).stem}.json',
                 'w',
             ) as f:
@@ -2771,6 +2774,7 @@ def evaluate_and_print_results_rl(
             grad buffers and restore to train mode. If None, uses model parameter.
     """
     args = get_args()
+    train_state = get_train_state()
 
     # TODO(vitalyk): I do not track eval loss as in training. We probably should.
     # megatron-lm uses forward_step_func to do the above.
@@ -2851,7 +2855,7 @@ def evaluate_and_print_results_rl(
                         tb_writer.add_scalar(k, v, iteration)
             wandb_writer = get_wandb_writer()
             if wandb_writer:
-                if args.do_train:
+                if train_state.do_train:
                     wandb_writer.log(eval_metrics, step=iteration)
                 else:
                     # Without a training loop the eval may target an arbitrary (older) checkpoint,
@@ -2870,7 +2874,7 @@ def evaluate_and_print_results_rl(
             if lang_rl_log_dir:
                 with open(
                     lang_rl_log_dir
-                    + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
+                    + f'/eval_rank{rank}_iteration{iteration}_'
                     + f'{Path(args.langrl_env_config).stem}.json',
                     'w',
                 ) as f:
@@ -2994,6 +2998,7 @@ def megatron_rl_inference_mode(
 
     """
     args = get_args()
+    train_state = get_train_state()
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
@@ -3046,7 +3051,7 @@ def megatron_rl_inference_mode(
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
-        inference_interface.set_generation_epoch(get_args().curr_iteration)
+        inference_interface.set_generation_epoch(train_state.iteration)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
