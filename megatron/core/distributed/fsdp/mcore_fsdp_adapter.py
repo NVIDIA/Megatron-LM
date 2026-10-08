@@ -16,6 +16,7 @@ import contextlib
 import logging
 import random
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -43,6 +44,7 @@ from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_c
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.residual_connection import ResidualConnection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -78,6 +80,11 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _prefetch_residual_forward(kwargs: dict[str, object]) -> bool:
+    """Prefetch the static successor on residual reads, but not later writes."""
+    return kwargs.get("operation") != "write"
 
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
@@ -710,11 +717,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
+                    unit_fully_shard_kwargs = common_fully_shard_kwargs
+                    if isinstance(submodule, ResidualConnection):
+                        # Read and write invoke the same module. The write follows
+                        # branch compute, so its static successor has already run.
+                        unit_fully_shard_kwargs = dict(
+                            common_fully_shard_kwargs,
+                            schedule_policy=replace(
+                                schedule_policy,
+                                forward_prefetch_predicate=_prefetch_residual_forward,
+                            ),
+                        )
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        **common_fully_shard_kwargs,
+                        **unit_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
