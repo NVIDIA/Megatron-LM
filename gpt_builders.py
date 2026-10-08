@@ -87,7 +87,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
         # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
         mtp_block_spec = get_gpt_mtp_block_spec(
-            config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
+            config,
+            transformer_layer_spec_for_mtp,
+            use_transformer_engine=use_te,
+            vp_stage=vp_stage,
+            pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
         )
 
     model = GPTModel(
@@ -98,12 +102,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        logit_dtype=getattr(args, 'logit_dtype', None),
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
+        rope_scaling_factor=args.rope_scaling_factor,
         mtp_block_spec=mtp_block_spec,
         vp_stage=vp_stage,
         pg_collection=pg_collection,

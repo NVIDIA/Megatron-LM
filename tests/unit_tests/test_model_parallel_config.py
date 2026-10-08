@@ -11,21 +11,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
 
 
-def test_te_cross_entropy_loss_fusion_warns_in_model_parallel_config():
-    with pytest.warns(UserWarning, match="known stability issues"):
-        config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te')
-
-    assert config.cross_entropy_loss_fusion
-    assert config.cross_entropy_fusion_impl == 'te'
-
-
-def test_native_cross_entropy_loss_fusion_is_allowed():
-    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='native')
-
-    assert config.cross_entropy_loss_fusion
-    assert config.cross_entropy_fusion_impl == 'native'
-
-
 def test_invalid_thd_tail_padding_policy_is_rejected_during_config_initialization():
     with pytest.raises(ValueError, match="thd_tail_padding_policy must be"):
         ModelParallelConfig(thd_tail_padding_policy="bogus")
@@ -209,7 +194,7 @@ def test_contiguous_context_parallel_rejects_bshd_inputs():
         )
 
 
-def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
+def _te_cross_entropy_training_args(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['test_model_parallel_config.py'])
     args = parse_args()
     args.num_layers = 2
@@ -226,6 +211,36 @@ def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
     args.vocab_size = 1024
     args.cross_entropy_loss_fusion = True
     args.cross_entropy_fusion_impl = 'te'
+    return args
 
-    with pytest.raises(AssertionError, match="Transformer Engine cross entropy loss fusion"):
+
+def test_te_cross_entropy_loss_fusion_is_allowed_in_model_parallel_config():
+    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te')
+
+    assert config.cross_entropy_loss_fusion
+    assert config.cross_entropy_fusion_impl == 'te'
+
+
+def test_native_cross_entropy_loss_fusion_is_allowed():
+    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='native')
+
+    assert config.cross_entropy_loss_fusion
+    assert config.cross_entropy_fusion_impl == 'native'
+
+
+def test_te_cross_entropy_loss_fusion_is_allowed_by_training_args(monkeypatch):
+    args = _te_cross_entropy_training_args(monkeypatch)
+    monkeypatch.setattr('megatron.training.arguments.is_te_min_version', lambda version: True)
+
+    validated_args = validate_args(args)
+
+    assert validated_args.cross_entropy_loss_fusion
+    assert validated_args.cross_entropy_fusion_impl == 'te'
+
+
+def test_te_cross_entropy_loss_fusion_requires_te_2_19(monkeypatch):
+    args = _te_cross_entropy_training_args(monkeypatch)
+    monkeypatch.setattr('megatron.training.arguments.is_te_min_version', lambda version: False)
+
+    with pytest.raises(AssertionError, match="disabled due to stability issues"):
         validate_args(args)

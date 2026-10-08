@@ -1,10 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MCore-facing utilities for the DSv4 THD context-parallel path.
-
-This module owns CP row mapping, boundary exchange, compressor-input layout,
-and indexer top-k metadata. It reuses MCore's fused MLA RoPE and calls the
-retained compaction kernel; ``csa.py`` calls final-index lowering directly.
-"""
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+"""Contiguous packed CSA row ownership, boundary exchange and indexer metadata."""
 
 import math
 from typing import Optional, Tuple
@@ -15,23 +10,11 @@ import torch.distributed as dist
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
-from . import thd_layout_kernels
-from .fused_sparse_attention import (
-    FUSED_INDEXER_MAX_SAFE_ROWS,
-    THDCompactIndexerWorkspace,
-    build_thd_compact_k_layout,
-    indexer_topk,
-    pack_thd_compact_k,
-)
-
-CPIndexerLayout = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-
-# =============================================================================
-# RoPE Wrappers
-# =============================================================================
+from . import packed_layout
+from .packed_sparse_attention import indexer_topk
 
 
-def thd_cp_position_ids(
+def _thd_cp_position_ids(
     cu_seqlens_padded: torch.Tensor, global_start: int, local_rows: int
 ) -> torch.Tensor:
     """Map a consecutive CP row interval to positions within packed sequences."""
@@ -48,10 +31,6 @@ def thd_cp_position_ids(
     sequence_ends = cu_seqlens_padded[sequence_ids + 1]
     valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
     return torch.where(valid_rows, global_rows - sequence_starts, 0)
-
-
-# Retained for callers outside megatron.core that already use the private name.
-_thd_cp_position_ids = thd_cp_position_ids
 
 
 def apply_thd_cp_local_rope_fused(
@@ -81,7 +60,7 @@ def apply_thd_cp_local_rope_fused(
         cu_seqlens_q=cu_seqlens_padded,
         inverse=inverse,
         remove_interleaving=True,
-        thd_global_start=global_start,
+        position_ids=_thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0]),
     )
     if squeezed_batch:
         return output.unsqueeze(1)
@@ -101,7 +80,7 @@ def apply_thd_cp_local_rope_unfused(
     inverse: bool = False,
 ) -> torch.Tensor:
     """Apply unfused RoPE to a consecutive interval of packed CP rows."""
-    position_ids = thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
     freqs = torch.index_select(rotary_pos_emb, 0, position_ids.long())
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
@@ -126,11 +105,6 @@ def apply_thd_cp_local_rope_unfused(
     return output
 
 
-# =============================================================================
-# Boundary Hidden Exchange
-# =============================================================================
-
-
 class _LeftBoundaryExchange(torch.autograd.Function):
     """Exchange fixed left-boundary windows and scatter gradients back to senders."""
 
@@ -142,7 +116,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         ctx.cp_group = cp_group
         ctx.d_window = d_window
         ctx.input_shape = tensor.shape
-        if tensor.shape[0] < d_window:
+        if cp_size > 1 and tensor.shape[0] < d_window:
             raise RuntimeError(
                 "DSv4 CP boundary exchange requires local rows >= D_window: "
                 f"local_rows={tensor.shape[0]}, D_window={d_window}."
@@ -163,7 +137,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                     dist.isend, send_tail, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
                 )
             )
-        for req in dist.batch_isend_irecv(ops):
+        for req in dist.batch_isend_irecv(ops) if ops else []:
             req.wait()
         return boundary
 
@@ -191,7 +165,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                     dist.irecv, recv_grad, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
                 )
             )
-        for req in dist.batch_isend_irecv(ops):
+        for req in dist.batch_isend_irecv(ops) if ops else []:
             req.wait()
         if cp_rank + 1 < cp_size:
             grad_input[-d_window:] = recv_grad
@@ -212,11 +186,6 @@ def exchange_cp_boundary_hidden(
     return boundary_hidden.reshape((d_window,) + tuple(hidden_states.shape[1:]))
 
 
-# =============================================================================
-# Compressed Metadata And Compressor Inputs
-# =============================================================================
-
-
 def prepare_cp_compressor_input(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
@@ -224,9 +193,7 @@ def prepare_cp_compressor_input(
     global_start: int,
     cp_size: int,
     ratio: int,
-) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build fixed-capacity compressor input for this rank's token block.
 
     Returns:
@@ -237,9 +204,6 @@ def prepare_cp_compressor_input(
             with ``ratio=4``, ``comp_id=3`` maps to RoPE position ``12``.
         ``compressed_position_ids``: precomputed RoPE positions, with padding
             groups mapped to position zero.
-        ``local_cu_seqlens`` and ``local_cu_seqlens_compressed``: prefixes that
-            describe the physically compacted token/group segments. They let the
-            regular THD fused compressor consume a pre-grouped CP buffer directly.
         ``cu_seqlens_compressed``: global sequence-major compressed prefixes.
         ``seq_to_rank_row``: map from global sequence-major compressed rows
             to their canonical rank-major all-gather rows.
@@ -255,7 +219,7 @@ def prepare_cp_compressor_input(
     group_alignment = 32 // math.gcd(32, ratio)
     c_cap = max(1, (l_local + d_comp) // ratio)
     c_cap = ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
-    return thd_layout_kernels.CompressorInputCompact.apply(
+    return packed_layout.compact_compressor_input(
         hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap, cp_size
     )
 
@@ -293,63 +257,6 @@ def build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
-@torch.compile
-def _build_cp_indexer_layout(
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    global_start: int,
-    local_rows: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the indexer's packed local-Q/full-K metadata."""
-    # Each real Q segment intersects its sequence with this rank's row interval,
-    # while K keeps the sequence's full compressed segment. The final synthetic
-    # segment holds CP capacity padding and has zero K rows. Causal offsets
-    # restore each non-empty local Q segment's position in the original sequence.
-    global_end = global_start + local_rows
-    zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
-    local_starts = cu_seqlens_q[:-1].clamp_min(global_start)
-    local_ends = cu_seqlens_q[1:].clamp_max(global_end)
-    q_lens = (local_ends - local_starts).clamp_min(0)
-    q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
-    padding_q = (global_end - cu_seqlens_q[-1].clamp_min(global_start)).clamp_min(0)
-    cu_q_topk = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
-    cu_k_topk = torch.cat((cu_seqlens_compressed, cu_seqlens_compressed[-1:]))
-    q_causal_offsets = torch.cat(
-        (torch.where(q_lens > 0, local_starts - cu_seqlens_q[:-1], 0), zero)
-    )
-    return cu_q_topk, cu_k_topk, q_causal_offsets
-
-
-def build_cp_compact_indexer_layout(
-    logical_layout: CPIndexerLayout,
-    cu_seqlens_compressed: torch.Tensor,
-    total_k_rows: int,
-    ratio: int,
-) -> Tuple[CPIndexerLayout, torch.Tensor]:
-    """Pad each THD K segment with an invisible row for compact Top-K."""
-    cu_q_topk, _, q_causal_offsets = logical_layout
-    cu_k_topk, source_row_map = build_thd_compact_k_layout(
-        cu_q_topk, cu_seqlens_compressed, total_k_rows, ratio
-    )
-    return (cu_q_topk, cu_k_topk, q_causal_offsets), source_row_map
-
-
-def pack_cp_compact_indexer_k(
-    k_indexer_seq_major: torch.Tensor, source_row_map: torch.Tensor
-) -> torch.Tensor:
-    """Insert zero-valued, causally invisible K rows for compact THD."""
-    return pack_thd_compact_k(k_indexer_seq_major, source_row_map)
-
-
-# Verified fused-kernel row-limit defect: see FUSED_INDEXER_MAX_SAFE_ROWS in
-# dsa_fused_safety.py (single source of truth; re-exported here for the
-# balanced-indexer prebuild and tests). Policy at THIS wrapper: the balanced
-# synthetic-layout path fails closed above the limit; ordinary reference calls
-# proceed unchanged — the once-per-process correctness warning fires inside
-# the CSA _indexer_topk_core funnel. The neighboring DSv3.2 backend applies the
-# same shared warning in dsa_cudnn_kernels before each direct cuDNN invocation.
-
-
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -361,79 +268,12 @@ def compute_cp_indexer_topk(
     topk_width: int,
     indexer_softmax_scale: float,
     max_seqlen_q: int,
-    use_fused: bool,
-    deterministic: bool = False,
-    precision: str = "bf16",
-    compact_workspace: Optional[THDCompactIndexerWorkspace] = None,
-    return_softmax: bool = False,
-    indexer_layout: Optional[CPIndexerLayout] = None,
-    logical_indexer_layout: Optional[CPIndexerLayout] = None,
-    max_seqlen_kv: Optional[int] = None,
-    prebuilt_layout: Optional[CPIndexerLayout] = None,
-    synthetic_layout: bool = False,
-) -> Tuple[Optional[torch.Tensor], Optional[CPIndexerLayout], Optional[torch.Tensor]]:
-    """Return local top-k, packed layout, and optional compact Top-K softmax.
-
-    Ordinary and balanced production calls use the compact scorer and workspace
-    contract. Legacy calls with ``prebuilt_layout`` use dense scoring and an
-    unpadded K layout; they return None as the third (compact softmax) result.
-
-    ``max_seqlen_kv`` optionally overrides the K capacity (default
-    ``max_seqlen_q // ratio``). Compact scoring adds two guard rows per segment;
-    its workspace must use the same bound. The legacy dense path uses this value
-    as the width of its FP32 score matrix.
-
-    ``prebuilt_layout`` optionally supplies a ``(cu_q, cu_k, q_causal_offsets)`` tuple from a
-    previous ``_build_cp_indexer_layout(cu_seqlens_q, cu_seqlens_compressed, global_start,
-    rows)`` call with identical arguments, skipping the rebuild (the layout is constant across
-    layers within a microbatch). Only the fused path consumes the layout for masking; the
-    unfused path recomputes its masking from ``(cu_seqlens_q, global_start)`` and returns the
-    tuple as metadata only. Callers passing a synthetic layout that differs from that
-    recomputation (the balanced zigzag path) must set ``synthetic_layout=True`` and use the fused
-    path. Non-empty calls with ``synthetic_layout=True`` and ``use_fused=False`` raise
-    ``ValueError`` rather than silently mis-mask. An ordinary cached
-    ``_build_cp_indexer_layout`` result keeps the default.
-    """
+) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
-        return None, None, None
-    max_seqlen_kv = int(max_seqlen_q) // int(ratio) if max_seqlen_kv is None else int(max_seqlen_kv)
-    if max_seqlen_kv == 0:
-        return None, None, None
-
-    if precision == "mxfp8" and not use_fused:
-        raise ValueError(
-            "MXFP8 CP indexer requires fused compact scoring; BF16 fallback is invalid"
-        )
-
-    if synthetic_layout and not use_fused:
-        raise ValueError(
-            "synthetic_layout=True requires use_fused=True because the unfused path "
-            "recomputes masking and ignores the synthetic layout."
-        )
-
-    if use_fused and int(q_indexer_local.shape[0]) > FUSED_INDEXER_MAX_SAFE_ROWS:
-        # See FUSED_INDEXER_MAX_SAFE_ROWS. Policy split (after the zero-work exits
-        # above, which never launch the kernel):
-        # - the balanced synthetic-layout path fails closed: it necessarily issues
-        #   multiple fused calls per microbatch, so a later above-limit call is the
-        #   verified-corrupt pattern, and a synthetic layout cannot take the unfused
-        #   path (the unfused arm treats layouts as metadata only);
-        # - pre-existing callers (reference CP path and non-CP paths) keep their
-        #   behavior and proceed fused; the once-per-process high-severity
-        #   correctness warning fires in the CSA _indexer_topk_core funnel;
-        #   DSv3.2 direct callers are guarded separately in dsa_cudnn_kernels.
-        if synthetic_layout:
-            raise RuntimeError(
-                f"fused indexer top-k with {int(q_indexer_local.shape[0])} query rows "
-                f"exceeds the verified-safe limit of {FUSED_INDEXER_MAX_SAFE_ROWS} for "
-                "the current fused kernel package (silent corruption of rows >= 32768 "
-                "unless first-in-process; verified on GB200 with cudnn-frontend 1.26.0, "
-                "no known-good version yet), and this synthetic layout cannot take the "
-                "unfused path. Reduce per-call rows (higher CP degree or smaller pack "
-                "capacity), or disable dsa_cp_balance_indexer and use the contiguous "
-                "reference path with an unfused backend."
-            )
+        return None, None
+    max_seqlen_kv = int(max_seqlen_q) // int(ratio)
 
     global_start = int(global_start)
     l_local = q_indexer_local.shape[0]
@@ -443,81 +283,17 @@ def compute_cp_indexer_topk(
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
 
-    if prebuilt_layout is not None:
-        logical_indexer_layout = indexer_layout = prebuilt_layout
-    else:
-        if logical_indexer_layout is None:
-            logical_indexer_layout = build_cp_indexer_layout(
-                cu_seqlens_q,
-                cu_seqlens_compressed,
-                global_start,
-                l_local,
-                k_indexer_seq_major.shape[0],
-            )
-        if not use_fused:
-            indexer_layout = logical_indexer_layout
-        elif indexer_layout is None:
-            indexer_layout, source_row_map = build_cp_compact_indexer_layout(
-                logical_indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
-            )
-            k_indexer_seq_major = pack_cp_compact_indexer_k(k_indexer_seq_major, source_row_map)
+    cu_q_topk, cu_k_topk, q_causal_offsets = build_cp_indexer_layout(
+        cu_seqlens_q, cu_seqlens_compressed, global_start, l_local, k_indexer_seq_major.shape[0]
+    )
 
-        if use_fused:
-            # Each real segment has one or two invisible K padding rows.
-            max_seqlen_kv += 2
-    cu_q_topk, cu_k_topk, q_causal_offsets = indexer_layout
+    if max_seqlen_kv == 0:
+        topk = torch.full(
+            (l_local, topk_width), -1, device=q_indexer_local.device, dtype=torch.int32
+        )
+        return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
-    if not use_fused:
-        global_rows = torch.arange(
-            global_start,
-            global_start + l_local,
-            dtype=cu_seqlens_q.dtype,
-            device=cu_seqlens_q.device,
-        )
-        sequence_ids = torch.bucketize(
-            global_rows, cu_seqlens_q[1:], out_int32=True, right=True
-        ).clamp_max(cu_seqlens_q.shape[0] - 2)
-        positions = global_rows - cu_seqlens_q[sequence_ids]
-        visible_k = torch.minimum(
-            torch.div(positions + 1, int(ratio), rounding_mode="floor"),
-            cu_seqlens_compressed[sequence_ids + 1] - cu_seqlens_compressed[sequence_ids],
-        ).clamp_min(0)
-        valid_q = (global_rows >= cu_seqlens_q[sequence_ids]) & (
-            global_rows < cu_seqlens_q[sequence_ids + 1]
-        )
-
-        k_rows = torch.arange(
-            k_indexer_seq_major.shape[0],
-            dtype=cu_seqlens_compressed.dtype,
-            device=cu_seqlens_compressed.device,
-        )
-        k_sequence_ids = torch.bucketize(
-            k_rows, cu_seqlens_compressed[1:], out_int32=True, right=True
-        ).clamp_max(cu_seqlens_compressed.shape[0] - 2)
-        k_positions = k_rows - cu_seqlens_compressed[k_sequence_ids]
-        output = torch.full(
-            (l_local, topk_width), -1, dtype=torch.int32, device=q_indexer_local.device
-        )
-        selected_width = min(topk_width, k_indexer_seq_major.shape[0])
-        for start in range(0, l_local, 128):
-            end = min(start + 128, l_local)
-            scores = torch.einsum(
-                "rhd,kd->rhk", q_indexer_local[start:end].float(), k_indexer_seq_major.float()
-            )
-            scores = torch.relu(scores) * weights_indexer_local[start:end].float().unsqueeze(-1)
-            scores = scores.sum(dim=1) * float(indexer_softmax_scale)
-            valid_k = (
-                (k_sequence_ids.unsqueeze(0) == sequence_ids[start:end].unsqueeze(1))
-                & (k_positions.unsqueeze(0) < visible_k[start:end].unsqueeze(1))
-                & valid_q[start:end].unsqueeze(1)
-            )
-            scores = scores.masked_fill(~valid_k, float("-inf"))
-            values, rows = torch.topk(scores, selected_width, dim=-1)
-            local_rows = k_positions[rows].to(torch.int32)
-            output[start:end, :selected_width] = torch.where(torch.isfinite(values), local_rows, -1)
-        return output, logical_indexer_layout, None
-
-    topk_result = indexer_topk(
+    topk, _ = indexer_topk(
         q_indexer_local,
         k_indexer_seq_major,
         weights_indexer_local,
@@ -529,15 +305,69 @@ def compute_cp_indexer_topk(
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
-        compact_workspace=compact_workspace,
-        use_compact=prebuilt_layout is None,
-        precision=precision,
-        deterministic=deterministic,
-        return_softmax=return_softmax,
     )
-    compact_predict = None
-    if return_softmax:
-        topk, _, compact_predict = topk_result
-    else:
-        topk, _ = topk_result
-    return topk, logical_indexer_layout, compact_predict
+    return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
+
+
+def validate_packed_inputs(packed_seq_params, config, cp_group):
+    """Validate the static packed contract without modifying any process group.
+
+    CP1 metadata may use None or the explicit singleton group required by the
+    main runtime-CP contract. Dynamic CP transitions remain unsupported; reject them
+    instead of accidentally
+    using a stale build-time group during forward or recompute.
+    """
+    if config.dsa_kernel_backend != "cudnn":
+        raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
+    if config.deterministic_mode:
+        raise NotImplementedError(
+            "Packed DSv4 attention does not yet support deterministic_mode; "
+            "deterministic THD/CP backward is tracked in #7921."
+        )
+    if packed_seq_params.qkv_format != "thd":
+        raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
+    if cp_group is None:
+        raise ValueError("DSv4 requires an explicit build-time CP process group, including CP1.")
+    runtime_size = packed_seq_params.local_cp_size
+    runtime_group = packed_seq_params.cp_group
+    if runtime_size is not None:
+        if runtime_size == 1 and runtime_group is not None and runtime_group.size() != 1:
+            raise ValueError("Runtime CP1 metadata requires None or a singleton cp_group.")
+        if runtime_size > 1 and (runtime_group is None or runtime_group.size() != runtime_size):
+            raise ValueError("Runtime CP metadata must provide the matching process group.")
+        if runtime_size != cp_group.size() or (runtime_size > 1 and runtime_group is not cp_group):
+            raise ValueError(
+                "DSv4 currently supports static CP; runtime group transitions are unsupported."
+            )
+    if cp_group.size() > 1 and config.attention_cp_layout != "contiguous":
+        raise ValueError("DSv4 packed CP requires attention_cp_layout='contiguous'.")
+    if packed_seq_params.max_seqlen_q is None or packed_seq_params.max_seqlen_kv is None:
+        raise ValueError("Packed DSv4 requires host-known maximum query and KV sequence lengths.")
+    q = packed_seq_params.cu_seqlens_q
+    kv = packed_seq_params.cu_seqlens_kv
+    if q is None or kv is None or q.ndim != 1 or q.shape != kv.shape or q.numel() < 2:
+        raise ValueError("Packed DSv4 requires query and KV cumulative lengths for self attention.")
+    for cu in (
+        q,
+        kv,
+        packed_seq_params.cu_seqlens_q_padded,
+        packed_seq_params.cu_seqlens_kv_padded,
+    ):
+        if cu is not None and (
+            cu.shape != q.shape or cu.dtype != torch.int32 or cu.device != q.device
+        ):
+            raise ValueError(
+                "Packed DSv4 cumulative lengths must be matching int32 tensors on one device."
+            )
+
+    if q.data_ptr() != kv.data_ptr():
+        torch._assert_async((q == kv).all(), "DSv4 packed CSA supports self attention only.")
+    padded_q = packed_seq_params.cu_seqlens_q_padded
+    padded_kv = packed_seq_params.cu_seqlens_kv_padded
+    physical_q = q if padded_q is None else padded_q
+    physical_kv = kv if padded_kv is None else padded_kv
+    if physical_q.data_ptr() != physical_kv.data_ptr():
+        torch._assert_async(
+            (physical_q == physical_kv).all(),
+            "Packed CSA requires matching physical Q/KV document boundaries.",
+        )

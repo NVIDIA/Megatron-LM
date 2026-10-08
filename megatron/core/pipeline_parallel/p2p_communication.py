@@ -1,10 +1,15 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -25,21 +30,24 @@ def _batched_p2p_ops(
     next_pipeline_rank: int,
 ):
     ops = []
-    if tensor_send_prev is not None:
-        send_prev_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
-        )
-        ops.append(send_prev_op)
-    if tensor_recv_prev is not None:
-        recv_prev_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
-        )
-        ops.append(recv_prev_op)
+    # With PP2, prev and next are the same peer. NCCL matches messages by
+    # order, so both peers must enqueue forward traffic before backward
+    # traffic to keep activations and gradients in their respective buffers.
     if tensor_send_next is not None:
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
         )
         ops.append(send_next_op)
+    if tensor_recv_prev is not None:
+        recv_prev_op = torch.distributed.P2POp(
+            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
+        )
+        ops.append(recv_prev_op)
+    if tensor_send_prev is not None:
+        send_prev_op = torch.distributed.P2POp(
+            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
+        )
+        ops.append(send_prev_op)
     if tensor_recv_next is not None:
         recv_next_op = torch.distributed.P2POp(
             torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
@@ -232,35 +240,17 @@ class P2PCommunicator:
                 group=self.pp_group,
             )
         else:
-            ops = []
-            if send_prev_shape_tensor is not None:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(send_prev_op)
-            if recv_prev_shape_tensor is not None:
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(recv_prev_op)
-            if send_next_shape_tensor is not None:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(send_next_op)
-            if recv_next_shape_tensor is not None:
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(recv_next_op)
-            if len(ops) > 0:
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
-
-            # To protect against race condition when using batch_isend_irecv().
-            # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            reqs = _batched_p2p_ops(
+                tensor_send_prev=send_prev_shape_tensor,
+                tensor_recv_prev=recv_prev_shape_tensor,
+                tensor_send_next=send_next_shape_tensor,
+                tensor_recv_next=recv_next_shape_tensor,
+                group=self.pp_group,
+                prev_pipeline_rank=self.prev_rank,
+                next_pipeline_rank=self.next_rank,
+            )
+            for req in reqs:
+                req.wait()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
@@ -444,6 +434,7 @@ class P2PCommunicator:
 
         return tensor_recv_prev, tensor_recv_next, reqs
 
+    @_otel_trace_fn('communication', 'megatron.p2p.recv_forward')
     @nvtx_decorator()
     def recv_forward(
         self, tensor_shapes, is_first_stage: bool
@@ -475,6 +466,7 @@ class P2PCommunicator:
             return input_tensors[0]
         return input_tensors
 
+    @_otel_trace_fn('communication', 'megatron.p2p.recv_backward')
     @nvtx_decorator()
     def recv_backward(
         self, tensor_shapes, is_last_stage: bool
@@ -506,6 +498,7 @@ class P2PCommunicator:
             return output_tensor_grads[0]
         return output_tensor_grads
 
+    @_otel_trace_fn('communication', 'megatron.p2p.send_forward')
     @nvtx_decorator()
     def send_forward(self, output_tensors, is_last_stage: bool) -> None:
         """Send tensor to next rank in pipeline (forward send)."""
@@ -527,6 +520,7 @@ class P2PCommunicator:
                 if config.timers is not None:
                     config.timers('forward-send').stop()
 
+    @_otel_trace_fn('communication', 'megatron.p2p.send_backward')
     @nvtx_decorator()
     def send_backward(self, input_tensor_grads, is_first_stage: bool) -> None:
         """Send tensor to previous rank in pipeline (backward send)."""

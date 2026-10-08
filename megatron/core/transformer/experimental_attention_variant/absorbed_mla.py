@@ -28,6 +28,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -165,6 +166,8 @@ class AbsorbedMLASelfAttention(Attention):
             name=name,
         )
 
+        # Resolve which classes to use for Q and KV linear up projections and norms, based on
+        # QK-norm selection.
         layer_classes = QKNormConfigResolver(self.config, submodules).resolve()
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"
@@ -501,9 +504,14 @@ class AbsorbedMLASelfAttention(Attention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             rope_max_seqlen_q = packed_seq_params.max_seqlen_q
             rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            rope_freqs_max_seqlen = (
+                max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                else None
+            )
         else:
             cu_seqlens_q = cu_seqlens_kv = None
-            rope_max_seqlen_q = rope_max_seqlen_kv = None
+            rope_freqs_max_seqlen = None
 
         # =========================================
         # Q down projection
@@ -683,7 +691,7 @@ class AbsorbedMLASelfAttention(Attention):
                     mscale=mscale,
                     cp_group=effective_cp_group,
                     mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_q,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -694,7 +702,7 @@ class AbsorbedMLASelfAttention(Attention):
                     mscale=mscale,
                     cp_group=effective_cp_group,
                     mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_kv,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
 
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
@@ -925,9 +933,7 @@ class AbsorbedMLASelfAttention(Attention):
         # attention use self.pg_collection.cp, which must point at this
         # microbatch's dynamic CP group. Restored before returning.
         _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+        self.pg_collection.cp = resolve_cp_group(self._build_time_cp_group, packed_seq_params)
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         if (
             thd_packed_seq

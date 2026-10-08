@@ -29,7 +29,9 @@ on:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    with:
+      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
@@ -49,7 +51,7 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set PATH
         run: |
@@ -65,7 +67,7 @@ jobs:
         run: bash docker/common/install.sh --environment dev --base-image pytorch --python-version ${{ matrix.python-version }}
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.63.2
@@ -100,7 +102,7 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set PATH
         run: |
@@ -119,7 +121,7 @@ jobs:
 
       # NGC PyTorch 25.05 has a version of triton that is broken on CPU only machines.
       # - name: Checkout check-imports
-      #   uses: actions/checkout@v6
+      #   uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       #   with:
       #     repository: NVIDIA-NeMo/FW-CI-templates
       #     ref: v0.63.2
@@ -145,7 +147,7 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Get workflow result
         id: result

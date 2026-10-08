@@ -21,13 +21,15 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
@@ -197,6 +199,7 @@ class TestMoESingleGroupedWeightNumerics:
         args.overlap_grad_reduce = overlap_grad_reduce
         args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         args.ddp_bucket_size = 40960
+        args.save_tokenizer_assets = False
 
         args.num_experts = 2
         args.moe_layer_freq = 1
@@ -224,7 +227,11 @@ class TestMoESingleGroupedWeightNumerics:
             raise ValueError(f"Unknown precision test case: {precision}")
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        set_run_config(pretrain_cfg_container_from_args(args))
+        initialize_runtime_services(args, build_tokenizer=False)
         return args
 
     def get_batch(self):

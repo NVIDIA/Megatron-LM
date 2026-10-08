@@ -12,7 +12,9 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -30,7 +32,11 @@ spec:
       --backwards-commit $MCORE_BACKWARDS_COMMIT \
       --repo $MCORE_REPO
 
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
     set -euo pipefail
     ls
 
@@ -58,14 +64,17 @@ spec:
     ls -al
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 
-# GB200 unit-test selection is marker-driven: a single catch-all bucket is
-# narrowed to files carrying @pytest.mark.launch_on_gb200 by find_test_cases.py
-# (see tests/unit_tests/run_ci_test.sh --platform gb200). Re-shard into smaller
-# buckets here if the marked set grows large enough to need parallelism.
+# GB200 selection is marker-driven. find_test_cases.py excludes the dedicated
+# M2N bucket from the catch-all bucket, so each marked test runs only once.
+# Keep M2N in a separate process: NCCL caches the test fixture's transport settings.
 products:
   - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py]
     products:
@@ -75,6 +84,20 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/resharding/test_nccl_m2n_copy_service.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]

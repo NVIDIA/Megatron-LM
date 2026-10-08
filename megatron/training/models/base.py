@@ -1,7 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import abc
+import functools
 import importlib
+import inspect
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
@@ -12,6 +14,50 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
+
+# Hooks and callbacks that each run attaches to the live config. Not to be serialized.
+_RUNTIME_FIELDS = frozenset(
+    {
+        "pre_wrap_hooks",
+        "post_wrap_hooks",
+        "timers",
+        "finalize_model_grads_func",
+        "grad_scale_func",
+        "moe_grad_scale_func",
+        "mtp_grad_scale_func",
+        "no_sync_func",
+        "grad_sync_func",
+        "param_sync_func",
+    }
+)
+
+
+def _encode_callable(value: Callable) -> dict[str, Any] | None:
+    """Serialize a callable so that it can be deserialized with `instantiate()`."""
+
+    if isinstance(value, functools.partial):
+        inner = _encode_callable(value.func)
+        if inner is None:
+            return None
+        encoded: dict[str, Any] = {
+            "_target_": inner["_target_"],
+            "_partial_": True,
+            "_args_": list(value.args),
+        }
+        encoded.update(value.keywords)
+        return encoded
+
+    module = inspect.getmodule(value)
+    qualname = getattr(value, "__qualname__", None)
+    if module is None or qualname is None:
+        return None
+    # Encode only paths that resolve back to `value`; a bound method's path drops its instance.
+    resolved = module
+    for part in qualname.split("."):
+        resolved = getattr(resolved, part, None)
+    if resolved != value:
+        return None
+    return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
 
 
 @runtime_checkable
@@ -105,17 +151,22 @@ class ModelConfig:
         def _as_dict(config):
             result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
             for f in dataclass_fields(config):
+                if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
+                    continue
                 value = getattr(config, f.name)
-                # Skip non-serializable fields
-                if (
-                    callable(value)
-                    or f.name.startswith("_")
-                    or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]
-                ):
+
+                if callable(value) and not is_dataclass(value):
+                    # Encode module-level callables (e.g. activation_func, layer-spec functions)
+                    # so they survive serialization instead of silently reverting to the default.
+                    encoded = _encode_callable(value)
+                    if encoded is not None:
+                        result[f.name] = encoded
                     continue
 
                 if is_dataclass(value):
                     result[f.name] = _as_dict(value)  # recurse on nested dataclasses
+                elif hasattr(value, "as_dict"):
+                    result[f.name] = value.as_dict()
                 else:
                     result[f.name] = value
 
@@ -155,11 +206,16 @@ class ModelConfig:
                 k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")
             }
 
-            # recurse on serialized nested dataclasses
+            # recurse on serialized nested dataclasses; resolve encoded callables
             subconfigs = {}
             for k, v in filtered_data.items():
                 if isinstance(v, dict) and "_target_" in v:
-                    subconfigs[k] = _from_dict(v)
+                    if v.get("_call_", True) is False or v.get("_partial_", False):
+                        from megatron.training.config.instantiate_utils import instantiate
+
+                        subconfigs[k] = instantiate(v)
+                    else:
+                        subconfigs[k] = _from_dict(v)
             filtered_data.update(subconfigs)
 
             return config_cls(**filtered_data)
@@ -234,6 +290,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -247,8 +304,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
-            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
-                parameters for the layer-wise distributed optimizer.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+                controls whether to compute and supply a shard-aligned param layout to DDP.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,
@@ -258,7 +316,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
 
 
 def compose_hooks(
-    hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]]
+    hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]],
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
     """Utility to compose pre/post-wrap hooks into a single function, preserving order.
 

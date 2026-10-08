@@ -98,7 +98,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import torch
 
@@ -174,11 +174,14 @@ class Combined1F1BTensorRelease:
         stream: torch.cuda.Stream,
         node: str,
         release_consumed: bool,
+        preserve_storage: Optional[Callable[[torch.Tensor], bool]] = None,
     ) -> None:
         """Consume input bindings and publish outputs from one forward node."""
 
         action = ReleaseAction.EMPTY_STORAGE if release_consumed else None
-        self._consume_and_publish(consumed, produced, action, stream, node)
+        self._consume_and_publish(
+            consumed, produced, action, stream, node, preserve_storage=preserve_storage
+        )
 
     def consume_forward_outputs(self, forward_outputs: Any) -> None:
         """End bindings for recomputed forward outputs consumed by autograd.
@@ -246,6 +249,7 @@ class Combined1F1BTensorRelease:
         action: Optional[ReleaseAction],
         stream: torch.cuda.Stream,
         node: str,
+        preserve_storage: Optional[Callable[[torch.Tensor], bool]] = None,
     ) -> None:
         """Consume one edge and publish the next, rejecting storage aliases."""
 
@@ -266,7 +270,12 @@ class Combined1F1BTensorRelease:
                     )
 
         for tensor in consumed_tensors:
-            self._consume_tensor(tensor, action, stream)
+            # External EP symmetric buffers remain owned by TE. Consume their
+            # schedule binding while leaving allocation lifetime with that owner.
+            tensor_action = (
+                None if preserve_storage is not None and preserve_storage(tensor) else action
+            )
+            self._consume_tensor(tensor, tensor_action, stream)
 
         for tensor in produced_tensors:
             self._publish_tensor(tensor, stream, node)

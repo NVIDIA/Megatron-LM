@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_ma
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -31,9 +32,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     get_valid_token_dispatcher_types,
 )
 from tests.unit_tests.test_utilities import Utils
-
-# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
-pytestmark = pytest.mark.flaky_in_dev
 
 
 def save(fn, message):
@@ -167,7 +165,7 @@ class TestPartialCudaGraphedA2AOverlap:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):

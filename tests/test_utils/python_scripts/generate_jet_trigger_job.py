@@ -95,6 +95,7 @@ def main(
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
     cadence_arg = cadence or None
+    job_timeout = "24 hours" if platform == "dgx_gb300" else "7 days"
 
     list_of_test_cases = [
         test_case
@@ -106,6 +107,7 @@ def main(
             platform=platform,
             tag=tag,
             cadence=cadence_arg,
+            time_limit=time_limit,
         )
         if test_case.type != "build"
     ]
@@ -133,7 +135,7 @@ def main(
                 "stage": "empty-pipeline-placeholder",
                 "image": f"{container_image}:{container_tag}",
                 "tags": tags,
-                "timeout": "7 days",
+                "timeout": job_timeout,
                 "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
@@ -176,7 +178,9 @@ def main(
 
         for test_idx, test_case in enumerate(list_of_test_cases):
             job_tags = list(tags)
-            job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
+            # JHB has no cluster-tagged submission runner; JET selects its GPU runner.
+            if cluster != "dgxgb300_oci-jhb":
+                job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "
@@ -184,7 +188,7 @@ def main(
                 f"--model {test_case['spec']['model']}",
                 f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
-                f"--time-limit {time_limit}",
+                f"--time-limit {test_case['spec'].get('time_limit', time_limit)}",
                 f"--scope {scope}",
                 f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",
@@ -221,7 +225,7 @@ def main(
                 "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
-                "timeout": "7 days",
+                "timeout": job_timeout,
                 "needs": needs,
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},

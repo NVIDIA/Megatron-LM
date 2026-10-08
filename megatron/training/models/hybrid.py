@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal
 
+import torch
 from typing_extensions import override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
@@ -11,6 +12,10 @@ from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
+)
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    wide_residual_hybrid_inference_stack_spec,
+    wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -48,6 +53,7 @@ class HybridModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     hybrid_attention_ratio: float = 0.0
@@ -110,6 +116,27 @@ class HybridModelConfig(ModelConfig):
             self.transformer.finalize()
 
 
+def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
+    """Return the configured stack spec, or the default one for the transformer config."""
+    if model_config.hybrid_stack_spec is not None:
+        return model_config.hybrid_stack_spec
+    use_wide_residual = model_config.transformer.wide_residual is not None
+    if model_config.transformer.transformer_impl == "inference_optimized":
+        return (
+            wide_residual_hybrid_inference_stack_spec
+            if use_wide_residual
+            else hybrid_inference_stack_spec
+        )
+    if model_config.restore_modelopt_state:
+        if use_wide_residual:
+            raise NotImplementedError(
+                "wide_residual does not support ModelOpt HybridStack specs because they "
+                "do not statically construct wide-residual layer classes."
+            )
+        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
+    return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
+
+
 class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
     """Builder to construct Megatron Core Hybrid models.
 
@@ -148,16 +175,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Note:
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
-        hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        if hybrid_stack_spec is None:
-            if self._model_config.transformer.transformer_impl == "inference_optimized":
-                hybrid_stack_spec = hybrid_inference_stack_spec
-            elif self._model_config.restore_modelopt_state:
-                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False, remap_te_layernorm=False
-                )
-            else:
-                hybrid_stack_spec = default_hybrid_stack_spec
+        hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (
             self._model_config.vocab_size is not None
@@ -184,6 +202,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
@@ -210,6 +229,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -224,8 +244,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
-            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
-                parameters for the layer-wise distributed optimizer.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+                controls whether to compute and supply a shard-aligned param layout to DDP.
 
         Returns:
             List of model stages.
@@ -246,6 +267,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

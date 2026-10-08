@@ -17,7 +17,15 @@ name: Approve Test Queue
 on:
   schedule:
     - cron: "*/5 * * * *" # Runs every 5 minutes
+  # Scheduled events can be delayed, so refill released queue slots immediately.
+  workflow_run:
+    workflows: ["CICD Megatron-LM"]
+    types: [completed]
   workflow_dispatch: # Allows manual triggering
+
+concurrency:
+  group: approve-test-queue
+  cancel-in-progress: false
 
 jobs:
   approve-queue:
@@ -38,10 +46,10 @@ jobs:
             contributor_type: external
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -64,6 +72,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
           MAX_CONCURRENCY_EXTERNAL: ${{ vars.MAX_CONCURRENCY_EXTERNAL || 1 }}
+          ALLOW_PR_RUN_ALL_TESTS: ${{ vars.ALLOW_PR_RUN_ALL_TESTS }}
           CONTRIBUTOR_TYPE: ${{ matrix.contributor_type }}
           SSO_USERS_FILE: users_sso.json
           PYTHONUNBUFFERED: 1
@@ -79,6 +88,14 @@ jobs:
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
+          INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
+          CICD_WORKFLOW_NAME = "CICD Megatron-LM"
+          FUNCTIONAL_TEST_LABEL = "Run functional tests"
+          RUN_TESTS_LABEL = "Run tests"
+          RUN_ALL_TESTS_LABELS = {FUNCTIONAL_TEST_LABEL, RUN_TESTS_LABEL}
+          ALLOW_PR_RUN_ALL_TESTS = (
+              os.environ.get("ALLOW_PR_RUN_ALL_TESTS", "").strip().lower() != "false"
+          )
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
@@ -131,10 +148,12 @@ jobs:
               return None
 
           def is_internal_contributor(pr_info):
-              """Return True if the PR author is a member of NVIDIA or NVIDIA-NeMo org (is_org_member)."""
+              """Return True for internal service accounts or NVIDIA organization members."""
               login = pr_info.get("user", {}).get("login", "")
               org_roles = sso_users.get(login, {}).get("org_roles", [])
-              return any(role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles)
+              return login in INTERNAL_SERVICE_ACCOUNTS or any(
+                  role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
+              )
 
           def get_pr_base_branch(workflow_run):
               """
@@ -158,6 +177,20 @@ jobs:
 
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
+
+          def get_pr_labels(workflow_run):
+              """Return the labels for the PR associated with a workflow run."""
+              head_branch = workflow_run.get("head_branch", "")
+              if not re.match(r"pull-request/(\d+)", head_branch):
+                  return set()
+              _, pr_info = get_pr_base_branch(workflow_run)
+              if pr_info is None:
+                  raise RuntimeError(f"Failed to inspect labels for {head_branch}")
+              return {label.get("name") for label in pr_info.get("labels", [])}
+
+          def has_functional_test_label(workflow_run):
+              """Return whether a PR workflow has opted into functional tests."""
+              return FUNCTIONAL_TEST_LABEL in get_pr_labels(workflow_run)
 
           def matches_contributor(workflow_run, contributor_type):
               """Return True if the workflow run matches the contributor type (ignores branch)."""
@@ -203,19 +236,25 @@ jobs:
               exit(1)
           in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
 
+          # The functional-test slot is global across all branch/contributor queues.
+          functional_test_workflow_running = any(
+              run.get("name") == CICD_WORKFLOW_NAME and has_functional_test_label(run)
+              for run in queued_workflow_runs + in_progress_workflow_runs
+          )
+
           # For external contributors, enforce a single global concurrency limit across ALL branches.
           # For internal contributors, enforce per-branch limits as before.
           if CONTRIBUTOR_TYPE == "external":
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
@@ -241,10 +280,10 @@ jobs:
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
@@ -259,6 +298,23 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
+              workflow_labels = get_pr_labels(workflow)
+              if not ALLOW_PR_RUN_ALL_TESTS and workflow_labels & RUN_ALL_TESTS_LABELS:
+                  blocked_labels = sorted(workflow_labels & RUN_ALL_TESTS_LABELS)
+                  print(
+                      f"Skipping full-test workflow {workflow_name} with Run Id: {workflow_id}; "
+                      f"ALLOW_PR_RUN_ALL_TESTS is false and PR has label(s): {blocked_labels}"
+                  )
+                  continue
+
+              runs_functional_tests = FUNCTIONAL_TEST_LABEL in workflow_labels
+              if runs_functional_tests and functional_test_workflow_running:
+                  print(
+                      f"Skipping functional-test workflow {workflow_name} with Run Id: {workflow_id}; "
+                      "another functional-test workflow is active"
+                  )
+                  continue
+
               print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
@@ -279,6 +335,8 @@ jobs:
 
               if result:
                   total_workflows += 1
+                  if runs_functional_tests:
+                      functional_test_workflow_running = True
               else:
                   print(f"Failed to approve deployment {deployment['id']}")
                   exit(1)

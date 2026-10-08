@@ -333,26 +333,11 @@ class LoggerConfig:
     log_l2_norm_grad_to_tensorboard: bool = False
     """Enable gradients logging to tensorboard."""
 
-    log_num_zeros_in_grad: bool = False
-    """If set, calculate and log the number of zeros in gradient."""
-
-    log_max_attention_logit: bool = False
-    """Enable max attention logit logging to tensorboard."""
-
     log_runtime_to_tensorboard: bool = False
     """Enable runtime metrics logging to tensorboard."""
 
     runtime_time_unit: str = "hours"
     """Time unit to use for time logging. """
-
-    barrier_with_L1_time: bool = field(
-        default=True,
-        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
-    )
-    """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
-    make sure calling barrier with their timers will not result in hangs. This can happen if for
-    example the user adds a level 1 timer that is not called by all ranks.
-    """
 
     log_world_size_to_tensorboard: bool = False
     """Enable world size logging to tensorboard."""
@@ -407,6 +392,52 @@ class LoggerConfig:
 
     moe_routing_trace_dump_weights: bool = False
     """Save router weight tensors to a .pt sidecar file."""
+
+    enable_one_logger: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-one-logger"]}}
+    )
+    """Enable/disable using one_logger to track E2E metrics.
+    Note that one_logger is an internal tool and not available externally.
+    For installation, please go to
+    https://confluence.nvidia.com/display/MLWFO/Package+Repositories for more details.
+    """
+
+    one_logger_project: str = "megatron-lm"
+    """The one-logger project name. Ignored if --no-one-logger is set."""
+
+    one_logger_run_name: str | None = None
+    """The one-logger run name displayed. Ignored if --no-one-logger is set."""
+
+    one_logger_async: bool = False
+    """Run one-logger asynchronously."""
+
+    app_tag_run_name: str | None = None
+    """Application run name shared across training jobs."""
+
+    app_tag_run_version: str = "0.0.0"
+    """Application version associated with performance metrics."""
+
+    otel_enabled: bool = False
+    """Enable OpenTelemetry telemetry (traces and metrics).
+    See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.
+    """
+
+    otel_service_name: str | None = None
+    """Override OTEL_SERVICE_NAME for this training run."""
+
+    otel_span_groups: str | None = None
+    """Comma-separated span-group spec controlling which OTel instrumentation boundaries are active.
+    Accepts preset keywords ("default", "per_step", "full", "all") or individual group names
+    ("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", "step",
+    "forward_backward", "optimizer", "microbatch"), or a mix.
+    Defaults to "default" (coarse job/checkpoint/evaluate spans only).
+    Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.
+    """
+
+    def validate(self) -> None:
+        """Check logging requirements shared by CLI and native configurations."""
+        if self.log_memory_interval is not None:
+            assert self.log_memory_interval % self.log_interval == 0
 
 
 @dataclass(kw_only=True)
@@ -550,8 +581,8 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
-    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
-    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+    async_strategy: Literal["nvrx"] = "nvrx"
+    """Which async save strategy to use. Deprecated and will be removed."""
 
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
@@ -592,6 +623,14 @@ class CheckpointConfig:
     "gather_object": Gather the checkpoint from all ranks in a single operation.
     """
 
+    ckpt_fully_parallel_load_per_rank_objects: bool = False
+    """Load ShardedObjects per-rank during fully parallel load of distributed checkpoints.
+    When True, every rank reads all of its own ShardedObjects (RNG states,
+    TE `_extra_state`, ...) directly from storage, which removes the WORLD-wide
+    `all_gather_object` that otherwise exchanges them. Objects are
+    content-addressable by `unique_key`, so the loaded values are identical.
+    When False (default), the legacy gather-based object exchange is used."""
+
     ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
     """Process group for fully parallel save of distributed checkpoints.
     "dp"(default): Data parallel process group.
@@ -607,10 +646,31 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_pg_tensors_cache_path: Optional[str] = None
+    """Directory of the parallelization-group distribution cache for fully parallel
+    save/load of distributed checkpoints. When set, the expensive
+    ``all_gather_object`` in ``determine_main_replica_uniform_distribution`` is
+    replaced by a single per-group file read (the load and save distributions are
+    loaded from this directory). Only safe when the config and world size match the
+    run that created the cache (see ``--ckpt-pg-tensors-cache-create``); no
+    existence/validity checks are performed, for the lowest possible latency.
+    Default (None) preserves the original collective-based behaviour."""
+
+    ckpt_pg_tensors_cache_create: bool = False
+    """Create (rather than read) the parallelization-group distribution cache at
+    ``--ckpt-pg-tensors-cache-path``. Set this for a single run with a matching
+    config/world size: the collective runs as usual but both the save and load
+    distributions are derived from that single gather and written to disk, one
+    file per parallelization group. Subsequent runs set only
+    ``--ckpt-pg-tensors-cache-path`` (leave this False) to skip the collective.
+    Default: False."""
+
     ckpt_load_validate_sharding_integrity: bool = True
-    """Whether to validate sharding access integrity when loading a distributed checkpoint.
-    When True (default), each tensor shard is checked to be accessed exactly once as main
-    replica by some rank. Disabling skips this validation"""
+    """Whether to validate sharding access integrity when loading *and saving* a distributed
+    checkpoint. When True (default), each tensor shard is checked to be accessed exactly once as
+    main replica by some rank. Disabling skips this validation; on save this also skips the
+    world-wide determine_global_metadata all_gather_object (otherwise run on the first save of a
+    job)."""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
@@ -626,7 +686,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
@@ -664,18 +727,10 @@ class CheckpointConfig:
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in [
-            "nvrx",
-            "mcore",
-        ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
+            "nvrx"
+        ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
-        if not self.async_save:
-            self.async_strategy = "mcore"
-
-        if (
-            self.async_save
-            and self.async_strategy == "nvrx"
-            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
-        ):
+        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
             assert has_nvrx_checkpointing_async_support(), (
                 "A compatible nvidia-resiliency-ext installation is required to enable "
                 "async save with async_strategy='nvrx'."
@@ -770,3 +825,6 @@ class TokenizerConfig:
 
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
+
+    use_gigatoken: Optional[bool] = False
+    """Whether to use faster implementation of tokenizers (gigatoken)"""

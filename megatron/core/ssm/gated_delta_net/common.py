@@ -27,13 +27,14 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -75,6 +76,37 @@ __all__ = [
 ]
 
 
+class _TorchL2Norm(torch.autograd.Function):
+    """Match FLA's saved-output gradient without its timing-based autotuning."""
+
+    @staticmethod
+    def forward(ctx, x, eps):
+        """Normalize in FP32 and save the rounded output used by FLA's backward."""
+        x_float = x.float()
+        rstd = 1.0 / torch.sqrt((x_float * x_float).sum(dim=-1, keepdim=True) + eps)
+        y = (x_float * rstd).to(x.dtype)
+        ctx.save_for_backward(y, rstd)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        """Apply the saved-output gradient formula in FP32."""
+        y, rstd = ctx.saved_tensors
+        y_float, dy_float = y.float(), dy.float()
+        dx = dy_float * rstd - (dy_float * y_float).sum(dim=-1, keepdim=True) * y_float * rstd
+        return dx.to(y.dtype), None
+
+
+def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize the last dimension with FLA-compatible epsilon and dtype semantics.
+
+    Both passes compute in FP32. Backward uses the normalized output rounded to
+    the input dtype, matching FLA rather than differentiating an unrounded norm.
+    This path avoids timing-selected reduction layouts in deterministic training.
+    """
+    return _TorchL2Norm.apply(x, eps)
+
+
 @dataclass
 class GatedDeltaNetSubmodules:
     """Module specs shared by GDN-family layers."""
@@ -85,7 +117,12 @@ class GatedDeltaNetSubmodules:
 
 
 class GatedDeltaRuleInterface(Protocol):
-    """Callable interface shared by GDN-family kernels."""
+    """
+    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
+
+    Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
+    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
+    """
 
     def __call__(
         self,
@@ -93,7 +130,6 @@ class GatedDeltaRuleInterface(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        beta: torch.Tensor,
         *,
         scale: float | None = None,
         initial_state: torch.Tensor | None = None,
@@ -104,7 +140,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule):
+class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     """Shared implementation for the GDN-family layers.
 
     Provides the projection, Q/K/V causal convolution, gated delta-rule parameters,
@@ -177,6 +213,7 @@ class _GDNBase(MegatronModule):
         # Attributes from arguments
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.pp_layer_offset = 0 if pp_layer_offset is None else pp_layer_offset
         self.is_mtp_layer = is_mtp_layer
         self.bias = bias
         self.conv_bias = conv_bias
@@ -241,7 +278,8 @@ class _GDNBase(MegatronModule):
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
         # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -338,6 +376,53 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
+    def forward_post_core_attn(
+        self, norm_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply a GDN variant's output projection to its normalized recurrence output."""
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        return out, out_bias
+
+    def _gated_norm_and_a2a(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
+        batch: int,
+        seq_len: int,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> torch.Tensor:
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+        return a2a_hp_to_cp(
+            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
+        )
+
+    def supports_two_stage_attention(self) -> bool:
+        """Use the split path only when the variant exposes a compatible static stage."""
+        return (
+            not self.recompute_norm_out
+            and not self.recompute_gdn
+            and not self.config.dynamic_context_parallel
+            and (self.config.linear_cp_mode == "headwise" or self.cp_size == 1)
+            and type(self).forward_pre_attn_and_core_attn
+            is not TwoStageAttentionLayer.forward_pre_attn_and_core_attn
+        )
+
     def _setup_variant_attrs(self):
         """Set variant projection sections, gate parameter sizes, and kernel callable.
 
@@ -388,9 +473,18 @@ class _GDNBase(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # pylint: disable=missing-function-docstring
-        raise NotImplementedError
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run a GDN variant's recurrence followed by its output projection."""
+        norm_out = self.forward_pre_attn_and_core_attn(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+        return self.forward_post_core_attn(norm_out)
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -428,7 +522,7 @@ class _GDNBase(MegatronModule):
             ``k``, ``v``, ``g``, and ``beta``), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
-        cp_size = 1 if cp_size_headwise is None else cp_size_headwise
+        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
 
         # Split qkv into query_key and value
         query_key, value = torch.split(
@@ -441,17 +535,8 @@ class _GDNBase(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = query_key.contiguous()
-            if self.config.deterministic_mode:
-                # FLA's L2 norm is outside PyTorch's deterministic-algorithm checks.
-                # Use PyTorch ops with the same FP32 accumulation and additive epsilon
-                # to preserve normalization behavior for small-norm inputs.
-                qk32 = query_key.float()
-                query_key = (qk32 * torch.rsqrt(qk32.pow(2).sum(-1, keepdim=True) + 1e-6)).to(
-                    query_key.dtype
-                )
-            else:
-                query_key = l2norm(query_key)
+            normalize = torch_l2norm if self.config.deterministic_mode else l2norm
+            query_key = normalize(query_key.contiguous())
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size

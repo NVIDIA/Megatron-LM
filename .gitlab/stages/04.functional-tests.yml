@@ -172,6 +172,16 @@ functional:configure:
         --cluster $GB200_CLUSTER \
         --output-path "functional-test-job-lts-GB200.yaml" \
         ${RELEASE_ARGS[@]}
+    - |
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "nightly" ]]; then
+        export PYTHONPATH=$(pwd)
+        python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+          ${ARGS[@]} \
+          --environment dev \
+          --platform dgx_gb300 \
+          --cluster "$CLUSTER_GB300" \
+          --output-path "functional-test-job-dev-GB300.yaml"
+      fi
   artifacts:
     paths:
       - functional-smoke-h100-job.yaml
@@ -182,6 +192,7 @@ functional:configure:
       - functional-test-job-dev-H100.yaml
       - functional-test-job-lts-GB200.yaml
       - functional-test-job-dev-GB200.yaml
+      - functional-test-job-dev-GB300.yaml
       - tests/test_utils/local_recipes
 
 .functional_run:
@@ -212,6 +223,8 @@ functional:configure:
   stage: functional_tests
   rules:
     - if: $BUILD == "no"
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "schedule"
       when: never
     - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/
       when: on_success
@@ -407,6 +420,23 @@ functional:run_dev_dgx_gb200:
     ENVIRONMENT: dev
     CLUSTER: GB200
 
+# Run the GB200 nightly matrix on GB300 without delaying or failing the parent.
+functional:run_dev_dgx_gb300:
+  extends: [.functional_run]
+  allow_failure: true
+  trigger:
+    # Clear the inherited waiting strategy; finish once the child is created.
+    strategy: null
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: GB300
+  rules:
+    - if: $BUILD == "no"
+      when: never
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "nightly"
+      when: on_success
+    - when: never
+
 functional:run_nemo:
   extends: [.functional_tests_rules]
   trigger:
@@ -426,41 +456,9 @@ functional:run_nemo:
       allow_failure: true
     - when: never
 
-functional:smoke_notify:
-  extends: [.functional_tests_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  needs:
-    - functional:smoke-h100
-    - functional:smoke-gb200
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  script:
-    - |
-      if [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
-        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
-      else
-        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
-      fi
-    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
-    - export GITLAB_ENDPOINT
-    - |
-      python tests/test_utils/python_scripts/notify.py \
-        --pipeline-id "${CI_PIPELINE_ID}" \
-        --check-for smoke-tests \
-        --pipeline-context "smoke-${FUNCTIONAL_TEST_SCOPE}" \
-        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
-  rules:
-    - if: $BUILD == "no"
-      when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")
-      when: always
-    - when: never
-
+# Sole root Slack notification for functional MR, nightly, weekly, and release
+# pipelines. Detailed triage and Linear updates reply in the thread recorded by
+# slack_notification.json; individual workload runners must not notify directly.
 functional:x_notify:
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
@@ -471,6 +469,8 @@ functional:x_notify:
     - functional:run_dev_dgx_h100
     - functional:run_lts_dgx_gb200
     - functional:run_dev_dgx_gb200
+    - job: functional:run_dev_dgx_gb300
+      optional: true
   tags:
     - arch/amd64
     - env/prod
@@ -492,19 +492,28 @@ functional:x_notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || echo "0")
     - export TEAM_SLUG=$SLACK_ADMIN
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \
         --check-for functional-tests \
         --pipeline-context $CONTEXT \
-        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}" \
+        --summary-output pipeline_summaries.json \
+        --failure-buckets-output failure_buckets.json \
+        --slack-output slack_notification.json
 
   artifacts:
     when: always
     paths:
       - scripts
+      - pipeline_summaries.json
+      - failure_buckets.json
+      - slack_notification.json
+      - inference_metrics.json
+      - agent_formatter_debug.txt
   rules:
     - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
       when: always
