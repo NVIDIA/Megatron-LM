@@ -40,6 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -577,6 +578,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer, MoE transformer, and Mamba layers are used.
+                Residual-stream replay additionally wraps its parameterized child norms
+                and residual connections so their forward hooks gather weights during replay.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -608,6 +611,35 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+        recompute_units = set()
+        if config.recompute_granularity == "selective" and "residual_stream" in (
+            config.recompute_modules or []
+        ):
+            # A replay block calls these children before their parent's backward
+            # hook. Give each child its own gather hook (see Megatron-LM #7777).
+            for layer in module.modules():
+                if isinstance(layer, (TransformerLayer, MoETransformerLayer)):
+                    names = (
+                        "input_layernorm",
+                        "pre_mlp_layernorm",
+                        "residual_connection_self_attn",
+                        "residual_connection_mlp",
+                    )
+                elif isinstance(layer, MambaLayer):
+                    names = ("norm", "residual_connection")
+                elif isinstance(layer, ShortcutMoEBlock):
+                    names = (
+                        "shortcut_pre_mlp_layernorm",
+                        "shortcut_post_norm",
+                        "shortcut_residual_read",
+                    )
+                else:
+                    continue
+                for name in names:
+                    child = getattr(layer, name, None)
+                    if child is not None and next(child.parameters(), None) is not None:
+                        recompute_units.add(child)
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -698,7 +730,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
-                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                if submodule in recompute_units or any(
+                    isinstance(submodule, module_type) for module_type in fsdp_unit_modules
+                ):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
                     fully_shard(
