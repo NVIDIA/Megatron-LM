@@ -161,6 +161,226 @@ def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> N
 
 
 @pytest.fixture
+def pr_files_environment(tmp_path: Path, shell_environment: dict[str, str]) -> dict[str, str]:
+    gh = tmp_path / "bin/gh"
+    gh.write_text(
+        '#!/bin/sh\n[ "$1" = "api" ] || exit 2\n'
+        'if [ "$2" = "--paginate" ]; then\n'
+        '  [ "$#" -eq 3 ] && '
+        '[ "$3" = "repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100" ] || exit 2\n'
+        '  echo files >> "$GH_LOG"\n'
+        '  cat "$TEST_PR_RESPONSE"\n'
+        '  exit "$TEST_API_EXIT"\n'
+        'fi\n'
+        '[ "$#" -eq 4 ] && [ "$2" = "repos/NVIDIA/Megatron-LM/pulls/7824" ] && '
+        '[ "$3" = "--jq" ] && [ "$4" = ".merge_commit_sha" ] || exit 2\n'
+        'echo sha >> "$GH_LOG"\n'
+        'printf "%s\\n" "$TEST_CURRENT_PR_SHA"\n'
+        'exit "$TEST_SHA_EXIT"\n'
+    )
+    gh.chmod(0o755)
+    response = tmp_path / "api-response"
+    response.write_text(
+        json.dumps(
+            [
+                {"status": "modified", "filename": "megatron/core/z.py"},
+                {"status": "added", "filename": "tests/unit_tests/test_a.py"},
+            ]
+        )
+        + "\n"
+        + json.dumps([{"status": "removed", "filename": "megatron/core/removed.py"}])
+        + "\n"
+    )
+    return {
+        **shell_environment,
+        "GH_LOG": str(tmp_path / "gh-calls"),
+        "TEST_PR_RESPONSE": str(response),
+        "TEST_API_EXIT": "0",
+        "TEST_SHA_EXIT": "0",
+        "TEST_CURRENT_PR_SHA": "c" * 40,
+        "RUNNER_TEMP": str(tmp_path / "runner"),
+        "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+        "PR_NUMBER": "7824",
+        "PR_CHANGED_FILES": "3",
+        "PR_MERGE_SHA": "c" * 40,
+        "TESTED_SHA": "c" * 40,
+    }
+
+
+def _assert_pr_files_artifact(tmp_path, outputs, record_count, paths):
+    assert outputs == {"ready": "true"}
+    artifact = tmp_path / "runner/unit-test-pr-files"
+    assert {path.name for path in artifact.iterdir()} == {"changed-files", "metadata.json"}
+    expected_paths = sorted(set(paths))
+    assert (artifact / "changed-files").read_text().splitlines() == expected_paths
+    assert json.loads((artifact / "metadata.json").read_text()) == {
+        "tested_sha": "c" * 40,
+        "changed_files": record_count,
+        "changed_paths": len(expected_paths),
+    }
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "multi-page",
+        "empty",
+        "api-error",
+        "recheck-error",
+        "wrong-count",
+        "too-many-files",
+        "initial-sha-mismatch",
+        "current-sha-mismatch",
+        "invalid-pr-number",
+        "invalid-tested-sha",
+        "invalid-file-count",
+        "invalid-json",
+        "invalid-page",
+        "missing-filename",
+        "missing-rename-source",
+        "newline-path",
+    ],
+)
+def test_pr_files_producer_requires_complete_data_for_the_tested_commit(
+    tmp_path: Path, pr_files_environment: dict[str, str], scenario: str
+) -> None:
+    environment = pr_files_environment
+    response = Path(environment["TEST_PR_RESPONSE"])
+    overrides = {
+        "empty": {"PR_CHANGED_FILES": "0"},
+        "api-error": {"TEST_API_EXIT": "1"},
+        "recheck-error": {"TEST_SHA_EXIT": "1"},
+        "wrong-count": {"PR_CHANGED_FILES": "4"},
+        "too-many-files": {"PR_CHANGED_FILES": "3001"},
+        "initial-sha-mismatch": {"PR_MERGE_SHA": "d" * 40},
+        "current-sha-mismatch": {"TEST_CURRENT_PR_SHA": "d" * 40},
+        "invalid-pr-number": {"PR_NUMBER": "invalid"},
+        "invalid-tested-sha": {"TESTED_SHA": "invalid"},
+        "invalid-file-count": {"PR_CHANGED_FILES": "invalid"},
+    }
+    environment.update(overrides.get(scenario, {}))
+    if scenario == "empty":
+        response.write_text("[]\n")
+    elif scenario == "invalid-json":
+        response.write_text("[")
+    elif scenario == "invalid-page":
+        response.write_text("{}")
+    elif scenario in {"missing-filename", "missing-rename-source", "newline-path"}:
+        record = {
+            "missing-filename": {"status": "modified"},
+            "missing-rename-source": {"status": "renamed", "filename": "new.py"},
+            "newline-path": {"status": "modified", "filename": "split\npath.py"},
+        }[scenario]
+        response.write_text(json.dumps([record]))
+        environment["PR_CHANGED_FILES"] = "1"
+    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    result, outputs = _run(step["run"], tmp_path, environment)
+    assert result.returncode == 0, result.stderr
+    if scenario in {"multi-page", "empty"}:
+        paths = (
+            []
+            if scenario == "empty"
+            else ["megatron/core/z.py", "tests/unit_tests/test_a.py", "megatron/core/removed.py"]
+        )
+        _assert_pr_files_artifact(tmp_path, outputs, len(paths), paths)
+    else:
+        assert "ready" not in outputs
+        assert "::notice::" in result.stdout
+        assert not (tmp_path / "runner/unit-test-pr-files/metadata.json").exists()
+    no_api = {
+        "too-many-files",
+        "initial-sha-mismatch",
+        "invalid-pr-number",
+        "invalid-tested-sha",
+        "invalid-file-count",
+    }
+    expected_calls = [] if scenario in no_api else ["files"]
+    if scenario in {"multi-page", "empty", "recheck-error", "current-sha-mismatch"}:
+        expected_calls.append("sha")
+    calls = Path(environment["GH_LOG"])
+    assert (calls.read_text().splitlines() if calls.exists() else []) == expected_calls
+
+
+@pytest.mark.parametrize("direction", ["into", "out", "within"])
+def test_pr_rename_endpoints_trigger_mandatory_selection(
+    tmp_path: Path, pr_files_environment: dict[str, str], direction: str
+) -> None:
+    source = "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental"
+    old = "outside/old.py" if direction == "into" else f"{source}/old.py"
+    new = "outside/new.py" if direction == "out" else f"{source}/new.py"
+    records = [{"status": "renamed", "filename": new, "previous_filename": old}]
+    if direction == "within":
+        # One rename's old path is another's new path: publish each path only once.
+        records.append(
+            {"status": "renamed", "filename": f"{source}/other.py", "previous_filename": new}
+        )
+    Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(json.dumps(records))
+    pr_files_environment["PR_CHANGED_FILES"] = str(len(records))
+    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    result, outputs = _run(step["run"], tmp_path, pr_files_environment)
+    assert result.returncode == 0, result.stderr
+    paths = [
+        path for record in records for path in (record["filename"], record["previous_filename"])
+    ]
+    _assert_pr_files_artifact(tmp_path, outputs, len(records), paths)
+
+    test_file = "tests/unit_tests/required/test_case.py"
+    (tmp_path / test_file).parent.mkdir(parents=True)
+    (tmp_path / test_file).write_text("def test_case(): pass\n")
+    config = tmp_path / "mandatory.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {"mappings": [{"source_dirs": [source], "test_buckets": {"dgx_h100": [test_file]}}]}
+        )
+    )
+    selection = tmp_path / "selected-tests"
+    selection.write_text(f"{test_file}::test_case\n")
+    selected = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tests/unit_tests/testmon_mandatory.py"),
+            "--config",
+            str(config),
+            "--changed-files",
+            str(tmp_path / "runner/unit-test-pr-files/changed-files"),
+            "--bucket",
+            "tests/unit_tests/**/*.py",
+            "--platform",
+            "dgx_h100",
+            "--selection",
+            str(selection),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert selection.read_text().splitlines() == [test_file]
+    assert (tmp_path / "mandatory-tests").read_text().splitlines() == [test_file]
+
+
+def test_pr_files_producer_accepts_3000_renames_with_6000_paths(
+    tmp_path: Path, pr_files_environment: dict[str, str]
+) -> None:
+    records = [
+        {"status": "renamed", "filename": f"new/{i:04}.py", "previous_filename": f"old/{i:04}.py"}
+        for i in range(3000)
+    ]
+    Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(
+        "\n".join(json.dumps(records[start : start + 100]) for start in range(0, 3000, 100))
+    )
+    pr_files_environment["PR_CHANGED_FILES"] = "3000"
+    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    result, outputs = _run(step["run"], tmp_path, pr_files_environment)
+    assert result.returncode == 0, result.stderr
+    paths = [
+        path for record in records for path in (record["filename"], record["previous_filename"])
+    ]
+    _assert_pr_files_artifact(tmp_path, outputs, 3000, paths)
+
+
+@pytest.fixture
 def configure_environment(
     tmp_path: Path, shell_environment: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, str]:

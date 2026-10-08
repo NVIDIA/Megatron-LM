@@ -13,6 +13,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -132,6 +133,7 @@ class RouterInterface(Protocol):
         /,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
 
@@ -497,6 +499,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
@@ -507,7 +510,7 @@ class MoELayer(BaseMoELayer):
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        router_kwargs = {"input_ids": input_ids}
+        router_kwargs = {"input_ids": input_ids, "packed_seq_params": packed_seq_params}
         if token_multiplicities is not None:
             router_kwargs["token_multiplicities"] = token_multiplicities
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, **router_kwargs)
@@ -693,6 +696,7 @@ class MoELayer(BaseMoELayer):
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -732,6 +736,7 @@ class MoELayer(BaseMoELayer):
                         hidden_states,
                         padding_mask,
                         input_ids=input_ids,
+                        packed_seq_params=packed_seq_params,
                         token_multiplicities=token_multiplicities,
                     )
                     hidden_states, probs = self.preprocess(
