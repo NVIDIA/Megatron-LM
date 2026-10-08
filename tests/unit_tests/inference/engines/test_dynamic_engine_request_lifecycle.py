@@ -64,6 +64,7 @@ REQUEST_FIELD_POLICY = {
 }
 
 SAMPLING_FIELD_POLICY = {
+    "seed": "preserve",
     "temperature": "preserve",
     "top_k": "preserve",
     "top_p": "preserve",

@@ -1,20 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Request-local draws must survive reordering, pauses, and batch-size changes."""
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
+    DynamicInferenceRequest,
+    Status,
+)
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 
 _DEVICES = [
-    "cpu",
     pytest.param(
         "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    ),
+    )
 ]
 
 
@@ -47,7 +52,9 @@ def draw(sampler, logits, ctx, **kwargs):
 
 @pytest.mark.parametrize("device", _DEVICES)
 def test_seeded_sequence_survives_batch_changes(device):
-    logits = torch.randn(3, 127, generator=torch.Generator().manual_seed(1)).to(device)
+    logits = torch.randn(
+        3, 127, device=device, generator=torch.Generator(device=device).manual_seed(1)
+    )
     sampler = TorchSampling(torch.Generator(device=device).manual_seed(22), 127)
     before = sampler._rng.get_state().clone()
     for position in range(8, 24):
@@ -76,32 +83,32 @@ def test_seeded_request_does_not_consume_unseeded_rng(device, separate_buckets):
 
 
 def test_gather_output_and_paused_requests():
-    sampler = TorchSampling(torch.Generator().manual_seed(42), 127)
-    logits = torch.randn(5, 127)
+    sampler = TorchSampling(torch.Generator(device="cuda").manual_seed(42), 127)
+    logits = torch.randn(5, 127, device="cuda")
     ctx = context([3, 4], [10, 20])
     expected = draw(sampler, logits[[1, 4]], ctx)
     ctx.paused_request_count = 2
     ctx.total_request_count = 4
-    output = torch.empty(2, dtype=torch.long)
+    output = torch.empty(2, dtype=torch.long, device="cuda")
     result = draw(sampler, logits, ctx, gather_indices=torch.tensor([1, 4]), output=output)
     assert result is output
     assert torch.equal(result, expected)
 
 
 def test_different_seeds_and_positions_change_streams():
-    sampler = TorchSampling(torch.Generator().manual_seed(1), 127)
-    logits = torch.zeros(2, 127)
+    sampler = TorchSampling(torch.Generator(device="cuda").manual_seed(1), 127)
+    logits = torch.zeros(2, 127, device="cuda")
     sequence = [draw(sampler, logits, context([11, 12], [i, i])).tolist() for i in range(20)]
     assert any(a != b for a, b in sequence)
     assert len({a for a, _ in sequence}) > 1
 
 
 def test_speculative_seeds_rejected():
-    sampler = TorchSampling(torch.Generator(), 127)
+    sampler = TorchSampling(torch.Generator(device="cuda"), 127)
     ctx = context([1], [10])
     ctx.config.num_speculative_tokens = 1
     with pytest.raises(ValueError, match="speculative"):
-        draw(sampler, torch.zeros(1, 127), ctx)
+        draw(sampler, torch.zeros(1, 127, device="cuda"), ctx)
 
 
 @pytest.mark.parametrize("seed", [None, 0, 42, 2**63 - 1])
@@ -173,21 +180,61 @@ def test_cuda_seeded_sampling_distribution():
 
 
 @pytest.mark.parametrize("backend,speculative", [("flashinfer", 0), ("torch", 2), ("torch", 0)])
-def test_unsupported_seed_rejected_before_engine_registration(backend, speculative):
+@pytest.mark.asyncio
+async def test_unsupported_seed_returns_failed_request(backend, speculative):
     from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 
     engine = object.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(
         config=SimpleNamespace(sampling_backend=backend, num_speculative_tokens=speculative),
         request_metadata={},
+        max_sequence_length=16,
+        max_tokens=16,
+        num_speculative_tokens=speculative,
+        block_size_tokens=8,
+        kv_block_allocator=SimpleNamespace(pool_size=32),
+        remove_vlm_request_data=Mock(),
     )
     engine.requests = {}
+    engine._loop = asyncio.get_running_loop()
+    engine._generation_epoch = None
+    engine.rank = 1
+    engine.enable_chunked_prefill = False
+    engine.waiting_request_ids = []
+    engine.failed_request_ids = []
+    engine.use_coordinator = True
+    engine.is_mp_coordinator = True
+    engine._send_requests_to_coordinator = Mock()
     req = DynamicInferenceRequest(
         request_id=1,
         prompt="",
         prompt_tokens=torch.tensor([1]),
-        sampling_params=SamplingParams(seed=42),
+        sampling_params=SamplingParams(seed=42, termination_id=0, num_tokens_to_generate=1),
     )
-    with pytest.raises(ValueError, match="Request-local seeds"):
-        engine._add_request(req)
-    assert engine.requests == {}
+    future = engine._add_request(req)
+    assert future.done()
+    result = await future
+    assert result.status == Status.FAILED
+    errors = [
+        e.payload for e in result.events if e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
+    ]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "Request-local seeds" in str(errors[0])
+    assert engine.waiting_request_ids == []
+    assert engine.failed_request_ids == [1]
+    engine._send_requests_to_coordinator.assert_called_once_with([result])
+
+
+@pytest.mark.parametrize("top_k", [0, 1])
+def test_seeded_cpu_sampling_rejected(top_k):
+    with pytest.raises(AssertionError, match="requires CUDA"):
+        TorchSampling.sample_from_logits(
+            torch.zeros(1, 127),
+            1.0,
+            top_k,
+            0.0,
+            generator=torch.Generator(),
+            row_seeds=[42],
+            row_positions=[7],
+        )

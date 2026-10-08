@@ -1,7 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import hashlib
-import struct
 from collections import defaultdict
 from typing import Any, List, Optional, Tuple
 
@@ -14,12 +12,6 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
-
-
-def request_token_seed(seed: int, position: int) -> int:
-    """Derive the CPU fallback's draw from request seed and absolute position."""
-    digest = hashlib.sha256(struct.pack("<QQ", seed, position)).digest()
-    return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
 
 class TorchSampling(Sampling):
@@ -118,6 +110,8 @@ class TorchSampling(Sampling):
         assert not (
             top_k > 0 and not is_no_op_top_p(top_p)
         ), "Cannot have top-p and top-k both active"
+        if row_seeds is not None and any(seed is not None for seed in row_seeds):
+            assert last_token_logits.is_cuda, "Request-local seeded sampling requires CUDA logits"
         if top_k == 1:
             return torch.argmax(last_token_logits, dim=-1)
 
@@ -151,23 +145,9 @@ class TorchSampling(Sampling):
                 noise = torch.empty((len(unseeded), q.shape[1]), device=q.device, dtype=q.dtype)
                 noise.exponential_(generator=generator)
                 q.index_copy_(0, indices, noise)
-            if q.is_cuda:
-                # Import lazily so CPU sampling does not require Triton.
-                from megatron.core.inference.sampling.request_seed_noise import (
-                    fill_request_seed_noise,
-                )
+            from megatron.core.inference.sampling.request_seed_noise import fill_request_seed_noise
 
-                fill_request_seed_noise(q, row_seeds, row_positions)
-            else:
-                local_rng = torch.Generator(device=q.device)
-                for row, seed in enumerate(row_seeds):
-                    if seed is not None:
-                        local_rng.manual_seed(
-                            seed
-                            if row_positions is None
-                            else request_token_seed(seed, row_positions[row])
-                        )
-                        q[row].exponential_(generator=local_rng)
+            fill_request_seed_noise(q, row_seeds, row_positions)
         sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
         if vocab_size:

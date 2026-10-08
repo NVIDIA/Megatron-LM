@@ -192,4 +192,4 @@ def sampling_params_for_choice(params: "SamplingParams", index: int) -> "Samplin
     """Assign stable distinct seeds to choices without mutating shared parameters."""
     if params.seed is None:
         return params
-    return replace(params, seed=(params.seed + index) % (2**63))
+    return replace(params, seed=(params.seed + index) % (2**63), return_prompt_top_n_logprobs=False)
