@@ -15,8 +15,11 @@
 """DBuffer placement definitions.
 
 DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
-types directly. ``Flat`` is the only DBuffer-specific placement: a dim-0
-``Shard`` whose local storage is part of one flattened buffer.
+types directly. ``RowAtomic``, ``BlockAtomic``, and ``TensorAtomic`` are
+DBuffer-specific dim-0 ``Shard`` placements whose local storage is part of one
+flattened buffer. ``RowAtomic`` and ``BlockAtomic`` split the flattened buffer into
+equal-size per-rank shards; ``TensorAtomic`` instead assigns every logical
+tensor as a whole to one owner rank, so per-rank shards may differ in size.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -24,7 +27,7 @@ Source         Destination    DBuffer operation
 sharded        ``Replicate``  ``allgather()``
 ``Partial``    sharded        ``reduce_scatter()``
 ``Partial``    ``Replicate``  ``allreduce()``
-``Replicate``  sharded        ``scatter()`` (local)
+``Replicate``  sharded        ``view()`` (local)
 =============  =============  ====================
 """
 
@@ -33,14 +36,55 @@ from collections.abc import Iterable
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["Flat", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "TensorAtomic", "changed_mesh_axis"]
 
 
-class Flat(Shard):
-    """DBuffer-specific flattened dim-0 shard placement."""
+class RowAtomic(Shard):
+    """DBuffer-specific dim-0 shard placement that keeps each row intact."""
 
     def __init__(self) -> None:
         super().__init__(0)
+
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim; DBuffer placements compare by type.
+        return isinstance(other, RowAtomic)
+
+
+class BlockAtomic(Shard):
+    """Flattened dim-0 shard placement that keeps ``block_size`` rows together."""
+
+    def __init__(self, block_size: int) -> None:
+        if block_size <= 0:
+            raise ValueError(f"BlockAtomic block_size must be positive, got {block_size}.")
+        super().__init__(0)
+        self.block_size = block_size
+
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim, so preserve the block size as well.
+        return isinstance(other, BlockAtomic) and self.block_size == other.block_size
+
+    def __repr__(self) -> str:
+        return f"BlockAtomic(block_size={self.block_size})"
+
+
+class TensorAtomic(Shard):
+    """Dim-0 shard placement that assigns each logical tensor as a whole to one rank.
+
+    With ``fully_shard``, use ``TensorAtomic()`` in ``Placements`` and supply only
+    ``fully_shard_context(parameter_to_owner=...)``. Each parameter group derives
+    its tensor owners from that mapping and passes them to
+    ``GlobalLayout.build_for_tensor_atomic``. Ownership is encoded by the layout's
+    offsets; this placement stores no owner assignments.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(0)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TensorAtomic)
+
+    def __repr__(self) -> str:
+        return "TensorAtomic()"
 
 
 def changed_mesh_axis(

@@ -1,8 +1,7 @@
 ---
 name: mcore-linting-and-formatting
-description: Linting and formatting for Megatron-LM. Covers running autoformat.sh, tools (ruff, black, isort, pylint, mypy), and code style rules.
+description: Linting and formatting for Megatron-LM. Covers running autoformat.sh, tools (ruff, black, isort, pylint, mypy), and code style rules. Use when running linting or autoformat; fixing style violations before a PR; 'pre-commit fails', 'ruff error', 'isort', 'mypy', 'style violation', 'how do I format', 'autoformat.sh'.
 license: Apache-2.0
-when_to_use: Running linting or autoformat; fixing style violations before a PR; 'pre-commit fails', 'ruff error', 'isort', 'mypy', 'style violation', 'how do I format', 'autoformat.sh'.
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
 ---
@@ -53,8 +52,4 @@ This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by
 
 ## Code Style Rules
 
-- **Type hints**: required on all public API functions. Use `X | None`, not `Optional[X]`.
-- **Docstrings**: Google-style on all public classes and functions.
-- **Naming**: follow Python conventions — `snake_case` for functions and variables, `PascalCase` for classes.
-- **Line length**: 119 characters (configured in `pyproject.toml`).
-- **No bare `except`**: always catch specific exception types.
+Follow [style-guide.md](../../style-guide.md).

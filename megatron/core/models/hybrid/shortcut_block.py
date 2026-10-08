@@ -1,0 +1,599 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Implement shortcut-connected MoE blocks based on the ScMoE architecture introduced in
+`Shortcut-connected Expert Parallelism for Accelerating Mixture of Experts
+<https://arxiv.org/abs/2404.05019>`_.
+
+ScMoE routes the preceding layer's representation through sparse experts while the paired layer
+computes attention and the shared expert, breaking the usual sequential dependency so
+expert-parallel All-to-All communication can overlap with computation.
+Our variant adds two LayerNorms to the paper's design: `shortcut_pre_mlp_layernorm` normalizes
+the shortcut representation before routing and expert dispatch, while `shortcut_post_norm`
+normalizes the merged routed- and shared-expert result before the MoE residual/BDA step.
+Also supports selective activation recomputation and activation offloading on
+shortcut_pre_mlp_layernorm and shortcut_post_norm, respectively, to reduce the additional
+device-memory pressure from enabling Shortcut-MoE.
+"""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+import torch
+
+from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
+from megatron.core.typed_torch import apply_module
+
+# Layer symbols that may precede a shortcut MoE
+SUPPORTED_SHORTCUT_PREDECESSORS = frozenset(
+    {LayerSymbols.MAMBA, LayerSymbols.GDN}
+    | {
+        symbol
+        for symbol, layer_config in LayerSymbols.LAYER_CONFIG_MAP.items()
+        if layer_config in LayerSymbols.ATTENTION_LAYER_CONFIGS
+    }
+)
+
+
+def _get_offloading_interface():
+    """Get the fine-grained activation offloading interface lazily."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface,
+    )
+
+    return FineGrainedActivationOffloadingInterface
+
+
+def group_layers_into_shortcut_blocks(
+    layers: torch.nn.ModuleList,
+    layer_type_list: Sequence[str],
+    config: TransformerConfig,
+    pp_layer_offset: int = 0,
+) -> torch.nn.ModuleList:
+    """Group physical layers into their registered shortcut-block hierarchy.
+
+    Grouping updates the layer names through the returned `ModuleList` hierarchy. Layers not
+    followed by an MoE remain direct children of the returned `ModuleList`.
+
+    Args:
+        layers: Physical layers in execution order.
+        layer_type_list: Physical layer symbols in execution order.
+        config: Transformer configuration controlling shortcut scheduling.
+        pp_layer_offset: Global offset of this pipeline stage's first physical layer.
+
+    Returns:
+        The registered logical layers.
+
+    Raises:
+        ValueError: If an MoE has an unsupported predecessor or its shortcut pair crosses a
+            pipeline-stage boundary.
+    """
+
+    if pp_layer_offset > 0 and layer_type_list and layer_type_list[0] == LayerSymbols.MOE:
+        raise ValueError(
+            "Shortcut MoE pairs cannot cross pipeline-stage boundaries; this pipeline stage "
+            f"begins with an MoE layer (global layer {pp_layer_offset + 1}). Move the stage "
+            "boundary so each MoE layer stays on the same stage as the layer before it."
+        )
+
+    grouped_layers = torch.nn.ModuleList()
+    physical_index = 0
+    while physical_index < len(layers):
+        next_is_moe = (
+            physical_index + 1 < len(layers)
+            and layer_type_list[physical_index + 1] == LayerSymbols.MOE
+        )
+        if not next_is_moe:
+            grouped_layers.append(layers[physical_index])
+            physical_index += 1
+            continue
+
+        compute_layer = layers[physical_index]
+        paired_type = layer_type_list[physical_index]
+        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSORS:
+            raise ValueError(
+                "Shortcut MoE must be preceded by a Mamba, GDN, or supported attention layer"
+            )
+
+        supports_two_stage = (
+            isinstance(compute_layer, TwoStageAttentionLayer)
+            and compute_layer.supports_two_stage_attention()
+        )
+        if not supports_two_stage:
+            raise ValueError(
+                f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
+            )
+        moe_layer = layers[physical_index + 1]
+        grouped_layers.append(
+            ShortcutMoEBlock(
+                compute_layer,
+                moe_layer,
+                overlap_a2a=config.moe_shortcut_parallel,
+                attn_local_idx=physical_index,
+                moe_local_idx=physical_index + 1,
+            )
+        )
+        physical_index += 2
+
+    return grouped_layers
+
+
+class ShortcutMoEBlock(MegatronModule):
+    """Own and execute one attention-layer/shortcut-MoE pair."""
+
+    _parallel_stream: torch.cuda.Stream | None = None
+
+    @classmethod
+    def _get_a2a_overlap_stream(cls) -> torch.cuda.Stream:
+        """Return the process-wide high-priority shortcut stream."""
+        if cls._parallel_stream is None:
+            cls._parallel_stream = torch.cuda.Stream(priority=-1)
+        return cls._parallel_stream
+
+    def __init__(
+        self,
+        compute_layer,
+        moe_layer,
+        overlap_a2a: bool,
+        attn_local_idx: int | None = None,
+        moe_local_idx: int | None = None,
+    ):
+        super().__init__(compute_layer.config)
+
+        self.overlap_mode = overlap_a2a
+        self.layer_number = compute_layer.layer_number
+        self.attn_layer_idx = compute_layer.layer_number - 1
+        self.attn_local_idx = attn_local_idx
+        self.moe_layer_idx = moe_layer.layer_number - 1
+        self.moe_local_idx = moe_local_idx
+
+        self.is_first_layer = getattr(compute_layer, "is_first_layer", False)
+        self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
+        self.tp_group = moe_layer.mlp.tp_group
+        self.compute_layer = compute_layer
+        self.moe_layer = moe_layer
+        self.recompute_shortcut_pre_mlp_layernorm = (
+            self.config.recompute_granularity == "selective"
+            and "shortcut_pre_mlp_layernorm" in (self.config.recompute_modules or [])
+        )
+        self.offload_shortcut_post_norm = (
+            self.config.fine_grained_activation_offloading
+            and "shortcut_post_norm" in (self.config.offload_modules or [])
+        )
+        self.off_interface = _get_offloading_interface()
+        self.shortcut_pre_mlp_layernorm_checkpoint = None
+
+        compute_is_mtp = bool(getattr(compute_layer, "is_mtp_layer", False))
+        moe_is_mtp = bool(getattr(moe_layer, "is_mtp_layer", False))
+        if compute_is_mtp != moe_is_mtp:
+            raise ValueError("A ShortcutMoE pair must agree on whether it belongs to MTP.")
+        self.is_mtp_layer = moe_is_mtp
+        if not self.is_mtp_layer and (
+            (compute_layer.config.wide_residual is None) != (moe_layer.config.wide_residual is None)
+        ):
+            raise ValueError(
+                "A ShortcutMoE pair must agree on whether it carries a wide residual stream."
+            )
+
+        self.shortcut_residual_read = None
+        if moe_layer.config.wide_residual is not None and not self.is_mtp_layer:
+            self.shortcut_residual_read = StreamwiseSigmoidWideResidualRead(
+                config=moe_layer.config,
+                layer_number=moe_layer.layer_number,
+                branch_name="shortcut_routed",
+            )
+            outer_connection = moe_layer._get_mlp_residual_connection()
+            if outer_connection is None:
+                raise ValueError(
+                    "A wide-residual shortcut read requires an outer MoE residual connection."
+                )
+            if (
+                self.shortcut_residual_read.residual_stream_hidden_size
+                != outer_connection.residual_stream_hidden_size
+            ):
+                raise ValueError(
+                    "The shortcut read and outer MoE residual connection must consume the "
+                    "same residual-stream width."
+                )
+            predecessor_stream_width = getattr(compute_layer, "residual_stream_hidden_size", None)
+            if predecessor_stream_width != self.shortcut_residual_read.residual_stream_hidden_size:
+                raise ValueError(
+                    "The shortcut predecessor and routed read must carry the same "
+                    "residual-stream width."
+                )
+
+        shortcut_norm_spec = TENorm
+        self.shortcut_pre_mlp_layernorm = build_module(
+            shortcut_norm_spec,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+            has_residual=False,
+        )
+        self.shortcut_post_norm = (
+            build_module(
+                shortcut_norm_spec,
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                has_residual=False,
+            )
+            if self.config.moe_shortcut_post_norm
+            else IdentityOp()
+        )
+        self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+
+    def _read_shortcut_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        recompute_context: ResidualStreamRecomputeContext | None,
+    ) -> torch.Tensor:
+        """Read the pair input used only by shortcut routing."""
+
+        if self.shortcut_residual_read is None:
+            return hidden_states
+        if recompute_context is not None:
+            return recompute_context.checkpoint(
+                apply_module(self.shortcut_residual_read), hidden_states
+            )
+        return apply_module(self.shortcut_residual_read)(hidden_states)
+
+    def _moe_router_preprocess(
+        self,
+        shortcut_hidden,
+        padding_mask=None,
+        packed_seq_params=None,
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        """Run shortcut normalization, routing, and dispatch preprocessing."""
+        if recompute_context is not None:
+            shortcut_input = recompute_context.checkpoint(
+                apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
+            )
+        elif self.recompute_shortcut_pre_mlp_layernorm and not InferenceMode.is_active():
+            self.shortcut_pre_mlp_layernorm_checkpoint = CheckpointWithoutOutput()
+            shortcut_input = self.shortcut_pre_mlp_layernorm_checkpoint.checkpoint(
+                apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
+            )
+        else:
+            shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
+        if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            # Replay reconstructs this norm output; exclude it from saved-tensor offloading.
+            self.off_interface.mark_not_offload(shortcut_input)
+        shortcut_input, padding_mask, _, _ = self.moe_layer._maybe_unflatten_for_moe(
+            shortcut_input, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
+        )
+        probs, routing_map = self.moe_layer.mlp.route(
+            shortcut_input, padding_mask, packed_seq_params=packed_seq_params
+        )
+        return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map, padding_mask)
+
+    def _moe_shared_experts(
+        self,
+        hidden_states,
+        padding_mask=None,
+        packed_seq_params=None,
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        """Run the paired MoE layer's pre-MLP norm and shared experts.
+
+        Returns:
+            `(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)`.
+        """
+        if recompute_context is None:
+            pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+                hidden_states
+            )
+        else:
+            pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+                hidden_states, residual_stream_recompute_context=recompute_context
+            )
+        pre_mlp_output, _, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
+            pre_mlp_output, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
+        )
+        shared_expert_output = self.moe_layer.mlp.shared_experts_compute(pre_mlp_output)
+        return shared_expert_output, moe_unflatten_mbs, residual, mlp_state
+
+    def _postprocess(
+        self,
+        residual,
+        combined_output,
+        shared_expert_output,
+        packed_seq_params=None,
+        moe_unflatten_mbs=None,
+        mlp_state=(),
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
+        output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
+        post_norm_input = output
+        post_norm_manager = self.off_interface(
+            self.offload_shortcut_post_norm
+            and recompute_context is None
+            and not InferenceMode.is_active(),
+            post_norm_input,
+            "shortcut_post_norm",
+        )
+        with post_norm_manager as post_norm_input:
+            if recompute_context is not None and not isinstance(
+                self.shortcut_post_norm, IdentityOp
+            ):
+                output = recompute_context.checkpoint(
+                    apply_module(self.shortcut_post_norm), post_norm_input
+                )
+            else:
+                output = apply_module(self.shortcut_post_norm)(post_norm_input)
+        output = post_norm_manager.group_offload(output, forced_released_tensors=[post_norm_input])
+        if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            # Residual replay manages this write input; exclude it from saved-tensor offloading.
+            self.off_interface.mark_not_offload(output)
+        output = self.moe_layer._maybe_reflatten_from_moe(
+            output, packed_seq_params, moe_unflatten_mbs
+        )
+        if recompute_context is None:
+            output = self.moe_layer._apply_mlp_bda_step((output, None), residual, mlp_state)
+        else:
+            output = self.moe_layer._apply_mlp_bda_step(
+                (output, None),
+                residual,
+                mlp_state,
+                residual_stream_recompute_context=recompute_context,
+            )
+        return output[0] if isinstance(output, tuple) else output
+
+    def _launch_dispatch(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, async_op: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Launch dispatch on the current stream or the shortcut side stream."""
+        if not async_op:
+            return self.moe_layer.mlp.dispatch(hidden_states, probs)
+
+        assert self.route_ready_event is not None
+        dispatch_stream = self._get_a2a_overlap_stream()
+        dispatch_stream.wait_event(self.route_ready_event)
+        hidden_states.record_stream(dispatch_stream)
+        probs.record_stream(dispatch_stream)
+
+        with torch.cuda.stream(dispatch_stream):
+            return self.moe_layer.mlp.dispatch(hidden_states, probs)
+
+    def _wait_dispatch(
+        self, dispatched_input: torch.Tensor, dispatched_probs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Wait for dispatch and return its outputs on the main stream."""
+        assert self.overlap_mode
+
+        torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
+        dispatched_input.record_stream(torch.cuda.current_stream())
+        dispatched_probs.record_stream(torch.cuda.current_stream())
+        return dispatched_input, dispatched_probs
+
+    def _launch_combine(self, output: torch.Tensor, async_op: bool = False) -> torch.Tensor:
+        """Launch combine on the current stream or the shortcut side stream."""
+        if not async_op:
+            return self.moe_layer.mlp.combine(output)
+
+        combine_stream = self._get_a2a_overlap_stream()
+        combine_stream.wait_stream(torch.cuda.current_stream())
+        output.record_stream(combine_stream)
+        with torch.cuda.stream(combine_stream):
+            return self.moe_layer.mlp.combine(output)
+
+    def _wait_combine(self, combined_output: torch.Tensor) -> torch.Tensor:
+        """Wait for the asynchronous combine and return its output on the main stream."""
+        torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
+        combined_output.record_stream(torch.cuda.current_stream())
+        return combined_output
+
+    def _forward_compute_atomic(
+        self,
+        hidden_states,
+        *,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+    ):
+        """Run the paired layer's ordinary forward, which updates its KV cache or recurrent state.
+
+        Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
+        """
+        if isinstance(self.compute_layer, MambaLayer):
+            return self.compute_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+        hidden_states, _ = self.compute_layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            sequence_len_offset=sequence_len_offset,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+        return hidden_states
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+        quant_context_factory,
+        cp_layout_state=None,
+        packed_sequence_cp_metadata=None,
+        attn_recompute_context: ResidualStreamRecomputeContext | None = None,
+        moe_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        """Run the eager schedule with each physical layer's quantization context.
+
+        In inference the paired layer runs its ordinary forward instead of the two-stage split,
+        which never updates KV-cache or recurrent state, and communication stays on the current
+        stream.
+        """
+
+        select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
+        if select_token_dispatcher is not None:
+            select_token_dispatcher()
+        inference = InferenceMode.is_active()
+        if inference:
+            if cp_layout_state is not None:
+                raise RuntimeError("Shortcut-MoE inference does not support context parallelism.")
+        else:
+            assert inference_context is None, (
+                "Shortcut-MoE received an inference context outside inference mode; the two-stage "
+                "schedule does not update KV-cache or recurrent inference state."
+            )
+        overlap = self.overlap_mode and not inference
+
+        if (attn_recompute_context is None) != (moe_recompute_context is None):
+            raise ValueError("Shortcut replay requires contexts for both layers in the pair.")
+        if attn_recompute_context is not None:
+            assert moe_recompute_context is not None
+            if attn_recompute_context.manager is not moe_recompute_context.manager:
+                raise ValueError("A shortcut pair must share one residual replay manager.")
+            if attn_recompute_context.is_block_end:
+                raise ValueError("A residual replay block cannot end inside a ShortcutMoE pair.")
+
+        attn_config = self.compute_layer.config
+        moe_config = self.moe_layer.config
+        if cp_layout_state is not None:
+            assert self.attn_local_idx is not None and self.moe_local_idx is not None
+            hidden_states, packed_seq_params = cp_layout_state.prepare_layer(
+                self.attn_local_idx, hidden_states
+            )
+        moe_hidden_states = hidden_states
+        moe_packed_seq_params = packed_seq_params
+        if cp_layout_state is not None:
+            moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
+                self.moe_local_idx, moe_hidden_states
+            )
+
+        # Launch the moe_router
+        with quant_context_factory(moe_config, self.moe_layer_idx):
+            moe_hidden_states = self._read_shortcut_hidden(
+                moe_hidden_states, recompute_context=attn_recompute_context
+            )
+            route_input, route_probs = self._moe_router_preprocess(
+                shortcut_hidden=moe_hidden_states,
+                padding_mask=padding_mask,
+                packed_seq_params=moe_packed_seq_params,
+                recompute_context=attn_recompute_context,
+            )
+            if overlap:
+                self.route_ready_event.record(torch.cuda.current_stream())
+
+        # Launch the input and attn of the attention layer
+        with quant_context_factory(attn_config, self.attn_layer_idx):
+            if inference:
+                attn_layer_output = self._forward_compute_atomic(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+            elif attn_recompute_context is None:
+                paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                )
+            else:
+                paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    residual_stream_recompute_context=attn_recompute_context,
+                )
+
+        # Launch the dispatch, experts, and combine
+        with quant_context_factory(moe_config, self.moe_layer_idx):
+            dispatched_input, dispatched_probs = self._launch_dispatch(
+                route_input, route_probs, async_op=overlap
+            )
+            if overlap:
+                dispatched_input, dispatched_probs = self._wait_dispatch(
+                    dispatched_input, dispatched_probs
+                )
+
+            output, _ = self.moe_layer.mlp.routed_experts_compute(
+                dispatched_input, dispatched_probs
+            )
+            combined_output = self._launch_combine(output, async_op=overlap)
+            if self.shortcut_pre_mlp_layernorm_checkpoint is not None:
+                self.shortcut_pre_mlp_layernorm_checkpoint.discard_output_and_register_recompute(
+                    combined_output
+                )
+                self.shortcut_pre_mlp_layernorm_checkpoint = None
+
+        # launch the output layer of the attention layer
+        if not inference:
+            with quant_context_factory(attn_config, self.attn_layer_idx):
+                if attn_recompute_context is None:
+                    attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
+                else:
+                    attn_layer_output = self.compute_layer.forward_post_core_attn(
+                        *paired_state, residual_stream_recompute_context=attn_recompute_context
+                    )
+                if isinstance(attn_layer_output, tuple):
+                    attn_layer_output = attn_layer_output[0]
+
+        if cp_layout_state is not None:
+            attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(
+                self.moe_local_idx, attn_layer_output
+            )
+
+        # launch the moe shared experts and combine attn and moe layer outputs
+        with quant_context_factory(moe_config, self.moe_layer_idx):
+            shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
+                self._moe_shared_experts(
+                    hidden_states=attn_layer_output,
+                    padding_mask=padding_mask,
+                    packed_seq_params=moe_packed_seq_params,
+                    recompute_context=moe_recompute_context,
+                )
+            )
+            if overlap:
+                combined_output = self._wait_combine(combined_output)
+
+            # Ensure the combine autograd node is scheduled first before shared_experts
+            set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
+            output = self._postprocess(
+                residual=mlp_residual,
+                combined_output=combined_output,
+                shared_expert_output=shared_expert_output,
+                packed_seq_params=moe_packed_seq_params,
+                moe_unflatten_mbs=moe_unflatten_mbs,
+                mlp_state=mlp_state,
+                recompute_context=moe_recompute_context,
+            )
+        if cp_layout_state is not None:
+            output = cp_layout_state.finalize_layer(self.moe_local_idx, output)
+        return output

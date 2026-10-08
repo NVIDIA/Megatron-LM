@@ -134,8 +134,11 @@ class TestHybridStackMHC:
         stack = _get_stack(config, num_local_layers=3)
 
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
-        assert all(layer.inner_layer.config is config for layer in stack.layers)
-        assert all(layer.inner_layer.config.enable_mhc_connections for layer in stack.layers)
+        assert all(
+            layer.config is layer_config and layer.inner_layer.config is layer_config
+            for layer, layer_config in zip(stack.layers, stack.layer_config_list, strict=True)
+        )
+        assert all(layer_config.enable_mhc_connections for layer_config in stack.layer_config_list)
         assert stack.hc_head_fn.shape == (
             config.mhc_num_residual_streams,
             config.hidden_size * config.mhc_num_residual_streams,
@@ -204,6 +207,57 @@ class TestHybridStackMHC:
             )
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert getattr(stack, name).grad is not None
+
+    def test_selective_mhc_strips_input_ids_from_non_hash_layers(self, monkeypatch):
+        config = _get_config(
+            num_layers=2,
+            recompute_granularity="selective",
+            recompute_modules=["core_attn", "mhc"],
+            mhc_recompute_layer_num=1,
+        )
+        stack = _get_stack(config, num_local_layers=2).cuda()
+        hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+        input_ids = torch.arange(8, device="cuda").repeat(2, 1)
+        seen_input_ids = []
+        original = HyperConnectionHybridLayer._call_inner_transformer_layer_without_local_bda
+
+        def record_input_ids(
+            layer,
+            hidden_states,
+            attention_mask,
+            inference_context,
+            rotary_pos_emb,
+            sequence_len_offset,
+            packed_seq_params,
+            padding_mask,
+            input_ids=None,
+            mhc_recompute_manager=None,
+        ):
+            seen_input_ids.append(input_ids)
+            return original(
+                layer,
+                hidden_states,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+                input_ids,
+                mhc_recompute_manager,
+            )
+
+        monkeypatch.setattr(
+            HyperConnectionHybridLayer,
+            "_call_inner_transformer_layer_without_local_bda",
+            record_input_ids,
+        )
+
+        output = stack(hidden_states, attention_mask=None, input_ids=input_ids)
+        output.float().sum().backward()
+
+        assert len(seen_input_ids) == 2
+        assert all(captured is None for captured in seen_input_ids)
 
     def test_fused_bf16_forward_backward(self):
         config = _get_config(

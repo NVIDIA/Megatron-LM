@@ -27,6 +27,7 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
@@ -257,6 +258,34 @@ def _freeze_base_for_mtp(model):
     _freeze_for_qad(model, "mtp")
 
 
+def _propagate_expert_allreduce_to_lsq_params(model):
+    """Copy each weight's MCore ``allreduce`` flag onto its LSQ ``_amax_{pre,post}`` params.
+
+    Without the flag, expert amax params get bucketed into the global data-parallel group
+    instead of the expert-data-parallel group (wrong grad reduction under expert parallelism).
+    """
+    module_by_name = dict(model.named_modules())
+    for name, param in model.named_parameters():
+        if not (name.endswith("_amax_pre") or name.endswith("_amax_post")):
+            continue
+        marker = ".weight_quantizer"
+        if marker not in name:
+            continue
+        linear = module_by_name.get(name.split(marker, 1)[0])
+        if linear is None:
+            continue
+        allreduce = next(
+            (
+                w.allreduce
+                for wname, w in linear.named_parameters(recurse=False)
+                if "weight" in wname and hasattr(w, "allreduce")
+            ),
+            None,
+        )
+        if allreduce is not None:
+            param.allreduce = allreduce
+
+
 def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
@@ -373,7 +402,10 @@ def modelopt_gpt_hybrid_builder(
                 config, use_transformer_engine=use_te,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
+                config,
+                decoder_layer_specs[-1],
+                use_transformer_engine=use_te,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
 
         model_kwargs = {
@@ -390,6 +422,7 @@ def modelopt_gpt_hybrid_builder(
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "rope_scaling_factor": args.rope_scaling_factor,
             "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
@@ -467,6 +500,12 @@ def modelopt_gpt_hybrid_builder(
         qad_train_target = 'mtp'
     if qad_train_target is not None:
         _freeze_for_qad(model, qad_train_target)
+
+    # LSQ _amax_* params lack MCore's ``allreduce`` attribute; propagate it from each weight
+    # before get_model() builds DDP and the distributed optimizer. No-op without LSQ params.
+    _propagate_expert_allreduce_to_lsq_params(model)
+    if getattr(args, "lsq_scale_lr", None) is not None:
+        install_lsq_optimizer_overrides()
 
     _add_load_convert_hooks(model)
 

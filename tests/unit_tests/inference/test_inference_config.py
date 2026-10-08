@@ -9,8 +9,13 @@ import torch
 
 from megatron.core.inference.config import (
     AsyncScheduleMode,
+    ImageProcessingConfig,
     InferenceConfig,
     MambaInferenceStateConfig,
+    MediaCacheCoordinatorPolicy,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
+    VideoProcessingConfig,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
@@ -24,22 +29,35 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize("backend", list(InferenceGroupedGemmBackend))
+    def test_grouped_gemm_backend_parses_config_value(self, backend):
+        assert InferenceGroupedGemmBackend.from_config(backend.value) is backend
+        assert InferenceGroupedGemmBackend.from_config(backend) is backend
+
+    def test_grouped_gemm_backend_reports_supported_config_values(self):
+        with pytest.raises(
+            ValueError,
+            match="inference_grouped_gemm_backend must be one of.*'flashinfer'.*'torch'.*'vllm'",
+        ):
+            InferenceGroupedGemmBackend.from_config("unknown")
+
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
             ("torch", "triton"),
             (InferenceGroupedGemmBackend.TORCH, "triton"),
-            ("flashinfer", "flashinfer"),
-            (InferenceGroupedGemmBackend.FLASHINFER, "flashinfer"),
+            ("flashinfer", "triton"),
+            (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
+            ("vllm", "triton"),
+            (InferenceGroupedGemmBackend.VLLM, "triton"),
         ],
     )
     def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
         assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
 
-    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
-    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
-            resolve_mxfp8_backend(grouped_gemm_backend)
+            resolve_mxfp8_backend("unknown")
 
     @staticmethod
     def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
@@ -78,7 +96,7 @@ class TestInferenceConfig:
     @pytest.mark.parametrize(
         "async_sched_mode, expected",
         [
-            (None, AsyncScheduleMode.LEGACY),
+            (None, AsyncScheduleMode.ASYNC),
             ("legacy", AsyncScheduleMode.LEGACY),
             (AsyncScheduleMode.LEGACY, AsyncScheduleMode.LEGACY),
             ("async", AsyncScheduleMode.ASYNC),
@@ -86,7 +104,7 @@ class TestInferenceConfig:
         ],
     )
     def test_async_sched_mode_default_and_coercion(self, async_sched_mode, expected):
-        """Ensure async scheduling mode defaults to legacy and accepts strings."""
+        """Ensure async scheduling mode defaults to async and accepts strings."""
         kwargs = {} if async_sched_mode is None else {"async_sched_mode": async_sched_mode}
         assert InferenceConfig(**kwargs).async_sched_mode == expected
 
@@ -96,11 +114,149 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
-    def test_async_sched_argparse_plumbing(self):
-        """Ensure the CLI exposes async scheduling mode."""
+    def test_routing_alpha_accepts_values_above_one(self):
+        """Alpha is a load coefficient, not a blend weight, so 1 is not a ceiling.
+
+        The routing tests reach the scorer through a hand-built coordinator, so
+        they never exercise this validation; a value they rely on would have been
+        rejected on the real config path.
+        """
+        assert InferenceConfig(prefix_caching_routing_alpha=5.0).prefix_caching_routing_alpha == 5.0
+
+    def test_routing_alpha_must_be_non_negative(self):
+        """A negative alpha would reward load instead of penalising it."""
+        with pytest.raises(ValueError, match="prefix_caching_routing_alpha"):
+            InferenceConfig(prefix_caching_routing_alpha=-0.1)
+
+    def test_media_cache_routing_weight_must_be_non_negative(self):
+        with pytest.raises(ValueError, match="media_cache_routing_weight"):
+            InferenceConfig(media_cache_routing_weight=-1.0)
+
+    def test_media_cache_coordinator_policy_defaults_to_affinity(self):
+        assert (
+            InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
+        )
+
+    def test_multimodal_prompt_config_builds_independent_specs_from_dict(self):
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "image_spec": {"model_token": "<image>", "prefix": "<img>"},
+                "video_spec": {
+                    "model_token": "<video>",
+                    "suffix": "</video>",
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                },
+                "content_part_order": "media_first",
+            }
+        )
+
+        assert config.content_part_order == "media_first"
+        assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
+        assert config.get_spec("video") == MediaPromptSpec(
+            model_token="<video>",
+            suffix="</video>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+        with pytest.raises(ValueError, match="Unsupported media modality"):
+            config.get_spec("audio")
+
+    def test_multimodal_prompt_config_partial_override_preserves_wrapper_defaults(self):
+        defaults = MultimodalPromptConfig(
+            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
+            content_part_order="media_first",
+        )
+
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "video_spec": {
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                }
+            },
+            defaults=defaults,
+        )
+
+        assert config.video_spec == MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+        assert config.content_part_order == "media_first"
+
+    def test_multimodal_prompt_config_rejects_invalid_content_part_order(self):
+        with pytest.raises(ValueError, match="content_part_order"):
+            MultimodalPromptConfig(content_part_order="interleave")
+
+    def test_media_prompt_timestamps_require_temporal_expansion(self):
+        with pytest.raises(ValueError, match="requires"):
+            MediaPromptSpec(include_frame_timestamps_for_nemotron_vl=True)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "error"),
+        [
+            ({"dynamic_resolution_rounding_mode": "floor"}, "rounding_mode"),
+            ({"dynamic_resolution_resize_mode": "nearest"}, "resize_mode"),
+            ({"dynamic_resolution_model_length": 4}, "greater than 4"),
+        ],
+    )
+    def test_image_processing_config_rejects_invalid_dynamic_resolution_options(
+        self, kwargs, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            ImageProcessingConfig(patch_dim=14, **kwargs)
+
+    def test_video_processing_config_preserves_image_contract_and_defaults(self):
+        image_config = ImageProcessingConfig(
+            patch_dim=14, dynamic_resolution=True, pixel_shuffle=True
+        )
+
+        video_config = VideoProcessingConfig(image_config=image_config)
+
+        assert video_config.image_config is image_config
+        assert video_config.num_frames == 8
+        assert video_config.temporal_patch_size == 1
+        assert video_config.video_maintain_aspect_ratio is True
+        assert video_config.frame_manifest_magic is None
+
+    @pytest.mark.parametrize(
+        "cli_args, expected",
+        [
+            ([], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "async"], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "legacy"], "legacy"),
+        ],
+    )
+    def test_async_sched_argparse_plumbing(self, cli_args, expected):
+        """Ensure the CLI defaults to async and supports an explicit legacy opt-out."""
         parser = _add_inference_args(ArgumentParser())
-        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "async"])
+        args = parser.parse_args(cli_args)
+        assert args.inference_dynamic_batching_async_sched_mode == expected
+
+    def test_multimodal_argparse_plumbing(self):
+        """Ensure the CLI exposes multimodal inference settings."""
+        parser = _add_inference_args(ArgumentParser())
+        args = parser.parse_args(
+            [
+                "--inference-dynamic-batching-async-sched-mode",
+                "async",
+                "--inference-dynamic-batching-media-cache-coordinator-policy",
+                "load_balanced",
+                "--inference-dynamic-batching-media-cache-routing-weight",
+                "2.5",
+                "--inference-dynamic-batching-vision-embedding-cache-max-bytes",
+                "1048576",
+                "--inference-dynamic-batching-allow-stale-multimodal-embeddings",
+            ]
+        )
         assert args.inference_dynamic_batching_async_sched_mode == "async"
+        assert args.inference_dynamic_batching_media_cache_coordinator_policy == "load_balanced"
+        assert args.inference_dynamic_batching_media_cache_routing_weight == 2.5
+        assert args.inference_dynamic_batching_vision_embedding_cache_max_bytes == 1048576
+        assert args.inference_dynamic_batching_allow_stale_multimodal_embeddings is True
 
     @pytest.mark.parametrize("invalid_mode", ["serial", "overlap"])
     def test_async_sched_argparse_rejects_removed_modes(self, invalid_mode):
@@ -109,7 +265,15 @@ class TestInferenceConfig:
         with pytest.raises(SystemExit):
             parser.parse_args(["--inference-dynamic-batching-async-sched-mode", invalid_mode])
 
-    def test_inference_setup_config_maps_async_sched_mode(self):
+    @pytest.mark.parametrize(
+        "setup_mode, expected",
+        [
+            (None, AsyncScheduleMode.ASYNC),
+            ("async", AsyncScheduleMode.ASYNC),
+            ("legacy", AsyncScheduleMode.LEGACY),
+        ],
+    )
+    def test_inference_setup_config_maps_async_sched_mode(self, setup_mode, expected):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
         model = SimpleNamespace(
             position_embedding_type="rope",
@@ -117,7 +281,38 @@ class TestInferenceConfig:
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
+        kwargs = (
+            {}
+            if setup_mode is None
+            else {"inference_dynamic_batching_async_sched_mode": setup_mode}
+        )
+        setup_config = InferenceSetupConfig(**kwargs)
+
+        inference_config = setup_config.to_inference_config(
+            model=model,
+            kv_cache_management_mode="persist",
+            static_kv_memory_pointers=False,
+            enable_cuda_graphs=False,
+            verbose=False,
+        )
+
+        assert inference_config.async_sched_mode == expected
+
+    def test_inference_setup_config_maps_multimodal_fields(self):
+        """Ensure declarative inference config maps multimodal fields to runtime config."""
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="async",
+            inference_dynamic_batching_media_cache_coordinator_policy="load_balanced",
+            inference_dynamic_batching_media_cache_routing_weight=2.5,
+            inference_dynamic_batching_vision_embedding_cache_max_bytes=1048576,
+            inference_dynamic_batching_allow_stale_multimodal_embeddings=True,
+        )
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -128,6 +323,13 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert (
+            inference_config.media_cache_coordinator_policy
+            == MediaCacheCoordinatorPolicy.LOAD_BALANCED
+        )
+        assert inference_config.media_cache_routing_weight == 2.5
+        assert inference_config.vision_embedding_cache_max_bytes == 1048576
+        assert inference_config.allow_stale_multimodal_embeddings is True
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""
@@ -163,9 +365,11 @@ def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
+    layers = [SimpleNamespace(mixer=mixer) for mixer in mixers]
     decoder = SimpleNamespace(
         layer_type_list=[Symbols.MAMBA] * len(mixers),
-        layers=[SimpleNamespace(mixer=mixer) for mixer in mixers],
+        layers=layers,
+        physical_layers=lambda: tuple(layers),
         mamba_state_shapes_per_request=lambda: ((16, 4), (2, 8, 16)),
     )
     return SimpleNamespace(
