@@ -239,8 +239,11 @@ run_testmon_phase() {
         --mode "$mode"
         --cache-dir "$UNIT_TESTMON_CACHE_DIR"
         --phase "$phase"
-        -- "$@"
     )
+    if [[ "$phase" == "both" ]]; then
+        command+=(--marker "$MARKER_ARG")
+    fi
+    command+=(-- "$@")
     "${command[@]}"
 }
 
@@ -339,12 +342,10 @@ run_enforced_tests() {
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
 
-    if ! run_testmon_phase select prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+    if ! run_testmon_phase select both \
+        -vs "${IGNORE_ARGS[@]}" "$target" \
         || ! merge_rank_selections prod \
         || ! apply_mandatory_tests prod \
-        || ! run_testmon_phase select experimental \
-            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
         || ! merge_rank_selections experimental \
         || ! apply_mandatory_tests experimental; then
         write_testmon_summary "full fallback: Testmon selection failed"
