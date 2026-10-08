@@ -18,7 +18,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     parse_segment_layers,
     pattern_from_ratios,
     select_pipeline_segment,
-    select_pipeline_segment_with_logical_offset,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -142,14 +141,18 @@ class TestValidateSegmentLayers:
         flat_configs = [result[0], *result[1], result[2]]
         assert len({id(config) for config in flat_configs}) == len(flat_configs)
 
-    @pytest.mark.parametrize("group", ["MM", "--", "**", "GG", "G*", "D+", "-E", "CH", "CW", "+C"])
-    def test_groups_reject_checkpoint_namespace_collisions(self, group):
-        with pytest.raises(ValueError, match="multiple layers in checkpoint namespace"):
-            validate_segment_layers(f"[{group}]", self.config)
-
-    @pytest.mark.parametrize("group", ["M*E", "M*-", "MGE", "M+E", "MD-", "*", "MCE", "MHE", "MWE"])
-    def test_groups_with_distinct_checkpoint_namespaces(self, group):
+    @pytest.mark.parametrize(
+        "group",
+        ["M*E", "M*-", "MGE", "M+E", "MD-", "*", "MCE", "MHE", "MWE", "MM", "**", "M*M*-", "-E"],
+    )
+    def test_group_patterns_parse(self, group):
+        """Groups keep each layer's own checkpoint key, so layer types may repeat."""
         assert parse_segment_layers(f"[{group}]") == [tuple(group)]
+
+    @pytest.mark.parametrize("group", ["MM", "**", "M*M*-"])
+    def test_groups_with_repeated_layer_types_build_configs(self, group):
+        result = validate_segment_layers(f"[{group}]", self.config)
+        assert len(result) == 1 and len(result[0]) == len(group)
 
     def test_valid_patterns(self):
         """Test that valid segment patterns produce configs in the correct order."""
@@ -799,17 +802,6 @@ class TestSelectPipelineSegment:
         )
         _assert_layer_config_types(layer_configs, "M-")
         assert offset == 3
-
-    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
-    def test_group_segment_logical_offsets(self, mock_log):
-        layer_configs, physical_offset, logical_offset = (
-            select_pipeline_segment_with_logical_offset(
-                "[*-][*-]|[*E][*E]", self.config, pp_group=None, vp_stage=1
-            )
-        )
-        assert get_layer_type_list_from_layer_config_list(layer_configs) == [('*', 'E'), ('*', 'E')]
-        assert physical_offset == 4
-        assert logical_offset == 2
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_empty_segment(self, mock_log):

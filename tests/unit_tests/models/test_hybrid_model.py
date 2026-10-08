@@ -814,28 +814,33 @@ class TestHybridModel:
 
         self.model.load_state_dict(torch.load(path))
 
-    def test_grouped_sharded_state_dict_uses_transformer_checkpoint_keys(self):
-        """Grouped HybridModel checkpoints should be load-compatible with GPTModel keys."""
-        model_config = TransformerConfig(
-            num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
-        )
-        model = HybridModel(
-            config=model_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=100,
-            max_sequence_length=4,
-            hybrid_layer_pattern="[*-]",
-        )
+    def test_grouped_sharded_state_dict_keeps_ungrouped_checkpoint_keys(self):
+        """A bracketed pattern saves the same checkpoint keys as its ungrouped pattern."""
 
-        sharded_state_dict = model.sharded_state_dict()
-        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+        def sharded_state_dict(hybrid_layer_pattern):
+            model_config = TransformerConfig(
+                num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+            )
+            model = HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern=hybrid_layer_pattern,
+            )
+            return model.sharded_state_dict()
 
-        assert "decoder.layers.0.self_attention.linear_qkv.weight" in sharded_keys
-        assert "decoder.layers.0.mlp.linear_fc1.weight" in sharded_keys
-        assert "decoder.layers.1.mlp.linear_fc1.weight" not in sharded_keys
-        assert "decoder.final_layernorm.weight" in sharded_keys
-        assert "decoder.final_norm.weight" not in sharded_keys
-        assert "output_layer._extra_state" not in sharded_state_dict
+        grouped_state_dict = sharded_state_dict("[*-]")
+        grouped_keys = {value.key for value in grouped_state_dict.values() if hasattr(value, "key")}
+        ungrouped_keys = {
+            value.key for value in sharded_state_dict("*-").values() if hasattr(value, "key")
+        }
+
+        assert grouped_keys == ungrouped_keys
+        assert "decoder.layers.0.self_attention.linear_qkv.weight" in grouped_keys
+        assert "decoder.layers.1.mlp.linear_fc1.weight" in grouped_keys
+        assert "decoder.final_norm.weight" in grouped_keys
+        assert "output_layer._extra_state" not in grouped_state_dict
 
     def test_ungrouped_sharded_state_dict_keeps_hybrid_final_norm_key(self):
         """Non-grouped patterns keep ``final_norm`` so older hybrid checkpoints load."""

@@ -126,9 +126,6 @@ class HybridStack(MegatronModule):
             be provided.
         pp_layer_offset (int, optional): the global physical layer offset for this pipeline
             segment. Defaults to 0.
-        logical_layer_offset (int, optional): the global logical layer offset for this
-            pipeline segment; bracketed groups count as one logical layer. Used for
-            checkpoint keys. Defaults to ``pp_layer_offset``.
         is_layer_group_stack (bool, optional): whether this stack is the nested stack built
             for a bracketed group. Defaults to False.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -168,18 +165,10 @@ class HybridStack(MegatronModule):
         layer_config_list: Sequence[LayerConfigItem] | None = None,
         boundary_layout: CPLayout | None = None,
         layer_number_offset: int | None = None,
-        logical_layer_offset: int | None = None,
         is_layer_group_stack: bool = False,
-        transformer_sharded_keys: bool = False,
     ) -> None:
         """
         Args:
-            transformer_sharded_keys (bool): emit ``TransformerBlock``-style sharded
-                checkpoint keys (``final_layernorm`` instead of ``final_norm``) so the
-                checkpoint is interchangeable with a ``GPTModel`` one. Only set for
-                bracketed-group patterns, whose logical layers map one-to-one onto
-                transformer layers; when off, the final norm is published as
-                ``final_norm``, the HybridModel checkpoint key.
             name (str | None): module instance name passed top-down from its paranet module
         """
         if (layer_type_list is None) == (layer_config_list is None):
@@ -222,12 +211,7 @@ class HybridStack(MegatronModule):
             self.config.linear_cp_layout if boundary_layout is None else boundary_layout
         )
         self.mtp_layer_number = mtp_layer_number
-        logical_layer_offset = (
-            pp_layer_offset if logical_layer_offset is None else logical_layer_offset
-        )
-        self.logical_layer_offset = logical_layer_offset
         self.is_layer_group_stack = is_layer_group_stack
-        self.transformer_sharded_keys = transformer_sharded_keys
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -308,9 +292,7 @@ class HybridStack(MegatronModule):
                         layer_config_list=list(layer_config),
                         pp_layer_offset=pp_layer_offset,
                         layer_number_offset=physical_layer_offset,
-                        logical_layer_offset=logical_layer_offset + len(self.layers),
                         is_layer_group_stack=True,
-                        transformer_sharded_keys=transformer_sharded_keys,
                         post_layer_norm=False,
                         post_process=False,
                         device=device,
@@ -1051,12 +1033,12 @@ class HybridStack(MegatronModule):
         metadata: Optional[dict] = None,
         sharded_layer_prefix: Optional[str] = None,
     ) -> ShardedStateDict:
-        """Build the sharded state dict using logical (bracketed-group aware) layer keys.
+        """Build the sharded state dict, storing every layer under its global layer number.
 
-        ``sharded_layer_prefix`` is the ``<prefix>layers.`` prefix of the outermost stack;
-        a nested group stack publishes all of its physical layers under the outer stack's
-        logical layer index so a ``[*-]`` group produces the same keys as one transformer
-        layer (``layers.N.self_attention.*`` and ``layers.N.mlp.*``).
+        Layers keep the index they would have without brackets, so a bracketed group does
+        not change checkpoint keys: a grouped model and the equivalent ungrouped model load
+        each other's checkpoints. ``sharded_layer_prefix`` is the ``<prefix>layers.`` prefix
+        of the outermost stack, under which a nested group stack publishes its layers.
         """
         sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
@@ -1064,24 +1046,10 @@ class HybridStack(MegatronModule):
         if sharded_layer_prefix is None:
             sharded_layer_prefix = layer_prefix
 
-        for local_layer_idx, (source_layer_idx, layer_config, layer) in enumerate(
-            zip(
-                self._execution_layer_indices,
-                self._execution_layer_config_list,
-                self.layers,
-                strict=True,
-            )
+        for local_layer_idx, (layer_config, layer) in enumerate(
+            zip(self._execution_layer_config_list, self.layers, strict=True)
         ):
             state_dict_prefix = f'{layer_prefix}{local_layer_idx}.'  # module list index
-            # Shortcut blocks collapse adjacent physical layers, while bracketed groups
-            # already occupy one logical slot. Use the index from before shortcut
-            # grouping so a shortcut block and the layers after it are keyed by their
-            # logical layer index.
-            logical_layer_idx = (
-                self.logical_layer_offset
-                if self.is_layer_group_stack
-                else self.logical_layer_offset + source_layer_idx
-            )
 
             if is_layer_group(layer_config):
                 sharded_state_dict.update(
@@ -1094,7 +1062,8 @@ class HybridStack(MegatronModule):
                 )
                 continue
 
-            sharded_prefix = f'{sharded_layer_prefix}{logical_layer_idx}.'
+            global_layer_offset = layer.layer_number - 1  # layer numbers start at 1
+            sharded_prefix = f'{sharded_layer_prefix}{global_layer_offset}.'
             sharded_pp_offset = []
 
             layer_sharded_state_dict = layer.sharded_state_dict(
@@ -1108,19 +1077,15 @@ class HybridStack(MegatronModule):
         # Add modules other than self.layers
         for name, module in self.named_children():
             if not module is self.layers:
-                module_prefix = f'{prefix}{name}.'
-                module_sharded_state_dict = sharded_state_dict_default(
-                    module, module_prefix, sharded_offsets, metadata, tp_group=self.tp_group
-                )
-                # Ungrouped stacks publish the final norm as ``final_norm``; grouped
-                # stacks publish it as ``final_layernorm``, matching TransformerBlock, so
-                # their checkpoints cross-load with GPTModel. The registered submodule
-                # (and so the local state-dict key) is ``final_norm`` in both cases.
-                if name == 'final_norm' and self.transformer_sharded_keys:
-                    replace_prefix_for_sharding(
-                        module_sharded_state_dict, module_prefix, f'{prefix}final_layernorm.'
+                sharded_state_dict.update(
+                    sharded_state_dict_default(
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        tp_group=self.tp_group,
                     )
-                sharded_state_dict.update(module_sharded_state_dict)
+                )
 
         local_state_dict: dict = {}
         self._save_to_state_dict(local_state_dict, '', keep_vars=True)

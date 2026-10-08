@@ -82,9 +82,6 @@ def test_shortcut_checkpoint_keys_preserve_physical_layer_offsets(pp_layer_offse
     block.layer_config_list = [object() for _ in range(5)]
     block._execution_layer_indices = [0, 2, 4]
     block._execution_layer_config_list = [block.layer_config_list[index] for index in (0, 2, 4)]
-    block.logical_layer_offset = pp_layer_offset
-    block.is_layer_group_stack = False
-    block.transformer_sharded_keys = False
 
     sharded_state_dict = block.sharded_state_dict(prefix='decoder.')
     assert set(sharded_state_dict) == {f'decoder.layers.{index}.weight' for index in range(3)}
@@ -281,20 +278,6 @@ def test_group_inference_offsets_match_flat_layers(monkeypatch, layer_pattern, p
 
     assert offsets[1] == offsets[0]
     assert len(set(offsets[1])) == len(offsets[1])
-
-
-@pytest.mark.parametrize("group", ["MM", "--", "**", "G*", "D+", "-E"])
-def test_explicit_group_configs_reject_checkpoint_namespace_collisions(group):
-    """Direct config tuples enforce the same checkpoint constraints as parsed patterns."""
-    config = MLATransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
-    group_configs = tuple(layer_utils.create_layer_config(config, symbol) for symbol in group)
-    with pytest.raises(ValueError, match="multiple layers in checkpoint namespace"):
-        HybridStack(
-            config,
-            hybrid_stack_spec.submodules,
-            layer_config_list=[group_configs],
-            pg_collection=_make_pg_collection(),
-        )
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):
@@ -1555,36 +1538,39 @@ class TestHybridBlock:
         assert [layer.layer_number for layer in block.layers[1].layers] == [2, 3]
 
     @pytest.mark.parametrize("stack_spec", [hybrid_stack_spec, hybrid_inference_stack_spec])
-    def test_group_sharded_state_dict_uses_logical_layer_keys(self, stack_spec):
-        """Grouped attention+MLP layers share one Transformer-compatible checkpoint key."""
-        layer_pattern = "[*-]"
-        transformer_config = TransformerConfig(
-            hidden_size=256,
-            num_layers=_num_physical_layers(layer_pattern),
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-        )
-        layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
-        block = HybridStack(
-            transformer_config,
-            stack_spec.submodules,
-            layer_config_list=layer_config_list,
-            pp_layer_offset=0,
-            logical_layer_offset=0,
-            # HybridModel sets this from the full layer pattern; a directly
-            # constructed stack has to opt in itself.
-            transformer_sharded_keys=True,
-            pg_collection=self.get_pg_collection(),
-        )
+    @pytest.mark.parametrize("grouped_pattern", ["[*-]", "M[*-]", "[M*-]", "[**-]"])
+    @pytest.mark.parametrize("pp_layer_offset", [0, 3])
+    def test_group_sharded_state_dict_keeps_ungrouped_keys(
+        self, stack_spec, grouped_pattern, pp_layer_offset
+    ):
+        """Brackets change execution, not checkpoint keys: grouped and ungrouped stacks match."""
 
-        sharded_state_dict = block.sharded_state_dict(prefix="decoder.")
-        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+        def sharded_keys(layer_pattern):
+            transformer_config = TransformerConfig(
+                hidden_size=256,
+                num_layers=pp_layer_offset + _num_physical_layers(layer_pattern),
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+            )
+            block = HybridStack(
+                transformer_config,
+                stack_spec.submodules,
+                layer_config_list=validate_segment_layers(layer_pattern, transformer_config),
+                pp_layer_offset=pp_layer_offset,
+                pg_collection=self.get_pg_collection(),
+            )
+            sharded_state_dict = block.sharded_state_dict(prefix="decoder.")
+            return {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
 
-        assert "decoder.layers.0.self_attention.linear_qkv.weight" in sharded_keys
-        assert "decoder.layers.0.mlp.linear_fc1.weight" in sharded_keys
-        assert "decoder.layers.1.mlp.linear_fc1.weight" not in sharded_keys
-        assert "decoder.final_layernorm.weight" in sharded_keys
-        assert "decoder.final_norm.weight" not in sharded_keys
+        ungrouped_pattern = grouped_pattern.replace("[", "").replace("]", "")
+        grouped_keys = sharded_keys(grouped_pattern)
+
+        assert grouped_keys == sharded_keys(ungrouped_pattern)
+        attention_idx = pp_layer_offset + ungrouped_pattern.index("*")
+        mlp_idx = pp_layer_offset + ungrouped_pattern.index("-")
+        assert f"decoder.layers.{attention_idx}.self_attention.linear_qkv.weight" in grouped_keys
+        assert f"decoder.layers.{mlp_idx}.mlp.linear_fc1.weight" in grouped_keys
+        assert "decoder.final_norm.weight" in grouped_keys
 
     @pytest.mark.parametrize("pp_layer_offset", [0, 5])
     def test_sharded_state_dict_keeps_historical_keys(self, pp_layer_offset):

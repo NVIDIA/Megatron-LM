@@ -44,19 +44,9 @@ def get_layer_type_physical_count(layer_type) -> int:
     return len(layer_type) if is_layer_group(layer_type) else 1
 
 
-def get_layer_type_logical_count(layer_type) -> int:
-    """Return the number of logical layers represented by a parsed layer item."""
-    return 1
-
-
 def get_layer_type_list_physical_count(layer_type_list: Sequence) -> int:
     """Return the number of physical layers represented by a parsed layer list."""
     return sum(get_layer_type_physical_count(layer_type) for layer_type in layer_type_list)
-
-
-def get_layer_type_list_logical_count(layer_type_list: Sequence) -> int:
-    """Return the number of logical layers represented by a parsed layer list."""
-    return sum(get_layer_type_logical_count(layer_type) for layer_type in layer_type_list)
 
 
 def layer_type_item_to_str(layer_type: LayerPatternItem) -> str:
@@ -74,14 +64,12 @@ def layer_type_list_to_str(layer_type_list: Sequence[LayerPatternItem]) -> str:
 def validate_layer_group(layer_types: Sequence[str]) -> None:
     """Validate the layer symbols of one bracketed group.
 
-    A group must not be empty, an MoE layer must be its last member, and its members
-    must use distinct sharded checkpoint namespaces.
+    A group must not be empty, and an MoE layer must be its last member.
     """
     if not layer_types:
         raise ValueError("Layer groups cannot be empty.")
     if Symbols.MOE in layer_types[:-1]:
         raise ValueError(f"MoE layer '{Symbols.MOE}' must be the last symbol inside a layer group.")
-    layer_utils.validate_layer_group_checkpoint_namespaces(layer_types)
 
 
 @dataclass
@@ -373,10 +361,9 @@ def parse_segment_layers(segment: str) -> List[LayerPatternItem]:
     """Parse a pipe-free pattern segment into layer symbols and bracketed groups.
 
     Bracketed groups such as ``[M*E]`` become tuples of symbols (``('M', '*', 'E')``); every
-    other valid symbol is returned as-is. Groups cannot be empty or nested, and
-    their layers must have distinct checkpoint namespaces. An MoE layer inside a
-    group must be its last symbol so that EP-overlap scheduling can split the
-    group into pre-dispatch compute and the terminal MoE layer.
+    other valid symbol is returned as-is. Groups cannot be empty or nested. An MoE
+    layer inside a group must be its last symbol so that EP-overlap scheduling can
+    split the group into pre-dispatch compute and the terminal MoE layer.
 
     Args:
         segment: A single pipeline segment pattern string (e.g., "M[M*]-").
@@ -488,76 +475,6 @@ def _slice_layer_type_list_by_physical_range(
         selected.append(layer_type)
         cursor = item_end
     return selected
-
-
-def _get_logical_offset_from_physical_offset(
-    layer_type_list: List[LayerPatternItem], offset: int
-) -> int:
-    """Return the logical item count before a physical-layer offset."""
-    logical_offset = 0
-    cursor = 0
-    for layer_type in layer_type_list:
-        item_count = get_layer_type_physical_count(layer_type)
-        item_end = cursor + item_count
-        if item_end <= offset:
-            logical_offset += get_layer_type_logical_count(layer_type)
-            cursor = item_end
-            continue
-        if cursor == offset:
-            return logical_offset
-        raise ValueError(
-            "Pipeline splitting would split a bracketed hybrid layer group. "
-            "Add pipe ('|') separators around bracketed groups to define valid boundaries."
-        )
-    if cursor == offset:
-        return logical_offset
-    raise ValueError(f"Physical layer offset {offset} is out of range for hybrid layer pattern.")
-
-
-def select_pipeline_segment_with_logical_offset(
-    main_pattern: str,
-    config: TransformerConfig,
-    pp_group: Optional[torch.distributed.ProcessGroup],
-    vp_stage: Optional[int],
-    first_stage_layers: Optional[int] = None,
-    last_stage_layers: Optional[int] = None,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[LayerConfigItem], int, int]:
-    """Select a pipeline segment and return physical and logical offsets.
-
-    The physical offset counts every layer symbol before this segment; the logical
-    offset counts pattern items, so a bracketed group before this segment adds one.
-    See :func:`select_pipeline_segment` for the argument semantics.
-    """
-    layer_config_list, layer_offset = select_pipeline_segment(
-        main_pattern,
-        config,
-        pp_group,
-        vp_stage,
-        first_stage_layers=first_stage_layers,
-        last_stage_layers=last_stage_layers,
-        tp_group=tp_group,
-        dp_cp_group=dp_cp_group,
-    )
-
-    segments = main_pattern.split(Symbols.PIPE) if main_pattern else ['']
-    if len(segments) == 1:
-        full_layer_type_list = parse_segment_layers(segments[0])
-        logical_layer_offset = _get_logical_offset_from_physical_offset(
-            full_layer_type_list, layer_offset
-        )
-    else:
-        pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
-        pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
-        vp_rel = vp_stage if vp_stage is not None else 0
-        segment_index = vp_rel * pp_size + pp_rank
-        logical_layer_offset = sum(
-            get_layer_type_list_logical_count(parse_segment_layers(segments[i]))
-            for i in range(segment_index)
-        )
-
-    return layer_config_list, layer_offset, logical_layer_offset
 
 
 def select_pipeline_segment(

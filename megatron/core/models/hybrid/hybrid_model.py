@@ -260,10 +260,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Parse unified pattern to extract main and MTP components.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            Symbols,
             get_layer_type_list_from_layer_config_list,
             parse_hybrid_pattern,
-            select_pipeline_segment_with_logical_offset,
+            select_pipeline_segment,
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
@@ -335,27 +334,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
 
-        # Bracketed-group patterns give every logical layer the structure of a
-        # transformer layer, so their checkpoints are made key-compatible with
-        # GPTModel. Derived from the full pattern rather than this rank's segment so
-        # every PP stage agrees on the naming. Ungrouped patterns use the HybridModel
-        # checkpoint keys.
-        transformer_sharded_keys = Symbols.GROUP_START in (parsed.main_pattern or '')
-
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
-        # Bracketed groups (e.g. ``[M*E]``) count as one logical layer for checkpoint
-        # keys but several physical layers for layer numbering, so track both offsets.
-        layer_config_list, layer_offset, logical_layer_offset = (
-            select_pipeline_segment_with_logical_offset(
-                parsed.main_pattern or '',
-                self.config,
-                self.pg_collection.pp,
-                vp_stage,
-                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-                **logging_pg_kwargs,
-            )
+        layer_config_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '',
+            self.config,
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
         _validate_hash_moe_pipeline_placement(
             get_layer_type_list_from_layer_config_list(layer_config_list),
@@ -416,8 +404,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
-            logical_layer_offset=logical_layer_offset,
-            transformer_sharded_keys=transformer_sharded_keys,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
