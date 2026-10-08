@@ -8,11 +8,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import (
+    GlobalLayout,
+    intersect_ranges,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
@@ -33,12 +36,124 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
+@pytest.mark.parametrize(
+    ("placement", "expected_ranges"),
+    [
+        (Replicate(), [(0, 32), (0, 32)]),
+        (Partial(), [(0, 32), (0, 32)]),
+        (RowAtomic(), [(0, 16), (16, 16)]),
+        (BlockAtomic(2), [(0, 16), (16, 16)]),
+    ],
+)
+def test_layout_get_rank_range_uses_global_rank(distributed_setup, placement, expected_ranges):
+    """Remote range queries use global ranks even when mesh-local indices differ."""
+    if distributed_setup.world_size < 4:
+        pytest.skip("Submesh range test requires at least 4 ranks.")
+
+    mesh = DeviceMesh(distributed_setup.device.type, [1, 3])
+    layout = GlobalLayout.build_for_row_atomic(
+        [torch.Size((8, 4))], dp_size=mesh.size(), block_size=2
+    )
+
+    for rank, expected in zip((1, 3), expected_ranges, strict=True):
+        assert layout.get_rank_range(mesh, [placement], rank) == expected
+    if mesh.get_coordinate() is not None:
+        assert layout.get_local_range(mesh, [placement]) == expected_ranges[mesh.get_local_rank()]
+
+    for rank in (-1, 0, 2, distributed_setup.world_size):
+        with pytest.raises(ValueError, match="Global rank .* is not in the device mesh"):
+            layout.get_rank_range(mesh, [placement], rank)
+
+
+@pytest.mark.parametrize(
+    ("placements", "expected_ranges"),
+    [
+        ([Replicate(), Replicate()], [(0, 32), (0, 32), (0, 32), (0, 32)]),
+        ([Replicate(), RowAtomic()], [(0, 16), (16, 16), (0, 16), (16, 16)]),
+        ([Partial(), RowAtomic()], [(0, 16), (16, 16), (0, 16), (16, 16)]),
+        ([RowAtomic(), RowAtomic()], [(0, 8), (16, 8), (8, 8), (24, 8)]),
+    ],
+)
+def test_layout_get_rank_range_on_2d_mesh(distributed_setup, placements, expected_ranges):
+    """Global ranks map to mesh coordinates and preserve per-axis sharding order."""
+    if distributed_setup.world_size < 4:
+        pytest.skip("2D range test requires at least 4 ranks.")
+
+    mesh = DeviceMesh(distributed_setup.device.type, [[0, 2], [1, 3]])
+    layout = GlobalLayout.build_for_row_atomic([torch.Size((8, 4))], dp_size=mesh.size())
+
+    for rank, expected in zip((0, 2, 1, 3), expected_ranges, strict=True):
+        assert layout.get_rank_range(mesh, iter(placements), rank) == expected
+    if (coordinate := mesh.get_coordinate()) is not None:
+        rank = coordinate[0] * mesh.size(1) + coordinate[1]
+        assert layout.get_local_range(mesh, iter(placements)) == expected_ranges[rank]
+
+
+@pytest.mark.parametrize(
+    'shapes, offsets, size, dp_size, expected',
+    [
+        ([(8, 4)], [0], 32, 2, [[(0, 16), (16, 16)]]),
+        ([(4, 2)], [4], 16, 2, [[(4, 4), (8, 4)]]),
+        ([(4, 2)], [0], 16, 2, [[(0, 8), (8, 0)]]),
+        ([(4, 2)], [8], 16, 2, [[(8, 0), (8, 8)]]),
+        ([(10, 2)], [0], 24, 3, [[(0, 8), (8, 8), (16, 4)]]),
+        (
+            [(6, 3), (4, 2), (2, 2)],
+            [0, 18, 26],
+            36,
+            3,
+            [[(0, 12), (12, 6), (24, 0)], [(18, 0), (18, 6), (24, 2)], [(26, 0), (26, 0), (26, 4)]],
+        ),
+    ],
+)
+def test_tensor_intersections(shapes, offsets, size, dp_size, expected):
+    layout = GlobalLayout(
+        tensor_shapes=tuple(torch.Size(shape) for shape in shapes),
+        tensor_to_offset=tuple(offsets),
+        size=size,
+        rank_to_offset=tuple(rank * (size // dp_size) for rank in range(dp_size)),
+    )
+    for i, ranges in enumerate(expected):
+        assert [
+            intersect_ranges(
+                layout.get_tensor_range(i), (rank * (size // dp_size), size // dp_size)
+            )
+            for rank in range(dp_size)
+        ] == ranges
+
+
+@pytest.mark.parametrize(
+    ("placements", "expected_ranges"),
+    [
+        ([TensorAtomic(), TensorAtomic()], [(0, 8), (12, 8), (8, 4), (20, 0)]),
+        ([Replicate(), TensorAtomic()], [(0, 12), (12, 8), (0, 12), (12, 8)]),
+    ],
+)
+def test_layout_get_rank_range_with_uneven_segments(distributed_setup, placements, expected_ranges):
+    """Remote range queries preserve unequal segments and ranks with no elements."""
+    if distributed_setup.world_size < 4:
+        pytest.skip("Uneven range test requires at least 4 ranks.")
+
+    mesh = DeviceMesh(distributed_setup.device.type, [[0, 2], [1, 3]])
+    layout = GlobalLayout.build_for_tensor_atomic(
+        [torch.Size((2, 4)), torch.Size((2, 2)), torch.Size((4, 2))],
+        dp_size=4,
+        tensor_owners=[0, 1, 2],
+    )
+    for rank, expected in zip((0, 2, 1, 3), expected_ranges, strict=True):
+        assert layout.get_rank_range(mesh, placements, rank) == expected
+        if rank == mesh.get_rank():
+            assert layout.get_local_range(mesh, placements) == expected
+
+
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
     """DBuffer layout returns element offsets and pads to LCM * DP size."""
     if distributed_setup.world_size < 2:
         pytest.skip("DBuffer layout test requires at least 2 ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 2-rank layout test mesh.")
     shapes = [torch.Size((5, 4)), torch.Size((2, 6)), torch.Size((3,))]
 
     buffer = DBuffer.empty(
@@ -60,6 +175,8 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
         pytest.skip("DBuffer layout test requires at least 2 ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 2-rank layout test mesh.")
     shapes = [torch.Size((4, 4)), torch.Size((1, 6))]
 
     buffer = DBuffer.empty(
