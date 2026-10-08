@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -1709,6 +1709,7 @@ def process_mtp_loss(
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
     sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+    dp_cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1736,6 +1737,8 @@ def process_mtp_loss(
             is provided.
         sequence_roll_context (Optional[MTPSequenceRollContext]): Layout-specific
             metadata shared by MTP rolls in this microbatch.
+        dp_cp_group (ProcessGroup, optional): Data/context-parallel group used for
+            loss normalization and logging. Defaults to the legacy MPU group.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -1774,6 +1777,10 @@ def process_mtp_loss(
             output_weight = output_layer.weight.detach()
 
     mtp_labels = labels
+
+    if dp_cp_group is None and (config.calculate_per_token_loss or is_training):
+        # Compatibility for standalone callers without explicit process groups.
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     # Store the original number of tokens before rolling for proper normalization
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
@@ -1835,22 +1842,22 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 correct=correct,
                 total=total,
-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                avg_group=dp_cp_group,
                 calculate_per_token_loss=config.calculate_per_token_loss,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            # When calculate_per_token_loss is enabled, finalize_model_grads will
-            # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
+            # finalize_model_grads divides accumulated gradients by the main-token
+            # count. Form each microbatch's main/MTP ratio over that same DP/CP
+            # domain: local ratios would weight tokens differently across ranks.
+            # Keep num_tokens local for logging and use separate reduction storage.
             assert original_num_tokens is not None
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
+            assert dp_cp_group is not None
+            token_counts = torch.stack((original_num_tokens, num_tokens))
+            if dp_cp_group.size() > 1:
+                torch.distributed.all_reduce(token_counts, group=dp_cp_group)
+            token_ratio = token_counts[0] / token_counts[1].clamp(min=1)
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss * token_ratio
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
