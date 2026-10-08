@@ -459,7 +459,8 @@ def validate_args(args, defaults={}):
     # args.data_parallel_size below is the replicate degree (matches
     # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
     from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+
+    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             args.tensor_model_parallel_size,
             args.tensor_parallel_num_weight_shards,
@@ -1220,9 +1221,7 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
-    if args.moe_megakernel_backend == "mok" and (
-        args.use_megatron_fsdp or args.use_torch_fsdp2
-    ):
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:
@@ -1707,14 +1706,14 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
     # Derive the internal gtp_weight_remat_size from the user-facing
     # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
     # from argument generation), so it is set here as a fresh attribute on args before it is
     # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
     # Mirrors ModelParallelConfig.__post_init__.
     from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+
+    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             args.tensor_model_parallel_size,
             args.tensor_parallel_num_weight_shards,
@@ -1724,7 +1723,7 @@ def validate_args(args, defaults={}):
     # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
     # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
-    (args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size) = (
+    args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             args.expert_tensor_parallel_size,
             args.expert_tensor_parallel_num_weight_shards,
@@ -1758,10 +1757,11 @@ def validate_args(args, defaults={}):
 
             # Sanity check for 'CUDA_GRAPHS_USE_NODE_PRIORITY'.
             if args.cuda_graph_impl != "none":
-                assert os.environ.get('CUDA_GRAPHS_USE_NODE_PRIORITY') == "1", \
-                    'GTP requires CUDA_GRAPHS_USE_NODE_PRIORITY=1 to make sure fine-grained GTP ' \
-                    'comms can be well overlapped with GEMMs when CudaGraph is enabled for ' \
+                assert os.environ.get('CUDA_GRAPHS_USE_NODE_PRIORITY') == "1", (
+                    'GTP requires CUDA_GRAPHS_USE_NODE_PRIORITY=1 to make sure fine-grained GTP '
+                    'comms can be well overlapped with GEMMs when CudaGraph is enabled for '
                     'Blackwell and later architecture.'
+                )
 
         # Sanity check for 'NCCL_PROTO'.
         if os.environ.get('NCCL_PROTO', '').lower() == "simple":
@@ -1808,7 +1808,9 @@ def validate_args(args, defaults={}):
 
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
+            args, 'gtp_expert_remat_nccl_ub', False
+        ):
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
@@ -2082,9 +2084,7 @@ def validate_args(args, defaults={}):
                 "not pass --use-layer-wise-param-layout) for fp8 parameter gather, or "
                 "fp8_param_gather=False."
             )
-    assert not (
-        args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
-    ), (
+    assert not (args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight), (
         "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
         "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
         "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
