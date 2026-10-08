@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from .layout import GlobalLayout, Shape, non_leading_numel
+from .layout import GlobalLayout, Shape, intersect_ranges, non_leading_numel
 from .placement import BlockAtomic, TensorAtomic
 
 
@@ -195,20 +195,15 @@ class DBuffer:
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
-        tensor_start = self.layout.tensor_to_offset[tensor_index]
-        tensor_end = tensor_start + self.layout.tensor_shapes[tensor_index].numel()
-        buffer_start = self.offset
-        buffer_end = self.offset + self.local_buffer.numel()
-
-        overlap_start = max(tensor_start, buffer_start)
-        overlap_end = min(tensor_end, buffer_end)
-        if overlap_start >= overlap_end:
+        tensor_range = self.layout.get_tensor_range(tensor_index)
+        start, numel = intersect_ranges(tensor_range, (self.offset, self.local_buffer.numel()))
+        if numel == 0:
             return None
 
         return _OwnedRange(
-            numel=overlap_end - overlap_start,
-            tensor_relative_offset=overlap_start - tensor_start,
-            buffer_relative_offset=overlap_start - buffer_start,
+            numel=numel,
+            tensor_relative_offset=start - tensor_range[0],
+            buffer_relative_offset=start - self.offset,
         )
 
     @classmethod
