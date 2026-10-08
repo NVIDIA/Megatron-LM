@@ -92,6 +92,7 @@ mcore-inference-user-guide
 :hidden:
 :caption: Observability
 
+user-guide/observability/index
 user-guide/observability/configuration
 user-guide/observability/span-groups
 user-guide/observability/metrics
