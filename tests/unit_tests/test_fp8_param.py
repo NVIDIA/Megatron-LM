@@ -14,6 +14,8 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import (
     is_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_layerwise_fp8_param,
     is_mxfp8tensor,
     uses_grad_buffer_for_fp8_param_gather,
 )
@@ -767,6 +769,161 @@ class TestFP8Param:
             if opt_param_scheduler is not None:
                 opt_param_scheduler.step(increment=args.global_batch_size)
         return torch.stack(losses)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("kind", ["float8", "nvfp4", "grouped_bf16", "grouped_mxfp8"])
+    def test_native_compact_layerwise_rejects_unsupported_storage(self, monkeypatch, kind):
+        """Reject real TE storage before DDP can replace payloads or quantization metadata."""
+        import transformer_engine.pytorch as te
+
+        # The launch marker selects GB200 tests; H100 CI also collects this file.
+        # Skip only hardware that cannot construct the requested native storage.
+        if kind in ("nvfp4", "grouped_mxfp8") and torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip(f"{kind} tensor construction requires compute capability 10.0 or newer")
+        if kind == "float8":
+            if not fp8_available:
+                pytest.skip(reason_for_no_fp8)
+            from transformer_engine.common.recipe import Float8CurrentScaling
+            from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
+
+            recipe = Float8CurrentScaling()
+            expected_class = Float8Tensor
+        elif kind == "nvfp4":
+            from transformer_engine.common.recipe import NVFP4BlockScaling
+            from transformer_engine.pytorch.fp8 import check_nvfp4_support
+            from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
+
+            supported, reason = check_nvfp4_support()
+            assert supported, reason
+            recipe = NVFP4BlockScaling()
+            expected_class = NVFP4Tensor
+        else:
+            from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+
+            expected_class = GroupedTensor
+            if kind == "grouped_mxfp8":
+                from transformer_engine.common.recipe import MXFP8BlockScaling
+                from transformer_engine.pytorch.fp8 import check_mxfp8_support
+
+                supported, reason = check_mxfp8_support()
+                assert supported, reason
+                recipe = MXFP8BlockScaling()
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        config_kwargs = {}
+        if kind == "grouped_bf16":
+            grouped = GroupedTensor.make_grouped_tensor_from_rowwise_data(
+                num_tensors=2,
+                tensor_shape=(128, 128),
+                rowwise_data=torch.zeros(2, 128, 128, dtype=torch.bfloat16, device="cuda"),
+            )
+            module = torch.nn.Module()
+            module.register_parameter("weight", torch.nn.Parameter(grouped))
+        else:
+            with te.fp8_model_init(enabled=True, recipe=recipe):
+                if kind == "grouped_mxfp8":
+                    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+                    module = te.GroupedLinear(
+                        2,
+                        128,
+                        128,
+                        bias=False,
+                        params_dtype=torch.bfloat16,
+                        device="cuda",
+                        single_grouped_weight=True,
+                    )
+                else:
+                    module = te.Linear(
+                        128, 128, bias=False, params_dtype=torch.bfloat16, device="cuda"
+                    )
+            if kind == "nvfp4":
+                config_kwargs = dict(fp4="e2m1", fp4_param=True)
+            else:
+                config_kwargs = dict(
+                    fp8="e4m3",
+                    fp8_param=True,
+                    fp8_recipe="mxfp8" if kind == "grouped_mxfp8" else "tensorwise",
+                )
+
+        param = module.weight
+        assert isinstance(param, expected_class)
+        param.is_managed_by_layer_wise_optimizer = True
+        config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            use_layer_wise_param_layout=False,
+            fp8_param_gather=True,
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+        )
+        assert not is_layerwise_fp8_param(param)
+        assert is_grouped_mxfp8tensor(param) is (kind == "grouped_mxfp8")
+        # Grouped MXFP8 obeys the global opt-in but has no compact whole-param copy-back.
+        assert uses_grad_buffer_for_fp8_param_gather(param, config) is (kind == "grouped_mxfp8")
+        if kind == "float8":
+            attributes = ("_data", "_scale_inv", "_transpose")
+        elif kind == "nvfp4":
+            attributes = (
+                "_rowwise_data",
+                "_columnwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_scale_inv",
+                "_amax_rowwise",
+                "_amax_columnwise",
+            )
+        else:
+            attributes = (
+                "rowwise_data",
+                "columnwise_data",
+                "scale_inv",
+                "columnwise_scale_inv",
+                "amax",
+                "columnwise_amax",
+                "scale",
+            )
+        assert torch.is_tensor(getattr(param, attributes[0]))
+        before = {}
+        for name in attributes:
+            tensor = getattr(param, name)
+            before[name] = (
+                None
+                if tensor is None
+                else (
+                    tensor.data_ptr(),
+                    tensor.dtype,
+                    tensor.shape,
+                    tensor.stride(),
+                    tensor.detach().contiguous().reshape(-1).view(torch.uint8).clone(),
+                )
+            )
+        with pytest.raises(TypeError) as error:
+            DDP(
+                TransformerConfig(
+                    num_layers=1, hidden_size=128, num_attention_heads=4, bf16=True, **config_kwargs
+                ),
+                config,
+                module,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+        assert str(error.value) == (
+            "Compact LayerWise parameter gather supports only plain MXFP8Tensor "
+            "and Float8BlockwiseQTensor quantized parameters; "
+            f"got {type(param).__name__}. GroupedTensor is not supported."
+        )
+        assert config.use_distributed_optimizer  # The shared configuration was not changed.
+        for name, original in before.items():
+            tensor = getattr(param, name)
+            if original is None:
+                assert tensor is None, name
+                continue
+            pointer, dtype, shape, stride, values = original
+            assert (tensor.data_ptr(), tensor.dtype, tensor.shape, tensor.stride()) == (
+                pointer,
+                dtype,
+                shape,
+                stride,
+            ), name
+            assert torch.equal(
+                tensor.detach().contiguous().reshape(-1).view(torch.uint8), values
+            ), name
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
