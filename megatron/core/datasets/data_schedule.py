@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
 import enum
-from typing import Any, Dict, Optional, Type
+from typing import Any, Callable, Dict, Optional, Type
 
 import torch
 
@@ -528,6 +528,30 @@ def wrap_data_iterator(
     )
 
 
+def _sequence_parallel_tp_cp_group(
+    config,
+    tp_group: torch.distributed.ProcessGroup,
+    dynamic_cp: bool,
+    local_cp_size: int,
+    dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]],
+    tp_cp_group: Optional[torch.distributed.ProcessGroup],
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return the TP x CP group sequence parallelism needs, or None without it."""
+    if not (config.sequence_parallel and tp_group.size() > 1):
+        return None
+    if dynamic_cp:
+        if dynamic_tp_cp_group_func is None:
+            raise ValueError(
+                "dynamic_tp_cp_group_func is required for dynamic CP with sequence parallelism"
+            )
+        return dynamic_tp_cp_group_func(group_size=local_cp_size)
+    if tp_cp_group is None:
+        raise ValueError(
+            "tp_cp_group (or pg_collection.tp_cp) is required for sequence parallelism"
+        )
+    return tp_cp_group
+
+
 def get_batch_on_this_rank_for_sequence_packing(
     data_iterator,
     vpp_size: Optional[int] = None,
@@ -537,6 +561,9 @@ def get_batch_on_this_rank_for_sequence_packing(
     pg_collection: Optional[ProcessGroupCollection] = None,
     config=None,
     return_context_parallel_batch: bool = False,
+    dynamic_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
+    dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -546,6 +573,12 @@ def get_batch_on_this_rank_for_sequence_packing(
         vp_stage (Optional[int]): The stage of the pipeline.
         return_context_parallel_batch (bool): Return layout-keyed batch views
             instead of the legacy GPT tuple.
+        dynamic_cp_group_func (Callable, optional): Returns the runtime DPxCP group of
+            ``group_size`` ranks containing this rank. Required when ``dynamic_cp`` is True.
+        dynamic_tp_cp_group_func (Callable, optional): Returns the TP x runtime-DPxCP group
+            of ``group_size`` ranks. Required for dynamic CP with sequence parallelism.
+        tp_cp_group (torch.distributed.ProcessGroup, optional): Static TP x CP group for
+            sequence parallelism. Defaults to ``pg_collection.tp_cp``.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -559,6 +592,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
         cp_group = pg_collection.cp
+        if tp_cp_group is None:
+            tp_cp_group = getattr(pg_collection, "tp_cp", None)
+    if dynamic_cp and dynamic_cp_group_func is None:
+        raise ValueError("dynamic_cp_group_func is required when dynamic_cp is True")
 
     tp_src_rank = torch.distributed.get_process_group_ranks(tp_group)[0]
 
@@ -598,7 +635,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size = batch['local_cp_size']
         if isinstance(local_cp_size, torch.Tensor):
             local_cp_size = int(local_cp_size.item())
-        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+        cp_group = dynamic_cp_group_func(group_size=local_cp_size)
 
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
@@ -721,9 +758,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         if config is None:
             raise ValueError("config is required when returning ContextParallelBatch")
         runtime_cp_group = (
-            parallel_state.get_dynamic_data_context_parallel_groups(
-                group_size=int(batch['local_cp_size'].item())
-            )
+            dynamic_cp_group_func(group_size=int(batch['local_cp_size'].item()))
             if dynamic_cp
             else cp_group
         )
@@ -737,19 +772,16 @@ def get_batch_on_this_rank_for_sequence_packing(
             is_hybrid_cp=dynamic_cp,
             cp_group=runtime_cp_group,
             additional_layouts=additional_layouts,
-            hybrid_cp_group_func=parallel_state.get_dynamic_data_context_parallel_groups,
+            hybrid_cp_group_func=dynamic_cp_group_func,
             sequence_parallel=config.sequence_parallel,
             tp_group=tp_group,
-            tp_cp_group=(
-                parallel_state.get_dynamic_tensor_data_context_parallel_group(
-                    group_size=int(batch['local_cp_size'].item())
-                )
-                if dynamic_cp and config.sequence_parallel and tp_group.size() > 1
-                else (
-                    parallel_state.get_tensor_and_context_parallel_group()
-                    if config.sequence_parallel and tp_group.size() > 1
-                    else None
-                )
+            tp_cp_group=_sequence_parallel_tp_cp_group(
+                config,
+                tp_group,
+                dynamic_cp,
+                int(batch['local_cp_size'].item()),
+                dynamic_tp_cp_group_func,
+                tp_cp_group,
             ),
             tokens_per_sample=None,
         )
@@ -764,11 +796,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = int(batch['local_cp_size'].item()) if dynamic_cp else None
-    runtime_cp_group = (
-        parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
-        if dynamic_cp
-        else None
-    )
+    runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size) if dynamic_cp else None
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
