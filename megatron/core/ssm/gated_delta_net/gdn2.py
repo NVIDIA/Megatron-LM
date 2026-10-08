@@ -21,7 +21,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     a2a_cp_to_hp,
     causal_conv1d,
     get_parameter_local_cp,
-    l2norm,
+    torch_l2norm,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
@@ -382,8 +382,8 @@ def torch_chunk_gdn2(
 
     initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
-        q = l2norm(q, dim=-1, eps=1e-6)
-        k = l2norm(k, dim=-1, eps=1e-6)
+        q = torch_l2norm(q)
+        k = torch_l2norm(k)
 
     # b s h d -> b h s d, and compute the whole recurrence in fp32
     query, key, value, g, b, w = [
