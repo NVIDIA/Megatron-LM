@@ -47,6 +47,11 @@ def get_run_config():
     return _GLOBAL_RUN_CONFIG
 
 
+def is_run_config_initialized() -> bool:
+    """Whether argument adapters have a run-owned config available yet."""
+    return _GLOBAL_RUN_CONFIG is not None
+
+
 def get_train_state():
     """Return the mutable state for the current training run.
 
