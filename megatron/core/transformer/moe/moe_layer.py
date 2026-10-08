@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -340,8 +340,7 @@ class MoELayer(BaseMoELayer):
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
                 else {}
             )
-            # TODO: When those GTP kwargs are added, carry them into this wrapper together with
-            # its owning TP group; TE tensor-parallel execution remains local with `tp_size=1`.
+            # Pass the owning TP group while TE execution remains local (`tp_size=1`).
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,

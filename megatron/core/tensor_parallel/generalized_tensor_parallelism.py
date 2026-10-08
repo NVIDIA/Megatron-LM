@@ -2056,6 +2056,20 @@ class GTPShardedParam(torch.nn.Parameter):
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
+        # Native autograd producers (notably embeddings) return the parameter
+        # dtype even when DDP accumulates gradients in FP32. Honor main_grad's
+        # precision before scaling and communication, as non-GTP DDP does.
+        # Upcasting only in main_grad.add_ would retain the RS's BF16 rounding.
+        wgrads = list(wgrads)
+        for index, (weight, gradient) in enumerate(zip(self._weights, wgrads)):
+            if weight.main_grad.dtype == torch.float32 and gradient.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                promoted = _wgrad_pool_get(tuple(gradient.shape), torch.float32, gradient.device)
+                promoted.copy_(gradient)
+                wgrads[index] = promoted
+
         # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
         self._prescale_wgrads_for_mean_rs(wgrads)
 
@@ -2863,7 +2877,8 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
 
         # GTP-sharded tensor: delegate to the GTP-aware single-tensor helper — it layers the
         # axis-0 GTP split onto TP, elects the writer over the gtp_remat-excluded DP group, and
-        # places alignment-padded shards in logical layout. (tp_axis None → 0; tp_size 1 when no TP.)
+        # places alignment-padded shards in logical layout.
+        # With no TP: tp_axis None maps to 0 and tp_size is 1.
         # Only tensors present in the axis map are also sharded across TP.
         tp_axis = tensor_parallel_layers_axis_map.get(layer_name, None)
         sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(

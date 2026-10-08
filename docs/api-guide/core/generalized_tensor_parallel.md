@@ -911,3 +911,26 @@ The parameter-readiness contract itself (§3.2) is likewise covered outside this
 The `num_zeros` padding correction (§3.7) has two more layers of coverage outside this suite, both CPU-only: `tests/unit_tests/tensor_parallel/test_layers.py::TestGtpLocalPadZeroCount` unit-tests `gtp_local_pad_zero_count`'s row-offset math directly (no padding, tail-only, DP-fragment overlap variants, and the small-`dim0` spillover case), and `tests/unit_tests/optimizer/test_clip_grads.py::TestCountZerosFp32GtpPadding` checks `count_zeros_fp32`'s subtraction with and without an explicit `.gtp_pad_zeros` stamp.
 
 All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.
+
+
+## Kimi-K3 integration on dev
+
+The Kimi-K3 preview combines KDA low-rank decay projections, gated MLA,
+attention residuals, and Stable LatentMoE. The fused latent up-projection
+`TERMSNormDuplicatedLinear` accepts explicit `gtp_remat_group` and
+`gtp_replica_group` arguments and participates in the common presharding
+context when `moe_latent_proj` is opted in. Its linear weight is sharded;
+RMSNorm scale and optional bias retain their complete logical shapes.
+The owning TP group remains checkpoint metadata only: the duplicated
+projection executes without TE tensor-parallel communication.
+
+For a numerical comparison with the preview's TP1 non-GTP Muon baseline,
+use `muon_tp_mode=duplicated` on both arms. The `blockwise` mode independently
+orthogonalizes each GTP shard and therefore changes the optimizer update
+when the GTP degree changes. Compare from one checkpoint and retain identical
+logical batch/data ordering and learned router settings.
+
+The four-rank regression `test_kimi_latent_rmsnorm_gtp.py` compares padded
+and unpadded fused projections against native PyTorch RMSNorm plus a full
+linear weight, checking output, input/scale/bias gradients and summed
+weight gradients, including replicated parameter shapes.
