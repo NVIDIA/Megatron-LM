@@ -16,11 +16,11 @@ from megatron.core import dist_checkpointing
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
-from megatron.core.dist_checkpointing.strategies import filesystem_async
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import Utils
 from tools.checkpoint import weighted_merge as weighted_merge_module
 from tools.checkpoint.weighted_merge import (
     WeightedMergeError,
@@ -31,12 +31,16 @@ from tools.checkpoint.weighted_merge import (
 
 @pytest.fixture
 def process_group():
-    already_initialized = dist.is_available() and dist.is_initialized()
+    if torch.cuda.is_available():
+        Utils.initialize_distributed()
+        yield
+        return
+    # CPU-only run: create a one-rank gloo group and destroy it afterwards.
+    created = not dist.is_initialized()
     weighted_merge_module._ensure_process_group()
     yield
-    if not already_initialized and dist.is_available() and dist.is_initialized():
-        if dist.get_world_size() == 1:
-            dist.destroy_process_group()
+    if created:
+        dist.destroy_process_group()
 
 
 def _configured_world_size():
@@ -90,11 +94,10 @@ def cpu_only_dcp_save(monkeypatch):
         monkeypatch.delenv(_var, raising=False)
     if torch.cuda.is_available():
         return
-    # DCP's mcore async writer synchronizes CUDA even for these CPU-only fixtures.
+    # dist_checkpointing synchronizes CUDA (e.g. fully_parallel.py) even for
+    # these CPU-only fixtures.
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
-    if not filesystem_async.HAVE_PSUTIL:
-        monkeypatch.setattr(filesystem_async, "_process_memory", lambda: 0)
 
 
 def _rank():

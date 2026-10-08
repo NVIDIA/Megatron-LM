@@ -2,6 +2,7 @@
 
 import pytest
 
+from megatron.core.activations import squared_relu
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -310,6 +311,24 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
         )
 
 
+def test_squared_relu_tanh_clamp_allows_te_op_fuser():
+    """Whether the fused path can clamp depends on the installed TE; TEGroupedMLP decides."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        activation_func=squared_relu,
+        use_fused_weighted_squared_relu=True,
+        activation_func_tanh_clamp_scale=16.0,
+        use_transformer_engine_op_fuser=True,
+    )
+
+    assert config.activation_func_tanh_clamp_scale == 16.0
+    assert config.use_transformer_engine_op_fuser is True
+
+
 def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
     kwargs = dict(
         num_layers=1,
@@ -390,7 +409,7 @@ def test_sequence_packing_dense_config_passes():
 
 
 @requires_te_2_9
-def test_sequence_packing_moe_requires_alltoall_dispatcher():
+def test_sequence_packing_moe_rejects_allgather_dispatcher():
     # The general allgather-vs-variable_seq_lengths check fires first, since
     # sequence packing derives variable_seq_lengths=True.
     with pytest.raises(ValueError, match="alltoall"):
@@ -400,6 +419,28 @@ def test_sequence_packing_moe_requires_alltoall_dispatcher():
 @requires_te_2_9
 def test_sequence_packing_moe_alltoall_dispatcher_passes():
     config = _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="alltoall")
+    assert config.variable_seq_lengths is True
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_requires_uneven_input_padding():
+    with pytest.raises(ValueError, match="HybridEP requires"):
+        _make_packing_config(
+            num_moe_experts=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+
     assert config.variable_seq_lengths is True
 
 

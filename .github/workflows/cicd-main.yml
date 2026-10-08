@@ -177,7 +177,9 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    with:
+      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
 
   configure:
     runs-on: ubuntu-latest
@@ -197,6 +199,7 @@ jobs:
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
+      unit_test_pr_files_artifact_id: ${{ steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -242,6 +245,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          ENABLE_SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
@@ -259,6 +263,7 @@ jobs:
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
           HAS_UNIT_TESTMON=$(echo "$LABELS"   | jq 'any(. == "Run selective unit tests")')
+          HAS_DISABLE_UNIT_TESTMON=$(echo "$LABELS" | jq 'any(. == "Disable selective unit tests")')
           # Synthetic PR pushes have no pull_request event payload for preflight.
           if echo "$LABELS" | jq -e 'any(. == "force-run-all")' > /dev/null; then
             FORCE_RUN_ALL=true
@@ -331,13 +336,29 @@ jobs:
 
           DEV=true
 
-          # Labeled PRs only read the shared main baseline. A missing or
+          # The repository variable sets the default; labels override it.
+          # Only an explicit true enables the default. The disable label wins
+          # if both labels are present, so full testing is always available.
+          UNIT_TESTMON_DEFAULT_ENABLED=false
+          if [[ "${ENABLE_SELECTIVE_UNIT_TESTS:-false}" == "true" ]]; then
+            UNIT_TESTMON_DEFAULT_ENABLED=true
+          fi
+          UNIT_TESTMON_REQUESTED=$UNIT_TESTMON_DEFAULT_ENABLED
+          if [[ "$HAS_UNIT_TESTMON" == "true" ]]; then
+            UNIT_TESTMON_REQUESTED=true
+          fi
+          if [[ "$HAS_DISABLE_UNIT_TESTMON" == "true" ]]; then
+            UNIT_TESTMON_REQUESTED=false
+          fi
+
+          # Eligible PRs only read the shared main baseline. A missing or
           # incompatible cache runs the full bucket without recording a database.
           UNIT_TESTMON_ELIGIBLE=false
           if [[ "$LABELS_VALID" == "true" \
-            && "$HAS_UNIT_TESTMON" == "true" \
+            && "$UNIT_TESTMON_REQUESTED" == "true" \
             && "$EVENT_NAME" == "push" \
             && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$IS_MERGE_GROUP" != "true" \
             && "$HAS_RUN_TESTS" != "true" \
             && "$HAS_RUN_FUNCTIONAL" != "true" \
             && "$FORCE_RUN_ALL" != "true" \
@@ -384,7 +405,10 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
-          | \`unit_testmon_requested\` | \`$HAS_UNIT_TESTMON\` |
+          | \`unit_testmon_default_enabled\` | \`$UNIT_TESTMON_DEFAULT_ENABLED\` |
+          | \`unit_testmon_enable_label\` | \`$HAS_UNIT_TESTMON\` |
+          | \`unit_testmon_disable_label\` | \`$HAS_DISABLE_UNIT_TESTMON\` |
+          | \`unit_testmon_requested\` | \`$UNIT_TESTMON_REQUESTED\` |
           | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
 
           ### Decision tree
@@ -422,6 +446,64 @@ jobs:
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
+
+      - name: Get changed files for mandatory unit tests
+        id: unit-test-pr-files
+        if: steps.configure.outputs.unit_testmon_eligible == 'true'
+        shell: bash -e -u -o pipefail {0}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          PR_CHANGED_FILES: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').changed_files }}
+          PR_MERGE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
+        run: |
+          PR_FILES_DIR="$RUNNER_TEMP/unit-test-pr-files"
+          PR_FILES_RESPONSE="$RUNNER_TEMP/unit-test-pr-files-response.json"
+          # Fetch once for all buckets. Missing or stale PR data leaves no
+          # artifact ID, so consumers fall back to the full unit-test bucket.
+          if mkdir -p "$PR_FILES_DIR" \
+            && [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ \
+                  && "$PR_MERGE_SHA" == "$TESTED_SHA" \
+                  && "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
+                  && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
+                  && "$PR_CHANGED_FILES" -le 3000 ]] \
+            && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+              > "$PR_FILES_RESPONSE" \
+            && CHANGED_FILES=$(jq -se '
+              def valid_path: type == "string" and length > 0 and (test("[\r\n]") | not);
+              if length > 0 and all(.[]; type == "array") then add
+              else error("Expected PR file pages") end
+              | if all(.[]; (.filename | valid_path)
+                  and (if .status == "renamed" or has("previous_filename")
+                       then (.previous_filename | valid_path) else true end))
+                then length else error("Invalid PR file record") end
+              ' "$PR_FILES_RESPONSE") \
+            && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
+            && jq -sr '[.[][] | .filename, (.previous_filename // empty)] | unique[]' \
+              "$PR_FILES_RESPONSE" > "$PR_FILES_DIR/changed-files" \
+            && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
+            && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
+            && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]] \
+            && jq -n --arg tested_sha "$TESTED_SHA" --argjson changed_files "$CHANGED_FILES" \
+              --argjson changed_paths "$CHANGED_PATHS" \
+              '{tested_sha: $tested_sha, changed_files: $changed_files, changed_paths: $changed_paths}' \
+              > "$PR_FILES_DIR/metadata.json"; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; unit-test buckets will run in full."
+          fi
+
+      - name: Upload changed files for mandatory unit tests
+        id: upload-unit-test-pr-files
+        if: steps.unit-test-pr-files.outputs.ready == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        continue-on-error: true
+        with:
+          name: unit-test-pr-files-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unit-test-pr-files/
+          if-no-files-found: error
 
   linting:
     runs-on: ubuntu-latest
@@ -820,6 +902,7 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -910,6 +993,7 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:

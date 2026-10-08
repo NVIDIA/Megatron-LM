@@ -119,6 +119,7 @@ class MultiModulePipelineCommunicator:
         module_output_ndim: Optional[Dict[str, int]] = None,
         bridge_recv_shape_fns: Optional[Dict[str, Callable[[Dict], Tuple[int, ...]]]] = None,
         bridge_requires_backward: Optional[Dict[str, bool]] = None,
+        bridge_comm_dtypes: Optional[Dict[str, torch.dtype]] = None,
     ):
         """
         Initialize the MultiModulePipelineCommunicator.
@@ -157,6 +158,8 @@ class MultiModulePipelineCommunicator:
                 Providing a callback skips shape exchange for that bridge. This mapping
                 must be configured identically on all ranks.
             bridge_requires_backward: Per-source backward policy. Missing sources default to True.
+            bridge_comm_dtypes: Optional communication dtype overrides keyed by bridge source
+                module. Missing sources use ``config.pipeline_dtype``.
         """
         self.module_to_grid_map = module_to_grid_map
         self.topology = topology
@@ -165,6 +168,13 @@ class MultiModulePipelineCommunicator:
         self.module_output_ndim = module_output_ndim or {}
         self.bridge_recv_shape_fns = bridge_recv_shape_fns or {}
         self.bridge_requires_backward = dict(bridge_requires_backward or {})
+        self.bridge_comm_dtypes = dict(bridge_comm_dtypes or {})
+        unknown_modules = self.bridge_comm_dtypes.keys() - self.module_to_grid_map.keys()
+        if unknown_modules:
+            raise ValueError(
+                "bridge_comm_dtypes contains modules absent from module_to_grid_map: "
+                f"{sorted(unknown_modules)}"
+            )
         for module_name, requires_backward in self.bridge_requires_backward.items():
             if requires_backward is False and (
                 module_name not in self.topology or not self._is_source_module(module_name)
@@ -183,6 +193,10 @@ class MultiModulePipelineCommunicator:
         self.rank_module_map = {}
         self._build_rank_module_info_map()
 
+    def _bridge_comm_dtype(self, src_module_name: str) -> Optional[torch.dtype]:
+        """Return the communication dtype for a bridge source."""
+        return self.bridge_comm_dtypes.get(src_module_name, self.config.pipeline_dtype)
+
     def _build_bridge_comms(self):
         """Construct and store BridgeCommunicator objects that describe the outgoing
         communication relationships for all of the modules.
@@ -194,7 +208,7 @@ class MultiModulePipelineCommunicator:
                     src_grid=src_grid,
                     dest_grid=dest_grid,
                     dim_mapping=self.dim_mapping,
-                    comm_dtype=self.config.pipeline_dtype,
+                    comm_dtype=self._bridge_comm_dtype(src_module_name),
                     src_module_name=src_module_name,
                     dest_module_name=dest_module_name,
                     tensor_ndim=self.module_output_ndim.get(src_module_name, 3),
