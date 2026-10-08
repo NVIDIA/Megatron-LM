@@ -7,7 +7,11 @@ import logging
 
 import torch
 
-from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.tensor_parallel.random import (
+    cudagraph_needs_generator_registration,
+    get_all_rng_states,
+    prime_cuda_rng_states_for_graph_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,8 +223,9 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
-            for _, state in get_all_rng_states().items():
-                FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
+            if cudagraph_needs_generator_registration():
+                for _, state in get_all_rng_states().items():
+                    FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
             with torch.cuda.graph(
@@ -229,6 +234,8 @@ class FullCudaGraphWrapper:
                 pool=get_graph_pool(self.use_single_mempool),
                 capture_error_mode="thread_local",
             ):
+                # Must precede all other captured work; see the helper's docstring.
+                prime_cuda_rng_states_for_graph_capture()
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )

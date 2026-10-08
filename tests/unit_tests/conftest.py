@@ -12,7 +12,12 @@ from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    reset_transient_process_state,
+    restore_process_state,
+    snapshot_process_state,
+)
 
 
 def pytest_configure(config):
@@ -58,6 +63,32 @@ def pytest_runtest_logreport(report):
 def experimental(request):
     """Simple fixture setting the experimental flag [CPU | GPU]"""
     config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
+
+
+@pytest.fixture
+def run_config(monkeypatch):
+    """Provide a config owner for isolated training-runtime consumers."""
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training import global_vars
+    from megatron.training.config import (
+        CheckpointConfig,
+        LoggerConfig,
+        PretrainConfigContainer,
+        SchedulerConfig,
+        TrainingConfig,
+    )
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    container = PretrainConfigContainer(
+        train=TrainingConfig(),
+        model=None,
+        optimizer=OptimizerConfig(),
+        scheduler=SchedulerConfig(),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(),
+    )
+    global_vars.set_run_config(container)
+    return container
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -141,3 +172,25 @@ def reset_env_vars():
     # After the test, restore the original environment
     os.environ.clear()
     os.environ.update(original_env)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def restore_module_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    restore_process_state(snapshot)
+
+
+@pytest.fixture(scope="class", autouse=True)
+def restore_class_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    restore_process_state(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def reset_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    reset_transient_process_state()
+    restore_process_state(snapshot)
