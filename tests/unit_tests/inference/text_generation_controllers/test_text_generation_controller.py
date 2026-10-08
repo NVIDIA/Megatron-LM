@@ -123,6 +123,7 @@ class TextGenerationControllerTestBase:
             num_attention_heads=4,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.auto if inference_optimized else AttnBackend.local,
+            flash_attention_version=2,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
             fp8="hybrid" if fp8 else None,
