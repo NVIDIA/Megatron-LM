@@ -26,7 +26,6 @@ class Storage:
         if self.remote:
             from megatron.core.msc_utils import MultiStorageClientFeature
 
-            MultiStorageClientFeature.enable()
             self.backend = MultiStorageClientFeature.import_package()
 
     def path(self, name: str) -> str:
@@ -68,6 +67,13 @@ class Storage:
         else:
             os.replace(self.path(source), self.path(destination))
 
+    def remove(self, name: str) -> None:
+        """Remove a marker when its writer resumes publication."""
+        if self.remote:
+            self.backend.delete(self.path(name))
+        else:
+            os.unlink(self.path(name))
+
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
         """Publish JSON after its dependencies are durable."""
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -89,7 +95,7 @@ class Storage:
 def quarantine_unpublished(storage: Storage, published_through: int) -> None:
     """Retire interrupted groups beyond the readable prefix before teacher resume.
 
-    Hide descriptors before moving tar objects so following students never see
+    Hide descriptors before moving tar objects so sequential students never see
     a partially reconstructed group. Retain both files for recovery.
     """
     suffix = f".aborted.{uuid.uuid4().hex}"

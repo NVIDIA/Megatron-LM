@@ -3,16 +3,21 @@
 """Small integration hooks for paired dumping, replay, and checkpoint resume."""
 
 import json
-import time
 import uuid
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from .v3_batch import layout_options, map_targets, token_map
 from .v3_format import capture_batch, digest
-from .v3_replay import ReplayIterator, ReplayReader, discover_groups, manifest_digest
+from .v3_replay import (
+    ReplayIterator,
+    ReplayReader,
+    discover_groups,
+    layout_options,
+    map_targets,
+    token_map,
+)
 from .v3_storage import CACHE_FILE, COMPLETE_FILE, Storage, quarantine_unpublished
 
 _PLAN = None
@@ -28,12 +33,9 @@ def validate_options(args: Any) -> None:
         raise ValueError("--logits-load-inputs requires --logits-load-dir")
     if saving and loading:
         raise ValueError("Paired v3 dumping and replay cannot run together")
-    if (args.logits_load_follow or args.logits_load_shuffle_shards) and not loading:
-        raise ValueError("Following/shuffling requires --logits-load-inputs")
-    if args.logits_load_follow and args.logits_load_shuffle_shards:
-        raise ValueError("Shuffling requires a fixed cache snapshot")
-    if args.logits_load_follow_timeout <= 0 or args.logits_load_follow_poll_interval <= 0:
-        raise ValueError("Offline KD follow timeout and polling interval must be positive")
+    shuffling = args.logits_load_shuffle_shards is not None
+    if shuffling and not loading:
+        raise ValueError("Shuffling requires --logits-load-inputs")
     if not (saving or loading):
         return
     if args.sequence_packing_scheduler or args.hybrid_context_parallel or args.use_varlen_dataset:
@@ -53,6 +55,11 @@ def validate_options(args: Any) -> None:
     if saving and getattr(args, "recompute_granularity", None) == "full":
         raise ValueError(
             "Paired teacher dumping does not support full-layer activation recomputation"
+        )
+    if loading and getattr(args, "logits_load_ignore_errors", False):
+        raise ValueError(
+            "V3 paired input replay does not support --logits-load-ignore-errors; "
+            "input/target failures must stop training"
         )
     if loading and args.dataloader_type != "single":
         raise ValueError("Offline KD v3 replay requires --dataloader-type single")
@@ -136,7 +143,6 @@ def initialize_dump_metadata(saver: Any) -> dict:
                     **expected,
                     "generation": uuid.uuid4().hex,
                     "first_sample": args.consumed_train_samples,
-                    "first_iteration": args.iteration,
                 }
                 storage.write_json(CACHE_FILE, metadata)
             groups = discover_groups(storage, metadata)
@@ -147,6 +153,10 @@ def initialize_dump_metadata(saver: Any) -> dict:
                     "resume an earlier checkpoint or use a new cache directory"
                 )
             quarantine_unpublished(storage, published)
+            if storage.exists(COMPLETE_FILE):
+                # The resumed writer can extend this generation. Until it exits
+                # successfully, students must not treat it as immutable.
+                storage.remove(COMPLETE_FILE)
             return {"metadata": {**metadata, "published_through": published}}
         except Exception as error:
             return {"error": f"{type(error).__name__}: {error}"}
@@ -155,19 +165,6 @@ def initialize_dump_metadata(saver: Any) -> dict:
     if "error" in result:
         raise RuntimeError(result["error"])
     return result["metadata"]
-
-
-def durable_dump_iteration(saver: Any, requested_iteration: int) -> int:
-    """Cap frozen-teacher progress at the prefix published by every DP rank."""
-    metadata = dict(saver.metadata_dict)
-    metadata.pop("published_through", None)
-    groups = discover_groups(Storage(saver.save_dir), metadata)
-    end = groups[-1][0]["records"][-1]["end"] if groups else metadata["first_sample"]
-    iteration = (
-        metadata.get("first_iteration", 0)
-        + (end - metadata["first_sample"]) // metadata["gbs_save"]
-    )
-    return min(requested_iteration, iteration)
 
 
 def initialize_replay(args: Any) -> None:
@@ -180,13 +177,8 @@ def initialize_replay(args: Any) -> None:
     if rank == 0:
         try:
             storage = Storage(args.logits_load_dir)
-            deadline = time.monotonic() + args.logits_load_follow_timeout
-            while not storage.exists(CACHE_FILE):
-                if not args.logits_load_follow or time.monotonic() >= deadline:
-                    raise FileNotFoundError(
-                        "No v3 cache header found; input replay requires a v3 dump"
-                    )
-                time.sleep(args.logits_load_follow_poll_interval)
+            if not storage.exists(CACHE_FILE):
+                raise FileNotFoundError("No v3 cache header found; input replay requires a v3 dump")
             metadata = storage.read_json(CACHE_FILE)
             if metadata.get("format_version") != 3 or metadata["tokenizer"] != tokenizer_identity():
                 raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
@@ -212,40 +204,22 @@ def initialize_replay(args: Any) -> None:
                 2 * args.context_parallel_size
             ):
                 raise ValueError("Student sequence length must be divisible by 2 * CP")
-            fresh = discover_groups(storage, metadata)
-            resume = getattr(args, "offline_kd_replay_state", None)
-            settings = {
-                "shuffle": args.logits_load_shuffle_shards,
-                "seed": args.logits_load_shuffle_seed,
-                "follow": args.logits_load_follow,
-                "seq_length": args.seq_length,
-            }
-            if resume is not None:
-                if resume["generation"] != metadata["generation"] or resume["settings"] != settings:
-                    raise ValueError("Offline KD replay generation or ordering changed on resume")
-                groups = resume["groups"]
-                if manifest_digest(groups) != resume["manifest_sha256"]:
-                    raise ValueError("Checkpoint offline KD manifest fingerprint is invalid")
-                if fresh[: len(groups)] != groups:
-                    raise ValueError("Offline KD published data changed since the checkpoint")
-                if args.consumed_train_samples != resume["consumed"]:
-                    raise ValueError(
-                        "Checkpoint training cursor disagrees with offline KD replay cursor"
-                    )
-            else:
-                if args.consumed_train_samples:
-                    raise ValueError(
-                        "Resuming v3 training requires a checkpoint with replay state; use --finetune for a new run"
-                    )
-                groups = fresh
-            if not groups and not args.logits_load_follow:
+            groups = discover_groups(storage, metadata)
+            end = groups[-1][0]["records"][-1]["end"] if groups else metadata["first_sample"]
+            if args.logits_load_shuffle_shards is not None:
+                if not storage.exists(COMPLETE_FILE):
+                    raise ValueError("V3 shuffling requires a completed cache")
+                complete = storage.read_json(COMPLETE_FILE)
+                if (
+                    complete["generation"] != metadata["generation"]
+                    or complete["end_sample"] != end
+                ):
+                    raise ValueError("V3 completion marker disagrees with the published cache")
+            if args.consumed_train_samples > end - metadata["first_sample"]:
+                raise ValueError("Checkpoint sample cursor exceeds the published offline KD cache")
+            if not groups and args.logits_load_shuffle_shards is not None:
                 raise ValueError("No complete teacher DP shard group is available")
-            result[0] = {
-                "metadata": metadata,
-                "groups": groups,
-                "settings": settings,
-                "manifest_sha256": manifest_digest(groups),
-            }
+            result[0] = {"metadata": metadata, "groups": groups}
         except Exception as error:
             result[0] = {"error": f"{type(error).__name__}: {error}"}
     if dist.is_initialized():
@@ -253,6 +227,31 @@ def initialize_replay(args: Any) -> None:
     if "error" in result[0]:
         raise RuntimeError(result[0]["error"])
     _PLAN = result[0]
+
+
+def refresh_replay_groups(storage: Storage, metadata: dict) -> list[list[dict]]:
+    """Share one remote listing among TP-zero DP/CP ranks on this pipeline stage.
+
+    This collective is entered at an iteration boundary by every participating
+    reader. Decode prefetch stays within that already-available iteration and
+    therefore never enters the collective from a background thread.
+    """
+    if not storage.remote or not dist.is_initialized():
+        return discover_groups(storage, metadata)
+    from megatron.core import parallel_state as mpu
+
+    group = mpu.get_data_parallel_group(with_context_parallel=True)
+    source = dist.get_process_group_ranks(group)[0]
+    result = [None]
+    if dist.get_rank() == source:
+        try:
+            result[0] = {"groups": discover_groups(storage, metadata)}
+        except Exception as error:
+            result[0] = {"error": f"{type(error).__name__}: {error}"}
+    dist.broadcast_object_list(result, src=source, group=group)
+    if "error" in result[0]:
+        raise RuntimeError(result[0]["error"])
+    return result[0]["groups"]
 
 
 def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader | None:
@@ -275,12 +274,10 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
         _PLAN["metadata"],
         _PLAN["groups"],
         targets=mpu.is_pipeline_last_stage(),
-        shuffle=args.logits_load_shuffle_shards,
-        seed=args.logits_load_shuffle_seed,
-        follow=args.logits_load_follow,
-        timeout=args.logits_load_follow_timeout,
-        poll_interval=args.logits_load_follow_poll_interval,
+        shuffle=args.logits_load_shuffle_shards is not None,
+        seed=args.logits_load_shuffle_shards if args.logits_load_shuffle_shards is not None else 0,
         decode_threads=args.logits_load_decode_threads,
+        refresh_groups=lambda: refresh_replay_groups(storage, _PLAN["metadata"]),
     )
     iterator = ReplayIterator(
         reader,
@@ -412,11 +409,14 @@ def broadcast_targets(sidecar: dict | None, *, vp_stage: int | None = None) -> d
             "sample_ids": ids,
         }
     else:
-        sidecar = {
-            **sidecar,
-            "values": sidecar["values"].to(device, non_blocking=True),
-            "indices": sidecar["indices"].to(device, non_blocking=True),
-        }
+        sidecar = dict(sidecar)
+        for field in ("values", "indices"):
+            tensor = sidecar[field]
+            # CP index_select creates fresh CPU tensors after DataLoader's
+            # pinning pass. Restore pinning for asynchronous target transfer.
+            if torch.cuda.is_available() and tensor.device.type == "cpu" and not tensor.is_pinned():
+                tensor = tensor.pin_memory()
+            sidecar[field] = tensor.to(device, non_blocking=True)
     if dist.is_initialized():
         for field in ("values", "indices"):
             dist.broadcast(sidecar[field], src=source, group=group)
@@ -430,32 +430,6 @@ def bind_student_logits(sidecar: dict | None) -> dict | None:
     from .cached_logits_loss import get_student_logits_capture
 
     return {**sidecar, "logits": get_student_logits_capture().pop()}
-
-
-def checkpoint_replay_state(args: Any) -> None:
-    """Persist logical consumption, never loader read-ahead or prefetched data."""
-    if not getattr(args, "logits_load_inputs", False) or _PLAN is None:
-        return
-    storage = Storage(args.logits_load_dir)
-    groups = _PLAN["groups"]
-    if args.logits_load_follow:
-        fresh = discover_groups(storage, _PLAN["metadata"])
-        groups = []
-        count = 0
-        for group in fresh:
-            if count >= args.consumed_train_samples:
-                break
-            groups.append(group)
-            count += sum(len(record["sample_ids"]) for d in group for record in d["records"])
-        if count < args.consumed_train_samples:
-            raise ValueError("Consumed offline KD records are no longer published")
-    args.offline_kd_replay_state = {
-        "generation": _PLAN["metadata"]["generation"],
-        "groups": groups,
-        "manifest_sha256": manifest_digest(groups),
-        "settings": _PLAN["settings"],
-        "consumed": args.consumed_train_samples,
-    }
 
 
 def finish_dump(*, completed: bool) -> None:

@@ -1,29 +1,126 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Sample-cursor replay independent of teacher iteration and batch sizes."""
+"""Sample replay, collation, and token mappings for paired offline KD data."""
 
 import bisect
 import concurrent.futures
-import json
-import logging
 import random
-import time
 from collections import OrderedDict
 from typing import Any, Callable
 
 import torch
 
-from .v3_format import (
-    BOUNDARY_FIELDS,
-    TOKEN_FIELDS,
-    decode,
-    digest,
-    unpack_targets,
-    validate_inputs,
-)
-from .v3_storage import COMPLETE_FILE, Storage, read_members
+from .v3_format import BOUNDARY_FIELDS, TOKEN_FIELDS, decode, unpack_targets, validate_inputs
+from .v3_storage import Storage, read_members
 
-logger = logging.getLogger(__name__)
+
+def merged_boundaries(rows: list[torch.Tensor], sample_lengths: list[int]) -> torch.Tensor:
+    """Combine document boundaries without losing sample-relative offsets."""
+    pieces = [torch.zeros(1, dtype=torch.int32)]
+    offset = 0
+    for row, length in zip(rows, sample_lengths):
+        pieces.append(row[1:].to(torch.int32).cpu() + offset)
+        offset += length
+    return torch.cat(pieces)
+
+
+def token_map(
+    inputs: dict[str, Any],
+    cp_rank: int,
+    cp_size: int,
+    *,
+    layout: str = "zigzag",
+    per_sequence: bool = False,
+    hybrid_padded_zigzag: bool = False,
+    tp_alignment: int = 1,
+) -> torch.Tensor:
+    """Return [local_sequence, model_batch] canonical token indices.
+
+    The same map gathers teacher outputs and slices student targets. Prefix
+    shortening has already happened before this mapping is constructed.
+    """
+    offsets = inputs["sample_offsets"]
+    lengths = (offsets[1:] - offsets[:-1]).tolist()
+    if len(set(lengths)) != 1:
+        raise ValueError("Variable-length v3 replay is reserved for a future packing adapter")
+    packed = inputs.get("cu_seqlens") is not None
+    length = lengths[0]
+    indices = torch.arange(int(offsets[-1]), dtype=torch.int64)
+    full = (
+        indices.reshape(-1, 1) if packed else indices.reshape(len(lengths), length).T.contiguous()
+    )
+    if cp_size == 1:
+        return full
+    if layout == "contiguous":
+        if full.shape[0] % (2 * cp_size):
+            raise ValueError("Offline KD sequence length must be divisible by 2 * student CP")
+        return full.chunk(cp_size, dim=0)[cp_rank].contiguous()
+    if layout != "zigzag":
+        raise ValueError(f"Unsupported offline KD CP layout: {layout}")
+    boundaries = None
+    if packed:
+        physical = inputs.get("cu_seqlens_padded") or inputs["cu_seqlens"]
+        boundaries = merged_boundaries(physical, lengths)
+        if hybrid_padded_zigzag:
+            from megatron.core.context_parallel.layout import _build_thd_zigzag_metadata
+
+            real = merged_boundaries(inputs["cu_seqlens"], lengths)
+            metadata = _build_thd_zigzag_metadata(real, boundaries, cp_size, tp_alignment)
+            index = metadata.rank_order_indices.reshape(cp_size, -1)[cp_rank].to(torch.int64)
+            return index.reshape(-1, 1)
+    if boundaries is None or per_sequence:
+        boundaries = torch.tensor([0, full.shape[0]])
+    pieces = []
+    for a, b in zip(boundaries[:-1].tolist(), boundaries[1:].tolist()):
+        if (b - a) % (2 * cp_size):
+            raise ValueError("Saved offline KD document padding is incompatible with student CP")
+        chunk = (b - a) // (2 * cp_size)
+        pieces.extend(
+            (
+                full[a + cp_rank * chunk : a + (cp_rank + 1) * chunk],
+                full[a + (2 * cp_size - cp_rank - 1) * chunk : a + (2 * cp_size - cp_rank) * chunk],
+            )
+        )
+    return torch.cat(pieces, dim=0).contiguous()
+
+
+def map_targets(
+    values: torch.Tensor, indices: torch.Tensor, mapping: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply precisely the input token mapping to teacher top-K targets."""
+    flat = mapping.reshape(-1)
+    valid = flat >= 0
+    selected = flat.clamp_min(0)
+    shape = (*mapping.shape, values.shape[-1])
+    local_values = values.index_select(0, selected).reshape(shape)
+    local_indices = indices.index_select(0, selected).reshape(shape)
+    if not valid.all():
+        local_values = local_values.masked_fill(~valid.reshape(*mapping.shape, 1), -1e3)
+        local_indices = local_indices.masked_fill(~valid.reshape(*mapping.shape, 1), 0)
+    return local_values, local_indices
+
+
+def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
+    """Match the entrypoint's standard CP partitioning options."""
+    layout = "zigzag"
+    attention_layout = "zigzag"
+    if hybrid:
+        from megatron.training.arguments import core_transformer_config_from_args
+
+        config = core_transformer_config_from_args(args)
+        layout = config.linear_cp_layout
+        attention_layout = config.attention_cp_layout
+    return {
+        "layout": layout,
+        "per_sequence": bool(args.dataloader_inter_document_masking and not args.sft),
+        "hybrid_padded_zigzag": hybrid
+        and layout == "zigzag"
+        and (
+            attention_layout == "contiguous"
+            or (args.dataloader_inter_document_masking and not args.sft)
+        ),
+        "tp_alignment": args.tensor_model_parallel_size if args.sequence_parallel else 1,
+    }
 
 
 def discover_groups(storage: Storage, metadata: dict) -> list[list[dict]]:
@@ -88,13 +185,8 @@ def discover_groups(storage: Storage, metadata: dict) -> list[list[dict]]:
     return result
 
 
-def manifest_digest(groups: list[list[dict]]) -> str:
-    """Fingerprint the complete replay snapshot, including member checksums."""
-    return digest(json.dumps(groups, sort_keys=True, separators=(",", ":")).encode())
-
-
 class ReplayReader:
-    """Read records with bounded decoding and optional live-cache following."""
+    """Read records with bounded decoding and one-shot discovery of newly published records."""
 
     def __init__(
         self,
@@ -105,22 +197,19 @@ class ReplayReader:
         targets: bool = True,
         shuffle: bool = False,
         seed: int = 0,
-        follow: bool = False,
-        timeout: float = 1800,
-        poll_interval: float = 10,
         decode_threads: int = 4,
+        refresh_groups: Callable[[], list[list[dict]]] | None = None,
     ):
-        if shuffle and follow:
-            raise ValueError("Cannot shuffle a growing offline KD cache")
         self.storage = storage
         self.metadata = metadata
         self.groups = list(groups)
         if shuffle:
             random.Random(seed).shuffle(self.groups)
         self.targets = targets
-        self.follow = follow
-        self.timeout = timeout
-        self.poll_interval = poll_interval
+        self.shuffle = shuffle
+        self.refresh_groups = refresh_groups or (
+            lambda: discover_groups(self.storage, self.metadata)
+        )
         self.decode_threads = max(1, decode_threads)
         self._cache = OrderedDict()
         self._reindex()
@@ -144,34 +233,19 @@ class ReplayReader:
         return self.ends[-1] if self.ends else 0
 
     def ensure_available(self, end: int) -> None:
-        """Wait for committed records, distinguishing exhaustion from delay."""
-        deadline = time.monotonic() + self.timeout
-        warned = False
-        while end > self.total_samples:
-            if not self.follow:
-                raise RuntimeError(
-                    f"Offline KD snapshot exhausted at {self.total_samples} samples; requested {end}"
-                )
-            fresh = discover_groups(self.storage, self.metadata)
+        """Refresh sequential shards once at exhaustion, then fail if still short."""
+        if end <= self.total_samples:
+            return
+        if not self.shuffle:
+            fresh = self.refresh_groups()
             if fresh[: len(self.groups)] != self.groups:
-                raise RuntimeError("Previously published offline KD data changed during following")
+                raise RuntimeError("Previously published offline KD data changed during replay")
             self.groups = fresh
             self._reindex()
-            if end <= self.total_samples:
-                return
-            if self.storage.exists(COMPLETE_FILE):
-                complete = self.storage.read_json(COMPLETE_FILE)
-                if complete["generation"] != self.metadata["generation"]:
-                    raise ValueError("Offline KD completion marker belongs to another generation")
-                raise RuntimeError(
-                    f"Teacher completed with only {self.total_samples} replay samples; requested {end}"
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for offline KD samples through {end}")
-            if not warned:
-                logger.info("Waiting for teacher publication through replay sample %s", end)
-                warned = True
-            time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
+        if end > self.total_samples:
+            raise RuntimeError(
+                f"Offline KD cache exhausted at {self.total_samples} samples; requested {end}"
+            )
 
     def _decode_record(self, descriptor: dict, record: dict) -> tuple[dict, tuple | None]:
         key = (record["start"], record["end"])

@@ -11,11 +11,11 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args
+from megatron.training import get_args, get_tensorboard_writer
 
 from .logits_saver import LogitsSaverHooks
-from .v3_batch import layout_options, token_map
 from .v3_format import capture_batch, encode, join_inputs, pack_targets
+from .v3_replay import layout_options, token_map
 from .v3_storage import Storage, write_shard
 
 
@@ -154,11 +154,22 @@ class PairedLogitsSaver(LogitsSaverHooks):
         if self.tp_rank == 0 and self.cp_rank == 0:
             if self._iteration_records is None:
                 raise RuntimeError("Teacher v3 iteration did not produce all paired records")
+            if self._topp_kept_counts and (writer := get_tensorboard_writer()) is not None:
+                args = get_args()
+                iteration = getattr(args, "curr_iteration", None)
+                if iteration is None:
+                    iteration = args.iteration
+                writer.add_scalar(
+                    "avg-logprobs-kept",
+                    sum(self._topp_kept_counts) / len(self._topp_kept_counts),
+                    iteration,
+                )
             record = self._iteration_records
             # Resume can replay a window already published before a weight checkpoint.
             if record["end"] > self.metadata_dict["published_through"]:
                 self._pending_writes[(record["start"], record["end"])] = record
             self._iteration_records = None
+        self._topp_kept_counts.clear()
 
     def take_pending_data(self) -> tuple:
         """Transfer ownership to the existing persistent async checkpoint worker."""
@@ -189,6 +200,11 @@ class PairedLogitsSaver(LogitsSaverHooks):
         if not writes:
             return
         try:
+            if msc_enabled:
+                # Persistent workers do not inherit the main process's feature flags.
+                from megatron.core.msc_utils import MultiStorageClientFeature
+
+                MultiStorageClientFeature.enable()
             metadata = json.loads(meta_bytes)
             # Resume-only state is not part of immutable shard metadata.
             metadata.pop("published_through", None)
