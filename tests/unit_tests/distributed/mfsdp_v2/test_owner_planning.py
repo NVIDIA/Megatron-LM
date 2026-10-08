@@ -29,17 +29,13 @@ def _mock_mesh(dp_size: int, this_rank: int):
     return SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank)
 
 
-def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
-    """Mock a `FsdpParameterGroup` with the given DBuffer layout.
+def _mock_group(shapes, dp_size, this_rank=0):
+    """Mock a `FsdpParameterGroup` whose DBuffer uses the RowAtomic layout built for `shapes`.
 
     Creates `nn.Parameter`s for each shape so the default `eligible_fn` (`param.ndim >= 2`) can
     filter on them.
     """
-    layout = GlobalLayout(
-        tensor_shapes=tuple(torch.Size(s) for s in shapes),
-        tensor_to_offset=tuple(offsets),
-        size=size,
-    )
+    layout = GlobalLayout.build_for_row_atomic(shapes, dp_size)
     params = tuple(nn.Parameter(torch.zeros(s)) for s in shapes)
     fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)
     return SimpleNamespace(
@@ -57,7 +53,7 @@ def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
 
 def test_from_group_even_split():
     """A parameter exactly divisible by dp_size splits evenly across ranks."""
-    group = _mock_group([(8, 4)], [0], 32, dp_size=2)
+    group = _mock_group([(8, 4)], dp_size=2)
     layouts = ParameterLayout.from_group(group)
     assert list(layouts) == [0]
     layout = layouts[0]
@@ -73,31 +69,27 @@ def test_from_group_boundary_param_split_across_ranks():
     """A parameter landing across a rank boundary splits at the flat element level."""
     # 6×3 = 18 elements; each rank's flat shard is 9 elements. rank0 owns flat [0, 9), rank1 owns
     # [9, 18). Tensor occupies [0, 18) fully.
-    group = _mock_group([(6, 3)], [0], 18, dp_size=2)
+    group = _mock_group([(6, 3)], dp_size=2)
     layout = ParameterLayout.from_group(group)[0]
     assert layout.flat_counts == (9, 9)
     assert layout.is_boundary()
 
 
-def test_from_group_fully_local_param_on_one_rank():
-    """A parameter fully contained in one rank's flat shard is fully local."""
-    # 4×2 = 8 elements. rank0 shard = [0, 12), rank1 = [12, 24). Tensor at offset 0 with 8 elements
-    # fits entirely in rank0.
-    group = _mock_group([(4, 2)], [0], 24, dp_size=2)
-    layout = ParameterLayout.from_group(group)[0]
-    assert layout.flat_counts == (8, 0)
-    assert not layout.is_boundary()
-    assert layout.owner_candidates() == (0,)
+def test_from_group_fully_local_params():
+    """A parameter fully contained in one rank's flat shard has exactly one holder."""
+    # Two 4×3 tensors (12 elements each) at offsets 0 and 12. rank0 shard = [0, 12),
+    # rank1 = [12, 24). Each tensor lies entirely in one rank.
+    layouts = ParameterLayout.from_group(_mock_group([(4, 3), (4, 3)], dp_size=2))
 
+    assert layouts[0].flat_counts == (12, 0)
+    assert not layouts[0].is_boundary()
+    assert layouts[0].owner_candidates() == (0,)
 
-def test_from_group_empty_rank_holds_no_elements():
-    """A rank whose flat shard does not overlap the parameter holds zero elements."""
-    # Tensor at offset 12 (entirely in rank1). rank0 holds nothing.
-    group = _mock_group([(4, 3)], [12], 24, dp_size=2)
-    layout = ParameterLayout.from_group(group)[0]
-    assert layout.flat_counts == (0, 12)
-    assert layout.is_boundary() is False
-    assert layout.owner_candidates() == (1,)
+    # A leading empty rank: rank0 holds nothing, so rank1's flat offset within the tensor is 0.
+    assert layouts[1].flat_counts == (0, 12)
+    assert not layouts[1].is_boundary()
+    assert layouts[1].owner_candidates() == (1,)
+    assert layouts[1].rank_offset(1) == 0
 
 
 def test_from_group_keys_are_tensor_indices():
@@ -105,7 +97,7 @@ def test_from_group_keys_are_tensor_indices():
     # 2D weight (tensor 0), 1D bias (tensor 1), 2D weight (tensor 2).
     # Only the ≥2D params are eligible (default `eligible_fn`); the 1D bias is
     # excluded.
-    group = _mock_group([(8, 4), (16,), (4, 4)], [0, 32, 48], 64, dp_size=2)
+    group = _mock_group([(8, 4), (16,), (4, 4)], dp_size=2)
     layouts = ParameterLayout.from_group(group)
     assert list(layouts) == [0, 2]
     assert layouts[0].full_shape == torch.Size((8, 4))
@@ -113,7 +105,7 @@ def test_from_group_keys_are_tensor_indices():
 
 
 def test_from_group_per_rank_data_not_uniform():
-    """Flat sharding with uniform buffer size but non-uniform per-rank tensor data.
+    """RowAtomic sharding with uniform buffer size but non-uniform per-rank tensor data.
 
     `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
     flat buffer is the same size. However, the actual tensor data per rank is not necessarily
@@ -129,7 +121,7 @@ def test_from_group_per_rank_data_not_uniform():
     #   rank 0: [0, 8)   -> 8 elements
     #   rank 1: [8, 16)  -> 8 elements
     #   rank 2: [16, 24) -> 4 elements (4 elements of padding)
-    group = _mock_group([(5, 4)], [0], 24, dp_size=3)
+    group = _mock_group([(5, 4)], dp_size=3)
     layout = ParameterLayout.from_group(group)[0]
     assert layout.flat_counts == (8, 8, 4)
     assert layout.rank_numel(0) == 8
@@ -144,7 +136,7 @@ def test_from_group_is_shape_agnostic():
     # A 3D conv-like weight (tensor 0) and a 1D vector (tensor 1), each 24 elements, placed on
     # opposite ranks. With the default `eligible_fn`, only the ≥2D param participates; with the
     # override, both do.
-    group = _mock_group([(2, 3, 4), (24,)], [0, 24], 48, dp_size=2)
+    group = _mock_group([(2, 3, 4), (24,)], dp_size=2)
     layouts = ParameterLayout.from_group(group)
     assert list(layouts) == [0]
     assert layouts[0].flat_counts == (24, 0)
@@ -239,7 +231,7 @@ def _round_trip_group(this_rank=0):
       - tensor 1 (4, 2) at offset 18: elements (0, 6, 2) – boundary.
       - tensor 2 (2, 2) at offset 26: elements (0, 0, 4) – non-boundary, holder rank 2.
     """
-    return _mock_group([(6, 3), (4, 2), (2, 2)], [0, 18, 26], 36, dp_size=3, this_rank=this_rank)
+    return _mock_group([(6, 3), (4, 2), (2, 2)], dp_size=3, this_rank=this_rank)
 
 
 def _per_rank_plans():
@@ -386,7 +378,7 @@ def test_pack_and_unpack_result_round_trip():
 
 def test_pack_with_no_eligible_params():
     """A group with no eligible params packs to an empty plan."""
-    group = _mock_group([(16,)], [0], 16, dp_size=2)  # 1D bias only.
+    group = _mock_group([(16,)], dp_size=2)  # 1D bias only.
     plan = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
     assert plan.layouts == {}
     assert plan.owners == {}
