@@ -378,6 +378,23 @@ class TestParseHybridPattern:
             assert result.mtp_pattern == expected_mtp, f"Failed for pattern: {pattern}"
             assert result.mtp_num_depths == expected_depths, f"Failed for pattern: {pattern}"
 
+    @pytest.mark.parametrize("depths", [1, 2, 4])
+    @pytest.mark.parametrize("mtp_pattern", ["[*E]", "[*E][*-]"])
+    def test_grouped_mtp_depths_preserve_physical_layer_counts(self, depths, mtp_pattern):
+        pattern = "[*E]" + f"/{mtp_pattern}" * depths
+        parsed = parse_hybrid_pattern(pattern)
+        assert parsed.mtp_pattern == mtp_pattern
+        assert parsed.mtp_num_depths == depths
+        counts = get_hybrid_layer_counts(pattern)
+        groups_per_depth = 2 if mtp_pattern == "[*E][*-]" else 1
+        assert counts[Symbols.ATTENTION] == 1 + groups_per_depth * depths
+        assert counts[Symbols.MOE] == 1 + depths
+        assert counts[Symbols.MLP] == (groups_per_depth - 1) * depths
+
+    def test_grouped_mtp_keeps_terminal_moe_constraint(self):
+        with pytest.raises(ValueError, match="last"):
+            parse_hybrid_pattern("[*E]/[E*]/[E*]")
+
     @pytest.mark.parametrize("pattern", ["*-/C-", "C-/*-"])
     def test_rejects_standard_and_mla_attention_across_main_and_mtp(self, pattern):
         with pytest.raises(ValueError, match="both Attention and MLA/DSA/CSA/HCA/Window"):
