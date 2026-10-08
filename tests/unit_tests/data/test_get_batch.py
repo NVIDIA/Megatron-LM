@@ -19,7 +19,9 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
+    _resolve_dynamic_cp_group_for_batch,
     flatten_batch_for_packed_sequences,
+    get_batch_on_this_cp_rank,
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
@@ -887,6 +889,100 @@ def test_metadata_only_cp_batch_skips_sharding():
     shard_batch.assert_not_called()
     assert cp_batch.get_batch()["tokens"] is None
     assert cp_batch.get_packed_seq_params("zigzag") is not None
+
+
+def _mock_group(size, rank=0):
+    group = MagicMock()
+    group.size.return_value = size
+    group.rank.return_value = rank
+    return group
+
+
+def test_dynamic_cp_singleton_runtime_group_keeps_the_batch_unsharded():
+    """A CP-off microbatch (local_cp_size == 1) resolves and records the singleton group."""
+    static_cp_group, singleton = _mock_group(2), _mock_group(1)
+    tokens = torch.arange(8).view(1, 8)
+    batch = {
+        "tokens": tokens.clone(),
+        "labels": tokens.clone() + 1,
+        "loss_mask": torch.ones(1, 8),
+        "position_ids": tokens.clone(),
+        "cu_seqlens": torch.tensor([[0, 8]], dtype=torch.int32),
+        "local_cp_size": torch.tensor([1], dtype=torch.int32),
+    }
+    requested_sizes = []
+
+    def group_func(group_size):
+        requested_sizes.append(group_size)
+        return singleton
+
+    with (
+        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
+        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
+    ):
+        batch = get_batch_on_this_cp_rank(
+            batch, is_hybrid_cp=True, cp_group=static_cp_group, hybrid_cp_group_func=group_func
+        )
+
+    assert requested_sizes == [1]
+    assert batch["hybrid_cp_group"] is singleton
+    torch.testing.assert_close(batch["tokens"], tokens)
+    torch.testing.assert_close(batch["labels"], tokens + 1)
+
+
+def test_dynamic_cp_group_resolution_prefers_the_scheduled_group():
+    scheduled = _mock_group(2)
+    batch = {"local_cp_size": 2, "hybrid_cp_group": scheduled}
+
+    def group_func(group_size):
+        raise AssertionError("an attached runtime group must not be looked up again")
+
+    assert _resolve_dynamic_cp_group_for_batch(batch, group_func) is scheduled
+
+
+@pytest.mark.parametrize(
+    "local_cp_size, group_func, match",
+    [
+        (None, lambda group_size: _mock_group(2), "local_cp_size is required"),
+        (torch.tensor([2]), None, "hybrid_cp_group_func is required"),
+        (torch.tensor([4]), lambda group_size: _mock_group(2), "does not match local_cp_size"),
+    ],
+)
+def test_dynamic_cp_group_resolution_rejects_inconsistent_metadata(
+    local_cp_size, group_func, match
+):
+    with pytest.raises(ValueError, match=match):
+        _resolve_dynamic_cp_group_for_batch({"local_cp_size": local_cp_size}, group_func)
+
+
+def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors():
+    runtime_cp_group = MagicMock()
+    runtime_cp_group.size.return_value = 2
+    runtime_cp_group.rank.return_value = 0
+    padding_mask = torch.tensor([[False, True, False, True, False, True, False, True]])
+    batch = dict.fromkeys(pretrain_hybrid.BATCH_KEYS)
+    batch.update(
+        {
+            "padding_mask": padding_mask,
+            "cu_seqlens": torch.tensor([[0, 8]], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([[0, 8]], dtype=torch.int32),
+            "max_seqlen": torch.tensor([8], dtype=torch.int32),
+            "local_cp_size": torch.tensor([2], dtype=torch.int32),
+            "hybrid_cp_group": runtime_cp_group,
+        }
+    )
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch, boundary_layout="zigzag", is_hybrid_cp=True, cp_group=runtime_cp_group
+        )
+
+    torch.testing.assert_close(cp_batch.get_batch()["padding_mask"], padding_mask[:, [0, 1, 6, 7]])
+    assert cp_batch.get_batch()["tokens"] is None
+    assert cp_batch.get_packed_seq_params().cp_group is runtime_cp_group
 
 
 def test_get_batch_builds_required_cp_layouts():
