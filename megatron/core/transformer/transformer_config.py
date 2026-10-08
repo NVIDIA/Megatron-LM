@@ -430,6 +430,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_use_qk_l2norm_in_kernel: bool = False
+    """Defer GDN q/k L2 normalization to the gated delta rule when pre-GDR fusion is off."""
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
