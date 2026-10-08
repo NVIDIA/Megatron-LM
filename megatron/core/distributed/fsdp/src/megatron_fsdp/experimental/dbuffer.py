@@ -24,8 +24,9 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from .layout import GlobalLayout, Range, Shape, intersect_ranges, non_leading_numel
+from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, TensorAtomic
+from .range import Range, intersect_ranges
 
 
 @dataclasses.dataclass(frozen=True)
