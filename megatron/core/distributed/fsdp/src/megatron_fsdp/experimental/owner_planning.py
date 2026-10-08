@@ -132,7 +132,7 @@ class ParameterLayout:
         return len(self.owner_candidates()) > 1
 
 
-def ns_cost_fn(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
+def newton_schulz_cost_fn(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
     """Cost function matching the Newton-Schulz orthogonalization compute estimate for the given
     number of Newton-Schulz iterations/steps.
 
@@ -171,7 +171,7 @@ def assign_owner_work(
         Mapping from tensor index to owner rank.
     """
     if cost_fn is None:
-        cost_fn = ns_cost_fn(num_ns_steps=5)
+        cost_fn = newton_schulz_cost_fn(num_ns_steps=5)
 
     assignments: dict[int, int] = {}
     if not layouts:

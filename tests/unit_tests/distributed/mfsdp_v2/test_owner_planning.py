@@ -20,7 +20,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_plannin
     OwnerScatterPlan,
     ParameterLayout,
     assign_owner_work,
-    ns_cost_fn,
+    newton_schulz_cost_fn,
 )
 
 
@@ -164,14 +164,14 @@ def test_assign_owner_work_balances_by_cost():
     layout0 = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))  # cost 64 * 41
     layout1 = ParameterLayout(torch.Size((4, 4)), (4, 4, 4, 4))  # cost 16 * 21
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
-    owners = assign_owner_work({0: layout0, 1: layout1}, ns_cost_fn(5))
+    owners = assign_owner_work({0: layout0, 1: layout1}, newton_schulz_cost_fn(5))
     assert owners == {0: 0, 1: 1}
 
 
 def test_assign_owner_work_keys_pass_through():
     """Keys pass through unchanged. Arbitrary tensor indices, not positions."""
     layout = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))
-    owners = assign_owner_work({7: layout}, ns_cost_fn(5))
+    owners = assign_owner_work({7: layout}, newton_schulz_cost_fn(5))
     assert owners == {7: 0}
 
 
@@ -180,7 +180,7 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
     # Only ranks 0 and 2 hold elements for both params.
     layout0 = ParameterLayout(torch.Size((8, 8)), (32, 0, 32, 0))
     layout1 = ParameterLayout(torch.Size((8, 8)), (32, 0, 32, 0))
-    owners = assign_owner_work({0: layout0, 1: layout1}, ns_cost_fn(5))
+    owners = assign_owner_work({0: layout0, 1: layout1}, newton_schulz_cost_fn(5))
     assert all(owner in (0, 2) for owner in owners.values())
     # Two equal-cost params split across the two eligible ranks.
     assert owners[0] != owners[1]
@@ -196,7 +196,7 @@ def test_assign_owner_work_lpt_sorts_by_descending_cost():
     layout_cheap = ParameterLayout(torch.Size((8, 1)), (2, 2, 2, 2))
     # Expensive param listed SECOND in input order.
     layout_expensive = ParameterLayout(torch.Size((8, 8)), (16, 16, 16, 16))
-    owners = assign_owner_work({0: layout_cheap, 1: layout_expensive}, ns_cost_fn(5))
+    owners = assign_owner_work({0: layout_cheap, 1: layout_expensive}, newton_schulz_cost_fn(5))
     # LPT: expensive (tensor 1) → rank0 first, then cheap (tensor 0) → rank1.
     assert owners == {0: 1, 1: 0}
 
@@ -205,7 +205,7 @@ def test_assign_owner_work_non_boundary_gets_sole_holder():
     """Non-boundary params are assigned their sole holder, not skipped."""
     # All 8 elements on rank 0; rank 1 holds nothing.
     layout = ParameterLayout(torch.Size((4, 2)), (8, 0))
-    owners = assign_owner_work({3: layout}, ns_cost_fn(3))
+    owners = assign_owner_work({3: layout}, newton_schulz_cost_fn(3))
     assert owners == {3: 0}
 
 
@@ -213,7 +213,7 @@ def test_assign_owner_work_non_boundary_cost_counts_toward_balance():
     """Forced non-boundary work biases the greedy balancer away from that rank."""
     non_boundary = ParameterLayout(torch.Size((2, 2)), (4, 0))
     boundary = ParameterLayout(torch.Size((8, 8)), (32, 32))
-    owners = assign_owner_work({0: non_boundary, 1: boundary}, ns_cost_fn(5))
+    owners = assign_owner_work({0: non_boundary, 1: boundary}, newton_schulz_cost_fn(5))
     assert owners == {0: 0, 1: 1}
 
 
@@ -237,7 +237,9 @@ def _round_trip_group(this_rank=0):
 def _per_rank_plans():
     """Build the round-trip group's `GroupOwnerLayout` once per rank (DP size 3)."""
     return [
-        GroupOwnerLayout.from_group(_round_trip_group(this_rank=rank), cost_fn=ns_cost_fn(5))
+        GroupOwnerLayout.from_group(
+            _round_trip_group(this_rank=rank), cost_fn=newton_schulz_cost_fn(5)
+        )
         for rank in range(3)
     ]
 
@@ -245,19 +247,19 @@ def _per_rank_plans():
 def test_group_owner_layout_from_group_composes_the_steps():
     """`from_group` bundles the group, its mesh, the layouts, and the balanced owners."""
     group = _round_trip_group()
-    plan = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
+    plan = GroupOwnerLayout.from_group(group, cost_fn=newton_schulz_cost_fn(5))
     assert plan.group is group
     assert plan.mesh is group.mesh
     # Composition equivalence: the bundle is exactly the two steps composed.
     assert plan.layouts == ParameterLayout.from_group(group)
-    assert plan.owners == assign_owner_work(plan.layouts, ns_cost_fn(5))
+    assert plan.owners == assign_owner_work(plan.layouts, newton_schulz_cost_fn(5))
 
 
 def test_group_owner_layout_from_group_respects_eligible_fn():
     """`eligible_fn` filters participation; layouts and owners cover exactly those."""
     group = _round_trip_group()
     plan = GroupOwnerLayout.from_group(
-        group, cost_fn=ns_cost_fn(5), eligible_fn=lambda param: param.numel() >= 8
+        group, cost_fn=newton_schulz_cost_fn(5), eligible_fn=lambda param: param.numel() >= 8
     )
     assert list(plan.layouts) == [0, 1]
     assert set(plan.owners) == {0, 1}
@@ -379,7 +381,7 @@ def test_pack_and_unpack_result_round_trip():
 def test_pack_with_no_eligible_params():
     """A group with no eligible params packs to an empty plan."""
     group = _mock_group([(16,)], dp_size=2)  # 1D bias only.
-    plan = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
+    plan = GroupOwnerLayout.from_group(group, cost_fn=newton_schulz_cost_fn(5))
     assert plan.layouts == {}
     assert plan.owners == {}
 
