@@ -33,6 +33,25 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
+@pytest.mark.parametrize("as_iterable", [list, tuple, iter])
+def test_global_layout_normalizes_iterables(as_iterable):
+    """Layout construction copies iterable inputs into immutable, hashable fields."""
+    shapes = [[2, 4], [1, 4]]
+    offsets = [0, 8]
+    rank_offsets = [0, 8]
+    layout = GlobalLayout(as_iterable(shapes), as_iterable(offsets), 12, as_iterable(rank_offsets))
+
+    shapes[0][0] = 99
+    offsets[0] = 99
+    rank_offsets[0] = 99
+
+    assert layout.tensor_shapes == (torch.Size([2, 4]), torch.Size([1, 4]))
+    assert all(isinstance(shape, torch.Size) for shape in layout.tensor_shapes)
+    assert layout.tensor_to_offset == (0, 8)
+    assert layout.rank_to_offset == (0, 8)
+    assert hash(layout) == hash(GlobalLayout([[2, 4], [1, 4]], [0, 8], 12, [0, 8]))
+
+
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
     """DBuffer layout returns element offsets and pads to LCM * DP size."""
     if distributed_setup.world_size < 2:
