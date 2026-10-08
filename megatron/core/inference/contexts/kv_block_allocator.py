@@ -704,19 +704,20 @@ class KVBlockAllocator:
 
         Returns:
             ndarray [total_routing_tokens, num_layers, topk] or None if any
-            block is missing routing data.
+            required block is missing routing data.
         """
         block_size = self.context.block_size_tokens
         routing_parts = []
         tokens_collected = 0
 
         for bid in block_ids:
-            routing = self.get_block_routing(bid)
-            if routing is None:
-                return None  # Missing routing data for this block
+            # Speculative preparation can add a trailing block the result does not need.
             remaining = total_routing_tokens - tokens_collected
             if remaining <= 0:
                 break
+            routing = self.get_block_routing(bid)
+            if routing is None:
+                return None  # Missing routing data for this block
             take = min(block_size, remaining)
             routing_parts.append(routing[:take])
             tokens_collected += take
