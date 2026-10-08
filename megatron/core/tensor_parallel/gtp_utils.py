@@ -127,21 +127,46 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
     TP-local projection (pad stripped) under the per-section keys, and the default merge
     cats them back to the unpadded TP-local width. Mirror GTP initialization: zero-pad up
     to ``gtp_local_size * gtp_remat_size``, then select this rank's rows. The
-    alignment-pad rows are re-zeroed rather than round-tripped.
+    alignment-pad rows are re-zeroed rather than round-tripped. The build wrapper
+    also accepts a physical shard, allowing optimizer masters and momentum to use
+    the same semantic keys as model weights without changing checkpoint format.
     """
     gtp_remat_group = weight.group
     gtp_rank = torch.distributed.get_rank(gtp_remat_group)
     gtp_remat_size = torch.distributed.get_world_size(gtp_remat_group)
     gtp_local_size = weight.data.size(0)
     original_merge_fn = factory.merge_fn
+    original_build_fn = factory.build_fn
+    logical_shape = tuple(factory.data.shape)
+    local_shape = tuple(weight.shape)
+
+    @torch.no_grad()
+    def _gtp_gather_before_split(key, data, replica_id, flattened_range):
+        # Model factories already hold the logical tensor; Muon's FP32 masters
+        # and momentum still hold a physical shard (possibly offloaded to CPU).
+        if tuple(data.shape) == local_shape:
+            source_device = data.device
+            local = data.to(weight.device).contiguous()
+            full = torch.empty(
+                (gtp_local_size * gtp_remat_size,) + local_shape[1:],
+                dtype=local.dtype,
+                device=local.device,
+            )
+            torch.distributed.all_gather_into_tensor(full, local, group=gtp_remat_group)
+            data = full[: logical_shape[0]].contiguous().to(source_device)
+        if tuple(data.shape) != logical_shape:
+            raise ValueError(
+                f"GTP fused-projection factory expects local {local_shape} or logical "
+                f"{logical_shape} data, got {tuple(data.shape)}"
+            )
+        return original_build_fn(key, data, replica_id, flattened_range)
 
     @torch.no_grad()
     def _gtp_slice_after_cat(sub_state_dict):
         full = original_merge_fn(sub_state_dict)
         if full.dim() != 2:
             # Fail loudly instead of padding/slicing a flattened buffer: only the
-            # unflattened 2-D model-weight factory is supported. Optimizer checkpoint
-            # formats require their own mapping; this wrapper does not handle them.
+            # unflattened 2-D model-weight and whole-matrix optimizer factories are supported.
             raise NotImplementedError(
                 "GTP fused-projection merge expects the unflattened 2-D projection; got "
                 f"a {full.dim()}-D tensor (flattened factories are unsupported)"
@@ -152,4 +177,8 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         start = gtp_rank * gtp_local_size
         return full[start : start + gtp_local_size].contiguous()
 
-    return replace(factory, merge_fn=_gtp_slice_after_cat)
+    result = replace(factory, build_fn=_gtp_gather_before_split, merge_fn=_gtp_slice_after_cat)
+    # The gathered model tensor has a different identity from its live shard.
+    # Keep the semantic factory discoverable by both Muon and distributed Adam.
+    result.gtp_source_param = weight
+    return result

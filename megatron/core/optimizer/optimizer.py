@@ -962,18 +962,18 @@ def _backfill_gtp_sharded_param_map(
          to the live FP8 param, so the model's OWN entry is reused here (identity first, tagged
          ``_debug_name`` second) -- preserving its full offsets (expert axes included) and
          replica_id.
-      2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
-         tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
-         ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
-         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
-         loudly instead of writing colliding shards across EP groups.
+      2. Gathered+split factory params (Mamba/KDA ``in_proj``): the model entry exposes the
+         *gathered* tensor, so its source backlink resolves the live GTP shard. Reuse that
+         semantic factory; it gathers optimizer shards before splitting and slices on load.
+         A plain per-shard rebuild remains a legacy fallback for entries without a factory
+         backlink and is refused for expert-parallel params.
 
     WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
     matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
     Distributed Adam's ``dp_reshardable`` format uses a separate flat-buffer path and is
-    unaffected by these identity mismatches. Its ``fully_reshardable`` and
-    ``fully_sharded_model_space`` formats reject unmatched GTP parameters up front in
-    ``DistributedOptimizer.sharded_state_dict``.
+    unaffected by these identity mismatches. Its ``fully_reshardable`` format resolves
+    GTP factories and backlinks separately; legacy ``fully_sharded_model_space`` still
+    rejects unmatched GTP parameters in ``DistributedOptimizer.sharded_state_dict``.
 
     No-op when GTP is unavailable or when every param already matched.
     """

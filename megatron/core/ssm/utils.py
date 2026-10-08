@@ -39,8 +39,8 @@ def _split_in_proj_factory(
     Ordinary weights and replicated biases use the section factory directly.
 
     All GTP ranks must call this together when constructing the checkpoint dict.
-    The returned GTP factory merges unflattened model weights; optimizer states
-    continue to use their existing per-shard checkpoint reconstruction.
+    The returned GTP factory also gathers whole-matrix optimizer shards before
+    splitting and restores their physical shard layout on load.
     """
     uses_gtp = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(weight)
     if uses_gtp:

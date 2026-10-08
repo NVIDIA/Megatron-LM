@@ -1733,8 +1733,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
 
-        if gtp_api.HAVE_GTP and sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
-            # These formats identify optimizer parameters by the model entry's data object.
+        if gtp_api.HAVE_GTP and sharding_type == 'fully_sharded_model_space':
+            # This legacy format has no GTP factory/backlink resolver, unlike fully_reshardable.
             # Gathered projection factories and dequantized FP8 entries own different tensors.
             model_param_ids = {
                 id(entry.data)
@@ -1747,8 +1747,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         raise NotImplementedError(
                             f"Distributed optimizer format '{sharding_type}' cannot map GTP "
                             "parameters to gathered or dequantized model checkpoint data. "
-                            "Use 'dp_reshardable': disable --dist-ckpt-optim-fully-reshardable, "
-                            "or set metadata['distrib_optim_sharding_type'] = 'dp_reshardable'."
+                            "Use 'fully_reshardable' for cross-topology loading or "
+                            "'dp_reshardable' "
+                            "for the existing buffer-based format."
                         )
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':

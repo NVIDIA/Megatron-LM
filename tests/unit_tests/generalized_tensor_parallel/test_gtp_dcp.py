@@ -1366,7 +1366,7 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
     GTP optimizer param and ``get_param_id_to_sharded_param_map`` drops it -> KeyError in
     ``Float16OptimizerWithFloat16Params.sharded_state_dict``. Unlike that test, this one drives the
     real production backfill (``_backfill_gtp_sharded_param_map``) rather than reproducing its
-    rebuild, so it also pins that GDP takes the per-shard rebuild branch, not the EP refusal.
+    rebuild, so it also pins that GDP reuses its semantic factory rather than an unsplit key.
     """
     from megatron.core.dist_checkpointing.optimizer import (
         get_param_id_to_sharded_param_map,
@@ -1397,41 +1397,20 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
         id_map = get_param_id_to_sharded_param_map(model_sd, [in_proj_w])
         assert 0 not in id_map, "expected in_proj to be MISSING from the id map (the KeyError gap)"
 
-        # The production backfill must fill it via the per-shard rebuild. An expert-parallel param
-        # would raise instead; in_proj is dense, so it must rebuild cleanly.
+        # The source backlink resolves the model's semantic factory even when
+        # its checkpoint prefix differs from the tagged module name.
         _backfill_gtp_sharded_param_map(id_map, [[in_proj_w]], model_sd)
-        assert 0 in id_map, "backfill did not restore in_proj"
         entry = id_map[0]
-        # A plain per-shard ShardedTensor keyed by the tagged name -- NOT the model's gathered+split
-        # factory (reusing that would hand the optimizer the wrong shape).
-        assert isinstance(entry, ShardedTensor), type(entry)
-        assert entry is not model_sd['mixer.in_proj.weight']
-        assert entry.key == in_proj_w._debug_name, (entry.key, in_proj_w._debug_name)
-        # The rebuilt entry describes this rank's slice of the LOGICAL global. Alignment padding
-        # is a local allocation detail: the trailing GTP rank's shard runs past the logical end,
-        # so its entry is shorter than the param. (This used to require entry.local_shape ==
-        # param.shape and a padded global, i.e. the layout in which every TP rank past 0 sat
-        # pad_length rows too far. tp_size is 1 here, so that shift was invisible.)
-        gtp_remat_rank = torch.distributed.get_rank(in_proj_w.group)
-        shard_rows = in_proj_w.shape[0]
-        start = min(gtp_remat_rank * shard_rows, in_proj_dim)
-        expected_rows = min(shard_rows, max(0, in_proj_dim - start))
-        assert tuple(entry.local_shape) == (expected_rows, in_proj_w.shape[1]), (
-            f"rebuilt local_shape {tuple(entry.local_shape)} != logical slice "
-            f"{(expected_rows, in_proj_w.shape[1])} (param shape {tuple(in_proj_w.shape)})"
-        )
-        assert entry.global_offset[0] == start, (entry.global_offset, gtp_remat_rank)
-        assert entry.global_shape[0] == in_proj_dim, (entry.global_shape, in_proj_dim)
-
-        # The optimizer state spans the full padded shard; make_sharded_optimizer_tensor must
-        # accept it and trim it to the same logical rows the model entry kept.
-        opt_state = torch.zeros_like(in_proj_w)
+        assert entry is model_sd['mixer.in_proj.weight']
+        assert isinstance(entry, ShardedTensorFactory)
+        opt_state = torch.zeros_like(in_proj_w, dtype=torch.float32)
         osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
-        assert osh is not None
-        assert tuple(osh.local_shape) == (expected_rows, in_proj_w.shape[1]), (
-            f"optimizer state {tuple(osh.local_shape)} not trimmed to "
-            f"{(expected_rows, in_proj_w.shape[1])}"
-        )
+        parts = osh.build()
+        assert {part.key for part in parts} == {
+            'optimizer.state.exp_avg.' + part.key for part in entry.build()
+        }
+        restored = osh.merge_fn([part.data for part in parts])
+        torch.testing.assert_close(restored, opt_state, rtol=0, atol=0)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
@@ -1545,17 +1524,19 @@ def _worker_fused_projection_checkpoint(world_size, *, kind, native_fp8=False):
             buffers=[SimpleNamespace(param_index_map={weight: None})],
             state_dict=mock.Mock(side_effect=RuntimeError("optimizer state reached")),
         )
-        for sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
-            with pytest.raises(NotImplementedError, match="Use 'dp_reshardable'"):
+        with pytest.raises(NotImplementedError, match="Use 'fully_reshardable'"):
+            DistributedOptimizer.sharded_state_dict(
+                optimizer,
+                sharded_sd,
+                metadata={'distrib_optim_sharding_type': 'fully_sharded_model_space'},
+            )
+        optimizer.state_dict.assert_not_called()
+        # Fully reshardable has a GTP resolver; both supported formats reach state handling.
+        for sharding_type in ('fully_reshardable', 'dp_reshardable'):
+            with pytest.raises(RuntimeError, match="optimizer state reached"):
                 DistributedOptimizer.sharded_state_dict(
                     optimizer, sharded_sd, metadata={'distrib_optim_sharding_type': sharding_type}
                 )
-        optimizer.state_dict.assert_not_called()
-        # The buffer-based format must still proceed past the guard.
-        with pytest.raises(RuntimeError, match="optimizer state reached"):
-            DistributedOptimizer.sharded_state_dict(
-                optimizer, sharded_sd, metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
-            )
 
         logical_rows, pad_rows = (1296, 48) if native_fp8 else (776, 24)
         assert tuple(factory.data.shape) == (logical_rows, config.hidden_size)
@@ -1680,6 +1661,30 @@ def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt
         ps.initialize_model_parallel()
 
 
+def _legacy_padded_gtp_checkpoint_entry(tensor, key, prepend_offsets=(), **kwargs):
+    """Build the pre-logical-layout TP1 format for backward-compatibility tests.
+
+    Current saves trim GTP padding. Construct the historical layout explicitly so
+    legacy-load tests still exercise a real on-disk shape mismatch.
+    """
+    entry = make_tp_sharded_tensor_for_checkpoint(
+        tensor, key, prepend_offsets=prepend_offsets, **kwargs
+    )
+    if not is_gtp_param(tensor):
+        return entry
+    assert dist.get_world_size(kwargs['tp_group']) == 1
+    legacy = ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *prepend_offsets,
+        (len(prepend_offsets), dist.get_rank(tensor.group), dist.get_world_size(tensor.group)),
+        replica_id=entry.replica_id,
+        prepend_axis_num=len(prepend_offsets),
+    )
+    legacy.gtp_pad_length = tensor.pad_length
+    return legacy
+
+
 def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
     """Regression: a checkpoint saved at one GTP degree must still load at a different one, even
     when only one side pads. Small-scale mirror of GTP64(pads 3072->4096)/GTP8(no pad) with
@@ -1714,7 +1719,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
 
     def _wrap(tensor, key, **extra):
         return {
-            key: make_tp_sharded_tensor_for_checkpoint(
+            key: _legacy_padded_gtp_checkpoint_entry(
                 tensor=tensor,
                 key=key,
                 tp_axis=0,
@@ -1781,7 +1786,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
 
     def _wrap(tensor, key, prepend_offsets=(), **extra):
         return {
-            key: make_tp_sharded_tensor_for_checkpoint(
+            key: _legacy_padded_gtp_checkpoint_entry(
                 tensor=tensor,
                 key=key,
                 tp_axis=0,
@@ -2532,8 +2537,8 @@ _PREFIX = "layer."  # arbitrary checkpoint key prefix; these tests do not depend
 def _sharded_weight(weight, rank, world_group, *, gtp, expect_global_shape):
     """Build ShardedTensors for one weight, with or without the GTP-aware builder.
 
-    The GTP builder records the PADDED global shape, the plain one the true shape; whether those
-    two agree is exactly what the three save/load-direction tests below turn on.
+    Both current builders describe the logical global shape. Legacy padded-format
+    tests construct their historical metadata explicitly.
     """
     build = (
         make_sharded_tensors_for_checkpoint_with_gtp_remat
@@ -2685,14 +2690,17 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
         )
         assert gtp_weight.pad_length == 4, gtp_weight.pad_length  # (8 - 20%8) % 8
 
-        # Checkpoint declares the padded shape (24, 8), not the true (20, 8).
-        gtp_sharded = _sharded_weight(
-            gtp_weight,
-            rank,
-            world_group,
-            gtp=True,
-            expect_global_shape=(out_features + 4, in_features),
-        )
+        # Explicit historical format: new production saves have the logical shape.
+        gtp_sharded = {
+            _PREFIX
+            + "weight": _legacy_padded_gtp_checkpoint_entry(
+                gtp_weight,
+                _PREFIX + "weight",
+                tp_group=_cached_new_group([rank]),
+                dp_cp_group=world_group,
+            )
+        }
+        assert gtp_sharded[_PREFIX + "weight"].global_shape == (out_features + 4, in_features)
 
         with TempNamedDir(ckpt_base / 'gtp_padded_save', sync=True) as ckpt_dir:
             save(gtp_sharded, ckpt_dir)

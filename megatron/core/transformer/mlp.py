@@ -32,7 +32,11 @@ from megatron.core.tensor_parallel.gtp_utils import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import cat_with_oom_fallback, ensure_metadata_has_dp_cp_group, sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    cat_with_oom_fallback,
+    ensure_metadata_has_dp_cp_group,
+    sharded_state_dict_default,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
@@ -397,11 +401,7 @@ class MLP(MegatronModule):
                                 metadata['dp_cp_group'],
                                 sharded_offsets,
                             )
-                        v = apply_swiglu_sharded_factory(
-                            v,
-                            sharded_offsets,
-                            singleton_local_shards,
-                        )
+                        v = apply_swiglu_sharded_factory(v, sharded_offsets, singleton_local_shards)
                         sub_sd[k] = _gtp_slice_rows_on_load(v, weight) if is_gtp_fc1 else v
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict

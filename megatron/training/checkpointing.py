@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Input/output checkpointing."""
 
@@ -12,6 +12,7 @@ import sys
 import threading
 import types
 from argparse import Namespace
+from dataclasses import replace
 from datetime import datetime
 from enum import Enum, auto
 from logging import getLogger
@@ -25,6 +26,7 @@ from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -2033,6 +2035,30 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
+def _stage_ignored_runtime_state(sharded_state_dict, checkpoint_name, ignored_keys):
+    """Read explicitly ignored runtime objects without applying them to training.
+
+    Strict checkpoint validation still covers every saved key. Distribute these
+    small objects over current ranks using their saved coordinates, even when the
+    old RNG/rerun topology cannot be restored into the current runtime.
+    """
+    if not ignored_keys:
+        return
+    metadata = load_sharded_metadata(checkpoint_name)
+    objects = sorted(
+        (name, entry)
+        for name, entry in metadata.items()
+        if isinstance(entry, ShardedObject) and entry.key in ignored_keys
+    )
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    sharded_state_dict['_ignored_runtime_state'] = {
+        name: replace(entry, replica_id=0)
+        for index, (name, entry) in enumerate(objects)
+        if index % world_size == rank
+    }
+
+
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -2254,6 +2280,15 @@ def load_checkpoint(
                 model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
             )
+        if ckpt_type == CheckpointType.GLOBAL:
+            ignored_keys = set()
+            if ignore_rng_state:
+                ignored_keys.add(f'{rng_state_key_prefix}rng_state')
+            if ignore_rerun_state:
+                ignored_keys.add('rerun_state_machine_state')
+            _stage_ignored_runtime_state(
+                load_kwargs['sharded_state_dict'], checkpoint_name, ignored_keys
+            )
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -2329,6 +2364,9 @@ def load_checkpoint(
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    # Staged runtime objects were validated/loaded, but intentionally are not restored.
+    state_dict.pop('_ignored_runtime_state', None)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
