@@ -2676,6 +2676,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # NonGraphedMHAMetadata: use actual max values.
             max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
             max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
+            # Prefill batches take the varlen kernel, where FlashAttention-2 reads
+            # max_seqlen_q == 1 as one query token per sequence and, under GQA, reshapes q
+            # assuming total_q == num_seqs; padding breaks that. Raising the bound is safe.
+            if self.num_prefill_requests > 0:
+                max_seqlen_q = max(2, max_seqlen_q)
         else:
             # GraphedMHAMetadata: use conservative bounds.
             if self.padded_batch_dimensions.prefill_req_count == 0:
@@ -2686,6 +2691,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if not self.using_cuda_graph_this_step() and real_bs == 0:
             max_seqlen_q = self.num_speculative_tokens + 1
             max_seqlen_k = 1
+        assert self.is_decode_only() or max_seqlen_q > 1, (
+            "a batch routed to the varlen attention kernel must publish max_seqlen_q > 1, "
+            f"got {max_seqlen_q}"
+        )
 
         # Bind state_data to GPU views now. set_state_data() only creates Python
         # slice references into the GPU buffer (no GPU reads), so it's safe to
@@ -3256,39 +3265,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
-        # Clamp so that effective_prefill_chunk_length >= 2 when possible.
-        # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
-        # which routes the batch into the flash-attention decode kernel and crashes.
-        # Round down to a block boundary to keep block-table indexing consistent.
-        if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
-            max_skip = prefill_chunk_length - 2
-            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
-
-            # Rounding down can land on a block that has no cached Mamba state.
-            # add_request() restores from `prefix_skip_tokens // block_size - 1`
-            # unconditionally and, when `restore_to_live` misses, ZEROES the SSM
-            # state while still skipping the tokens -- the request then resumes
-            # mid-prompt from a zero state and produces a wrong (but internally
-            # coherent) distribution for its first generated token.
-            #
-            # Mamba boundaries are sparse: only the few positions selected in
-            # `compute_and_store_offsets` are cached, so the clamped boundary is
-            # frequently not one of them. A 5889-token prompt caches state only at
-            # block 22 (offset 5888), the clamp moves the skip to 5632, and the
-            # restore then targets block 21, which has none.
-            #
-            # Walk back to the nearest block that actually has cached state, the
-            # same way the `raw_skip >= prefill_chunk_length` branch above does.
-            if (
-                self.is_hybrid_model
-                and self.mamba_slot_allocator is not None
-                and finished == 0
-                and prefix_skip_tokens > 0
-            ):
-                usable = self._find_mamba_match_count(
-                    req=req, start_block=0, end_block=prefix_skip_tokens // self.block_size_tokens
-                )
-                prefix_skip_tokens = usable * self.block_size_tokens
+        # A one-token chunk is fine: `initialize_attention_state` keeps max_seqlen_q >= 2
+        # for any batch containing prefill.
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
@@ -3600,9 +3578,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             chunk_end_token = effective_kv_offset + effective_prefill_chunk_length
 
             # 3. The redundant tokens are where those two spans overlap. Non-empty
-            #    whenever we matched more blocks than we skipped tokens for: the
-            #    ">= 2 computed tokens" clamp, the Mamba back-off, or memory-only
-            #    hybrid mode where nothing is skipped but blocks are still shared.
+            #    whenever we matched more blocks than we skipped tokens for: a fully
+            #    cached chunk still computing its last token, the Mamba back-off, or
+            #    memory-only hybrid mode where nothing is skipped but blocks are shared.
             overlap_start_token = max(matched_prefix_start_token, chunk_start_token)
             overlap_end_token = min(matched_prefix_end_token, chunk_end_token)
 

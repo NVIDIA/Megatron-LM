@@ -192,6 +192,7 @@ from .global_vars import (
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
+    get_train_state,
     get_wandb_writer,
     get_run_config,
 )
@@ -2563,6 +2564,7 @@ def _forward_backward_grad_context(args):
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
+    cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
@@ -2758,7 +2760,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
@@ -4649,6 +4651,7 @@ def train(
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
+    train_state = get_train_state()
 
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -5294,6 +5297,7 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        train_state.iteration += 1
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -5329,6 +5333,7 @@ def train(
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
+        train_state.consumed_train_samples += iteration_sequences
 
         # Use iteration_sequences as batch_size for floating point operations
         batch_size = iteration_sequences
@@ -5341,6 +5346,7 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
+        train_state.skipped_train_samples += num_skipped_samples_in_batch
         # Drain the per-iteration packed-sequence stats so the FLOPs computation
         # reflects THD per-chunk causal attention AND excludes padding tokens
         # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
@@ -5360,6 +5366,7 @@ def train(
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
+        train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
 
         # OTel: super-span over the whole post-step REPORTING block (loss-scale
         # sync, param-norm reduction, throughput/tensorboard/wandb logging). One
@@ -5637,6 +5644,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
+    train_state = get_train_state()
 
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
@@ -5777,6 +5785,7 @@ def evaluate(
                         raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
 
             args.consumed_valid_samples += eval_batch_size
+            train_state.consumed_valid_samples += eval_batch_size
 
             if args.exit_duration_in_mins:
                 train_time = (time.time() - _TRAIN_START_TIME) / 60.0
@@ -6110,6 +6119,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
+
+    train_state = get_train_state()
+    train_state.do_train = args.do_train
+    train_state.do_valid = args.do_valid
+    train_state.do_test = args.do_test
+
     return train_dataloader, valid_dataloaders, test_dataloader
 
 

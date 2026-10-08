@@ -680,7 +680,7 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
 
     moe_layer = _FakeMoE(config)
     mlp = moe_layer.mlp
-    mlp.route = lambda hidden_states, padding_mask=None: (
+    mlp.route = lambda hidden_states, padding_mask=None, packed_seq_params=None: (
         torch.ones_like(hidden_states),
         torch.ones_like(hidden_states, dtype=torch.bool),
     )
