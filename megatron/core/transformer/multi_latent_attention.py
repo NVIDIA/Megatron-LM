@@ -18,6 +18,7 @@ except ImportError:
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -985,9 +986,10 @@ class MLASelfAttention(MultiLatentAttention):
                 )
             else:
                 if self.config.q_lora_rank is not None:
-                    # q_compressed: [num_tokens, q_lora_rank]
+                    # q_compressed: [num_tokens, q_lora_rank], a column slice of the fused
+                    # down-projection output; made contiguous here with a vectorized copy
                     # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                    q, _ = self.linear_q_up_proj(q_compressed)
+                    q, _ = self.linear_q_up_proj(contiguous_rows(q_compressed))
                 else:
                     # q_compressed: [num_tokens, hidden_size]
                     # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -996,8 +998,9 @@ class MLASelfAttention(MultiLatentAttention):
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
+            # kv_compressed: a column slice of the (fused) down-projection output
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(kv_compressed)
+            kv, _ = self.linear_kv_up_proj(contiguous_rows(kv_compressed))
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(

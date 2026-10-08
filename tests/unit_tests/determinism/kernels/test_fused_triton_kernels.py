@@ -4,6 +4,8 @@
 
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
+* ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
+  ``Tensor.contiguous`` on row-strided views.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
   ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
   autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
@@ -23,11 +25,16 @@ from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_replays_bit_exact,
+    bytes_equal,
+    seeded,
+)
 
 try:
     import triton  # noqa: F401
@@ -153,6 +160,24 @@ def test_fused_indices_to_multihot_replays_fwd_bwd(experimental_enabled):
         return multihot, probs_in_multihot
 
     assert_replays_bit_exact(fn, (experts, probs), replays=3, what="fused_indices_to_multihot")
+
+
+# --- row-strided contiguous copy -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "width, start, stop", [(2112, 0, 1536), (2112, 1536, 2048), (576, 0, 512), (300, 7, 200)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_contiguous_rows_replays_and_matches_torch(width, start, stop, dtype):
+    seeded()
+    view = torch.randn(4096, 1, width, device="cuda", dtype=dtype)[..., start:stop]
+    view.requires_grad_(True)
+    outputs, _ = assert_replays_bit_exact(
+        contiguous_rows, (view,), replays=3, contention=True, what="contiguous_rows"
+    )
+    assert outputs["out"].is_contiguous()
+    assert bytes_equal(outputs["out"], view.detach().contiguous())
 
 
 # --- MLA YaRN RoPE --------------------------------------------------------------------------

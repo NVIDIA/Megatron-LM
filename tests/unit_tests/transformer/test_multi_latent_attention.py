@@ -1706,6 +1706,20 @@ class TestFusedMLASelfAttention:
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
 
+    def test_up_projection_inputs_copied_as_contiguous_rows(self):
+        config = self.transformer_config
+        self.fused_attention.cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            self.fused_attention(hidden_states, attention_mask)
+        # The q and kv slices of the fused down-projection output take the vectorized copy.
+        assert copy.call_count == 2
+        assert not any(call.args[0].is_contiguous() for call in copy.call_args_list)
+
     def test_fused_weight_shape(self):
         config = self.transformer_config
         expected_out = config.q_lora_rank + config.kv_lora_rank + config.qk_pos_emb_head_dim
