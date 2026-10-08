@@ -608,13 +608,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.decouple_ddp_layout = not config.use_layer_wise_param_layout
         self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
 
-        # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
-        # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
-        self.ddp_config = None
-        if model_chunks:
-            self.ddp_config = model_chunks[0].ddp_config
-            if any(model_chunk.ddp_config != self.ddp_config for model_chunk in model_chunks[1:]):
-                raise ValueError("LayerWise optimizer model chunks must share one DDP config")
+        # Compact LayerWise buffers override the model-level DistOpt setting.
+        # Their bucket groups own the effective parameter-sync policy; sibling
+        # Adam buckets may still use DistOpt and must not select Muon's sync path.
+        ddp_configs = [
+            group.ddp_config
+            for chunk in model_chunks or []
+            for group in chunk.bucket_groups + chunk.expert_parallel_bucket_groups
+            if group.buckets and _bucket_is_managed_by_layer_wise_optimizer(group.buckets[0])
+        ]
+        if not ddp_configs:
+            ddp_configs = [chunk.ddp_config for chunk in model_chunks or []]
+        self.ddp_config = ddp_configs[0] if ddp_configs else None
+        if any(ddp_config != self.ddp_config for ddp_config in ddp_configs[1:]):
+            raise ValueError("LayerWise optimizer owned bucket groups must share one DDP config")
 
         # The data-parallel groups this optimizer shards parameters over. Cached here so the
         # sharding, all-gather and broadcast paths read one attribute instead of reaching back
