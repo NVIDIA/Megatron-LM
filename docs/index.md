@@ -76,6 +76,7 @@ user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers
+developer/gdn_ew_fusion
 ```
 
 ```{toctree}

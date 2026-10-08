@@ -15,6 +15,7 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -59,12 +60,26 @@ class Placements:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
+
+
 @contextmanager
 def fully_shard_context(
     device: torch.device | None = None,
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    parameter_to_owner: dict[nn.Parameter, int] | None = None,
+    caller_managed_grad_sync: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -79,6 +94,15 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        parameter_to_owner: Construction-time owner assignments for TensorAtomic
+            parameters, keyed by the original parameters before sharding. Owners are
+            ranks in each parameter group's 1-D data-parallel mesh and must agree across
+            that mesh. Every TensorAtomic parameter needs an entry; other entries are
+            ignored. Tensors are packed by owner without changing logical parameter order.
+        caller_managed_grad_sync: Disable the automatic autograd completion callback,
+            allowing delayed weight gradients or custom backward schedules. The caller must
+            call ``context.finish_grad_sync()`` after all backward work and before reading
+            or modifying gradients.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -91,6 +115,8 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        parameter_to_owner=parameter_to_owner,
+        caller_managed_grad_sync=caller_managed_grad_sync,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
@@ -229,6 +255,10 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
-    module_cls = module.__class__
-    fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
-    module.__class__ = fsdp_cls
+    module.__class__ = _get_fsdp_class(module.__class__)
+
+
+@functools.cache
+def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
+    """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
+    return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})

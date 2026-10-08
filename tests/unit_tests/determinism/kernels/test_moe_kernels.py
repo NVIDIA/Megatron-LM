@@ -16,14 +16,21 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
-from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    SequentialMLP,
+    TEGroupedMLP,
+    _te_supports_scaled_tanh_srelu,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
@@ -295,6 +302,19 @@ def _moe_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
+class _InQuantizationContext(torch.nn.Module):
+    """Run the wrapped module inside MCore's FP8 autocast, as TransformerBlock does."""
+
+    def __init__(self, module, config):
+        super().__init__()
+        self.module = module
+        self.config = config
+
+    def forward(self, *args):
+        with get_fp8_context(self.config):
+            return self.module(*args)
+
+
 class TestMoEModules:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -303,16 +323,94 @@ class TestMoEModules:
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
 
+    @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
+    @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])
+    @pytest.mark.parametrize("per_token_loss", [False, True])
+    def test_runtime_cp_moe_layer_replays(self, dispatcher, balancing, per_token_loss, monkeypatch):
+        """Replay real routing, collectives, experts and backward as runtime CP changes.
+
+        CP2/CP4 include a rank with no valid tokens and uneven peer counts. CP1 is
+        repeated after the larger groups to catch stale per-microbatch routing state.
+        """
+        if Utils.world_size < 4 or Utils.world_size % 4:
+            pytest.skip("runtime CP1/CP2/CP4 needs a world size divisible by four")
+        Utils.initialize_model_parallel(dynamic_context_parallel=True)
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = _moe_config(
+            moe_grouped_gemm=False,
+            moe_token_dispatcher_type=dispatcher,
+            moe_router_load_balancing_type=balancing,
+            calculate_per_token_loss=per_token_loss,
+        )
+        mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda().train()
+        layer.set_layer_number(1)
+        monkeypatch.setattr(
+            moe_utils.MoEAuxLossAutoScaler,
+            "main_loss_backward_scale",
+            torch.tensor(1.0, device="cuda"),
+        )
+        hidden = torch.randn(2048, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        cp1_reference = None
+        for cp_size in (1, 2, 4, 1):
+            cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=cp_size)
+            packed = PackedSeqParams(qkv_format="thd", local_cp_size=cp_size, cp_group=cp_group)
+            valid_tokens = 1537 if cp_size == 1 else cp_group.rank() * 511
+            padding_mask = torch.arange(2048, device="cuda").unsqueeze(0) >= valid_tokens
+
+            # Integer counts must retain their local value through in-place all-reduces.
+            routing_map = torch.zeros(2048, 8, device="cuda", dtype=torch.bool)
+            routing_map[:valid_tokens, :2] = True
+            counts, local_count, total_count = moe_utils.get_tokens_per_expert_and_token_count(
+                routing_map, (cp_group, layer.router.tp_group), 2, True
+            )
+            expected_total = 1537 if cp_size == 1 else 511 * cp_size * (cp_size - 1) // 2
+            assert local_count.item() == valid_tokens
+            assert total_count.item() == expected_total
+            torch.testing.assert_close(counts[:2], torch.full_like(counts[:2], expected_total))
+            assert counts[2:].count_nonzero().item() == 0
+
+            with deterministic_algorithms(True):
+                outputs, grads = assert_module_replays_bit_exact(
+                    layer,
+                    {
+                        "hidden_states": hidden,
+                        "padding_mask": padding_mask,
+                        "packed_seq_params": packed,
+                    },
+                    replays=3,
+                    contention=True,
+                    what=f"runtime CP{cp_size} MoELayer[{dispatcher}, {balancing}, per-token={per_token_loss}]",
+                )
+            assert grads, "backward must produce parameter and input gradients"
+            assert any("router" in name for name in grads)
+            for tensor in (*outputs.values(), *grads.values()):
+                assert torch.isfinite(tensor).all()
+            if cp_size == 1:
+                if cp1_reference is None:
+                    cp1_reference = (outputs, grads)
+                else:
+                    for reference, current in zip(cp1_reference, (outputs, grads)):
+                        assert reference.keys() == current.keys()
+                        for name in reference:
+                            torch.testing.assert_close(
+                                reference[name], current[name], rtol=0, atol=0
+                            )
+        moe_utils.get_moe_metrics_tracker().clear()
+
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias",
+        "balancing,score,expert_bias,hash_routing",
         [
-            ("aux_loss", "softmax", False),
-            ("seq_aux_loss", "sigmoid", True),
-            ("sinkhorn", "softmax", False),
+            ("aux_loss", "softmax", False, False),
+            ("seq_aux_loss", "sigmoid", True, False),
+            ("sinkhorn", "softmax", False, False),
+            ("none", "sigmoid", False, True),
+            ("none", "softmax", False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn"],
+        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias):
+    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
         self._init()
         seeded()
         config = _moe_config(
@@ -322,15 +420,69 @@ class TestMoEModules:
             moe_router_score_function=score,
             moe_router_enable_expert_bias=expert_bias,
             moe_router_pre_softmax=balancing == "sinkhorn",
-            moe_aux_loss_coeff=0.0 if balancing == "sinkhorn" else 0.01,
+            moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
+            moe_num_hash_layers=int(hash_routing),
+            hash_moe_vocab_size=128 if hash_routing else None,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        inputs = (hidden,)
+        if expert_bias:
+            padding_mask = torch.arange(8192, device="cuda").reshape(2048, 4) % 3 == 0
+            inputs = {"input": hidden, "padding_mask": padding_mask}
+        grad_output = None
+        if hash_routing:
+            assert router.is_hash_layer
+            # Repeated token IDs exercise the fixed table with many tokens per expert.
+            input_ids = torch.arange(8192, device="cuda").view(4, 2048) % config.hash_moe_vocab_size
+            inputs = {"input": hidden, "input_ids": input_ids}
+            # Summing normalized routing probabilities would mask their gradients.
+            grad_output = torch.randn(8192, config.num_moe_experts, device="cuda")
         assert_module_replays_bit_exact(
-            router, (hidden,), replays=3, what=f"TopKRouter[{balancing}]"
+            router,
+            inputs,
+            replays=3,
+            grad_output=grad_output,
+            contention=hash_routing,
+            what=f"TopKRouter[{balancing}, hash={hash_routing}]",
+        )
+
+    @pytest.mark.skipif(
+        not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
+        reason="TE dense fused router output is not available",
+    )
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("expert_bias", [False, True], ids=["no_bias", "bias"])
+    def test_topk_router_dense_indices_replays(self, backend, expert_bias):
+        """With TE dense fused output, flex deepep/ncclep routers return dense int64
+        [tokens, topk] indices next to the full-width [tokens, num_experts] probs (the dispatcher
+        selects the weights) and count expert loads from the indices."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="aux_loss",
+            # Expert bias is only permitted with the sigmoid / sqrtsoftplus score functions.
+            moe_router_score_function="sigmoid" if expert_bias else "softmax",
+            moe_router_enable_expert_bias=expert_bias,
+            moe_router_fusion=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend=backend,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs, routing_map = router(hidden)
+        assert routing_map.dtype == torch.int64 and routing_map.shape == (8192, 8)
+        assert probs.shape == (8192, 64)
+        assert_module_replays_bit_exact(
+            router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
@@ -401,6 +553,52 @@ class TestMoEModules:
             build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
         )
 
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])
+    def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser):
+        """Squared ReLU with the tanh soft clamp: the unfused weighted_squared_relu_impl path, and
+        the fused cuDNN srelu_tanh grouped GEMM (op fuser + MXFP8; SM100 and ScaledTanhSReLU)."""
+        if op_fuser:
+            if torch.cuda.get_device_capability()[0] < 10:
+                pytest.skip("fused grouped MLP under MXFP8 needs SM100+")
+            if not _te_supports_scaled_tanh_srelu():
+                pytest.skip("installed TE has no ScaledTanhSReLU")
+        self._init()
+        seeded()
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            bias_activation_fusion=False,
+            use_fused_weighted_squared_relu=True,
+            activation_func_tanh_clamp_scale=16.0,
+            use_transformer_engine_op_fuser=op_fuser,
+            **({"fp8": "e4m3", "fp8_recipe": "mxfp8"} if op_fuser else {}),
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        with get_fp8_context(config, is_init=True):
+            experts = get_submodules(spec.submodules.mlp).experts(
+                num_local_experts=8,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl is op_fuser
+        experts = experts.cuda()
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(rows, device="cuda", requires_grad=True)
+        module = _InQuantizationContext(experts, config) if op_fuser else experts
+        assert_module_replays_bit_exact(
+            module,
+            (hidden, tokens_per_expert, probs),
+            replays=3,
+            contention=True,
+            what=f"TEGroupedMLP[tanh clamp, {'op fuser' if op_fuser else 'unfused'}]",
+        )
+
     def test_sequential_mlp_replays_on_uneven_experts(self):
         self._init()
         seeded()
@@ -430,6 +628,18 @@ class TestMoEModules:
         [
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_num_hash_layers": 1,
+                    "hash_moe_vocab_size": 128,
+                    "moe_router_score_function": "sigmoid",
+                    "moe_router_load_balancing_type": "none",
+                    "moe_aux_loss_coeff": 0.0,
+                },
+                id="alltoall-hash",
+            ),
             (
                 "alltoall",
                 1,
@@ -460,14 +670,19 @@ class TestMoEModules:
             mlp_spec = get_gpt_layer_with_transformer_engine_spec(
                 num_experts=8, moe_grouped_gemm=True
             ).submodules.mlp
-        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer = MoELayer(
+            config,
+            get_submodules(mlp_spec),
+            hash_moe_layer_threshold=1 if config.moe_num_hash_layers else None,
+        ).cuda()
         layer.set_layer_number(0)
         hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        inputs = (hidden,)
+        if config.moe_num_hash_layers:
+            assert layer.router.is_hash_layer
+            input_ids = torch.arange(4096, device="cuda").view(2, 2048) % config.hash_moe_vocab_size
+            inputs = {"hidden_states": hidden, "input_ids": input_ids}
         with deterministic_algorithms(True):
             assert_module_replays_bit_exact(
-                layer,
-                (hidden,),
-                replays=3,
-                contention=True,
-                what=f"MoELayer[{dispatcher}, ep={ep}]",
+                layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
             )
