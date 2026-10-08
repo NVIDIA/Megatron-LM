@@ -145,9 +145,8 @@ class QKNormConfigResolver:
                     self.submodules.linear_q_up_proj, "linear_q_up_proj"
                 )
         else:
-            linear_q_proj_cls = self._mla_fused_linear_or_default(
-                self.submodules.linear_q_proj, "linear_q_proj"
-            )
+            # No Q norm unless the spec fuses one into linear_q_proj.
+            linear_q_proj_cls = self.submodules.linear_q_proj or self.linear_impl
 
         kv_norm_cls = self.submodules.kv_layernorm or IdentityOp
         if self._is_trivial(kv_norm_cls):
