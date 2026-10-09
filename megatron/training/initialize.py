@@ -41,6 +41,7 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
+from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.global_vars import get_run_config
@@ -117,7 +118,8 @@ def initialize_megatron(
         enable_batch_invariant_mode(backend, collective)
 
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
-    tuning.install(args.triton_autotune, deterministic=args.deterministic_mode)
+    # Built from the parsed arguments so callers that skip validate_args still get their policy.
+    tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
 
     # torch.distributed initialization
     def finish_mpu_init():
