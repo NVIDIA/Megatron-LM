@@ -19,6 +19,7 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -33,6 +34,7 @@ from megatron.core.utils import init_method_normal
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
@@ -488,13 +490,42 @@ class TestTEWrappers:
         k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-        def fn(q, k, v):
-            return module(q, k, v, None, AttnMaskType.causal)
+        cp_group = parallel_state.get_context_parallel_group()
+        assert cp_group.size() == 1
+        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        assert module.cp_group is None
+        reference = None
 
         try:
-            assert_replays_bit_exact(
-                fn, (q, k, v), replays=4, contention=True, what=f"TEDotProductAttention[{backend}]"
-            )
+            # Runtime CP1 retains its singleton metadata but must dispatch the same
+            # CP-off kernels as the legacy path, including after metadata is removed.
+            for packed_seq_params in (None, runtime_cp1, None):
+
+                def fn(q, k, v):
+                    output = module(
+                        q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params
+                    )
+                    assert module.cp_group is None
+                    return output
+
+                result = assert_replays_bit_exact(
+                    fn,
+                    (q, k, v),
+                    replays=4,
+                    contention=True,
+                    what=f"TEDotProductAttention[{backend},runtime_cp1={packed_seq_params is not None}]",
+                )
+                assert len(result[1]) == 3  # Replay covers dQ, dK, and dV.
+                assert runtime_cp1.cp_group is cp_group
+                assert runtime_cp1.local_cp_size == 1
+                assert module.cp_group is None
+                if reference is None:
+                    reference = result
+                for expected, actual in zip(reference, result):
+                    assert actual.keys() == expected.keys()
+                    for name in expected:
+                        assert torch.isfinite(actual[name]).all()
+                        assert bytes_equal(expected[name], actual[name]), name
         except (RuntimeError, AssertionError) as error:
             if "backend" in str(error).lower() and "avail" in str(error).lower():
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")
@@ -533,3 +564,45 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+# --- fused top-k router with dense indices ------------------------------------------------------
+
+
+@pytest.mark.parametrize("indices_dtype", [torch.int64, torch.int16], ids=["int64", "int16"])
+def test_te_fused_topk_dense_indices_replays(indices_dtype):
+    """The fused router wrapper can write dense [tokens, topk] expert ids into a caller-provided
+    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
+    )
+
+    if fused_topk_with_score_function is None:
+        pytest.skip("TE fused router unavailable")
+    if not fused_topk_with_score_function_supports_topk_indices:
+        pytest.skip("TE fused router does not support topk_indices")
+    seeded()
+    num_tokens, num_experts, topk = 8192, 256, 8
+    logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.01
+
+    def fn(logits):
+        topk_indices = torch.empty(num_tokens, topk, dtype=indices_dtype, device="cuda")
+        probs, routing_map = fused_topk_with_score_function(
+            logits=logits,
+            topk=topk,
+            use_pre_softmax=False,
+            num_groups=None,
+            group_topk=None,
+            scaling_factor=2.5,
+            score_function="sigmoid",
+            expert_bias=expert_bias,
+            topk_indices=topk_indices,
+        )
+        assert routing_map.dtype == indices_dtype and routing_map.shape == (num_tokens, topk)
+        return probs, routing_map
+
+    assert_replays_bit_exact(
+        fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
+    )

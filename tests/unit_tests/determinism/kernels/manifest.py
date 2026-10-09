@@ -142,12 +142,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/activations.py",
             "megatron/core/transformer/utils.py",
             "megatron/core/transformer/torch_norm.py",
-            "megatron/core/transformer/attention.py",
         ),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction) and Attention._apply_output_gate.",
+        "L2Norm._norm (row reduction).",
+    ),
+    KernelEntry(
+        name="attention_kernels_and_dispatch",
+        sources=("megatron/core/transformer/attention.py",),
+        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        kind="dispatch",
+        notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
+        "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
+        "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
+        "test_runtime_cp_attention.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -197,6 +206,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
     ),
     KernelEntry(
+        name="fused_row_copy",
+        sources=("megatron/core/fusions/fused_row_copy.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Copy with unique stores; bit-identical to Tensor.contiguous.",
+    ),
+    KernelEntry(
         name="fused_mla_yarn_rope",
         sources=("megatron/core/fusions/fused_mla_yarn_rope_apply.py",),
         tests=(K + "test_fused_triton_kernels.py",),
@@ -242,7 +258,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_layers",
         sources=("megatron/core/tensor_parallel/layers.py",),
-        tests=(K + "test_tensor_parallel_kernels.py",),
+        tests=(
+            K + "test_tensor_parallel_kernels.py",
+            "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+        ),
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding) and local Column/RowParallelLinear "
         "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
@@ -270,10 +289,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="transformer_engine_wrappers",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_te_wrappers.py", C + "test_fp8_determinism.py"),
+        tests=(
+            K + "test_te_wrappers.py",
+            C + "test_fp8_determinism.py",
+            K + "test_runtime_cp_attention.py",
+        ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
-        "FP8/FP4 recipes in the model-level suite.",
+        "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
+        "replayed through packed SelfAttention in test_runtime_cp_attention.py.",
     ),
     KernelEntry(
         name="kitchen_extension",
@@ -454,7 +478,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
-        tests=(K + "test_optimizer_kernels.py",),
+        tests=(
+            K + "test_optimizer_kernels.py",
+            "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+        ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
@@ -472,9 +499,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ddp_grad_buffer_reductions",
         sources=("megatron/core/distributed/param_and_grad_buffer.py",),
-        tests=(C + "test_gpt_model.py",),
+        tests=(
+            C + "test_gpt_model.py",
+            "tests/unit_tests/distributed/test_param_storage_copyback.py",
+        ),
         kind="external-lib",
-        notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite.",
+        notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
+        "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -696,6 +727,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
+    ),
+    KernelEntry(
+        name="muon_newton_schulz_dispatch",
+        sources=("megatron/core/optimizer/layer_sharded_muon.py",),
+        tests=(
+            "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
+            "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
+        ),
+        kind="dispatch",
+        notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
+        "full matrices; use_syrk selects its Triton SYRK kernels (tsyrk_ex, and batched_tsyrk_ex "
+        "for 3-D chunks when ns_batch_size > 1, emerging-optimizers >= 0.5.0a0), otherwise the "
+        "GEMM / baddbmm path. The kernels live outside this repository. Bitwise coverage: "
+        "test_layer_sharded_muon.py (test_step_matches_duplicated_mode, "
+        "test_batched_matches_unbatched, test_concurrent_groups_match_serial_bitwise, "
+        "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
+        "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
+        "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(

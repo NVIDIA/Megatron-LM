@@ -45,6 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -118,6 +119,7 @@ from megatron.rl.server.inference.inference_interface_server import InferenceInt
 from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
 from megatron.training.global_vars import (
     get_args,
+    get_run_config,
     get_tensorboard_writer,
     get_tokenizer,
     get_wandb_writer,
@@ -182,7 +184,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     with UVM or torch_memory_saver when enabled.
     """
     args = get_args()
-    if not args.rl_offload_inference_model_weights_when_idle:
+    if not args.rl_offload_inference_model_weights:
         return
 
     # Check for torch_memory_saver path (when offloading is enabled but UVM is not)
@@ -416,6 +418,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     Also logs metrics to wandb and stores them on RLRuntimeState for
     downstream consumers (e.g. RLProfiler).
     """
+    cfg = get_run_config()
     log_string = ''
     tokens_per_sec = None
     tokens_per_sec_per_gpu = None
@@ -496,7 +499,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
-    elif args.log_throughput:
+    elif cfg.logger.log_throughput:
         log_string += f' avg_seq_len: {args.seq_length} |'
 
     return log_string
@@ -3018,6 +3021,18 @@ def megatron_rl_inference_mode(
     model_core = unwrap_model(model[0])
     with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
+    if training_model is None and optimizer is not None:
+        # Complete parameter sync before inference bypasses training forward hooks.
+        with torch.no_grad(), nvtx_range("rl/synchronize-inference-parameters", time=True):
+            optimizer.prepare_model_params_for_param_sync()
+            for model_chunk in model:
+                # Non-overlapped gathers already completed in optimizer.step().
+                if (
+                    isinstance(model_chunk, DistributedDataParallel)
+                    and model_chunk.ddp_config.overlap_param_gather
+                ):
+                    model_chunk.start_param_sync(force_sync=True)
+
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
