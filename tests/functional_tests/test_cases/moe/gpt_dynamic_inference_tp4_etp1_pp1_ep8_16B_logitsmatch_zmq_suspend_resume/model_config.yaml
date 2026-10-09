@@ -83,9 +83,9 @@ MODEL_ARGS:
   --prompt-file: "./tests/functional_tests/test_cases/moe/gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq_suspend_resume/prompts.json"
   --suspend-resume-interval: 16
   --suspend-timeout: 4.0
-  --rl-kv-cache-management-mode: recompute
+  --inference-kv-cache-management-mode: recompute
   --inference-dynamic-batching-unified-memory-level: 0
-  --no-rl-persist-cuda-graphs: true
+  --no-inference-static-kv-memory-pointers: true
 
 METRICS:
 LAUNCHER: ft_launcher

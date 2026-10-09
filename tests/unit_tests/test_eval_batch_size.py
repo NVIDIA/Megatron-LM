@@ -34,7 +34,6 @@ def create_test_args(**overrides):
     args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
-    args.perform_rl_step = False
     args.phase_transition_iterations = None
     for key, val in overrides.items():
         setattr(args, key, val)
