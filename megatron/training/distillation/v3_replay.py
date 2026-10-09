@@ -4,14 +4,32 @@
 
 import bisect
 import concurrent.futures
+import json
+import queue
 import random
-from collections import OrderedDict
-from typing import Any, Callable
+import threading
+from typing import Any, Callable, Iterator
 
 import torch
 
-from .v3_format import BOUNDARY_FIELDS, TOKEN_FIELDS, decode, unpack_targets, validate_inputs
-from .v3_storage import Storage, read_members
+from .v3_format import (
+    BOUNDARY_FIELDS,
+    TOKEN_FIELDS,
+    decode,
+    mismatched_settings,
+    unpack_targets,
+    validate_inputs,
+)
+from .v3_storage import (
+    DEFAULT_CHUNK_BYTES,
+    META_MEMBER,
+    Storage,
+    complete_ranges,
+    iter_tar,
+    list_tars,
+    member_name,
+    tar_name,
+)
 
 
 def merged_boundaries(rows: list[torch.Tensor], sample_lengths: list[int]) -> torch.Tensor:
@@ -123,184 +141,312 @@ def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
     }
 
 
-def discover_groups(storage: Storage, metadata: dict) -> list[list[dict]]:
-    """Expose only complete, immutable teacher DP shard groups."""
-    groups = {}
-    for name in storage.list("dp*__*.tar.ready.json"):
+def discover_groups(
+    storage: Storage, metadata: dict
+) -> tuple[list[tuple[int, int]], tuple[int, int, int] | None]:
+    """List tar names once and return the contiguous published prefix.
+
+    A flush range is published when its inputs and targets tars exist for every
+    teacher DP rank. Returns ``(groups, hole)`` where ``groups`` are the published
+    ``(start, end)`` sample ranges from ``first_sample`` without a gap, and
+    ``hole`` is ``(gap_start, next_published_start, later_groups)`` when published
+    ranges exist beyond a gap (e.g. parallel dump jobs that are still writing).
+    """
+    ranges = complete_ranges(list_tars(storage), metadata["dp_size_save"])
+    gbs = metadata["gbs_save"]
+    previous = None
+    for start, end in ranges:
+        if end <= start or (end - start) % gbs:
+            raise ValueError(f"Offline KD v3 range {start}-{end} is not whole teacher iterations")
+        if previous is not None and start < previous[1]:
+            raise ValueError(f"Overlapping offline KD v3 ranges {previous} and {(start, end)}")
+        previous = (start, end)
+    by_start = dict(ranges)
+    groups = []
+    cursor = metadata["first_sample"]
+    while cursor in by_start:
+        groups.append((cursor, by_start[cursor]))
+        cursor = by_start[cursor]
+    later = [span for span in ranges if span[0] > cursor]
+    hole = (cursor, later[0][0], len(later)) if later else None
+    return groups, hole
+
+
+def describe_hole(hole: tuple[int, int, int] | None) -> str:
+    """Explain a gap in the published prefix."""
+    if hole is None:
+        return ""
+    gap_start, next_start, later = hole
+    return (
+        f"samples {gap_start}-{next_start} are not yet published, but {later} later range(s) "
+        "are; a parallel dump job may still be writing"
+    )
+
+
+class _Lane:
+    """Stream one teacher DP rank's tars in replay order, decoding a bounded window ahead.
+
+    Records are consumed in non-decreasing ``(group, record)`` order, so each tar
+    is read once, sequentially. Records before the first requested one are skipped
+    without decoding (resuming mid-range still streams their bytes).
+    """
+
+    def __init__(self, reader: "ReplayReader", dp_rank: int, group_index: int, record_index: int):
+        self.reader = reader
+        self.dp_rank = dp_rank
+        self.queue: queue.Queue = queue.Queue(maxsize=reader.prefetch_depth)
+        self.current = None
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            args=(group_index, record_index),
+            name=f"offline-kd-v3-dp{dp_rank}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _put(self, item: tuple) -> bool:
+        while not self.stopped.is_set():
+            try:
+                self.queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self, group_index: int, record_index: int) -> None:
         try:
-            descriptor = storage.read_json(name)
-        except FileNotFoundError:
-            # A resuming teacher may retire an incomplete, unreadable group
-            # between the listing and this read. Complete-prefix validation
-            # still detects removal of any previously consumed group.
-            continue
-        if descriptor["metadata"] != metadata:
-            raise ValueError("Offline KD v3 directory mixes incompatible cache generations")
-        records = descriptor["records"]
-        if not records:
-            raise ValueError("Empty offline KD shard descriptor")
-        key = (records[0]["start"], records[-1]["end"])
-        dp_rank = int(descriptor["tar"].split("__")[0][2:])
-        if dp_rank in groups.setdefault(key, {}):
-            raise ValueError("Duplicate offline KD shard for a saved DP rank")
-        groups[key][dp_rank] = descriptor
-    result = []
-    expected_start = metadata["first_sample"]
-    for (start, end), ranks in sorted(groups.items()):
-        if start < expected_start:
-            raise ValueError("Overlapping offline KD v3 shard groups")
-        if start != expected_start or set(ranks) != set(range(metadata["dp_size_save"])):
-            # Later groups may finish first. Never consume across a hole.
-            break
-        group = [ranks[rank] for rank in range(metadata["dp_size_save"])]
-        ranges = [(r["start"], r["end"]) for r in group[0]["records"]]
-        cursor = start
-        for a, b in ranges:
-            if a != cursor or b <= a:
-                raise ValueError("Offline KD record ranges are not contiguous")
-            cursor = b
-        if cursor != end or any(
-            [(r["start"], r["end"]) for r in d["records"]] != ranges for d in group
-        ):
-            raise ValueError("Offline KD DP descriptors disagree on iteration ranges")
-        for i, (a, b) in enumerate(ranges):
-            ids = [sid for d in group for sid in d["records"][i]["sample_ids"]]
-            if sorted(ids) != list(range(a, b)):
-                raise ValueError("Offline KD shard group has missing or duplicated samples")
-            mbs, dp = metadata["mbs_save"], metadata["dp_size_save"]
-            if (b - a) % (mbs * dp):
-                raise ValueError("Offline KD saved iteration has incomplete microbatches")
-            for rank, descriptor in enumerate(group):
-                expected_ids = [
-                    a + (mb * dp + rank) * mbs + row
-                    for mb in range((b - a) // (mbs * dp))
-                    for row in range(mbs)
-                ]
-                if descriptor["records"][i]["sample_ids"] != expected_ids:
+            index = group_index
+            while not self.stopped.is_set():
+                span = self.reader.wait_for_group(index, self.stopped)
+                if span is None:
+                    return
+                first = record_index if index == group_index else 0
+                for record, future in self._stream_group(index, span, first):
+                    if not self._put((index, record, future)):
+                        return
+                index += 1
+        except BaseException as error:  # Surface any failure to the consumer.
+            self._put((None, None, error))
+
+    def _stream_group(
+        self, index: int, span: tuple[int, int], first: int
+    ) -> Iterator[tuple[int, concurrent.futures.Future]]:
+        reader = self.reader
+        start, end = span
+        kinds = ("inputs", "targets") if reader.targets else ("inputs",)
+        streams = [
+            iter_tar(reader.storage, tar_name(self.dp_rank, start, end, kind), reader.chunk_bytes)
+            for kind in kinds
+        ]
+        try:
+            generations = set()
+            for kind, stream in zip(kinds, streams):
+                name, raw = next(stream, (None, None))
+                if name != META_MEMBER:
                     raise ValueError(
-                        "Offline KD sample IDs disagree with the saved DP/microbatch layout"
+                        f"Offline KD v3 tar for dp{self.dp_rank} {span} lacks metadata"
                     )
-        result.append(group)
-        expected_start = end
-    return result
+                generations.add(reader.check_meta(raw, kind, self.dp_rank, span))
+            if len(generations) != 1:
+                raise ValueError(
+                    f"Offline KD v3 inputs and targets for dp{self.dp_rank} {span} "
+                    "were written by different dump jobs"
+                )
+            generation = generations.pop()
+            for record, record_start in enumerate(range(start, end, reader.gbs)):
+                record_end = record_start + reader.gbs
+                payloads = []
+                for kind, stream in zip(kinds, streams):
+                    name, raw = next(stream, (None, None))
+                    if name != member_name(record_start, record_end, kind):
+                        raise ValueError(
+                            f"Offline KD v3 tar for dp{self.dp_rank} {span} has member {name}; "
+                            f"expected {member_name(record_start, record_end, kind)}"
+                        )
+                    payloads.append(raw)
+                if record < first:
+                    continue
+                yield record, reader.pool.submit(
+                    reader.decode_record,
+                    self.dp_rank,
+                    record_start,
+                    record_end,
+                    generation,
+                    *payloads,
+                )
+            for stream in streams:
+                if next(stream, None) is not None:
+                    raise ValueError(
+                        f"Offline KD v3 tar for dp{self.dp_rank} {span} has extra members"
+                    )
+        finally:
+            for stream in streams:
+                stream.close()
+
+    def record(self, group_index: int, record_index: int) -> tuple[dict, tuple | None]:
+        """Return a decoded record, advancing the stream as needed."""
+        wanted = (group_index, record_index)
+        while self.current is None or self.current[:2] < wanted:
+            item = self.queue.get()
+            if item[0] is None:
+                raise item[2]
+            self.current = item
+        if self.current[:2] != wanted:
+            raise RuntimeError(f"Offline KD v3 replay requested {wanted} after {self.current[:2]}")
+        return self.current[2].result()
+
+    def close(self) -> None:
+        """Stop streaming and release buffered records."""
+        self.stopped.set()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.current = None
 
 
 class ReplayReader:
-    """Read records with bounded decoding and one-shot discovery of newly published records."""
+    """Read records by logical replay position, streaming each teacher DP rank's tars."""
 
     def __init__(
         self,
         storage: Storage,
         metadata: dict,
-        groups: list[list[dict]],
+        groups: list[tuple[int, int]],
         *,
         targets: bool = True,
         shuffle: bool = False,
         seed: int = 0,
         decode_threads: int = 4,
-        refresh_groups: Callable[[], list[list[dict]]] | None = None,
+        prefetch_depth: int = 2,
+        chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     ):
         self.storage = storage
         self.metadata = metadata
-        self.groups = list(groups)
+        self.gbs = metadata["gbs_save"]
+        self.mbs = metadata["mbs_save"]
+        self.dp = metadata["dp_size_save"]
+        self.groups = [tuple(group) for group in groups]
         if shuffle:
             random.Random(seed).shuffle(self.groups)
         self.targets = targets
         self.shuffle = shuffle
-        self.refresh_groups = refresh_groups or (
-            lambda: discover_groups(self.storage, self.metadata)
+        self.prefetch_depth = max(1, prefetch_depth)
+        self.chunk_bytes = chunk_bytes
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, decode_threads), thread_name_prefix="offline-kd-v3-decode"
         )
-        self.decode_threads = max(1, decode_threads)
-        self._cache = OrderedDict()
+        self.lanes: dict[int, _Lane] = {}
+        self.closed = False
+        self.condition = threading.Condition()
         self._reindex()
 
     def _reindex(self) -> None:
         self.ends = []
         self.group_starts = []
-        self.records = []
         logical_start = 0
-        for group in self.groups:
-            records = group[0]["records"]
+        for start, end in self.groups:
             self.group_starts.append(logical_start)
-            # Index iterations, not one Python reference tuple per corpus sample.
-            self.records.append([record["end"] for record in records])
-            logical_start += records[-1]["end"] - records[0]["start"]
+            logical_start += end - start
             self.ends.append(logical_start)
 
     @property
     def total_samples(self) -> int:
-        """Number of currently published samples in replay order."""
+        """Number of currently available samples in replay order."""
         return self.ends[-1] if self.ends else 0
 
-    def ensure_available(self, end: int) -> None:
-        """Refresh sequential shards once at exhaustion, then fail if still short."""
-        if end <= self.total_samples:
-            return
-        if not self.shuffle:
-            fresh = self.refresh_groups()
-            if fresh[: len(self.groups)] != self.groups:
-                raise RuntimeError("Previously published offline KD data changed during replay")
-            self.groups = fresh
+    def extend(self, groups: list[tuple[int, int]]) -> None:
+        """Append newly published sequential groups (agreed collectively by all ranks)."""
+        if self.shuffle and groups:
+            raise RuntimeError("Shuffled offline KD replay cannot extend its group order")
+        with self.condition:
+            self.groups.extend(tuple(group) for group in groups)
             self._reindex()
+            self.condition.notify_all()
+
+    def wait_for_group(self, index: int, stopped: threading.Event) -> tuple[int, int] | None:
+        """Block a lane until group ``index`` is known, or return None at the end."""
+        with self.condition:
+            while index >= len(self.groups):
+                if self.closed or stopped.is_set() or self.shuffle:
+                    return None
+                self.condition.wait(timeout=0.5)
+            return self.groups[index]
+
+    def ensure_available(self, end: int) -> None:
+        """Fail if the collectively agreed frontier does not cover ``end``; never lists."""
         if end > self.total_samples:
             raise RuntimeError(
                 f"Offline KD cache exhausted at {self.total_samples} samples; requested {end}"
             )
 
-    def _decode_record(self, descriptor: dict, record: dict) -> tuple[dict, tuple | None]:
-        key = (record["start"], record["end"])
-        members = read_members(self.storage, descriptor, self.targets, {key})[key]
-        inputs = decode(members["inputs"], record["inputs"]["sha256"])
-        validate_inputs(inputs)
-        if (
-            inputs.get("record_id") != record["record_id"]
-            or inputs.get("sample_ids") != record["sample_ids"]
+    def check_meta(self, raw: bytes, kind: str, dp_rank: int, span: tuple[int, int]) -> str:
+        """Validate a tar's ``_meta.json`` against the cache and return its job generation."""
+        meta = json.loads(raw)
+        mismatched = mismatched_settings(meta, self.metadata)
+        if mismatched:
+            raise ValueError(
+                f"Offline KD v3 tar dp{dp_rank} {span[0]}-{span[1]} ({kind}) disagrees with the "
+                f"cache on {', '.join(mismatched)}; it was written by an incompatible dump job"
+            )
+        if (meta.get("kind"), meta.get("dp_rank"), meta.get("range")) != (
+            kind,
+            dp_rank,
+            list(span),
         ):
-            raise ValueError("Offline KD input record identity disagrees with its descriptor")
-        if inputs["sample_offsets"].numel() - 1 != len(record["sample_ids"]):
-            raise ValueError("Offline KD descriptor/input sample counts disagree")
+            raise ValueError(f"Offline KD v3 tar dp{dp_rank} {span} ({kind}) has wrong metadata")
+        return meta["generation"]
+
+    def decode_record(
+        self,
+        dp_rank: int,
+        start: int,
+        end: int,
+        generation: str,
+        raw_inputs: bytes,
+        raw_targets: bytes | None = None,
+    ) -> tuple[dict, tuple | None]:
+        """Decode and validate one teacher iteration's paired members."""
+        record_id = f"{generation}:dp{dp_rank}:{start}-{end}"
+        inputs = decode(raw_inputs)
+        validate_inputs(inputs)
+        if inputs.get("record_id") != record_id:
+            raise ValueError(f"Offline KD input record {inputs.get('record_id')} != {record_id}")
+        if inputs["sample_offsets"].numel() - 1 != (end - start) // self.dp:
+            raise ValueError(f"Offline KD record {record_id} has the wrong sample count")
         targets = None
-        if self.targets:
-            payload = decode(members["targets"], record["targets"]["sha256"])
-            if payload.get("record_id") != inputs["record_id"]:
+        if raw_targets is not None:
+            payload = decode(raw_targets)
+            if payload.get("record_id") != record_id:
                 raise ValueError("Offline KD inputs and targets belong to different records")
             targets = unpack_targets(payload)
-        if targets is not None and targets[0].shape[0] != inputs["tokens"].numel():
-            raise ValueError("Offline KD input/target token counts disagree")
+            if targets[0].shape[0] != inputs["tokens"].numel():
+                raise ValueError("Offline KD input/target token counts disagree")
         return inputs, targets
 
+    def _lane(self, dp_rank: int, group_index: int, record_index: int) -> _Lane:
+        lane = self.lanes.get(dp_rank)
+        if lane is None:
+            lane = self.lanes[dp_rank] = _Lane(self, dp_rank, group_index, record_index)
+        return lane
+
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
-        """Fetch selected records in logical replay order, decoding once per member."""
+        """Fetch samples at logical replay positions (non-decreasing across calls)."""
         self.ensure_available(available_end)
-        refs = []
-        pending = {}
+        samples = []
         for position in positions:
             group_index = bisect.bisect_right(self.ends, position)
-            group = self.groups[group_index]
-            sid = group[0]["records"][0]["start"] + position - self.group_starts[group_index]
-            record_index = bisect.bisect_right(self.records[group_index], sid)
-            start = group[0]["records"][record_index]["start"]
-            mbs, dp = self.metadata["mbs_save"], self.metadata["dp_size_save"]
-            offset = sid - start
-            descriptor = group[(offset // mbs) % dp]
-            record = descriptor["records"][record_index]
-            row = (offset // (mbs * dp)) * mbs + offset % mbs
-            key = (descriptor["tar"], record["start"])
-            refs.append((key, row, record["sample_ids"][row]))
-            if key not in self._cache:
-                pending[key] = (descriptor, record)
-        if pending:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.decode_threads) as pool:
-                futures = {
-                    key: pool.submit(self._decode_record, *source)
-                    for key, source in pending.items()
-                }
-                for key, future in futures.items():
-                    self._cache[key] = future.result()
-        samples = []
-        for key, row, sid in refs:
-            inputs, targets = self._cache[key]
-            self._cache.move_to_end(key)
+            start, _ = self.groups[group_index]
+            sid = start + position - self.group_starts[group_index]
+            record_index = (sid - start) // self.gbs
+            offset = sid - (start + record_index * self.gbs)
+            dp_rank = (offset // self.mbs) % self.dp
+            row = (offset // (self.mbs * self.dp)) * self.mbs + offset % self.mbs
+            inputs, targets = self._lane(dp_rank, group_index, record_index).record(
+                group_index, record_index
+            )
             a, b = inputs["sample_offsets"][row : row + 2].tolist()
             sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
             sample["sample_id"] = sid
@@ -311,15 +457,26 @@ class ReplayReader:
                     tensor[a:b] for tensor in targets
                 )
             samples.append(sample)
-        # Decode at most the current batch's source members plus a small reusable
-        # working set, not every payload in a multi-iteration tar group.
-        while len(self._cache) > max(len(pending), self.metadata["dp_size_save"], 1):
-            self._cache.popitem(last=False)
         return samples
 
+    def close(self) -> None:
+        """Stop all lanes and the decode pool."""
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        for lane in self.lanes.values():
+            lane.close()
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
-def collate_samples(samples: list[dict], seq_length: int) -> dict[str, Any]:
-    """Build a student CPU microbatch, shortening only non-packed prefixes."""
+
+def collate_samples(
+    samples: list[dict], seq_length: int, *, cp_size: int = 1, layout: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build a student CPU microbatch, shortening only non-packed prefixes.
+
+    Teacher targets are mapped into one ``[local_sequence, batch, K]`` shard per
+    student CP rank with exactly the token mapping used for the inputs.
+    """
     if not samples:
         raise ValueError("Cannot collate an empty offline KD microbatch")
     result = {}
@@ -356,8 +513,19 @@ def collate_samples(samples: list[dict], seq_length: int) -> dict[str, Any]:
     )
     result["_kd_sample_ids"] = [sample["sample_id"] for sample in samples]
     if "teacher_values" in samples[0]:
-        result["_kd_values"] = torch.stack([s["teacher_values"][:seq_length] for s in samples])
-        result["_kd_indices"] = torch.stack([s["teacher_indices"][:seq_length] for s in samples])
+        values = torch.cat([s["teacher_values"][:seq_length] for s in samples])
+        indices = torch.cat([s["teacher_indices"][:seq_length] for s in samples])
+        boundaries = {
+            "sample_offsets": torch.arange(len(samples) + 1, dtype=torch.int64) * seq_length
+        }
+        for field in BOUNDARY_FIELDS:
+            boundaries[field] = None if result[field] is None else [s[field] for s in samples]
+        shards = [
+            map_targets(values, indices, token_map(boundaries, rank, cp_size, **(layout or {})))
+            for rank in range(cp_size)
+        ]
+        result["_kd_values"] = [shard[0] for shard in shards]
+        result["_kd_indices"] = [shard[1] for shard in shards]
     return result
 
 
@@ -375,6 +543,8 @@ class ReplayIterator:
         seq_length: int,
         num_microbatches: Callable[[], int],
         prefetch: bool = False,
+        cp_size: int = 1,
+        layout: dict[str, Any] | None = None,
     ):
         self.reader = reader
         self.consumed = consumed
@@ -383,6 +553,8 @@ class ReplayIterator:
         self.mbs = micro_batch_size
         self.seq_length = seq_length
         self.num_microbatches = num_microbatches
+        self.cp_size = cp_size
+        self.layout = layout
         self._microbatch = 0
         self._count = 0
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if prefetch else None
@@ -391,35 +563,38 @@ class ReplayIterator:
     def __iter__(self) -> "ReplayIterator":
         return self
 
+    def _load(self, start: int, end: int) -> dict[str, Any]:
+        samples = self.reader.samples(list(range(start, start + self.mbs)), end)
+        return collate_samples(samples, self.seq_length, cp_size=self.cp_size, layout=self.layout)
+
     def __next__(self) -> dict[str, Any]:
         if self._microbatch == 0:
             self._count = self.num_microbatches()
         end = self.consumed + self._count * self.mbs * self.dp_size
         start = self.consumed + (self._microbatch * self.dp_size + self.dp_rank) * self.mbs
         if self._prefetched is None:
-            samples = self.reader.samples(list(range(start, start + self.mbs)), end)
+            batch = self._load(start, end)
         else:
-            samples = self._prefetched.result()
+            batch = self._prefetched.result()
             self._prefetched = None
-        batch = collate_samples(samples, self.seq_length)
         self._microbatch += 1
         if self._microbatch == self._count:
             self.consumed = end
             self._microbatch = 0
         elif self._executor is not None:
-            # Stay within this iteration: the next iteration's ramp-up count
-            # is determined only when Megatron updates its batch calculator.
+            # Stay within this iteration: the next iteration's ramp-up count is
+            # determined only when Megatron updates its batch calculator. The
+            # per-rank streams already decode ahead across iterations.
             next_start = self.consumed + (self._microbatch * self.dp_size + self.dp_rank) * self.mbs
-            self._prefetched = self._executor.submit(
-                self.reader.samples, list(range(next_start, next_start + self.mbs)), end
-            )
+            self._prefetched = self._executor.submit(self._load, next_start, end)
         return batch
 
     def close(self) -> None:
-        """Drain the bounded CPU prefetch worker when its loader is discarded."""
+        """Drain the prefetch worker and stop the reader's streams."""
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
+        self.reader.close()
 
     def __del__(self):
         if getattr(self, "_executor", None) is not None:

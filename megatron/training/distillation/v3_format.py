@@ -17,25 +17,51 @@ import zstandard
 FORMAT_VERSION = 3
 TOKEN_FIELDS = ("tokens", "labels", "position_ids", "loss_mask")
 BOUNDARY_FIELDS = ("cu_seqlens", "cu_seqlens_padded")
+# Settings every tar in a cache must share, whichever dump job wrote it.
+SHARED_KEYS = (
+    "format_version",
+    "first_sample",
+    "dp_size_save",
+    "mbs_save",
+    "gbs_save",
+    "cp_size_save",
+    "save_interval",
+    "train_budget",
+    "seq_length",
+    "sft",
+    "inter_document_masking",
+    "reset_attention_mask",
+    "tokenizer",
+    "padded_vocab_size",
+    "targets",
+    "dataset_identity",
+    "boundary_convention",
+)
+
+
+def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
+    """Return the shared settings on which two cache descriptions disagree."""
+    return [key for key in SHARED_KEYS if meta.get(key) != expected.get(key)]
 
 
 def digest(data: bytes) -> str:
-    """Return the integrity digest for an encoded member."""
+    """Return a stable fingerprint (used for tokenizer identity)."""
     return hashlib.sha256(data).hexdigest()
 
 
 def encode(payload: dict[str, Any]) -> bytes:
-    """Serialize tensors into one independently compressed tar member."""
+    """Serialize tensors into one zstd frame carrying its own content checksum."""
     stream = io.BytesIO()
     torch.save(payload, stream)
-    return zstandard.ZstdCompressor(level=3).compress(stream.getvalue())
+    return zstandard.ZstdCompressor(level=3, write_checksum=True).compress(stream.getvalue())
 
 
-def decode(data: bytes, expected_digest: str) -> dict[str, Any]:
-    """Validate a member before decoding its tensor-only payload."""
-    if digest(data) != expected_digest:
-        raise ValueError("Offline KD v3 member checksum mismatch")
-    raw = zstandard.ZstdDecompressor().decompress(data)
+def decode(data: bytes) -> dict[str, Any]:
+    """Verify the frame checksum while decompressing, then load the tensor-only payload."""
+    try:
+        raw = zstandard.ZstdDecompressor().decompress(data)
+    except zstandard.ZstdError as error:
+        raise ValueError(f"Offline KD v3 member checksum or framing error: {error}") from None
     result = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
     if result.get("format_version") != FORMAT_VERSION:
         raise ValueError("Expected an offline KD v3 payload")

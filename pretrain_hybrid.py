@@ -157,7 +157,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         if getattr(args, "logits_load_inputs", False) and "_kd_sample_ids" in batch:
             from megatron.training.distillation.v3_runtime import prepare_replay_batch
 
-            batch, kd_batch = prepare_replay_batch(batch, hybrid=True)
+            batch, kd_batch = prepare_replay_batch(batch)
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)

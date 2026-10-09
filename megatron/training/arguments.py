@@ -3677,14 +3677,21 @@ def _add_logits_distillation_args(parser):
     group.add_argument('--logits-load-inputs', action='store_true',
                        help='Use a v3 cache as the training dataset and KD target source.')
     group.add_argument('--logits-load-shuffle-shards', type=int, default=None, metavar='SEED',
-                       help='Shuffle completed v3 teacher DP shard groups using this seed.')
+                       help='Shuffle v3 teacher flush-range groups using this seed. The '
+                            'shuffled extent is fixed at the first launch and restored on '
+                            'resume.')
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
                        help='Number of decode threads for cached-logits zstd '
                             'decompression and torch.load processing.')
     group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
                        help='For MSC/object-storage logits tar shards, number '
                             'of whole tar shards to prefetch into the MSC '
-                            'cache ahead of sequential tar consumption.')
+                            'cache ahead of sequential tar consumption. For v3 '
+                            'replay, number of decoded teacher iterations each '
+                            'teacher-DP-rank stream keeps ahead.')
+    group.add_argument('--logits-load-read-chunk-mb', type=int, default=64,
+                       help='For v3 replay from MSC/object storage, size of each '
+                            'sequential ranged read (one request per chunk).')
     group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
                        help='KD loss alpha for loading logits. Total loss is calculated as '
                             'alpha * kd_loss + (1 - alpha) * lm_loss.')

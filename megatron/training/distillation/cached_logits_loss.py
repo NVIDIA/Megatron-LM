@@ -1394,6 +1394,45 @@ class CachedLogitsKDLoss:
 # ---------------------------------------------------------------------------
 
 
+def masked_loss_sum(losses: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    """Apply a (possibly fractional) loss mask to unreduced per-token losses."""
+    return torch.sum(losses.reshape(-1).float() * loss_mask.reshape(-1).float())
+
+
+def lm_loss_and_report(
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    """Return the masked LM loss, its token count, and the initial loss report."""
+    loss_lm = masked_loss_sum(output_tensor, loss_mask)
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
+    return loss_lm, num_tokens, report
+
+
+def add_kd_loss(
+    loss_lm: torch.Tensor,
+    num_tokens: torch.Tensor,
+    report: Dict[str, torch.Tensor],
+    kd_per_token: torch.Tensor,
+    loss_mask: torch.Tensor,
+    alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    """Reduce per-token sparse KD over TP, blend it with the LM loss, and report both.
+
+    Shared by cached-logits KD (v1/v2) and paired-input replay (v3), which differ
+    only in where the teacher targets come from.
+    """
+    loss_kd = masked_loss_sum(kd_per_token, loss_mask)
+    # Each TP rank holds the KD contribution of its vocabulary shard.
+    dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+    report["logits distillation loss"] = torch.cat(
+        [loss_kd.clone().detach().view(1), num_tokens.view(1)]
+    )
+    loss_total = (1 - alpha) * loss_lm + alpha * loss_kd
+    report["total loss"] = torch.cat([loss_total.clone().detach().view(1), num_tokens.view(1)])
+    return loss_total, num_tokens, report
+
+
 class LossFuncCallable:
     def __init__(
         self,
@@ -1411,13 +1450,6 @@ class LossFuncCallable:
         self.alpha = kd_loss_alpha
         self.ignore_errors = ignore_errors
         self.ignore_hash = ignore_hash
-
-    @staticmethod
-    def _mask_loss(output_tensor, loss_mask):
-        """Apply mask to the unreduced loss tensor."""
-        losses = output_tensor.view(-1).float()
-        loss_mask = loss_mask.reshape(-1).float()
-        return torch.sum(losses * loss_mask)
 
     def __call__(self, loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: LanguageModule):
         """Loss function wrapper for compatibility with Megatron LM training loop.
@@ -1437,9 +1469,7 @@ class LossFuncCallable:
             )
 
         # LM loss
-        loss_lm = self._mask_loss(output_tensor, loss_mask)
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-        report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
+        loss_lm, num_tokens, report = lm_loss_and_report(loss_mask, output_tensor)
 
         # Eval case
         if not model.training:
@@ -1456,10 +1486,9 @@ class LossFuncCallable:
                 )
             logits = logits_capture.pop()
 
-            loss_kd = self.kd_func(logits)
-            loss_kd = self._mask_loss(loss_kd, loss_mask)
-            # Requires extra TP reduction
-            dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+            return add_kd_loss(
+                loss_lm, num_tokens, report, self.kd_func(logits), loss_mask, self.alpha
+            )
         except StopIteration as e:
             # Last-PP ranks all hit this; keep the failure loud but avoid a
             # full traceback storm across TP×DP×CP.
@@ -1475,13 +1504,6 @@ class LossFuncCallable:
             logger.warning(
                 f">>>>>> KD LOSS FAILED — falling back to LM loss. {type(e).__name__}: {e} <<<<<<"
             )
+            report.pop("logits distillation loss", None)
+            report.pop("total loss", None)
             return loss_lm, num_tokens, report
-
-        report["logits distillation loss"] = torch.cat(
-            [loss_kd.clone().detach().view(1), num_tokens.view(1)]
-        )
-
-        loss_total = (1 - self.alpha) * loss_lm + self.alpha * loss_kd
-        report["total loss"] = torch.cat([loss_total.clone().detach().view(1), num_tokens.view(1)])
-
-        return loss_total, num_tokens, report

@@ -10,9 +10,12 @@ Megatron package's GPU initialization code.
 
 import argparse
 import ast
+import collections
 import importlib
+import json
 import sys
 import types
+import typing
 from pathlib import Path
 
 import pytest
@@ -42,56 +45,97 @@ def inputs(ids, length=8, packed=False):
     return batch
 
 
-def write_cache(
-    root, dp=2, mbs=2, gbs=8, iterations=4, bundle=2, packed=False, extra_metadata=None
-):
-    storage = Storage(str(root))
-    metadata = {
+def settings(dp=2, mbs=2, gbs=8, **overrides):
+    """Shared cache settings, as a dump job records them in every tar."""
+    result = {
         "format_version": 3,
-        "generation": "test-generation",
+        "first_sample": 0,
         "dp_size_save": dp,
         "mbs_save": mbs,
         "gbs_save": gbs,
-        "first_sample": 0,
+        "cp_size_save": 1,
+        "save_interval": 2,
+        "train_budget": 1024,
+        "seq_length": 8,
+        "sft": False,
+        "inter_document_masking": False,
+        "reset_attention_mask": False,
+        "tokenizer": None,
+        "padded_vocab_size": 3,
+        "targets": {"k": 1},
+        "dataset_identity": {"seed": 7},
+        "boundary_convention": "exact_dataset_boundaries_may_include_padding",
     }
-    metadata.update(extra_metadata or {})
-    storage.write_json(storage_module.CACHE_FILE, metadata)
-    for begin in range(0, iterations, bundle):
+    result.update(overrides)
+    return result
+
+
+def write_flush(storage, metadata, rank, begin, finish, *, packed=False, generation="gen"):
+    """Write one teacher DP rank's flush exactly as the saver does."""
+    dp, mbs, gbs = metadata["dp_size_save"], metadata["mbs_save"], metadata["gbs_save"]
+    members = {"inputs": [], "targets": []}
+    for iteration in range(begin, finish):
+        start, end = iteration * gbs, (iteration + 1) * gbs
+        ids = [
+            start + (mb * dp + rank) * mbs + j
+            for mb in range(gbs // (dp * mbs))
+            for j in range(mbs)
+        ]
+        captured = codec.capture_batch(inputs(ids, packed=packed))
+        target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
+        targets = codec.pack_targets(target_ids.float(), target_ids)
+        captured["record_id"] = targets["record_id"] = f"{generation}:dp{rank}:{start}-{end}"
+        for kind, payload in (("inputs", captured), ("targets", targets)):
+            members[kind].append(
+                (storage_module.member_name(start, end, kind), codec.encode(payload))
+            )
+    for kind in storage_module.KINDS:
+        meta = {
+            **metadata,
+            "generation": generation,
+            "kind": kind,
+            "dp_rank": rank,
+            "range": [begin * gbs, finish * gbs],
+        }
+        name = storage_module.tar_name(rank, begin * gbs, finish * gbs, kind)
+        storage_module.write_tar(storage, name, meta, members[kind])
+
+
+def write_cache(
+    root,
+    dp=2,
+    mbs=2,
+    gbs=8,
+    iterations=4,
+    bundle=2,
+    packed=False,
+    extra_metadata=None,
+    start=0,
+    generation="gen",
+):
+    storage = Storage(str(root))
+    metadata = settings(dp, mbs, gbs, **(extra_metadata or {}))
+    for begin in range(start, iterations, bundle):
         finish = min(begin + bundle, iterations)
         for rank in range(dp):
-            records = []
-            for iteration in range(begin, finish):
-                ids = [
-                    iteration * gbs + (mb * dp + rank) * mbs + j
-                    for mb in range(gbs // (dp * mbs))
-                    for j in range(mbs)
-                ]
-                captured = codec.capture_batch(inputs(ids, packed=packed))
-                target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
-                targets = codec.pack_targets(target_ids.float(), target_ids)
-                record_id = f'{metadata["generation"]}:dp{rank}:{iteration*gbs}-{(iteration+1)*gbs}'
-                captured["record_id"] = targets["record_id"] = record_id
-                captured["sample_ids"] = ids
-                records.append(
-                    {
-                        "start": iteration * gbs,
-                        "end": (iteration + 1) * gbs,
-                        "sample_ids": ids,
-                        "record_id": record_id,
-                        "inputs": codec.encode(captured),
-                        "targets": codec.encode(targets),
-                    }
+            name = storage_module.tar_name(rank, begin * gbs, finish * gbs, "inputs")
+            if not storage.exists(name):
+                write_flush(
+                    storage, metadata, rank, begin, finish, packed=packed, generation=generation
                 )
-            storage_module.write_shard(
-                storage, f"dp{rank}__{begin*gbs}-{finish*gbs}.tar", metadata, records
-            )
     return storage, metadata
 
 
+def groups(storage, metadata):
+    return replay.discover_groups(storage, metadata)[0]
+
+
 def reader(storage, metadata, **kwargs):
-    return replay.ReplayReader(
-        storage, metadata, replay.discover_groups(storage, metadata), **kwargs
-    )
+    return replay.ReplayReader(storage, metadata, groups(storage, metadata), **kwargs)
+
+
+def ids_of(samples):
+    return [s["sample_id"] for s in samples]
 
 
 def test_compact_inputs_preserve_labels_masks_and_positions():
@@ -101,8 +145,7 @@ def test_compact_inputs_preserve_labels_masks_and_positions():
     captured = codec.capture_batch(source)
     assert captured["tokens"].dtype == torch.int32
     assert captured["loss_mask"].dtype == torch.bool
-    raw = codec.encode(captured)
-    restored = codec.decode(raw, codec.digest(raw))
+    restored = codec.decode(codec.encode(captured))
     codec.validate_inputs(restored)
     assert restored["labels"][0] == -100
     assert restored["cu_seqlens"][1].tolist() == [0, 2, 8]
@@ -121,7 +164,7 @@ def test_fractional_mask_and_integer_overflow():
         codec.capture_batch(source)
 
 
-def test_17_bit_indices_and_checksums():
+def test_17_bit_indices_and_zstd_checksums():
     indices = torch.tensor([[0, 65535, 65536, 131071, -1]])
     values = torch.tensor([[0.0, -1.0, -2.0, -3.0, -1000.0]])
     encoded = codec.pack_targets(values, indices)
@@ -132,7 +175,22 @@ def test_17_bit_indices_and_checksums():
         codec.pack_targets(values, indices + (1 << 17))
     raw = codec.encode(encoded)
     with pytest.raises(ValueError, match="checksum"):
-        codec.decode(raw[:-1] + bytes([raw[-1] ^ 1]), codec.digest(raw))
+        codec.decode(raw[:-1] + bytes([raw[-1] ^ 1]))
+
+
+def test_tars_are_self_describing_and_immutable(tmp_path):
+    storage, metadata = write_cache(tmp_path)
+    assert storage.list("*") == sorted(
+        storage_module.tar_name(rank, a, b, kind)
+        for rank in range(2)
+        for a, b in ((0, 16), (16, 32))
+        for kind in ("inputs", "targets")
+    )
+    meta = storage_module.read_meta(storage, "dp1__16-32.targets.tar")
+    assert codec.mismatched_settings(meta, metadata) == []
+    assert (meta["kind"], meta["dp_rank"], meta["range"]) == ("targets", 1, [16, 32])
+    with pytest.raises(RuntimeError, match="replace published"):
+        storage_module.write_tar(storage, "dp1__16-32.targets.tar", meta, [])
 
 
 @pytest.mark.parametrize(
@@ -154,40 +212,41 @@ def test_resharding_and_prefix_shortening(
             seq_length=4,
             num_microbatches=lambda: gbs // (student_dp * student_mbs),
         )
-        for _ in range(2 * gbs // (student_dp * student_mbs)):
-            batch = next(iterator)
-            assert torch.equal(batch["tokens"], batch["_kd_indices"].squeeze(-1))
-            assert batch["tokens"].shape == (student_mbs, 4)
-            all_ids.extend(batch["_kd_sample_ids"])
+        try:
+            for _ in range(2 * gbs // (student_dp * student_mbs)):
+                batch = next(iterator)
+                assert torch.equal(batch["tokens"].T, batch["_kd_indices"][0].squeeze(-1))
+                assert batch["tokens"].shape == (student_mbs, 4)
+                all_ids.extend(batch["_kd_sample_ids"])
+        finally:
+            iterator.close()
     assert sorted(all_ids) == list(range(24))
 
 
 def test_rampup_changes_iteration_size_without_skips(tmp_path):
     storage, metadata = write_cache(tmp_path)
     count = [1]
-    iterator = replay.ReplayIterator(
-        reader(storage, metadata),
-        consumed=0,
-        dp_rank=0,
-        dp_size=1,
-        micro_batch_size=2,
-        seq_length=8,
-        num_microbatches=lambda: count[0],
-    )
+
+    def make(consumed, counter):
+        return replay.ReplayIterator(
+            reader(storage, metadata),
+            consumed=consumed,
+            dp_rank=0,
+            dp_size=1,
+            micro_batch_size=2,
+            seq_length=8,
+            num_microbatches=counter,
+        )
+
+    iterator = make(0, lambda: count[0])
     assert next(iterator)["_kd_sample_ids"] == [0, 1]
     count[0] = 3
     assert [next(iterator)["_kd_sample_ids"] for _ in range(3)] == [[2, 3], [4, 5], [6, 7]]
     assert iterator.consumed == 8
-    resumed = replay.ReplayIterator(
-        reader(storage, metadata),
-        consumed=8,
-        dp_rank=0,
-        dp_size=1,
-        micro_batch_size=2,
-        seq_length=8,
-        num_microbatches=lambda: 3,
-    )
+    iterator.close()
+    resumed = make(8, lambda: 3)
     assert next(resumed)["_kd_sample_ids"] == [8, 9]
+    resumed.close()
 
 
 def test_shuffle_is_deterministic_and_group_granular(tmp_path):
@@ -195,11 +254,13 @@ def test_shuffle_is_deterministic_and_group_granular(tmp_path):
     first = reader(storage, metadata, shuffle=True, seed=7)
     second = reader(storage, metadata, shuffle=True, seed=7)
     assert first.groups == second.groups
-    assert first.groups != replay.discover_groups(storage, metadata)
-    ids = [s["sample_id"] for s in first.samples(list(range(64)), 64)]
+    assert first.groups != groups(storage, metadata)
+    ids = ids_of(first.samples(list(range(64)), 64))
     assert sorted(ids) == list(range(64))
     for start in range(0, 64, 16):
         assert ids[start : start + 16] == list(range(ids[start], ids[start] + 16))
+    first.close()
+    second.close()
 
 
 def test_prefetch_stays_within_iteration_and_preserves_rampup(tmp_path):
@@ -227,95 +288,141 @@ def test_prefetch_stays_within_iteration_and_preserves_rampup(tmp_path):
         iterator.close()
 
 
-def test_missing_dp_group_is_not_published(tmp_path):
+@pytest.mark.parametrize("missing", ["dp1__0-16.targets.tar", "dp0__0-16.inputs.tar"])
+def test_range_is_published_only_when_every_rank_and_kind_exists(tmp_path, missing):
     storage, metadata = write_cache(tmp_path)
-    (tmp_path / "dp1__0-16.tar.ready.json").unlink()
-    assert replay.discover_groups(storage, metadata) == []
+    (tmp_path / missing).unlink()
+    found, hole = replay.discover_groups(storage, metadata)
+    assert found == []
+    assert hole == (0, 16, 1)
     with pytest.raises(RuntimeError, match="exhausted"):
         reader(storage, metadata).samples([0], 1)
 
 
-def test_sequential_refresh_discovers_new_groups(tmp_path, monkeypatch):
-    storage, metadata = write_cache(tmp_path, iterations=2)
-    live = replay.ReplayReader(storage, metadata, [])
-    assert live.samples([0], 1)[0]["sample_id"] == 0
-    write_cache(tmp_path, iterations=4)
-    assert live.samples([16], 17)[0]["sample_id"] == 16
-    assert live.total_samples == 32
+def test_hole_from_parallel_jobs_is_a_warning_until_filled(tmp_path):
+    # The job owning iterations 2-4 finishes before the one owning 0-2.
+    storage, metadata = write_cache(tmp_path, start=2, generation="job-b")
+    found, hole = replay.discover_groups(storage, metadata)
+    assert found == [] and hole == (0, 16, 1)
+    assert "parallel dump job may still be writing" in replay.describe_hole(hole)
+    write_cache(tmp_path, iterations=2, generation="job-a")
+    found, hole = replay.discover_groups(storage, metadata)
+    assert found == [(0, 16), (16, 32)] and hole is None
+    sequential_root = tmp_path / "sequential"
+    sequential, _ = write_cache(sequential_root)
+    parallel_reader = reader(storage, metadata)
+    sequential_reader = reader(sequential, metadata)
+    try:
+        for got, want in zip(
+            parallel_reader.samples(list(range(32)), 32),
+            sequential_reader.samples(list(range(32)), 32),
+        ):
+            assert got["sample_id"] == want["sample_id"]
+            assert torch.equal(got["tokens"], want["tokens"])
+            assert torch.equal(got["teacher_indices"], want["teacher_indices"])
+    finally:
+        parallel_reader.close()
+        sequential_reader.close()
 
 
-@pytest.mark.parametrize("incomplete", [False, True])
-def test_sequential_exhaustion_refreshes_once(tmp_path, monkeypatch, incomplete):
+def test_overlapping_ranges_are_rejected(tmp_path):
+    storage, metadata = write_cache(tmp_path)
+    write_cache(tmp_path / "other", iterations=3, bundle=3)
+    for path in list((tmp_path / "other").iterdir()):
+        path.rename(tmp_path / path.name)
+    with pytest.raises(ValueError, match="Overlapping"):
+        replay.discover_groups(storage, metadata)
+
+
+def test_sequential_reader_extends_with_new_groups(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
     live = reader(storage, metadata)
-    if incomplete:
-        write_cache(tmp_path, iterations=4)
-        (tmp_path / "dp1__16-32.tar.ready.json").unlink()
-    calls = []
-    discover = replay.discover_groups
-
-    def counted(*args):
-        calls.append(args)
-        return discover(*args)
-
-    monkeypatch.setattr(replay, "discover_groups", counted)
-    live.ensure_available(16)
-    assert not calls
+    assert ids_of(live.samples([0], 1)) == [0]
+    write_cache(tmp_path, iterations=4)
     with pytest.raises(RuntimeError, match="exhausted at 16 samples; requested 17"):
         live.ensure_available(17)
-    assert len(calls) == 1
+    live.extend(groups(storage, metadata)[1:])
+    assert ids_of(live.samples([16], 17)) == [16]
+    assert live.total_samples == 32
+    live.close()
 
 
-def test_shuffle_exhaustion_does_not_extend_cache(tmp_path, monkeypatch):
+def test_shuffled_reader_never_extends(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
     shuffled = reader(storage, metadata, shuffle=True)
-    write_cache(tmp_path, iterations=4)
-
-    def unexpected(*args):
-        raise AssertionError("Shuffled loading must retain its original groups")
-
-    monkeypatch.setattr(replay, "discover_groups", unexpected)
-    with pytest.raises(RuntimeError, match="exhausted"):
-        shuffled.ensure_available(17)
+    with pytest.raises(RuntimeError, match="cannot extend"):
+        shuffled.extend([(16, 32)])
+    shuffled.close()
 
 
-def test_sequential_refresh_rejects_changed_prefix(tmp_path):
-    storage, metadata = write_cache(tmp_path, iterations=2)
-    live = reader(storage, metadata)
-    (tmp_path / "dp1__0-16.tar.ready.json").unlink()
-    with pytest.raises(RuntimeError, match="Previously published"):
-        live.ensure_available(17)
-
-
-def test_published_shards_are_immutable_and_input_only_reads_skip_targets(tmp_path):
+def test_input_only_readers_never_open_targets(tmp_path, monkeypatch):
     storage, metadata = write_cache(tmp_path)
-    group = replay.discover_groups(storage, metadata)[0]
-    members = storage_module.read_members(storage, group[0], False)
-    assert all(set(value) == {"inputs"} for value in members.values())
-    descriptor = group[0]
-    records = []
-    for r in descriptor["records"]:
-        records.append(
-            {
-                "start": r["start"],
-                "end": r["end"],
-                "sample_ids": r["sample_ids"],
-                "record_id": r["record_id"],
-                "inputs": b"replacement",
-                "targets": b"replacement",
-            }
-        )
-    with pytest.raises(RuntimeError, match="replace published"):
-        storage_module.write_shard(storage, descriptor["tar"], metadata, records)
+    opened = []
+    original = storage_module.iter_tar
+
+    def recording(storage, name, chunk_bytes=storage_module.DEFAULT_CHUNK_BYTES):
+        opened.append(name)
+        return original(storage, name, chunk_bytes)
+
+    monkeypatch.setattr(replay, "iter_tar", recording)
+    live = reader(storage, metadata, targets=False)
+    samples = live.samples(list(range(32)), 32)
+    live.close()
+    assert ids_of(samples) == list(range(32))
+    assert "teacher_values" not in samples[0]
+    assert opened and all(name.endswith(".inputs.tar") for name in opened)
+
+
+def test_mismatched_tar_is_rejected_before_any_record_is_used(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2)
+    write_cache(tmp_path, iterations=4, extra_metadata={"seq_length": 16}, generation="bad")
+    live = reader(storage, metadata)
+    assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
+    with pytest.raises(ValueError, match="seq_length"):
+        live.samples([16], 17)
+    live.close()
+
+
+def test_inputs_and_targets_from_different_jobs_are_rejected(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2)
+    other, _ = write_cache(tmp_path / "other", iterations=2, generation="other")
+    (tmp_path / "other" / "dp0__0-16.targets.tar").replace(tmp_path / "dp0__0-16.targets.tar")
+    live = reader(storage, metadata)
+    with pytest.raises(ValueError, match="different dump jobs"):
+        live.samples([0], 1)
+    live.close()
 
 
 def test_packed_shortening_rejected_and_collation_preserves_boundaries(tmp_path):
     storage, metadata = write_cache(tmp_path, packed=True)
-    samples = reader(storage, metadata).samples([0, 1], 2)
+    live = reader(storage, metadata)
+    samples = live.samples([0, 1], 2)
+    live.close()
     with pytest.raises(ValueError, match="prefix shortening"):
         replay.collate_samples(samples, 4)
     result = replay.collate_samples(samples, 8)
     assert result["cu_seqlens"].tolist() == [[0, 4, 8], [0, 4, 8]]
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_collation_maps_targets_for_every_cp_rank(tmp_path, packed):
+    storage, metadata = write_cache(tmp_path, packed=packed)
+    live = reader(storage, metadata)
+    samples = live.samples([0, 1], 2)
+    live.close()
+    result = replay.collate_samples(samples, 8, cp_size=2)
+    captured = codec.capture_batch(
+        {
+            key: result[key]
+            for key in ("tokens", "labels", "position_ids", "loss_mask", "cu_seqlens")
+            if result[key] is not None
+        }
+    )
+    for rank in range(2):
+        mapping = replay.token_map(captured, rank, 2)
+        assert torch.equal(
+            result["_kd_indices"][rank].squeeze(-1), captured["tokens"][mapping].long()
+        )
 
 
 @pytest.mark.parametrize(
@@ -392,6 +499,57 @@ def test_corrupt_sample_offsets_are_rejected():
         codec.validate_inputs(captured)
 
 
+class _CountingRemote:
+    """A remote-like storage view over local files that counts ranged reads."""
+
+    remote = True
+
+    def __init__(self, root):
+        self.local = Storage(str(root))
+        self.reads = []
+
+    def size(self, name):
+        return self.local.size(name)
+
+    def read_range(self, name, offset, size):
+        self.reads.append((name, offset, size))
+        return self.local.read_range(name, offset, size)
+
+
+@pytest.mark.parametrize("chunk", [1 << 10, 4 << 10, 1 << 20])
+def test_chunked_remote_reads_issue_one_request_per_chunk(tmp_path, chunk):
+    storage, _ = write_cache(tmp_path, iterations=2)
+    name = "dp0__0-16.targets.tar"
+    remote = _CountingRemote(tmp_path)
+    streamed = list(storage_module.iter_tar(remote, name, chunk))
+    assert streamed == list(storage_module.iter_tar(storage, name))
+    size = storage.size(name)
+    # Sequential, non-overlapping chunk-sized requests; trailing tar padding may go unread.
+    assert [offset for _, offset, _ in remote.reads] == [
+        index * chunk for index in range(len(remote.reads))
+    ]
+    assert all(length == min(chunk, size - offset) for _, offset, length in remote.reads)
+    assert len(remote.reads) <= -(-size // chunk)
+    remote.reads.clear()
+    assert storage_module.read_meta(remote, name)["kind"] == "targets"
+    assert len(remote.reads) == 1
+
+
+def test_discard_unpublished_only_touches_its_own_range(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=6)
+    (tmp_path / "dp1__16-32.targets.tar").unlink()
+    (tmp_path / "dp0__16-32.inputs.tar.0123456789abcdef0123456789abcdef.tmp").write_bytes(b"x")
+    removed = storage_module.discard_unpublished(storage, 16, 32)
+    assert sorted(removed) == [
+        "dp0__16-32.inputs.tar",
+        "dp0__16-32.inputs.tar.0123456789abcdef0123456789abcdef.tmp",
+        "dp0__16-32.targets.tar",
+        "dp1__16-32.inputs.tar",
+    ]
+    # Another job's range (32-48) is untouched.
+    assert len(storage.list("dp*__32-48.*.tar")) == 4
+
+
 @pytest.fixture
 def runtime_environment(monkeypatch):
     """Provide CPU process-group boundaries, retaining actual codec/replay code."""
@@ -402,6 +560,9 @@ def runtime_environment(monkeypatch):
         logits_load_dir=None,
         logits_load_shuffle_shards=7,
         logits_load_decode_threads=2,
+        logits_load_msc_prefetch_depth=2,
+        logits_load_read_chunk_mb=1,
+        logits_load_replay_end=None,
         seq_length=8,
         context_parallel_size=1,
         consumed_train_samples=0,
@@ -412,8 +573,18 @@ def runtime_environment(monkeypatch):
         tensor_model_parallel_size=1,
         sequence_parallel=False,
         micro_batch_size=2,
+        global_batch_size=8,
         logits_load_kd_loss_alpha=0.9,
         padded_vocab_size=3,
+        save="/progress",
+        save_interval=2,
+        exit_interval=None,
+        train_iters=128,
+        train_samples=None,
+        freeze_all_layers=True,
+        load="original-weights",
+        override_ckpt_iteration=None,
+        iterations_to_skip=[],
     )
     training = types.ModuleType("megatron.training")
     training.get_args = lambda: args
@@ -428,10 +599,14 @@ def runtime_environment(monkeypatch):
         get_tensor_model_parallel_group=lambda: None,
         get_tensor_model_parallel_src_rank=lambda: 0,
         get_context_parallel_rank=lambda: 0,
+        get_data_parallel_rank=lambda: 0,
+        get_data_parallel_world_size=lambda: 2,
+        is_pipeline_first_stage=lambda: True,
         is_pipeline_last_stage=lambda: True,
     )
     calculator = types.ModuleType("megatron.core.num_microbatches_calculator")
     calculator.get_num_microbatches = lambda: 2
+    calculator.get_current_global_batch_size = lambda: args.global_batch_size
     for name, module in (
         ("megatron", types.ModuleType("megatron")),
         ("megatron.training", training),
@@ -442,9 +617,15 @@ def runtime_environment(monkeypatch):
     legacy_saver = types.ModuleType(f"{_namespace}.logits_saver")
     legacy_saver.LogitsSaverHooks = object
     monkeypatch.setitem(sys.modules, legacy_saver.__name__, legacy_saver)
+    utils = types.ModuleType(f"{_namespace}.utils")
+    utils._broadcast_without_pp = lambda factory: factory()
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
     runtime = importlib.import_module(f"{_namespace}.v3_runtime")
     runtime._PLAN = None
     yield args, runtime, legacy_saver
+    if runtime._PLAN is not None:
+        for live in runtime._PLAN["readers"]:
+            live.close()
     runtime._PLAN = None
 
 
@@ -462,7 +643,7 @@ def test_single_shuffle_argument_parses_enablement_and_seed(seed):
     argv = [] if seed is None else ["--logits-load-shuffle-shards", str(seed)]
     args = parser.parse_args(argv)
     assert args.logits_load_shuffle_shards == seed
-    assert not hasattr(args, "logits_load_shuffle_seed")
+    assert args.logits_load_read_chunk_mb == 64
     with pytest.raises(SystemExit):
         parser.parse_args(["--logits-load-shuffle-shards"])
 
@@ -476,159 +657,240 @@ def test_shuffle_seed_requires_replay(runtime_environment, seed):
         runtime.validate_options(args)
 
 
-def replay_cache(tmp_path, args, runtime, *, completed=True, generation="test-generation"):
-    """Create a runtime-compatible cache, optionally publishing completion."""
-    extra = {
-        "generation": generation,
-        "tokenizer": runtime.tokenizer_identity(),
-        "seq_length": 8,
-        "sft": False,
-        "inter_document_masking": False,
-        "reset_attention_mask": False,
-        "padded_vocab_size": 3,
-    }
-    storage, metadata = write_cache(tmp_path, extra_metadata=extra)
-    if completed:
-        storage.write_json(
-            storage_module.COMPLETE_FILE, {"generation": metadata["generation"], "end_sample": 32}
-        )
+def dump_args(args):
+    args.logits_load_inputs = False
+    args.logits_load_shuffle_shards = None
+    args.logits_save_inputs = True
+    args.logits_save_dir = "/dump"
+    args.sequence_packing_scheduler = args.hybrid_context_parallel = args.use_varlen_dataset = False
+    args.mtp_num_layers = None
+    return args
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"iterations_to_skip": [5]}, "iterations-to-skip"),
+        ({"allow_ambiguous_pad_tokens": True}, "ambiguous-pad"),
+        ({"save_interval": None}, "save-interval"),
+        ({"exit_interval": 3}, "exit-interval to be a multiple"),
+        ({"override_ckpt_iteration": 3}, "override-ckpt-iteration to be a multiple"),
+    ],
+)
+def test_dump_validation_rejects_unsafe_options(runtime_environment, change, message):
+    args, runtime, _ = runtime_environment
+    dump_args(args)
+    args.exit_interval = 4
+    args.override_ckpt_iteration = 4
+    runtime.validate_options(args)
+    for key, value in change.items():
+        setattr(args, key, value)
+    with pytest.raises(ValueError, match=message):
+        runtime.validate_options(args)
+
+
+def replay_cache(tmp_path, args, runtime, *, iterations=4, generation="gen"):
+    """Create a runtime-compatible cache."""
+    extra = {"tokenizer": runtime.tokenizer_identity()}
+    storage, metadata = write_cache(
+        tmp_path, iterations=iterations, extra_metadata=extra, generation=generation
+    )
     args.logits_load_dir = str(tmp_path)
     return storage, metadata
 
 
-def test_loader_enables_shuffling_with_seed_zero(tmp_path, runtime_environment, monkeypatch):
+def build_loader_iterator(runtime, args, consumed):
+    loader = runtime.build_replay_loader(args, consumed=consumed)
+    return iter(loader.dataset)
+
+
+def test_loader_enables_shuffling_with_seed_zero(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     args.logits_load_shuffle_shards = 0
-    storage, metadata = replay_cache(tmp_path, args, runtime)
-    write_cache(tmp_path, iterations=8, extra_metadata=metadata)
-    storage.write_json(
-        storage_module.COMPLETE_FILE, {"generation": metadata["generation"], "end_sample": 64}
-    )
+    storage, metadata = replay_cache(tmp_path, args, runtime, iterations=8)
     runtime.initialize_replay(args)
-    mpu = sys.modules["megatron.core"].parallel_state
-    monkeypatch.setattr(mpu, "is_pipeline_first_stage", lambda: True, raising=False)
-    monkeypatch.setattr(mpu, "get_data_parallel_rank", lambda: 0, raising=False)
-    monkeypatch.setattr(mpu, "get_data_parallel_world_size", lambda: 1, raising=False)
-    loader = runtime.build_replay_loader(args, consumed=0)
-    iterator = iter(loader.dataset)
+    iterator = build_loader_iterator(runtime, args, 0)
     expected = reader(storage, metadata, shuffle=True, seed=0)
     try:
         assert iterator.reader.groups == expected.groups
-        assert iterator.reader.groups != replay.discover_groups(storage, metadata)
-        assert next(iterator)["_kd_sample_ids"] == [
-            s["sample_id"] for s in expected.samples([0, 1], 4)
-        ]
+        assert iterator.reader.groups != groups(storage, metadata)
+        batch = next(iterator)
+        assert batch["_kd_sample_ids"] == ids_of(expected.samples([0, 1], 4))
+        assert torch.is_tensor(batch["_kd_values"])  # This CP rank's shard only.
     finally:
         iterator.close()
+        expected.close()
 
 
-def test_completed_cache_resume_uses_seed_and_standard_sample_cursor(tmp_path, runtime_environment):
+def test_shuffled_resume_reuses_the_checkpointed_extent(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     storage, metadata = replay_cache(tmp_path, args, runtime)
     before = set(storage.list("*"))
     runtime.initialize_replay(args)
-    expected = [
-        s["sample_id"] for s in reader(storage, metadata, shuffle=True, seed=7).samples([8, 9], 10)
-    ]
+    assert args.logits_load_replay_end == 32
+    expected_reader = reader(storage, metadata, shuffle=True, seed=7)
+    expected = ids_of(expected_reader.samples([8, 9], 10))
+    expected_reader.close()
+    assert set(storage.list("*")) == before  # Students need only read access.
+    # The teacher keeps publishing; a resume must still shuffle the original extent.
+    replay_cache(tmp_path, args, runtime, iterations=8)
     args.consumed_train_samples = 8
     runtime._PLAN = None
     runtime.initialize_replay(args)
-    iterator = replay.ReplayIterator(
-        reader(storage, metadata, shuffle=True, seed=7),
-        consumed=args.consumed_train_samples,
-        dp_rank=0,
-        dp_size=1,
-        micro_batch_size=2,
-        seq_length=8,
-        num_microbatches=lambda: 1,
-    )
-    assert next(iterator)["_kd_sample_ids"] == expected
-    assert not hasattr(args, "offline_kd_cache_generation")
-    assert not hasattr(args, "offline_kd_replay_state")
-    assert set(storage.list("*")) == before  # Students need only read access to cache storage.
+    assert runtime._PLAN["groups"] == [(0, 16), (16, 32)]
+    iterator = build_loader_iterator(runtime, args, args.consumed_train_samples)
+    try:
+        assert next(iterator)["_kd_sample_ids"] == expected
+    finally:
+        iterator.close()
 
 
-@pytest.mark.parametrize("seed", [0, 7])
-def test_shuffling_requires_completed_cache(tmp_path, runtime_environment, seed):
+def test_shuffled_resume_requires_the_planned_extent(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
-    replay_cache(tmp_path, args, runtime, completed=False)
-    args.logits_load_shuffle_shards = seed
-    with pytest.raises(RuntimeError, match="requires a completed cache"):
+    replay_cache(tmp_path, args, runtime)
+    args.logits_load_replay_end = 48
+    with pytest.raises(RuntimeError, match="planned over samples up to 48"):
         runtime.initialize_replay(args)
 
 
-@pytest.mark.parametrize("failure", ["generation", "range", "missing_dp"])
-def test_completion_marker_must_match_published_cache(tmp_path, runtime_environment, failure):
-    args, runtime, _ = runtime_environment
-    storage, metadata = replay_cache(tmp_path, args, runtime)
-    complete = storage.read_json(storage_module.COMPLETE_FILE)
-    if failure == "generation":
-        complete["generation"] = "wrong-generation"
-    elif failure == "range":
-        complete["end_sample"] += 8
-    else:
-        (tmp_path / "dp1__16-32.tar.ready.json").unlink()
-    storage.write_json(storage_module.COMPLETE_FILE, complete)
-    with pytest.raises(RuntimeError, match="completion marker disagrees"):
-        runtime.initialize_replay(args)
-
-
-def test_sequential_resume_discovers_new_groups_without_checkpoint_manifest(
-    tmp_path, runtime_environment
-):
+def test_sequential_resume_sees_new_groups(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     args.logits_load_shuffle_shards = None
-    storage, metadata = replay_cache(tmp_path, args, runtime, completed=False)
+    storage, metadata = replay_cache(tmp_path, args, runtime)
     runtime.initialize_replay(args)
     args.consumed_train_samples = 16
-    write_cache(tmp_path, iterations=6, extra_metadata=metadata)
+    replay_cache(tmp_path, args, runtime, iterations=6)
     runtime._PLAN = None
     runtime.initialize_replay(args)
-    assert reader(storage, metadata).total_samples == 48
-    assert reader(storage, metadata).samples([16], 17)[0]["sample_id"] == 16
-    assert not hasattr(args, "offline_kd_replay_state")
+    assert runtime._PLAN["available"] == 48
+    assert args.logits_load_replay_end is None
 
 
 def test_resume_validates_sample_cursor(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     replay_cache(tmp_path, args, runtime)
-    runtime.initialize_replay(args)
     args.consumed_train_samples = 40
-    runtime._PLAN = None
-    with pytest.raises(RuntimeError, match="cursor exceeds"):
+    with pytest.raises(RuntimeError, match="cursor 40 exceeds"):
+        runtime.initialize_replay(args)
+
+
+def test_student_rejects_incompatible_cache(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    replay_cache(tmp_path, args, runtime)
+    args.padded_vocab_size = 5
+    with pytest.raises(RuntimeError, match="padded vocabulary"):
         runtime.initialize_replay(args)
 
 
 @pytest.mark.parametrize("shuffle", [False, True])
-def test_resume_can_switch_to_replacement_dump(tmp_path, runtime_environment, shuffle):
+def test_resume_can_switch_to_identically_dumped_replacement(
+    tmp_path, runtime_environment, shuffle
+):
     args, runtime, _ = runtime_environment
     args.logits_load_shuffle_shards = 7 if shuffle else None
     original, metadata = replay_cache(tmp_path / "original", args, runtime)
     runtime.initialize_replay(args)
-    expected = [
-        s["sample_id"]
-        for s in reader(original, metadata, shuffle=shuffle, seed=7).samples([8, 9], 10)
-    ]
+    original_reader = reader(original, metadata, shuffle=shuffle, seed=7)
+    expected = ids_of(original_reader.samples([8, 9], 10))
+    original_reader.close()
     args.consumed_train_samples = 8
-    replacement, replacement_metadata = replay_cache(
-        tmp_path / "replacement", args, runtime, generation="replacement-generation"
-    )
+    replay_cache(tmp_path / "replacement", args, runtime, generation="replacement")
     runtime._PLAN = None
     runtime.initialize_replay(args)
-    assert runtime._PLAN["metadata"]["generation"] != metadata["generation"]
-    iterator = replay.ReplayIterator(
-        reader(replacement, replacement_metadata, shuffle=shuffle, seed=7),
-        consumed=args.consumed_train_samples,
-        dp_rank=0,
-        dp_size=1,
-        micro_batch_size=2,
-        seq_length=8,
-        num_microbatches=lambda: 1,
+    iterator = build_loader_iterator(runtime, args, args.consumed_train_samples)
+    try:
+        batch = next(iterator)
+        assert batch["_kd_sample_ids"] == expected
+        assert torch.equal(batch["tokens"].T, batch["_kd_indices"].squeeze(-1))
+    finally:
+        iterator.close()
+
+
+def test_frontier_is_collective_and_errors_together(tmp_path, runtime_environment, monkeypatch):
+    args, runtime, _ = runtime_environment
+    args.logits_load_shuffle_shards = None
+    storage, metadata = replay_cache(tmp_path, args, runtime, iterations=2)
+    runtime.initialize_replay(args)
+    live = reader(storage, metadata)
+    runtime._PLAN["readers"].append(live)
+    listings = []
+    original = runtime.discover_groups
+    monkeypatch.setattr(runtime, "discover_groups", lambda *a: listings.append(a) or original(*a))
+    args.consumed_train_samples = 8
+    runtime.ensure_replay_frontier(args)  # 8 + 8 <= 16: no listing.
+    assert not listings
+    replay_cache(tmp_path, args, runtime, iterations=4)
+    args.consumed_train_samples = 16
+    runtime.ensure_replay_frontier(args)
+    assert len(listings) == 1
+    assert runtime._PLAN["available"] == 32 and live.total_samples == 32
+    # A hole: the next range's owner has not published yet; every rank raises the same error.
+    write_cache(
+        tmp_path, start=6, iterations=8, extra_metadata={"tokenizer": metadata["tokenizer"]}
     )
-    batch = next(iterator)
-    assert batch["_kd_sample_ids"] == expected
-    assert torch.equal(batch["tokens"], batch["_kd_indices"].squeeze(-1))
-    assert not hasattr(args, "offline_kd_cache_generation")
+    args.consumed_train_samples = 32
+    payload = []
+
+    def broadcast(result, src):
+        if payload:
+            result[:] = payload
+        else:
+            payload[:] = result
+
+    monkeypatch.setattr(runtime.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(runtime.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(runtime.dist, "broadcast_object_list", broadcast)
+    with pytest.raises(RuntimeError, match="exhausted at 32 samples; requested 40.*parallel dump"):
+        runtime.ensure_replay_frontier(args)
+    monkeypatch.setattr(runtime.dist, "get_rank", lambda: 1)  # A peer receives the same plan.
+    with pytest.raises(RuntimeError, match="exhausted at 32 samples; requested 40"):
+        runtime.ensure_replay_frontier(args)
+    assert len(listings) == 2
+
+
+def test_frontier_rejects_changed_published_prefix(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    args.logits_load_shuffle_shards = None
+    replay_cache(tmp_path, args, runtime, iterations=2)
+    runtime.initialize_replay(args)
+    (tmp_path / "dp1__0-16.inputs.tar").unlink()
+    args.consumed_train_samples = 16
+    with pytest.raises(RuntimeError, match="Previously published"):
+        runtime.ensure_replay_frontier(args)
+
+
+def test_context_parallel_replay_scatters_shards_and_errors(runtime_environment, monkeypatch):
+    _, runtime, _ = runtime_environment
+    mpu = sys.modules["megatron.core"].parallel_state
+    mpu.get_context_parallel_group = lambda: "cp"
+    monkeypatch.setattr(runtime.dist, "get_global_rank", lambda group, rank: 11)
+    sent = []
+
+    def scatter(output, payload, src, group):
+        assert (src, group) == (11, "cp")
+        if payload is not None:
+            sent[:] = payload
+        output[0] = sent[rank[0]]
+
+    monkeypatch.setattr(runtime.dist, "scatter_object_list", scatter)
+    batch = {"tokens": torch.zeros(1), "_kd_values": ["v0", "v1"], "_kd_indices": ["i0", "i1"]}
+    rank = [0]
+    sender = runtime._ContextParallelReplay(iter([batch]), 0, 2)
+    assert next(sender)["_kd_values"] == "v0"
+    rank[0] = 1
+    receiver = runtime._ContextParallelReplay(None, 1, 2)
+    assert next(receiver)["_kd_indices"] == "i1"
+
+    def broken():
+        raise ValueError("corrupt tar")
+        yield
+
+    rank[0] = 0
+    with pytest.raises(RuntimeError, match="corrupt tar"):
+        next(runtime._ContextParallelReplay(broken(), 0, 2))
+    rank[0] = 1
+    with pytest.raises(RuntimeError, match="corrupt tar"):
+        next(receiver)
 
 
 @pytest.mark.parametrize(
@@ -660,59 +922,114 @@ def test_standard_checkpoint_arg_checks_reject_replay_option_changes(runtime_env
         namespace["check_checkpoint_args"](saved)
 
 
-def test_incomplete_groups_can_be_regenerated_without_replacing_published_data(tmp_path):
-    storage, metadata = write_cache(tmp_path)
-    (tmp_path / "dp1__16-32.tar.ready.json").unlink()
-    immutable = (tmp_path / "dp0__0-16.tar.ready.json").read_bytes()
-    storage_module.quarantine_unpublished(storage, 16)
-    assert len(storage.list("*.ready.json")) == 2
-    assert len(storage.list("*.aborted.*")) == 2
-    assert (tmp_path / "dp0__0-16.tar.ready.json").read_bytes() == immutable
-    write_cache(tmp_path)
-    assert reader(storage, metadata).total_samples == 32
+def teacher_saver(runtime, tmp_path, dp_size=2):
+    return types.SimpleNamespace(
+        dp_size=dp_size,
+        cp_size=1,
+        metadata_dict={"saver": {"k": 1}, "identifiers": {"seed": 7}},
+        save_dir=str(tmp_path),
+    )
 
 
-def test_teacher_metadata_restore_checks_publication_cursor(
-    tmp_path, runtime_environment, monkeypatch
+def teacher_cache(tmp_path, runtime, args, **kwargs):
+    saver = teacher_saver(runtime, tmp_path)
+    shared = runtime._dump_settings(saver)
+    shared["first_sample"] = kwargs.pop("first_sample", 0)
+    return write_cache(tmp_path, extra_metadata=shared, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "override,exit_interval,expected",
+    [
+        (None, None, (None, 128)),
+        (4, 4, (4, 8)),
+        (6, 4, (6, 8)),
+        (124, 8, (124, 128)),
+        (4, None, (4, 128)),
+    ],
+)
+def test_dump_range_uses_override_and_exit_interval(
+    runtime_environment, override, exit_interval, expected
 ):
     args, runtime, _ = runtime_environment
-    args.global_batch_size = 8
-    args.load = "original-weights"
-    args.iteration = 0
+    args.logits_save_range_start = override
+    args.exit_interval = exit_interval
+    assert runtime.dump_range(args) == expected
+
+
+def test_frozen_resume_uses_published_range_end(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    dump_args(args)
     args.logits_save_dir = str(tmp_path)
-    utils = types.ModuleType(f"{_namespace}.utils")
-    utils._broadcast_without_pp = lambda factory: factory()
-    monkeypatch.setitem(sys.modules, utils.__name__, utils)
-    legacy_metadata = {"saver": {"k": 1}, "identifiers": {"seed": 7}}
+    args.exit_interval = 4
+    # Job B (iterations 4-8) has published 4-6; job A (0-4) has nothing yet.
+    teacher_cache(tmp_path, runtime, args, start=4, iterations=6)
+    args.override_ckpt_iteration = 4
+    assert runtime.frozen_resume_iteration(args) == 6
+    assert args.logits_save_range_start == 4
+    args.override_ckpt_iteration = 6  # Replaced by load_checkpoint; the range start sticks.
+    assert runtime.frozen_resume_iteration(args) == 6
+    del args.logits_save_range_start
+    args.override_ckpt_iteration = 0
+    assert runtime.frozen_resume_iteration(args) == 0  # Job A starts its own range.
+    del args.logits_save_range_start
+    args.override_ckpt_iteration = None  # A single sequential writer stops at the hole.
+    assert runtime.frozen_resume_iteration(args) == 0
 
-    def initialize():
-        saver = types.SimpleNamespace(
-            dp_size=2, cp_size=1, metadata_dict=legacy_metadata, save_dir=str(tmp_path)
-        )
-        return runtime.initialize_dump_metadata(saver)
 
-    metadata = initialize()
-    assert metadata["published_through"] == 0
-    metadata.pop("published_through")
-    extra = {
-        key: value
-        for key, value in metadata.items()
-        if key not in ("dp_size_save", "mbs_save", "gbs_save", "first_sample")
-    }
-    write_cache(tmp_path, extra_metadata=extra)
-    storage_module.Storage(str(tmp_path)).write_json(
-        storage_module.COMPLETE_FILE, {"generation": metadata["generation"], "end_sample": 32}
-    )
-    args.load = "resumed-training-checkpoint"
+def test_completed_range_exits_before_any_step(runtime_environment):
+    args, runtime, _ = runtime_environment
+    dump_args(args)
+    args.logits_load_inputs = False
+    args.exit_interval = 4
+    args.logits_save_range_start = 4
+    args.consumed_train_samples = 7 * 8
+    assert not runtime.before_train_step(args)
+    args.consumed_train_samples = 8 * 8
+    assert runtime.before_train_step(args)
+    args.logits_save_range_start = None  # A sequential writer is bounded by --train-iters.
+    assert not runtime.before_train_step(args)
+
+
+def test_teacher_metadata_checks_cache_and_cleans_only_its_range(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    dump_args(args)
+    args.logits_save_dir = str(tmp_path)
+    args.exit_interval = 4
+    saver = teacher_saver(runtime, tmp_path)
+    metadata = runtime.initialize_dump_metadata(saver)  # Empty cache.
+    assert (metadata["published_through"], metadata["first_sample"]) == (0, 0)
+    teacher_cache(tmp_path, runtime, args, start=4, iterations=8)
+    (tmp_path / "dp1__48-64.targets.tar").unlink()  # Job B's interrupted tail.
+    args.logits_save_range_start = 4
+    args.consumed_train_samples = 6 * 8
+    metadata = runtime.initialize_dump_metadata(saver)
+    assert (metadata["published_through"], metadata["range_end"]) == (48, 64)
+    assert not storage_module.Storage(str(tmp_path)).list("dp*__48-64.*.tar")
+    assert len(storage_module.Storage(str(tmp_path)).list("dp*__32-48.*.tar")) == 4
+    args.consumed_train_samples = 8 * 8
+    with pytest.raises(RuntimeError, match="outside this job's published range"):
+        runtime.initialize_dump_metadata(saver)
+    args.consumed_train_samples = 6 * 8
+    args.micro_batch_size = 1
+    with pytest.raises(RuntimeError, match="mbs_save"):
+        runtime.initialize_dump_metadata(saver)
+
+
+def test_unfrozen_teacher_recovers_first_sample(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    dump_args(args)
+    args.logits_save_dir = str(tmp_path)
+    args.freeze_all_layers = False
     args.consumed_train_samples = 16
-    args.iteration = 2
-    restored = initialize()
-    assert restored["teacher_checkpoint"] == "original-weights"
-    assert restored["published_through"] == 32
-    assert not storage_module.Storage(str(tmp_path)).exists(storage_module.COMPLETE_FILE)
-    args.consumed_train_samples = 40
-    with pytest.raises(RuntimeError, match="outside the published"):
-        initialize()
+    saver = teacher_saver(runtime, tmp_path)
+    assert runtime.initialize_dump_metadata(saver)["first_sample"] == 16
+    teacher_cache(tmp_path, runtime, args, first_sample=16, start=2, iterations=4)
+    args.load = "resumed-training-checkpoint"
+    args.consumed_train_samples = 24
+    metadata = runtime.initialize_dump_metadata(saver)
+    assert (metadata["first_sample"], metadata["published_through"]) == (16, 32)
+    assert metadata["teacher_checkpoint"] == "resumed-training-checkpoint"
 
 
 def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeypatch):
@@ -720,13 +1037,14 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     module = importlib.import_module(f"{_namespace}.v3_saver")
     monkeypatch.setattr(module, "get_args", lambda: args)
     monkeypatch.setattr(module, "get_num_microbatches", lambda: 2)
+    args.global_batch_size = 4
     saver = module.PairedLogitsSaver.__new__(module.PairedLogitsSaver)
     saver.tp_rank = saver.cp_rank = saver.dp_rank = 0
     saver.cp_size = saver.dp_size = 1
     saver._initialized = True
-    saver.metadata_dict = {"generation": "test-generation", "published_through": 0}
+    saver.metadata_dict = {"generation": "gen", "published_through": 0}
     saver._captured = []
-    saver._pending_writes = replay.OrderedDict()
+    saver._pending_writes = collections.OrderedDict()
     saver._process_single_microbatch = lambda logits: (logits.half(), logits.long())
 
     def forward(ids):
@@ -745,13 +1063,75 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     forward([6, 7])
     saver.commit_attempt()
     record = saver._pending_writes[(0, 4)]
-    restored = codec.decode(record["inputs"], codec.digest(record["inputs"]))
-    values, indices = codec.unpack_targets(
-        codec.decode(record["targets"], codec.digest(record["targets"]))
-    )
+    restored = codec.decode(record["inputs"])
+    values, indices = codec.unpack_targets(codec.decode(record["targets"]))
+    assert "sample_ids" not in record and "sample_ids" not in restored
+    assert restored["record_id"] == "gen:dp0:0-4"
     assert restored["tokens"][0] == 400
     assert torch.equal(restored["tokens"].long(), indices.squeeze(-1))
     assert torch.equal(values.long(), indices)
+
+
+def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environment, monkeypatch):
+    args, runtime, _ = runtime_environment
+    module = importlib.import_module(f"{_namespace}.v3_saver")
+    metadata = settings()
+    writes = {}
+    for iteration in (0, 1):
+        start, end = iteration * 8, (iteration + 1) * 8
+        for rank in (0, 1):
+            ids = [start + (mb * 2 + rank) * 2 + j for mb in range(2) for j in range(2)]
+            captured = codec.capture_batch(inputs(ids))
+            target_ids = captured["tokens"].long().reshape(-1, 1)
+            targets = codec.pack_targets(target_ids.float(), target_ids)
+            captured["record_id"] = targets["record_id"] = f"gen:dp{rank}:{start}-{end}"
+            writes.setdefault(rank, {})[(start, end)] = {
+                "start": start,
+                "end": end,
+                "record_id": captured["record_id"],
+                "inputs": codec.encode(captured),
+                "targets": codec.encode(targets),
+            }
+    meta = json.dumps({**metadata, "generation": "gen", "published_through": 0, "range_end": 64})
+    for rank in (0, 1):
+        module.PairedLogitsSaver._write_batched_tar(
+            str(tmp_path / storage_module.tar_name(rank, 0, 16, "inputs")), writes[rank], meta
+        )
+    storage = Storage(str(tmp_path))
+    assert "published_through" not in storage_module.read_meta(storage, "dp0__0-16.inputs.tar")
+    live = reader(storage, metadata)
+    assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
+    live.close()
+
+
+def _loss_namespace(monkeypatch):
+    """Execute the real shared LM/KD loss helpers without importing GPU startup."""
+    path = Path(_package.__path__[0]) / "cached_logits_loss.py"
+    names = {"topk_kl_div", "masked_loss_sum", "lm_loss_and_report", "add_kd_loss"}
+    nodes = [
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    dist = types.SimpleNamespace(
+        all_reduce=lambda *a, **kw: None,
+        ReduceOp=torch.distributed.ReduceOp,
+        ProcessGroup=torch.distributed.ProcessGroup,
+    )
+    namespace = {
+        "torch": torch,
+        "dist": dist,
+        "dist_nn": None,
+        "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3,
+        "parallel_state": types.SimpleNamespace(get_tensor_model_parallel_group=lambda: None),
+        **{name: getattr(typing, name) for name in ("Dict", "Tuple")},
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    cached = types.ModuleType(f"{_namespace}.cached_logits_loss")
+    for name in names:
+        setattr(cached, name, namespace[name])
+    monkeypatch.setitem(sys.modules, cached.__name__, cached)
+    return cached
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
@@ -759,23 +1139,12 @@ def test_paired_loss_uses_explicit_targets_and_keeps_gradients(
     runtime_environment, monkeypatch, dtype
 ):
     args, runtime, legacy = runtime_environment
-    # Execute the real legacy sparse KL function without importing GPU startup.
-    path = Path(_package.__path__[0]) / "cached_logits_loss.py"
-    node = next(
-        n
-        for n in ast.parse(path.read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "topk_kl_div"
-    )
-    namespace = {"torch": torch, "dist": torch.distributed, "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    cached = types.ModuleType(f"{_namespace}.cached_logits_loss")
-    cached.topk_kl_div = namespace["topk_kl_div"]
+    cached = _loss_namespace(monkeypatch)
     logits = torch.randn(8, 2, 3, dtype=dtype, requires_grad=True)
     cached.get_student_logits_capture = lambda: types.SimpleNamespace(pop=lambda: logits)
-    monkeypatch.setitem(sys.modules, cached.__name__, cached)
+    monkeypatch.delitem(sys.modules, f"{_namespace}.v3_loss", raising=False)
     module = importlib.import_module(f"{_namespace}.v3_loss")
     monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module.dist, "all_reduce", lambda *a, **kw: None)
     teacher = torch.randn(8, 2, 3).log_softmax(-1)
     sidecar = runtime.bind_student_logits(
         {"values": teacher, "indices": torch.arange(3).expand(8, 2, -1)}
@@ -803,7 +1172,9 @@ def test_paired_loss_uses_explicit_targets_and_keeps_gradients(
     total.backward()
     assert torch.isfinite(logits.grad).all()
     assert count == 15
-    assert "logits distillation loss" in report
+    assert list(report) == ["lm loss", "logits distillation loss", "total loss"]
+    lm_only = module.paired_loss(mask, lm_losses, types.SimpleNamespace(training=False), None)
+    assert list(lm_only[2]) == ["lm loss"]
 
 
 def legacy_saver_methods():
@@ -870,8 +1241,7 @@ def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
     assert torch.equal(indices, torch.where(keep, expected_ids, -1))
     assert torch.allclose(values, torch.where(keep, expected, -1e3).to(dtype), atol=1e-6)
     encoded = codec.pack_targets(values.reshape(-1, 4), indices.reshape(-1, 4))
-    raw = codec.encode(encoded)
-    restored, restored_ids = codec.unpack_targets(codec.decode(raw, codec.digest(raw)))
+    restored, restored_ids = codec.unpack_targets(codec.decode(codec.encode(encoded)))
     assert torch.equal(restored, values.reshape(-1, 4))
     assert torch.equal(
         restored_ids[keep.reshape(-1, 4)], expected_ids.reshape(-1, 4)[keep.reshape(-1, 4)]
@@ -906,47 +1276,6 @@ def test_top_p_metric_is_committed_only_for_accepted_attempt(runtime_environment
     assert not saver._topp_kept_counts
 
 
-def test_remote_refresh_lists_once_and_broadcasts_errors(runtime_environment, monkeypatch):
-    _, runtime, _ = runtime_environment
-    mpu = sys.modules["megatron.core"].parallel_state
-    group = object()
-    mpu.get_data_parallel_group = lambda **kw: group
-    monkeypatch.setattr(runtime.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(runtime.dist, "get_process_group_ranks", lambda g: [3, 5])
-    rank = [3]
-    monkeypatch.setattr(runtime.dist, "get_rank", lambda: rank[0])
-    payload = []
-
-    def broadcast(result, src, group):
-        assert src == 3
-        if rank[0] == src:
-            payload[:] = result
-        else:
-            result[:] = payload
-
-    monkeypatch.setattr(runtime.dist, "broadcast_object_list", broadcast)
-    listings = []
-    monkeypatch.setattr(
-        runtime, "discover_groups", lambda *a: listings.append(a) or [[{"test": True}]]
-    )
-    storage = types.SimpleNamespace(remote=True)
-    assert runtime.refresh_replay_groups(storage, {}) == [[{"test": True}]]
-    rank[0] = 5
-    assert runtime.refresh_replay_groups(storage, {}) == [[{"test": True}]]
-    assert len(listings) == 1
-    rank[0] = 3
-
-    def broken(*args):
-        raise ValueError("broken descriptor")
-
-    monkeypatch.setattr(runtime, "discover_groups", broken)
-    with pytest.raises(RuntimeError, match="broken descriptor"):
-        runtime.refresh_replay_groups(storage, {})
-    rank[0] = 5
-    with pytest.raises(RuntimeError, match="broken descriptor"):
-        runtime.refresh_replay_groups(storage, {})
-
-
 def test_msc_opt_in_and_worker_enable_are_preserved(runtime_environment, monkeypatch):
     _, _, _ = runtime_environment
     state = {"enabled": False}
@@ -967,17 +1296,24 @@ def test_msc_opt_in_and_worker_enable_are_preserved(runtime_environment, monkeyp
         Storage("msc://test/dump")
     calls = []
     backend.glob = lambda pattern: calls.append(pattern) or [
-        "msc://test/dump/dp0__0-8.tar.ready.json"
+        "msc://test/dump/dp0__0-8.inputs.tar",
+        "msc://test/dump/dp0__0-8.targets.tar",
     ]
     module = importlib.import_module(f"{_namespace}.v3_saver")
-    monkeypatch.setattr(module, "write_shard", lambda *a: None)
+    monkeypatch.setattr(module, "write_tar", lambda *a: None)
     module.PairedLogitsSaver._write_batched_tar(
-        "msc://test/dump/dp0__0-8.tar", {0: {}}, "{}", msc_enabled=True
+        "msc://test/dump/dp0__0-8.inputs.tar",
+        {0: {"start": 0, "end": 8, "inputs": b"", "targets": b""}},
+        "{}",
+        msc_enabled=True,
     )
     assert state["enabled"]
     storage = Storage("msc://test/dump")
-    assert storage.list("*.ready.json") == ["dp0__0-8.tar.ready.json"]
-    storage.list("*.ready.json")
+    assert [tar.name for tar in storage_module.list_tars(storage)] == [
+        "dp0__0-8.inputs.tar",
+        "dp0__0-8.targets.tar",
+    ]
+    storage_module.list_tars(storage)
     assert len(calls) == 2  # Refreshes never reuse a stale application-level listing.
 
 
@@ -1021,7 +1357,7 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     saver._captured = [(captured, maps[0], *mapped[0])]
     saver._serialize_attempt()
     raw = saver._iteration_records["targets"]
-    values, indices = codec.unpack_targets(codec.decode(raw, codec.digest(raw)))
+    values, indices = codec.unpack_targets(codec.decode(raw))
     assert len(calls) == 3
     assert torch.equal(values, full_values)
     assert torch.equal(indices, full_ids)
@@ -1152,11 +1488,14 @@ def test_v3_async_write_failure_sets_shared_event(runtime_environment, monkeypat
     def broken(*args):
         raise OSError("failed publication")
 
-    monkeypatch.setattr(module, "write_shard", broken)
+    monkeypatch.setattr(module, "write_tar", broken)
     event = types.SimpleNamespace(set=lambda: failures.append(True))
     with pytest.raises(OSError, match="failed publication"):
         module.PairedLogitsSaver._write_batched_tar(
-            str(tmp_path / "dp0__0-8.tar"), {0: {}}, "{}", failure_event=event
+            str(tmp_path / "dp0__0-8.inputs.tar"),
+            {0: {"start": 0, "end": 8, "inputs": b"", "targets": b""}},
+            "{}",
+            failure_event=event,
         )
     assert failures == [True]
 
@@ -1174,11 +1513,8 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
         tmp_path, dp=teacher_dp, mbs=teacher_mbs, gbs=teacher_gbs, iterations=12, packed=packed
     )
     prototype = reader(storage, metadata, shuffle=shuffle, seed=7)
-    expected_order = [
-        sid
-        for group in prototype.groups
-        for sid in range(group[0]["records"][0]["start"], group[0]["records"][-1]["end"])
-    ]
+    expected_order = [sid for start, end in prototype.groups for sid in range(start, end)]
+    prototype.close()
     # A valid old student checkpoint need not align to teacher iterations,
     # saved microbatches, or the new student's batch size.
     consumed = 5
@@ -1207,7 +1543,9 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
                     start = consumed + (mb * student_dp + rank) * student_mbs
                     expected = expected_order[start : start + student_mbs]
                     assert batch["_kd_sample_ids"] == expected
-                    assert torch.equal(batch["tokens"], batch["_kd_indices"].squeeze(-1))
+                    # Packed batches map to the flattened THD layout, others to [S, B].
+                    layout = batch["tokens"].reshape(-1, 1) if packed else batch["tokens"].T
+                    assert torch.equal(layout, batch["_kd_indices"][0].squeeze(-1))
                     assert torch.equal(
                         batch["tokens"], torch.tensor(expected).unsqueeze(1) * 100 + torch.arange(8)
                     )

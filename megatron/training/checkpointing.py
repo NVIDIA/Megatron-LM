@@ -2913,7 +2913,13 @@ def load_checkpoint(
         # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
         finetune = True
-        if override_ckpt_iteration is None:
+        if getattr(args, 'logits_save_inputs', False):
+            # Offline KD v3: resume from what this job's range has actually published, not
+            # from the tracker, which can run ahead of a failed or interrupted flush.
+            from megatron.training.distillation.v3_runtime import frozen_resume_iteration
+
+            override_ckpt_iteration = frozen_resume_iteration(args)
+        elif override_ckpt_iteration is None:
             progress_iteration = read_frozen_resume_iteration(checkpoint.save)
             if progress_iteration > 0:
                 override_ckpt_iteration = progress_iteration
@@ -3503,6 +3509,9 @@ def load_checkpoint(
                 current_train_state.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
             else:
                 print_rank_0('could not find runtime training state in the checkpoint ...')
+
+    if getattr(args, "logits_load_inputs", False) and "args" in state_dict and not finetune:
+        args.logits_load_replay_end = getattr(checkpoint_args, "logits_load_replay_end", None)
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The

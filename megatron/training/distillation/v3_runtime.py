@@ -9,18 +9,20 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from .v3_format import capture_batch, digest
-from .v3_replay import (
-    ReplayIterator,
-    ReplayReader,
-    discover_groups,
-    layout_options,
-    map_targets,
-    token_map,
+from .v3_format import digest, mismatched_settings
+from .v3_replay import ReplayIterator, ReplayReader, describe_hole, discover_groups, layout_options
+from .v3_storage import (
+    Storage,
+    complete_ranges,
+    contiguous_end,
+    discard_unpublished,
+    list_tars,
+    parse_tar_name,
+    read_meta,
 )
-from .v3_storage import CACHE_FILE, COMPLETE_FILE, Storage, quarantine_unpublished
 
 _PLAN = None
+_HYBRID_LAYOUT = False
 
 
 def validate_options(args: Any) -> None:
@@ -52,10 +54,13 @@ def validate_options(args: Any) -> None:
         raise ValueError(
             "Offline KD v3 requires ordinary forward execution, without CUDA graphs or schedule-plan overlap"
         )
-    if saving and getattr(args, "recompute_granularity", None) == "full":
+    if getattr(args, "allow_ambiguous_pad_tokens", False):
         raise ValueError(
-            "Paired teacher dumping does not support full-layer activation recomputation"
+            "Offline KD v3 does not support --allow-ambiguous-pad-tokens: replayed attention "
+            "masks are rebuilt from tokens after pad replacement"
         )
+    if saving:
+        _validate_dump_options(args)
     if loading and getattr(args, "logits_load_ignore_errors", False):
         raise ValueError(
             "V3 paired input replay does not support --logits-load-ignore-errors; "
@@ -67,6 +72,36 @@ def validate_options(args: Any) -> None:
         raise ValueError("Offline KD v3 replay does not yet support dataset phase transitions")
     if loading and getattr(args, "override_ckpt_iteration", None) is not None:
         raise ValueError("A v3 replay cursor cannot be rewound with --override-ckpt-iteration")
+
+
+def _validate_dump_options(args: Any) -> None:
+    if getattr(args, "recompute_granularity", None) == "full":
+        raise ValueError(
+            "Paired teacher dumping does not support full-layer activation recomputation"
+        )
+    if getattr(args, "iterations_to_skip", None):
+        raise ValueError(
+            "Paired teacher dumping does not support --iterations-to-skip (including iterations "
+            "from --result-rejected-tracker-filename): skipped windows would leave holes"
+        )
+    if not getattr(args, "save", None) or not getattr(args, "save_interval", None):
+        raise ValueError(
+            "Paired teacher dumping requires --save and --save-interval (the flush interval)"
+        )
+    if args.exit_interval and args.exit_interval % args.save_interval:
+        raise ValueError(
+            "Paired teacher dumping requires --exit-interval to be a multiple of --save-interval"
+        )
+    start = getattr(args, "override_ckpt_iteration", None)
+    if (
+        getattr(args, "freeze_all_layers", False)
+        and start is not None
+        and start % args.save_interval
+    ):
+        raise ValueError(
+            "Paired teacher dumping requires --override-ckpt-iteration to be a multiple of "
+            "--save-interval"
+        )
 
 
 def tokenizer_identity() -> dict[str, Any]:
@@ -97,19 +132,73 @@ def tokenizer_identity() -> dict[str, Any]:
     }
 
 
-def initialize_dump_metadata(saver: Any) -> dict:
-    """Create or restore one cache generation on the saver stage collectively."""
+def dump_range(args: Any) -> tuple[int | None, int]:
+    """Return this dump job's ``(start, end)`` iterations.
+
+    A frozen teacher started with ``--override-ckpt-iteration s`` owns
+    ``[s, next multiple of --exit-interval)``; Megatron's own exit-interval check
+    ends it there. Otherwise the job is the cache's single sequential writer and
+    owns everything up to ``--train-iters`` (``start`` is None: the cache start).
+    """
+    start = getattr(args, "logits_save_range_start", None)
+    if start is None:
+        return None, args.train_iters
+    if not args.exit_interval:
+        return start, args.train_iters
+    return start, min((start // args.exit_interval + 1) * args.exit_interval, args.train_iters)
+
+
+def _published_end(storage: Storage, dp_size: int, start: int, end: int) -> int:
+    return contiguous_end(complete_ranges(list_tars(storage), dp_size), start, end)
+
+
+def frozen_resume_iteration(args: Any) -> int:
+    """Return the iteration a frozen v3 teacher resumes from: its range's published end.
+
+    The cache, not the progress tracker, is the source of truth, so a resubmitted
+    parallel job (unchanged ``--override-ckpt-iteration``) continues inside its own
+    range, and periodic ``--exit-interval`` requeues of a single writer advance.
+    """
+    if not hasattr(args, "logits_save_range_start"):
+        # Record the user's range start once; load_checkpoint then replaces the override.
+        args.logits_save_range_start = args.override_ckpt_iteration
+    start_iteration, end_iteration = dump_range(args)
+    gbs = args.global_batch_size
+
+    def resolve() -> dict:
+        try:
+            from megatron.core import parallel_state as mpu
+
+            storage = Storage(args.logits_save_dir)
+            start = (start_iteration or 0) * gbs
+            published = _published_end(
+                storage, mpu.get_data_parallel_world_size(), start, end_iteration * gbs
+            )
+            return {"iteration": published // gbs}
+        except Exception as error:
+            return {"error": f"{type(error).__name__}: {error}"}
+
+    result = [resolve() if not dist.is_initialized() or dist.get_rank() == 0 else None]
+    if dist.is_initialized():
+        dist.broadcast_object_list(result, src=0)
+    if "error" in result[0]:
+        raise RuntimeError(result[0]["error"])
+    return result[0]["iteration"]
+
+
+def _dump_settings(saver: Any) -> dict[str, Any]:
+    """Settings every tar of a cache must share (see ``SHARED_KEYS``), minus ``first_sample``."""
     from megatron.training import get_args
 
-    from .utils import _broadcast_without_pp
-
     args = get_args()
-    expected = {
+    settings = {
         "format_version": 3,
         "dp_size_save": saver.dp_size,
         "mbs_save": args.micro_batch_size,
         "gbs_save": args.global_batch_size,
         "cp_size_save": saver.cp_size,
+        "save_interval": args.save_interval,
+        "train_budget": args.train_samples or args.train_iters * args.global_batch_size,
         "seq_length": args.seq_length,
         "sft": bool(args.sft),
         "inter_document_masking": bool(args.dataloader_inter_document_masking),
@@ -118,46 +207,62 @@ def initialize_dump_metadata(saver: Any) -> dict:
         "padded_vocab_size": args.padded_vocab_size,
         "targets": {**saver.metadata_dict["saver"], "format_version": 3},
         "dataset_identity": saver.metadata_dict["identifiers"],
-        "teacher_checkpoint": str(args.load),
         "boundary_convention": "exact_dataset_boundaries_may_include_padding",
     }
+    # Compare exactly what a JSON round trip through a tar's _meta.json preserves.
+    return json.loads(json.dumps(settings))
+
+
+def initialize_dump_metadata(saver: Any) -> dict:
+    """Check this dump job against the cache and find where it resumes, collectively."""
+    from megatron.training import get_args
+
+    from .utils import _broadcast_without_pp
+
+    args = get_args()
+    expected = _dump_settings(saver)
+    gbs = args.global_batch_size
+    frozen = bool(getattr(args, "freeze_all_layers", False))
 
     def create():
         try:
             storage = Storage(saver.save_dir)
-            if storage.exists(CACHE_FILE):
-                metadata = storage.read_json(CACHE_FILE)
-                comparisons = dict(expected)
-                # A training teacher can resume from its output checkpoint while
-                # the original checkpoint remains recorded as provenance.
-                if args.consumed_train_samples > metadata["first_sample"]:
-                    comparisons.pop("teacher_checkpoint")
-                if any(metadata.get(key) != value for key, value in comparisons.items()):
-                    raise ValueError(
-                        "Teacher settings differ from existing v3 cache; use a new save directory"
-                    )
-            else:
-                if storage.list("*.tar"):
-                    raise ValueError("Cannot mix legacy and v3 dumps in the same directory")
-                metadata = {
-                    **expected,
-                    "generation": uuid.uuid4().hex,
-                    "first_sample": args.consumed_train_samples,
-                }
-                storage.write_json(CACHE_FILE, metadata)
-            groups = discover_groups(storage, metadata)
-            published = groups[-1][0]["records"][-1]["end"] if groups else metadata["first_sample"]
-            if not metadata["first_sample"] <= args.consumed_train_samples <= published:
-                raise ValueError(
-                    "Teacher checkpoint cursor is outside the published v3 prefix; "
-                    "resume an earlier checkpoint or use a new cache directory"
+            if any(parse_tar_name(name) is None for name in storage.list("*.tar")):
+                raise ValueError("Cannot mix legacy and v3 dumps in the same directory")
+            tars = list_tars(storage)
+            first_sample = 0 if frozen else args.consumed_train_samples
+            if tars:
+                existing = read_meta(storage, tars[0].name)
+                mismatched = mismatched_settings(
+                    existing, {**expected, "first_sample": existing.get("first_sample")}
                 )
-            quarantine_unpublished(storage, published)
-            if storage.exists(COMPLETE_FILE):
-                # The resumed writer can extend this generation. Until it exits
-                # successfully, students must not treat it as immutable.
-                storage.remove(COMPLETE_FILE)
-            return {"metadata": {**metadata, "published_through": published}}
+                if mismatched:
+                    raise ValueError(
+                        f"Teacher settings differ from existing v3 tars ({', '.join(mismatched)}); "
+                        "use a new save directory"
+                    )
+                first_sample = existing["first_sample"]
+            start_iteration, end_iteration = dump_range(args)
+            start = first_sample if start_iteration is None else start_iteration * gbs
+            end = end_iteration * gbs
+            published = _published_end(storage, saver.dp_size, start, end)
+            if not start <= args.consumed_train_samples <= published:
+                raise ValueError(
+                    f"Teacher cursor {args.consumed_train_samples} is outside this job's published "
+                    f"range {start}-{published}; resume an earlier checkpoint or use a new cache "
+                    "directory"
+                )
+            discard_unpublished(storage, published, end)
+            return {
+                "metadata": {
+                    **expected,
+                    "first_sample": first_sample,
+                    "generation": uuid.uuid4().hex,
+                    "teacher_checkpoint": str(args.load),
+                    "published_through": published,
+                    "range_end": end,
+                }
+            }
         except Exception as error:
             return {"error": f"{type(error).__name__}: {error}"}
 
@@ -167,91 +272,212 @@ def initialize_dump_metadata(saver: Any) -> dict:
     return result["metadata"]
 
 
+def _check_student_compatibility(args: Any, metadata: dict) -> None:
+    if metadata.get("format_version") != 3 or metadata["tokenizer"] != tokenizer_identity():
+        raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
+    if args.padded_vocab_size != metadata["padded_vocab_size"]:
+        raise ValueError(
+            "V3 teacher/student padded vocabulary sizes must match; "
+            "adjust vocabulary padding when changing TP"
+        )
+    if (
+        bool(args.sft) != metadata["sft"]
+        or bool(args.dataloader_inter_document_masking) != metadata["inter_document_masking"]
+    ):
+        raise ValueError("Student packing flags must match the saved v3 layout")
+    if bool(args.reset_attention_mask) != metadata["reset_attention_mask"]:
+        raise ValueError("Student attention isolation differs from the teacher cache")
+    packed = metadata["sft"] or metadata["inter_document_masking"]
+    if args.seq_length > metadata["seq_length"] or (
+        packed and args.seq_length != metadata["seq_length"]
+    ):
+        raise ValueError("Only non-packed prefix shortening is supported by v3 replay")
+    if args.context_parallel_size > 1 and args.seq_length % (2 * args.context_parallel_size):
+        raise ValueError("Student sequence length must be divisible by 2 * CP")
+
+
 def initialize_replay(args: Any) -> None:
     """Establish a common replay plan on all ranks before building datasets."""
     global _PLAN
     if not getattr(args, "logits_load_inputs", False) or _PLAN is not None:
         return
+    shuffle = args.logits_load_shuffle_shards is not None
     rank = dist.get_rank() if dist.is_initialized() else 0
     result = [None]
     if rank == 0:
         try:
             storage = Storage(args.logits_load_dir)
-            if not storage.exists(CACHE_FILE):
-                raise FileNotFoundError("No v3 cache header found; input replay requires a v3 dump")
-            metadata = storage.read_json(CACHE_FILE)
-            if metadata.get("format_version") != 3 or metadata["tokenizer"] != tokenizer_identity():
-                raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
-            if args.padded_vocab_size != metadata["padded_vocab_size"]:
+            if any(parse_tar_name(name) is None for name in storage.list("*.tar")):
+                raise ValueError("Input replay requires a v3 dump; found legacy tars")
+            tars = list_tars(storage)
+            if not tars:
+                raise FileNotFoundError("No v3 tars found; input replay requires a v3 dump")
+            metadata = read_meta(storage, tars[0].name)
+            _check_student_compatibility(args, metadata)
+            groups, hole = discover_groups(storage, metadata)
+            replay_end = getattr(args, "logits_load_replay_end", None)
+            if shuffle:
+                if replay_end is None:
+                    # Fix the shuffled extent at the first launch; resumes reuse it.
+                    replay_end = groups[-1][1] if groups else metadata["first_sample"]
+                if (groups[-1][1] if groups else metadata["first_sample"]) < replay_end:
+                    raise ValueError(
+                        f"Shuffled replay was planned over samples up to {replay_end}, but only "
+                        f"{groups[-1][1] if groups else metadata['first_sample']} are published"
+                    )
+                groups = [group for group in groups if group[1] <= replay_end]
+                if not groups:
+                    raise ValueError("No complete teacher shard group is available to shuffle")
+            available = sum(end - start for start, end in groups)
+            if args.consumed_train_samples > available:
                 raise ValueError(
-                    "V3 teacher/student padded vocabulary sizes must match; "
-                    "adjust vocabulary padding when changing TP"
+                    f"Checkpoint sample cursor {args.consumed_train_samples} exceeds the "
+                    f"published offline KD cache ({available} samples)"
                 )
-            if (
-                bool(args.sft) != metadata["sft"]
-                or bool(args.dataloader_inter_document_masking)
-                != metadata["inter_document_masking"]
-            ):
-                raise ValueError("Student packing flags must match the saved v3 layout")
-            if bool(args.reset_attention_mask) != metadata["reset_attention_mask"]:
-                raise ValueError("Student attention isolation differs from the teacher cache")
-            packed = metadata["sft"] or metadata["inter_document_masking"]
-            if args.seq_length > metadata["seq_length"] or (
-                packed and args.seq_length != metadata["seq_length"]
-            ):
-                raise ValueError("Only non-packed prefix shortening is supported by v3 replay")
-            if args.context_parallel_size > 1 and args.seq_length % (
-                2 * args.context_parallel_size
-            ):
-                raise ValueError("Student sequence length must be divisible by 2 * CP")
-            groups = discover_groups(storage, metadata)
-            end = groups[-1][0]["records"][-1]["end"] if groups else metadata["first_sample"]
-            if args.logits_load_shuffle_shards is not None:
-                if not storage.exists(COMPLETE_FILE):
-                    raise ValueError("V3 shuffling requires a completed cache")
-                complete = storage.read_json(COMPLETE_FILE)
-                if (
-                    complete["generation"] != metadata["generation"]
-                    or complete["end_sample"] != end
-                ):
-                    raise ValueError("V3 completion marker disagrees with the published cache")
-            if args.consumed_train_samples > end - metadata["first_sample"]:
-                raise ValueError("Checkpoint sample cursor exceeds the published offline KD cache")
-            if not groups and args.logits_load_shuffle_shards is not None:
-                raise ValueError("No complete teacher DP shard group is available")
-            result[0] = {"metadata": metadata, "groups": groups}
+            result[0] = {
+                "metadata": metadata,
+                "groups": groups,
+                "hole": hole,
+                "replay_end": replay_end,
+            }
         except Exception as error:
             result[0] = {"error": f"{type(error).__name__}: {error}"}
     if dist.is_initialized():
         dist.broadcast_object_list(result, src=0)
     if "error" in result[0]:
         raise RuntimeError(result[0]["error"])
-    _PLAN = result[0]
+    if shuffle:
+        # Saved with the checkpoint's args so a resume shuffles the same groups.
+        args.logits_load_replay_end = result[0]["replay_end"]
+    _PLAN = {
+        **result[0],
+        "available": sum(end - start for start, end in result[0]["groups"]),
+        "readers": [],
+    }
+    if rank == 0 and result[0]["hole"] is not None:
+        print(f"WARNING: offline KD v3 cache: {describe_hole(result[0]['hole'])}", flush=True)
 
 
-def refresh_replay_groups(storage: Storage, metadata: dict) -> list[list[dict]]:
-    """Share one remote listing among TP-zero DP/CP ranks on this pipeline stage.
+def ensure_replay_frontier(args: Any) -> None:
+    """Agree on all ranks that the next iteration's samples are published.
 
-    This collective is entered at an iteration boundary by every participating
-    reader. Decode prefetch stays within that already-available iteration and
-    therefore never enters the collective from a background thread.
+    Collective only when the next iteration would cross the known frontier: world
+    rank 0 lists once and broadcasts newly published groups, so every rank either
+    continues or raises the same exhaustion error. Never sleeps or polls.
     """
-    if not storage.remote or not dist.is_initialized():
-        return discover_groups(storage, metadata)
-    from megatron.core import parallel_state as mpu
+    from megatron.core.num_microbatches_calculator import get_current_global_batch_size
 
-    group = mpu.get_data_parallel_group(with_context_parallel=True)
-    source = dist.get_process_group_ranks(group)[0]
-    result = [None]
-    if dist.get_rank() == source:
-        try:
-            result[0] = {"groups": discover_groups(storage, metadata)}
-        except Exception as error:
-            result[0] = {"error": f"{type(error).__name__}: {error}"}
-    dist.broadcast_object_list(result, src=source, group=group)
-    if "error" in result[0]:
-        raise RuntimeError(result[0]["error"])
-    return result[0]["groups"]
+    need = args.consumed_train_samples + get_current_global_batch_size()
+    if need <= _PLAN["available"]:
+        return
+    if args.logits_load_shuffle_shards is None:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        result = [None]
+        if rank == 0:
+            try:
+                storage = Storage(args.logits_load_dir)
+                groups, hole = discover_groups(storage, _PLAN["metadata"])
+                known = _PLAN["groups"]
+                if groups[: len(known)] != known:
+                    raise RuntimeError("Previously published offline KD data changed during replay")
+                result[0] = {"groups": groups[len(known) :], "hole": hole}
+            except Exception as error:
+                result[0] = {"error": f"{type(error).__name__}: {error}"}
+        if dist.is_initialized():
+            dist.broadcast_object_list(result, src=0)
+        if "error" in result[0]:
+            raise RuntimeError(result[0]["error"])
+        new_groups = result[0]["groups"]
+        _PLAN["groups"].extend(new_groups)
+        _PLAN["available"] += sum(end - start for start, end in new_groups)
+        for reader in _PLAN["readers"]:
+            reader.extend(new_groups)
+        if rank == 0 and result[0]["hole"] is not None and result[0]["hole"] != _PLAN["hole"]:
+            print(f"WARNING: offline KD v3 cache: {describe_hole(result[0]['hole'])}", flush=True)
+        _PLAN["hole"] = result[0]["hole"]
+    if need > _PLAN["available"]:
+        detail = describe_hole(_PLAN["hole"])
+        raise RuntimeError(
+            f"Offline KD cache exhausted at {_PLAN['available']} samples; requested {need}"
+            + (f" ({detail})" if detail else "")
+        )
+
+
+def before_train_step(args: Any) -> bool:
+    """Run v3 checks at the top of each training iteration; True means exit cleanly."""
+    if getattr(args, "logits_load_inputs", False):
+        ensure_replay_frontier(args)
+    if getattr(args, "logits_save_inputs", False):
+        start, end = dump_range(args)
+        if start is not None and args.consumed_train_samples >= end * args.global_batch_size:
+            # Megatron checks --exit-interval only after a step; a resubmitted job whose
+            # range is already published must not dump into the next job's range.
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"Offline KD v3 dump range {start}-{end} is complete; exiting", flush=True)
+            return True
+    return False
+
+
+def use_hybrid_layout() -> None:
+    """Called by the hybrid entrypoint: replay must use its CP layouts."""
+    global _HYBRID_LAYOUT
+    _HYBRID_LAYOUT = True
+
+
+class _ContextParallelReplay:
+    """Serve replay batches to every CP rank while only CP rank 0 reads storage.
+
+    CP rank 0 maps the teacher targets for every CP rank in its prefetch thread;
+    this iterator scatters each rank its inputs and its own target shard.
+    """
+
+    def __init__(self, source: ReplayIterator | None, cp_rank: int, cp_size: int):
+        self.source = source
+        self.cp_rank = cp_rank
+        self.cp_size = cp_size
+        if cp_size > 1:
+            from megatron.core import parallel_state as mpu
+
+            self.group = mpu.get_context_parallel_group()
+            self.src = dist.get_global_rank(self.group, 0)
+
+    @property
+    def reader(self) -> ReplayReader | None:
+        """The underlying reader on CP rank 0."""
+        return None if self.source is None else self.source.reader
+
+    def __iter__(self) -> "_ContextParallelReplay":
+        return self
+
+    @staticmethod
+    def _for_rank(batch: dict, rank: int) -> dict:
+        local = dict(batch)
+        for key in ("_kd_values", "_kd_indices"):
+            if key in local:
+                local[key] = local[key][rank]
+        return local
+
+    def __next__(self) -> dict:
+        if self.cp_size == 1:
+            return self._for_rank(next(self.source), 0)
+        payload = None
+        if self.cp_rank == 0:
+            try:
+                batch = next(self.source)
+                payload = [self._for_rank(batch, rank) for rank in range(self.cp_size)]
+            except Exception as error:
+                # Fail every CP rank together instead of leaving peers in the collective.
+                payload = [{"_kd_error": f"{type(error).__name__}: {error}"}] * self.cp_size
+        received = [None]
+        dist.scatter_object_list(received, payload, src=self.src, group=self.group)
+        if "_kd_error" in received[0]:
+            raise RuntimeError(received[0]["_kd_error"])
+        return received[0]
+
+    def close(self) -> None:
+        """Stop the reader's streams."""
+        if self.source is not None:
+            self.source.close()
 
 
 def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader | None:
@@ -268,27 +494,35 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
         or args.dataloader_inter_document_masking
     ):
         return None
-    storage = Storage(args.logits_load_dir)
-    reader = ReplayReader(
-        storage,
-        _PLAN["metadata"],
-        _PLAN["groups"],
-        targets=mpu.is_pipeline_last_stage(),
-        shuffle=args.logits_load_shuffle_shards is not None,
-        seed=args.logits_load_shuffle_shards if args.logits_load_shuffle_shards is not None else 0,
-        decode_threads=args.logits_load_decode_threads,
-        refresh_groups=lambda: refresh_replay_groups(storage, _PLAN["metadata"]),
-    )
-    iterator = ReplayIterator(
-        reader,
-        consumed=consumed,
-        dp_rank=mpu.get_data_parallel_rank(),
-        dp_size=mpu.get_data_parallel_world_size(),
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
-        num_microbatches=get_num_microbatches,
-        prefetch=True,
-    )
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_size = args.context_parallel_size
+    source = None
+    if cp_rank == 0:
+        reader = ReplayReader(
+            Storage(args.logits_load_dir),
+            _PLAN["metadata"],
+            _PLAN["groups"],
+            targets=mpu.is_pipeline_last_stage(),
+            shuffle=args.logits_load_shuffle_shards is not None,
+            seed=args.logits_load_shuffle_shards or 0,
+            decode_threads=args.logits_load_decode_threads,
+            prefetch_depth=args.logits_load_msc_prefetch_depth,
+            chunk_bytes=args.logits_load_read_chunk_mb << 20,
+        )
+        _PLAN["readers"].append(reader)
+        source = ReplayIterator(
+            reader,
+            consumed=consumed,
+            dp_rank=mpu.get_data_parallel_rank(),
+            dp_size=mpu.get_data_parallel_world_size(),
+            micro_batch_size=args.micro_batch_size,
+            seq_length=args.seq_length,
+            num_microbatches=get_num_microbatches,
+            prefetch=True,
+            cp_size=cp_size,
+            layout=layout_options(args, hybrid=_HYBRID_LAYOUT),
+        )
+    iterator = _ContextParallelReplay(source, cp_rank, cp_size)
 
     class Dataset(torch.utils.data.IterableDataset):
         def __iter__(self):
@@ -323,47 +557,22 @@ def capture_dump_batch(batch: dict, *, hybrid: bool = False, vp_stage: int | Non
         and hasattr(saver, "capture")
         and mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
     ):
-        if batch.get("attention_mask") is not None:
-            from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
-            from megatron.training import get_args, get_tokenizer
-
-            args = get_args()
-            expected = torch.stack(
-                [
-                    _get_ltor_masks_and_position_ids(
-                        tokens, get_tokenizer().eod, False, args.reset_attention_mask, False, True
-                    )[0]
-                    for tokens in batch["tokens"]
-                ]
-            )
-            if not torch.equal(batch["attention_mask"], expected):
-                raise ValueError(
-                    "V3 currently supports causal/EOD attention masks only; "
-                    "custom masks need a future format adapter"
-                )
         saver.capture(batch, hybrid=hybrid)
 
 
-def prepare_replay_batch(batch: dict, *, hybrid: bool = False) -> tuple[dict, dict | None]:
-    """Keep replay tensors immutable and separate targets from model batch fields."""
-    from megatron.core import parallel_state as mpu
+def prepare_replay_batch(batch: dict) -> tuple[dict, dict | None]:
+    """Separate this CP rank's already-mapped targets from the model batch fields."""
     from megatron.training import get_args
 
     args = get_args()
     result = dict(batch)
     sidecar = None
     if "_kd_values" in batch:
-        inputs = capture_batch(batch)
-        mapping = token_map(
-            inputs,
-            mpu.get_context_parallel_rank(),
-            args.context_parallel_size,
-            **layout_options(args, hybrid=hybrid),
-        )
-        values = batch["_kd_values"].reshape(-1, batch["_kd_values"].shape[-1])
-        indices = batch["_kd_indices"].reshape_as(values)
-        values, indices = map_targets(values, indices, mapping)
-        sidecar = {"values": values, "indices": indices, "sample_ids": batch["_kd_sample_ids"]}
+        sidecar = {
+            "values": batch["_kd_values"],
+            "indices": batch["_kd_indices"],
+            "sample_ids": batch["_kd_sample_ids"],
+        }
     for key in ("_kd_values", "_kd_indices", "_kd_sample_ids"):
         result.pop(key, None)
     if args.create_attention_mask_in_dataloader:
@@ -412,8 +621,6 @@ def broadcast_targets(sidecar: dict | None, *, vp_stage: int | None = None) -> d
         sidecar = dict(sidecar)
         for field in ("values", "indices"):
             tensor = sidecar[field]
-            # CP index_select creates fresh CPU tensors after DataLoader's
-            # pinning pass. Restore pinning for asynchronous target transfer.
             if torch.cuda.is_available() and tensor.device.type == "cpu" and not tensor.is_pinned():
                 tensor = tensor.pin_memory()
             sidecar[field] = tensor.to(device, non_blocking=True)
@@ -432,8 +639,8 @@ def bind_student_logits(sidecar: dict | None) -> dict | None:
     return {**sidecar, "logits": get_student_logits_capture().pop()}
 
 
-def finish_dump(*, completed: bool) -> None:
-    """Flush the final teacher tail after draining async writes, then mark completion."""
+def finish_dump() -> None:
+    """Flush the final teacher tail synchronously after draining async writes."""
     from .logits_saver import get_logits_saver
 
     saver = get_logits_saver()
@@ -441,28 +648,16 @@ def finish_dump(*, completed: bool) -> None:
         return
     saver.initialize()
     saver._write_batched_tar(*saver.take_pending_data())
-    # Synchronize only ranks on the saver stage, not the whole pipeline.
-    from megatron.core import parallel_state as mpu
-
-    if dist.is_initialized():
-        dist.barrier(group=mpu.get_tensor_and_data_parallel_group(with_context_parallel=True))
-    if completed and saver.tp_rank == saver.cp_rank == saver.dp_rank == 0:
-        from megatron.training import get_args
-
-        storage = Storage(saver.save_dir)
-        metadata = dict(saver.metadata_dict)
-        metadata.pop("published_through", None)
-        groups = discover_groups(storage, metadata)
-        end = groups[-1][0]["records"][-1]["end"] if groups else metadata["first_sample"]
-        if end != get_args().consumed_train_samples:
-            raise RuntimeError("Teacher v3 completion has unpublished sample ranges")
-        storage.write_json(COMPLETE_FILE, {"generation": metadata["generation"], "end_sample": end})
 
 
 def reset_runtime() -> None:
     """Clear replay state when Megatron is torn down or restarted in-process."""
-    global _PLAN
+    global _PLAN, _HYBRID_LAYOUT
+    if _PLAN is not None:
+        for reader in _PLAN.get("readers", []):
+            reader.close()
     _PLAN = None
+    _HYBRID_LAYOUT = False
     from . import cached_logits_loss, logits_saver
 
     logits_saver._ACTIVE_LOGITS_SAVER = None

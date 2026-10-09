@@ -16,7 +16,7 @@ from megatron.training import get_args, get_tensorboard_writer
 from .logits_saver import LogitsSaverHooks
 from .v3_format import capture_batch, encode, join_inputs, pack_targets
 from .v3_replay import layout_options, token_map
-from .v3_storage import Storage, write_shard
+from .v3_storage import KINDS, Storage, member_name, parse_tar_name, tar_name, write_tar
 
 
 class PairedLogitsSaver(LogitsSaverHooks):
@@ -47,10 +47,15 @@ class PairedLogitsSaver(LogitsSaverHooks):
         if self.tp_rank != 0:
             return
         inputs = capture_batch(batch)
-        mapping = token_map(
-            inputs, self.cp_rank, self.cp_size, **layout_options(get_args(), hybrid=hybrid)
-        )
+        mapping = token_map(inputs, self.cp_rank, self.cp_size, **self._layout_options(hybrid))
         self._pending_input = (inputs, mapping)
+
+    def _layout_options(self, hybrid: bool) -> dict:
+        # The hybrid layouts come from a full TransformerConfig; build it once, not per microbatch.
+        cache = self.__dict__.setdefault("_layout_cache", {})
+        if hybrid not in cache:
+            cache[hybrid] = layout_options(get_args(), hybrid=hybrid)
+        return cache[hybrid]
 
     def begin_attempt(self) -> None:
         """Discard provisional data before an iteration execution or rerun."""
@@ -129,20 +134,11 @@ class PairedLogitsSaver(LogitsSaverHooks):
             args = get_args()
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
-            count = inputs["sample_offsets"].numel() - 1
-            ids = [
-                start
-                + (i // args.micro_batch_size * self.dp_size + self.dp_rank) * args.micro_batch_size
-                + i % args.micro_batch_size
-                for i in range(count)
-            ]
             record_id = f'{self.metadata_dict["generation"]}:dp{self.dp_rank}:{start}-{end}'
             inputs["record_id"] = targets["record_id"] = record_id
-            inputs["sample_ids"] = ids
             self._iteration_records = {
                 "start": start,
                 "end": end,
-                "sample_ids": ids,
                 "record_id": record_id,
                 "inputs": encode(inputs),
                 "targets": encode(targets),
@@ -178,7 +174,8 @@ class PairedLogitsSaver(LogitsSaverHooks):
         name = ""
         if writes:
             start, end = min(a for a, _ in writes), max(b for _, b in writes)
-            name = os.path.join(self.save_dir, f"dp{self.dp_rank}__{start}-{end}.tar")
+            # The inputs tar name; the paired targets tar shares its rank and range.
+            name = os.path.join(self.save_dir, tar_name(self.dp_rank, start, end, "inputs"))
         return (
             name,
             writes,
@@ -206,10 +203,27 @@ class PairedLogitsSaver(LogitsSaverHooks):
 
                 MultiStorageClientFeature.enable()
             metadata = json.loads(meta_bytes)
-            # Resume-only state is not part of immutable shard metadata.
+            # Resume-only state is not part of the immutable tar metadata.
             metadata.pop("published_through", None)
+            metadata.pop("range_end", None)
             storage = Storage(os.path.dirname(tar_path))
-            write_shard(storage, os.path.basename(tar_path), metadata, list(writes.values()))
+            parsed = parse_tar_name(os.path.basename(tar_path))
+            records = list(writes.values())
+            # Inputs first: a range is only readable once both tars exist.
+            for kind in KINDS:
+                meta = {
+                    **metadata,
+                    "kind": kind,
+                    "dp_rank": parsed.dp_rank,
+                    "range": [parsed.start, parsed.end],
+                }
+                members = [
+                    (member_name(record["start"], record["end"], kind), record[kind])
+                    for record in records
+                ]
+                write_tar(
+                    storage, tar_name(parsed.dp_rank, parsed.start, parsed.end, kind), meta, members
+                )
         except Exception:
             if failure_event is not None:
                 failure_event.set()
