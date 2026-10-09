@@ -18,6 +18,7 @@ from megatron.core.context_parallel.utils import (
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import (
+    _get_batch_on_this_cp_rank_per_document_balancing,
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
 )
@@ -784,7 +785,10 @@ def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_siz
     ],
 )
 @pytest.mark.parametrize("with_contiguous_layout", [False, True])
-def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with_contiguous_layout):
+@pytest.mark.parametrize("tokens_per_sample", [16, None], ids=["fixed", "variable"])
+def test_get_batch_on_this_cp_rank_zigzag_packed(
+    cp_rank, expected_indices, with_contiguous_layout, tokens_per_sample
+):
     tokens = torch.arange(1, 17).view(1, 16)
     loss_mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]])
     batch = {
@@ -828,7 +832,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
             sequence_parallel=True,
             tp_group=tp_group,
             tp_cp_group=MagicMock(),
-            tokens_per_sample=16,
+            tokens_per_sample=tokens_per_sample,
         )
         result = cp_batch.get_batch("zigzag")
 
@@ -864,6 +868,18 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     torch.testing.assert_close(
         zigzag_packed_seq_params.seq_idx, torch.tensor([[0] * 8 + [1] * 24], dtype=torch.int32)
     )
+    if tokens_per_sample is None:
+        indices = torch.tensor(expected_indices)
+        expected_moe_seq_idx = torch.searchsorted(
+            torch.tensor([4, 16], dtype=torch.int32), indices.clamp_min(0), right=True
+        ).to(torch.int32)
+        expected_moe_seq_idx.masked_fill_(padding, 2)
+        torch.testing.assert_close(
+            zigzag_packed_seq_params.moe_seq_idx, expected_moe_seq_idx.unsqueeze(0)
+        )
+    else:
+        assert zigzag_packed_seq_params.moe_seq_idx is None
+    assert "moe_seq_idx" not in result
 
 
 def test_metadata_only_cp_batch_skips_sharding():
@@ -887,6 +903,37 @@ def test_metadata_only_cp_batch_skips_sharding():
     shard_batch.assert_not_called()
     assert cp_batch.get_batch()["tokens"] is None
     assert cp_batch.get_packed_seq_params("zigzag") is not None
+
+
+def test_per_document_cp_shards_moe_sequence_ids_without_tokens():
+    """Intermediate PP stages still need CP-local sequence ownership for MoE."""
+    batch = {
+        "tokens": None,
+        "labels": None,
+        "loss_mask": None,
+        "position_ids": None,
+        "moe_seq_idx": torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.int32),
+        "cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32),
+        "cu_seqlens_padded": None,
+    }
+    indices = torch.tensor([0, 3, 4, 7])
+    te_mock = MagicMock()
+    te_mock.thd_get_partitioned_indices.return_value = indices
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("megatron.core.utils.tex", te_mock),
+    ):
+        result = _get_batch_on_this_cp_rank_per_document_balancing(batch, MagicMock())
+
+    torch.testing.assert_close(
+        result["moe_seq_idx"], torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
+    )
+    te_mock.thd_get_partitioned_indices.assert_called_once()
+    te_args = te_mock.thd_get_partitioned_indices.call_args.args
+    torch.testing.assert_close(te_args[0], batch["cu_seqlens"][0])
+    assert te_args[1:] == (8, 2, 0)
 
 
 def test_get_batch_builds_required_cp_layouts():

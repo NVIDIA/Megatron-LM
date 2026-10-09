@@ -1231,6 +1231,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             input_ids = input_ids.view(mbs, tokens_per_sample)
         return hidden_states, padding_mask, input_ids, mbs
 
+    def _uses_variable_packed_seq_aux_loss(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> bool:
+        """Return whether this layer needs logical sequence accounting for a THD pack."""
+        routing_type = self.config.moe_router_load_balancing_type
+        uses_seq_aux_loss = routing_type == "seq_aux_loss" or (
+            isinstance(routing_type, list) and "seq_aux_loss" in routing_type
+        )
+        return (
+            self.is_moe_layer
+            and uses_seq_aux_loss
+            and packed_seq_params is not None
+            and packed_seq_params.tokens_per_sample is None
+        )
+
     def _maybe_reflatten_from_moe(self, output, packed_seq_params, mbs):
         """Re-flatten MoE output back to [mbs*S, 1, H] for the residual add."""
         if mbs is None:
@@ -1456,6 +1471,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             and inference_context is None
             and self.training
             and not isinstance(self.mlp, IdentityOp)
+            and not self._uses_variable_packed_seq_aux_loss(packed_seq_params)
         )
 
         using_fused_tp_inference_kernel = (
@@ -1851,6 +1867,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        if self._uses_variable_packed_seq_aux_loss(kwargs.get("packed_seq_params")):
+            raise ValueError(
+                "Variable-length packed seq_aux_loss is not supported with Transformer Engine "
+                "CUDA graphs because packed sequence metadata is not captured."
+            )
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -1912,6 +1933,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         However, CUDA graph accepts only Tensor inputs.
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
+        if self._uses_variable_packed_seq_aux_loss(kwargs.get("packed_seq_params")):
+            raise ValueError(
+                "Variable-length packed seq_aux_loss is not supported with Transformer Engine "
+                "CUDA graphs because packed sequence metadata is not captured."
+            )
         context = None
         if (
             self.config.cuda_graph_modules
@@ -2633,6 +2659,8 @@ class MoETransformerLayer(TransformerLayer):
           and _forward_mlp_postprocess by CudaGraphManager.__init__. The expert dispatch
           in between runs eagerly. This is used during training.
         """
+        if self._uses_variable_packed_seq_aux_loss(kwargs.get("packed_seq_params")):
+            return False
         if self.use_partial_cudagraphs:
             return False
         if self.config.cuda_graph_impl != "local":
@@ -2813,6 +2841,17 @@ class MoETransformerLayer(TransformerLayer):
         If `use_partial_cudagraphs` is True, this method stitches together the
         router, expert_compute, and postprocess calls.
         """
+
+        if self.use_partial_cudagraphs and self._uses_variable_packed_seq_aux_loss(
+            packed_seq_params
+        ):
+            self.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+            return super()._forward_mlp(
+                hidden_states,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
+            )
 
         if inference_context is not None:
             assert not self.use_partial_cudagraphs, (

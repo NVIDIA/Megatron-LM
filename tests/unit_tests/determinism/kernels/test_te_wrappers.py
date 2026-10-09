@@ -485,6 +485,7 @@ class TestTEWrappers:
         module = TEDotProductAttention(
             config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
         ).cuda()
+        assert "moe_seq_idx" not in module.kept_packed_seq_params
         s, b, h, hkv, d = 4096, 2, 16, 4, 128
         q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)

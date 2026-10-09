@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutputManager,
@@ -484,7 +485,7 @@ def _no_layers_have_manager(block) -> bool:
     return all(not hasattr(layer, 'cudagraph_manager') for layer in block.layers)
 
 
-def _make_moe_transformer_layer(*, partial_cudagraph: bool):
+def _make_moe_transformer_layer(*, partial_cudagraph: bool, routing_type: str = "none"):
     config = TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -493,7 +494,8 @@ def _make_moe_transformer_layer(*, partial_cudagraph: bool):
         moe_ffn_hidden_size=64,
         num_moe_experts=4,
         moe_router_topk=2,
-        moe_router_load_balancing_type="none",
+        moe_router_load_balancing_type=routing_type,
+        moe_aux_loss_coeff=1.0 if routing_type == "seq_aux_loss" else None,
         moe_token_dispatcher_type="allgather",
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -579,6 +581,33 @@ class TestTransformerLayerCudaGraphManagers:
         # All-gather routing metadata stays on CUDA, so replay must not create a host-wait event.
         assert not hasattr(partial_cg_layer, '_router_dtoh_event')
         torch.testing.assert_close(partial_cg_output, eager_output, rtol=0, atol=0)
+
+    def test_variable_packed_seq_aux_loss_falls_back_from_partial_cudagraph(self):
+        eager_layer = _make_moe_transformer_layer(
+            partial_cudagraph=False, routing_type="seq_aux_loss"
+        ).cuda()
+        partial_cg_layer = _make_moe_transformer_layer(
+            partial_cudagraph=True, routing_type="seq_aux_loss"
+        ).cuda()
+        partial_cg_layer.load_state_dict(eager_layer.state_dict())
+
+        hidden_states = torch.randn(8, 1, 32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda"),
+            moe_seq_idx=torch.tensor([0, 0, 0, 1, 1, 1, 1, 1], device="cuda"),
+        )
+
+        eager_output = eager_layer._forward_mlp(
+            hidden_states.clone(), packed_seq_params=packed_seq_params
+        )
+        partial_cg_output = partial_cg_layer._forward_mlp(
+            hidden_states.clone(), packed_seq_params=packed_seq_params
+        )
+
+        torch.testing.assert_close(partial_cg_output, eager_output, rtol=0, atol=0)
+        assert partial_cg_layer.mlp.fwd_execution_map == ["route", "expert_compute", "postprocess"]
+        assert not partial_cg_layer.cudagraph_manager_router.cudagraph_runners
 
     def test_empty_scope_transformer_layer_has_per_layer_manager(self):
         block = _make_cuda_graph_gpt_block(

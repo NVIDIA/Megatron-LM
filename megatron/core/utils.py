@@ -2601,6 +2601,11 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
     cp_rank = torch.distributed.get_rank(cp_group)
 
     if cp_size > 1:
+        sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids', 'moe_seq_idx')
+        sequence_tensor = next(
+            (batch[key] for key in sequence_keys if batch.get(key) is not None), None
+        )
+        assert sequence_tensor is not None, "At least one sequence tensor is required"
         # cu_seqlens / cu_seqlens_padded carry a leading batch dim (1, n).
         # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze
         # the batch dim inline without mutating the batch dict.
@@ -2610,15 +2615,9 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             else batch["cu_seqlens"]
         )[0]
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
-        for key in SEQUENCE_KEYS:
+        for key in sequence_keys:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)
     return batch
