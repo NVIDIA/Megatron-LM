@@ -441,7 +441,7 @@ class TestGetDsaModuleSpec:
         ), f"Expected 1 for_qk=True call (indexer only), got {len(qk_calls)}"
 
     def test_linear_projections(self):
-        """Verify Q/KV projection slots and backend.column_parallel_linear call count."""
+        """Verify Q/KV/gate projection slots and column-parallel backend call count."""
         backend = _make_backend()
         cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True)
         spec = self._call(cfg=cfg, backend=backend)
@@ -451,9 +451,10 @@ class TestGetDsaModuleSpec:
         assert subs.linear_q_up_proj == _FakeColumnParallelLinear
         assert subs.linear_kv_down_proj == _FakeLinear
         assert subs.linear_kv_up_proj == _FakeColumnParallelLinear
+        assert subs.linear_gate == _FakeColumnParallelLinear
         assert subs.linear_proj == _FakeRowParallelLinear
-        # column_parallel_linear() is called exactly 3 times (q_proj, q_up_proj, kv_up_proj)
-        assert backend.column_parallel_linear.call_count == 3
+        # column_parallel_linear() is called for q_proj, q_up_proj, kv_up_proj, and gate.
+        assert backend.column_parallel_linear.call_count == 4
         assert backend.row_parallel_linear.call_count == 1
 
 
