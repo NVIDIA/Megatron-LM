@@ -704,13 +704,16 @@ class TestMultiTokenPredictionLayer:
     @pytest.mark.parametrize("tp", [1, 2])
     @pytest.mark.parametrize("cp", [1, 2])
     @pytest.mark.parametrize("layout", ["unpacked", "packed", "padded_packed"])
-    def test_get_embeddings_rolls_padding_mask(self, tp, cp, layout):
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
+    def test_get_embeddings_rolls_padding_mask(self, tp, cp, layout, cp_layout):
         """Shifted sequence ends and existing padding stay excluded at every MTP depth."""
         if Utils.world_size < tp * cp:
             pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=tp, cp=cp, use_te=cp > 1)
         mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        # Only the token-field preprocessing is exercised; no attention forward runs.
+        mtp_layer.config.attention_cp_layout = cp_layout
         cp_group = get_context_parallel_group()
         cp_rank = torch.distributed.get_rank(group=cp_group)
         tp_rank = torch.distributed.get_rank(group=get_tensor_model_parallel_group())
@@ -724,6 +727,9 @@ class TestMultiTokenPredictionLayer:
                 local_indices.extend(range(start + chunk * width, start + (chunk + 1) * width))
             logical.append(logical[-1] + length)
             physical.append(start + capacity)
+        if cp_layout == "contiguous":
+            width = physical[-1] // cp
+            local_indices = list(range(cp_rank * width, (cp_rank + 1) * width))
         index = torch.tensor(local_indices, device="cuda")
         packed_seq_params = None
         if layout != "unpacked":

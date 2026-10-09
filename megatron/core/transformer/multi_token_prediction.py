@@ -13,6 +13,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
+from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -213,7 +214,16 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, return_sum=True):
+def roll_tensor(
+    tensor,
+    shifts=-1,
+    dims=-1,
+    cp_group=None,
+    packed_seq_params=None,
+    return_sum=True,
+    cp_layout: CPLayout = "zigzag",
+    fill_value=0,
+):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -222,8 +232,8 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     boundary conditions.
 
     For CP=1 (default behavior): Uses standard torch.roll with zero padding
-    For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
-    boundary elements between adjacent CP ranks to maintain sequence continuity.
+    For zigzag CP>1: Rolls within each chunk, then exchanges boundary elements between
+    adjacent CP ranks. The contiguous layout exchanges shard boundaries and honors fill_value.
 
     For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
     from different sequences.
@@ -238,11 +248,24 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                             If provided, respects sequence boundaries.
         return_sum (bool): Whether to calculate and return the rolled tensor sum.
                            Defaults to True.
+        cp_layout (CPLayout): "contiguous" selects contiguous CP shards and requires
+                              shifts=-1; "zigzag" retains the legacy rolling paths.
+        fill_value: Value used outside the same real document in the contiguous path.
+                    Other layouts require the default zero fill.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor). The sum is None when disabled.
     """
     if tensor is None:
         return None, None
+
+    if cp_layout == "contiguous":
+        if shifts != -1:
+            raise ValueError("Contiguous CP roll supports shifts=-1.")
+        result = roll_contiguous(tensor, dims, cp_group, packed_seq_params, fill_value)
+        return result, result.sum() if return_sum else None
+
+    if fill_value != 0:
+        raise ValueError("roll_tensor honors fill_value only with cp_layout='contiguous'.")
 
     # Handle packed sequences cases
     if packed_seq_params is not None:
@@ -1140,6 +1163,7 @@ def process_mtp_loss(
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
             return_sum=False,
+            cp_layout=config.attention_cp_layout,
         )
         derived_labels_from_input_ids = True
 
@@ -1163,6 +1187,7 @@ def process_mtp_loss(
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
             return_sum=False,
+            cp_layout=config.attention_cp_layout,
         )
 
     # Store the original number of tokens before rolling for proper normalization
@@ -1202,47 +1227,62 @@ def process_mtp_loss(
                 sequence_dim=0,
                 batch_dim=1,
             )
-        mtp_labels, _ = roll_tensor(
-            mtp_labels,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            return_sum=False,
-        )
-
-        if mtp_input_mask is not None:
-            # Each MTP step consumes one additional token. Accumulate validity so
-            # one invalid conditioning token also masks every later step on that path.
-            mask_metadata = torch.cat((loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0)
-            mask_metadata, _ = roll_tensor(
-                mask_metadata,
+        if config.attention_cp_layout == "contiguous":
+            mtp_labels, loss_mask, mtp_input_mask = roll_contiguous_fields(
+                (mtp_labels, loss_mask, mtp_input_mask), cp_group, packed_seq_params
+            )
+            layer_loss_mask = loss_mask
+            if mtp_input_mask is not None:
+                cumulative_mtp_input_mask = (
+                    mtp_input_mask
+                    if cumulative_mtp_input_mask is None
+                    else cumulative_mtp_input_mask & mtp_input_mask
+                )
+                layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+            num_tokens = layer_loss_mask.sum()
+        else:
+            mtp_labels, _ = roll_tensor(
+                mtp_labels,
                 shifts=-1,
                 dims=-1,
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
-            loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
-            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-            if cumulative_mtp_input_mask is None:
-                cumulative_mtp_input_mask = mtp_input_mask
+            if mtp_input_mask is not None:
+                # Each MTP step consumes one additional token. Accumulate validity so
+                # one invalid conditioning token also masks every later step on that path.
+                mask_metadata = torch.cat(
+                    (loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0
+                )
+                mask_metadata, _ = roll_tensor(
+                    mask_metadata,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                )
+                loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+                if cumulative_mtp_input_mask is None:
+                    cumulative_mtp_input_mask = mtp_input_mask
+                else:
+                    cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
+                layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+                num_tokens = layer_loss_mask.sum()
             else:
-                cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
-            layer_loss_mask = loss_mask * cumulative_mtp_input_mask
-            num_tokens = layer_loss_mask.sum()
-        else:
-            loss_mask, rolled_num_tokens = roll_tensor(
-                loss_mask,
-                shifts=-1,
-                dims=-1,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-            )
-            layer_loss_mask = loss_mask
-            # roll_tensor already computed this reduction. Preserve the legacy
-            # no-mask fast path for all non-multimodal MTP callers.
-            num_tokens = rolled_num_tokens
+                loss_mask, rolled_num_tokens = roll_tensor(
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                layer_loss_mask = loss_mask
+                # roll_tensor already computed this reduction. Preserve the legacy
+                # no-mask fast path for all non-multimodal MTP callers.
+                num_tokens = rolled_num_tokens
 
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
@@ -1580,70 +1620,80 @@ class MultiTokenPredictionLayer(MegatronModule):
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        if mtp_input_mask is None:
-            input_ids, _ = roll_tensor(
-                input_ids,
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
-            )
-        else:
+        if mtp_input_mask is not None:
             assert mtp_input_mask.shape == input_ids.shape, (
                 f"mtp_input_mask shape {mtp_input_mask.shape} must match "
                 f"input_ids shape {input_ids.shape}"
             )
-            # Roll IDs and validity together so CP performs one boundary exchange.
-            token_metadata = torch.cat((input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0)
-            token_metadata, _ = roll_tensor(
-                token_metadata,
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
+        if padding_mask is not None and self.config.sequence_parallel:
+            # The mask is SP-sharded, while IDs and CP metadata cover the full
+            # CP-local sequence. Restore that sequence before either layout's roll.
+            padding_mask = gather_from_sequence_parallel_region(
+                padding_mask.transpose(0, 1).contiguous(),
+                tensor_parallel_output_grad=False,
+                group=self.tp_group,
+            ).transpose(0, 1)
+        if self.config.attention_cp_layout == "contiguous":
+            input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
+                (input_ids, position_ids, padding_mask, mtp_input_mask),
+                self.cp_group,
+                packed_seq_params,
+                fill_values=(0, 0, True, False),
             )
-            input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
-            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-            return_sum=False,
-        )
-        if padding_mask is not None:
-            # GPT has already SP-sharded this mask. Reconstruct the CP-local
-            # sequence before rolling so TP boundaries are not mistaken for ends
-            # and packed/CP metadata still describes the tensor being shifted.
-            if self.config.sequence_parallel:
-                padding_mask = gather_from_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous(),
-                    tensor_parallel_output_grad=False,
-                    group=self.tp_group,
-                ).transpose(0, 1)
-            # roll_tensor zero-fills sequence ends. Roll validity so these new
-            # positions remain padding (True), including packed/CP boundaries.
-            valid_mask, _ = roll_tensor(
-                ~padding_mask,
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
-            )
-            padding_mask = ~valid_mask
-            if self.config.sequence_parallel:
-                padding_mask = (
-                    scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
+            if mtp_input_mask is not None:
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+        else:
+            if mtp_input_mask is None:
+                input_ids, _ = roll_tensor(
+                    input_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
                 )
+            else:
+                # Roll IDs and validity together so CP performs one boundary exchange.
+                token_metadata = torch.cat(
+                    (input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0
+                )
+                token_metadata, _ = roll_tensor(
+                    token_metadata,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                )
+                input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+            position_ids, _ = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+                return_sum=False,
+            )
+            if padding_mask is not None:
+                # Roll validity so zero-filled sequence ends remain padding.
+                valid_mask, _ = roll_tensor(
+                    ~padding_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                )
+                padding_mask = ~valid_mask
+        if padding_mask is not None and self.config.sequence_parallel:
+            padding_mask = (
+                scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -2703,7 +2753,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                         padded_cu_seqlens is not None
                         and padded_cu_seqlens is not packed_seq_params.cu_seqlens_q
                     )
-                    use_local_packed_roll = use_local_packed_roll or genuinely_padded
+                    use_local_packed_roll = use_local_packed_roll or (
+                        genuinely_padded and self.config.attention_cp_layout != "contiguous"
+                    )
                 if use_local_packed_roll and packed_seq_params is not None:
                     shard_params = _packed_seq_params_for_local_hsm_roll(
                         packed_seq_params,
@@ -2720,6 +2772,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     cp_group=None if use_local_packed_roll else self.cp_group,
                     packed_seq_params=roll_packed_seq_params,
                     return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
                 )
                 rolled_older_hidden_states = rolled.reshape(
                     num_entries, batch_size, hidden_size, sequence_length

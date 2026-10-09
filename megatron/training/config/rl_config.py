@@ -97,15 +97,6 @@ class RLConfig:
     rl_offload_optimizer_during_inference: bool = False
     """Offload optimizer state to CPU during inference/rollout to save GPU memory."""
 
-    rl_kv_cache_management_mode: Literal["persist", "offload", "recompute"] = "persist"
-    """KV cache management mode during RL training. persist: leave KV cache in GPU memory (default).
-    offload: offload KV cache to CPU during training. recompute: deallocate KV cache and recompute
-    from scratch each cycle."""
-
-    rl_persist_cuda_graphs: bool = field(default=False, metadata=_BOOL_OPTIONAL)
-    """Persist CUDA graphs when the inference engine is suspended. If False, CUDA graphs are deleted
-    on suspend and re-captured on resume."""
-
     rl_partial_rollouts: bool = field(default=False, metadata=_BOOL_OPTIONAL)
     """Allow inference to continue generating rollouts while training updates the policy weights.
     This enables off-policy training where rollouts may be generated with a stale version of the
@@ -242,12 +233,6 @@ class RLConfig:
             self.rl_submission_granularity == "B" and self.rl_consumption_granularity == "G"
         ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
 
-        # KV cache offload requires CUDA graph persistence: recapturing CUDA graphs runs dummy
-        # forward passes that corrupt the preserved KV data.
-        assert self.rl_kv_cache_management_mode != "offload" or self.rl_persist_cuda_graphs, (
-            "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
-        )
-
         if (
             self.rl_offload_inference_model_weights
             and self.rl_inference_model_unified_memory_level != 1
@@ -261,3 +246,58 @@ class RLConfig:
                     "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
                     "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                 )
+
+    def validate_run(
+        self,
+        *,
+        cuda_graph_impl: str | None,
+        micro_batch_size: int | None,
+        global_batch_size: int | None,
+        skip_train: bool,
+        load_optim: bool,
+        save_interval: int | None,
+        exit_interval: int | None,
+    ) -> None:
+        """Check this section against the rest of the run it belongs to."""
+        if not self.perform_rl_step:
+            return
+
+        # Training CGs only make sense if we build any CGs.
+        if cuda_graph_impl == "none" and self.rl_training_cuda_graphs:
+            raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
+
+        if self.rl_use_sequence_packing and micro_batch_size != 1:
+            raise ValueError(
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per "
+                "micro batch increase the sequence length."
+            )
+
+        if global_batch_size is None:
+            raise ValueError("global_batch_size must be resolved before validating the RL run.")
+        # Ensure that the number of samples we collect is a multiple of the global batch size.
+        samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
+        if samples_per_inference_iteration % global_batch_size != 0:
+            raise ValueError(
+                "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                "global_batch_size"
+            )
+        # For now only exit/checkpoint on iterations where we generate data. We don't currently
+        # have a way to checkpoint the generated data.
+        iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
+        if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+            raise ValueError(
+                "exit_interval should be divisible by number of global batches per inference "
+                "iteration."
+            )
+        if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+            raise ValueError(
+                "save_interval should be divisible by number of global batches per inference "
+                "iteration."
+            )
+
+        # In inference-only mode the optimizer is created only when it is loaded.
+        if skip_train and not load_optim and self.rl_offload_optimizer_during_inference:
+            raise ValueError(
+                "--no-load-optim with --skip-train --perform-rl-step skips the optimizer; "
+                "--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload)."
+            )
