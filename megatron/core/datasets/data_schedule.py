@@ -15,6 +15,7 @@ from megatron.core.datasets.data_schedule_utils import (
     create_data_iterator,
     get_batch_and_global_seqlens,
     get_packed_sequence_alignment,
+    get_packed_sequence_length,
     next_hdp_group_packing_aware,
     pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
@@ -87,6 +88,7 @@ class BasePackingScheduler:
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
+        pad_sequences: bool = False,
     ):
         """
         Args:
@@ -95,11 +97,13 @@ class BasePackingScheduler:
             dp_size: The data parallel size.
             microbatch_group_size_per_vp_stage: The microbatch group size per virtual
             pipeline stage, only used when enabling VPP, otherwise None.
+            pad_sequences: Account for per-sequence zigzag padding when packing.
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+        self.pad_sequences = pad_sequences
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -171,13 +175,18 @@ class DpBalancedScheduler(BasePackingScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+            seq_len = get_packed_sequence_length(
+                sample_id_seqlens[i][1], self.cp_size, self.pad_sequences
+            )
+            if seq_len > self.max_seq_len_all_ranks:
+                raise ValueError("A padded sequence exceeds the static CP packing capacity")
+            if sum_seqlen + seq_len <= self.max_seq_len_all_ranks:
                 single_microbatch.append(i)
-                sum_seqlen += sample_id_seqlens[i][1]
+                sum_seqlen += seq_len
             else:
                 packed_id_groups.append(single_microbatch)
                 single_microbatch = [i]
-                sum_seqlen = sample_id_seqlens[i][1]
+                sum_seqlen = seq_len
         if len(single_microbatch) > 0:
             packed_id_groups.append(single_microbatch)
 
@@ -420,6 +429,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda item: item[1], reverse=True)
+        lengths_by_id = dict(sample_id_seqlens)
         sample_id_groups = []
 
         while sample_id_seqlens:
@@ -429,6 +439,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 max_seq_len_per_rank=self.max_seqlen_per_dp_cp_rank,
                 min_cp_size=self.min_cp_size,
                 cp_group_sizes=self.cp_group_sizes,
+                pad_sequences=self.pad_sequences,
             )
             sample_id_groups.append(sample_ids)
 
@@ -437,7 +448,12 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
             and self.microbatch_group_size_per_vp_stage > 1
         ):
             sample_id_groups = align_sample_id_groups(
-                sample_id_groups, self.microbatch_group_size_per_vp_stage
+                sample_id_groups,
+                self.microbatch_group_size_per_vp_stage,
+                cp_group_sizes=self.cp_group_sizes,
+                sample_lengths=lengths_by_id,
+                max_seq_len_per_rank=self.max_seqlen_per_dp_cp_rank,
+                pad_sequences=self.pad_sequences,
             )
 
         return sample_id_groups
@@ -493,6 +509,7 @@ def wrap_data_iterator(
 
     capacity = config.max_seqlen_per_dp_cp_rank
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
+    scheduler_kwargs['pad_sequences'] = pad_enabled
     if pad_enabled:
         capacity -= capacity % alignment
         if capacity < alignment:
@@ -605,7 +622,6 @@ def get_batch_on_this_rank_for_sequence_packing(
         vp_stage is None or vp_stage == vpp_size - 1
     )
 
-    is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
 
     # data_iterator should return a batch including the following keys.
@@ -663,8 +679,10 @@ def get_batch_on_this_rank_for_sequence_packing(
             ), "Transformer Engine is required to use Context Parallel with THD format data."
             index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             cp_slice_keys = ['padding_mask']
-            if is_first_or_last_stage or mtp_on_this_rank:
-                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+            if is_first_stage or mtp_on_this_rank:
+                cp_slice_keys.extend(['tokens', 'position_ids'])
+            if is_last_stage or mtp_on_this_rank:
+                cp_slice_keys.extend(['labels', 'loss_mask'])
             for key in cp_slice_keys:
                 batch[key] = batch[key].index_select(0, index)
 
@@ -779,7 +797,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 config,
                 tp_group,
                 dynamic_cp,
-                int(batch['local_cp_size'].item()),
+                runtime_cp_group.size(),
                 dynamic_tp_cp_group_func,
                 tp_cp_group,
             ),
