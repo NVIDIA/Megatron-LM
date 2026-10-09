@@ -9,8 +9,9 @@ Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`RowAt
   `FsdpParameterGroup`, keyed by each parameter's index within the group.
 - `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
   function.
-- `GroupOwnerLayout.from_group` builds a data structure capturing the per-group owner layout upon
-  the above.
+- `GroupOwnerLayout` is a data structure capturing the per-group owner layout.
+- `GroupOwnerLayout.from_groups` builds one `GroupOwnerLayout` per group, balancing owner work
+  jointly across the groups.
 - `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` take the `GroupOwnerLayout` plus this rank's data
   and build the flat P2P send/recv buffers,
 - `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full flat tensor on the
@@ -149,18 +150,24 @@ def ns_cost_fn(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
 
 
 def assign_owner_work(
-    layouts: dict[int, ParameterLayout], cost_fn: Callable[[ParameterLayout], float] | None = None
-) -> dict[int, int]:
-    """Assign one owner rank to each parameter, keyed by tensor index.
+    group_layouts: list[dict[int, ParameterLayout]],
+    cost_fn: Callable[[ParameterLayout], float] | None = None,
+) -> list[dict[int, int]]:
+    """Jointly assign owners for several groups' parameter layouts, one mapping per group, each
+    keyed by tensor index.
 
     Non-boundary parameters are assigned to their original rank (the only rank holding their
     elements, so no communication is needed) and their cost counts toward that rank's running total
     cost. Boundary parameters are processed in descending cost order and each is greedily given to
     its eligible rank with the smallest running cost total.
 
+    Deterministic and rank-identical for rank-identical inputs: group order, layouts, cost
+    estimates, and the `(resulting load, rank)` tie-break are identical on every rank.
+
     Args:
-        layouts: Parameter layouts keyed by each parameter's tensor index in its
-            `FsdpParameterGroup`.
+        group_layouts: One `{tensor_index: layout}` mapping per group, in rank-identical group
+            order. Each `tensor_index` is the parameter's index in its `FsdpParameterGroup`. All
+            groups must sit on the same DP mesh.
         cost_fn: Callable that returns a positive cost estimate for a given parameter layout. The
             greedy balancer minimizes the maximum running cost total across ranks, so the cost
             should reflect the relative compute weight of owning each parameter (e.g., an
@@ -168,35 +175,42 @@ def assign_owner_work(
             orthogonalization via Newton-Schulz with 5 iterations/steps.
 
     Returns:
-        Mapping from tensor index to owner rank.
+        One mapping from tensor indices to owner ranks per group.
     """
     if cost_fn is None:
         cost_fn = ns_cost_fn(num_ns_steps=5)
 
-    assignments: dict[int, int] = {}
-    if not layouts:
-        return assignments
-    dp_size = next(iter(layouts.values())).dp_size
+    assignments_per_group: list[dict[int, int]] = [{} for _ in group_layouts]
+    first_layout = next((layout for layouts in group_layouts for layout in layouts.values()), None)
+    if first_layout is None:
+        return assignments_per_group
+    # Verify `dp_size` consistency across groups.
+    dp_size = first_layout.dp_size
+    for layouts in group_layouts:
+        for layout in layouts.values():
+            if layout.dp_size != dp_size:
+                raise ValueError(
+                    "`assign_owner_work` requires every group's layouts to share one DP mesh size; "
+                    f"got {layout.dp_size} vs {dp_size}. Balance groups per mesh instead."
+                )
     running: dict[int, float] = {r: 0.0 for r in range(dp_size)}
+    boundary: list[tuple[float, int, int]] = []  # (cost, group index, tensor index)
     # Non-boundary parameters are assigned to their sole holder; account for their cost.
-    for tensor_index, layout in layouts.items():
-        if layout.is_boundary():
-            continue
-        (holder,) = layout.owner_candidates()
-        assignments[tensor_index] = holder
-        running[holder] += cost_fn(layout)
-    # Sort boundary params by descending cost (longest processing time first).
-    boundary_costs = sorted(
-        (
-            (tensor_index, cost_fn(layout))
-            for tensor_index, layout in layouts.items()
-            if layout.is_boundary()
-        ),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    for tensor_index, cost in boundary_costs:
-        layout = layouts[tensor_index]
+    for group_index, layouts in enumerate(group_layouts):
+        for tensor_index, layout in layouts.items():
+            if layout.is_boundary():
+                # Collect boundary parameters for later.
+                boundary.append((cost_fn(layout), group_index, tensor_index))
+                continue
+            (holder,) = layout.owner_candidates()
+            assignments_per_group[group_index][tensor_index] = holder
+            running[holder] += cost_fn(layout)
+    # Sort boundary params by descending cost (longest processing time first). Ties keep the
+    # rank-identical (group order, tensor index) order.
+    for cost, group_index, tensor_index in sorted(
+        boundary, key=lambda item: (-item[0], item[1], item[2])
+    ):
+        layout = group_layouts[group_index][tensor_index]
         candidates = layout.owner_candidates()
         if not candidates:
             raise RuntimeError(
@@ -204,9 +218,9 @@ def assign_owner_work(
                 "no rank owns a shard."
             )
         owner = min(candidates, key=lambda r: running[r])
-        assignments[tensor_index] = owner
+        assignments_per_group[group_index][tensor_index] = owner
         running[owner] += cost
-    return assignments
+    return assignments_per_group
 
 
 @dataclasses.dataclass(frozen=True)
@@ -231,27 +245,51 @@ class GroupOwnerLayout:
     owners: dict[int, int]
 
     @classmethod
-    def from_group(
+    def from_groups(
         cls,
-        group: FsdpParameterGroup,
+        groups: list[FsdpParameterGroup],
         *,
         cost_fn: Callable[[ParameterLayout], float] | None = None,
         eligible_fn: Callable[[torch.Tensor], bool] | None = None,
-    ) -> Self:
-        """Build the owner layout for one group.
+    ) -> list[Self]:
+        """Build one owner layout per group, balancing owner work jointly across the groups.
+
+        All groups must sit on the same DP mesh: owner ranks index into that one mesh, and the joint
+        balancing assumes each rank index denotes the same rank in every group.
 
         Args:
-            group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
+            groups: The FSDP parameter groups whose DBuffer layouts describe the parameter
+                placements, in rank-identical order.
             cost_fn: Cost estimate per parameter layout used to balance owner assignments across
                 ranks. When `None`, defaults to a compute estimate for orthogonalization via
                 Newton-Schulz with 5 iterations/steps. See also `assign_owner_work`.
             eligible_fn: Predicate selecting which parameters participate in owner-compute
                 orthogonalization. When `None`, defaults to matching ≥2D tensors. See also
                 `ParameterLayout.from_group`.
+
+        Returns:
+            One `GroupOwnerLayout` per group, in input order.
         """
-        layouts = ParameterLayout.from_group(group, eligible_fn=eligible_fn)
-        owners = assign_owner_work(layouts, cost_fn)
-        return cls(group=group, layouts=layouts, owners=owners)
+        if not groups:
+            return []
+        mesh = groups[0].mesh
+        for group_index, group in enumerate(groups[1:], start=1):
+            if group.mesh != mesh:
+                raise ValueError(
+                    "`GroupOwnerLayout.from_groups` requires every group to sit on the same "
+                    f"DP mesh; group {group_index}'s mesh differs from group 0's. "
+                    "Balance groups per mesh instead."
+                )
+        layouts_per_group = [
+            ParameterLayout.from_group(group, eligible_fn=eligible_fn) for group in groups
+        ]
+        owners_per_group = assign_owner_work(layouts_per_group, cost_fn)
+        return [
+            cls(group=group, layouts=layouts, owners=owners)
+            for group, layouts, owners in zip(
+                groups, layouts_per_group, owners_per_group, strict=True
+            )
+        ]
 
     @property
     def mesh(self) -> DeviceMesh:
@@ -341,19 +379,19 @@ class OwnerGatherPlan:
     recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
-    def pack(cls, plan: GroupOwnerLayout, local_shards: dict[int, torch.Tensor]) -> Self:
+    def pack(cls, owner_layout: GroupOwnerLayout, local_shards: dict[int, torch.Tensor]) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
         Args:
-            plan: The group's owner layout.
+            owner_layout: The group's owner layout.
             local_shards: This rank's local shard per parameter, only required for every parameter
                 it holds elements of. Shards may be passed in any shape.
         """
-        mesh = plan.mesh
+        mesh = owner_layout.mesh
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
-        layouts = plan.layouts
-        owners = plan.owners
+        layouts = owner_layout.layouts
+        owners = owner_layout.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
         for tensor_index, layout in layouts.items():
@@ -476,19 +514,19 @@ class OwnerScatterPlan:
     recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
-    def pack(cls, plan: GroupOwnerLayout, full_results: dict[int, torch.Tensor]) -> Self:
+    def pack(cls, owner_layout: GroupOwnerLayout, full_results: dict[int, torch.Tensor]) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
         Args:
-            plan: The group's owner layout.
+            owner_layout: The group's owner layout.
             full_results: Full result tensor per parameter this rank owns. Tensors may be passed in
                 any shape.
         """
-        mesh = plan.mesh
+        mesh = owner_layout.mesh
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
-        layouts = plan.layouts
-        owners = plan.owners
+        layouts = owner_layout.layouts
+        owners = owner_layout.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
         for tensor_index, layout in layouts.items():
