@@ -17,10 +17,21 @@ each stream and for results to be ready before consuming them on another stream.
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
+from .layout import GlobalLayout
 from .owner_planning import GroupOwnerLayout
 from .placement import RowAtomic
-from .range import intersect_ranges
+from .range import Range, intersect_ranges
+
+
+def _get_rank_ranges(layout: GlobalLayout, mesh: DeviceMesh) -> dict[int, Range]:
+    """Return all-RowAtomic buffer ranges keyed by global rank, in buffer offset order."""
+    placements = (RowAtomic(),) * mesh.ndim
+    ranges = {
+        rank: layout.get_rank_range(mesh, placements, rank) for rank in mesh.mesh.flatten().tolist()
+    }
+    return dict(sorted(ranges.items(), key=lambda item: item[1].start))
 
 
 def gather(
@@ -52,11 +63,7 @@ def gather(
     mesh = owner_layout.mesh
     this_rank = mesh.get_rank()
     layout = owner_layout.layout
-    rank_ranges = {
-        rank: layout.get_rank_range(mesh, [RowAtomic()] * mesh.ndim, rank)
-        for rank in mesh.mesh.flatten().tolist()
-    }
-    rank_ranges = dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
+    rank_ranges = _get_rank_ranges(layout, mesh)
     group = mesh.get_group()
     owned_tensor_indices = [
         i for i, owner in sorted(owner_layout.tensor_to_owner.items()) if owner == this_rank
@@ -148,11 +155,7 @@ def scatter(
     mesh = owner_layout.mesh
     this_rank = mesh.get_rank()
     layout = owner_layout.layout
-    rank_ranges = {
-        rank: layout.get_rank_range(mesh, [RowAtomic()] * mesh.ndim, rank)
-        for rank in mesh.mesh.flatten().tolist()
-    }
-    rank_ranges = dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
+    rank_ranges = _get_rank_ranges(layout, mesh)
     group = mesh.get_group()
     held_tensor_indices = [
         i
