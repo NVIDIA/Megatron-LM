@@ -278,8 +278,8 @@ def _mtp_scale():
 def test_grouped_mtp_loss_matches_independent_forwards(with_input_mask):
     """One grouped call must inject the MTP gradient of one independent call per group.
 
-    The input-mask case covers MLM-L41: the grouped denominator must use the cumulative
-    ``mtp_input_mask`` like the ungrouped path.
+    In the input-mask case the grouped denominator must use the cumulative ``mtp_input_mask``
+    like the ungrouped path.
     """
     pack = _MTPPack()
     input_mask = pack.input_mask if with_input_mask else None
