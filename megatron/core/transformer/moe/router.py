@@ -51,39 +51,67 @@ def _expert_bias_token_counts(
     token_multiplicities: Optional[torch.Tensor] = None,
     *,
     num_experts: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Count logical tokens for boolean maps or dense top-k expert indices.
+    """Count routed tokens per expert for boolean maps or dense top-k expert indices.
 
-    Shared prompt rows carry the number of logical copies they replace. Padding
-    and invalid (-1) dense routes contribute zero, with no data-dependent shapes.
+    Counts are added in place to ``out`` (the expert-bias buffer) or to a new int64 tensor.
+    Padding and invalid (-1) dense routes contribute zero, with no data-dependent shapes.
+    Shared-prefix prompt rows pass ``token_multiplicities``: the number of logical copies
+    each row replaces. Without them, the kernels are the upstream expert-bias kernels.
     """
+    use_dense_indices = routing_map.dtype != torch.bool
     if padding_mask is not None:
         padding_mask = padding_mask.reshape(-1)
         if padding_mask.shape[0] != routing_map.shape[0]:
-            raise ValueError("MoE padding mask must contain one value per routed token")
+            raise ValueError(
+                f"MoE padding mask must contain one value per routed token: "
+                f"{tuple(padding_mask.shape)} vs routing map {tuple(routing_map.shape)}"
+            )
+    if out is None:
+        if not use_dense_indices:
+            num_experts = routing_map.shape[-1]
+        elif num_experts is None or num_experts < 1:
+            raise ValueError("Dense expert indices require an explicit positive num_experts")
+        out = torch.zeros(num_experts, dtype=torch.int64, device=routing_map.device)
     if token_multiplicities is not None:
         token_multiplicities = token_multiplicities.reshape(-1)
         if token_multiplicities.shape[0] != routing_map.shape[0]:
             raise ValueError("MoE token multiplicities must contain one value per routed token")
         if token_multiplicities.device != routing_map.device:
             raise ValueError("MoE token multiplicities must be on the routing-map device")
+        # Accumulate in the count dtype (int64 for the expert-bias buffer) so large logical
+        # counts stay exact; multiplicities are small integers in any input dtype.
+        token_multiplicities = token_multiplicities.to(out.dtype)
+
+    if not use_dense_indices:
+        if padding_mask is not None:
+            routing_map = routing_map & (~padding_mask).unsqueeze(-1)
+        if token_multiplicities is not None:
+            routing_map = routing_map * token_multiplicities.unsqueeze(-1)
+        out += routing_map.sum(dim=0)
+        return out
+
+    # Fixed-shape counting: keep every [num_tokens, topk] slot and give padding tokens and
+    # invalid (-1) routes a zero weight instead of filtering rows, which would be a
+    # data-dependent shape (nonzero + host sync) inside the compiled expert-bias update and
+    # inside the moe_router CUDA graph scope.
+    expert_indices = routing_map.reshape(-1).to(torch.long)
+    if token_multiplicities is None:
+        token_counts = torch.ones_like(expert_indices, dtype=out.dtype)
     else:
-        token_multiplicities = torch.ones(
-            routing_map.shape[0], dtype=torch.long, device=routing_map.device
-        )
+        token_counts = token_multiplicities.unsqueeze(-1).expand_as(routing_map).reshape(-1)
     if padding_mask is not None:
-        token_multiplicities = token_multiplicities.masked_fill(padding_mask, 0)
-    if routing_map.dtype == torch.bool:
-        return (routing_map * token_multiplicities.unsqueeze(-1)).sum(dim=0)
-    if num_experts is None or num_experts < 1:
-        raise ValueError("Dense expert indices require an explicit positive num_experts")
-    indices = routing_map.reshape(-1).long()
-    weights = token_multiplicities.unsqueeze(-1).expand_as(routing_map).reshape(-1)
-    invalid_routes = indices < 0
-    indices = indices.masked_fill(invalid_routes, 0)
-    weights = weights.masked_fill(invalid_routes, 0)
-    counts = torch.zeros(num_experts, dtype=token_multiplicities.dtype, device=routing_map.device)
-    return counts.index_add_(0, indices, weights)
+        valid = (~padding_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
+        token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
+    invalid_routes = expert_indices < 0
+    expert_indices = expert_indices.masked_fill(invalid_routes, 0)
+    token_counts = token_counts.masked_fill(invalid_routes, 0)
+    if torch.are_deterministic_algorithms_enabled():
+        out.index_add_(0, expert_indices, token_counts)
+    else:
+        out.scatter_add_(0, expert_indices, token_counts)
+    return out
 
 
 @dataclass(frozen=True)
@@ -959,46 +987,12 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                if token_multiplicities is not None:
-                    counts = _expert_bias_token_counts(
-                        routing_map,
-                        padding_mask=padding_mask,
-                        token_multiplicities=token_multiplicities,
-                        num_experts=self.config.num_moe_experts,
-                    )
-                    self.local_tokens_per_expert += counts.to(self.local_tokens_per_expert.dtype)
-                else:
-                    use_dense_indices = routing_map.dtype != torch.bool
-                    if padding_mask is not None:
-                        flat_mask = padding_mask.reshape(-1)
-                        assert (
-                            flat_mask.shape[0] == routing_map.shape[0]
-                        ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                        if not use_dense_indices:
-                            routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                    if use_dense_indices:
-                        # Fixed-shape counting: keep every [num_tokens, topk] slot and give padding
-                        # tokens and invalid (-1) routes a zero weight instead of filtering rows,
-                        # which would be a data-dependent shape (nonzero + host sync) inside this
-                        # compiled function and inside the moe_router CUDA graph scope.
-                        expert_indices = routing_map.reshape(-1).to(torch.long)
-                        token_counts = torch.ones_like(
-                            expert_indices, dtype=self.local_tokens_per_expert.dtype
-                        )
-                        if padding_mask is not None:
-                            valid = (~flat_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
-                            token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
-                        invalid_routes = expert_indices < 0
-                        expert_indices = expert_indices.masked_fill(invalid_routes, 0)
-                        token_counts = token_counts.masked_fill(invalid_routes, 0)
-                        if torch.are_deterministic_algorithms_enabled():
-                            self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
-                        else:
-                            self.local_tokens_per_expert.scatter_add_(
-                                0, expert_indices, token_counts
-                            )
-                    else:
-                        self.local_tokens_per_expert += routing_map.sum(dim=0)
+                _expert_bias_token_counts(
+                    routing_map,
+                    padding_mask=padding_mask,
+                    token_multiplicities=token_multiplicities,
+                    out=self.local_tokens_per_expert,
+                )
 
     def _hash_routing(
         self, logits: torch.Tensor, input_ids: torch.Tensor, dense_output: bool = False
