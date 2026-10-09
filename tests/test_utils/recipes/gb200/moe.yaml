@@ -233,3 +233,9 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
+
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_bf16_cg]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
