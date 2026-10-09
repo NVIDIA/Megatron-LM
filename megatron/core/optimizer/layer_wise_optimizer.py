@@ -535,7 +535,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         from ..distributed.param_and_grad_buffer import _compute_default_per_buffer_param_layout
         from .distrib_optimizer import DistributedOptimizer
 
-        # The layout toggle affects only LayerWise buffers; Adam keeps byte-level sharding.
+        # Within this precomputed-layout path, Adam keeps byte-level sharding.
         use_padded_layout = ddp_config.use_layer_wise_param_layout
         buffer_groups = group_params_for_buffers(
             params, ddp_config.grad_reduce_in_fp32, merge_layerwise_fp8_grads=not use_padded_layout
@@ -1039,14 +1039,29 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         For each bucket in each model chunk's bucket groups, build per-rank param lists
         by cross-referencing the layer-wise sharded param lists with the bucket's params.
+        Compact LayerWise owns both Muon and Adam parameters; the Muon routing tag only
+        filters ownership for the padded layout, which has a separate Adam DistOpt.
 
         Args:
             model_chunks: DDP-wrapped model chunks with bucket_groups.
         """
+
+        def enable_compact_param_sync(group):
+            # A high-precision Adam bucket may have neither overlap nor FP8 reuse.
+            # Binding its whole-parameter owners makes it a compact sync group too.
+            if not self.use_layer_wise_param_layout and not group.param_sync_via_bucket_group:
+                group.param_sync_via_bucket_group = True
+                group.intra_distributed_optimizer_instance_group = group.data_parallel_group
+                group.intra_distributed_optimizer_instance_size = group.data_parallel_group.size()
+                group.intra_distributed_optimizer_instance_rank = group.data_parallel_group.rank()
+
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
+                enable_compact_param_sync(group)
                 for bucket in group.buckets:
-                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                    if self.use_layer_wise_param_layout and not (
+                        _bucket_is_managed_by_layer_wise_optimizer(bucket)
+                    ):
                         continue
                     if self.dp_cp_params_list is not None:
                         bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp))]
@@ -1063,8 +1078,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
+                enable_compact_param_sync(group)
                 for bucket in group.buckets:
-                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                    if self.use_layer_wise_param_layout and not (
+                        _bucket_is_managed_by_layer_wise_optimizer(bucket)
+                    ):
                         continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp))]
@@ -1230,10 +1248,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 
-        Walks each model chunk's dense + expert-parallel bucket groups and
-        skips any group not managed by LayerWise, so a sibling
-        :class:`DistributedOptimizer`'s own ``start_param_sync`` call does not
-        double-sync the same buckets. Uses
+        Compact LayerWise owns all dense and expert-parallel bucket groups, including
+        Adam parameters. Padded LayerWise skips non-Muon groups so its sibling
+        :class:`DistributedOptimizer` does not double-sync the same buckets. Uses
         :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
         post-all-gather processing (and MXFP8 copy) still runs.
         """
@@ -1241,8 +1258,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
             ):
-                if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0]
+                if bucket_group.buckets and (
+                    not self.use_layer_wise_param_layout
+                    or _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0])
                 ):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
@@ -1279,14 +1297,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             wrapped_state_dict = {1: state_dict}
         else:
             wrapped_state_dict = state_dict
-        # Legacy torch checkpoints retain a list for multiple inner optimizers;
-        # distributed checkpoints use an index-keyed dict instead.
-        states = (
-            wrapped_state_dict.values()
-            if isinstance(wrapped_state_dict, dict)
-            else wrapped_state_dict
-        )
-        for sd in states:
+        for sd in wrapped_state_dict.values():
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 log_single_rank(
                     logger,

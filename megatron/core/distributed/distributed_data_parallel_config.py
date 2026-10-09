@@ -46,8 +46,9 @@ class DistributedDataParallelConfig:
        If true, LayerWise-managed buffers use shard-aligned padding, gradient
        reduce-scatter, and fixed-size parameter all-gather. If false, they use a
        compact layout, gradient all-reduce, and whole-parameter all-gather.
-       Adam buffers retain standard DistributedOptimizer sharding in both cases.
-       FP8 staging-buffer reuse is independent of this layout choice.
+       Padded layout uses a separate Adam DistributedOptimizer. Compact layout keeps
+       Muon and Adam inside LayerWise and all-reduces both sets of gradients.
+       FP8 staging-buffer reuse follows the parameter policy in either layout.
     """
 
     check_for_nan_in_grad: bool = False

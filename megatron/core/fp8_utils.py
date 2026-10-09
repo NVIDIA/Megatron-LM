@@ -173,10 +173,12 @@ def uses_grad_buffer_for_fp8_param_gather(
 ) -> bool:
     """Return whether this parameter gathers BF16 through temporary gradient storage.
 
-    MXFP8 follows the existing reuse flag for both optimizer owners. LayerWise-owned
-    blockwise FP8 always stages BF16; Adam blockwise keeps native FP8 transport. Layout
-    and tensor-parallel sharding do not affect this policy. High-precision parameters
-    never reuse gradient storage for parameter gather.
+    MXFP8 follows the existing reuse flag for both optimizer owners. Muon-tagged
+    blockwise FP8 always stages BF16; Adam blockwise never reuses gradient storage.
+    DistributedOptimizer provides native FP8 transport for Adam blockwise parameters.
+    The Muon tag remains distinct from container membership when compact LayerWise
+    also contains Adam. Layout and tensor-parallel sharding do not affect this policy.
+    High-precision parameters never reuse gradient storage for parameter gather.
 
     Grouped MXFP8 participates in the general DistributedOptimizer reuse path. This
     does not imply compact LayerWise support: ``is_layerwise_fp8_param`` deliberately

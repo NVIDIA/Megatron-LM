@@ -122,7 +122,7 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         return matches[0]
 
     def _on_model_built(self, model_chunks, optimizer, args):
-        assert isinstance(args.use_layer_wise_param_layout, bool)
+        assert args.use_layer_wise_param_layout is True
         assert args.expert_gtp_weight_remat_size == 1
         assert args.gtp_weight_remat_size == 1
         native_fp8 = args.fp8_param_gather
@@ -386,17 +386,16 @@ class TestMuonBlockwiseFP8ParamGather:
         ),
     )
     @pytest.mark.parametrize("overlap", [False, True])
-    @pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
-    def test_gdp_adamw_moe_muon_blockwise_param_gather(
-        self, overlap, use_layer_wise_param_layout, monkeypatch
-    ):
+    def test_gdp_adamw_moe_muon_blockwise_param_gather(self, overlap, monkeypatch):
         """GDP-AdamW + MoE-Muon must agree with blockwise parameter gather ON and OFF.
 
         ``ME`` builds a GDP mixer followed by a grouped-MoE layer. GDP itself marks its
         ``in_proj.weight`` ``use_muon=False``, which routes it to scalar AdamW; GDP ``out_proj``
-        and the two-dimensional expert weights remain on LayerWise/Muon. Both layouts
-        create separate AdamW-owned and Muon-owned buffers. For each overlap mode, the native
-        FP8 parameter-gather/reuse trajectory must remain close to the same model using BF16
+        and the two-dimensional expert weights remain on LayerWise/Muon. Padded layout
+        places AdamW in a separate DistributedOptimizer with native blockwise FP8 transport.
+        Compact layout retains scalar Adam inside LayerWise and is outside this test's scope.
+        For each overlap mode, the native FP8 parameter-gather/reuse trajectory must remain
+        close to the same model using BF16
         primary weights, while both runs use the same compute recipe. In particular, the
         first post-update loss verifies that LayerWise/Muon initialized its FP32 masters from
         TE's preserved high-precision values instead of dequantized FP8 weights.
@@ -421,9 +420,7 @@ class TestMuonBlockwiseFP8ParamGather:
         harness.seq_length = 128
         harness.micro_batch_size = 1
         try:
-            common = _gdp_moe_test_args(
-                overlap, use_layer_wise_param_layout=use_layer_wise_param_layout
-            )
+            common = _gdp_moe_test_args(overlap, use_layer_wise_param_layout=True)
 
             loss_fp8_param_gather_on = harness._run_test_helper(
                 recipe="blockwise", fp8_param_gather=True, **common
@@ -459,7 +456,7 @@ class TestMuonBlockwiseFP8ParamGather:
             tolerance = allowed_diff[worst_rank, worst_step].item()
             assert torch.isfinite(trajectories).all() and diff <= tolerance, (
                 "GDP-AdamW + MoE-Muon loss differs with FP8 parameter gather ON versus OFF "
-                f"(recipe=blockwise, layout={use_layer_wise_param_layout}, overlap={overlap}, "
+                f"(recipe=blockwise, layout=True, overlap={overlap}, "
                 f"|diff|={diff:.6f}, allowed={tolerance:.6f}, "
                 f"atol={atol}, rtol={rtol}, worst_rank={worst_rank}, "
                 f"worst_step={worst_step}; fp8-param-gather-ON: "

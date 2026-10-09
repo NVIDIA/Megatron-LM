@@ -65,16 +65,31 @@ def _assert_equal(actual, expected, msg):
     )
 
 
-def _snapshot_masters(model):
-    # FP8 storage grouping can change padded whole-matrix ownership. Compare the
-    # same global Muon master by name, not whichever rank happens to own it.
+def _snapshot_masters(model, optimizer):
+    # FP8 storage grouping can change padded whole-matrix ownership. Compact
+    # LayerWise also owns Adam's whole parameters, so reconstruct every LayerWise
+    # master by name instead of comparing whichever parameters this rank owns.
+    layerwise = (
+        optimizer
+        if isinstance(optimizer, LayerWiseDistributedOptimizer)
+        else optimizer.chained_optimizers[0]
+    )
+    local_layerwise_masters = {}
+    for child in layerwise.chained_optimizers:
+        for model_group, main_group in zip(child.float16_groups, child.fp32_from_float16_groups):
+            local_layerwise_masters.update(zip(model_group, main_group))
+        for model_group in child.fp32_from_fp32_groups:
+            local_layerwise_masters.update((param, param) for param in model_group)
     param_buffers = {
         p: buffer for buffer in model.buffers + model.expert_parallel_buffers for p in buffer.params
     }
     result = {}
     for name, param in model.named_parameters():
         main = getattr(param, "main_param", None)
-        if getattr(param, "is_managed_by_layer_wise_optimizer", False):
+        if not param_buffers[param].ddp_config.use_distributed_optimizer or getattr(
+            param, "is_managed_by_layer_wise_optimizer", False
+        ):
+            main = local_layerwise_masters.get(param)
             value = torch.zeros(param.shape, dtype=torch.float32, device=param.device)
             owner_count = torch.tensor(int(main is not None), device=param.device)
             if main is not None:
@@ -82,7 +97,7 @@ def _snapshot_masters(model):
             group = param_buffers[param].data_parallel_group
             torch.distributed.all_reduce(value, group=group)
             torch.distributed.all_reduce(owner_count, group=group)
-            assert owner_count.item() == 1, f"Expected one Muon owner for {name}"
+            assert owner_count.item() == 1, f"Expected one LayerWise owner for {name}"
             result[name] = value
         elif main is not None:
             result[name] = main.detach().clone()
@@ -299,10 +314,15 @@ class TestMuonFP8ParamGather:
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert len(model) == 1
-        assert isinstance(optimizer.chained_optimizers[0], LayerWiseDistributedOptimizer), (
-            "muon + use_distributed_optimizer should route to LayerWiseDistributedOptimizer; got "
-            f"{type(optimizer.chained_optimizers[0]).__name__}"
-        )
+        if self.use_param_layout:
+            assert not isinstance(optimizer, LayerWiseDistributedOptimizer)
+            assert len(optimizer.chained_optimizers) == 2
+            assert isinstance(optimizer.chained_optimizers[0], LayerWiseDistributedOptimizer)
+        else:
+            assert isinstance(optimizer, LayerWiseDistributedOptimizer), (
+                "Compact Muon and scalar Adam must share LayerWiseDistributedOptimizer; "
+                f"got {type(optimizer).__name__}"
+            )
         counts = assert_param_storage_policy(model[0], args)
         if fp8_param_gather:
             assert counts["muon_fp8"], "No native Muon FP8 parameters were exercised"
@@ -356,7 +376,7 @@ class TestMuonFP8ParamGather:
             grad = _snapshot_grads(model[0])
             ok, _, _ = optimizer.step()
             assert ok
-            masters.append(_snapshot_masters(model[0]))
+            masters.append(_snapshot_masters(model[0], optimizer))
             grads.append(grad)
             losses.append(loss.detach().clone())
             outs.append(out.detach().clone())
@@ -369,7 +389,7 @@ class TestMuonFP8ParamGather:
             off_args, off_model, off_opt = self._build(
                 False, fp8_recipe, overlap, num_experts, expert_model_parallel_size
             )
-            masters0 = _snapshot_masters(off_model[0])
+            masters0 = _snapshot_masters(off_model[0], off_opt)
             off = self._run_steps(off_args, off_model, off_opt, n)
             del off_model, off_opt
             gc.collect()
@@ -382,7 +402,7 @@ class TestMuonFP8ParamGather:
             )
             # Compare independently initialized native masters. Copying the OFF state into
             # ON here would conceal a regression that seeds masters from lossy FP8 values.
-            on_masters0 = _snapshot_masters(on_model[0])
+            on_masters0 = _snapshot_masters(on_model[0], on_opt)
             assert masters0.keys() == on_masters0.keys()
             assert masters0, "No FP32 master parameters captured"
             for name in masters0:
