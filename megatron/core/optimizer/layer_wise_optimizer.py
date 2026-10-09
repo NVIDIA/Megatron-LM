@@ -1279,7 +1279,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             wrapped_state_dict = {1: state_dict}
         else:
             wrapped_state_dict = state_dict
-        for sd in wrapped_state_dict.values():
+        # Legacy torch checkpoints retain a list for multiple inner optimizers;
+        # distributed checkpoints use an index-keyed dict instead.
+        states = (
+            wrapped_state_dict.values()
+            if isinstance(wrapped_state_dict, dict)
+            else wrapped_state_dict
+        )
+        for sd in states:
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 log_single_rank(
                     logger,

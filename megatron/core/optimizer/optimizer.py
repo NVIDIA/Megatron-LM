@@ -1716,6 +1716,68 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_state_dict(state)
         self._synchronize_steps()
 
+    def save_state_dict_to_file(self, filename: str) -> None:
+        """Save rank-local LayerWise state and complete DistOpt state for torch checkpoints.
+
+        LayerWise legacy checkpoints already write one file per DP rank and require the
+        same DP layout on load. DistOpt's ordinary state_dict only includes metadata;
+        embed its local FP32 parameter and moment shards as well. No DP-zero gather or
+        Gloo group is needed, including for an expert-DP sibling with different owners.
+        """
+        from .distrib_optimizer import DistributedOptimizer
+
+        state_dict = self.state_dict()
+
+        def add_parameter_state(optimizer, state):
+            if isinstance(optimizer, ChainedOptimizer):
+                states = [state] if len(optimizer.chained_optimizers) == 1 else state
+                for child, child_state in zip(optimizer.chained_optimizers, states):
+                    add_parameter_state(child, child_state)
+            elif isinstance(optimizer, DistributedOptimizer) and not optimizer.is_stub_optimizer:
+                param_state = optimizer.get_parameter_state_dp_reshardable()
+                # The loader also accepts DCP bucket states containing padding entries.
+                # This rank-local representation contains only real parameter shards.
+                for buffer_idx in range(len(optimizer.gbuf_ranges)):
+                    for buckets in param_state[buffer_idx].values():
+                        for bucket in buckets:
+                            for param in bucket:
+                                param["padding"] = False
+                state["param_state"] = param_state
+                state["param_state_sharding_type"] = "dp_reshardable"
+
+        add_parameter_state(self, state_dict)
+        torch.save(state_dict, filename)
+
+    def load_state_dict_from_file(self, filename: str) -> None:
+        """Restore a rank-local torch checkpoint, including embedded DistOpt shards."""
+        from .distrib_optimizer import DistributedOptimizer
+
+        # CPU loading avoids allocating another rank's serialized CUDA tensors here.
+        state_dict = torch.load(filename, map_location="cpu", weights_only=False)
+
+        def check_parameter_state(optimizer, state):
+            if isinstance(optimizer, ChainedOptimizer):
+                if len(optimizer.chained_optimizers) == 1:
+                    states = [state]
+                elif isinstance(state, dict):
+                    states = [value for _, value in sorted(state.items())]
+                else:
+                    states = state
+                for child, child_state in zip(optimizer.chained_optimizers, states):
+                    check_parameter_state(child, child_state)
+            elif isinstance(optimizer, DistributedOptimizer) and not optimizer.is_stub_optimizer:
+                if not isinstance(state, dict) or state.get("param_state") is None:
+                    raise RuntimeError(
+                        "LayerWise torch checkpoint is missing DistributedOptimizer parameter "
+                        "shards. Restoring an older full-parameter Adam checkpoint into the "
+                        "compact LayerWise + DistributedOptimizer layout is not supported."
+                    )
+
+        # Validate before mutating any optimizer. Metadata-only DistOpt state cannot
+        # restore the FP32 masters or moments from the old full-parameter Adam layout.
+        check_parameter_state(self, state_dict)
+        self.load_state_dict(state_dict)
+
     def _iter_leaf_optimizers(self):
         """Visit nested chains without staging a shared model chunk more than once."""
         for optimizer in self.chained_optimizers:
