@@ -5,7 +5,11 @@ import sys
 import types
 import torch
 
-from utils import initialize_checkpoint_converter_fake_process_groups, print_memory_usage
+from utils import (
+    initialize_checkpoint_converter_distributed,
+    initialize_checkpoint_converter_fake_process_groups,
+    print_memory_usage,
+)
 
 class MegatronCheckpointLoaderBase:
     """Orchestrates loading a Megatron checkpoint and sending
@@ -142,6 +146,7 @@ class MegatronCheckpointLoaderBase:
 
         cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
         set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
+        initialize_checkpoint_converter_distributed()
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
@@ -239,6 +244,7 @@ class MegatronCheckpointLoaderBase:
         mpu.set_virtual_pipeline_model_parallel_rank(0)
         for pp_rank in range(pp_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
+            mpu.get_pipeline_model_parallel_group().set_rank(pp_rank)
             all_models.append(get_models_for_pipeline_stage(tp_size, dtype))
 
         return all_models, consumed_train_samples, consumed_valid_samples
