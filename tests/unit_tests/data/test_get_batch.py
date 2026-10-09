@@ -969,6 +969,23 @@ def test_packed_seq_params_expose_actual_thd_lengths_for_contiguous_cp(
     assert packed_seq_params.total_tokens == 8
 
 
+@pytest.mark.parametrize("padding", ["absent", "equal", "actual"])
+def test_contiguous_packed_metadata_marks_actual_padding(padding):
+    cu = torch.tensor([[0, 3, 8]], dtype=torch.int32)
+    padded = None if padding == "absent" else cu.clone()
+    if padding == "actual":
+        padded = torch.tensor([[0, 4, 12]], dtype=torch.int32)
+    params = _build_packed_seq_params(
+        {"cu_seqlens": cu, "cu_seqlens_padded": padded, "max_seqlen": torch.tensor([8])},
+        "contiguous",
+        2,
+        tokens_per_sample=8,
+    )
+    assert params.pad_between_seqs is (padding == "actual")
+    assert params.cu_seqlens_q is params.cu_seqlens_kv
+    assert params.cu_seqlens_q_padded is params.cu_seqlens_kv_padded
+
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):

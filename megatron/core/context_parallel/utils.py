@@ -162,6 +162,12 @@ def _build_packed_seq_params(
         if (layout == "contiguous" and cp_size > 1) or use_logical_qkv_seqlens
         else physical_cu_seqlens
     )
+    if layout == "contiguous" and cp_size > 1 and pad_between_seqs is None:
+        # TE's sync-free default uses object identity. Independently materialized
+        # but equal boundaries are still unpadded and must remain eligible for FA.
+        pad_between_seqs = cu_seqlens_padded is not None and not torch.equal(
+            cu_seqlens, cu_seqlens_padded
+        )
 
     max_seqlen = int(batch['max_seqlen'].item())
     local_cp_size = batch.get('local_cp_size')
