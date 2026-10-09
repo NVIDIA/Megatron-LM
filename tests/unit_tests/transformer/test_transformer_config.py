@@ -455,6 +455,52 @@ def test_sequence_packing_requires_max_seqlen_per_dp_cp_rank():
         _make_packing_config(max_seqlen_per_dp_cp_rank=None)
 
 
+_PADDED_ROUTING_MOE_KWARGS = dict(
+    num_layers=2,
+    hidden_size=128,
+    num_attention_heads=8,
+    num_moe_experts=8,
+    moe_router_dtype="fp32",
+    fp4="e2m1",
+    moe_token_dispatcher_type="alltoall",
+)
+
+# The canonical flag and its deprecated alias must be validated identically.
+_PADDING_FLAGS = ["moe_router_padding_for_quantization", "moe_router_padding_for_fp8"]
+
+
+def test_moe_router_padding_for_fp8_enables_padding_for_quantization():
+    with pytest.warns(UserWarning, match="moe-router-padding-for-fp8"):
+        config = TransformerConfig(**_PADDED_ROUTING_MOE_KWARGS, moe_router_padding_for_fp8=True)
+
+    assert config.moe_router_padding_for_quantization
+
+
+@pytest.mark.parametrize("padding_flag", _PADDING_FLAGS)
+def test_padded_routing_rejects_moe_preprocess_cuda_graph(padding_flag: str):
+    with pytest.raises(AssertionError, match="moe_preprocess cuda graph is not supported"):
+        TransformerConfig(
+            **_PADDED_ROUTING_MOE_KWARGS,
+            cuda_graph_impl="local",
+            cuda_graph_modules=["moe_router", "moe_preprocess"],
+            **{padding_flag: True},
+        )
+
+
+@pytest.mark.parametrize("padding_flag", _PADDING_FLAGS)
+def test_inference_optimized_moe_rejects_padded_routing(padding_flag: str):
+    with pytest.raises(ValueError, match="do not support padded routing map"):
+        TransformerConfig(
+            **_PADDED_ROUTING_MOE_KWARGS,
+            transformer_impl="inference_optimized",
+            gated_linear_unit=False,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            moe_router_score_function="sigmoid",
+            **{padding_flag: True},
+        )
+
+
 class TestTransformerConfig:
     def test_num_query_groups_divides_num_attention_heads(self):
         config = TransformerConfig(
