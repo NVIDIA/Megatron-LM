@@ -25,6 +25,7 @@ from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
@@ -1088,6 +1089,8 @@ def process_mtp_loss(
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[Tensor] = None,
+    cp_batch: Optional[ContextParallelBatch] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1119,6 +1122,12 @@ def process_mtp_loss(
         metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
         main_hidden_states (Optional[Tensor]): Hidden states returned to the main model.
             Defaults to the first chunk of ``hidden_states``.
+        cp_batch (Optional[ContextParallelBatch]): Main-model batch layouts and conversion plan.
+            Project padded zigzag MTP outputs in the main head's contiguous layout when
+            doing so removes padding. Dense and already aligned packed inputs stay in place.
+            Rolling stays in the attention layout; per-token losses return there before
+            normalization, preserving the existing rank-local loss weights.
+        tp_cp_group (Optional[ProcessGroup]): Joint TP/CP group for SP layout conversion.
 
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
@@ -1178,15 +1187,71 @@ def process_mtp_loss(
         )
         mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
 
-    for mtp_layer_number in range(config.mtp_num_layers):
+    source_layout = config.attention_cp_layout
+    head_layout = cp_batch.boundary_layout if cp_batch is not None else source_layout
+    redistribute_head = (
+        cp_batch is not None
+        and cp_batch.thd_plan is not None
+        and cp_group is not None
+        and cp_group.size() > 1
+        and source_layout == "zigzag"
+        and head_layout == "contiguous"
+        and packed_seq_params is not None
+        and packed_seq_params.qkv_format == "thd"
+    )
+    if redistribute_head:
+        # Equal-sized layouts only change token ownership, without saving projection work.
+        # The plan's host-known row counts are uniform across ranks; no GPU sync is needed.
+        redistribute_head = (
+            cp_batch.thd_plan.zigzag_local_token_count
+            > cp_batch.thd_plan.contiguous_local_token_count
+        )
+
+    def _convert_head_layout(tensor: Tensor, source: CPLayout, target: CPLayout) -> Tensor:
+        return convert_cp_layout(
+            tensor,
+            source,
+            target,
+            cp_group,
+            config.sequence_parallel,
+            tp_group,
+            tp_cp_group,
+            cp_batch.thd_plan,
+        )
+
+    def _convert_per_token(tensor: Tensor, source: CPLayout, target: CPLayout) -> Tensor:
+        # Labels/masks/losses are [batch, sequence], replicated over TP. The main
+        # model's plan expects sequence-major SP shards, just like hidden states.
+        tensor = tensor.transpose(0, 1)
+        if config.sequence_parallel:
+            tensor = scatter_to_sequence_parallel_region(tensor, group=tp_group)
+        tensor = _convert_head_layout(tensor, source, target)
+        if config.sequence_parallel:
+            tensor = gather_from_sequence_parallel_region(
+                tensor, tensor_parallel_output_grad=False, group=tp_group
+            )
+        return tensor.transpose(0, 1).contiguous()
+
+    def _mtp_head_loss(
+        mtp_layer_number: int, head_hidden: Tensor, head_labels: Tensor, layer_loss_mask: Tensor
+    ):
+        """Project one MTP depth and return its masked loss and acceptance counts."""
+        if redistribute_head:
+            # Roll first in attention coordinates, then reuse the main head's
+            # redistribution to remove attention-only padding and balance CP work.
+            head_hidden = _convert_head_layout(head_hidden, source_layout, head_layout)
+            head_labels = _convert_per_token(head_labels, source_layout, head_layout)
+            layer_loss_mask = _convert_per_token(layer_loss_mask, source_layout, head_layout)
         mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
+            head_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         if is_observing_tensor("mtp_logits"):
+            observation_name = f"mtp_logits.{mtp_layer_number}"
+            if redistribute_head:
+                # Compaction changes token ownership and removes padding from this population.
+                observation_name += f".{head_layout}"
             gather_output = (
                 getattr(output_layer, "gather_output")
                 if runtime_gather_output is None
@@ -1194,13 +1259,32 @@ def process_mtp_loss(
             )
             observe_tensor(
                 output_layer,
-                f"mtp_logits.{mtp_layer_number}",
+                observation_name,
                 "mtp_logits",
                 mtp_logits,
                 tp_shard_dim=None if gather_output else -1,
                 sequence_dim=0,
                 batch_dim=1,
             )
+        correct = total = None
+        if is_training:
+            correct, total = _compute_mtp_acceptance_counts(
+                mtp_logits,
+                head_labels,
+                layer_loss_mask,
+                output_layer,
+                runtime_gather_output,
+                tp_group,
+            )
+        head_loss = compute_language_model_loss(head_labels, mtp_logits)
+        head_loss = layer_loss_mask * head_loss
+        if redistribute_head:
+            # Only [batch, sequence] losses return, never vocabulary-sized tensors.
+            # This keeps each token's original CP-rank denominator and logging mean.
+            head_loss = _convert_per_token(head_loss, head_layout, source_layout)
+        return head_loss, correct, total
+
+    for mtp_layer_number in range(config.mtp_num_layers):
         mtp_labels, _ = roll_tensor(
             mtp_labels,
             shifts=-1,
@@ -1243,23 +1327,14 @@ def process_mtp_loss(
             # no-mask fast path for all non-multimodal MTP callers.
             num_tokens = rolled_num_tokens
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-
-        mtp_loss = layer_loss_mask * mtp_loss
+        mtp_loss, correct, total = _mtp_head_loss(
+            mtp_layer_number, hidden_states_list[mtp_layer_number + 1], mtp_labels, layer_loss_mask
+        )
 
         if is_training:
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits,
-                mtp_labels,
-                layer_loss_mask,
-                output_layer,
-                runtime_gather_output,
-                tp_group,
-            )
-
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
                 metric_avg_group = parallel_state.get_data_parallel_group(
@@ -2390,8 +2465,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         requires_conversion = self.cp_group.size() > 1 and source_layout != target_layout
 
         if requires_conversion:
-            if mtp_input_mask is not None:
-                raise ValueError("mtp_input_mask is not supported with CP layout conversion")
             if cp_batch is None:
                 raise ValueError("cp_batch is required when MTP uses a different CP layout")
             hidden_states = convert_cp_layout(
@@ -2432,6 +2505,8 @@ class MultiTokenPredictionBlock(MegatronModule):
             position_ids = layout_batch["position_ids"]
             labels = layout_batch["labels"]
             loss_mask = layout_batch["loss_mask"]
+            if mtp_input_mask is not None:
+                mtp_input_mask = layout_batch["mtp_input_mask"]
 
         return MultiTokenPredictionInputs(
             input_ids=input_ids,
