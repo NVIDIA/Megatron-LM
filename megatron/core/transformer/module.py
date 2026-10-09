@@ -623,9 +623,7 @@ class GraphableMegatronModule(MegatronModule):
             and self.config.cuda_graph_impl != "none"
         )
 
-    def get_layer_static_inputs(
-        self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False
-    ):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """
         Get synthetic inputs for the layer.
         We assume that the module has one hidden_states input, whose shape is inferred

@@ -1203,7 +1203,10 @@ class TestContiguousPackedCPPreparedRollRowsDistributed:
 
         def run(sequence_roll_context, sequence_roll_padding_mask=None):
             config = SimpleNamespace(
-                pipeline_model_parallel_size=1, mtp_num_layers=num_depths, mtp_detach_heads=False
+                pipeline_model_parallel_size=1,
+                mtp_num_layers=num_depths,
+                mtp_detach_heads=False,
+                mtp_repeated_layer_shared_components=None,
             )
             block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
             torch.nn.Module.__init__(block)
@@ -1428,6 +1431,7 @@ def test_mtp_block_scatters_only_prepared_global_padding_masks(
         mtp_num_layers=1,
         mtp_detach_heads=False,
         sequence_parallel=sequence_parallel,
+        mtp_repeated_layer_shared_components=None,
     )
     block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
     torch.nn.Module.__init__(block)

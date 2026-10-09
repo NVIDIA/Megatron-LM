@@ -45,6 +45,7 @@ change the optimizer parameter set. See
 The fused TV kernel supports FP16, BF16, and FP32 logits. Softmax statistics,
 vocabulary reductions, and the TV and prefix loss outputs use FP32; draft-logit
 gradients are returned in the draft logits' dtype.
+
 ## Repeated-Layer Sharing
 
 Set `mtp_use_repeated_layer: true`, `mtp_num_layers > 1`, and

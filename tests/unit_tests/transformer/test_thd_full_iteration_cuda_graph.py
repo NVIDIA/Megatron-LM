@@ -31,6 +31,7 @@ from megatron.core.full_cuda_graph import (
     FullCudaGraphWrapper,
     StaticBufferLoader,
 )
+from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
 from megatron.core.process_groups_config import (
@@ -42,6 +43,12 @@ from megatron.core.tensor_parallel.random import (
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
     initialize_rng_tracker,
+)
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    ZigzagPackedCPRollContext,
+    prepare_mtp_sequence_roll_context,
+    prepare_mtp_sequence_roll_fields,
 )
 from megatron.core.utils import is_te_min_version
 from megatron.training.training import _resolve_thd_static_batch_pg_collection
@@ -73,6 +80,7 @@ def _make_thd_full_iter_config(**overrides):
         thd_tail_padding_policy=None,
         cp_partition_mode='zigzag',
         dynamic_context_parallel=False,
+        cuda_graph_static_dynamic_cp=False,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=None,
         virtual_pipeline_model_parallel_size=None,
@@ -113,16 +121,71 @@ def _make_raw_packed_batch(sequence_lengths, seed, device='cuda', with_tokens=Tr
 class _FakeCPGroup:
     """Two-rank CP geometry for single-rank static-metadata lifecycle tests."""
 
-    @staticmethod
-    def size():
-        return 2
+    def __init__(self, size=2, rank=0, global_ranks=None):
+        self._size = size
+        self._rank = rank
+        self.global_ranks = tuple(range(size)) if global_ranks is None else tuple(global_ranks)
 
-    @staticmethod
-    def rank():
-        return 0
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
 
 
 _FAKE_CP_GROUP = _FakeCPGroup()
+
+
+def _pad_boundaries(boundaries):
+    """Pad one boundary list to the configured graph-static metadata width."""
+    return list(boundaries) + [boundaries[-1]] * (MAX_PACKED_SEQS + 1 - len(boundaries))
+
+
+def _make_dynamic_cp_batch_outputs(
+    group,
+    boundaries,
+    *,
+    seed,
+    cp_partition_mode='zigzag',
+    host_boundaries=None,
+    split_mismatch=False,
+    zigzag_cp_min_chunk_size=None,
+):
+    """Build already-sliced outputs for certificate-only dynamic-CP tests."""
+    generator = torch.Generator(device='cpu').manual_seed(seed)
+    tokens = torch.randint(0, VOCAB_SIZE - 2, (1, TOKEN_CAPACITY), generator=generator).cuda()
+    labels = (tokens + 1).clone()
+    loss_mask = torch.ones((1, TOKEN_CAPACITY), dtype=torch.float32, device='cuda')
+    position_ids = torch.arange(TOKEN_CAPACITY, dtype=torch.int64, device='cuda').unsqueeze(0)
+    padding_mask = torch.zeros((1, TOKEN_CAPACITY), dtype=torch.bool, device='cuda')
+    cu_seqlens = torch.tensor(_pad_boundaries(boundaries), dtype=torch.int32, device='cuda')
+    packed_seq_params = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+        max_seqlen_q=int(boundaries[-1]),
+        max_seqlen_kv=int(boundaries[-1]),
+        local_cp_size=group.size(),
+        cp_group=group,
+        cp_partition_mode=cp_partition_mode,
+        pad_between_seqs=True,
+        zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+    )
+    if group.size() > 1:
+        packed_seq_params.cp_partition_route = build_thd_cp_partition_route(
+            cu_seqlens, cp_size=group.size(), cp_rank=group.rank(), device=cu_seqlens.device
+        )
+        if split_mismatch:
+            split_sizes = packed_seq_params.cp_partition_route.zigzag_split_sizes
+            assert len(split_sizes) >= 2 and split_sizes[1] > 0
+            split_sizes[0] += 1
+            split_sizes[1] -= 1
+    if host_boundaries is not None:
+        packed_seq_params.thd_cp_host_cu_seqlens_q = list(host_boundaries)
+        packed_seq_params.thd_cp_host_cu_seqlens_kv = list(host_boundaries)
+    return (tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask)
 
 
 def _finalize_with_fake_cp(packed_seq_params):
@@ -164,6 +227,169 @@ class TestThdStaticBatchPreparation:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def _prepare_dynamic_cp_batch(
+        self,
+        monkeypatch,
+        group,
+        boundaries,
+        *,
+        seed,
+        cp_partition_mode='zigzag',
+        host_boundaries=None,
+        split_mismatch=False,
+        local_cp_size=None,
+        zigzag_cp_min_chunk_size=None,
+        mtp_num_layers=None,
+    ):
+        outputs = _make_dynamic_cp_batch_outputs(
+            group,
+            boundaries,
+            seed=seed,
+            cp_partition_mode=cp_partition_mode,
+            host_boundaries=host_boundaries,
+            split_mismatch=split_mismatch,
+            zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+        )
+        if local_cp_size is not None:
+            outputs[5].local_cp_size = local_cp_size
+
+        def _get_batch(*args, dynamic_cp=False, **kwargs):
+            assert dynamic_cp, "Static-certified preparation must preserve dynamic-CP batch mode."
+            return outputs
+
+        monkeypatch.setattr(
+            data_schedule, 'get_batch_on_this_rank_for_sequence_packing', _get_batch
+        )
+        monkeypatch.setattr(data_schedule, 'finalize_packed_seq_params', lambda params: params)
+        monkeypatch.setattr(
+            torch.distributed,
+            'get_process_group_ranks',
+            lambda process_group: list(process_group.global_ranks),
+        )
+        config = _make_thd_full_iter_config(
+            dynamic_context_parallel=True,
+            cuda_graph_static_dynamic_cp=True,
+            sequence_packing_scheduler='default_dynamic_cp',
+            cp_partition_mode=cp_partition_mode,
+            mtp_num_layers=mtp_num_layers,
+        )
+        return prepare_thd_static_batch_for_full_iteration_cuda_graph(iter([{}]), config=config)
+
+    def test_dynamic_cp_static_slot_preserves_graph_safe_zigzag_mtp_certificate(self, monkeypatch):
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        batch = self._prepare_dynamic_cp_batch(
+            monkeypatch,
+            group,
+            [0, 32, 64, 2 * TOKEN_CAPACITY],
+            seed=73,
+            zigzag_cp_min_chunk_size=8,
+            mtp_num_layers=7,
+        )
+        metadata = batch[FULL_CUDA_GRAPH_STATIC_METADATA_KEY]
+        assert metadata['thd_dynamic_cp']['validation_error'] is None
+        assert metadata['thd_cp_layout']['zigzag_cp_min_chunk_size'] == 8
+
+        static_batch = StaticBufferLoader()(batch, 'training', 0)
+        packed_seq_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=_make_thd_full_iter_config(mtp_num_layers=7)
+        )[5]
+        assert packed_seq_params.zigzag_cp_min_chunk_size == 8
+        context = prepare_mtp_sequence_roll_context(
+            static_batch['tokens'], group, packed_seq_params
+        )
+        assert isinstance(context, ZigzagPackedCPRollContext)
+        assert context.min_chunk_size == 8
+
+        monkeypatch.setattr(
+            torch.distributed,
+            'get_rank',
+            lambda group=None: group.rank() if isinstance(group, _FakeCPGroup) else 0,
+        )
+        monkeypatch.setattr(
+            'megatron.core.transformer.mtp_sequence_roll.'
+            '_exchange_zigzag_packed_cp_roll_field_halos',
+            lambda fields, transport, **kwargs: {
+                field.key: field.source.new_full(
+                    (2 * transport.front_prefix_rows.numel(), *field.source.shape[1:]),
+                    field.fill_value,
+                )
+                for field in fields
+            },
+        )
+        fields = [MTPSequenceRollField('input_ids', static_batch['tokens'], -1, 0, 0)]
+        prepared = prepare_mtp_sequence_roll_fields(context, fields, max_offset=8)
+        assert prepared is not None
+        assert prepared.max_offset == 8
+        assert prepared.materialize('input_ids', 8).shape == static_batch['tokens'].shape
+
+    @pytest.mark.parametrize('certificate', [None, 0, 7])
+    def test_dynamic_cp_defers_unsafe_zigzag_mtp_certificate_to_consensus(
+        self, monkeypatch, certificate
+    ):
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        batch = self._prepare_dynamic_cp_batch(
+            monkeypatch,
+            group,
+            [0, 32, 64, 2 * TOKEN_CAPACITY],
+            seed=74,
+            zigzag_cp_min_chunk_size=certificate,
+            mtp_num_layers=7,
+        )
+        metadata = batch[FULL_CUDA_GRAPH_STATIC_METADATA_KEY]
+        assert 'mtp_num_layers + 1 (8)' in metadata['thd_dynamic_cp']['validation_error']
+        assert 'thd_cp_layout' not in metadata
+
+        wrapper = FullCudaGraphWrapper(
+            lambda **kwargs: None, require_global_static_metadata_consensus=True
+        )
+        wrapper.static_loader.begin_batch('training', defer_static_metadata_mismatch=True)
+        wrapper.static_loader(batch, 'training', 0)
+        with pytest.raises(RuntimeError, match='legacy cumulative-roll fallback'):
+            wrapper._check_global_static_metadata_consensus('training')
+
+        assert StaticBufferLoader.static_buffers['training'] == []
+
+    def test_dynamic_cp_rejects_certificate_tightened_by_final_padding(self, monkeypatch):
+        """The full-iteration gate consumes the post-padding scheduler certificate."""
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        cu_seqlens = torch.tensor([0, 32], dtype=torch.int32, device='cuda')
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=32,
+            max_seqlen_kv=32,
+            local_cp_size=2,
+            cp_group=group,
+            cp_partition_mode='zigzag',
+            zigzag_cp_min_chunk_size=8,
+        )
+        tokens = torch.ones((1, 16), dtype=torch.int64, device='cuda')
+        _, _, _, _, padded_params, _ = pad_sequence_for_thd(
+            tokens,
+            None,
+            None,
+            None,
+            packed_seq_params,
+            target_len=30,
+            tail_padding_policy='append_dummy_seq',
+            cp_size=2,
+            cp_rank=0,
+        )
+        assert padded_params.zigzag_cp_min_chunk_size == 7
+
+        monkeypatch.setattr(
+            torch.distributed,
+            'get_process_group_ranks',
+            lambda process_group: list(process_group.global_ranks),
+        )
+        signature = data_schedule._build_thd_full_iteration_dynamic_cp_signature(
+            padded_params, config=_make_thd_full_iter_config(mtp_num_layers=7)
+        )
+        assert 'mtp_num_layers + 1 (8)' in signature['validation_error']
 
     @pytest.mark.parametrize(
         'sequence_lengths', [[10, 20, 5], [TOKEN_CAPACITY], [3, 3, 3, 3], [1, TOKEN_CAPACITY - 1]]
@@ -344,6 +570,207 @@ class TestThdStaticBatchPreparation:
         )
         with pytest.raises(RuntimeError, match='static input metadata changed'):
             loader(changed_geometry, 'training', 0)
+
+    def test_dynamic_cp1_restores_topology_while_valid_boundaries_change(self, monkeypatch):
+        """Effective CP1 keeps its certified group while token boundaries remain inputs."""
+        group = _FakeCPGroup(size=1, global_ranks=(7,))
+        loader = StaticBufferLoader()
+
+        first = self._prepare_dynamic_cp_batch(
+            monkeypatch, group, [0, 7, 16, TOKEN_CAPACITY], seed=31
+        )
+        static_batch = loader(first, 'training', 0)
+        first_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=_make_thd_full_iter_config()
+        )[5]
+        topology = first[FULL_CUDA_GRAPH_STATIC_METADATA_KEY]['thd_dynamic_cp']
+        assert topology['local_cp_size'] == 1
+        assert topology['cp_group_global_ranks'] == (7,)
+        assert first_params.local_cp_size == 1
+        assert first_params.cp_group is group
+
+        second = self._prepare_dynamic_cp_batch(
+            monkeypatch, group, [0, 8, 16, TOKEN_CAPACITY], seed=32
+        )
+        static_batch = loader(second, 'training', 0)
+        second_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=_make_thd_full_iter_config()
+        )[5]
+
+        assert second_params is not first_params
+        assert second_params.local_cp_size == 1
+        assert second_params.cp_group is group
+        assert second_params.cu_seqlens_q[:4].tolist() == [0, 8, 16, TOKEN_CAPACITY]
+
+    def test_dynamic_cp2_stable_certificate_reuses_route_and_metadata(self, monkeypatch):
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        loader = StaticBufferLoader()
+        boundaries = [0, 16, 32, 2 * TOKEN_CAPACITY]
+        host_boundaries = [0, 16, 32, 2 * TOKEN_CAPACITY]
+
+        first = self._prepare_dynamic_cp_batch(
+            monkeypatch, group, boundaries, seed=41, host_boundaries=host_boundaries
+        )
+        static_batch = loader(first, 'training', 0)
+        first_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=_make_thd_full_iter_config()
+        )[5]
+        first_route_ptr = first_params.cp_partition_route.contiguous_index.data_ptr()
+
+        second = self._prepare_dynamic_cp_batch(
+            monkeypatch, group, boundaries, seed=42, host_boundaries=host_boundaries
+        )
+        static_batch = loader(second, 'training', 0)
+        second_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=_make_thd_full_iter_config()
+        )[5]
+
+        assert second_params is first_params
+        assert second_params.local_cp_size == 2
+        assert second_params.cp_group is group
+        assert second_params.cp_partition_route.contiguous_index.data_ptr() == first_route_ptr
+
+    @pytest.mark.parametrize(
+        'mismatch', ['bucket', 'boundary', 'host_boundary', 'group', 'partition', 'split']
+    )
+    def test_dynamic_cp_certificate_rejects_realized_schedule_mismatch(self, monkeypatch, mismatch):
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        loader = StaticBufferLoader()
+        first = self._prepare_dynamic_cp_batch(
+            monkeypatch,
+            group,
+            [0, 16, 32, 2 * TOKEN_CAPACITY],
+            seed=51,
+            host_boundaries=[0, 16, 32, 2 * TOKEN_CAPACITY],
+        )
+        loader(first, 'training', 0)
+
+        next_group = group
+        next_boundaries = [0, 16, 32, 2 * TOKEN_CAPACITY]
+        next_host_boundaries = list(next_boundaries)
+        next_partition_mode = 'zigzag'
+        split_mismatch = False
+        if mismatch == 'bucket':
+            next_group = _FakeCPGroup(size=1, global_ranks=(4,))
+            next_boundaries = [0, 16, 32, TOKEN_CAPACITY]
+            next_host_boundaries = list(next_boundaries)
+        elif mismatch == 'boundary':
+            next_boundaries = [0, 8, 32, 2 * TOKEN_CAPACITY]
+            next_host_boundaries = list(next_boundaries)
+        elif mismatch == 'host_boundary':
+            next_host_boundaries = [0, 8, 32, 2 * TOKEN_CAPACITY]
+        elif mismatch == 'group':
+            # Same membership is still a mismatch: the captured collective is
+            # bound to the original ProcessGroup object.
+            next_group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        elif mismatch == 'partition':
+            next_partition_mode = 'contiguous'
+        elif mismatch == 'split':
+            split_mismatch = True
+
+        changed = self._prepare_dynamic_cp_batch(
+            monkeypatch,
+            next_group,
+            next_boundaries,
+            seed=52,
+            cp_partition_mode=next_partition_mode,
+            host_boundaries=next_host_boundaries,
+            split_mismatch=split_mismatch,
+        )
+        with pytest.raises(RuntimeError, match='static input metadata changed'):
+            loader(changed, 'training', 0)
+
+    def test_dynamic_cp_mismatch_consensus_fails_every_rank_before_replay(self):
+        wrapper = FullCudaGraphWrapper(
+            lambda **kwargs: None, require_global_static_metadata_consensus=True
+        )
+        wrapper.static_loader.begin_batch('training', defer_static_metadata_mismatch=True)
+        if torch.distributed.get_rank() == 0:
+            wrapper.static_loader.static_metadata_mismatch = 'rank-local layout mismatch.'
+
+        with pytest.raises(RuntimeError, match='before capture or replay'):
+            wrapper._check_global_static_metadata_consensus('training')
+
+    def test_invalid_dynamic_cp_topology_is_deferred_to_global_consensus(self, monkeypatch):
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        invalid = self._prepare_dynamic_cp_batch(
+            monkeypatch, group, [0, 16, 32, 2 * TOKEN_CAPACITY], seed=61, local_cp_size=1
+        )
+        wrapper = FullCudaGraphWrapper(
+            lambda **kwargs: None, require_global_static_metadata_consensus=True
+        )
+        wrapper.static_loader.begin_batch('training', defer_static_metadata_mismatch=True)
+        wrapper.static_loader(invalid, 'training', 0)
+
+        with pytest.raises(RuntimeError, match='inconsistent topology'):
+            wrapper._check_global_static_metadata_consensus('training')
+
+        assert StaticBufferLoader.static_buffers['training'] == []
+
+    def test_dynamic_cp_certificate_rejects_missing_raw_group_before_finalize(self, monkeypatch):
+        """The ordinary static-CP fallback must not manufacture a DCP certificate."""
+        group = _FakeCPGroup(size=2, global_ranks=(4, 9))
+        outputs = _make_dynamic_cp_batch_outputs(group, [0, 16, 32, 2 * TOKEN_CAPACITY], seed=62)
+        outputs[5].cp_group = None
+
+        def _get_batch(*args, dynamic_cp=False, **kwargs):
+            assert dynamic_cp
+            return outputs
+
+        monkeypatch.setattr(
+            data_schedule, 'get_batch_on_this_rank_for_sequence_packing', _get_batch
+        )
+        monkeypatch.setattr(
+            data_schedule,
+            'finalize_packed_seq_params',
+            lambda params: pytest.fail('invalid raw DCP metadata must not be finalized'),
+        )
+        config = _make_thd_full_iter_config(
+            dynamic_context_parallel=True,
+            cuda_graph_static_dynamic_cp=True,
+            sequence_packing_scheduler='default_dynamic_cp',
+        )
+
+        batch = prepare_thd_static_batch_for_full_iteration_cuda_graph(iter([{}]), config=config)
+        topology = batch[FULL_CUDA_GRAPH_STATIC_METADATA_KEY]['thd_dynamic_cp']
+        assert 'realized CP process group' in topology['validation_error']
+        assert topology['cp_group_identity'] is None
+        assert topology['cp_group_global_ranks'] == ()
+
+    @pytest.mark.parametrize('mismatch', ['current_signature', 'captured_signature'])
+    def test_signature_consensus_fails_before_data_read(self, monkeypatch, mismatch):
+        wrapper = FullCudaGraphWrapper(
+            lambda **kwargs: None, require_global_static_metadata_consensus=True
+        )
+        data_read_called = False
+
+        def _data_read(*args, **kwargs):
+            nonlocal data_read_called
+            data_read_called = True
+            raise AssertionError('signature consensus must run before data_read')
+
+        def _all_gather_into_tensor(output, local_state):
+            gathered = local_state.repeat(2, 1)
+            if mismatch == 'current_signature':
+                gathered[1, 0] += 1
+            else:
+                gathered[1, -1] = 1
+            output.copy_(gathered.flatten())
+
+        monkeypatch.setattr(wrapper, 'data_read', _data_read)
+        monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+        monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
+
+        with pytest.raises(RuntimeError, match='before reading data, capture, or replay'):
+            wrapper(
+                model=torch.nn.Identity().cuda(),
+                data_iterator=None,
+                num_microbatches=2,
+                seq_length=TOKEN_CAPACITY,
+                forward_only=False,
+            )
+
+        assert not data_read_called
 
 
 def test_resolve_thd_static_batch_pg_collection():

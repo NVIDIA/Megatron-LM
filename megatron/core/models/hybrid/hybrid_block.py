@@ -188,9 +188,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             )
         )
 
-    def get_layer_static_inputs(
-        self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False
-    ):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """Use one stream for split attention, and n streams for whole-wrapper capture.
 
         CUDA graph capture and pipeline prewarm allocate static buffers sized by this method.
@@ -199,15 +197,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
         if hasattr(self.inner_layer, "get_layer_static_inputs"):
             static_inputs = self.inner_layer.get_layer_static_inputs(
-                seq_length,
-                micro_batch_size,
-                for_pipeline_prewarm=for_pipeline_prewarm,
+                seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
             )
         else:
             static_inputs = super().get_layer_static_inputs(
-                seq_length,
-                micro_batch_size,
-                for_pipeline_prewarm=for_pipeline_prewarm,
+                seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
             )
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             return static_inputs

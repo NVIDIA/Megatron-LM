@@ -227,7 +227,10 @@ def test_selective_core_checkpoint_uses_private_source_and_consumer_snapshots(
         return q * k + topk.sum()
 
     attention = SimpleNamespace(
-        config=config, core_attention=attention_call, attn_mask_type=AttnMaskType.causal
+        config=config,
+        core_attention=attention_call,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=SimpleNamespace(cp=None),
     )
     inputs = [torch.randn(2, requires_grad=True) for _ in range(2)]
     outputs = []
