@@ -110,13 +110,13 @@ class GroupOwnerLayout:
     Attributes:
         mesh: The device mesh over which the buffer is all-RowAtomic sharded.
         layout: The existing `DBuffer.layout`, including all tensors in the group.
-        owners: Participating tensor index to owner global process rank. These keys
+        tensor_to_owner: Participating tensor index to owner global process rank. These keys
             identify the participating tensors; no filtered layout copy is stored.
     """
 
     mesh: DeviceMesh
     layout: GlobalLayout
-    owners: dict[int, int]
+    tensor_to_owner: dict[int, int]
 
     @classmethod
     def from_group(
@@ -137,8 +137,8 @@ class GroupOwnerLayout:
             i for i, param in enumerate(group.fsdp_parameters) if eligible_fn(param.sharded)
         )
         layout = group.main_weight.layout
-        owners = assign_owner_work(layout, group.mesh, tensor_indices, cost_fn)
-        return cls(mesh=group.mesh, layout=layout, owners=owners)
+        tensor_to_owner = assign_owner_work(layout, group.mesh, tensor_indices, cost_fn)
+        return cls(mesh=group.mesh, layout=layout, tensor_to_owner=tensor_to_owner)
 
 
 @dataclasses.dataclass
@@ -170,7 +170,7 @@ class OwnerGatherPlan:
     # rank 0 holds [0, 20); rank 1 holds [20, 40).
     # Choose rank 1 as both owners for this example. It holds part of param_0
     # and all of param_1; these are explicit assignments, not the default balancer's output.
-    owner_layout = GroupOwnerLayout(mesh=mesh, layout=layout, owners={0: 1, 1: 1})
+    owner_layout = GroupOwnerLayout(mesh=mesh, layout=layout, tensor_to_owner={0: 1, 1: 1})
 
     param_0.local_shard.shape == (5, 4)  # Rank 0 holds param_0[0:5, ...].
     param_1.local_shard.shape == (0, 4)  # Rank 0 holds none of param_1.
@@ -243,9 +243,9 @@ class OwnerGatherPlan:
         this_rank = mesh.get_rank()
         layout = plan.layout
         placements = (RowAtomic(),) * mesh.ndim
-        owners = plan.owners
-        tensor_indices = sorted(owners)
-        owned_indices = [i for i in tensor_indices if owners[i] == this_rank]
+        tensor_to_owner = plan.tensor_to_owner
+        tensor_indices = sorted(tensor_to_owner)
+        owned_indices = [i for i in tensor_indices if tensor_to_owner[i] == this_rank]
 
         # Query each source once and compute both its receive size and offsets.
         rank_ranges: dict[int, Range] = {}
@@ -270,7 +270,7 @@ class OwnerGatherPlan:
         local_range = rank_ranges[this_rank]
         send_sizes: dict[int, int] = {}
         for tensor_index in tensor_indices:
-            owner = owners[tensor_index]
+            owner = tensor_to_owner[tensor_index]
             if owner == this_rank:
                 continue
             numel = intersect_ranges(layout.get_tensor_range(tensor_index), local_range).numel
@@ -289,7 +289,7 @@ class OwnerGatherPlan:
         cursors: dict[int, int] = {owner: 0 for owner in send_buffers}
         own_shards: dict[int, torch.Tensor] = {}
         for tensor_index in tensor_indices:
-            owner = owners[tensor_index]
+            owner = tensor_to_owner[tensor_index]
             if owner == this_rank:
                 own_shards[tensor_index] = local_shards[tensor_index].flatten()
                 continue
@@ -381,10 +381,10 @@ class OwnerScatterPlan:
         layout = plan.layout
         placements = (RowAtomic(),) * mesh.ndim
         local_range = layout.get_local_range(mesh, placements)
-        owners = plan.owners
-        tensor_indices = sorted(owners)
+        tensor_to_owner = plan.tensor_to_owner
+        tensor_indices = sorted(tensor_to_owner)
         flat_results = {
-            i: full_results[i].flatten() for i in tensor_indices if owners[i] == this_rank
+            i: full_results[i].flatten() for i in tensor_indices if tensor_to_owner[i] == this_rank
         }
 
         # Query each destination once and pack its shards in tensor-index order.
@@ -407,7 +407,7 @@ class OwnerScatterPlan:
         recv_sizes: dict[int, int] = {}
         recv_offsets: dict[tuple[int, int], int] = {}
         for tensor_index in tensor_indices:
-            owner = owners[tensor_index]
+            owner = tensor_to_owner[tensor_index]
             if owner == this_rank:
                 continue
             numel = intersect_ranges(layout.get_tensor_range(tensor_index), local_range).numel
