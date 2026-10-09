@@ -14,6 +14,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
@@ -1075,8 +1076,26 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
     @torch.no_grad()
     def refresh_cache(self) -> None:
-        """Refresh the existing decode-cache storage from the current ``A_log``."""
-        self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+        """Refresh existing decode-cache storage from ``A_log``.
+
+        With FSDP DTensors, all ranks in the shard mesh must call this method
+        in matching module order because reconstructing ``A_log`` is collective.
+        """
+        a_log = self.A_log
+        if isinstance(a_log, DTensor):
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+                uneven_dtensor_to_full_tensor,
+            )
+
+            # FSDP exposes optimizer DTensors between forwards, including after
+            # checkpoint import. Their local shards can be uneven or empty;
+            # to_local() alone is not the TP-local parameter needed by this cache.
+            # Gather the small head vector, then retain this mixer's TP slice.
+            a_log = uneven_dtensor_to_full_tensor(a_log)
+            a_log = a_log.narrow(
+                0, self.pg_collection.tp.rank() * self.nheads_local_tp, self.nheads_local_tp
+            )
+        self._A_neg_exp_cache.copy_(-torch.exp(a_log.float()))
         self._A_neg_exp_cache_stale = False
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:

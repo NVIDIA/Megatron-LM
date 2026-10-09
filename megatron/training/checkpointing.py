@@ -78,6 +78,7 @@ try:
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
+        handle_mamba_in_state_dict,
         handle_mla_down_proj_in_state_dict,
         handle_mtp_in_state_dict,
         handle_swiglu_in_state_dict,
@@ -1900,7 +1901,7 @@ def _localize_redundant_extra_states(state_dict):
     dict_list_map_inplace(_maybe_localize, state_dict)
 
 
-def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, *, checkpoint_metadata=None):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
 
@@ -1915,6 +1916,11 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
 
     if args.swiglu:
         apply(handle_swiglu_in_state_dict)
+    apply(
+        lambda model, msd, osd: handle_mamba_in_state_dict(
+            model, msd, osd, checkpoint_metadata=checkpoint_metadata
+        )
+    )
     # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
     # layout used on disk. No-op for unfused models.
     apply(handle_mla_down_proj_in_state_dict)
@@ -2333,9 +2339,11 @@ def _load_base_checkpoint(
         )
         raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
         model = state_dict.pop('_model')
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+        state_dict = preprocess_fsdp_dtensor_state_dict(
+            args, state_dict, model[0], checkpoint_metadata=state_dict_metadata
+        )
         if gpt_compat_layer_maps is not None:
             from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
                 retarget_fsdp_state_dict_to_gpt_checkpoint,
