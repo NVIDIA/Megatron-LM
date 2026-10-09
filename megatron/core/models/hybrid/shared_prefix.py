@@ -70,11 +70,11 @@ def _validate_mamba_fork(mixer: MambaMixer) -> None:
 
 
 def _prefix_conv_context(xbc: Tensor, width: int) -> Tensor:
-    """Last ``width`` pre-convolution columns, including the causal left-zero padding."""
+    """Last ``width`` pre-convolution ``[batch, length, channels]`` rows, zero-padded causally."""
     if width == 0:
-        return xbc[:, :, :0]
-    padded = F.pad(xbc, (max(0, width - xbc.shape[-1]), 0))
-    return padded[:, :, -width:].clone()
+        return xbc[:, :0]
+    padded = F.pad(xbc, (0, 0, max(0, width - xbc.shape[1]), 0))
+    return padded[:, -width:].clone()
 
 
 def _mamba_prefix_fork_boundary(mixer: MambaMixer, prefix_len: int) -> int:
@@ -125,28 +125,31 @@ def _scan_mamba_projected_segment(
     xbc, dt = torch.split(projected, [d_inner + 2 * num_groups * mixer.d_state, num_heads], dim=-1)
     A = -torch.exp(cp.get_A_log().float())
 
-    xbc = rearrange(xbc, "b l d -> b d l").contiguous()
+    # Keep [batch, length, channels] storage and pass the convolution a channel-last view, as
+    # MambaMixer does. causal_conv1d's channel-first backward returns wrong gradients at some
+    # lengths (L % 1024 in 1..7 for bf16/fp16, L % 512 in 1..3 for fp32).
+    xbc = xbc.contiguous()
     next_conv_context = _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
     if conv_context is not None:
         if (
             conv_context.ndim != 3
-            or conv_context.shape[1] != xbc.shape[1]
-            or conv_context.shape[2] != mixer.d_conv - 1
+            or conv_context.shape[1] != mixer.d_conv - 1
+            or conv_context.shape[2] != xbc.shape[2]
         ):
             raise ValueError("prefix convolution state is incompatible with the branch")
         if conv_context.shape[0] not in (1, branch_count):
             raise ValueError("prefix convolution state batch is incompatible with the branch")
         repeated_context = conv_context.to(xbc.dtype).expand(branch_count, -1, -1)
-        conv_input = torch.cat([repeated_context, xbc], dim=-1)
+        conv_input = torch.cat([repeated_context, xbc], dim=1)
         conv_output = causal_conv1d_fn(
-            conv_input,
+            conv_input.transpose(1, 2),
             rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
             cp.get_conv1d_bias(),
             activation=mixer.activation,
-        )[:, :, repeated_context.shape[-1] :]
+        )[:, :, repeated_context.shape[1] :]
     else:
         conv_output = causal_conv1d_fn(
-            xbc,
+            xbc.transpose(1, 2),
             rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
             cp.get_conv1d_bias(),
             activation=mixer.activation,
@@ -226,21 +229,22 @@ def _fork_mamba_segment(
     )
     A = -torch.exp(cp.get_A_log().float())
 
-    xbc = rearrange(xbc, "b l d -> b d l").contiguous()
+    # Channel-last convolution input, as in _scan_mamba_projected_segment.
+    xbc = xbc.contiguous()
     next_conv_context = _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
     if conv_context is not None:
-        if conv_context.shape[:2] != xbc.shape[:2]:
+        if conv_context.shape[0] != xbc.shape[0] or conv_context.shape[2] != xbc.shape[2]:
             raise ValueError("prefix convolution state is incompatible with the branch")
-        conv_input = torch.cat([conv_context.to(xbc.dtype), xbc], dim=-1)
+        conv_input = torch.cat([conv_context.to(xbc.dtype), xbc], dim=1)
         conv_output = causal_conv1d_fn(
-            conv_input,
+            conv_input.transpose(1, 2),
             rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
             cp.get_conv1d_bias(),
             activation=mixer.activation,
-        )[:, :, conv_context.shape[-1] :]
+        )[:, :, conv_context.shape[1] :]
     else:
         conv_output = causal_conv1d_fn(
-            xbc,
+            xbc.transpose(1, 2),
             rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
             cp.get_conv1d_bias(),
             activation=mixer.activation,
@@ -322,23 +326,24 @@ def _fork_mamba_branches(
     )
     A = -torch.exp(cp.get_A_log().float())
 
-    xbc = rearrange(xbc, "b l d -> b d l").contiguous()
+    # Channel-last convolution input, as in _scan_mamba_projected_segment.
+    xbc = xbc.contiguous()
     if conv_context is None:
         conv_output = causal_conv1d_fn(
-            xbc,
+            xbc.transpose(1, 2),
             rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
             cp.get_conv1d_bias(),
             activation=mixer.activation,
         )
     else:
         repeated_context = conv_context.to(xbc.dtype).expand(branch_count, -1, -1)
-        conv_input = torch.cat([repeated_context, xbc], dim=-1)
+        conv_input = torch.cat([repeated_context, xbc], dim=1)
         conv_output = causal_conv1d_fn(
-            conv_input,
+            conv_input.transpose(1, 2),
             rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
             cp.get_conv1d_bias(),
             activation=mixer.activation,
-        )[:, :, repeated_context.shape[-1] :]
+        )[:, :, repeated_context.shape[1] :]
     xbc = rearrange(conv_output, "b d l -> b l d").contiguous()
 
     x, B, C = torch.split(
