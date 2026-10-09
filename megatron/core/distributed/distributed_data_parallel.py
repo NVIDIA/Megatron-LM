@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import logging
 import weakref
 from contextlib import contextmanager
@@ -116,6 +117,22 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional[FullParamLayout] = None,
     ):
         super().__init__(config=config, module=module)
+        if (
+            ddp_config.use_distributed_optimizer
+            and not ddp_config.use_layer_wise_param_layout
+            and any(
+                getattr(param, "is_managed_by_layer_wise_optimizer", False)
+                for param in module.parameters()
+                if param.requires_grad
+            )
+        ):
+            # Compact LayerWise owns both Muon and Adam. Normalize direct core callers
+            # before selecting process groups or layouts, without changing their config.
+            ddp_config = dataclasses.replace(
+                ddp_config,
+                use_distributed_optimizer=False,
+                num_buckets=None if ddp_config.bucket_size is not None else ddp_config.num_buckets,
+            )
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -216,15 +233,7 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-            compute_layout = DistributedOptimizer.compute_full_param_layout
-            if any(key.is_managed_by_layer_wise_optimizer for key in buffer_groups):
-                from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-
-                # Direct DDP callers must honor the same ownership/layout contract as
-                # training wrappers. In particular, compact Muon cannot consume offsets
-                # padded for byte-level DistOpt sharding.
-                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            full_param_layout = compute_layout(
+            full_param_layout = DistributedOptimizer.compute_full_param_layout(
                 all_params,
                 self.bucket_size,
                 self.intra_dp_cp_group.size(),

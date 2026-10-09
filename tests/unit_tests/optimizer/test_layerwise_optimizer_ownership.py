@@ -3,15 +3,19 @@
 """Preserve main's compact Muon/Adam ownership and existing checkpoint interface."""
 
 from copy import deepcopy
+from itertools import cycle
 
 import pytest
 import torch
 
 import megatron.core.optimizer as optimizer_module
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -26,7 +30,7 @@ pytestmark = [
 ]
 
 
-def _build_model_and_config(layout, expert_bias, overlap, seed):
+def _build_model_and_config(layout, expert_bias, overlap, seed, direct_core=False):
     torch.manual_seed(seed)
     pg = ProcessGroupCollection.use_mpu_process_groups()
     model = torch.nn.Module()
@@ -75,14 +79,25 @@ def _build_model_and_config(layout, expert_bias, overlap, seed):
         expert_model_parallel_size=pg.ep.size(),
         expert_tensor_parallel_size=1,
     )
-    ddp = wrap_model_chunks_with_ddp(
-        [model],
-        config,
-        DistributedDataParallelConfig(grad_reduce_in_fp32=True, overlap_param_gather=overlap),
-        use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=layout,
-        pg_collection=pg,
-    )[0]
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True, overlap_param_gather=overlap
+    )
+    if direct_core:
+        ddp_config.use_distributed_optimizer = True
+        ddp_config.use_layer_wise_param_layout = layout
+        tag_params_for_buffer_routing([model])
+        ddp = DistributedDataParallel(config, ddp_config, model, pg_collection=pg)
+        assert ddp_config.use_distributed_optimizer, "DDP must preserve the caller's configuration"
+        assert ddp.ddp_config is not ddp_config
+    else:
+        ddp = wrap_model_chunks_with_ddp(
+            [model],
+            config,
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=layout,
+            pg_collection=pg,
+        )[0]
     optimizer_config = OptimizerConfig(
         optimizer="muon",
         lr=0.001,
@@ -178,6 +193,54 @@ def test_layerwise_optimizer_preserves_main_ownership(layout, expert_bias):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("expert_bias", [False, True])
+def test_compact_core_api_preserves_layerwise_ownership(expert_bias):
+    """Direct DDP construction uses the same compact ownership as the training entry point."""
+    Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_tensor_parallel_size=1)
+    try:
+        ddp, config, pg = _build_model_and_config(False, expert_bias, True, 1234, direct_core=True)
+        optimizer = _make_optimizer(ddp, config, pg)
+        _assert_compact_ownership(ddp, optimizer, pg)
+        for buffer in ddp.buffers + ddp.expert_parallel_buffers:
+            assert not buffer.ddp_config.use_distributed_optimizer
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _shard_with_main_owners(optimizer, base_optimizers, dp_size, expert_dp_size):
+    """Reference main's stable-numel ownership independently of DDP buffer offsets."""
+    groups = [group for base in base_optimizers for group in base.param_groups]
+    entries = [(param, index) for index, group in enumerate(groups) for param in group["params"]]
+    entries.sort(key=lambda item: item[0].numel())
+    rank_cycles = {
+        False: cycle([*range(dp_size), *reversed(range(dp_size))]),
+        True: cycle([*range(expert_dp_size), *reversed(range(expert_dp_size))]),
+    }
+    owners = {False: [[] for _ in range(dp_size)], True: [[] for _ in range(expert_dp_size)]}
+    local_rank = {False: optimizer.dp_cp.rank(), True: optimizer.expt_dp.rank()}
+    local_groups = [[] for _ in groups]
+    for param, group_index in entries:
+        expert = groups[group_index].get("is_expert_parallel", False)
+        owner = next(rank_cycles[expert])
+        owners[expert][owner].append(param)
+        if owner == local_rank[expert]:
+            local_groups[group_index].append(param)
+    for group, params in zip(groups, local_groups):
+        group["params"] = params
+    optimizer.dp_cp_params_list = owners[False]
+    optimizer.expt_dp_params_list = (
+        owners[True] if expert_dp_size > 1 and any(owners[True]) else None
+    )
+
+
+def _local_parameter_names(ddp, optimizer):
+    names = {param: name for name, param in ddp.named_parameters()}
+    return [
+        [[names[param] for param in group] for group in child.float16_groups]
+        for child in optimizer.chained_optimizers
+    ]
+
+
 def _assert_equal(actual, expected):
     if isinstance(expected, torch.Tensor):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -207,17 +270,24 @@ def _step(ddp, optimizer, step):
 
 @pytest.mark.parametrize("expert_parallel_size", [1, 2])
 @pytest.mark.parametrize("overlap", [False, True])
-def test_compact_existing_torch_checkpoint_restores_next_update(
-    tmp_path, expert_parallel_size, overlap
+def test_compact_main_torch_checkpoint_restores_next_update(
+    tmp_path, monkeypatch, expert_parallel_size, overlap
 ):
-    """The unchanged LayerWise file API preserves full masters, moments and next update."""
+    """Main-owner checkpoints preserve masters, moments and the next update after loading."""
     Utils.initialize_model_parallel(
         expert_model_parallel_size=expert_parallel_size, expert_tensor_parallel_size=1
     )
     try:
         ddp, config, pg = _build_model_and_config(False, True, overlap, 1234)
-        optimizer = _make_optimizer(ddp, config, pg)
+        # Build the saved optimizer using main's ownership rule. The repeated equal-size
+        # parameters deliberately expose any new buffer-offset tie-breaker in the loader.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                LayerWiseDistributedOptimizer, "_shard_params_ping_pong", _shard_with_main_owners
+            )
+            optimizer = _make_optimizer(ddp, config, pg)
         _assert_compact_ownership(ddp, optimizer, pg)
+        saved_owner_names = _local_parameter_names(ddp, optimizer)
         _step(ddp, optimizer, 1)
         _step(ddp, optimizer, 2)
         saved_model = deepcopy(ddp.module.state_dict())
@@ -244,6 +314,7 @@ def test_compact_existing_torch_checkpoint_restores_next_update(
 
         resumed, resumed_config, resumed_pg = _build_model_and_config(False, True, overlap, 9876)
         resumed_optimizer = _make_optimizer(resumed, resumed_config, resumed_pg)
+        assert _local_parameter_names(resumed, resumed_optimizer) == saved_owner_names
         resumed.module.load_state_dict(saved_model)
         resumed_optimizer.load_state_dict_from_file(path)
         _assert_equal(resumed_optimizer.state_dict(), saved_optimizer)
