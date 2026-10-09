@@ -1445,6 +1445,9 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    gdp_batch_invariant_block_size: int = 16
+    """Canonical GDP block size in internal updates, shared by training and inference."""
+
     gdp_num_householder: int = 3
     """The number of Householder reflections used in Gated Delta Product layers."""
 
@@ -1713,6 +1716,9 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
             )
+
+        if self.gdp_batch_invariant_block_size not in (16, 32):
+            raise ValueError("gdp_batch_invariant_block_size must be 16 or 32")
 
         if self.gdp_num_householder < 1:
             raise ValueError(
