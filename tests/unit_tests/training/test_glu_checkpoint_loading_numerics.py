@@ -532,7 +532,7 @@ def test_non_glu_checkpoint_ignores_interleave_size(
 
 @pytest.mark.parametrize("interleave", [None, 32], ids=["canonical", "interleaved"])
 def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
-    moe_case, tmp_path_dist_ckpt, interleave
+    moe_case, tmp_path_dist_ckpt, interleave, monkeypatch
 ):
     """Restore real DP shards and Adam state, then compare two further parameter updates.
 
@@ -544,6 +544,9 @@ def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
     from masters before the immediate model comparison.
     """
     numerics._skip_if_unsupported("bf16")
+    # Determinism tests can set this globally during collection. Keep exercising
+    # GroupedTensor + bias, whose TE dbias kernel requires atomic adds.
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
     setup_kwargs = dict(
         single_weight=False,
         single_bias=False,
