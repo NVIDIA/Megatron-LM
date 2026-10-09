@@ -43,6 +43,17 @@ def test_entry_paths_exist(entry):
     for test in entry.tests:
         assert (REPO_ROOT / test).is_file(), f"{entry.name}: test {test} does not exist"
         assert test.startswith("tests/unit_tests/"), f"{entry.name}: {test} must be a unit test"
+    assert len(set(entry.author_tests)) == len(entry.author_tests), "Duplicate author test IDs"
+    for node_id in entry.author_tests:
+        path, test_id = node_id.split("::", 1)
+        assert (
+            path in entry.tests
+        ), f"{entry.name}: author test must belong to a registered test file"
+        tree = ast.parse((REPO_ROOT / path).read_text())
+        assert any(
+            isinstance(node, ast.FunctionDef) and node.name == test_id.split("[", 1)[0]
+            for node in tree.body
+        ), f"{entry.name}: missing author test function {test_id}"
 
 
 @pytest.mark.parametrize("entry", manifest.KERNELS, ids=lambda e: e.name)
@@ -58,7 +69,7 @@ def test_entry_has_test_or_exemption(entry):
 def _imported_modules(test_file: Path) -> set:
     """Dotted module paths imported anywhere in ``test_file`` (module or function level)."""
     tree = ast.parse(test_file.read_text())
-    modules = set()
+    modules: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(alias.name for alias in node.names)
