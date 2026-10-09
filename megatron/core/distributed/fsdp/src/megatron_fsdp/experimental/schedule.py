@@ -54,18 +54,10 @@ class TraceEvent:
     phase: str = "none"
 
 
-@dataclass(frozen=True)
-class PlanAction:
-    """Communication annotation compiled for one logical trace occurrence."""
-
-    prefetch_target: "FsdpModule | None" = None
-    retain: bool = False
-
-
 class TraceAndReplayScheduler:
     """Observe complete iterations and optimize communication without ordering compute.
 
-    Replay validates every logical occurrence before executing its compiled action.
+    Replay validates every logical occurrence before looking up its optimizations.
     Every module's final logical operation must reshard its parameters. Compiled
     prefetches are consumed within that iteration, and retention never skips a
     final release, so ordinary module operations own storage cleanup.
@@ -84,7 +76,8 @@ class TraceAndReplayScheduler:
             raise ValueError("max_reuse_distance must be non-negative or None.")
         self.max_reuse_distance = max_reuse_distance
         self._plan: list[TraceEvent] = []
-        self._actions: list[PlanAction] = []
+        self._prefetch_after: dict[int, FsdpModule] = {}
+        self._skip_reshard: set[int] = set()
         self._events: list[TraceEvent] = []
         self._position = 0
         self._active = False
@@ -105,54 +98,55 @@ class TraceAndReplayScheduler:
             raise RuntimeError("FSDP trace replay ended before all logical events were consumed.")
         if not self._plan:
             self._plan = list(self._events)
-            self._compile_actions()
+            self._compile_optimizations()
         self._active = False
 
-    def _record(self, event: TraceEvent) -> PlanAction:
+    def _record(self, event: TraceEvent) -> int:
         if not self._active:
             raise RuntimeError("Call context.begin_iteration() before using trace replay.")
         if self._plan:
             if self._position >= len(self._plan) or self._plan[self._position] != event:
                 raise RuntimeError("FSDP trace replay diverged from its logical event sequence.")
-            action = self._actions[self._position]
+            position = self._position
             self._position += 1
-            return action
+            return position
+        position = len(self._events)
         self._events.append(event)
-        return PlanAction()
+        return position
 
     def unshard(self, module: "FsdpModule", prefetch: str = "none") -> None:
         """Execute a validated demand gather and wait, then its annotated prefetch."""
-        action = self._record(TraceEvent("unshard", module, prefetch))
+        position = self._record(TraceEvent("unshard", module, prefetch))
         module._unshard_parameter_groups()
         assert module._unshard_event is not None
         module.context.current_stream().wait_event(module._unshard_event)
-        target = action.prefetch_target
+        target = self._prefetch_after.get(position)
         if target is not None and target._unshard_event is None:
             target._unshard_parameter_groups()
 
     def reshard(self, module: "FsdpModule") -> None:
         """Execute a validated release, retaining only a bounded planned reuse."""
-        action = self._record(TraceEvent("reshard", module))
-        if action.retain:
+        position = self._record(TraceEvent("reshard", module))
+        if position in self._skip_reshard:
             return
         module._reshard_parameter_groups()
 
-    def _compile_actions(self) -> None:
+    def _compile_optimizations(self) -> None:
         final_operations = {id(event.module): event.kind for event in self._plan}
         if any(kind != "reshard" for kind in final_operations.values()):
             raise RuntimeError("FSDP trace must end with reshard for every materialized module.")
-        actions = []
+        prefetch_after: dict[int, FsdpModule] = {}
+        skip_reshard: set[int] = set()
         for position, event in enumerate(self._plan):
-            target = None
-            retain = False
             if event.kind == "reshard" and self.max_reuse_distance is not None:
                 for successor_position in range(position + 1, len(self._plan)):
                     successor = self._plan[successor_position]
                     if successor.module is event.module:
-                        retain = (
+                        if (
                             successor.kind == "unshard"
                             and successor_position - position - 1 <= self.max_reuse_distance
-                        )
+                        ):
+                            skip_reshard.add(position)
                         break
             if event.kind == "unshard" and event.phase != "none":
                 budget = (
@@ -169,7 +163,7 @@ class TraceAndReplayScheduler:
                             successor.module is not event.module
                             and id(successor.module) not in released
                         ):
-                            target = successor.module
+                            prefetch_after[position] = successor.module
                             break
-            actions.append(PlanAction(target, retain))
-        self._actions = actions
+        self._prefetch_after = prefetch_after
+        self._skip_reshard = skip_reshard

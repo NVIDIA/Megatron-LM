@@ -50,6 +50,9 @@ def test_replay_prefetch_and_retention(max_reuse_distance):
     sequence = (repeated, repeated, second, repeated, third)
     for iteration in range(3):
         scheduler.begin_iteration()
+        if iteration == 0:
+            assert scheduler._prefetch_after == {}
+            assert scheduler._skip_reshard == set()
         for index, module in enumerate(sequence):
             previous_event = module._unshard_event
             scheduler.unshard(module, prefetch="forward")
@@ -71,11 +74,16 @@ def test_replay_prefetch_and_retention(max_reuse_distance):
         scheduler.end_iteration()
         assert all(module._unshard_event is None for module in (repeated, second, third))
         assert len(scheduler._plan) == 2 * len(sequence)
-        assert scheduler._actions[0].prefetch_target is second
-        assert scheduler._actions[6].prefetch_target is third
+        assert scheduler._prefetch_after[0] is second
+        assert scheduler._prefetch_after[6] is third
+        assert all(scheduler._plan[index].kind == "unshard" for index in scheduler._prefetch_after)
+        expected_skips = set() if max_reuse_distance is None else {1}
+        if max_reuse_distance == 2:
+            expected_skips.add(3)
+        assert scheduler._skip_reshard == expected_skips
         if iteration == 0:
-            scheduler._compile_actions = Mock(side_effect=AssertionError("recompiled replay"))
-    scheduler._compile_actions.assert_not_called()
+            scheduler._compile_optimizations = Mock(side_effect=AssertionError("recompiled replay"))
+    scheduler._compile_optimizations.assert_not_called()
 
 
 def test_replay_matches_dense_training(distributed_setup):
