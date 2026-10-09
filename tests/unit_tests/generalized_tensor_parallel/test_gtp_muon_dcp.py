@@ -105,6 +105,7 @@ def _initialize_native_fp8_moe_model(
     return model
 
 
+@pytest.mark.usefixtures("run_config")
 class TestGTPMuonDCP:
     """GTP + Muon (LayerWise) distributed checkpointing tests."""
 

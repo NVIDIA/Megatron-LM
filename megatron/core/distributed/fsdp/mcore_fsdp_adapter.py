@@ -697,13 +697,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
-        # open and finalize our own.
+        # open and finalize our own. MCore's finalize_model_grads() owns the wait
+        # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
-        construction_context = (
-            nullcontext(active_context)
-            if active_context is not None
-            else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
-        )
+        if active_context is None:
+            construction_context = fully_shard_context(
+                device=device,
+                use_symmetric_memory=ddp_config.nccl_ub,
+                caller_managed_grad_sync=True,
+            )
+        else:
+            if not active_context.caller_managed_grad_sync:
+                raise ValueError(
+                    "MCore MFSDP v2 requires shared contexts to be constructed with "
+                    "caller_managed_grad_sync=True."
+                )
+            construction_context = nullcontext(active_context)
         with construction_context:
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
@@ -899,12 +908,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
-        if self.config.overlap_moe_expert_parallel_comm:
-            # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
-            # Synchronize gradients here to ensure it is safe to call optimizer.step().
-            context = self.module.context
-            context.current_stream().wait_stream(context.reduce_scatter_stream)
+        """Wait on all submitted reductions, including delayed weight gradients."""
+        self.module.context.finish_grad_sync()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
@@ -916,7 +921,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
     def stop_communication(self) -> None:
-        """MFSDP v2 communication is complete when backward returns."""
+        """Wait for any pending gradient reductions."""
+        self.finish_grad_sync()
 
 
 def FullyShardedDataParallel(

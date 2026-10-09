@@ -134,7 +134,7 @@ class RecordingMoE(torch.nn.Module):
         super().__init__()
         self.calls = []
 
-    def forward(self, hidden_states, padding_mask=None, input_ids=None):
+    def forward(self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None):
         self.calls.append((padding_mask, input_ids))
         return hidden_states, None
 

@@ -2466,7 +2466,7 @@ def wrap_model_chunks_with_ddp(
         DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
-        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
         if is_mfsdp_v2
         else nullcontext()
     )
@@ -2562,6 +2562,7 @@ def _forward_backward_grad_context(args):
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
+    cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
@@ -2775,7 +2776,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
