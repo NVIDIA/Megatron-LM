@@ -26,7 +26,6 @@ from tests.unit_tests.models.hybrid.shared_prefix_test_utils import (
     clear_attention_env,
     compare_model_runs,
     copy_params,
-    rel_l2,
     round_params_to,
     run_dense_rows,
     run_shared,
@@ -432,16 +431,9 @@ class TestSharedPrefixMTPParity:
             reference = run_dense_rows(reference_model, tokens, reference_routing)
             dense = run_dense_rows(model, tokens, routing)
             shared = run_shared(model, tokens, layout, routing)
-            mtp_names = [name for name, _ in model.named_parameters() if name.startswith("mtp.")]
-            assert mtp_names
 
             def errors(run):
-                result = compare_model_runs(run, reference, model)
-                result["mtp_grads"] = rel_l2(
-                    torch.cat([run.grads[name].flatten() for name in mtp_names]),
-                    torch.cat([reference.grads[name].flatten() for name in mtp_names]),
-                )
-                return result
+                return compare_model_runs(run, reference, model)
 
             dense_error, shared_error = errors(dense), errors(shared)
             label = "main+mtp" if main_loss else "mtp-only"
@@ -463,3 +455,61 @@ class TestSharedPrefixMTPParity:
         finally:
             routing.close()
             reference_routing.close()
+
+
+# MTP loss normalization uses CP-local token counts, so grouped (shared) and per-row (dense)
+# normalization agree at CP>1 only when every row's local count ratio is 1. These lengths satisfy
+# that at CP2 with padding multiple 8 (review fu-mtp-parity, wsim.py), making a direct
+# shared-vs-dense comparison valid.
+MTP_CP2_STAR = ((64, (203, 260, 333, 190)),)
+MTP_CP2_FOREST = ((48, (150, 177)), (40, (131, 160)))
+# See test_shared_prefix_model_parity.py: the TP/SP/CP gap must stay within 1.5x of the TP1/CP1 gap.
+TOPOLOGY_RATIO = 1.5
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestSharedPrefixMTPDistributedParity:
+    """MTP branch repacking across TP/SP/CP: shared star vs dense rows."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _gap(self, monkeypatch, roots, forest):
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(123)
+        clear_attention_env(monkeypatch)
+        torch.manual_seed(0)
+        model = build_hybrid_model(MTP_PATTERN, torch.bfloat16, calculate_per_token_loss=True)
+        problem = SharedPrefixProblem(roots, padding_multiple=8, topology_multiple=8)
+        tokens = TokenProblem(problem, vocab_size=2048, seed=1)
+        routing = ReplayedRouting(model, tokens.num_keys, seed=2)
+        try:
+            dense = run_dense_rows(model, tokens, routing)
+            shared = run_shared(model, tokens, problem.layout(forest), routing)
+        finally:
+            routing.close()
+        return dense, shared, compare_model_runs(shared, dense, model)
+
+    @pytest.mark.usefixtures("_mtp_scale")
+    @pytest.mark.parametrize(
+        "roots,forest", [(MTP_CP2_STAR, False), (MTP_CP2_FOREST, True)], ids=["star", "forest"]
+    )
+    def test_mtp_matches_dense_rows_tp2_sp_cp2(self, roots, forest, monkeypatch):
+        if Utils.world_size < 4 or Utils.world_size % 4:
+            pytest.skip("requires a world size divisible by 4")
+        Utils.initialize_model_parallel(1, 1)
+        _, _, baseline = self._gap(monkeypatch, roots, forest)
+        Utils.destroy_model_parallel()
+
+        Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
+        dense, shared, gap = self._gap(monkeypatch, roots, forest)
+        print(f"\n[mtp tp2 cp2] gap={gap} tp1/cp1 gap={baseline}")
+        for shared_count, dense_count in zip(shared.counts, dense.counts):
+            torch.testing.assert_close(shared_count, dense_count, rtol=0, atol=0)
+        for metric in ("logits", "grads", "mtp_grads"):
+            assert gap[metric] <= TOPOLOGY_RATIO * baseline[metric] + SLACK, (
+                f"TP2/CP2 shared-vs-dense {metric} gap {gap[metric]:.3e} exceeds "
+                f"{TOPOLOGY_RATIO}x the TP1/CP1 gap {baseline[metric]:.3e}"
+            )

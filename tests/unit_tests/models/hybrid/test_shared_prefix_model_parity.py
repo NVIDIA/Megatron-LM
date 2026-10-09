@@ -306,13 +306,22 @@ class TestSharedPrefixHybridModelDistributedParity:
             routing.close()
         return dense, shared, compare_model_runs(shared, dense, model)
 
-    @pytest.mark.parametrize("tp,cp", [(2, 2), (1, 4)], ids=["tp2-sp-cp2", "tp1-cp4"])
+    @pytest.mark.parametrize(
+        "tp,cp,mamba_backend",
+        [(2, 2, None), (1, 4, None), (2, 2, "ragged_state_fork")],
+        ids=["tp2-sp-cp2", "tp1-cp4", "tp2-sp-cp2-ragged"],
+    )
     @pytest.mark.parametrize(
         "roots,forest", [(STAR, False), (FOREST, True)], ids=["star", "forest"]
     )
-    def test_model_matches_dense_rows_distributed(self, tp, cp, roots, forest, monkeypatch):
+    def test_model_matches_dense_rows_distributed(
+        self, tp, cp, mamba_backend, roots, forest, monkeypatch
+    ):
         if Utils.world_size < tp * cp or Utils.world_size % (tp * cp):
             pytest.skip(f"requires a world size divisible by {tp * cp}")
+        if mamba_backend is not None:
+            # The backend used by the documented NeMo-RL configuration.
+            monkeypatch.setenv("NRL_SP_MAMBA_IMPL", mamba_backend)
         Utils.initialize_model_parallel(1, 1)
         _, _, baseline = self._gap(monkeypatch, roots, forest)
         Utils.destroy_model_parallel()

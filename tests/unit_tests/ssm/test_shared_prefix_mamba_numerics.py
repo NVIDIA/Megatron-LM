@@ -87,6 +87,8 @@ def _shape_cases():
         )
     )
     cases.append(("star-long-G16", _star(1000, [(37 * i) % 300 + 1 for i in range(16)]), False))
+    # A prompt shorter than the d_conv - 1 = 3 token convolution halo.
+    cases.append(("star-P2-halo", _star(2, [1, 7, CHUNK + 1]), False))
     # The review's x-grad-gap problem: fork at 256 with a 44-token tail, six completions.
     completions = (180, 64, 257, 33, 129, 200)
     cases.append(("star-P300-G6", _star(300, completions), False))
@@ -137,11 +139,12 @@ class TestSharedPrefixMambaNumerics:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = self._tf32
         Utils.destroy_model_parallel()
 
-    def _check(self, problem, backend, forest, seed=0):
+    def _check(self, problem, backend, forest, seed=0, d_has_hdim=False):
         torch.manual_seed(seed)
-        layer32 = build_local_mamba_layer(torch.float32, hidden_size=HIDDEN)
+        build = {"hidden_size": HIDDEN, "d_has_hdim": d_has_hdim}
+        layer32 = build_local_mamba_layer(torch.float32, **build)
         round_params_to(layer32, torch.bfloat16)
-        layer16 = low_precision_copy(layer32, torch.bfloat16, hidden_size=HIDDEN)
+        layer16 = low_precision_copy(layer32, torch.bfloat16, **build)
         data = LayerProblemData(problem, HIDDEN, seed)
         layout = problem.layout(forest)
 
@@ -187,6 +190,15 @@ class TestSharedPrefixMambaNumerics:
     def test_backend_matches_dense_rows(self, case, backend):
         _, problem, forest = case
         self._check(problem, backend, forest)
+
+    @pytest.mark.parametrize("backend", MAMBA_BACKENDS)
+    def test_per_channel_skip_matches_dense_rows(self, backend):
+        """``D_has_hdim=True`` (one skip coefficient per channel instead of per head)."""
+        if backend == "star_cp1":
+            problem, forest = _star(2 * CHUNK + 1, [7, CHUNK + 1, 1, CHUNK], 3), False
+        else:
+            problem, forest = _forest([(2 * CHUNK + 1, [7, CHUNK + 1]), (50, [1, CHUNK])], 3), True
+        self._check(problem, backend, forest, d_has_hdim=True)
 
     @pytest.mark.parametrize("backend", MAMBA_BACKENDS)
     @pytest.mark.parametrize("conv_len", CONV_LENGTH_CASES)

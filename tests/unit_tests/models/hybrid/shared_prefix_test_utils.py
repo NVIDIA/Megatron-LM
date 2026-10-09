@@ -331,6 +331,7 @@ def build_local_mamba_layer(
     head_dim: int = 64,
     num_groups: int = 2,
     state_dim: int = 64,
+    d_has_hdim: bool = False,
 ):
     """A MambaLayer whose projections are local (torch) linears.
 
@@ -369,6 +370,7 @@ def build_local_mamba_layer(
         norm=WrappedTorchNorm,
         mixer=ModuleSpec(
             module=MambaMixer,
+            params={"D_has_hdim": d_has_hdim},
             submodules=MambaMixerSubmodules(
                 in_proj=ColumnParallelLinear, out_proj=RowParallelLinear
             ),
@@ -770,11 +772,15 @@ def run_shared(
     return ModelRun(logits, _reduced_grads(model), _summed_counts(model))
 
 
-def model_grads_rel_l2(candidate: dict[str, Tensor], reference: dict[str, Tensor], model) -> float:
-    """Whole-model gradient relative L2, counting each TP shard once across the TP group."""
+def model_grads_rel_l2(
+    candidate: dict[str, Tensor], reference: dict[str, Tensor], model, prefix: str = ""
+) -> float:
+    """Gradient relative L2 over parameters named ``prefix*``, each TP shard counted once."""
     tp_group, tp_rank, _, _, _, _ = _parallel_state()
     totals = torch.zeros(2, dtype=torch.float64, device="cuda")
     for name, param in model.named_parameters():
+        if not name.startswith(prefix):
+            continue
         if not getattr(param, "tensor_model_parallel", False) and tp_rank != 0:
             continue
         diff = (candidate[name] - reference[name]).pow(2).sum()
@@ -785,8 +791,16 @@ def model_grads_rel_l2(candidate: dict[str, Tensor], reference: dict[str, Tensor
 
 
 def compare_model_runs(candidate: ModelRun, reference: ModelRun, model) -> dict[str, float]:
-    """Completion-logit and whole-gradient relative errors of two model runs."""
-    return {
+    """Completion-logit and whole-gradient relative errors of two model runs.
+
+    Models with MTP heads also report the MTP-head gradients alone (``mtp_grads``).
+    """
+    errors = {
         "logits": rel_l2(torch.cat(candidate.logits), torch.cat(reference.logits)),
         "grads": model_grads_rel_l2(candidate.grads, reference.grads, model),
     }
+    if getattr(model, "mtp_process", False):
+        errors["mtp_grads"] = model_grads_rel_l2(
+            candidate.grads, reference.grads, model, prefix="mtp."
+        )
+    return errors
