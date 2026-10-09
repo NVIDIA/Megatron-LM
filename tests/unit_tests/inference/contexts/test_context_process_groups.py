@@ -10,6 +10,7 @@ code under test runs, so a read of the global grid fails instead of passing by c
 import contextlib
 import math
 import sys
+import warnings
 from unittest import mock
 
 import pytest
@@ -17,14 +18,27 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
+from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
 # Same accessor selection as tools/check_process_group_usage.py.
@@ -234,3 +248,65 @@ class TestDynamicContextTensorParallelSize:
         assert vllm_buffers.call_args.kwargs["max_tokens"] == max(
             max_tokens, per_rank_token_count * ep_size
         )
+
+
+class TestStaticContextProcessGroups:
+    """`StaticInferenceContext` carries a collection to everything built on it."""
+
+    def teardown_method(self, method):
+        InferenceMode.unset_active()
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    def test_collection_is_stored_in_config(self):
+        assert StaticInferenceContext(4, 64).config.pg_collection is None
+        pg_collection = ProcessGroupCollection()
+        context = StaticInferenceContext(4, 64, pg_collection=pg_collection)
+        assert context.config.pg_collection is pg_collection
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_static_engine_uses_collection_of_static_context(self):
+        context_tp = 2
+        _require_world_size_multiple_of(context_tp)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        pg_collection = _build_collection(context_tp)
+        model_parallel_cuda_manual_seed(123)
+        vocab_size = 100
+        model = GPTModel(
+            config=TransformerConfig(
+                num_layers=2,
+                hidden_size=32,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                tensor_model_parallel_size=context_tp,
+                params_dtype=torch.bfloat16,
+            ),
+            transformer_layer_spec=get_gpt_layer_local_spec(),
+            vocab_size=vocab_size,
+            max_sequence_length=64,
+            pg_collection=pg_collection,
+        ).cuda()
+        model.to(torch.bfloat16)
+        tokenizer = mock.Mock(vocab_size=vocab_size, eod=vocab_size - 1)
+
+        with warnings.catch_warnings(record=True) as caught, forbid_global_process_groups():
+            warnings.simplefilter("always")
+            context = StaticInferenceContext(4, 64, pg_collection=pg_collection)
+            controller = TextGenerationController(
+                inference_wrapped_model=GPTInferenceWrapper(model, context), tokenizer=tokenizer
+            )
+            engine = StaticInferenceEngine(controller, max_batch_size=4, buffer_size_gb=0.1)
+
+        # The engine catches construction errors and falls back to the legacy engine.
+        fallbacks = [str(w.message) for w in caught if "legacy static engine" in str(w.message)]
+        assert not fallbacks, fallbacks
+        assert not engine.legacy
+        assert controller.inference_wrapped_model.tp_group is pg_collection.tp
+        assert controller.pp_group is pg_collection.pp
+        dynamic_context = engine.dynamic_engine.context
+        assert dynamic_context.config.pg_collection is pg_collection
+        assert dynamic_context.tp_size == context_tp
+        assert dynamic_context.expert_model_parallel_group is pg_collection.ep
+        assert engine.dynamic_engine.pg_collection is pg_collection
