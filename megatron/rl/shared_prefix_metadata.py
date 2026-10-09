@@ -60,14 +60,20 @@ def _pack_full_length_group(
     also fits as one deduplicated star because removing repeated prompts can
     only shorten it; if exact-prompt validation later fails, the same bin still
     fits as one ordinary block-diagonal packed microbatch.
+
+    A group larger than ``max_rows_per_slot`` is spread evenly over the fewest
+    bins that respect it (17 -> 9+8 with the default 16, not a 16-row bin plus
+    an unshared singleton), as ``plan_shared_prefix_bins`` does.
     """
+    num_bins = -(-len(rows) // max_rows_per_slot)
+    max_rows_per_bin = -(-len(rows) // num_bins) if num_bins else max_rows_per_slot
     bins: list[list[int]] = []
     bin_work: list[int] = []
     for row_index in sorted(rows, key=lambda index: (-padded_lengths[index], index)):
         destination: int | None = None
         for bin_index, bin_rows in enumerate(bins):
             if (
-                len(bin_rows) < max_rows_per_slot
+                len(bin_rows) < max_rows_per_bin
                 and bin_work[bin_index] + padded_lengths[row_index] <= bin_capacity
             ):
                 destination = bin_index

@@ -330,10 +330,13 @@ def _large_group(count, completion_length=1):
     return [SharedPrefixRow(index, "g", (1, 2, 3), completion_length) for index in range(count)]
 
 
+@pytest.mark.parametrize("repack_groups", [False, True], ids=["slots", "repack"])
 @pytest.mark.parametrize(
     "count, sizes", [(16, (16,)), (17, (9, 8)), (32, (16, 16)), (33, (11,) * 3)]
 )
-def test_slot_larger_than_branch_limit_splits_evenly_under_group_packing(count, sizes):
+def test_slot_larger_than_branch_limit_splits_evenly_under_group_packing(
+    count, sizes, repack_groups
+):
     rows = _large_group(count)
     units = plan_shared_prefix_execution_units(
         rows,
@@ -341,6 +344,7 @@ def test_slot_larger_than_branch_limit_splits_evenly_under_group_packing(count, 
         bin_capacity=4 * count,
         padding_multiple=1,
         pack_groups=True,
+        repack_groups=repack_groups,
     )
     roots = [root for unit in units for _, root in unit.shared_layout.iter_roots()]
     assert tuple(len(root.row_indices) for root in roots) == sizes

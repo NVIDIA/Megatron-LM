@@ -92,6 +92,18 @@ def test_fixed_execution_slots_equalize_real_units_without_dummies() -> None:
             assert 0 < slot_work <= 10
 
 
+@pytest.mark.parametrize(
+    "count, sizes", [(16, (16,)), (17, (9, 8)), (32, (16, 16)), (33, (11,) * 3)]
+)
+def test_fixed_execution_slots_split_groups_past_the_row_limit_evenly(count, sizes) -> None:
+    plan = plan_fixed_execution_slots(
+        group_ids=["g"] * count, sequence_lengths=[4] * count, bin_capacity=4 * count
+    )
+
+    assert plan.units_per_group_by_chunk == (len(sizes),)
+    assert tuple(plan.row_slot_ids.count(slot) for slot in range(len(sizes))) == sizes
+
+
 def test_fixed_execution_slots_uses_full_length_capacity_and_padding() -> None:
     with pytest.raises(ValueError, match="exceeds the execution bin capacity"):
         plan_fixed_execution_slots(
