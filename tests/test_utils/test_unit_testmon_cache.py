@@ -31,12 +31,7 @@ BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
 @pytest.fixture
 def source_tree(tmp_path):
     root = tmp_path / "source"
-    for name in (
-        *cache.COMPATIBILITY_FILES,
-        "docker/.ngc_version.dev",
-        "docker/Dockerfile.ci.dev",
-        ".dockerignore",
-    ):
+    for name in (*cache.COMPATIBILITY_FILES, "docker/.ngc_version.dev", "docker/Dockerfile.ci.dev"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
@@ -76,8 +71,10 @@ def test_source_edits_preserve_identity(source_tree):
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
 
 
-@pytest.mark.parametrize("changed", [".dockerignore"])
-def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
+@pytest.mark.parametrize(
+    "changed", ["tests/test_utils/python_scripts/download_unit_tests_dataset.py"]
+)
+def test_compatibility_inputs_preserve_lookup_prefix_but_reject_restored_generation(
     source_tree, generation, changed
 ):
     directory, producer = generation
@@ -476,7 +473,9 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     elif restore == "missing-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100")
     elif restore == "changed-config":
-        (source_tree / ".dockerignore").write_text("changed")
+        (source_tree / "tests/test_utils/python_scripts/download_unit_tests_dataset.py").write_text(
+            "changed"
+        )
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()

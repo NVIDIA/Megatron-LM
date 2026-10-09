@@ -28,7 +28,6 @@ TRACKED_ENVIRONMENT_PACKAGES = frozenset(
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
 COMPATIBILITY_FILES: set[str] = {"tests/test_utils/python_scripts/download_unit_tests_dataset.py"}
-COMPATIBILITY_GLOBS = (".dockerignore",)
 DATABASE_TABLES = {
     "metadata",
     "environment",
@@ -121,9 +120,6 @@ def cache_identity(
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
-    paths.update(
-        path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
-    )
     paths.update(_bucket_conftests(root, bucket))
     inputs = {str(path.relative_to(root)): _digest(path) for path in sorted(paths)}
     contract = {
