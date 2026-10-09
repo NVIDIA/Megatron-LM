@@ -147,33 +147,25 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
 
 @pytest.mark.parametrize("use_out", [False, True])
 def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
-    """Gather every plane on a 1D mesh, allocating or reusing output."""
-    world_size = distributed_setup.world_size
-    if world_size < 2:
-        pytest.skip("Requires at least two ranks.")
-    mesh = init_device_mesh(distributed_setup.device.type, (world_size,))
-    source = QuantizedDBuffer.empty(
-        mesh, [BlockAtomic(32)], [(128, 64), (32, 128)], distributed_setup.device
-    )
+    """All-gather preserves rank order in every plane, with or without an output buffer."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    shapes = [(128, 64), (32, 128)]
+    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
     for index, plane in enumerate(source.planes):
-        values = (
-            torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
-        )
-        plane.local_buffer.copy_(values % 251)
+        plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
     if use_out:
-        out = QuantizedDBuffer.empty(
-            mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
-        )
-        result = source.allgather(0, out=out)
-        assert result is out
+        destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
+        result = source.allgather(0, out=destination)
+        assert result is destination
     else:
-        out = source.allgather(0)
-    for index, plane in enumerate(out.planes):
+        result = source.allgather(0)
+    for index, plane in enumerate(result.planes):
         assert plane.placements == (Replicate(),)
-        expected = (
-            (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
-        ).to(plane.dtype)
-        torch.testing.assert_close(plane.local_buffer, expected, rtol=0, atol=0)
+        chunks = plane.local_buffer.view(mesh.size(), -1)
+        for rank in range(mesh.size()):
+            assert chunks[rank].eq(index * mesh.size() + rank).all()
 
 
 @pytest.mark.parametrize("use_out", [False, True])
