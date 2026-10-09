@@ -452,7 +452,11 @@ def get_valid_dynamic_context_parallel_group_sizes(total_size: int) -> List[int]
 
 
 def create_dynamic_dp_cp_groups(
-    rank: int, ranks: Sequence[int], pg_options: object, min_cp_size: int = 1
+    rank: int,
+    ranks: Sequence[int],
+    pg_options: object,
+    min_cp_size: int = 1,
+    timeout: Optional[timedelta] = None,
 ) -> Dict[int, torch.distributed.ProcessGroup]:
     """
     Creates groups required for dynamic DPxCP.
@@ -473,6 +477,7 @@ def create_dynamic_dp_cp_groups(
         for i in range(0, len(ranks), group_size):
             group = create_group(
                 ranks[i : i + group_size],
+                timeout=timeout,
                 pg_options=pg_options,
                 group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
             )
@@ -1090,6 +1095,7 @@ def initialize_model_parallel(
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
+                    timeout=timeout,
                 )
             )
 
@@ -1525,7 +1531,7 @@ def initialize_model_parallel(
         )
         if create_gloo_process_groups:
             group_gloo = create_group(
-                ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
+                ranks, timeout=timeout, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
             )
         else:
             group_gloo = None
