@@ -58,9 +58,31 @@ TOPOLOGY_RATIO = 1.5
 SLACK = 1e-5
 PADDING_MULTIPLE = 8  # 2*TP*CP for TP2/CP2 and TP1/CP4; explicit branch padding at TP1/CP1.
 PATTERN = "M*EM*E"
+MTP_PATTERN = "M*EM*E/*E/*E"
 
 STAR = ((300, (97, 210, 41, 150)),)
 FOREST = ((150, (60, 131)), (200, (33, 90, 47, 70)))
+
+
+@pytest.fixture
+def _deterministic_kernels(monkeypatch):
+    """Bit-reproducible backward for the test, restored afterwards.
+
+    The Mamba scan, causal_conv1d and TE attention backward kernels accumulate with atomics by
+    default, so two identical calls differ in the last bits (Mamba ``A_log`` first). They take
+    ordered reductions when torch's deterministic flag (or their environment switch) is set.
+    """
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
 
 
 def _problem(roots):
@@ -280,6 +302,26 @@ class TestSharedPrefixHybridModelParity:
         assert recompute_error <= 2 * repeat_error + SLACK
         for plain_count, recomputed_count in zip(plain.counts, recomputed.counts):
             torch.testing.assert_close(recomputed_count, plain_count, rtol=0, atol=0)
+
+    @pytest.mark.usefixtures("_deterministic_kernels")
+    @pytest.mark.parametrize("pattern", [PATTERN, MTP_PATTERN], ids=["no-mtp", "mtp"])
+    def test_explicit_none_layout_is_the_default_path(self, pattern, monkeypatch):
+        """``shared_prefix_layout=None`` runs the ordinary forward bit for bit (feature off)."""
+        clear_attention_env(monkeypatch)
+        torch.manual_seed(0)
+        model = build_hybrid_model(pattern, torch.bfloat16)
+        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
+        # Natural (not replayed) routing: this is the production default path.
+        omitted = run_dense_rows(model, tokens)
+        explicit = run_dense_rows(model, tokens, shared_prefix_layout=None)
+        for omitted_logits, explicit_logits in zip(omitted.logits, explicit.logits):
+            assert torch.equal(omitted_logits, explicit_logits)
+        assert omitted.grads.keys() == explicit.grads.keys()
+        for name, grad in omitted.grads.items():
+            assert torch.equal(grad, explicit.grads[name]), name
+        assert len(omitted.counts) == pattern.count("E")
+        for omitted_count, explicit_count in zip(omitted.counts, explicit.counts):
+            assert torch.equal(omitted_count, explicit_count)
 
 
 @pytest.mark.internal

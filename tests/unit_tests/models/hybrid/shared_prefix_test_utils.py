@@ -707,9 +707,15 @@ def _start_run(model: torch.nn.Module) -> None:
 
 
 def run_dense_rows(
-    model: torch.nn.Module, tokens: TokenProblem, routing: ReplayedRouting | None = None
+    model: torch.nn.Module,
+    tokens: TokenProblem,
+    routing: ReplayedRouting | None = None,
+    **forward_kwargs,
 ) -> ModelRun:
-    """Run every dense row as its own ordinary forward/backward (CP zigzag, TP/SP)."""
+    """Run every dense row as its own ordinary forward/backward (CP zigzag, TP/SP).
+
+    ``forward_kwargs`` are passed to every ``model(...)`` call unchanged.
+    """
     _start_run(model)
     with_mtp = bool(getattr(model, "mtp_process", False))
     logits = []
@@ -730,6 +736,7 @@ def run_dense_rows(
             position_ids=local[None].cuda(),
             attention_mask=None,
             **extra,
+            **forward_kwargs,
         )
         loss = (output.float() * _vocab_shard(cotangent[local])[None].cuda()).sum()
         loss.backward()
