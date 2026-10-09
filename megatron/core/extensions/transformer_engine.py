@@ -33,7 +33,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    amax_reduction_group,
+    resolve_gtp_remat_group,
+)
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -361,7 +365,18 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
     return _get_fp8_model_init_for_quant_recipe(qrecipe)
 
 
-def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+def _get_fp8_autocast_for_quant_recipe(
+    qrecipe: TEQuantizationRecipe, *, pg_collection: Optional[ProcessGroupCollection] = None
+):
+    """Return the autocast context that applies a per-module quantization recipe.
+
+    Args:
+        qrecipe: Recipe of the module.
+        pg_collection: Process groups of the model that owns the module. A quantized autocast
+            reduces amaxes over ``amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)``.
+            When omitted, it uses the global amax reduction group of ``parallel_state`` if model
+            parallelism is initialized, and passes no group otherwise.
+    """
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
             return nullcontext()
@@ -373,11 +388,14 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         # Force BF16 for this layer and override autocast
         return fp8_autocast(enabled=False)
     else:
-        amax_group = None
-        if model_parallel_is_initialized():
+        if pg_collection is not None:
+            amax_group = amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)
+        elif model_parallel_is_initialized():
             amax_group = get_amax_reduction_group(
                 with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
             )
+        else:
+            amax_group = None
         if (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
@@ -412,13 +430,30 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_for_quant_params(
+    qparams: TEQuantizationParams | None,
+    training: bool,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Return the autocast context for the training or evaluation recipe in ``qparams``.
+
+    Args:
+        qparams: Per-module quantization parameters, or None if the module has none.
+        training: Whether the module is in training mode.
+        pg_collection: Process groups of the model that owns the module; see
+            ``_get_fp8_autocast_for_quant_recipe``.
+    """
     if qparams is None:
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        return _get_fp8_autocast_for_quant_recipe(
+            qparams.evaluation_recipe, pg_collection=pg_collection
+        )
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        return _get_fp8_autocast_for_quant_recipe(
+            qparams.training_recipe, pg_collection=pg_collection
+        )
 
 
 def _get_should_context_be_quantized_recipe(
