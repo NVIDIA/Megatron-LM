@@ -310,6 +310,9 @@ RUN export HOME=/home/nemo-runtime \
 
 USER root
 
+# Remove the Nsight Systems EFA metrics plugin to address CVE-2026-27143.
+RUN rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
+
 ##### For NVIDIANS only #####
 FROM main AS jet
 ARG JET_API_VERSION

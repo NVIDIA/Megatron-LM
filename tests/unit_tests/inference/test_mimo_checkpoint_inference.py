@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from examples.inference.advanced import vlm_dynamic_inference as vlm
 from examples.multimodal.mimo_checkpoint_model import (
     MimoCheckpointLLaVAModel,
     _unfused_fast_gelu,
@@ -15,9 +16,6 @@ from examples.multimodal.mimo_checkpoint_model import (
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
-)
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    vlm_dynamic_inference as vlm,
 )
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings

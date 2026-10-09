@@ -59,6 +59,22 @@ class GlobalLayout:
     size: int
     rank_to_offset: tuple[int, ...]
 
+    def __init__(
+        self,
+        tensor_shapes: Iterable[Shape],
+        tensor_to_offset: Iterable[int],
+        size: int,
+        rank_to_offset: Iterable[int],
+    ) -> None:
+        """Normalize iterable inputs to immutable tuples and validate the layout."""
+        object.__setattr__(
+            self, "tensor_shapes", tuple(torch.Size(shape) for shape in tensor_shapes)
+        )
+        object.__setattr__(self, "tensor_to_offset", tuple(tensor_to_offset))
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "rank_to_offset", tuple(rank_to_offset))
+        self.__post_init__()
+
     @classmethod
     def build_for_row_atomic(
         cls, shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1
@@ -201,9 +217,9 @@ class GlobalLayout:
         segment = size // dp_size
         layout = cls(
             tensor_shapes=tensor_shapes,
-            tensor_to_offset=tuple(tensor_to_offset),
+            tensor_to_offset=tensor_to_offset,
             size=size,
-            rank_to_offset=tuple(segment * rank for rank in range(dp_size)),
+            rank_to_offset=(segment * rank for rank in range(dp_size)),
         )
         layout.validate_for_row_atomic(block_size=block_size)
         return layout
@@ -271,7 +287,7 @@ class GlobalLayout:
 
         layout = cls(
             tensor_shapes=tensor_shapes,
-            tensor_to_offset=tuple(tensor_to_offset),
+            tensor_to_offset=tensor_to_offset,
             size=sum(numels),
             rank_to_offset=rank_to_offset,
         )
