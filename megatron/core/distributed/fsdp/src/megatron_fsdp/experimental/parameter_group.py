@@ -28,6 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from ..utils import HAVE_TE
+from . import layout_builder
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
@@ -238,7 +239,7 @@ class FsdpParameterGroup:
         shapes = (parameter.shape for parameter in parameters)
         if not _contains_any_placement_type(*placement_groups, placement_types=TensorAtomic):
             # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
-            return GlobalLayout.build_for_row_atomic(
+            return layout_builder.build_for_row_atomic(
                 shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
             )
         if _contains_any_placement_type(
@@ -251,7 +252,7 @@ class FsdpParameterGroup:
             raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
         if parameter_to_owner is None:
             raise ValueError("TensorAtomic placements require parameter_to_owner.")
-        return GlobalLayout.build_for_tensor_atomic(
+        return layout_builder.build_for_tensor_atomic(
             shapes,
             dp_size=self.mesh.size(),
             tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),

@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
     GroupOwnerLayout,
     OwnerGatherPlan,
@@ -35,7 +35,7 @@ def _mock_group(shapes, dp_size, this_rank=0):
     Creates `nn.Parameter`s for each shape so the default `eligible_fn` (`param.ndim >= 2`) can
     filter on them.
     """
-    layout = GlobalLayout.build_for_row_atomic(shapes, dp_size)
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size)
     params = tuple(nn.Parameter(torch.zeros(s)) for s in shapes)
     fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)
     return SimpleNamespace(
@@ -107,15 +107,15 @@ def test_from_group_keys_are_tensor_indices():
 def test_from_group_per_rank_data_not_uniform():
     """RowAtomic sharding with uniform buffer size but non-uniform per-rank tensor data.
 
-    `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
-    flat buffer is the same size. However, the actual tensor data per rank is not necessarily
-    uniform.
+    `layout_builder.build_for_row_atomic` pads the total size to a multiple of
+    `chunk_size * dp_size` so every rank's flat buffer is the same size. However, the actual
+    tensor data per rank is not necessarily uniform.
 
     This test verifies `from_group` correctly computes the non-uniform per-rank element counts from
     a uniform `rank_flat_shard_size`.
     """
     # 5×4 = 20 elements, dp_size = 3.
-    # GlobalLayout.build pads to 24 (next multiple of chunk_size * dp_size = 4 * 3 = 12), so
+    # The builder pads to 24 (next multiple of chunk_size * dp_size = 4 * 3 = 12), so
     # rank_flat_shard_size = 24 // 3 = 8 (uniform buffer per rank).
     # But the tensor occupies only 20 of 24 elements:
     #   rank 0: [0, 8)   -> 8 elements
