@@ -10,14 +10,12 @@ implementations, including an uninterrupted prefix-replay parity oracle, are sel
 ``_forward_mamba_layer_shared_prefix_cp``. Attention uses the exact-backward fused forest kernel.
 Unsupported topology or model features fail before executing a partial forward.
 
-The implementation is the narrow production slice of the shared-prefix work developed in
-Megatron-RL/Megatron-LM commit ``0bf30804f`` plus the fused kernel port ``5b7173f7``. CP>1 uses
-the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The implemented
-surface covers TP1 and TP>1 with sequence parallelism, CP1 and CP>1, explicit physical padding,
-MoE expert-bias accounting, and full uniform activation recomputation. The capability tokens at
-the end of this module name these code paths so integrations can require the exact conjunction
-they use; they are contract identifiers, not evidence that a topology has been qualified at
-full-model scale.
+CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The
+implemented surface covers TP1 and TP>1 with sequence parallelism, CP1 and CP>1, explicit physical
+padding, MoE expert-bias accounting, and full uniform activation recomputation. The capability
+tokens at the end of this module name these code paths so integrations can require the exact
+conjunction they use; they are contract identifiers, not evidence that a topology has been
+qualified at full-model scale.
 """
 
 import os
@@ -594,15 +592,14 @@ def _forward_mamba_layer_shared_prefix_cp(
 
     ``ragged_state_fork`` is the default for every topology and root count, including TP1/CP1
     single stars. It scans each chunk-aligned prefix once, forks the state into every branch and
-    pads each branch only to its own chunk boundary. Evidence:
+    pads each branch only to its own chunk boundary, so its scan work follows the real completion
+    lengths rather than the longest sibling's. It is also checked for exactness:
 
     - it matches per-row dense Mamba to about 1e-7 in FP32 with IEEE GEMMs and, on the tested
       shapes, stays within 1.5x of the dense BF16 error
       (``tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py``);
     - its Triton kernels replay bit-exactly under deterministic mode
-      (``tests/unit_tests/determinism/kernels/test_shared_prefix_mamba_kernels.py``);
-    - its layer forward+backward was 1.5-6x faster than ``state_fork`` on GB200 BF16 G=16 stars
-      and forests.
+      (``tests/unit_tests/determinism/kernels/test_shared_prefix_mamba_kernels.py``).
 
     It calls private mamba_ssm SSD kernels, so stack validation fails early when they cannot be
     imported and names ``state_fork`` as the workaround.
