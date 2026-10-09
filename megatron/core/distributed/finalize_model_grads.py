@@ -93,7 +93,7 @@ def _reshard_if_dtensor(
 def _allreduce_conditional_embedding_grads(
     model: List[torch.nn.Module],
     config: TransformerConfig,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: torch.distributed.ProcessGroup,
 ):
     """
     All-reduce conditional embedding grads.
@@ -102,9 +102,6 @@ def _allreduce_conditional_embedding_grads(
     (e.g., timestep embedder, FPS embedder, label embedder) stay in sync.
     This is for the models with replicated embedders on each PP / VPP rank, like diffusion models.
     """
-    if pp_group is None:
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
     if pp_group.size() > 1 and getattr(config, "has_cond_embedder", False):
         grads_dict = {}
         for model_chunk in model:
@@ -168,8 +165,8 @@ def _get_position_embedding_weight(model_module: torch.nn.Module) -> torch.nn.Pa
 def _allreduce_word_embedding_grads(
     model: List[torch.nn.Module],
     config: TransformerConfig,
-    embd_group: Optional[torch.distributed.ProcessGroup] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    embd_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: torch.distributed.ProcessGroup,
 ):
     """All-reduce word-embedding gradients across the first and last PP stages.
 
@@ -182,20 +179,13 @@ def _allreduce_word_embedding_grads(
             virtual pipeline chunks).
         config: Transformer configuration. Used for edge
             cases like MTP where embeddings might be shared differently.
-        embd_group: The process
-            group over which to all-reduce the word-embedding gradients. If
-            ``None``, it will be looked up based on the current pipeline model
-            parallel group.
-        pp_group: The pipeline
-            parallel process group used to identify first/last stages. If
-            ``None``, it will be looked up.
+        embd_group: The process group over which to all-reduce the
+            word-embedding gradients, or ``None`` on a rank that is not in
+            the word-embedding group (for example, a middle pipeline stage),
+            which has nothing to reduce.
+        pp_group: The pipeline parallel process group used to identify
+            first/last stages.
     """
-    if embd_group is None:
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        if get_pg_size(embd_group) > 1:
-            assert pp_group is None
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
-
     _allreduce_embedding_grad(
         model,
         embd_group,
@@ -314,14 +304,18 @@ def _allreduce_position_embedding_grads(
     )
 
 
-def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerConfig):
+def _allreduce_router_grads(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    pp_group: torch.distributed.ProcessGroup,
+):
     """
     All-reduce router grads.
 
     Reduce grads across all the pp stages to ensure that parameters of the router stay in sync.
     """
 
-    if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+    if pp_group.size() > 1:
         grads_dict: Dict[str, List[torch.Tensor]] = {}
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
@@ -340,9 +334,7 @@ def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerCon
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(
-                coalesced, group=parallel_state.get_pipeline_model_parallel_group()
-            )
+            torch.distributed.all_reduce(coalesced, group=pp_group)
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
 
@@ -611,42 +603,61 @@ def finalize_model_grads(
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
     embedding grads across first and last pipeline stages (if not tied),
     scale gradients by `num_tokens`.
+
+    Args:
+        model: The model chunks on this rank.
+        num_tokens: The number of tokens that the loss on the last pipeline stage was computed
+            over, used for per-token loss normalization; ``None`` skips the normalization.
+        pg_collection: The model's process groups. When given, only these groups are used:
+            ``tp`` and ``pp`` are required. ``embd`` is required when ``pp`` has more than one
+            rank; set it to ``None`` on ranks outside the word-embedding group. ``pos_embd`` is
+            needed only when position embeddings are replicated on several stages; unset or
+            ``None`` skips their reduction.
+            ``dp_cp_gtp_remat`` or ``dp_cp`` is required with ``num_tokens`` or quantile
+            balancing, and ``tp_dp_cp`` with ``moe_router_enable_expert_bias``. An unset
+            ``gtp_remat`` or ``expt_gtp_remat`` means that axis is off. When omitted, the
+            groups come from ``parallel_state``.
+        force_all_reduce: Passed to ``finish_grad_sync`` of each model chunk.
     """
 
     config = get_model_config(model[0])
     tp_dp_cp_group = None
     if pg_collection is not None:
-        assert hasattr(pg_collection, 'tp')
-        assert hasattr(pg_collection, 'pp')
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group."
-            " If you are using the default process group, please use"
-            " `parallel_state.get_embedding_group()` "
-            "If you don't need embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group."
-            " If you are using the default process group, please use "
-            " `parallel_state.get_position_embedding_group()` "
-            "If you don't need pos_embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'dp_cp')
-        if config.moe_router_enable_expert_bias:
-            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
-                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
-            )
-            tp_dp_cp_group = pg_collection.tp_dp_cp
+        for name, group in (('tp', pg_collection.tp), ('pp', pg_collection.pp)):
+            if group is None:
+                raise ValueError(f"finalize_model_grads: pg_collection.{name} must be set")
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
+        # An unset field and a field set to None both read as None, so check vars() to tell
+        # them apart. None marks a rank outside the word-embedding group, which skips the
+        # reduction; an unset embd would silently skip it on the first and last stages too.
+        if pp_group.size() > 1 and 'embd' not in vars(pg_collection):
+            raise ValueError(
+                "finalize_model_grads: pg_collection.embd must be set when the pipeline has "
+                "more than one stage; set it to None on ranks outside the word-embedding group"
+            )
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
         # Full DP x CP x gtp_remat group: num_tokens (the per-token-loss divisor below) counts the
         # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
-        dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
-        gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
-        egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
+        dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+        # A collective with group=None runs over every rank in the job.
+        if dp_cp_group is None and (
+            num_tokens is not None or config.moe_router_load_balancing_type == "quantile_balancing"
+        ):
+            raise ValueError(
+                "finalize_model_grads: pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp "
+                "must be set to reduce num_tokens or the quantile-balancing router bias"
+            )
+        if config.moe_router_enable_expert_bias:
+            tp_dp_cp_group = pg_collection.tp_dp_cp
+            if tp_dp_cp_group is None:
+                raise ValueError(
+                    "finalize_model_grads: pg_collection.tp_dp_cp must be set when "
+                    "moe_router_enable_expert_bias is enabled"
+                )
+        gtp_remat_group = pg_collection.gtp_remat
+        egtp_remat_group = pg_collection.expt_gtp_remat
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -695,7 +706,7 @@ def finalize_model_grads(
         config.timers('conditional-embedder-grads-all-reduce').stop()
 
     if getattr(config, 'flextron', False):
-        _allreduce_router_grads(model, config)
+        _allreduce_router_grads(model, config, pp_group)
 
     # All-reduce layer-norm grads (for sequence parallelism) and non-tensor parallel modules.
     if config.timers is not None:
