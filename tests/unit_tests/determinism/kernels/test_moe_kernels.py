@@ -5,10 +5,12 @@
 Operator level: token permute / unpermute (torch and TE-fused, both branches of the
 ``torch.are_deterministic_algorithms_enabled()`` switch), chunk sorting, top-k routing (torch
 and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-fused), and
-the router gating GEMM. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
-deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
-the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available).
+the router gating GEMM (also in fixed row blocks). Module level: ``TopKRouter``,
+``TEGroupedMLP`` / ``SequentialMLP`` on deliberately uneven expert loads (including an empty
+expert), and a full ``MoELayer`` through the all-gather and all-to-all dispatchers (plus the
+flex/DeepEP dispatcher from ``fused_a2a.py`` when the dependency and the GPUs are available).
+The shared-prefix inputs (logical token multiplicities for expert-bias counts and the fixed
+router row-block scope) are replayed for ``TopKRouter`` and ``MoELayer``.
 """
 
 import pytest
@@ -273,7 +275,61 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
     )
 
 
+@pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_router_gating_linear_token_blocks_replays(router_dtype, with_bias):
+    """The shared-prefix scope runs the router GEMM in fixed 1024-row blocks (uneven tail)."""
+    seeded()
+    inp = torch.randn(8192 + 300, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(256, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.02
+    weight = weight.detach().requires_grad_(True)
+    bias = (
+        torch.randn(256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        if with_bias
+        else None
+    )
+
+    def fn(i, w, b):
+        with moe_utils.router_gating_token_blocks(1024):
+            return moe_utils.router_gating_linear(i, w, b, router_dtype)
+
+    assert_replays_bit_exact(
+        fn, (inp, weight, bias), replays=3, contention=True, what="router_gating_linear[blocks]"
+    )
+
+
 # --- modules --------------------------------------------------------------------------------
+
+
+def _token_multiplicities(num_tokens, seed=7):
+    """Shared-prefix logical copy counts: 0 for padding, up to G=16 for prompt rows."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randint(0, 17, (num_tokens,), device="cuda", generator=generator).float()
+
+
+class _WithExpertCounts(torch.nn.Module):
+    """Return the router's expert-bias token counts of this call with the module outputs."""
+
+    def __init__(self, module, router, multiplicities, *, moe_layer=None):
+        super().__init__()
+        self.module = module
+        self.router = router
+        self.multiplicities = multiplicities
+        self.moe_layer = moe_layer
+
+    def forward(self, hidden):
+        self.router.local_tokens_per_expert.zero_()
+        if self.moe_layer is None:
+            outputs = self.module(hidden, token_multiplicities=self.multiplicities)
+        else:
+            # As forward_hybrid_stack_shared_prefix scopes every MoE layer call.
+            self.moe_layer._shared_prefix_token_multiplicities = self.multiplicities
+            try:
+                with moe_utils.router_gating_token_blocks():
+                    outputs = self.module(hidden)
+            finally:
+                del self.moe_layer._shared_prefix_token_multiplicities
+        return (*outputs, self.router.local_tokens_per_expert.clone())
 
 
 def _moe_config(**overrides):
@@ -449,6 +505,31 @@ class TestMoEModules:
             contention=hash_routing,
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
+
+    def test_topk_router_token_multiplicities_replays(self):
+        """Expert-bias counts weighted by shared-prefix multiplicities replay exactly."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="none",
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_aux_loss_coeff=0.0,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        module = _WithExpertCounts(router, router, _token_multiplicities(8192))
+        hidden = torch.randn(8192, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        outputs, _ = assert_module_replays_bit_exact(
+            module, (hidden,), replays=3, contention=True, what="TopKRouter[multiplicities]"
+        )
+        counts = outputs["out[2]"]
+        assert counts.dtype == torch.int64
+        assert int(counts.sum()) == config.moe_router_topk * int(module.multiplicities.sum())
 
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
@@ -686,3 +767,41 @@ class TestMoEModules:
             assert_module_replays_bit_exact(
                 layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
             )
+
+    @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
+    def test_moe_layer_shared_prefix_scope_replays(self, dispatcher):
+        """MoELayer with shared-prefix multiplicities inside the router row-block scope."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            moe_token_dispatcher_type=dispatcher,
+            moe_router_load_balancing_type="none",
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_aux_loss_coeff=0.0,
+        )
+        if not HAVE_TE:
+            config.moe_grouped_gemm = False
+            mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        else:
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=8, moe_grouped_gemm=True
+            ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer.set_layer_number(0)
+        # 3000 tokens: two full 1024-row router blocks and an uneven tail.
+        module = _WithExpertCounts(
+            layer, layer.router, _token_multiplicities(3000), moe_layer=layer
+        )
+        hidden = torch.randn(3000, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        with deterministic_algorithms(True):
+            outputs, _ = assert_module_replays_bit_exact(
+                module,
+                (hidden,),
+                replays=3,
+                contention=True,
+                what=f"MoELayer[{dispatcher}, shared-prefix scope]",
+            )
+        counts = outputs["out[2]"]
+        assert int(counts.sum()) == config.moe_router_topk * int(module.multiplicities.sum())
+        assert layer._shared_prefix_token_multiplicities is None
