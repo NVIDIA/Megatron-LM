@@ -33,11 +33,13 @@ class Platform:
 
         if cc[0] == 10:
             from .linear_cross_entropy.blackwell import entry as gpu_entry
-
-            self.forward_func: typing.Callable[..., typing.Any] = gpu_entry.forward
-            self.backward_func: typing.Callable[..., typing.Any] = gpu_entry.backward
+        elif cc[0] == 9:
+            from .linear_cross_entropy.hopper import entry as gpu_entry
         else:
             raise ValueError(f"Unsupported architecture: {cc[0]}")
+
+        self.forward_func: typing.Callable[..., typing.Any] = gpu_entry.forward
+        self.backward_func: typing.Callable[..., typing.Any] = gpu_entry.backward
 
         self._initialized = True
 
