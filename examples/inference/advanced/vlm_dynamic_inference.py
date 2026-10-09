@@ -11,9 +11,6 @@ support multimodal checkpoints:
   * :func:`_print_resolved_args` — diagnostic dump of the args namespace
     *after* the late checkpoint resolution above
   * :func:`get_model` — build and load either a GPT or LLaVA model
-
-The image-preprocessing helpers live in :mod:`.image_preprocessing` and are
-re-exported here for backwards compatibility with older standalone callers.
 """
 
 import json
@@ -44,7 +41,7 @@ from megatron.training.checkpointing import (
 # ``from config import ...``. The *caller* of this module (typically
 # ``tools/run_dynamic_text_generation_server.py``) is expected to have already
 # added the repo root and ``examples/multimodal/`` to ``sys.path`` before
-# invoking ``get_model``. ``megatron/core`` does not mutate ``sys.path`` here.
+# invoking `get_model`. This module does not mutate sys.path itself.
 
 
 def add_vlm_inference_args(parser):
