@@ -1311,12 +1311,14 @@ def process_mtp_loss(
                 assert original_group_counts is not None
                 # Coalescing forwards must not change the pre-existing per-star
                 # token-count correction, especially at short prompt boundaries.
+                # Each group's rolled count is num_tokens restricted to that group,
+                # so it includes the cumulative mtp_input_mask when one is given.
                 mtp_loss_normalized = torch.cat(
                     [
                         mtp_loss_scale * part * (original / mask.sum().clamp(min=1))
                         for part, mask, original in zip(
                             mtp_loss.split(loss_group_lengths, dim=-1),
-                            loss_mask.split(loss_group_lengths, dim=-1),
+                            layer_loss_mask.split(loss_group_lengths, dim=-1),
                             original_group_counts,
                             strict=True,
                         )
