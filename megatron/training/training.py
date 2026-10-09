@@ -6561,6 +6561,7 @@ def train(
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
             batch_preparation_fn=thd_batch_preparation_fn,
+            require_global_static_metadata_consensus=config.cuda_graph_static_dynamic_cp,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
