@@ -1651,7 +1651,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return
         # A previous overlap gather must finish before its storage is overwritten by masters.
         for model_chunk in self.model_chunks:
-            model_chunk.finish_pending_param_sync()
+            if not model_chunk.ddp_config.use_megatron_fsdp:
+                model_chunk.finish_pending_param_sync()
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
         # self.model_chunks, not a walk over the members: __init__ collects chunks only from
