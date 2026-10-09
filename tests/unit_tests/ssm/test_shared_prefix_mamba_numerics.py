@@ -102,12 +102,12 @@ def _conv_length_problem(backend, conv_len):
     """A single star whose ``causal_conv1d`` input for ``backend`` has length ``conv_len``.
 
     With prefix 300 and chunk 128 the state forks at 256 and replays a 44-token tail.
-    Fork-based paths convolve ``(d_conv - 1) + tail + longest completion`` per branch, replay
+    state_fork convolves ``(d_conv - 1) + tail + longest completion`` per branch, replay
     convolves ``prefix + longest completion``, and the packed/ragged paths convolve the whole
     channel-last sequence.
     """
     prefix_len, short = 300, 33
-    if backend in ("star_cp1", "state_fork"):
+    if backend == "state_fork":
         longest = conv_len - 3 - (prefix_len - 2 * CHUNK)
     elif backend == "replay_prefix":
         longest = conv_len - prefix_len
@@ -194,11 +194,8 @@ class TestSharedPrefixMambaNumerics:
     @pytest.mark.parametrize("backend", MAMBA_BACKENDS)
     def test_per_channel_skip_matches_dense_rows(self, backend):
         """``D_has_hdim=True`` (one skip coefficient per channel instead of per head)."""
-        if backend == "star_cp1":
-            problem, forest = _star(2 * CHUNK + 1, [7, CHUNK + 1, 1, CHUNK], 3), False
-        else:
-            problem, forest = _forest([(2 * CHUNK + 1, [7, CHUNK + 1]), (50, [1, CHUNK])], 3), True
-        self._check(problem, backend, forest, d_has_hdim=True)
+        problem = _forest([(2 * CHUNK + 1, [7, CHUNK + 1]), (50, [1, CHUNK])], 3)
+        self._check(problem, backend, forest=True, d_has_hdim=True)
 
     @pytest.mark.parametrize("backend", MAMBA_BACKENDS)
     @pytest.mark.parametrize("conv_len", CONV_LENGTH_CASES)
@@ -209,14 +206,12 @@ class TestSharedPrefixMambaNumerics:
     @pytest.mark.parametrize("backend", MAMBA_BACKENDS)
     def test_eval_forward_equals_training_forward(self, backend):
         """The logprob pass (eval, no grad) must reproduce the training forward bit for bit."""
-        problem, forest = _forest([(2 * CHUNK + 1, [7, CHUNK + 1]), (50, [1, CHUNK])], 3), True
-        if backend == "star_cp1":
-            problem, forest = _star(2 * CHUNK + 1, [7, CHUNK + 1, 1, CHUNK], 3), False
+        problem = _forest([(2 * CHUNK + 1, [7, CHUNK + 1]), (50, [1, CHUNK])], 3)
         torch.manual_seed(0)
         layer = build_local_mamba_layer(torch.bfloat16, hidden_size=HIDDEN)
         data = LayerProblemData(problem, HIDDEN, seed=0)
         hidden = data.star_input.cuda().to(torch.bfloat16)
-        layout = problem.layout(forest)
+        layout = problem.layout(forest=True)
         train = shared_mamba_layer_forward(
             layer, hidden.clone().requires_grad_(True), layout, backend
         )

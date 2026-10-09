@@ -312,15 +312,10 @@ def round_params_to(module: torch.nn.Module, dtype: torch.dtype) -> None:
             param.copy_(param.to(dtype).to(param.dtype))
 
 
-# Every shared-prefix Mamba execution path. ``star_cp1`` is the TP1/CP1 single-root path the
-# Hybrid stack dispatches plain layouts to; the others are selected with NRL_SP_MAMBA_IMPL.
-MAMBA_BACKENDS = (
-    "star_cp1",
-    "state_fork",
-    "replay_prefix",
-    "packed_recurrence",
-    "ragged_state_fork",
-)
+# Every differentiable shared-prefix Mamba backend, selected with NRL_SP_MAMBA_IMPL;
+# ragged_state_fork is the default at every topology. The ``*_training`` variants run these same
+# paths in training mode, and packed_fused is a single-root diagnostic oracle.
+MAMBA_BACKENDS = ("ragged_state_fork", "state_fork", "replay_prefix", "packed_recurrence")
 
 
 def build_local_mamba_layer(
@@ -391,30 +386,17 @@ def low_precision_copy(layer, dtype: torch.dtype, **build_kwargs):
 
 
 def shared_mamba_layer_forward(layer, hidden_states: Tensor, layout, backend: str) -> Tensor:
-    """Run one MambaLayer through the named shared-prefix backend.
+    """Run one MambaLayer through the shared-prefix backend selected by ``NRL_SP_MAMBA_IMPL``.
 
-    Backends removed from the implementation are skipped, not failed, so the matrix keeps
-    covering whatever remains.
+    An unknown backend name fails (``_shared_prefix_mamba_impl`` raises ValueError) instead of
+    silently running the default backend.
     """
-    import pytest
-
     from megatron.core.models.hybrid import shared_prefix
 
-    if backend == "star_cp1":
-        if isinstance(layout, SharedPrefixForestLayout):
-            pytest.skip("the TP1/CP1 single-star path executes one root")
-        forward = getattr(shared_prefix, "_forward_mamba_layer_shared_prefix", None)
-        if forward is None:
-            pytest.skip("the TP1/CP1 single-star Mamba path no longer exists")
-        return forward(layer, hidden_states, layout)
     previous = os.environ.get("NRL_SP_MAMBA_IMPL")
     os.environ["NRL_SP_MAMBA_IMPL"] = backend
     try:
         return shared_prefix._forward_mamba_layer_shared_prefix_cp(layer, hidden_states, layout)
-    except ValueError as error:
-        if "NRL_SP_MAMBA_IMPL" in str(error):
-            pytest.skip(f"shared-prefix Mamba backend {backend!r} no longer exists")
-        raise
     finally:
         if previous is None:
             os.environ.pop("NRL_SP_MAMBA_IMPL", None)

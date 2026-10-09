@@ -390,8 +390,8 @@ class TestSharedPrefixHybridModelDistributedParity:
 
     @pytest.mark.parametrize(
         "tp,cp,mamba_backend",
-        [(2, 2, None), (1, 4, None), (2, 2, "ragged_state_fork")],
-        ids=["tp2-sp-cp2", "tp1-cp4", "tp2-sp-cp2-ragged"],
+        [(2, 2, None), (1, 4, None), (2, 2, "state_fork")],
+        ids=["tp2-sp-cp2", "tp1-cp4", "tp2-sp-cp2-state-fork"],
     )
     @pytest.mark.parametrize(
         "roots,forest", [(STAR, False), (FOREST, True)], ids=["star", "forest"]
@@ -401,8 +401,11 @@ class TestSharedPrefixHybridModelDistributedParity:
     ):
         if Utils.world_size < tp * cp or Utils.world_size % (tp * cp):
             pytest.skip(f"requires a world size divisible by {tp * cp}")
-        if mamba_backend is not None:
-            # The backend used by the documented NeMo-RL configuration.
+        if mamba_backend is None:
+            # The default backend, ragged_state_fork.
+            monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
+        else:
+            # The opt-in backend that uses only the public mamba_ssm API.
             monkeypatch.setenv("NRL_SP_MAMBA_IMPL", mamba_backend)
         Utils.initialize_model_parallel(1, 1)
         _, _, baseline = self._gap(monkeypatch, roots, forest)
