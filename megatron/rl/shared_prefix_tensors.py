@@ -448,8 +448,7 @@ def _gather_token_aligned_tensor(
     width = source.shape[1]
     packed = source[indices.token_gather_rows, columns.clamp_max(width - 1)]
     packed.masked_fill_(columns >= width, padding_value)
-    packed[indices.physical_padding_positions] = padding_value
-    return packed
+    return packed.index_fill_(0, indices.physical_padding_positions, padding_value)
 
 
 def _to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
