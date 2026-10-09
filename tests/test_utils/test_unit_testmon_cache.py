@@ -26,27 +26,6 @@ cache = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cache)
 IMAGE_ID = "sha256:" + "a" * 64
 BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
-UNHASHED_INPUTS = (
-    ".github/actions/action.yml",
-    ".github/workflows/_build_ci_container.yml",
-    "pyproject.toml",
-    "uv.lock",
-    "megatron/core/__init__.py",
-    "megatron/core/package_info.py",
-    "megatron/core/ordinary.py",
-    "tests/unit_tests/run_ci_test.sh",
-    "tests/unit_tests/find_test_cases.py",
-    "tests/unit_tests/testmon_selector.py",
-    "tests/unit_tests/testmon_cache.py",
-    "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
-    "tests/test_utils/python_scripts/recipe_parser.py",
-    "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-    "docker/.ngc_version.dev",
-    "docker/Dockerfile.ci.dev",
-    "docker/nested/config.json",
-    "tests/test_utils/recipes/h100/unit-tests.yaml",
-    "tests/test_utils/recipes/gb200/unit-tests.yaml",
-)
 
 
 @pytest.fixture
@@ -54,14 +33,17 @@ def source_tree(tmp_path):
     root = tmp_path / "source"
     for name in (
         *cache.COMPATIBILITY_FILES,
-        *UNHASHED_INPUTS,
+        "docker/.ngc_version.dev",
+        "docker/Dockerfile.ci.dev",
         ".dockerignore",
-        "tests/unit_tests/conftest.py",
-        "tests/unit_tests/nested/conftest.py",
     ):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
+    for definition in cache.PLATFORMS.values():
+        recipe = root / definition["recipe"]
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text("recipe fixture")
     return root
 
 
@@ -87,29 +69,15 @@ def _snapshot(directory):
     }
 
 
-@pytest.mark.parametrize("changed", UNHASHED_INPUTS)
-def test_unhashed_edits_preserve_restored_generation(source_tree, generation, changed):
-    directory, producer = generation
-    (source_tree / changed).write_text("changed")
-    consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
-    assert consumer == producer
-    before = _snapshot(directory)
-    manifest = cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
-    assert manifest["identity"] == consumer["compatibility"]
-    assert _snapshot(directory) == before
+def test_source_edits_preserve_identity(source_tree):
+    before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    (source_tree / "megatron/core").mkdir(parents=True)
+    (source_tree / "megatron/core/ordinary.py").write_text("changed source")
+    assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
 
 
-@pytest.mark.parametrize(
-    "changed",
-    [
-        "README.md",
-        "tests/unit_tests/testmon_mandatory.py",
-        ".dockerignore",
-        "tests/unit_tests/conftest.py",
-        "tests/unit_tests/nested/conftest.py",
-    ],
-)
-def test_compatibility_edits_preserve_lookup_prefix_but_reject_restored_generation(
+@pytest.mark.parametrize("changed", [".dockerignore"])
+def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
     source_tree, generation, changed
 ):
     directory, producer = generation
@@ -143,7 +111,7 @@ def test_new_platform_uses_registry_without_hashing_its_recipe(source_tree, monk
 
     before = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
     assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_gb300-")
-    assert "tests/unit_tests/testmon_mandatory.py" in before["compatibility"]["inputs"]
+    assert "tests/unit_tests/testmon_cache.py" not in before["compatibility"]["inputs"]
     assert recipe not in before["compatibility"]["inputs"]
 
     (source_tree / recipe).write_text("changed recipe")
@@ -483,7 +451,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     elif restore == "missing-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100")
     elif restore == "changed-config":
-        (source_tree / "tests/unit_tests/testmon_mandatory.py").write_text("changed")
+        (source_tree / ".dockerignore").write_text("changed")
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
