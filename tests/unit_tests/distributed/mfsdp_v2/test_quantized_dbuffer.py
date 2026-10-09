@@ -25,10 +25,12 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
 pytestmark = pytest.mark.launch_on_gb200
 
-if not is_mxfp8_available():
-    pytest.skip("MXFP8 quantization is not available.", allow_module_level=True)
+requires_mxfp8 = pytest.mark.skipif(
+    not is_mxfp8_available(), reason="MXFP8 quantization is not available."
+)
 
 
+@requires_mxfp8
 def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
     """Quantized tensor views match TE's data and scales."""
     device = distributed_setup.device
@@ -64,6 +66,7 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             )
 
 
+@requires_mxfp8
 def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
     device = distributed_setup.device
@@ -142,26 +145,30 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
                 assert chunks[rank].eq(0).all()
 
 
-def test_quantized_dbuffer_allgathers_every_plane(distributed_setup):
-    """Gather every plane into aliased output storage on a 1D mesh."""
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
+    """Gather every plane on a 1D mesh, allocating or reusing output."""
     world_size = distributed_setup.world_size
     if world_size < 2:
         pytest.skip("Requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (world_size,))
-    out = QuantizedDBuffer.empty(
-        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    source = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32)], [(128, 64), (32, 128)], distributed_setup.device
     )
-    for plane in out.planes:
-        plane.local_buffer.zero_()
-    source = out.view([BlockAtomic(32)])
     for index, plane in enumerate(source.planes):
         values = (
             torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
         )
         plane.local_buffer.copy_(values % 251)
-    result = source.allgather(0, out=out)
-    assert result is out
-    for index, plane in enumerate(result.planes):
+    if use_out:
+        out = QuantizedDBuffer.empty(
+            mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        )
+        result = source.allgather(0, out=out)
+        assert result is out
+    else:
+        out = source.allgather(0)
+    for index, plane in enumerate(out.planes):
         assert plane.placements == (Replicate(),)
         expected = (
             (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
@@ -169,26 +176,31 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup):
         torch.testing.assert_close(plane.local_buffer, expected, rtol=0, atol=0)
 
 
-def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup):
-    """Gather every plane into aliased output storage on a 2D mesh."""
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup, use_out):
+    """Gather an axis iterator in every plane, allocating or reusing output."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even world size of at least two.")
     mesh = init_device_mesh(distributed_setup.device.type, (2, world_size // 2))
-    out = QuantizedDBuffer.empty(
-        mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    source = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32), BlockAtomic(32)], [(128, 64), (32, 128)], distributed_setup.device
     )
-    for plane in out.planes:
-        plane.local_buffer.zero_()
-    source = out.view([BlockAtomic(32), BlockAtomic(32)])
     for index, plane in enumerate(source.planes):
         values = (
             torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
         )
         plane.local_buffer.copy_(values % 251)
-    result = source.allgather((0, 1), out=out)
-    assert result is out
-    for index, plane in enumerate(result.planes):
+    # A one-shot iterator must be reusable across all four planes.
+    if use_out:
+        out = QuantizedDBuffer.empty(
+            mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        )
+        result = source.allgather(iter((0, 1)), out=out)
+        assert result is out
+    else:
+        out = source.allgather(iter((0, 1)))
+    for index, plane in enumerate(out.planes):
         assert plane.placements == (Replicate(), Replicate())
         expected = (
             (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
