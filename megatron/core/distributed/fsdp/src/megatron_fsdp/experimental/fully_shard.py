@@ -81,6 +81,7 @@ def fully_shard_context(
     parameter_to_owner: dict[nn.Parameter, int] | None = None,
     caller_managed_grad_sync: bool = False,
     use_trace_replay: bool = False,
+    max_reuse_distance: int | None = 0,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -109,6 +110,9 @@ def fully_shard_context(
             and ``end_iteration`` calls, ending before optimizer updates. Static
             module-order prefetch remains the default. Trace replay prefetches at
             most one successor; a zero SchedulePolicy budget disables that prefetch.
+        max_reuse_distance: Maximum intervening logical unshard/reshard events for
+            retaining gathered weights until the next use of the same module within
+            this iteration. None disables retention; zero allows immediate adjacency.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -124,6 +128,7 @@ def fully_shard_context(
         parameter_to_owner=parameter_to_owner,
         caller_managed_grad_sync=caller_managed_grad_sync,
         use_trace_replay=use_trace_replay,
+        max_reuse_distance=max_reuse_distance,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
