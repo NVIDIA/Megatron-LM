@@ -29,18 +29,20 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
+    MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     MultiTokenPredictionInputs,
     MultiTokenPredictionLayer,
     _initialize_hidden_state_mixing_rng_tracker,
     _mix_hidden_state_history,
-    _mtp_logits_are_vocab_sharded,
     _packed_seq_params_for_local_hsm_roll,
     get_mtp_layer_offset,
     get_mtp_num_layers_to_build,
@@ -232,7 +234,6 @@ class TestMultiTokenPredictionLayer:
             loss_mask=torch.ones(1, seq_len),
             output_layer=lambda hidden, **kwargs: (hidden, None),
             output_weight=None,
-            runtime_gather_output=None,
             is_training=True,
             compute_language_model_loss=lambda labels, logits: torch.ones_like(
                 labels, dtype=logits.dtype
@@ -1169,7 +1170,6 @@ class TestMultiTokenPredictionLayer:
             loss_mask=loss_mask,
             output_layer=output_layer,
             output_weight=output_weight,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,
@@ -1208,7 +1208,6 @@ class TestMultiTokenPredictionLayer:
             loss_mask=torch.zeros(1, seq_len),
             output_layer=output_layer,
             output_weight=output_weight,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,
@@ -1251,7 +1250,6 @@ class TestMultiTokenPredictionLayer:
             mtp_input_mask=torch.tensor([[True, False, True, True, True]]),
             output_layer=output_layer,
             output_weight=None,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,
@@ -1292,7 +1290,6 @@ class TestMultiTokenPredictionLayer:
             ),
             output_layer=lambda hidden, **kwargs: (hidden, None),
             output_weight=None,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=lambda labels, logits: torch.ones_like(
                 labels, dtype=logits.dtype
@@ -1335,7 +1332,6 @@ class TestMultiTokenPredictionLayer:
             loss_mask=torch.ones(1, seq_len),
             output_layer=output_layer,
             output_weight=output_weight,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,
@@ -2922,7 +2918,6 @@ class TestMultiTokenPrediction:
             loss_mask=None,
             output_layer=output_layer,
             output_weight=None,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,
@@ -2948,9 +2943,10 @@ class TestMultiTokenPrediction:
         # hidden_states is chunked into (1 + mtp_num_layers) along dim 0.
         hidden_states = torch.ones(2, 1, 5)
         input_ids = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.long)
-        seen = {'labels': None, 'masked_loss': None}
+        seen = {'labels': None, 'masked_loss': None, 'runtime_gather_output': None}
 
         def output_layer(hidden, weight=None, runtime_gather_output=None):
+            seen['runtime_gather_output'] = runtime_gather_output
             return hidden.clone(), None
 
         def compute_language_model_loss(mtp_labels, mtp_logits):
@@ -2964,7 +2960,6 @@ class TestMultiTokenPrediction:
             loss_mask=None,
             output_layer=output_layer,
             output_weight=None,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,
@@ -2977,6 +2972,75 @@ class TestMultiTokenPrediction:
         # [10,20,30,40,50] -> [20,30,40,50,0] -> [30,40,50,0,0].
         assert seen['labels'] is not None, "loss should be computed in RL mode"
         assert torch.equal(seen['labels'], torch.tensor([[30, 40, 50, 0, 0]], dtype=torch.long))
+        # The vocab-parallel MTP loss needs sharded logits.
+        assert seen['runtime_gather_output'] is False
+
+    @pytest.mark.parametrize("tp", [2, 4])
+    def test_process_mtp_loss_keeps_logits_vocab_sharded(self, tp, monkeypatch):
+        """An output layer that gathers by default (parallel_output=False) must give the same MTP
+        loss, acceptance counts and gradients as a sharded one. Gathered MTP logits would make
+        the vocab-parallel loss see a TP-times larger vocabulary: loss +ln(TP), wrong gradients."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        tp_group = get_tensor_model_parallel_group()
+        config = TransformerConfig(
+            hidden_size=64,
+            num_layers=2,
+            num_attention_heads=4,
+            mtp_num_layers=1,
+            use_cpu_initialization=True,
+        )
+        seq_len, vocab_size = 16, 256
+        # Identical on every TP rank; the targets land on every rank's vocab shard.
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, self.micro_batch_size, config.hidden_size
+        ).cuda()
+        labels = torch.randint(0, vocab_size, (self.micro_batch_size, seq_len)).cuda()
+
+        def compute_language_model_loss(labels, logits):
+            # LanguageModule.compute_language_model_loss: [b, s] labels vs [s, b, v/tp] logits.
+            loss = vocab_parallel_cross_entropy(
+                logits, labels.transpose(0, 1).contiguous(), tp_group=tp_group
+            )
+            return loss.transpose(0, 1).contiguous()
+
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        results = {}
+        for gather_output in (False, True):
+            torch.manual_seed(_SEED)  # Same weights for both layers.
+            output_layer = ColumnParallelLinear(
+                config.hidden_size,
+                vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=gather_output,
+                tp_group=tp_group,
+            ).cuda()
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            hidden = hidden_states.clone().requires_grad_(True)
+            process_mtp_loss(
+                hidden_states=hidden,
+                labels=labels,
+                loss_mask=None,
+                output_layer=output_layer,
+                output_weight=None,
+                is_training=True,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                tp_group=tp_group,
+            ).sum().backward()
+            tracker = MTPLossLoggingHelper.tracker
+            metrics = torch.cat(
+                [tracker[key] for key in ("loss_values", "correct_values", "total_values")]
+            )
+            results[gather_output] = (metrics, output_layer.weight.grad, hidden.grad)
+
+        for sharded, gathered in zip(results[False], results[True]):
+            torch.testing.assert_close(gathered, sharded)
 
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
@@ -3174,18 +3238,6 @@ class TestMTPLossLoggingHelper:
         assert tracker["total_values"][layer_number] == total
         assert tracker["reduce_group"] is None
         assert tracker["avg_group"] is None
-
-    def test_mtp_logits_are_vocab_sharded(self):
-        """Test detection for vocab-sharded versus gathered MTP logits."""
-
-        class DummyOutputLayer:
-            def __init__(self, gather_output):
-                self.gather_output = gather_output
-
-        assert _mtp_logits_are_vocab_sharded(DummyOutputLayer(gather_output=True), None) is False
-        assert _mtp_logits_are_vocab_sharded(DummyOutputLayer(gather_output=False), None) is True
-        assert _mtp_logits_are_vocab_sharded(DummyOutputLayer(gather_output=True), True) is False
-        assert _mtp_logits_are_vocab_sharded(DummyOutputLayer(gather_output=True), False) is True
 
     def test_track_mtp_metrics(self):
         """Test tracking MTP metrics including acceptance rate."""
