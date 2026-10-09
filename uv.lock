@@ -2774,8 +2774,8 @@ requires-dist = [
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=6ea2a74a9e98c99e6d7b164a33775cc457520027" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
-    { name = "wandb", marker = "extra == 'mlm'" },
-    { name = "wandb", marker = "extra == 'training'" },
+    { name = "wandb", marker = "extra == 'mlm'", specifier = ">=0.30.0" },
+    { name = "wandb", marker = "extra == 'training'", specifier = ">=0.30.0" },
     { name = "wget", marker = "extra == 'dev'" },
     { name = "zstandard", marker = "extra == 'dev'" },
 ]

@@ -310,6 +310,10 @@ RUN export HOME=/home/nemo-runtime \
 
 USER root
 
+# Upgrade the separate system W&B installation inherited from the base image.
+# The uv sync above installs the locked version in the virtual environment.
+RUN uv pip install --python /usr/bin/python3 --break-system-packages --no-cache "wandb==0.30.0"
+
 ##### For NVIDIANS only #####
 FROM main AS jet
 ARG JET_API_VERSION
