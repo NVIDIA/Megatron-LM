@@ -178,18 +178,24 @@ def assert_param_storage_policy(ddp, args):
 
 
 @pytest.mark.parametrize("completion", ["sync", "wait", "force"])
-@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("dp_size", [1, 2, 3])
 @pytest.mark.parametrize("has_fp8", [False, True])
-def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8):
-    """A BF16-first compact bucket borrows gradient storage only for FP8 payloads."""
+@pytest.mark.parametrize("mixed_dtypes", [False, True])
+def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8, mixed_dtypes):
+    """Reuse the transport plan across updates, including mixed dtypes and empty ranks."""
     from megatron.core.distributed import param_and_grad_buffer as buffers
 
-    high_precision = [
-        torch.nn.Parameter(torch.tensor([2.0 + rank, 4.0], dtype=torch.bfloat16))
-        for rank in range(dp_size)
+    dtypes = [torch.bfloat16, torch.float32] if mixed_dtypes else [torch.bfloat16]
+    # The third rank deliberately owns no parameters in this bucket.
+    owner_count = min(dp_size, 2)
+    high_precision_by_rank = [
+        [torch.nn.Parameter(torch.tensor([2.0 + rank, 4.0], dtype=dtype)) for dtype in dtypes]
+        for rank in range(owner_count)
     ]
+    high_precision = [param for params in high_precision_by_rank for param in params]
     quantized = [
-        torch.nn.Parameter(torch.full((2,), -99.0, dtype=torch.bfloat16)) for _ in range(dp_size)
+        torch.nn.Parameter(torch.full((2,), -99.0, dtype=torch.bfloat16))
+        for _ in range(owner_count)
     ]
     for param in quantized:
         param.test_fp8 = True
@@ -197,21 +203,34 @@ def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8):
     quantized[0].main_param = torch.tensor([1.006, 2.02], dtype=torch.float32)
     expected_remote = torch.tensor([11.0625, 13.5], dtype=torch.bfloat16)
     owner_lists = [
-        [high_precision[rank]] + ([quantized[rank]] if has_fp8 else []) for rank in range(dp_size)
-    ]
-    grad_data = torch.full((8,), 17.0, dtype=torch.float32)
-    bucket = SimpleNamespace(
-        layerwise_params_list=owner_lists,
-        params_list=[param for params in owner_lists for param in params],
-        grad_data=grad_data,
+        high_precision_by_rank[rank] + ([quantized[rank]] if has_fp8 else [])
+        for rank in range(owner_count)
+    ] + [[] for _ in range(dp_size - owner_count)]
+    params_list = [param for params in owner_lists for param in params]
+    param_index_map = {}
+    offset = 0
+    for param in params_list:
+        param_index_map[param] = (offset, offset + param.numel(), 0)
+        offset += param.numel()
+    grad_data = torch.full((offset,), 17.0, dtype=torch.float32)
+    config = SimpleNamespace(
+        overlap_param_gather=completion != "sync", use_distributed_optimizer=False
+    )
+    bucket = buffers._ParamAndGradBucket(
+        params=params_list,
         param_data=None,
-        layerwise_gather_list=None,
+        grad_data=grad_data,
+        offset=0,
+        numel_unpadded=offset,
+        gradient_scaling_factor=1.0,
+        bucket_id=0,
+        param_index_map=param_index_map,
+        params_with_extra_main_grads=[],
+        ddp_config=config,
         reuse_grad_buffer_for_param_ag=has_fp8,
     )
     group = buffers._ParamAndGradBucketGroup.__new__(buffers._ParamAndGradBucketGroup)
-    group.ddp_config = SimpleNamespace(
-        overlap_param_gather=completion != "sync", use_distributed_optimizer=False
-    )
+    group.ddp_config = config
     group.buckets = [bucket]
     group.param_sync_via_bucket_group = True
     group.param_gather_handle = None
@@ -220,15 +239,15 @@ def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8):
     group.intra_distributed_optimizer_instance_size = dp_size
     group.intra_distributed_optimizer_instance_rank = 0
     group.intra_distributed_optimizer_instance_group = object()
-    monkeypatch.setattr(
-        buffers,
-        "uses_grad_buffer_for_fp8_param_gather",
-        lambda p, config: getattr(p, "test_fp8", False),
-    )
+    reuse_policy = Mock(side_effect=lambda p, config: getattr(p, "test_fp8", False))
+    monkeypatch.setattr(buffers, "uses_grad_buffer_for_fp8_param_gather", reuse_policy)
     monkeypatch.setattr(
         buffers, "_param_uses_quantized_storage", lambda p: getattr(p, "test_fp8", False)
     )
     monkeypatch.setattr(buffers, "post_all_gather_processing", Mock())
+    bucket.set_layerwise_params_list(owner_lists)
+    gather_plan = bucket.layerwise_gather_plan
+    reuse_policy.reset_mock()
     copy_sources = []
 
     def copy_back(params, values):
@@ -240,43 +259,63 @@ def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8):
     work = Mock()
 
     def gather(outputs, source, **kwargs):
-        if source.untyped_storage().data_ptr() == grad_data.untyped_storage().data_ptr():
-            outputs[1].copy_(expected_remote)
-        else:
-            outputs[1].copy_(high_precision[1].detach())
+        for rank, output in enumerate(outputs[1:], start=1):
+            if rank >= owner_count:
+                assert output.numel() == 0
+            elif source.untyped_storage().data_ptr() == grad_data.untyped_storage().data_ptr():
+                output.copy_(expected_remote)
+            else:
+                remote = next(p for p in high_precision_by_rank[rank] if p.dtype == source.dtype)
+                output.copy_(remote.detach())
         return work if kwargs["async_op"] else None
 
     collective = Mock(side_effect=gather)
     monkeypatch.setattr(torch.distributed, "all_gather", collective)
     before_high_precision = [p.detach().clone() for p in high_precision]
-    group.start_param_sync()
-    if completion != "sync":
-        assert group.param_gather_handle is not None, "DP1 still needs local copy-back completion"
-        assert len(bucket.layerwise_gather_list) == 1 + has_fp8
-        for params_by_rank, received, reuse in bucket.layerwise_gather_list:
-            assert all(
-                getattr(p, "test_fp8", False) == reuse for params in params_by_rank for p in params
-            )
+    for step in range(2):
+        if step:
+            # Parameter values change; owner lists, dtype groups and receive sizes do not.
+            quantized[0].main_param.add_(0.5)
+            grad_data.fill_(17.0)
+            collective.reset_mock()
+            copy_sources.clear()
+        group.start_param_sync()
+        assert bucket.layerwise_gather_plan is gather_plan
+        reuse_policy.assert_not_called()
+        if completion != "sync":
             assert (
-                received[0].untyped_storage().data_ptr() == grad_data.untyped_storage().data_ptr()
-            ) == reuse
-        if completion == "force":
-            group.start_param_sync(force_sync=True)
+                group.param_gather_handle is not None
+            ), "DP1 still needs local copy-back completion"
+            assert len(bucket.layerwise_gather_list) == len(dtypes) + has_fp8
+            for params_by_rank, received, reuse in bucket.layerwise_gather_list:
+                assert all(
+                    getattr(p, "test_fp8", False) == reuse
+                    for params in params_by_rank
+                    for p in params
+                )
+                assert (
+                    received[0].untyped_storage().data_ptr()
+                    == grad_data.untyped_storage().data_ptr()
+                ) == reuse
+                if dp_size > owner_count:
+                    assert received[-1].numel() == 0
+            if completion == "force":
+                group.start_param_sync(force_sync=True)
+            else:
+                group.finish_param_sync(skip_next_bucket_dispatch=True)
+        assert collective.call_count == (len(dtypes) + has_fp8 if dp_size > 1 else 0)
+        assert bucket.layerwise_gather_list is None
+        assert group.param_gather_handle is None
+        for param, before in zip(high_precision, before_high_precision):
+            assert torch.equal(param, before)
+        if has_fp8:
+            assert torch.equal(quantized[0], quantized[0].main_param.to(torch.bfloat16))
+            if dp_size > 1:
+                assert torch.equal(quantized[1], expected_remote)
+            assert len(copy_sources) == owner_count
+            assert torch.count_nonzero(grad_data) == 0
         else:
-            group.finish_param_sync(skip_next_bucket_dispatch=True)
-    assert collective.call_count == (1 + has_fp8 if dp_size > 1 else 0)
-    assert bucket.layerwise_gather_list is None
-    assert group.param_gather_handle is None
-    for param, before in zip(high_precision, before_high_precision):
-        assert torch.equal(param, before)
-    if has_fp8:
-        assert torch.equal(quantized[0], quantized[0].main_param.to(torch.bfloat16))
-        if dp_size > 1:
-            assert torch.equal(quantized[1], expected_remote)
-        assert len(copy_sources) == dp_size
-        assert torch.count_nonzero(grad_data) == 0
-    else:
-        assert torch.all(grad_data == 17), "High-precision AG must not touch gradient storage"
+            assert torch.all(grad_data == 17), "High-precision AG must not touch gradient storage"
 
 
 @pytest.mark.parametrize("layout", [False, True])

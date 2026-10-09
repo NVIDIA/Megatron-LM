@@ -168,7 +168,6 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         )
         # A bare module has a buffers() method, not DDP layout metadata. Preserve
         # direct LayerWise construction and its synchronous parameter-gather fallback.
-        assert optimizer._build_param_sort_keys([model]) is None
         assert not optimizer.use_buffer_param_sync
         assert not optimizer.layerwise_param_sync_via_bucket_group
 
