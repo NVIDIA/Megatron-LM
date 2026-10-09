@@ -166,6 +166,24 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 "This method is supported only for `huggingface` and `megatron` libraries."
             )
 
+    def tokenize_batch(self, texts: list[str]) -> "ak.Array":
+        """
+        Tokenizes a batch of texts.
+
+        Args:
+            texts (list[str]): list of texts to be tokenized.
+
+        Returns:
+            "ak.Array": an array of tokenized texts.
+        """
+
+        if self.library in ["huggingface", "megatron"]:
+            return self._tokenizer.encode_batch(texts)
+        else:
+            raise NotImplementedError(
+                "This method is supported only for `huggingface` and `megatron` libraries."
+            )
+
     def save_pretrained(self, path: str) -> None:
         """
         Saves HF tokenizer files.

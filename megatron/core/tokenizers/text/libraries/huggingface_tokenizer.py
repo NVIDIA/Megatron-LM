@@ -361,6 +361,24 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 "Please, set `use_gigatoken=True`."
             )
 
+    def encode_batch(self, texts: list[str]) -> "ak.Array":
+        """Encodes a batch of texts."""
+        if self.use_gigatoken:
+            from megatron.core.tokenizers.utils import has_gigatoken_support
+
+            if has_gigatoken_support():
+                return self.tokenizer.tokenizer.encode_batch(texts, parallel=True)
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
+        else:
+            raise NotImplementedError(
+                "This method is supported only for gigatoken tokenizers. "
+                "Please, set `use_gigatoken=True`."
+            )
+
     @property
     def vocab(self) -> list:
         """Returns tokenizer vocab values."""
