@@ -63,6 +63,33 @@ def message_handler(*headers):
     return decorator
 
 
+@message_handler(Headers.REGISTER_ROLE)
+def handle_register_role(coordinator, sender_identity, metadata, bodies):
+    """Register a coordinator-native prefill or decode engine."""
+
+    try:
+        if not coordinator.is_disaggregated_inference():
+            raise ValueError("REGISTER_ROLE requires a disaggregated coordinator")
+        _, role, transport, instance_meta = metadata
+        coordinator.disaggregated_runtime.register_engine(
+            sender_identity, role, transport, instance_meta
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        logging.warning(
+            "Coordinator: rejecting role registration from %r: %s", sender_identity, error
+        )
+        coordinator.router_socket.send_multipart(
+            [
+                sender_identity,
+                msgpack.packb([Headers.REQUEST_ERROR.value, str(error)], use_bin_type=True),
+            ]
+        )
+        return
+    coordinator.router_socket.send_multipart(
+        [sender_identity, msgpack.packb([Headers.REGISTER_ROLE_ACK.value], use_bin_type=True)]
+    )
+
+
 @message_handler(Headers.CONNECT)
 def handle_connect(coordinator, sender_identity, metadata, bodies):
     """Handshake with a new client, replying with a CONNECT_ACK.
@@ -72,13 +99,12 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
     ``metadata``: ``[header]``.
     ``bodies``: empty.
     """
-    if sender_identity in coordinator.known_clients:
-        logging.info(f"Client {sender_identity} sent a duplicate connect request. Ignoring ..")
-        return
-
     coordinator.known_clients.add(sender_identity)
     coordinator.router_socket.send_multipart(
-        [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+        [
+            sender_identity,
+            msgpack.packb([Headers.CONNECT_ACK.value, coordinator.instance_id], use_bin_type=True),
+        ]
     )
 
 
@@ -141,6 +167,26 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     media_frame = bodies[2]
     offload_frame = bodies[3]
 
+    if coordinator.is_disaggregated_inference():
+        if media_meta or media_frame != b"\xc0":
+            # Native handoffs do not support VLM/media state yet. Reject only
+            # this request, before allocating an ID or reserving engine capacity.
+            coordinator.router_socket.send_multipart(
+                [
+                    sender_identity,
+                    msgpack.packb(
+                        [
+                            Headers.REQUEST_ERROR.value,
+                            client_request_id,
+                            "native disaggregation does not support multimodal requests",
+                            True,
+                        ],
+                        use_bin_type=True,
+                    ),
+                ]
+            )
+            return
+
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
     request_id = coordinator.next_request_id
@@ -197,6 +243,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     ):
         request_hashes = request_hashes[:1]
 
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.route_submit(
+            request_id, prompt_frame, sampling_params, request_hashes, offload_frame
+        )
+        return
+
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_best_data_parallel_rank(
@@ -236,10 +288,15 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
 @message_handler(Headers.SUBMIT_REQUEST_WITH_KV)
 def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies):
-    """Route a client-supplied KV handoff to a decode engine.
+    """Route an externally orchestrated KV handoff within a decode service.
 
     Sent by ``InferenceClient.add_request_with_kv_handoff`` /
-    ``add_request_with_kv_handoff_streaming``.
+    ``add_request_with_kv_handoff_streaming`` to an externally managed decode
+    endpoint. Its registered engines must all be decode-capable.
+
+    Native disaggregation rejects client-supplied handoffs here: its runtime
+    selects and reserves a decode engine, then sends SUBMIT_REQUEST_WITH_KV
+    directly to that engine, bypassing this handler.
 
     ``metadata``: ``[header, client_request_id, sampling_params, kv_meta]``,
         where ``kv_meta`` is the peer's NIXL agent/layout export. It is bounded
@@ -248,9 +305,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     ``bodies``: ``[prompt, src_block_ids]``. ``src_block_ids`` names one remote
         block per block_size_tokens of prompt, so it grows with the prompt and
         travels as its own frame. Both bodies are forwarded to the engine
-        untouched, so the coordinator decodes nothing sequence-dependent. In
-        disaggregated serving every decode request arrives here, so this is as
-        hot as a plain submission.
+        untouched, so the coordinator decodes nothing sequence-dependent.
     """
 
     if sender_identity not in coordinator.known_clients:
@@ -267,6 +322,25 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
         return
 
     _, client_request_id, sampling_params, kv_meta = metadata
+    if coordinator.is_disaggregated_inference():
+        # No engine has read the source state. Reject before allocating an ID
+        # or bypassing the native runtime's role routing and reservations.
+        coordinator.router_socket.send_multipart(
+            [
+                sender_identity,
+                msgpack.packb(
+                    [
+                        Headers.REQUEST_ERROR.value,
+                        client_request_id,
+                        "SUBMIT_REQUEST_WITH_KV is not supported by native disaggregation; "
+                        "use SUBMIT_REQUEST",
+                        True,
+                    ],
+                    use_bin_type=True,
+                ),
+            ]
+        )
+        return
     request_id = coordinator.next_request_id
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
@@ -294,21 +368,106 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
 
 
+def _release_owned_handoff(coordinator, request_id, engine):
+    """Forget ownership only after the release is queued to its source."""
+    if not coordinator._send_to_engine(
+        engine, [msgpack.packb([Headers.RELEASE_KV.value, request_id])], remove_unreachable=False
+    ):
+        return False
+    coordinator.handoff_ownership.release(request_id)
+    return True
+
+
 @message_handler(Headers.RELEASE_KV)
 def handle_release_kv(coordinator, sender_identity, metadata, bodies):
-    """Broadcast release of prefill blocks retained for a completed handoff.
+    """Release prefill blocks retained for a completed handoff.
 
-    Sent by ``InferenceClient.release_handoff``. Broadcast to every engine;
-    engines not holding that request id treat it as a no-op.
+    Sent by ``InferenceClient.release_handoff``. Target the registered source,
+    falling back to broadcast for handoffs without ownership bookkeeping.
 
-    ``metadata``: ``[header, client_request_id]``.
+    ``metadata``: ``[header, engine_request_id, optional_coordinator_instance_id]``.
+    Fenced releases receive an acknowledgement; a stale instance never releases
+    a request in a replacement coordinator that may have reused the same ID.
     ``bodies``: empty.
     """
 
     if sender_identity not in coordinator.known_clients:
         logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
         return
-    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, int(metadata[1])])
+    request_id = int(metadata[1])
+    instance_id = metadata[2] if len(metadata) > 2 else None
+    # Legacy releases have no instance fence. Fenced releases may affect only
+    # this coordinator incarnation, never a replacement reusing the request ID.
+    if len(metadata) == 2 or instance_id == coordinator.instance_id:
+        engine = coordinator.handoff_ownership.source_engine(request_id)
+        if engine is None:
+            # Legacy/untracked handoffs have no registered owner; engines that
+            # do not hold this request ignore the broadcast (including retries).
+            coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
+        elif not _release_owned_handoff(coordinator, request_id, engine):
+            return  # No ACK: the caller must retry delivery.
+    if len(metadata) == 2:
+        # The legacy client is fire-and-forget and does not expect an ACK.
+        return
+    # ACK successful releases and stale-instance no-ops. Acknowledging a stale
+    # instance retires the caller's retry without releasing allocations that
+    # belong to the current coordinator incarnation.
+    coordinator.router_socket.send_multipart(
+        [
+            sender_identity,
+            msgpack.packb(
+                [Headers.RELEASE_KV_ACK.value, request_id, instance_id], use_bin_type=True
+            ),
+        ]
+    )
+
+
+@message_handler(Headers.REGISTER_KV)
+def handle_register_kv(coordinator, sender_identity, metadata, bodies):
+    """Register source state before its engine publishes handoff metadata."""
+    if sender_identity in coordinator.identities_of_data_parallel_ranks and len(metadata) == 2:
+        coordinator.handoff_ownership.offer(int(metadata[1]), sender_identity)
+
+
+@message_handler(Headers.CLAIM_KV, Headers.RELEASE_KV_OWNER)
+def handle_handoff_owner(coordinator, sender_identity, metadata, bodies):
+    """Claim a handoff or accept a supervisor's explicit termination barrier.
+
+    This trusted control-plane operation must not be exposed to public clients.
+    RELEASE_KV_OWNER is an attestation, not a failure detector.
+    """
+    if sender_identity not in coordinator.known_clients:
+        return
+    header = Headers(metadata[0])
+    if header == Headers.CLAIM_KV:
+        if len(metadata) != 4:
+            return
+        _, request_id, instance_id, owner = metadata
+        accepted = (
+            instance_id == coordinator.instance_id
+            and isinstance(owner, str)
+            and isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+        )
+        accepted = accepted and coordinator.handoff_ownership.claim(request_id, owner)
+        reply = [Headers.CLAIM_KV_ACK.value, request_id, instance_id, bool(accepted)]
+    else:
+        if len(metadata) != 3:
+            return
+        _, instance_id, owner = metadata
+        if not isinstance(owner, str) or not owner:
+            return
+        if instance_id == coordinator.instance_id:
+            delivered = True
+            for request_id, engine in coordinator.handoff_ownership.confirm_terminated(owner):
+                if not _release_owned_handoff(coordinator, request_id, engine):
+                    delivered = False
+            if not delivered:
+                return  # Keep failed releases indexed by owner for supervisor retry.
+        reply = [Headers.RELEASE_KV_OWNER_ACK.value, instance_id, owner]
+    coordinator.router_socket.send_multipart(
+        [sender_identity, msgpack.packb(reply, use_bin_type=True)]
+    )
 
 
 @message_handler(
@@ -395,17 +554,30 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[fid]
-        client_request_id = coordinator.request_id_to_client_request_id[fid]
-        del coordinator.request_id_to_client_id[fid]
-        del coordinator.request_id_to_client_request_id[fid]
-        del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
+        if (
+            coordinator.is_disaggregated_inference()
+            and fid in coordinator.disaggregated_runtime.hop1_request_ids
+        ):
+            finished_request = msgpack.unpackb(body, raw=False)
+            coordinator.disaggregated_runtime.handle_prefill_done(fid, finished_request)
+            continue
+
+        if fid not in coordinator.request_id_to_client_id:
+            logging.warning(
+                "Coordinator: ignoring duplicate or late ENGINE_REPLY for request %d from %r",
+                fid,
+                sender_identity,
+            )
+            continue
+        client_identity, client_request_id = coordinator._forget_client_request(fid)
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
             idx = coordinator.identity_to_rank_index.get(assigned_rank)
             if idx is not None:
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
+        if coordinator.is_disaggregated_inference():
+            coordinator.disaggregated_runtime.handle_decode_done(fid)
 
         if needs_detokenize:
             # Detokenization writes generated_text into the reply, so the body must
@@ -419,6 +591,89 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
         coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
+
+
+@message_handler(Headers.KV_READ_DONE)
+def handle_kv_read_done(coordinator, sender_identity, metadata, bodies):
+    """Release prefill-owned cache storage after decode imports it."""
+
+    if not coordinator.is_disaggregated_inference():
+        logging.warning("Coordinator: ignoring KV_READ_DONE without disaggregation enabled")
+        return
+    coordinator.disaggregated_runtime.handle_kv_read_done(sender_identity, int(metadata[1]))
+
+
+@message_handler(Headers.KV_TRANSFER_READY)
+def handle_kv_transfer_ready(coordinator, sender_identity, metadata, bodies):
+    """Start NCCL sends after decode commits the matching destinations."""
+
+    if not coordinator.is_disaggregated_inference():
+        logging.warning("Coordinator: ignoring KV_TRANSFER_READY without disaggregation enabled")
+        return
+    coordinator.disaggregated_runtime.handle_kv_transfer_ready(
+        sender_identity, int(metadata[1]), int(metadata[2])
+    )
+
+
+@message_handler(Headers.REQUEST_ERROR)
+def handle_request_error(coordinator, sender_identity, metadata, bodies):
+    """Forward a terminal engine-side request failure to its client."""
+
+    request_id, reason, source_safe = int(metadata[1]), str(metadata[2]), bool(metadata[3])
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.handle_engine_failure(
+            request_id, reason, source_safe=source_safe
+        )
+        return
+
+    client_identity = coordinator.request_id_to_client_id.get(request_id)
+    client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+    if client_identity is None or client_request_id is None:
+        return
+    coordinator.router_socket.send_multipart(
+        [
+            client_identity,
+            msgpack.packb(
+                [Headers.REQUEST_ERROR.value, client_request_id, reason, source_safe],
+                use_bin_type=True,
+            ),
+        ]
+    )
+    if source_safe:
+        coordinator._forget_client_request(request_id)
+        assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+        if assigned_rank is not None:
+            index = coordinator.identity_to_rank_index.get(assigned_rank)
+            if index is not None and coordinator._pending_counts[index] > 0:
+                coordinator._pending_counts[index] -= 1
+
+
+@message_handler(Headers.REQUEST_ABORTED)
+def handle_request_aborted(coordinator, sender_identity, metadata, bodies):
+    """Forward engine cancellation completion to the requesting client."""
+
+    request_id, source_safe = int(metadata[1]), bool(metadata[2])
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.handle_engine_aborted(request_id, source_safe=source_safe)
+        return
+    if not source_safe:
+        return
+    client_identity, client_request_id = coordinator._forget_client_request(request_id)
+    assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+    if assigned_rank is not None:
+        index = coordinator.identity_to_rank_index.get(assigned_rank)
+        if index is not None and coordinator._pending_counts[index] > 0:
+            coordinator._pending_counts[index] -= 1
+    if client_identity is None or client_request_id is None:
+        return
+    coordinator.router_socket.send_multipart(
+        [
+            client_identity,
+            msgpack.packb(
+                [Headers.REQUEST_ABORTED.value, client_request_id, source_safe], use_bin_type=True
+            ),
+        ]
+    )
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
@@ -441,8 +696,13 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
         return
     for request_id, body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[request_id]
-        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+        if client_identity is None or client_request_id is None:
+            logging.warning(
+                "Coordinator: ignoring late ENGINE_REPLY_PARTIAL for request %d", request_id
+            )
+            continue
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
         coordinator.router_socket.send_multipart(
@@ -472,6 +732,9 @@ def handle_abort_request(coordinator, sender_identity, metadata, bodies):
     client_request_id = int(metadata[1])
     request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
     if request_id is None:
+        return
+    if coordinator.is_disaggregated_inference():
+        coordinator.disaggregated_runtime.abort_request(request_id)
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)
     if assigned_rank is not None:

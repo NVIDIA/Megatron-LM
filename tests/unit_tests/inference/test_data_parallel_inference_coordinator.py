@@ -37,6 +37,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.inference.routing import select_engine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_asyncio_loop
@@ -59,10 +60,73 @@ def test_coordinator_registers_client_kv_handoff_handlers():
     assert Headers.RELEASE_KV in HANDLERS
 
 
+def test_invalid_role_registration_replies_without_raising():
+    coordinator = unittest.mock.MagicMock()
+    coordinator.disaggregated_runtime = None
+    coordinator.is_disaggregated_inference.return_value = False
+
+    HANDLERS[Headers.REGISTER_ROLE](
+        coordinator, b"engine", [Headers.REGISTER_ROLE.value, "prefill", "nixl", []], []
+    )
+
+    reply = msgpack.unpackb(
+        coordinator.router_socket.send_multipart.call_args.args[0][1], raw=False
+    )
+    assert Headers(reply[0]) == Headers.REQUEST_ERROR
+
+
+def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator():
+    coordinator = unittest.mock.MagicMock(
+        known_clients={b"client"},
+        enable_prefix_caching=False,
+        next_request_id=0,
+        request_id_to_client_id={},
+        request_id_to_client_request_id={},
+        client_request_to_request_id={},
+    )
+
+    coordinator.is_disaggregated_inference.return_value = True
+    coordinator._handlers = HANDLERS
+    submissions = [
+        [
+            b"client",
+            msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, {}, None]),
+            msgpack.packb([1]),
+            msgpack.packb(None),
+            msgpack.packb(media),
+            msgpack.packb(None),
+        ]
+        for request_id, media in [(7, {"image": [b"image"]}), (8, None)]
+    ]
+    coordinator.router_socket.recv_multipart.side_effect = [
+        *submissions,
+        [b"client", msgpack.packb([Headers.SHUTDOWN.value])],
+    ]
+
+    DataParallelInferenceCoordinator.start(coordinator)
+
+    coordinator.disaggregated_runtime.route_submit.assert_called_once_with(
+        0, msgpack.packb([1]), {}, [], msgpack.packb(None)
+    )
+    assert coordinator.next_request_id == 1
+    assert coordinator.client_request_to_request_id == {(b"client", 8): 0}
+    destination, payload = coordinator.router_socket.send_multipart.call_args.args[0]
+    assert destination == b"client"
+    assert msgpack.unpackb(payload, raw=False) == [
+        Headers.REQUEST_ERROR.value,
+        7,
+        "native disaggregation does not support multimodal requests",
+        True,
+    ]
+
+
 class _StubCoordinator:
     """Minimal stand-in exposing only what the submit handlers touch."""
 
+    is_disaggregated_inference = DataParallelInferenceCoordinator.is_disaggregated_inference
+
     def __init__(self, identity=b"engine-0"):
+        self.disaggregated_runtime = None
         self.known_clients = {b"client-0"}
         self.next_request_id = 100
         self.request_id_to_client_id = {}
@@ -86,11 +150,13 @@ class _StubCoordinator:
         return True
 
 
-def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame():
+@pytest.mark.parametrize("native_disaggregation", [False, True])
+def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame(native_disaggregation):
     """Client -> coordinator -> engine for a KV handoff, asserting the framing.
 
     The prompt must never be decoded by the coordinator: it is forwarded as the
-    opaque body frame the client packed, byte for byte.
+    opaque body frame the client packed, byte for byte. Native coordinators
+    reject external handoffs before routing or allocating request state.
     """
     prompt_tokens = [11, 22, 33, 44]
     kv_meta = {"agent": "nixl-0"}
@@ -115,8 +181,28 @@ def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame():
 
     # --- coordinator side: route it ---
     coordinator = _StubCoordinator()
+    if native_disaggregation:
+        coordinator.disaggregated_runtime = object()
+        coordinator.router_socket = unittest.mock.Mock()
     handler = HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV]
-    handler(coordinator, b"client-0", metadata, frames[1:])
+    assert handler(coordinator, b"client-0", metadata, frames[1:]) is None
+
+    if native_disaggregation:
+        assert coordinator.sent == []
+        assert coordinator.next_request_id == 100
+        assert not coordinator.request_id_to_client_id
+        assert not coordinator.request_id_to_client_request_id
+        assert not coordinator.client_request_to_request_id
+        assert not coordinator.request_id_to_rank
+        assert coordinator._pending_counts[0] == 0
+        coordinator.router_socket.send_multipart.assert_called_once()
+        destination, error_frame = coordinator.router_socket.send_multipart.call_args.args[0]
+        header, rejected_id, reason, source_safe = msgpack.unpackb(error_frame, raw=False)
+        assert destination == b"client-0"
+        assert header == Headers.REQUEST_ERROR.value and rejected_id == request_id
+        assert "native disaggregation" in reason and "use SUBMIT_REQUEST" in reason
+        assert source_safe is True
+        return
 
     assert len(coordinator.sent) == 1
     identity, out_frames = coordinator.sent[0]
@@ -228,6 +314,8 @@ class DummyEngine(DynamicInferenceEngine):
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
+        self._disagg_config = None
+        self._kv_transfer_role = None
         self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
@@ -904,6 +992,76 @@ def _make_routing_coordinator(
 class TestRoutingPolicies:
     """Unit tests for routing behavior under different policies and load conditions."""
 
+    @pytest.mark.parametrize(
+        "loads,affinity,capacity,alpha,expected",
+        [
+            ([2, 0], None, None, 0.0, b"a"),
+            ([0, 0], None, None, 0.0, b"z"),
+            ([0, 2], None, [0.25, 0.75], 1.0, b"a"),
+            ([2, 0], None, [0.5, 0.5], 0.0, b"a"),
+            ([0, 0], None, [0.5, 0.5], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 1.0, b"a"),
+            ([0, 0], [1.0, 1.0], [0.25, 1.0], 1.0, b"z"),
+        ],
+    )
+    def test_stateless_selection(self, loads, affinity, capacity, alpha, expected):
+        identities = [b"z", b"a"]  # Rank order, not lexical identity order.
+        loads = np.array(loads)
+        affinity = None if affinity is None else np.array(affinity)
+        capacity = None if capacity is None else np.array(capacity)
+        for array in (loads, affinity, capacity):
+            if array is not None:
+                array.flags.writeable = False
+        assert (
+            select_engine(
+                identities,
+                loads,
+                affinity_scores=affinity,
+                available_fractions=capacity,
+                routing_alpha=alpha,
+            )
+            == expected
+        )
+        assert identities == [b"z", b"a"]
+        with pytest.raises(RuntimeError, match="No engines connected"):
+            select_engine([], np.array([]))
+
+    @pytest.mark.parametrize("header", [Headers.RELEASE_KV, Headers.RELEASE_KV_OWNER])
+    def test_handoff_release_retries_after_source_disconnect(self, header):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.instance_id = "source-instance"
+        coord.known_clients = {b"client"}
+        for request_id, owner in ((7, "old"), (8, "replacement")):
+            coord.handoff_ownership.offer(request_id, b"rank-0")
+            assert coord.handoff_ownership.claim(request_id, owner)
+        # Routing eviction is not evidence that the source freed its allocations.
+        coord._remove_engine(b"rank-0")
+        metadata = (
+            [header.value, 7, coord.instance_id]
+            if header == Headers.RELEASE_KV
+            else [header.value, coord.instance_id, "old"]
+        )
+        coord.router_socket = unittest.mock.MagicMock(
+            send_multipart=unittest.mock.MagicMock(side_effect=zmq.ZMQError(zmq.EHOSTUNREACH))
+        )
+        HANDLERS[header](coord, b"client", metadata, [])
+        # Only delivery to the source was attempted; no successful ACK to the client.
+        assert coord.router_socket.send_multipart.call_count == 1
+        assert coord.router_socket.send_multipart.call_args.args[0][0] == b"rank-0"
+        assert coord.handoff_ownership.source_engine(7) == b"rank-0"
+        assert not coord.handoff_ownership.claim(7, "other")
+
+        coord._handle_rank_registration(b"rank-0")
+        coord.router_socket.send_multipart.reset_mock(side_effect=True)
+        HANDLERS[header](coord, b"client", metadata, [])
+        release, ack = coord.router_socket.send_multipart.call_args_list
+        assert release.args[0][0] == b"rank-0"
+        assert msgpack.unpackb(release.args[0][1]) == [Headers.RELEASE_KV.value, 7]
+        assert ack.args[0][0] == b"client"
+        assert coord.handoff_ownership.source_engine(7) is None
+        assert coord.handoff_ownership.source_engine(8) == b"rank-0"
+
     def test_no_prefix_caching_uses_load_balanced(self):
         """When prefix caching is off, routing goes to the least-loaded rank."""
         coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
@@ -1032,6 +1190,59 @@ class TestRoutingPolicies:
         assert coord.tokenizer.detokenize_calls == [[10, 11, 12]]
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
+
+        # A duplicated or delayed completion cannot be routed after the first
+        # reply releases its client mapping, but it must not kill the coordinator.
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", *reply(11))
+        assert "duplicate or late ENGINE_REPLY" in caplog.text
+        assert coord.router_socket.send_multipart.call_count == 1
+
+    def test_unsafe_terminal_error_keeps_routing_until_safety_ack(self):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {11: b"rank-0"}
+        coord._pending_counts[0] = 1
+
+        HANDLERS[Headers.REQUEST_ERROR](
+            coord, b"rank-0", [Headers.REQUEST_ERROR.value, 11, "failed", False], []
+        )
+
+        assert coord.request_id_to_client_id == {11: b"client-A"}
+        assert coord.request_id_to_client_request_id == {11: 7}
+        assert coord.client_request_to_request_id == {(b"client-A", 7): 11}
+        assert coord.request_id_to_rank == {11: b"rank-0"}
+        assert coord._pending_counts[0] == 1
+
+        HANDLERS[Headers.REQUEST_ABORTED](
+            coord, b"rank-0", [Headers.REQUEST_ABORTED.value, 11, True], []
+        )
+
+        assert coord.request_id_to_client_id == {}
+        assert coord.request_id_to_client_request_id == {}
+        assert coord.client_request_to_request_id == {}
+        assert coord.request_id_to_rank == {}
+        assert coord._pending_counts[0] == 0
+
+    def test_late_partial_reply_is_ignored(self, caplog):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {}
+        coord.request_id_to_client_request_id = {}
+
+        with caplog.at_level(logging.WARNING):
+            HANDLERS[Headers.ENGINE_REPLY_PARTIAL](
+                coord,
+                b"rank-0",
+                [Headers.ENGINE_REPLY_PARTIAL.value, [11]],
+                [msgpack.packb({"request_id": 11}, use_bin_type=True)],
+            )
+
+        assert "late ENGINE_REPLY_PARTIAL" in caplog.text
+        coord.router_socket.send_multipart.assert_not_called()
 
 
 def test_engine_reply_defaults_to_detokenizing():

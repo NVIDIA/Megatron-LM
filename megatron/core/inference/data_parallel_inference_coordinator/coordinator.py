@@ -7,6 +7,7 @@ import logging
 import signal
 import socket
 import time
+import uuid
 from collections import OrderedDict, deque
 from multiprocessing import Event
 from multiprocessing.connection import Connection
@@ -18,8 +19,11 @@ from megatron.core.inference.config import (
     MediaCacheCoordinatorPolicy,
     PrefixCachingCoordinatorPolicy,
 )
+from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.routing import select_engine
 from megatron.core.inference.utils import detokenize_tokens
 
 from .handlers import HANDLERS
@@ -87,6 +91,8 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
+    disaggregated_runtime: DisaggCoordinatorRuntime | None = None
+
     # Exposed as a class attribute for backwards compatibility; the canonical
     # definition lives in state.py.
     CoordinatorState = CoordinatorState
@@ -113,6 +119,7 @@ class DataParallelInferenceCoordinator:
         vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
     ):
         """
         Initializes the inference coordinator.
@@ -151,6 +158,7 @@ class DataParallelInferenceCoordinator:
             "pip install msgpack"
         )
         self.pipe_connection = pipe_connection
+        self.instance_id = uuid.uuid4().hex
         self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
 
@@ -260,9 +268,15 @@ class DataParallelInferenceCoordinator:
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
+        self.handoff_ownership = HandoffOwnership()
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
+        self.disaggregated_runtime = DisaggCoordinatorRuntime(self) if disaggregated else None
+
+    def is_disaggregated_inference(self) -> bool:
+        """Whether this coordinator manages native prefill/decode handoffs."""
+        return self.disaggregated_runtime is not None
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -273,10 +287,7 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the least-loaded data parallel rank.
         """
-        if not self._identities_list:
-            raise RuntimeError("No engines connected")
-        best_idx = int(np.argmin(self._pending_counts))
-        return self._identities_list[best_idx]
+        return select_engine(self._identities_list, self._pending_counts)
 
     def _update_media_affinity(self, media_cache_key: str, identity: bytes) -> None:
         """Record the rank most recently assigned a generated media key."""
@@ -305,6 +316,14 @@ class DataParallelInferenceCoordinator:
             len(self._identities_list),
         )
 
+    def _forget_client_request(self, request_id):
+        """Remove both directions of client routing and return the former client IDs."""
+        client_identity = self.request_id_to_client_id.pop(request_id, None)
+        client_request_id = self.request_id_to_client_request_id.pop(request_id, None)
+        if client_identity is not None and client_request_id is not None:
+            self.client_request_to_request_id.pop((client_identity, client_request_id), None)
+        return client_identity, client_request_id
+
     def _remove_engine(self, identity):
         """Remove a disconnected engine from all routing bookkeeping.
         Called both during shutdown and when an engine becomes unreachable mid-operation
@@ -312,6 +331,8 @@ class DataParallelInferenceCoordinator:
         rebuild are acceptable because the number of connected engines is small; optimize
         only if dynamic registration/deregistration at high engine counts becomes a use case.
         """
+        if identity not in self.identities_of_data_parallel_ranks:
+            return
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
         self._media_cache_affinity = OrderedDict(
@@ -319,6 +340,8 @@ class DataParallelInferenceCoordinator:
             for media_key, assigned_identity in self._media_cache_affinity.items()
             if assigned_identity != identity
         )
+        # Losing the control connection does not prove source allocations are gone.
+        # Keep handoff ownership so cleanup can retry if the engine reconnects.
         idx = self.identity_to_rank_index.pop(identity, None)
         if idx is None:
             return
@@ -343,28 +366,32 @@ class DataParallelInferenceCoordinator:
             if new_row:
                 new_hash_table[h] = new_row
         self._hash_table = new_hash_table
+        # Remove role routing and fail disaggregated work assigned to the dead engine.
+        if self.is_disaggregated_inference():
+            self.disaggregated_runtime.remove_engine(identity)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, frames):
-        """Send a message to an engine, removing it from the pool if unreachable.
+    def _send_to_engine(self, identity, frames, *, remove_unreachable=True):
+        """Send a message to an engine, optionally removing it if unreachable.
 
         Args:
             identity: ZMQ identity of the target engine.
             frames (list): Raw frames to send, metadata frame first.
 
         Returns:
-            True if the send succeeded, False if the engine was unreachable and removed.
+            True if the send succeeded, otherwise False.
         """
         try:
             self.router_socket.send_multipart([identity, *frames])
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
-                self._remove_engine(identity)
+                if remove_unreachable:
+                    self._remove_engine(identity)
                 return False
             raise
 
@@ -420,6 +447,28 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
+        return select_engine(
+            self._identities_list,
+            self._pending_counts,
+            affinity_scores=self.get_routing_affinity(
+                self._identities_list, self._pending_counts, request_hashes, media_cache_key
+            ),
+            routing_alpha=self.prefix_caching_routing_alpha,
+        )
+
+    def get_routing_affinity(
+        self,
+        identities: list[bytes],
+        counts: np.ndarray,
+        request_hashes: list[int],
+        media_cache_key: str | None = None,
+    ) -> np.ndarray | None:
+        """Read normalized cache affinity for an ordered eligible engine pool.
+
+        Return None when no candidate has a policy-enabled cache hit. Counts
+        align with identities and gate media affinity at request capacity.
+        Cache state stays here; callers own eligibility, load and selection.
+        """
         # Use load-balancing if text or multimodal coordination affinity is deactivated.
         has_media = isinstance(media_cache_key, str) and bool(media_cache_key)
         use_prefix_affinity = (
@@ -434,28 +483,31 @@ class DataParallelInferenceCoordinator:
             and self.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
         if not use_prefix_affinity and not use_media_affinity:
-            return self.get_least_loaded_data_parallel_rank()
+            return None
 
         # Compute text affinity.
-        n_ranks = len(self._identities_list)
+        n_ranks = len(identities)
         prefix_blocks = np.zeros(n_ranks, dtype=np.float64)
         if use_prefix_affinity:
             prefix_blocks = self._prefix_depth_vector(request_hashes)
+            if identities is not self._identities_list:
+                prefix_blocks = prefix_blocks[
+                    [self.identity_to_rank_index[identity] for identity in identities]
+                ]
 
         # Compute multimodal affinity.
         media_hit = np.zeros(n_ranks, dtype=np.float64)
         if use_media_affinity:
             media_identity = self._media_cache_affinity.get(media_cache_key)
-            media_rank_idx = self.identity_to_rank_index.get(media_identity)
-            if (
-                media_rank_idx is not None
-                and self._pending_counts[media_rank_idx] < self.max_requests
-            ):
+            media_rank_idx = (
+                identities.index(media_identity) if media_identity in identities else None
+            )
+            if media_rank_idx is not None and counts[media_rank_idx] < self.max_requests:
                 media_hit[media_rank_idx] = 1.0
 
         # If there are no hits anywhere, just fall-back to load balancing.
         if not prefix_blocks.any() and not media_hit.any():
-            return self.get_least_loaded_data_parallel_rank()
+            return None
 
         # Fraction of this request's reusable work that each rank already holds,
         # combining prompt blocks with a weighted media hit. Normalized by the most
@@ -466,32 +518,7 @@ class DataParallelInferenceCoordinator:
         maximum_reusable_work = prefix_block_count + (
             self.media_cache_routing_weight if use_media_affinity else 0.0
         )
-        cache_score = (
-            reusable_work / maximum_reusable_work if maximum_reusable_work > 0 else reusable_work
-        )
-
-        # Penalise a rank for the load it carries *relative to the fleet* rather
-        # than for its absolute occupancy. Measuring against max_requests scales
-        # the term by a configured ceiling instead of the actual operating point:
-        # with a large ceiling a sizeable imbalance stays a small fraction of it,
-        # so affinity wins however lopsided the fleet gets. Against the mean the
-        # term vanishes while ranks are even -- at saturation this is pure affinity
-        # -- and grows only as they diverge, which is the drain at the end of a
-        # batch, exactly when work should spread to idle ranks.
-        #
-        # Subtractive rather than a convex blend, so a full cache hit cannot cancel
-        # the load term and strand work on a saturated rank. Both terms are
-        # normalized, which is what makes alpha dimensionless.
-        #
-        # The mean is floored at 1 so a near-idle fleet does not turn a single
-        # in-flight request into a large relative load and thrash on noise.
-        mean_load = float(self._pending_counts.mean()) if n_ranks else 0.0
-        relative_load = (self._pending_counts - mean_load) / max(1.0, mean_load)
-        scores = cache_score - self.prefix_caching_routing_alpha * relative_load
-
-        # Tiebreak: highest score, then least loaded, then lowest rank index.
-        order = np.lexsort((np.arange(n_ranks), self._pending_counts, -scores))
-        return self._identities_list[int(order[0])]
+        return reusable_work / maximum_reusable_work if maximum_reusable_work > 0 else reusable_work
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.
@@ -660,6 +687,7 @@ class DataParallelInferenceCoordinator:
         vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -704,6 +732,7 @@ class DataParallelInferenceCoordinator:
             vision_embedding_cache_enabled=vision_embedding_cache_enabled,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            disaggregated=disaggregated,
         )
         ready_event.set()
         try:

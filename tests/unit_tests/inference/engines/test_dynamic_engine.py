@@ -1575,6 +1575,59 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
 
 
+def test_post_process_zero_token_handoff_keeps_resume_log_prob():
+    request = DynamicInferenceRequest(
+        request_id=17,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=0,
+            termination_id=-1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            do_kv_handoff=True,
+        ),
+    )
+    future = mock.Mock()
+    future.done.return_value = False
+    entry = types.SimpleNamespace(
+        record=DynamicInferenceRequestRecord.from_request(request), future=future
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        kv_block_allocator=types.SimpleNamespace(), remove_vlm_request_data=mock.Mock()
+    )
+    engine.requests = {request.request_id: entry}
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine._prepare_handoff_metadata_batch = mock.Mock(return_value={request.request_id: "meta"})
+    engine._capture_handoff_meta = mock.Mock()
+
+    active_request_ids, finished_requests = engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        finished_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        evict_request_ids=torch.empty(0, dtype=torch.int64),
+        step_time=0.0,
+        sample=torch.tensor([99], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-0.25]],
+        consumed_chunked_prefill_request_id=-1,
+        finished_handoff_block_ids={request.request_id: [10]},
+        finished_handoff_decode_tokens={request.request_id: [99]},
+    )
+
+    assert active_request_ids == []
+    assert len(finished_requests) == 1
+    finished_request = finished_requests[0]
+    assert finished_request.generated_tokens == []
+    assert not finished_request.generated_log_probs
+    assert engine._prepare_handoff_metadata_batch.call_args.args[2] == {request.request_id: [-0.25]}
+    engine._capture_handoff_meta.assert_called_once_with(request, "meta")
+    future.set_result.assert_called_once_with(finished_request)
+
+
 @pytest.mark.asyncio
 async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     """Normal and failed completion each expose their one future-owned flat request."""
@@ -2503,6 +2556,37 @@ def _submit_request_message(request_id, sampling_params, prompt, offload_params)
         msgpack.packb(None, use_bin_type=True),
         msgpack.packb(offload_params, use_bin_type=True),
     ]
+
+
+@pytest.mark.parametrize("offload_params", [None, {"destination": "payload-store"}])
+def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params):
+    params = SamplingParams(num_tokens_to_generate=2)
+    kv_meta = {"resume_tokens": [99]}
+    message = [
+        msgpack.packb([Headers.SUBMIT_REQUEST_WITH_KV.value, 42, params.serialize(), kv_meta]),
+        msgpack.packb([3, 4]),
+        msgpack.packb([7]),
+    ]
+    if offload_params is not None:
+        message.append(msgpack.packb(offload_params))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request_with_kv_handoff = mock.Mock()
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+        message,
+        dynamic_engine.zmq.Again,
+    ]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    assert engine.schedule_requests() == 1
+    engine.add_request_with_kv_handoff.assert_called_once_with(
+        42, [3, 4], params, kv_meta, [7], offload_params=offload_params
+    )
 
 
 def test_engine_prepares_prompt_before_model_parallel_broadcast():

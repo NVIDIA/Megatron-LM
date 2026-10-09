@@ -23,7 +23,10 @@ import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
 from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, plan_ssm_reshard
-from megatron.core.inference.disaggregation.transfer_backends.base import compute_buffer_geometry
+from megatron.core.inference.disaggregation.transfer_backends.base import (
+    TransferStartError,
+    compute_buffer_geometry,
+)
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
@@ -133,6 +136,12 @@ class NixlPullHandle:
     timeout_s: float = _POLL_TIMEOUT_S
     done: bool = False
     error: Optional[str] = None
+
+    @property
+    def storage_safe(self) -> bool:
+        """Whether every operation has stopped accessing its buffers."""
+
+        return self.done
 
     def poll(self) -> bool:
         """Return True if every transfer has settled, without blocking."""
@@ -631,6 +640,8 @@ class NixlTransferBackend:
                 xfers.append(xfer)
                 contexts.append(ctx)
         except Exception as exc:
+            storage_safe = not isinstance(exc, TransferStartError) or exc.storage_safe
+            unsafe_cleanup = None
             if xfers:
                 cleanup = NixlPullHandle(
                     agent=self._agent, xfers=xfers, contexts=contexts, submitted_at=submitted_at
@@ -640,11 +651,24 @@ class NixlTransferBackend:
                 except TimeoutError:
                     # Tell the owner not to recycle the destination storage while
                     # an already-submitted transfer may still write to it.
-                    setattr(exc, "transfer_destinations_safe", False)
+                    storage_safe = False
+                    unsafe_cleanup = cleanup
                 except Exception:
                     # Transfer errors are reported only after every submitted
                     # transfer has reached a terminal state.
                     pass
+            if isinstance(exc, TransferStartError):
+                if unsafe_cleanup is not None:
+                    exc.resources = (unsafe_cleanup, exc.resources)
+                    exc.cleanup_handles.append(unsafe_cleanup)
+                raise
+            if not storage_safe:
+                raise TransferStartError(
+                    str(exc),
+                    storage_safe=False,
+                    resources=unsafe_cleanup,
+                    cleanup_handles=[unsafe_cleanup],
+                ) from exc
             raise
         return NixlPullHandle(
             agent=self._agent, xfers=xfers, contexts=contexts, submitted_at=submitted_at
@@ -732,8 +756,15 @@ class NixlTransferBackend:
         except Exception as exc:
             # The transport may have accepted the operation before surfacing an
             # error, so its destination cannot be proven safe for immediate reuse.
-            setattr(exc, "transfer_destinations_safe", False)
-            raise
+            cleanup = NixlPullHandle(
+                agent=self._agent, xfers=[xfer], contexts=[ctx], submitted_at=time.perf_counter()
+            )
+            raise TransferStartError(
+                str(exc),
+                storage_safe=False,
+                resources=(xfer, src_descs, dst_descs),
+                cleanup_handles=[cleanup],
+            ) from exc
         return xfer, ctx
 
     def close(self) -> None:

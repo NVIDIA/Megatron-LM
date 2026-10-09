@@ -19,10 +19,13 @@ class DeferredKvHandoff:
     prompt: list
     sampling_params: SamplingParams
     kv_meta: dict
+    resume_tokens: List[int]
+    resume_log_probs: List[float]
     src_block_ids: List[int]
     hashes: List[int]
     num_blocks: int
     future: asyncio.Future
+    offload_params: dict | None = None
 
 
 @dataclass(kw_only=True)
@@ -46,8 +49,11 @@ class PendingKvImport:
     handle: Any
     future: asyncio.Future
     ssm: PendingSSMImport | None = None
+    offload_params: dict | None = None
     resume_tokens: List[int] = field(default_factory=list)  # Sampled token, then MTP proposals.
+    resume_log_probs: List[float] = field(default_factory=list)  # First sampled token only.
     continuation_blocks: List[int] = field(default_factory=list)  # Empty KV for resume writes.
     local_error: Exception | None = None  # Exact local error, if this rank failed.
     destinations_safe: bool = True  # Whether allocated blocks may return to the pool.
     terminal_state_reported: bool = False  # Avoid repeat reports and premature block reuse.
+    cancel_requested: bool = False

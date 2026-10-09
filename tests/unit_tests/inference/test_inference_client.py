@@ -8,7 +8,7 @@ import pytest
 import zmq
 
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from megatron.core.inference.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.asyncio
@@ -53,7 +53,7 @@ async def test_inference_client_lifecycle():
     # one. Subsequent recvs raise zmq.Again so the listener yields back to the
     # event loop.
     recv_queue = [
-        [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
+        [msgpack.packb([Headers.CONNECT_ACK.value, "coordinator-instance"], use_bin_type=True)],
         [
             msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
             msgpack.packb({"foo": "bar"}, use_bin_type=True),
@@ -68,6 +68,7 @@ async def test_inference_client_lifecycle():
     fake_socket.recv_multipart.side_effect = fake_recv
 
     client.start()
+    assert client.coordinator_instance_id == "coordinator-instance"
     assert isinstance(client.listener_task, asyncio.Task)
     sent_connect = fake_socket.send.call_args.args[0]
     assert msgpack.unpackb(sent_connect, raw=False)[0] == Headers.CONNECT.value
@@ -168,6 +169,120 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert msgpack.unpackb(prompt_frame, raw=False) == [1, 2, 3]
     assert msgpack.unpackb(blocks_frame, raw=False) == [10, 11]
     future.cancel()
+
+
+async def test_terminal_error_and_abort_acknowledgement():
+    client, _, fake_socket = _make_client()
+    recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
+
+    def fake_recv(*args, **kwargs):
+        if recv_queue:
+            return recv_queue.pop(0)
+        raise zmq.Again()
+
+    fake_socket.recv_multipart.side_effect = fake_recv
+    client.start()
+
+    failed = client.add_request("failed", SamplingParams())
+    recv_queue.append([msgpack.packb([Headers.REQUEST_ERROR.value, 0, "transfer failed", True])])
+    with pytest.raises(InferenceRequestError, match="transfer failed") as error:
+        await asyncio.wait_for(failed, timeout=2.0)
+    assert error.value.source_safe
+
+    unsafe = client.add_request("unsafe", SamplingParams())
+    recv_queue.append([msgpack.packb([Headers.REQUEST_ERROR.value, 1, "read failed", False])])
+    with pytest.raises(InferenceRequestError, match="read failed") as error:
+        await asyncio.wait_for(unsafe, timeout=2.0)
+    assert not error.value.source_safe
+    assert 1 not in client.abort_futures
+    abort_ack = client.abort_request_and_wait(1)
+    assert abort_ack.get_loop() is asyncio.get_running_loop()
+    assert not abort_ack.done()
+    abort_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert abort_payload == [Headers.ABORT_REQUEST.value, 1]
+    recv_queue.append([msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True])])
+    assert await asyncio.wait_for(abort_ack, timeout=2.0)
+    await asyncio.sleep(0)
+    assert 1 not in client.abort_futures
+    assert 1 not in client.aborted_request_ids
+
+    recv_queue.append(
+        [
+            msgpack.packb([Headers.ENGINE_REPLY.value, 1], use_bin_type=True),
+            msgpack.packb({}, use_bin_type=True),
+        ]
+    )
+    await asyncio.sleep(0.01)
+    assert not client.listener_task.done()
+
+    client.stop()
+
+
+@pytest.mark.parametrize("completed_before_abort", [False, True])
+async def test_abort_acknowledges_racing_normal_completion(completed_before_abort):
+    client, _, socket = _make_client()
+    replies = [[msgpack.packb([Headers.CONNECT_ACK.value])]]
+
+    def receive(*args, **kwargs):
+        if replies:
+            return replies.pop(0)
+        raise zmq.Again()
+
+    socket.recv_multipart.side_effect = receive
+    client.start()
+    try:
+        stream = client.add_request_streaming([1, 2], SamplingParams())
+        reply = [
+            msgpack.packb([Headers.ENGINE_REPLY.value, stream.request_id]),
+            msgpack.packb({"status": "COMPLETED", "generated_tokens": [3]}),
+        ]
+        if completed_before_abort:
+            replies.append(reply)
+            async with asyncio.timeout(2):
+                while stream.request_id in client.streams:
+                    await asyncio.sleep(0.005)
+        socket.send.reset_mock()
+        ack = client.abort_request_and_wait(stream.request_id)
+        if completed_before_abort:
+            socket.send.assert_not_called()
+        else:
+            replies.append(reply)
+        assert await asyncio.wait_for(ack, timeout=2)
+        assert not client._pending_source_requests
+        assert not client.aborted_request_ids
+        with pytest.raises(ValueError, match="Unknown request ID"):
+            client.abort_request_and_wait(client.next_request_id)
+    finally:
+        client.stop()
+
+
+async def test_fire_and_forget_abort_acknowledgement_clears_late_reply_guard():
+    client, _, fake_socket = _make_client()
+    recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
+
+    def fake_recv(*args, **kwargs):
+        if recv_queue:
+            return recv_queue.pop(0)
+        raise zmq.Again()
+
+    fake_socket.recv_multipart.side_effect = fake_recv
+    client.start()
+
+    request_id, _ = client.add_request_with_id("aborted", SamplingParams())
+    assert client.abort_request(request_id) is None
+    assert request_id in client.aborted_request_ids
+    assert request_id not in client.abort_futures
+
+    recv_queue.append(
+        [msgpack.packb([Headers.REQUEST_ABORTED.value, request_id, True], use_bin_type=True)]
+    )
+    for _ in range(100):
+        if request_id not in client.aborted_request_ids:
+            break
+        await asyncio.sleep(0.005)
+
+    assert request_id not in client.aborted_request_ids
+    client.stop()
 
 
 def _configured_client(policy=None, block_size=4):

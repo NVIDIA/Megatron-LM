@@ -36,6 +36,14 @@ except:
     HAVE_MSGPACK = False
 
 
+class InferenceRequestError(RuntimeError):
+    """Terminal request failure reported by the inference coordinator."""
+
+    def __init__(self, reason: str, *, source_safe: bool = False):
+        super().__init__(reason)
+        self.source_safe = source_safe
+
+
 class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
@@ -104,8 +112,16 @@ class InferenceClient:
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
+        self.coordinator_instance_id: str | None = None
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
+        # Cancellation and local shutdown do not prove remote transfers safe.
+        # Only a terminal reply or explicit source-safe acknowledgement removes an ID.
+        self._pending_source_requests: set[int] = set()
+        # Resolves when abort cleanup makes transferred state safe to reuse.
+        self.abort_futures: dict[int, asyncio.Future] = {}
+        # Background socket receiver for request, stream, and abort replies.
+        self.listener_task: asyncio.Task | None = None
         self.block_size_tokens = block_size_tokens
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
 
@@ -401,10 +417,38 @@ class InferenceClient:
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
+
+        self._send_abort(request_id)
+
+    def abort_request_and_wait(self, request_id: int) -> asyncio.Future:
+        """Cancel a request and return its source-safety acknowledgement."""
+
+        request_id = int(request_id)
+        if not 0 <= request_id < self.next_request_id:
+            raise ValueError(f"Unknown request ID: {request_id}")
+        existing = self.abort_futures.get(request_id)
+        if existing is not None:
+            return existing
+        abort_future = self._new_abort_future(request_id)
+        if request_id not in self._pending_source_requests:
+            abort_future.set_result(True)
+        else:
+            self._send_abort(request_id)
+        return abort_future
+
+    def _mark_source_safe(self, request_id: int) -> None:
+        """Resolve cancellation even when normal completion wins the race."""
+        self._pending_source_requests.discard(request_id)
+        future = self.abort_futures.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(True)
+
+    def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
         stream = self.streams.pop(request_id, None)
         future = self.completion_futures.pop(request_id, None)
-        if stream is None and future is None:
+        abort_future = self.abort_futures.get(request_id)
+        if stream is None and future is None and abort_future is None:
             # Already completed (or never submitted): _submit_request and
             # _submit_stream register synchronously and _recv_task pops only
             # immediately before delivering, so absence from both means the
@@ -421,6 +465,20 @@ class InferenceClient:
         self.aborted_request_ids.add(request_id)
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
+    def _new_abort_future(self, request_id: int) -> asyncio.Future:
+        """Create a future for the request's source-safety acknowledgement."""
+
+        future = asyncio.get_running_loop().create_future()
+        self.abort_futures[request_id] = future
+        future.add_done_callback(functools.partial(self._discard_abort_future, request_id))
+        return future
+
+    def _discard_abort_future(self, request_id: int, future: asyncio.Future) -> None:
+        """Remove a completed acknowledgement without discarding a newer waiter."""
+
+        if self.abort_futures.get(request_id) is future:
+            self.abort_futures.pop(request_id)
 
     def add_request_streaming(
         self,
@@ -475,6 +533,7 @@ class InferenceClient:
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
+        self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
@@ -484,6 +543,7 @@ class InferenceClient:
 
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
+        self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
@@ -513,6 +573,7 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id = data[1]
+                    self._mark_source_safe(request_id)
                     if request_id in self.aborted_request_ids:
                         self.aborted_request_ids.discard(request_id)
                         continue
@@ -531,7 +592,12 @@ class InferenceClient:
                         stream.put({"final": completed_request})
                         stream.finish()
                         continue
-                    completion_future = self.completion_futures.pop(request_id)
+                    completion_future = self.completion_futures.pop(request_id, None)
+                    if completion_future is None:
+                        logging.warning(
+                            "Client: ignoring late ENGINE_REPLY for request %d", request_id
+                        )
+                        continue
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
@@ -544,6 +610,25 @@ class InferenceClient:
                     stream = self.streams.get(request_id)
                     if stream is not None:
                         stream.put({"partial": msgpack.unpackb(frames[1], raw=False)})
+                elif header == Headers.REQUEST_ERROR:
+                    request_id, reason, source_safe = data[1:]
+                    self.request_submission_times.pop(request_id, None)
+                    error = InferenceRequestError(str(reason), source_safe=bool(source_safe))
+                    if source_safe:
+                        self._mark_source_safe(request_id)
+                        self.aborted_request_ids.discard(request_id)
+                    stream = self.streams.pop(request_id, None)
+                    if stream is not None:
+                        stream.finish(exception=error)
+                        continue
+                    future = self.completion_futures.pop(request_id, None)
+                    if future is not None and not future.done():
+                        future.set_exception(error)
+                elif header == Headers.REQUEST_ABORTED:
+                    request_id, source_safe = int(data[1]), bool(data[2])
+                    if source_safe:
+                        self._mark_source_safe(request_id)
+                        self.aborted_request_ids.discard(request_id)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -565,6 +650,7 @@ class InferenceClient:
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
         reply = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
         assert Headers(reply[0]) == Headers.CONNECT_ACK
+        self.coordinator_instance_id = str(reply[1]) if len(reply) > 1 else None
 
     def start(
         self,
@@ -666,7 +752,7 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        if hasattr(self, 'listener_task') and not self.listener_task.done():
+        if self.listener_task is not None and not self.listener_task.done():
             self.listener_task.cancel()
         # Wake up any listeners.
         for future in self.completion_futures.values():
@@ -677,6 +763,10 @@ class InferenceClient:
         for stream in self.streams.values():
             stream.finish()
         self.streams.clear()
+        for future in self.abort_futures.values():
+            if not future.done():
+                future.cancel()
+        self.abort_futures.clear()
         self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()
