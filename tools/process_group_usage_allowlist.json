@@ -108,8 +108,7 @@
       "build_inference_pg_collection:accessor:parallel_state.get_tensor_model_parallel_world_size"
     ],
     "megatron/core/inference/text_generation_controllers/text_generation_controller.py": [
-      "TextGenerationController.__init__:accessor:parallel_state.get_data_parallel_group",
-      "TextGenerationController.__init__:accessor:parallel_state.get_pipeline_model_parallel_group"
+      "TextGenerationController.__init__:accessor:parallel_state.get_data_parallel_group"
     ],
     "megatron/core/inference/text_generation_server/dynamic_text_gen_server/tokenization.py": [
       "tokenize_prompts:accessor:parallel_state.get_data_parallel_src_rank"
@@ -320,5 +319,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 210
+  "total": 209
 }
