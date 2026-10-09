@@ -5800,9 +5800,9 @@ class TransformerConfig(ModelParallelConfig):
         )
 
         if self.pipeline_model_parallel_prewarm:
-            assert self.pipeline_model_parallel_size > 1, (
-                "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
-            )
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 
