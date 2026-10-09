@@ -511,6 +511,11 @@ class TransformerConfig(ModelParallelConfig):
     This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
+    gdn_gated_output_norm_fusion: bool = False
+    """Fuse GDN-family output RMSNorm with SiLU gating for GDN or sigmoid gating for KDA.
+    Unsupported configurations and layouts raise on every forward; see
+    docs/developer/gdn_ew_fusion.md for requirements."""
+
     ####################
     # initialization
     ####################
@@ -2155,6 +2160,15 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
                 "experimental_attention_variant='gdn'."
+            )
+
+        if self.gdn_gated_output_norm_fusion and not is_gated_delta_net_variant(
+            self.experimental_attention_variant
+        ):
+            raise ValueError(
+                "gdn_gated_output_norm_fusion is only supported with "
+                "experimental_attention_variant='gdn' or 'kda' "
+                "or deprecated alias experimental_attention_variant='gated_delta_net'."
             )
 
         if self.fp8:
