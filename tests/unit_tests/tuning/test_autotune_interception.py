@@ -5,6 +5,8 @@
 import json
 import logging
 import os
+import sys
+import types
 from dataclasses import asdict
 from unittest.mock import Mock
 
@@ -59,7 +61,27 @@ def test_install_is_cuda_lazy(isolated_policy, monkeypatch):
         pytest.fail("install queried CUDA before rank-local device selection")
 
     monkeypatch.setattr(selection, "arch_tag", unexpected_device_query)
-    assert interception.install(AutotunePolicy(mode="pinned"))
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert interception._installed
+
+
+def test_install_refuses_a_triton_without_the_patched_autotuner(isolated_policy, monkeypatch):
+    interception.install(AutotunePolicy(mode="auto"))
+    monkeypatch.setitem(
+        sys.modules, "triton.runtime.autotuner", types.ModuleType("triton.runtime.autotuner")
+    )
+    with pytest.raises(ImportError, match="patches triton.runtime.autotuner.Autotuner"):
+        interception.install(AutotunePolicy(mode="pinned"))
+    # A policy that could not be carried out changes nothing.
+    assert interception.active_policy() == AutotunePolicy(mode="auto")
+    assert not interception._installed
+
+
+def test_install_without_triton_has_nothing_to_patch(isolated_policy, monkeypatch):
+    monkeypatch.setitem(sys.modules, "triton", None)
+    interception.install(AutotunePolicy(mode="pinned"))
+    assert interception.active_policy() == AutotunePolicy(mode="pinned")
+    assert not interception._installed
 
 
 def test_install_pins_in_tree_tuner_created_before_install(isolated_policy, monkeypatch):

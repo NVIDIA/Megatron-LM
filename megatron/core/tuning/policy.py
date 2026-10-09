@@ -15,11 +15,9 @@ Pinning the choice to a pure function of the candidate list fixes both. This
 module holds the intent; :mod:`megatron.core.tuning.interception` carries it out.
 """
 
-from __future__ import annotations
-
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Literal
 
 import torch
@@ -89,10 +87,13 @@ class AutotunePolicy:
     """Module prefixes to act on, matched at package boundaries. Kernels outside
     them keep Triton's timed choice."""
 
-    config_invariant: tuple[str, ...] = DEFAULT_CONFIG_INVARIANT
+    config_invariant: tuple[str, ...] = field(
+        default=DEFAULT_CONFIG_INVARIANT, metadata={"argparse_meta": {"nargs": "*"}}
+    )
     """Qualified kernel names (``module.function``) whose outputs do not depend on
     the launch configuration. They keep Triton's timed choice even in ``pinned`` mode,
-    since pinning them costs throughput without changing any result."""
+    since pinning them costs throughput without changing any result. An empty tuple
+    pins every kernel in scope."""
 
     table_path: tuple[str, ...] = ()
     """Directories searched for tuned tables before the packaged defaults. ``~`` is
@@ -187,7 +188,7 @@ class AutotunePolicy:
         Keys set to ``None`` fall back to their defaults, as an omitted key would.
         Unknown keys raise, so a misspelled option cannot be silently ignored.
         """
-        known = {field.name for field in fields(cls)}
+        known = {item.name for item in fields(cls)}
         unknown = sorted(set(values) - known)
         if unknown:
             raise TypeError(f"Unknown AutotunePolicy option(s): {', '.join(unknown)}")

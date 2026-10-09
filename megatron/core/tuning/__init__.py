@@ -31,8 +31,8 @@ Recording a table for a new architecture::
 
 Seeing what a run actually did::
 
-    --triton-autotune-enumerate          # every multi-config autotuner reached
-    --triton-autotune-verify-every 1     # compare observed choices at each step
+    --triton-autotune-enumerate-autotuners  # every multi-config autotuner reached
+    --triton-autotune-verify-every 1        # compare observed choices at each step
 """
 
 from megatron.core.tuning.interception import (

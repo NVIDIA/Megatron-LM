@@ -207,7 +207,7 @@ def maybe_verify_choices(iteration: int, group=None) -> bool | None:
     return verify_choices(group=group)
 
 
-def install(policy: AutotunePolicy | Mapping | None = None, *, deterministic: bool = False) -> bool:
+def install(policy: AutotunePolicy | Mapping | None = None, *, deterministic: bool = False) -> None:
     """Apply ``policy`` to the whole process, replacing the previous one.
 
     Call during initialization, before kernels run. Megatron's training
@@ -215,15 +215,16 @@ def install(policy: AutotunePolicy | Mapping | None = None, *, deterministic: bo
     callers that build models directly call it themselves. ``None`` applies the
     default policy, and a mapping is converted. An omitted ``mode`` is derived:
     a recording path selects ``record``, ``deterministic`` or PyTorch's
-    deterministic flag selects ``pinned``, and anything else ``auto``. A policy
-    that fails to install, such as one whose recording path is not writable,
-    leaves the previous one in place. Repeated calls reuse the same adapter
-    rather than nesting patches.
+    deterministic flag selects ``pinned``, and anything else ``auto``. Repeated
+    calls reuse the same adapter rather than nesting patches.
 
-    Returns whether the adapter is installed.
+    Raises if the policy cannot be carried out, such as when its recording path
+    is not writable or when Triton is installed without the autotuner this
+    adapter patches; the previous policy then stays in place. Without Triton no
+    kernel is autotuned, so there is nothing to patch.
     """
     policy = coerce_policy(policy) or AutotunePolicy()
-    return _install(policy.resolve(deterministic=deterministic))
+    _install(policy.resolve(deterministic=deterministic))
 
 
 def _reset_runtime_state() -> None:
@@ -242,8 +243,30 @@ def _reset_runtime_state() -> None:
     selection.reset_warnings()
 
 
-def _install(policy: AutotunePolicy) -> bool:
+def _autotuner_class():
+    """Triton's ``Autotuner``, or ``None`` when Triton is not installed."""
+    try:
+        import triton
+    except ImportError:
+        # Without Triton no kernel is autotuned, so there is nothing to patch.
+        return None
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError as exc:
+        # Triton kernels would still run, but outside the policy.
+        raise ImportError(
+            "The Triton autotune policy patches triton.runtime.autotuner.Autotuner, "
+            f"which Triton {triton.__version__} does not provide"
+        ) from exc
+    return Autotuner
+
+
+def _install(policy: AutotunePolicy) -> None:
     global _installed, _policy
+
+    # Look the autotuner up before changing any state, so that a policy which
+    # cannot be carried out leaves the previous one in place.
+    autotuner_class = _autotuner_class() if policy.intercepts and not _installed else None
 
     if policy != _policy:
         if policy.mode == "record":
@@ -254,16 +277,10 @@ def _install(policy: AutotunePolicy) -> bool:
         _reset_runtime_state()
         selection.warn_if_mamba_env_ignored(policy)
 
-    if _installed:
-        return True
-    if not policy.intercepts:
-        return False
-    try:
-        from triton.runtime.autotuner import Autotuner
-    except ImportError:
-        return False
+    if autotuner_class is None:
+        return
 
-    original_run = Autotuner.run
+    original_run = autotuner_class.run
 
     @wraps(original_run)
     def policy_run(self, *args, **kwargs):
@@ -355,10 +372,9 @@ def _install(policy: AutotunePolicy) -> bool:
             self.configs = candidates
             self.nargs = nargs
 
-    Autotuner.run = policy_run
+    autotuner_class.run = policy_run
     atexit.register(_dump_records)
     _installed = True
-    return True
 
 
 __all__ = [

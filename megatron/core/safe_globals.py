@@ -25,7 +25,6 @@ from megatron.core.transformer.enums import (
     CudaGraphScope,
     InferenceCudaGraphScope,
 )
-from megatron.core.tuning.policy import AutotunePolicy
 
 SAFE_GLOBALS = [
     SimpleNamespace,
@@ -41,8 +40,6 @@ SAFE_GLOBALS = [
     InferenceCudaGraphScope,
     ModelType,
     OptimizerConfig,
-    # Training arguments, and so checkpoints, carry the validated Triton autotune policy.
-    AutotunePolicy,
     RerunDiagnostic,
     RerunMode,
     RerunState,

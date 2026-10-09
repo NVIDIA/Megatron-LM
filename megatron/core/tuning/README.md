@@ -12,10 +12,10 @@ settings such as selection mode, module scope, table paths, and verification
 cadence. Installing it applies the settings to the whole process, so it is
 installed once, during initialization, before any Triton kernel runs.
 
-Training builds the policy from the `--triton-autotune-*` arguments while
-validating them, and `initialize_megatron` installs it right after enabling
-batch-invariant mode, before distributed initialization, so the kernel warm-up
-before model construction already runs under it. `--deterministic-mode` selects
+`initialize_megatron` builds the policy from the `--triton-autotune-*`
+arguments and installs it right after enabling batch-invariant mode, before
+distributed initialization, so the kernel warm-up before model construction
+already runs under it. `--deterministic-mode` selects
 `pinned` for a policy that leaves `mode` unset. `--yaml-cfg` users put the policy
 in a top-level `triton_autotune` section:
 
@@ -43,9 +43,12 @@ install(
 ```
 
 `install` replaces the previous policy, and `install()` restores the default. A
-mapping is converted to `AutotunePolicy` and any other type is rejected first. A
-policy that fails to install, such as one whose recording path is not writable,
-leaves the previous policy in place. Installation does not query CUDA, and
+mapping is converted to `AutotunePolicy` and any other type is rejected first.
+`install` raises if the policy cannot be carried out, such as when its recording
+path is not writable or when Triton is installed without the
+`triton.runtime.autotuner.Autotuner` that the adapter patches, and the previous
+policy then stays in place. Without Triton no kernel is autotuned, so there is
+nothing to patch. Installation does not query CUDA, and
 architecture tables load on the first pinned kernel invocation. Changing the
 policy clears selected configurations, tables, and diagnostics. The adapter does
 not add thread-safety to Triton's mutable state.
@@ -204,19 +207,14 @@ adapter reports through the `logging` module rather than `warnings`, so launcher
 warning filters do not hide it. Chaos mode deliberately makes ranks choose
 different configs; use it only as a diagnostic in pinned mode.
 
-| `AutotunePolicy` field | Training argument |
-|---|---|
-| `mode` | `--triton-autotune-mode {auto,pinned,record}` |
-| `modules` | `--triton-autotune-modules mamba_ssm transformer_engine megatron.core my_package` |
-| `config_invariant` | `--triton-autotune-config-invariant pkg.module.kernel ...` (no names: pin everything) |
-| `table_path` | `--triton-autotune-table-path /tables/first /tables/second` |
-| `record_path` | `--triton-autotune-record-path /tmp/rec` |
-| `on_miss` | `--triton-autotune-on-miss {min_cost,error}` |
-| `block_sizes` | `--triton-autotune-block-sizes BLOCK_C=512 BLOCK_S=1` |
-| `verify_every` | `--triton-autotune-verify-every 10` |
-| `verify_strict` | `--triton-autotune-verify-strict` |
-| `enumerate_autotuners` | `--triton-autotune-enumerate` |
-| `chaos` | `--triton-autotune-chaos` |
+The training arguments are generated from `AutotunePolicy`: each field has a
+`--triton-autotune-<field>` argument (underscores become hyphens) whose help is
+the field's docstring, for example `--triton-autotune-on-miss error` or
+`--triton-autotune-verify-strict`. Tuple fields take several values
+(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core my_package`),
+`--triton-autotune-config-invariant` without names pins every kernel in scope,
+and `--triton-autotune-block-sizes` takes `NAME=VALUE` pairs such as
+`BLOCK_C=512 BLOCK_S=1`.
 
 Configure this policy through Python, training arguments, or YAML. In YAML, a
 `null` value means the default, and a mistyped value (such as a quoted `"false"`

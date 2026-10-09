@@ -2,14 +2,13 @@
 
 """Exercise the public Triton policy from CLI/YAML parsing through training initialization."""
 
-import io
 import sys
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import torch
 
 from megatron.core import tuning
 from megatron.core.transformer import TransformerConfig
@@ -32,6 +31,13 @@ def install_policy(monkeypatch):
     install = Mock()
     monkeypatch.setattr(tuning, 'install', install)
     return install
+
+
+def _yaml_args(section):
+    """Arguments as load_yaml returns them, with an optional triton_autotune section."""
+    if section is None:
+        return SimpleNamespace(yaml_cfg='config.yaml')
+    return SimpleNamespace(yaml_cfg='config.yaml', triton_autotune=section)
 
 
 def _validated_args(monkeypatch, *flags):
@@ -70,7 +76,7 @@ def test_cli_flags_build_the_policy(parser):
             '--triton-autotune-verify-every',
             '10',
             '--triton-autotune-verify-strict',
-            '--triton-autotune-enumerate',
+            '--triton-autotune-enumerate-autotuners',
             '--triton-autotune-chaos',
             '--triton-autotune-block-sizes',
             'BLOCK_C=512',
@@ -92,37 +98,20 @@ def test_cli_flags_build_the_policy(parser):
 
 
 def test_cli_defaults_preserve_implicit_policy(parser):
-    assert _triton_autotune_config_from_args(parser.parse_args([])) is None
+    args = parser.parse_args([])
+    # Every field has an argument, generated from the dataclass with its default.
+    assert all(hasattr(args, f'triton_autotune_{item.name}') for item in fields(AutotunePolicy))
+    assert _triton_autotune_config_from_args(args) == AutotunePolicy()
     args = parser.parse_args(['--triton-autotune-record-path', '/tmp/record'])
     policy = _triton_autotune_config_from_args(args)
     assert policy.record_path == '/tmp/record'
     assert policy.resolve(deterministic=True).mode == 'record'
 
 
-def test_python_policy_survives_argument_conversion(parser):
-    policy = AutotunePolicy(mode='auto', modules=('my_kernels',))
-    args = parser.parse_args([])
-    args.triton_autotune = policy
-    assert _triton_autotune_config_from_args(args) is policy
-
-
-def test_validation_builds_the_policy(monkeypatch):
-    assert _validated_args(monkeypatch).triton_autotune is None
+def test_validated_arguments_build_the_policy_without_storing_it(monkeypatch):
     args = _validated_args(monkeypatch, '--triton-autotune-modules', 'my_kernels')
-    assert args.triton_autotune == AutotunePolicy(modules=('my_kernels',))
-
-
-def test_policy_on_args_loads_from_a_weights_only_checkpoint():
-    policy = AutotunePolicy(
-        mode='pinned',
-        modules=('my_kernels',),
-        table_path=('/tmp/tuned',),
-        block_sizes={'BLOCK_C': 512},
-    )
-    buffer = io.BytesIO()
-    torch.save({'args': Namespace(triton_autotune=policy)}, buffer)
-    buffer.seek(0)
-    assert torch.load(buffer, weights_only=True)['args'].triton_autotune == policy
+    assert not hasattr(args, 'triton_autotune')
+    assert _triton_autotune_config_from_args(args) == AutotunePolicy(modules=('my_kernels',))
 
 
 def test_model_config_does_not_install_a_policy(install_policy):
@@ -159,7 +148,7 @@ def test_yaml_section_builds_typed_policy(as_namespace):
         values['block_sizes'] = SimpleNamespace(**values['block_sizes'])
         values = SimpleNamespace(**values)
 
-    policy = _triton_autotune_config_from_args(SimpleNamespace(triton_autotune=values))
+    policy = _triton_autotune_config_from_args(_yaml_args(values))
 
     assert policy == AutotunePolicy(
         mode='pinned', modules=('my_kernels',), block_sizes={'BLOCK_C': 512}
@@ -196,14 +185,13 @@ def test_yaml_loader_preserves_nested_block_overrides(tmp_path):
 
 
 def test_yaml_policy_nulls_fall_back_and_mistyped_values_raise():
-    nulls = SimpleNamespace(
-        triton_autotune={'mode': 'pinned', 'table_path': None, 'verify_every': None}
-    )
+    assert _triton_autotune_config_from_args(_yaml_args(None)) == AutotunePolicy()
+    nulls = _yaml_args({'mode': 'pinned', 'table_path': None, 'verify_every': None})
     assert _triton_autotune_config_from_args(nulls) == AutotunePolicy(mode='pinned')
-    quoted = SimpleNamespace(triton_autotune={'mode': 'pinned', 'chaos': 'false'})
+    quoted = _yaml_args({'mode': 'pinned', 'chaos': 'false'})
     with pytest.raises(TypeError, match='chaos must be a bool'):
         _triton_autotune_config_from_args(quoted)
-    unknown = SimpleNamespace(triton_autotune={'enumerate': True})
+    unknown = _yaml_args({'enumerate': True})
     with pytest.raises(TypeError, match='Unknown AutotunePolicy option'):
         _triton_autotune_config_from_args(unknown)
 

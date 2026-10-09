@@ -160,7 +160,7 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
         print(
             "Deterministic mode: TRITON_CACHE_AUTOTUNING=1 only applies to autotuners outside "
             "the pinned scope; pinned kernels ignore the cache and TRITON_PRINT_AUTOTUNING. "
-            "Pass --triton-autotune-enumerate to list which autotuners are pinned and "
+            "Pass --triton-autotune-enumerate-autotuners to list which autotuners are pinned and "
             "--triton-autotune-verify-every N to compare the choices ranks made.",
             flush=True,
         )

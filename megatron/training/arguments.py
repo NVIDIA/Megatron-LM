@@ -25,6 +25,7 @@ from megatron.core.transformer.cuda_graph_config import (
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.tuning import AutotunePolicy
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
@@ -35,7 +36,6 @@ from megatron.training import global_vars
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
     _default_config_from_args,
-    _triton_autotune_config_from_args,
     _wide_residual_config_from_args,
     core_transformer_config_from_args,
 )
@@ -148,7 +148,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Experimental yaml
     if args.yaml_cfg is not None:
-        if _triton_autotune_config_from_args(args) is not None:
+        cli_policy = _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
+        if cli_policy != AutotunePolicy():
             raise ValueError(
                 'Triton autotune CLI arguments cannot be combined with --yaml-cfg; '
                 'set triton_autotune in the YAML configuration instead.'
@@ -1743,9 +1744,6 @@ def validate_args(args, defaults={}):
 
         apply_determinism_to_args(args)
 
-    # Built here so a bad option fails now; training installs it in initialize_megatron.
-    args.triton_autotune = _triton_autotune_config_from_args(args)
-
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
@@ -2593,88 +2591,19 @@ def _parse_triton_autotune_block_size(value):
 
 def _add_triton_autotune_args(parser):
     """Add CLI controls for the process-wide Triton autotune policy."""
-    group = parser.add_argument_group(
-        title='Triton autotune policy',
-        description=(
-            'See megatron/core/tuning/README.md for modes, scope, tables and configuration.'
-        ),
+    autotune_factory = ArgumentGroupFactory(
+        AutotunePolicy, exclude=['block_sizes'], prefix='triton_autotune'
     )
-    group.add_argument(
-        '--triton-autotune-mode',
-        choices=('auto', 'pinned', 'record'),
-        default=None,
-        help='Choose timed autotuning, fixed configuration selection, or recording. '
-        'When omitted, a record path selects recording; otherwise deterministic mode pins.',
-    )
-    group.add_argument(
-        '--triton-autotune-modules',
-        nargs='+',
-        default=None,
-        metavar='MODULE',
-        help='Kernel module prefixes to cover; replaces the default scope '
-        '(mamba_ssm, transformer_engine, megatron.core).',
-    )
-    group.add_argument(
-        '--triton-autotune-config-invariant',
-        nargs='*',
-        default=None,
-        metavar='MODULE.KERNEL',
-        help='Qualified names of kernels whose outputs do not depend on the launch config; '
-        'they keep timed autotuning when pinned. Replaces the default list; pass no names to '
-        'pin every covered kernel.',
-    )
-    group.add_argument(
-        '--triton-autotune-table-path',
-        nargs='+',
-        default=None,
-        metavar='DIRECTORY',
-        help='Directories searched in order for architecture tables before bundled tables.',
-    )
-    group.add_argument(
-        '--triton-autotune-record-path',
-        default=None,
-        metavar='PREFIX',
-        help='File prefix for per-rank recordings: PREFIX.rankN.json.',
-    )
-    group.add_argument(
-        '--triton-autotune-on-miss',
-        choices=('min_cost', 'error'),
-        default=None,
-        help='Use a fixed minimum-cost candidate or raise when no tuned configuration matches.',
-    )
-    group.add_argument(
-        '--triton-autotune-verify-every',
-        type=int,
-        default=None,
-        metavar='STEPS',
-        help='Compare observed configurations across ranks every N training steps; 0 disables.',
-    )
-    group.add_argument(
-        '--triton-autotune-verify-strict',
-        action='store_true',
-        default=None,
-        help='Raise on cross-rank configuration disagreement instead of warning.',
-    )
-    group.add_argument(
-        '--triton-autotune-enumerate',
-        dest='triton_autotune_enumerate_autotuners',
-        action='store_true',
-        default=None,
-        help='Log every autotuner with multiple candidates reached by the workload.',
-    )
-    group.add_argument(
-        '--triton-autotune-chaos',
-        action='store_true',
-        default=None,
-        help='Test divergence detection by selecting different configurations across ranks.',
-    )
+    group = autotune_factory.build_group(parser, title='Triton autotune policy')
+    # NAME=VALUE pairs cannot be inferred from the field type.
     group.add_argument(
         '--triton-autotune-block-sizes',
         type=_parse_triton_autotune_block_size,
         nargs='+',
-        default=None,
+        default=(),
         metavar='BLOCK_NAME=VALUE',
-        help='Fallback block-size constraints, for example BLOCK_SIZE=128 BLOCK_M=64.',
+        help='Block sizes to match when no tuned table entry applies, '
+        'for example BLOCK_SIZE=128 BLOCK_M=64.',
     )
     return parser
 

@@ -32,7 +32,7 @@ Each variable may be set by the launcher or left unset. If set, the value must b
 | `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` or `:16:8` | `:4096:8` | Deterministic cuBLAS workspace (both sizes are reproducible per NVIDIA docs; `:4096:8` is faster, `:16:8` uses less memory) |
 | `TRITON_CACHE_AUTOTUNING` | `0` or `1` | *(none — opt-in)* | Persists Triton autotune winners for autotuners **outside** the pinned scope, so ranks reuse one choice instead of re-timing it. Kernels inside the scope are pinned without timing either way — see [Triton autotuning](#triton-autotuning) |
 | `TRITON_CACHE_DIR` | any shared-filesystem path | *(none — required only with `TRITON_CACHE_AUTOTUNING=1`)* | No safe default exists: unset, Triton uses a node-local directory and each node autotunes on its own. Required rather than filled in |
-| `TRITON_PRINT_AUTOTUNING` | `1` | *(none — not set)* | Logs the config Triton times, which only happens for autotuners outside the pinned scope. For pinned kernels use `--triton-autotune-enumerate` and `--triton-autotune-verify-every` — see [Verifying kernel-config agreement](#verifying-kernel-config-agreement) |
+| `TRITON_PRINT_AUTOTUNING` | `1` | *(none — not set)* | Logs the config Triton times, which only happens for autotuners outside the pinned scope. For pinned kernels use `--triton-autotune-enumerate-autotuners` and `--triton-autotune-verify-every` — see [Verifying kernel-config agreement](#verifying-kernel-config-agreement) |
 | `MAMBA_DETERMINISTIC` | any string starting with `'1'` | *(none — SSM auto-detects)* | Controls the external `mamba_ssm` package, which auto-follows `torch.are_deterministic_algorithms_enabled()` when unset; only an explicit non-deterministic override is rejected. Megatron's in-tree SSM kernels (`megatron.core.ssm.ops`) do not read it and follow `--deterministic-mode` instead |
 | `CAUSAL_CONV1D_DETERMINISTIC` | any string starting with `'1'` | *(none — the kernel auto-detects)* | causal_conv1d ≥ 1.6.0 auto-follows `torch.are_deterministic_algorithms_enabled()` when unset, reducing the conv weight/bias gradients through a workspace instead of `atomicAdd`; the Mamba and GDP mixers reject a deterministic run without it |
 
@@ -77,7 +77,7 @@ Autotuners outside the scope still time their candidates. `TRITON_CACHE_AUTOTUNI
 
 ## Verifying kernel-config agreement
 
-`--triton-autotune-verify-every N` compares, every N training steps, the configs that ranks chose for the same kernel and shape, and logs any disagreement (`--triton-autotune-verify-strict` raises instead). Each check exchanges only the choices made since the previous one. `--triton-autotune-enumerate` logs, per rank, every multi-config autotuner the run reaches and whether it is pinned, timed as config-invariant, or outside the scope.
+`--triton-autotune-verify-every N` compares, every N training steps, the configs that ranks chose for the same kernel and shape, and logs any disagreement (`--triton-autotune-verify-strict` raises instead). Each check exchanges only the choices made since the previous one. `--triton-autotune-enumerate-autotuners` logs, per rank, every multi-config autotuner the run reaches and whether it is pinned, timed as config-invariant, or outside the scope.
 
 For autotuners outside the scope, `TRITON_PRINT_AUTOTUNING=1` makes each rank log the config Triton selects; a rank only logs when it tunes, so a run where some ranks hit the autotune cache and others miss cannot be compared this way.
 

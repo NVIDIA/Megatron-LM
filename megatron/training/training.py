@@ -189,13 +189,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
-    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
+    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (

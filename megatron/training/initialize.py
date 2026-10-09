@@ -118,7 +118,6 @@ def initialize_megatron(
         enable_batch_invariant_mode(backend, collective)
 
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
-    # Built from the parsed arguments so callers that skip validate_args still get their policy.
     tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
 
     # torch.distributed initialization

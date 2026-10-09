@@ -29,7 +29,6 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.argument_utils import (
     _mfsdp_v2_disables_pipeline_output_dealloc,
     _model_rng_config,
-    _triton_autotune_config_from_args,
 )
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -362,9 +361,6 @@ def validate_yaml(args, defaults={}):
             "Number of experts should be a multiple of expert model parallel_size."
         assert not args.model_parallel.fp16, \
             "Expert parallelism is not supported with fp16 training."
-
-    # Built here so a bad section fails now; training installs it in initialize_megatron.
-    args.triton_autotune = _triton_autotune_config_from_args(args)
 
     # Print arguments.
     _print_args("arguments", args)
