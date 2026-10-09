@@ -434,8 +434,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Finalize group ranges and checkpoint indices.
         for group_index, group_range in enumerate(group_ranges):
-            # Main parameter groups put native FP32 shards before FP16/BF16
-            # master shards. Checkpoint lookups must use that same ordering,
+            # Optimizer parameter groups put shards of FP32 model parameters before
+            # those derived from FP16/BF16 model parameters. Checkpoint lookups use this order,
             # even when gradient buffers encountered the low-precision dtype first.
             # Keep this partition in sync with both orig_group["params"] branches
             # in _build_model_and_main_param_groups.
