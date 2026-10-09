@@ -20,7 +20,7 @@ from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.shared_prefix import (
     SharedPrefixForestLayout,
     SharedPrefixLayout,
-    _validate_shared_prefix_physical_length,
+    _validate_hybrid_stack,
     forward_hybrid_stack_shared_prefix,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -1050,20 +1050,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
-
-        if self.config.moe_paged_stash:
-            self.preprocess_for_paged_stash()
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        in_inference_mode = InferenceMode.is_active()
-
+        # Validate a shared-prefix request before any preprocessing or partial forward runs.
+        shared_prefix_physical_len = None
         if shared_prefix_layout is not None:
             if cp_batch is not None:
                 raise ValueError("Shared prefix owns CP token layout; cp_batch must be None")
-            if in_inference_mode or inference_context is not None:
+            if (
+                InferenceMode.is_active()
+                or inference_context is not None
+                or inference_params is not None
+            ):
                 raise NotImplementedError("shared-prefix Hybrid forward is training-only")
             if attention_mask is not None:
                 raise ValueError(
@@ -1121,36 +1117,38 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 )
             tp_size = self.pg_collection.tp.size()
             cp_size = self.pg_collection.cp.size()
-            if tp_size > 1 and not self.config.sequence_parallel:
-                raise NotImplementedError(
-                    "shared-prefix HybridModel TP>1 requires sequence parallelism"
-                )
-            if tp_size == 1 and self.config.sequence_parallel:
-                raise NotImplementedError(
-                    "shared-prefix HybridModel sequence parallelism requires TP>1"
-                )
-            if self.config.tensor_model_parallel_size != tp_size:
-                raise RuntimeError(
-                    "shared-prefix HybridModel tensor-parallel config does not match its "
-                    "process group"
-                )
-            if tp_size > 1 and (not self.parallel_output or runtime_gather_output):
-                raise NotImplementedError(
-                    "shared-prefix HybridModel TP/SP requires TP-sharded parallel output logits"
-                )
             if decoder_input is None:
                 if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
                     raise ValueError(
                         "shared-prefix Hybrid input_ids must have shape [1, physical_len/CP]"
                     )
-                physical_len = input_ids.shape[1] * cp_size
-                _validate_shared_prefix_physical_length(
-                    shared_prefix_layout,
-                    physical_len,
-                    tp_size=tp_size,
-                    cp_size=cp_size,
-                    sequence_parallel=self.config.sequence_parallel,
+                shared_prefix_physical_len = input_ids.shape[1] * cp_size
+            else:
+                if decoder_input.ndim != 3 or decoder_input.shape[1] != 1:
+                    raise ValueError(
+                        "shared-prefix Hybrid decoder input must have shape "
+                        "[physical_len/(TP*CP), 1, hidden] when sequence parallelism is enabled"
+                    )
+                sequence_shards = tp_size if self.config.sequence_parallel else 1
+                shared_prefix_physical_len = decoder_input.shape[0] * cp_size * sequence_shards
+            # Topology (TP/SP/CP/PP), layer types, MoE features and the physical length.
+            _validate_hybrid_stack(
+                self.decoder, shared_prefix_layout, physical_len=shared_prefix_physical_len
+            )
+            if tp_size > 1 and (not self.parallel_output or runtime_gather_output):
+                raise NotImplementedError(
+                    "shared-prefix HybridModel TP/SP requires TP-sharded parallel output logits"
                 )
+
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
+
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -1228,23 +1226,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise RuntimeError("shared-prefix Hybrid embedding did not produce decoder input")
             cp_group = self.pg_collection.cp
             cp_size = cp_group.size()
-            tp_size = self.pg_collection.tp.size()
-            sequence_shards = tp_size if self.config.sequence_parallel else 1
-            physical_len = decoder_input.shape[0] * cp_size * sequence_shards
-            if decoder_input.ndim != 3 or decoder_input.shape[1] != 1:
-                raise ValueError(
-                    "shared-prefix Hybrid decoder input must have shape "
-                    "[physical_len/(TP*CP), 1, hidden] when sequence parallelism is enabled"
-                )
             rotary_table = self.rotary_pos_emb.get_emb(
                 max(shared_prefix_layout.dense_branch_lengths)
             )
             global_position_ids = shared_prefix_layout.padded_position_ids(
-                physical_len, rotary_table.device
+                shared_prefix_physical_len, rotary_table.device
             )
             if cp_size > 1:
                 local_indices = shared_prefix_layout.cp_local_indices(
-                    physical_len, cp_size, cp_group.rank(), rotary_table.device
+                    shared_prefix_physical_len, cp_size, cp_group.rank(), rotary_table.device
                 )
                 global_position_ids = global_position_ids.index_select(0, local_indices)
             rotary_pos_emb = rotary_table.index_select(0, global_position_ids)

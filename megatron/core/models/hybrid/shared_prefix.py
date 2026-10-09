@@ -83,11 +83,11 @@ def _shared_prefix_mamba_impl() -> str:
 
 
 def _validate_mamba_fork(mixer: MambaMixer) -> None:
-    tp_size = mixer.pg_collection.tp.size()
-    if tp_size > 1 and not mixer.config.sequence_parallel:
-        raise NotImplementedError("shared-prefix Mamba TP>1 requires sequence parallelism")
-    if tp_size == 1 and mixer.config.sequence_parallel:
-        raise NotImplementedError("shared-prefix Mamba sequence parallelism requires TP>1")
+    """Reject Mamba mixers and backend selections the shared-prefix paths cannot run.
+
+    ``_validate_hybrid_stack`` calls this for every Mamba layer before any layer executes, and
+    checks the mixer's TP/CP groups against the stack; the layer forwards do not repeat it.
+    """
     if not mixer.rmsnorm:
         raise NotImplementedError("shared-prefix Mamba state forking requires gated RMSNorm")
     if causal_conv1d_fn is None or mamba_chunk_scan_combined is None:
@@ -323,7 +323,6 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
     transform and TP output-projection reduce-scatter.
     """
     mixer = layer.mixer
-    _validate_mamba_fork(mixer)
     cp = mixer.cp
 
     residual = hidden_states.float() if layer.config.fp32_residual_connection else hidden_states
@@ -421,14 +420,8 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
     cp_group = mixer.pg_collection.cp
     tp_size = tp_group.size()
     cp_size = cp_group.size()
+    # _validate_hybrid_stack has checked this length against the layout and topology.
     physical_len = hidden_states.shape[0] * tp_size * cp_size
-    _validate_shared_prefix_physical_length(
-        layout,
-        physical_len,
-        tp_size=tp_size,
-        cp_size=cp_size,
-        sequence_parallel=bool(mixer.config.sequence_parallel),
-    )
 
     # [star/(TP*CP),1,H] -> one canonical global star.  The oracle runs under
     # no_grad, but use the same collectives/order as the differentiable MTP
