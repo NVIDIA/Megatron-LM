@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Packing contracts independent of NeMo's batch/configuration classes."""
 
+import inspect
 import pickle
 import subprocess
 import sys
@@ -187,8 +188,28 @@ def test_historical_generation_request_api_and_pickle_paths_are_preserved():
     assert updated.temperature == 0.8 and updated.top_k == 16 and updated.max_tokens == 32
     request = Request(generation_args=updated)
     assert pickle.loads(pickle.dumps(request)) == request
-    assert GenericGenerationArgs.__module__ == Request.__module__ == "megatron.rl"
-    assert TypeLookupable.__module__ == "megatron.rl"
+    # Pickles written before the split name the package path; they still load.
+    legacy = pickle.dumps(request, protocol=0).replace(
+        b"megatron.rl.generation_api\n", b"megatron.rl\n"
+    )
+    assert b"megatron.rl.generation_api" not in legacy
+    assert pickle.loads(legacy) == request
+    for public_type in (GenericGenerationArgs, Request, TypeLookupable):
+        assert "class " + public_type.__name__ in inspect.getsource(public_type)
+
+
+def test_rl_submodules_share_the_package_generation_types():
+    pytest.importorskip("pydantic")
+    repo = Path(__file__).resolve().parents[3]
+    code = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import megatron.rl
+from megatron.rl.inference import api
+assert api.InferenceRequest.__mro__[1] is megatron.rl.Request
+assert "megatron.rl.__init__" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code, str(repo)], check=True)
 
 
 def _merge_rows():

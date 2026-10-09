@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
 
-from ..__init__ import Request, TypeLookupable
+from ..generation_api import Request, TypeLookupable
 from ..inference import InferenceInterface, InferenceRequest, InferenceResponse, LLMChatMessage
 from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 from ..types import AgentBaseModel, GroupedRollouts, Rollout, RolloutGroup, Rollouts, TokenRollout

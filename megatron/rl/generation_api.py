@@ -47,8 +47,3 @@ class Request(BaseModel):
     """Generation Request."""
 
     generation_args: GenericGenerationArgs = GenericGenerationArgs()
-
-
-# Retain the historical public class path for pickle and request consumers.
-for _public_type in (TypeLookupable, GenericGenerationArgs, Request):
-    _public_type.__module__ = "megatron.rl"

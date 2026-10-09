@@ -6,6 +6,23 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
+# Ship only megatron.rl's dependency-free shared-prefix packing API (plus its
+# lazy package __init__) in built wheels. The RL runtime (rl_utils, agent,
+# inference, server) needs undeclared dependencies, and shipping it would turn
+# on megatron.training's guarded RL import for every wheel user. This narrowing
+# applies to wheel installs only: an editable install maps the whole
+# megatron/rl directory, so the full package (and that import) stays visible.
+py-modules = [
+    "megatron.rl.generation_api",
+    "megatron.rl.shared_prefix_alignment",
+    "megatron.rl.shared_prefix_cost",
+    "megatron.rl.shared_prefix_dense_bins",
+    "megatron.rl.shared_prefix_execution",
+    "megatron.rl.shared_prefix_metadata",
+    "megatron.rl.shared_prefix_packing",
+    "megatron.rl.shared_prefix_tensors",
+    "megatron.rl.tree_layout",
+]
 
 [tool.setuptools.packages.find]
 include = [
@@ -13,8 +30,6 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
-    "megatron.rl",
-    "megatron.rl.*",
 ]
 
 [tool.setuptools.dynamic]
