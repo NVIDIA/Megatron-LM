@@ -2,26 +2,28 @@
 
 """Finetune utilities."""
 
-from functools import partial
 import sys
+from functools import partial
+
 import torch
 
-from megatron.training import get_args
-from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import print_rank_0
-from megatron.training import get_timers
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.checkpointing import save_checkpoint
-from megatron.training.training import evaluate_and_print_results
-from megatron.training.training import setup_model_and_optimizer
-from megatron.training.training import train_step
-from megatron.training.training import training_log
-from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.utils import calc_params_l2_norm
-from megatron.training.utils import check_adlr_autoresume_termination
+from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.training import get_args, get_timers, get_train_state, print_rank_0
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import get_run_config
+from megatron.training.training import (
+    evaluate_and_print_results,
+    setup_model_and_optimizer,
+    train_step,
+    training_log,
+)
+from megatron.training.utils import (
+    average_losses_across_data_parallel_group,
+    calc_params_l2_norm,
+    check_adlr_autoresume_termination,
+)
 
 
 def process_batch(batch):
@@ -150,6 +152,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     """Train the model."""
     cfg = get_run_config()
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
     assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
@@ -162,9 +165,9 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     losses_dict_sum = {}
 
     # Starting epoch and iteration
-    start_epoch = args.iteration // args.train_iters_per_epoch
-    start_iteration = args.iteration % args.train_iters_per_epoch
-    iteration = args.iteration
+    start_epoch = train_state.iteration // args.train_iters_per_epoch
+    start_iteration = train_state.iteration % args.train_iters_per_epoch
+    iteration = train_state.iteration
 
     # Memory reporting flag.
     report_memory_flag = True
@@ -248,6 +251,7 @@ def finetune(train_valid_datasets_provider, model_provider,
              task_collate_fn=None):
     """Main finetune function used across all tasks."""
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
     # Train and validation data loaders.
@@ -276,7 +280,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
     timers('pretrained checkpoint', log_level=0).start(barrier=True)
-    if args.iteration == 0 and args.pretrained_checkpoint is not None:
+    if train_state.iteration == 0 and args.pretrained_checkpoint is not None:
         original_load = args.load
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng

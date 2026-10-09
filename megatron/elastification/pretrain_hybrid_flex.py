@@ -44,20 +44,23 @@ from megatron.training import (
     get_args,
     get_timers,
     get_tokenizer,
+    get_train_state,
     inprocess_restart,
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
     get_run_config,
     initialize_runtime_services,
     set_run_config,
 )
+from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
@@ -355,7 +358,10 @@ def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42
     global _global_choice_counter
 
     # DP-specific seeding
-    rng = np.random.RandomState(base_seed + _global_choice_counter + grad_accumulation_steps*args.curr_iteration*10)
+    iteration = get_train_state().iteration
+    rng = np.random.RandomState(
+        base_seed + _global_choice_counter + grad_accumulation_steps * iteration * 10
+    )
     if choices is None:
         choice = rng.uniform(0, 1)
     else:

@@ -15,14 +15,18 @@ class TrainState(Stateful):
     and floating-point operations.
     """
 
-    iteration: int = 0
+    iteration: int = 0  # tracks iters as train progresses, whereas args.iteration only updated on resume
+    resume_iteration: int = 0  # during training might need to know which iter was resumed, but this does not need to be ckpt'd
     consumed_train_samples: int = 0
     skipped_train_samples: int = 0
     consumed_valid_samples: int = 0
     num_floating_point_operations_so_far: int = 0
+    # FLOPs at the start of this run; derived on resume, not checkpointed.
+    resume_num_floating_point_operations: int = 0
     do_train: bool = False
     do_valid: bool = False
     do_test: bool = False
+    release: bool = False
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Serializes the training state into a dictionary of tensors.
@@ -51,6 +55,7 @@ class TrainState(Stateful):
             "do_train": torch.tensor(self.do_train, dtype=torch.bool),
             "do_valid": torch.tensor(self.do_valid, dtype=torch.bool),
             "do_test": torch.tensor(self.do_test, dtype=torch.bool),
+            "release": torch.tensor(self.release, dtype=torch.bool),
         }
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -69,3 +74,4 @@ class TrainState(Stateful):
         self.do_train = state_dict["do_train"].item()
         self.do_valid = state_dict["do_valid"].item()
         self.do_test = state_dict["do_test"].item()
+        self.release = state_dict["release"].item()

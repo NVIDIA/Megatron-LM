@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 
-def is_initial_checkpoint_load_without_dataloader_state(args: object) -> bool:
+def is_initial_checkpoint_load_without_dataloader_state(args: object, iteration: int) -> bool:
     """Return whether model weights are being loaded to start a fresh training run."""
-    return getattr(args, "iteration", None) == 0 and (
+    return iteration == 0 and (
         getattr(args, "finetune", False)
         or getattr(args, "pretrained_checkpoint", None) is not None
     )
