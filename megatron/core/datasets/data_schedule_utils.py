@@ -420,20 +420,22 @@ def reroute_samples_to_dcp_ranks(
     Reroutes the sub-samples to the correct rank after scheduling.
 
     For each key in the batch dict, we perform an all-to-all communication
-    to transfer the data to the correct ranks.
+    to transfer the data to the correct ranks. ``tp_group`` is unused; it stays
+    in the signature for existing callers.
     """
 
     def _gid_to_src_rank(gid: int) -> int:
         dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
-        dcp_rank = (
-            torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
-        ) % dp_cp_group.size()
+        dcp_rank = torch.distributed.get_group_rank(
+            dp_cp_group, torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank]
+        )
         return dcp_rank
 
     gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
     dcp_rank = dp_cp_group.rank()
     dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
-    dp_ranks = [(r // tp_group.size()) % dp_cp_group.size() for r in dp_ranks]
+    # Map the global ranks of the DP peers to their ranks in the DPxCP group.
+    dp_ranks = [torch.distributed.get_group_rank(dp_cp_group, r) for r in dp_ranks]
 
     data_keys = batch[0].keys()
 
