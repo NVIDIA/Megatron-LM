@@ -131,6 +131,7 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 num_layers=2,
                 hidden_size=8,
                 num_attention_heads=2,
+                add_bias_linear=False,
                 num_moe_experts=4,
                 moe_router_topk=2,
                 moe_aux_loss_coeff=0.01,
