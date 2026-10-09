@@ -303,6 +303,46 @@ class TestSharedPrefixHybridModelParity:
         for plain_count, recomputed_count in zip(plain.counts, recomputed.counts):
             torch.testing.assert_close(recomputed_count, plain_count, rtol=0, atol=0)
 
+    @pytest.mark.parametrize("exclude", [None, False, True], ids=["default", "counted", "excluded"])
+    def test_expert_bias_padding_convention_matches_dense(self, exclude, monkeypatch):
+        """The caller's flag selects which dense padding convention the counts reproduce."""
+        clear_attention_env(monkeypatch)
+        torch.manual_seed(0)
+        model = build_hybrid_model(PATTERN, torch.bfloat16)
+        tokens = TokenProblem(_problem(FOREST), vocab_size=2048, seed=1)
+        layout = tokens.problem.layout(forest=True)
+        routing = ReplayedRouting(model, tokens.num_keys, seed=2)
+        flag = {}
+        if exclude is not None:
+            flag["shared_prefix_exclude_sequence_padding_from_expert_bias"] = exclude
+        try:
+            counted = run_dense_rows(model, tokens, routing)
+            masked = run_dense_rows(model, tokens, routing, mask_sequence_padding=True)
+            shared = run_shared(model, tokens, layout, routing, **flag)
+        finally:
+            routing.close()
+        # The problem has per-branch padding, so the two dense conventions differ.
+        assert sum(map(torch.sum, masked.counts)) < sum(map(torch.sum, counted.counts))
+        # Unset, the flag counts padding rows, as a dense forward with padding_mask=None does.
+        expected = masked if exclude else counted
+        assert len(shared.counts) == PATTERN.count("E")
+        for shared_count, expected_count in zip(shared.counts, expected.counts):
+            torch.testing.assert_close(shared_count, expected_count, rtol=0, atol=0)
+
+    def test_expert_bias_padding_flag_requires_layout(self, monkeypatch):
+        """Excluding padding rows has no meaning without a shared-prefix layout."""
+        clear_attention_env(monkeypatch)
+        torch.manual_seed(0)
+        model = build_hybrid_model(PATTERN, torch.bfloat16)
+        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
+        with pytest.raises(ValueError, match="requires shared_prefix_layout"):
+            model(
+                input_ids=tokens.row_ids[0][None].cuda(),
+                position_ids=torch.arange(tokens.row_ids[0].numel())[None].cuda(),
+                attention_mask=None,
+                shared_prefix_exclude_sequence_padding_from_expert_bias=True,
+            )
+
     @pytest.mark.usefixtures("_deterministic_kernels")
     @pytest.mark.parametrize("pattern", [PATTERN, MTP_PATTERN], ids=["no-mtp", "mtp"])
     def test_explicit_none_layout_is_the_default_path(self, pattern, monkeypatch):

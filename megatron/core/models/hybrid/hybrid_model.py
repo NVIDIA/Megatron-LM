@@ -1016,6 +1016,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
         shared_prefix_layout: Optional[SharedPrefixLayout | SharedPrefixForestLayout] = None,
+        shared_prefix_exclude_sequence_padding_from_expert_bias: bool = False,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -1046,6 +1047,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ``loss_mask``; it rejects ``decoder_input`` and ``mtp_input_mask``, and a
                 forest layout also requires ``calculate_per_token_loss``. The normal decoder
                 path is unchanged when the argument is ``None``. Defaults to None.
+            shared_prefix_exclude_sequence_padding_from_expert_bias (bool, optional): The
+                caller's dense expert-bias convention for per-branch padding rows of a
+                ``shared_prefix_layout``. ``False`` counts them, as a dense forward with
+                ``padding_mask=None`` does; ``True`` excludes them, as a dense forward with the
+                packed-sequence padding mask does. Trailing topology padding is never counted.
+                ``True`` requires ``shared_prefix_layout``. Defaults to False.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -1139,6 +1146,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise NotImplementedError(
                     "shared-prefix HybridModel TP/SP requires TP-sharded parallel output logits"
                 )
+        elif shared_prefix_exclude_sequence_padding_from_expert_bias:
+            raise ValueError(
+                "shared_prefix_exclude_sequence_padding_from_expert_bias requires "
+                "shared_prefix_layout"
+            )
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -1291,6 +1303,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     shared_prefix_layout,
                     rotary_pos_emb=rotary_pos_emb,
                     position_embedding_type=self.position_embedding_type,
+                    exclude_sequence_padding_from_expert_bias=(
+                        shared_prefix_exclude_sequence_padding_from_expert_bias
+                    ),
                 )
                 mhc_multistream = None
             else:

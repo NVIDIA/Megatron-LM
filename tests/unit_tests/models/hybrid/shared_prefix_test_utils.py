@@ -710,10 +710,13 @@ def run_dense_rows(
     model: torch.nn.Module,
     tokens: TokenProblem,
     routing: ReplayedRouting | None = None,
+    *,
+    mask_sequence_padding: bool = False,
     **forward_kwargs,
 ) -> ModelRun:
     """Run every dense row as its own ordinary forward/backward (CP zigzag, TP/SP).
 
+    ``mask_sequence_padding`` passes each row's per-sequence padding as ``padding_mask``.
     ``forward_kwargs`` are passed to every ``model(...)`` call unchanged.
     """
     _start_run(model)
@@ -731,6 +734,9 @@ def run_dense_rows(
         if routing is not None:
             routing.set(_sequence_shard(keys.index_select(0, local)))
         extra = {"loss_mask": loss_mask[local][None].cuda()} if with_mtp else {}
+        if mask_sequence_padding:
+            padding = torch.arange(row.dense_len) >= row.prefix_len + row.logical_len
+            extra["padding_mask"] = padding[local][None].cuda()
         output = model(
             input_ids=ids[local][None].cuda(),
             position_ids=local[None].cuda(),
@@ -746,9 +752,16 @@ def run_dense_rows(
 
 
 def run_shared(
-    model: torch.nn.Module, tokens: TokenProblem, layout, routing: ReplayedRouting | None = None
+    model: torch.nn.Module,
+    tokens: TokenProblem,
+    layout,
+    routing: ReplayedRouting | None = None,
+    **forward_kwargs,
 ) -> ModelRun:
-    """Run the whole problem as one shared-prefix forward/backward."""
+    """Run the whole problem as one shared-prefix forward/backward.
+
+    ``forward_kwargs`` are passed to the ``model(...)`` call unchanged.
+    """
     _start_run(model)
     problem = tokens.problem
     with_mtp = bool(getattr(model, "mtp_process", False))
@@ -768,6 +781,7 @@ def run_shared(
         attention_mask=None,
         shared_prefix_layout=layout,
         **extra,
+        **forward_kwargs,
     )
     loss = (output.float() * _vocab_shard(tokens.star_cotangent[local])[None].cuda()).sum()
     loss.backward()
