@@ -729,7 +729,9 @@ def _run_gpt_to_hybrid_optimizer_load(
                     data_parallel_size=data_parallel_size,
                 )
             try:
-                iteration, _ = load_checkpoint(hybrid_model, hybrid_optimizer, None)
+                iteration, _ = load_checkpoint(
+                    hybrid_model, hybrid_optimizer, None, restore_training_state=True
+                )
             finally:
                 if not finetune:
                     destroy_num_microbatches_calculator()

@@ -2385,7 +2385,7 @@ class TestMultiTokenPrediction:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         set_run_config(pretrain_cfg_container_from_args(args))
-        initialize_runtime_services(args, build_tokenizer=False)
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -2563,7 +2563,9 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
-            load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
+            )
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
@@ -3793,7 +3795,7 @@ class TestMultiTokenPredictionHybrid:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         set_run_config(pretrain_cfg_container_from_args(args))
-        initialize_runtime_services(args, build_tokenizer=False)
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -4244,7 +4246,13 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
-            load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                mamba_model,
+                optimizer,
+                opt_param_scheduler,
+                strict=False,
+                restore_training_state=True,
+            )
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
