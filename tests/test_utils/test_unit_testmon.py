@@ -36,7 +36,7 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0):
+def _invoke(project, cache, mode, phase="prod", rank=0, *, pytest_args=()):
     return subprocess.run(
         [
             sys.executable,
@@ -47,11 +47,13 @@ def _invoke(project, cache, mode, phase="prod", rank=0):
             str(cache),
             "--phase",
             phase,
+            *(["--marker", "not flaky"] if phase == "both" else []),
             "--",
             "-q",
             "-c",
             str(project / "pytest.ini"),
             "tests",
+            *pytest_args,
         ],
         cwd=project,
         env={
@@ -219,6 +221,152 @@ def test_new_test_file_is_discovered_from_old_baseline(project, cache):
     assert selected.read_text().splitlines() == ["tests/test_new.py::test_new"]
 
 
+@pytest.fixture
+def phased_project(project):
+    (project / "pytest.ini").write_text("[pytest]\nmarkers =\n    experimental\n    flaky\n")
+    (project / "conftest.py").write_text(
+        "def pytest_addoption(parser):\n"
+        "    parser.addoption('--experimental', action='store_true')\n\n"
+        "def pytest_generate_tests(metafunc):\n"
+        "    if 'phase_option' in metafunc.fixturenames:\n"
+        "        metafunc.parametrize('phase_option', "
+        "[metafunc.config.getoption('--experimental')])\n"
+    )
+    (project / "app.py").write_text(
+        "from pathlib import Path\n"
+        "with Path('imports.log').open('a') as stream:\n"
+        "    stream.write('imported\\n')\n\n"
+        "def active(value):\n    return value + 1\n\n"
+        "def experimental(value):\n    return value - 1\n"
+    )
+    (project / "tests/test_app.py").write_text(
+        "import pytest\nfrom app import active, experimental\n\n"
+        "@pytest.mark.parametrize('value', [1, 2], ids=['space value', 'quote \\\" and $value'])\n"
+        "def test_active(value, phase_option):\n"
+        "    assert not phase_option\n"
+        "    assert active(value) == value + 1\n\n"
+        "@pytest.mark.experimental\n"
+        "def test_experimental(phase_option):\n"
+        "    assert phase_option\n"
+        "    assert experimental(1) == 0\n\n"
+        "@pytest.mark.flaky\n"
+        "def test_flaky():\n    raise AssertionError('filtered test')\n"
+    )
+    return project
+
+
+@pytest.fixture
+def phased_cache(phased_project, tmp_path):
+    cache = tmp_path / "phased-cache"
+    for phase in ("prod", "experimental"):
+        pytest_args = (
+            ("-m", "not experimental and not flaky")
+            if phase == "prod"
+            else ("--experimental", "-m", "experimental and not flaky")
+        )
+        result = _invoke(phased_project, cache, "baseline", phase, pytest_args=pytest_args)
+        assert result.returncode == 0, result.stdout + result.stderr
+    return cache
+
+
+@pytest.mark.parametrize("rank", (0, 3))
+@pytest.mark.parametrize("changed", ("prod", "experimental", "both", "neither"))
+def test_combined_selection_matches_separate_phases(phased_project, phased_cache, changed, rank):
+    project, cache = phased_project, phased_cache
+    source = (project / "app.py").read_text()
+    if changed in ("prod", "both"):
+        source = source.replace("return value + 1", "return value + 2")
+    if changed in ("experimental", "both"):
+        source = source.replace("return value - 1", "return value - 2")
+    (project / "app.py").write_text(source)
+    before = {phase: _snapshot(cache / phase) for phase in ("prod", "experimental")}
+
+    expected = {}
+    for phase in ("prod", "experimental"):
+        pytest_args = (
+            ("-m", "not experimental and not flaky")
+            if phase == "prod"
+            else ("--experimental", "-m", "experimental and not flaky")
+        )
+        result = _invoke(project, cache, "select", phase, rank, pytest_args=pytest_args)
+        assert result.returncode == 0, result.stdout + result.stderr
+        expected[phase] = (cache / f".testmon-work/{phase}/rank-{rank}/selected-tests").read_text()
+
+    (project / "imports.log").write_text("")
+    result = _invoke(project, cache, "select", "both", rank)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for phase in ("prod", "experimental"):
+        selected = (cache / f".testmon-work/{phase}/rank-{rank}/selected-tests").read_text()
+        assert selected == expected[phase]
+        assert _snapshot(cache / phase) == before[phase]
+    if changed in ("prod", "both"):
+        assert len(expected["prod"].splitlines()) == 2
+    if changed in ("experimental", "both"):
+        assert len(expected["experimental"].splitlines()) == 1
+    # Selection shares imports but must never execute either phase's failing test bodies.
+    assert (project / "imports.log").read_text() in ("", "imported\n")
+    if changed == "both":
+        assert (project / "imports.log").read_text() == "imported\n"
+
+
+def test_combined_selection_discovers_new_tests_in_both_phases(phased_project, phased_cache):
+    (phased_project / "tests/test_new.py").write_text(
+        "import pytest\n\n"
+        "def test_new_prod():\n    raise AssertionError('collection only')\n\n"
+        "@pytest.mark.experimental\n"
+        "def test_new_experimental():\n    raise AssertionError('collection only')\n"
+    )
+    result = _invoke(phased_project, phased_cache, "select", "both")
+    assert result.returncode == 0, result.stdout + result.stderr
+    for phase, name in (("prod", "test_new_prod"), ("experimental", "test_new_experimental")):
+        selected = phased_cache / f".testmon-work/{phase}/rank-0/selected-tests"
+        assert selected.read_text().splitlines() == [f"tests/test_new.py::{name}"]
+
+
+def test_combined_selection_validates_both_baselines_before_collecting(
+    phased_project, phased_cache
+):
+    (phased_cache / "experimental/.testmondata").write_bytes(b"corrupt")
+    (phased_project / "imports.log").write_text("")
+    result = _invoke(phased_project, phased_cache, "select", "both")
+    assert result.returncode != 0
+    assert not (phased_cache / ".testmon-work").exists()
+    assert (phased_project / "imports.log").read_text() == ""
+
+
+def test_combined_selection_reports_collection_failure(phased_project, phased_cache):
+    (phased_project / "tests/test_broken.py").write_text("this is not valid Python!\n")
+    result = _invoke(phased_project, phased_cache, "select", "both")
+    assert result.returncode != 0
+
+
+def test_combined_selection_reports_second_session_failure(phased_project, phased_cache):
+    source = phased_project / "app.py"
+    source.write_text(source.read_text().replace("return value + 1", "return value + 2"))
+    conftest = phased_project / "conftest.py"
+    conftest.write_text(
+        conftest.read_text().replace(
+            "def pytest_generate_tests(metafunc):\n",
+            "def pytest_generate_tests(metafunc):\n"
+            "    if metafunc.config.getoption('--experimental'):\n"
+            "        raise RuntimeError('experimental collection failed')\n",
+        )
+    )
+    result = _invoke(phased_project, phased_cache, "select", "both")
+    assert result.returncode != 0
+    assert "experimental collection failed" in result.stdout
+    # Production completed, but its output must not hide the second session's failure.
+    selected = phased_cache / ".testmon-work/prod/rank-0/selected-tests"
+    assert "test_active[False-space value]" in selected.read_text()
+
+
+def test_combined_mode_rejects_baseline_generation(phased_project, tmp_path):
+    cache = tmp_path / "rejected-baseline"
+    result = _invoke(phased_project, cache, "baseline", "both")
+    assert result.returncode != 0
+    assert not cache.exists()
+
+
 def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
     parameter_ids = ["space value", 'quote " and $value']
     (project / "tests/test_app.py").write_text(
@@ -322,7 +470,8 @@ def test_invalid_baseline_falls_back_before_private_copy(project, cache, problem
             'write_testmon_summary() { printf "%s\\n" "$1"; }',
             "merge_rank_selections() { return 0; }",
             'run_testmon_phase() { RANK=0 WORLD_SIZE=1 "$TEST_PYTHON" "$WRAPPER" '
-            '--mode "$1" --phase "$2" --cache-dir "$UNIT_TESTMON_CACHE_DIR" '
+            '--mode "$1" --phase "$2" --marker "$MARKER_ARG" '
+            '--cache-dir "$UNIT_TESTMON_CACHE_DIR" '
             '-- -q -c "$PROJECT/pytest.ini" "$PROJECT/tests"; }',
             "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
             "run_enforced_tests",
