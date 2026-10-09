@@ -1173,7 +1173,11 @@ class _ParamAndGradBuffer:
         # Compact Muon all-reduces gradients. Copy its config so Adam siblings retain
         # DistOpt reduce-scatter and the shared model-level configuration stays unchanged.
         if self._is_layer_wise_buffer and not self.ddp_config.use_layer_wise_param_layout:
-            self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
+            # DDP has already resolved num_buckets into bucket_size. Keep that size in
+            # the private copy without revalidating the two user inputs as simultaneous.
+            self.ddp_config = dataclasses.replace(
+                self.ddp_config, use_distributed_optimizer=False, num_buckets=None
+            )
             for param in self.params:
                 if is_grouped_tensor(param) or (
                     _param_uses_quantized_storage(param) and not is_layerwise_fp8_param(param)

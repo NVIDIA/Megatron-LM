@@ -362,11 +362,13 @@ def test_nested_optimizer_staging_and_deferred_gather(native_sibling):
 
 
 @pytest.mark.parametrize("layout", [False, True])
-def test_direct_ddp_keeps_shared_config_and_adam_sharding(layout):
+@pytest.mark.parametrize("num_buckets", [None, 2])
+def test_direct_ddp_keeps_shared_config_and_adam_sharding(layout, num_buckets):
     """Direct DDP construction honors owner tags without a precomputed layout."""
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer import TransformerConfig
+    from megatron.training.training import resolve_ddp_bucket_size
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel()
@@ -375,21 +377,34 @@ def test_direct_ddp_keeps_shared_config_and_adam_sharding(layout):
         module.weight.is_managed_by_layer_wise_optimizer = True
         module.bias.is_managed_by_layer_wise_optimizer = False
         config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True, use_layer_wise_param_layout=layout
+            use_distributed_optimizer=True,
+            use_layer_wise_param_layout=layout,
+            overlap_grad_reduce=True,
+            num_buckets=num_buckets,
         )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Training resolves the user-specified count before DDP creates compact buffers.
+        resolved_bucket_size = resolve_ddp_bucket_size(
+            config, pg_collection.dp_cp, True, sum(param.numel() for param in module.parameters())
+        )
+        config.bucket_size = resolved_bucket_size
         ddp = DistributedDataParallel(
             TransformerConfig(num_layers=1, num_attention_heads=1),
             config,
             module,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            pg_collection=pg_collection,
         )
         assert config.use_distributed_optimizer, "Muon must not mutate the shared config"
+        assert config.num_buckets == num_buckets
+        assert config.bucket_size == resolved_bucket_size
         assert len(ddp.buffers) == 2
         for buffer in ddp.buffers:
             owner = buffer.params[0].is_managed_by_layer_wise_optimizer
             assert buffer.ddp_config.use_distributed_optimizer == (layout or not owner)
             if owner and not layout:
                 assert buffer.ddp_config is not config
+                assert buffer.ddp_config.num_buckets is None
+                assert buffer.ddp_config.bucket_size == resolved_bucket_size
                 assert buffer.numel == buffer.numel_unpadded
             if not owner:
                 assert buffer.param_data is not None
