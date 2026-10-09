@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from math import ceil, lcm, log2
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import torch
 
@@ -24,6 +24,7 @@ _REROUTE_KEY_ORDER = (
 )
 _REROUTE_KEY_SET = frozenset(_REROUTE_KEY_ORDER)
 _REROUTE_SCALAR_KEYS = frozenset(("original_seq_len", "padded_seq_len"))
+_SequenceLength = TypeVar('_SequenceLength', int, torch.Tensor)
 
 
 def get_packed_sequence_alignment(config, tp_size: int) -> tuple[int, bool]:
@@ -45,6 +46,14 @@ def get_packed_sequence_alignment(config, tp_size: int) -> tuple[int, bool]:
     return alignment, requested is not None or mxfp8
 
 
+def get_packed_sequence_length(
+    seq_len: _SequenceLength, cp_size: int, pad_sequences: bool
+) -> _SequenceLength:
+    """Return the physical length used by eager per-sequence zigzag padding."""
+    alignment = 2 * cp_size if pad_sequences and cp_size > 1 else 1
+    return seq_len + (-seq_len % alignment)
+
+
 def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
     """Pad global THD data and metadata before constructing any CP layout.
 
@@ -59,8 +68,7 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     logical = batch['cu_seqlens']
     physical = batch['cu_seqlens_padded']
     lengths = physical.diff()
-    seq_alignment = 2 * cp_size if cp_size > 1 else 1
-    padded_lengths = lengths + (-lengths % seq_alignment)
+    padded_lengths = get_packed_sequence_length(lengths, cp_size, pad_sequences=True)
     global_length = int(padded_lengths.sum().item())
     local_length = (global_length + cp_size - 1) // cp_size
     limit = getattr(config, 'max_seqlen_per_dp_cp_rank', None)
@@ -636,6 +644,7 @@ def next_hdp_group_packing_aware(
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
     cp_group_sizes: Optional[Sequence[int]] = None,
+    pad_sequences: bool = False,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -678,9 +687,16 @@ def next_hdp_group_packing_aware(
         )
 
     def cp_min_fn(seq_len: int) -> int:
-        return dcp_gpus_needed(
-            seq_len, max_seq_len_per_rank, min_cp_size, valid_group_sizes=enabled_cp_sizes
+        for size in enabled_cp_sizes:
+            if per_rank_length(seq_len, size) <= max_seq_len_per_rank:
+                return size
+        raise ValueError(
+            f"Sequence length {seq_len}, including CP padding, exceeds the capacity of "
+            f"configured CP groups {enabled_cp_sizes} at {max_seq_len_per_rank} tokens per rank"
         )
+
+    def per_rank_length(seq_len: int, cp_size: int) -> float:
+        return get_packed_sequence_length(seq_len, cp_size, pad_sequences) / cp_size
 
     def workload(seq_len: int, cp_size: int) -> float:
         return (seq_len * seq_len) / cp_size
@@ -710,7 +726,7 @@ def next_hdp_group_packing_aware(
     members = list(range(cp_size))
     group_members[group_id] = members
     group_size[group_id] = cp_size
-    packing_sequence_len[group_id] = seq_len / cp_size
+    packing_sequence_len[group_id] = per_rank_length(seq_len, cp_size)
     per_gpu_cost = workload(seq_len, cp_size)
     for rank in members:
         gpu_group_id[rank] = group_id
@@ -724,14 +740,17 @@ def next_hdp_group_packing_aware(
         best = None
 
         for cp_size in enabled_cp_sizes:
-            if cp_size < min_needed:
+            if cp_size < min_needed or per_rank_length(seq_len, cp_size) > max_seq_len_per_rank:
                 continue
             per_gpu_cost = workload(seq_len, cp_size)
 
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
                     continue
-                if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
+                if (
+                    packing_sequence_len.get(group_id, 0) + per_rank_length(seq_len, cp_size)
+                    > max_seq_len_per_rank
+                ):
                     continue
                 members = group_members[group_id]
                 member_set = set(members)
@@ -765,7 +784,7 @@ def next_hdp_group_packing_aware(
         per_gpu_cost = workload(seq_len, selected_cp_size)
         if action == "add":
             members = group_members[group_id]
-            packing_sequence_len[group_id] += seq_len / selected_cp_size
+            packing_sequence_len[group_id] += per_rank_length(seq_len, selected_cp_size)
             for rank in members:
                 micro_batches[rank].append(seq_len)
                 exec_times[rank] += per_gpu_cost
@@ -775,7 +794,7 @@ def next_hdp_group_packing_aware(
             next_gid += 1
             group_members[group_id] = chosen_members
             group_size[group_id] = selected_cp_size
-            packing_sequence_len[group_id] = seq_len / selected_cp_size
+            packing_sequence_len[group_id] = per_rank_length(seq_len, selected_cp_size)
             for rank in chosen_members:
                 gpu_group_id[rank] = group_id
                 micro_batches[rank].append(seq_len)
@@ -806,6 +825,13 @@ def next_hdp_group_packing_aware(
                 continue
 
             members = group_members[group_id]
+            if (
+                sum(
+                    per_rank_length(length, next_group_size) for length in micro_batches[members[0]]
+                )
+                > max_seq_len_per_rank
+            ):
+                continue
             needed_count = next_group_size - min_group_size
             group_start_rank = members[0]
             group_end_rank = members[-1]
@@ -872,7 +898,7 @@ def next_hdp_group_packing_aware(
         packed_sequence_len = 0.0
 
         for sample_id, seq_len in sample_seqlens:
-            per_rank_len = seq_len / total_gpus
+            per_rank_len = per_rank_length(seq_len, total_gpus)
             if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
@@ -901,96 +927,113 @@ def next_hdp_group_packing_aware(
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
-def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_stage: int) -> List:
-    """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
+def align_sample_id_groups(
+    sample_id_groups: List,
+    microbatch_group_size_per_vp_stage: int,
+    *,
+    cp_group_sizes: Optional[Sequence[int]] = None,
+    sample_lengths: Optional[Dict[int, int]] = None,
+    max_seq_len_per_rank: Optional[int] = None,
+    pad_sequences: bool = False,
+) -> List:
+    """Split microbatches for VPP without dropping samples or inventing CP groups.
 
-    Standalone version extracted from DefaultDynamicCPScheduler.
+    Expand only through the configured group family, falling back to the full
+    DPxCP group if smaller groups cannot fill a non-power-of-two domain. A full
+    domain group can itself be split when it contains multiple packed samples.
+    Every loop either adds a microbatch/rank or terminates with an explicit error.
     """
     multiple = int(microbatch_group_size_per_vp_stage)
+    if multiple < 1:
+        raise ValueError("microbatch_group_size_per_vp_stage must be positive")
+    if not sample_id_groups:
+        return sample_id_groups
+    total_ranks = len(sample_id_groups[0])
+    valid_sizes = tuple(
+        sorted(cp_group_sizes or get_valid_dynamic_context_parallel_group_sizes(total_ranks))
+    )
+
+    def fits(ids, size):
+        if sample_lengths is None or max_seq_len_per_rank is None:
+            return True
+        return (
+            sum(get_packed_sequence_length(sample_lengths[sid], size, pad_sequences) for sid in ids)
+            <= size * max_seq_len_per_rank
+        )
+
+    def fill(groups):
+        groups = list(groups)
+        assigned = sum(size for _, size in groups)
+        while assigned < total_ranks:
+            # Expanding the smallest group first preserves power-of-two alignment.
+            groups.sort(key=lambda group: group[1], reverse=True)
+            for i in range(len(groups) - 1, -1, -1):
+                ids, size = groups[i]
+                larger_sizes = [candidate for candidate in valid_sizes if candidate > size]
+                if not larger_sizes:
+                    continue
+                next_size = larger_sizes[0]
+                if next_size - size <= total_ranks - assigned and fits(ids, next_size):
+                    groups[i] = (ids, next_size)
+                    assigned += next_size - size
+                    break
+            else:
+                # E.g. two CP2 groups and two empty ranks in a DPxCP=6 domain.
+                # CP4 does not exist there, so merge into the supported full group.
+                ids = [sid for group_ids, _ in groups for sid in group_ids]
+                if total_ranks not in valid_sizes or not fits(ids, total_ranks):
+                    return None
+                groups = [(ids, total_ranks)]
+                assigned = total_ranks
+        groups.sort(key=lambda group: group[1], reverse=True)
+        return [list(ids) for ids, size in groups for _ in range(size)]
+
+    def split_group(microbatch):
+        groups = []
+        rank = 0
+        while rank < total_ranks:
+            ids = microbatch[rank]
+            if not ids:
+                raise ValueError("VPP alignment requires nonempty input ranks")
+            end = rank + 1
+            while end < total_ranks and microbatch[end] == ids:
+                end += 1
+            groups.append((ids, end - rank))
+            rank = end
+
+        if len(groups) == 1:
+            ids, size = groups[0]
+            if len(ids) < 2:
+                return None, None
+            mid = len(ids) // 2
+            return fill([(ids[:mid], size)]), fill([(ids[mid:], size)])
+
+        # Prefer balanced rank counts, but try other boundaries if padding
+        # prevents a particular pair of expanded batches from fitting.
+        cuts = sorted(
+            range(1, len(groups)),
+            key=lambda cut: abs(2 * sum(size for _, size in groups[:cut]) - total_ranks),
+        )
+        for cut in cuts:
+            left, right = fill(groups[:cut]), fill(groups[cut:])
+            if left is not None and right is not None:
+                return left, right
+        return None, None
+
     remainder = (-len(sample_id_groups)) % multiple
-    i = len(sample_id_groups) - 1
-
-    def split_group(sample_id_group):
-        total_hdp_ranks = len(sample_id_group)
-        cu_ranks = [0]
-        prev_cp_size = 0
-
-        while cu_ranks[-1] != total_hdp_ranks:
-            start_rank = cu_ranks[-1]
-            sid0 = sample_id_group[start_rank][0]
-            cp_size = 0
-            for r in range(start_rank, total_hdp_ranks):
-                if sid0 in sample_id_group[r]:
-                    cp_size += 1
-                else:
-                    break
-            assert (
-                prev_cp_size == 0 or cp_size <= prev_cp_size
-            ), f"split_group: CP size is not decreasing: prev={prev_cp_size}, cur={cp_size}"
-            cu_ranks.append(start_rank + cp_size)
-            prev_cp_size = cp_size
-        if len(cu_ranks) == 2:
-            return None, None
-
-        k = 0
-        while cu_ranks[k] < total_hdp_ranks // 2:
-            k += 1
-
-        old_mb = sample_id_group[: cu_ranks[k]] + [[] for _ in range(total_hdp_ranks - cu_ranks[k])]
-        new_mb = sample_id_group[cu_ranks[k] :] + [[] for _ in range(cu_ranks[k])]
-        old_mb = fill_empty_by_expanding_cp(old_mb)
-        new_mb = fill_empty_by_expanding_cp(new_mb)
-        return new_mb, old_mb
-
-    def fill_empty_by_expanding_cp(sample_id_group):
-        def fill_empty(sample_id_group):
-            empty_size = sum(1 for x in sample_id_group if len(x) == 0)
-            i = len(sample_id_group) - 1 - empty_size
-            prev_cp_size = 0
-            while i >= 0:
-                sid0 = sample_id_group[i][0]
-                cp_size = 0
-                while sid0 in sample_id_group[i] and i >= 0:
-                    cp_size += 1
-                    i -= 1
-                if cp_size > prev_cp_size and prev_cp_size != 0:
-                    start_idx = i + 1 + cp_size
-                    end_idx = -empty_size + prev_cp_size if -empty_size + prev_cp_size < 0 else None
-                    sample_id_group[start_idx + 2 * prev_cp_size : end_idx] = sample_id_group[
-                        start_idx + prev_cp_size : -empty_size
-                    ]
-                    sample_id_group[start_idx + prev_cp_size : start_idx + 2 * prev_cp_size] = (
-                        sample_id_group[start_idx : start_idx + prev_cp_size]
-                    )
-                    break
-                elif cp_size <= empty_size and i == -1:
-                    end_idx = -empty_size + cp_size if -empty_size + cp_size < 0 else None
-                    sample_id_group[2 * cp_size : end_idx] = sample_id_group[cp_size:-empty_size]
-                    sample_id_group[cp_size : 2 * cp_size] = sample_id_group[0:cp_size]
-                    break
-                prev_cp_size = cp_size
-            return sample_id_group
-
-        while len(sample_id_group[-1]) == 0:
-            sample_id_group = fill_empty(sample_id_group)
-        return sample_id_group
-
-    attempts_since_split = 0
-    while remainder > 0:
-        if i < 0:
-            if attempts_since_split >= len(sample_id_groups):
-                assert False, 'align_sample_id_groups: no tail microbatch has enough ids to split'
-            i = len(sample_id_groups) - 1
-        group1, group2 = split_group(sample_id_groups[i])
-        if group1 is not None and group2 is not None:
-            sample_id_groups[i] = group1
-            sample_id_groups.append(group2)
-            remainder -= 1
-            attempts_since_split = 0
+    for _ in range(remainder):
+        for i in range(len(sample_id_groups) - 1, -1, -1):
+            left, right = split_group(sample_id_groups[i])
+            if left is not None and right is not None:
+                sample_id_groups[i] = left
+                sample_id_groups.append(right)
+                break
         else:
-            attempts_since_split += 1
-        i -= 1
-
+            raise ValueError(
+                "Cannot align packed microbatches for VPP: no microbatch can be split "
+                "within the configured CP groups and padded capacity. Increase the "
+                "number of input samples or reduce microbatch_group_size_per_vp_stage."
+            )
     return sample_id_groups
 
 
