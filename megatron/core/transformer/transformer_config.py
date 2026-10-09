@@ -1536,7 +1536,7 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
-    buffer_transformer_engine_calibration_metadata: bool = False
+    ckpt_transformer_engine_calibration: bool = False
     """If True, enable Transformer Engine calibration and buffer input and weight scaling
     factors for export to inference engines."""
 

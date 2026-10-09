@@ -24,13 +24,13 @@ def _disable_scale_collectives(monkeypatch):
 def test_calibration_options_default_to_disabled():
     fields = {field.name: field for field in dataclasses.fields(TransformerConfig)}
 
-    assert fields["buffer_transformer_engine_calibration_metadata"].default is False
+    assert fields["ckpt_transformer_engine_calibration"].default is False
     assert fields["transformer_engine_calibration_decay"].default == 0.0
 
 
 def test_disabled_megatron_option_returns_no_te_calibration_config():
     config = SimpleNamespace(
-        buffer_transformer_engine_calibration_metadata=False,
+        ckpt_transformer_engine_calibration=False,
         transformer_engine_calibration_decay=0.5,
     )
 
@@ -39,7 +39,7 @@ def test_disabled_megatron_option_returns_no_te_calibration_config():
 
 def test_calibration_option_requires_te_config_support(monkeypatch):
     config = SimpleNamespace(
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.123,
     )
     monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "QuantizationCalibrationConfig", None)
@@ -51,7 +51,7 @@ def test_calibration_option_requires_te_config_support(monkeypatch):
 
 def test_megatron_options_create_te_calibration_config():
     config = SimpleNamespace(
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
 
@@ -70,7 +70,7 @@ def test_fp8_context_receives_calibration_config(monkeypatch):
         fp8=True,
         fp8_param=False,
         first_last_layers_bf16=False,
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
     monkeypatch.setattr(fp8_utils, "is_first_last_bf16_layer", lambda *_: False)
@@ -96,7 +96,7 @@ def test_fp8_context_reports_unsupported_te_calibration_autocast(monkeypatch):
         fp8=True,
         fp8_param=False,
         first_last_layers_bf16=False,
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
     monkeypatch.setattr(fp8_utils, "is_first_last_bf16_layer", lambda *_: False)
@@ -110,7 +110,7 @@ def test_fp8_context_reports_unsupported_te_calibration_autocast(monkeypatch):
 
     with pytest.raises(
         RuntimeError,
-        match="--buffer-transformer-engine-calibration-metadata.*accepts calibration_config",
+        match="--ckpt-transformer-engine-calibration.*accepts calibration_config",
     ):
         fp8_utils.get_fp8_context(config)
 
@@ -120,7 +120,7 @@ def test_fp8_context_ignores_calibration_when_fp8_is_disabled(monkeypatch):
         fp8=False,
         fp8_param=False,
         first_last_layers_bf16=False,
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
     monkeypatch.setattr(fp8_utils, "is_first_last_bf16_layer", lambda *_: False)
@@ -143,7 +143,7 @@ def test_fp4_context_receives_calibration_config(monkeypatch):
         fp4_param=False,
         first_last_layers_bf16=False,
         num_layers=1,
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
     monkeypatch.setattr(fp4_utils, "get_fp4_recipe", lambda _: recipe)
@@ -169,7 +169,7 @@ def test_fp4_context_ignores_calibration_when_fp4_is_disabled(monkeypatch):
         fp4_param=False,
         first_last_layers_bf16=False,
         num_layers=1,
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
     monkeypatch.setattr(
@@ -188,7 +188,7 @@ def test_disabled_fp8_context_ignores_calibration(monkeypatch):
     config = SimpleNamespace(
         fp8=True,
         fp4=None,
-        buffer_transformer_engine_calibration_metadata=True,
+        ckpt_transformer_engine_calibration=True,
         transformer_engine_calibration_decay=0.5,
     )
     monkeypatch.setattr(

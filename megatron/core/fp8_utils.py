@@ -107,7 +107,7 @@ def _make_te_calibration_config(transformer_engine_calibration_decay: float = 0.
     """Construct an immutable TE calibration config once per decay value."""
     if not HAVE_TE:
         raise RuntimeError(
-            "buffer_transformer_engine_calibration_metadata requires Transformer Engine "
+            "ckpt_transformer_engine_calibration requires Transformer Engine "
             "to be installed"
         )
     calibration_config_cls = getattr(
@@ -115,7 +115,7 @@ def _make_te_calibration_config(transformer_engine_calibration_decay: float = 0.
     )
     if calibration_config_cls is None:
         raise RuntimeError(
-            "buffer_transformer_engine_calibration_metadata requires a Transformer Engine "
+            "ckpt_transformer_engine_calibration requires a Transformer Engine "
             "version with QuantizationCalibrationConfig support"
         )
     return calibration_config_cls(
@@ -125,7 +125,7 @@ def _make_te_calibration_config(transformer_engine_calibration_decay: float = 0.
 
 def get_te_calibration_config(config: TransformerConfig):
     """Translate Megatron calibration options to a Transformer Engine config."""
-    if not config.buffer_transformer_engine_calibration_metadata:
+    if not config.ckpt_transformer_engine_calibration:
         return None
     return _make_te_calibration_config(config.transformer_engine_calibration_decay)
 
@@ -140,7 +140,7 @@ def _fp8_autocast_with_calibration_config(fp8_autocast, *, calibration_config=No
         if "calibration_config" not in str(exc):
             raise  # the exc
         raise RuntimeError(
-            "--buffer-transformer-engine-calibration-metadata requires a Transformer Engine "
+            "--ckpt-transformer-engine-calibration requires a Transformer Engine "
             "version whose autocast API accepts calibration_config; upgrade Transformer Engine "
             "or disable this option"
         ) from exc
