@@ -1,11 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+import sys
 
 import pytest
 import torch
 from packaging.version import Version as PkgVersion
 
+from megatron.core import parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_local_spec,
     get_bert_layer_with_transformer_engine_spec,
@@ -13,6 +16,7 @@ from megatron.core.models.bert.bert_layer_specs import (
 )
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -317,3 +321,129 @@ class TestBertModelAttentionDimensions:
             "Flash and fused attention is not supported with transformer engine version "
             "< 1.7. Set --attention-backend to unfused or leave it to be default (auto) or upgrade transformer engine >= 1.7"
         )
+
+
+_GLOBAL_GRID_PREFIXES = (
+    "get_tensor_model_parallel",
+    "get_pipeline_model_parallel",
+    "get_context_parallel",
+    "is_pipeline_",
+)
+
+
+def _forbid_global_grid(patch):
+    """Make the global TP, PP and CP accessors, the stage predicates and the shim raise.
+
+    Modules that imported an accessor by name hold their own reference, so those are patched too.
+    """
+    for name in dir(parallel_state):
+        if not name.startswith(_GLOBAL_GRID_PREFIXES):
+            continue
+        original = getattr(parallel_state, name)
+
+        def forbid(*args, _name=name, **kwargs):
+            raise AssertionError(f"read of the global grid: parallel_state.{_name}")
+
+        for module in list(sys.modules.values()):
+            if getattr(module, "__name__", "").startswith("megatron.") and (
+                getattr(module, "__dict__", {}).get(name) is original
+            ):
+                patch.setattr(module, name, forbid)
+
+    def forbid_shim(cls, *args, **kwargs):
+        raise AssertionError("read of the global grid: use_mpu_process_groups")
+
+    patch.setattr(ProcessGroupCollection, "use_mpu_process_groups", classmethod(forbid_shim))
+
+
+class TestBertModelWithOwnProcessGroups:
+    """A BertModel given its own collection runs entirely on the groups in that collection."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        Utils.world_size < 2 or Utils.world_size % 2 != 0, reason="needs an even number of ranks"
+    )
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
+    def test_forward_matches_global_grid_without_reading_it(
+        self, monkeypatch, sequence_parallel, position_embedding_type
+    ):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            attention_backend=AttnBackend.unfused,
+        )
+
+        def build_bert(pg_collection=None):
+            return BertModel(
+                config=config,
+                num_tokentypes=0,
+                transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=8,
+                position_embedding_type=position_embedding_type,
+                pg_collection=pg_collection,
+            )
+
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        reference = build_bert().cuda().eval()
+
+        # Same layout as the global grid (TP=2, CP=1, PP=1), but new communicators: a module that
+        # read the global groups instead of these would hit the forbidden accessors below.
+        grid = HyperCommGrid([2, 1, 1, Utils.world_size // 2], ["tp", "cp", "pp", "dp"])
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"),
+                cp=grid.create_pg("cp"),
+                pp=grid.create_pg("pp"),
+                # Single pipeline stage: no embedding groups and no GTP axis.
+                embd=None,
+                pos_embd=None,
+                gtp_remat=None,
+                expt_gtp_remat=None,
+            )
+            assert pg_collection.tp is not parallel_state.get_tensor_model_parallel_group()
+            assert torch.distributed.get_process_group_ranks(
+                pg_collection.tp
+            ) == torch.distributed.get_process_group_ranks(
+                parallel_state.get_tensor_model_parallel_group()
+            )
+
+            input_ids = torch.randint(
+                0,
+                100,
+                (2, 8),
+                device="cuda",
+                generator=torch.Generator(device="cuda").manual_seed(0),
+            )
+            attention_mask = torch.ones((2, 8), dtype=bool, device="cuda")
+            with torch.no_grad():
+                expected_logits, expected_binary_logits = reference(input_ids, attention_mask)
+
+            with monkeypatch.context() as patch:
+                _forbid_global_grid(patch)
+                model = build_bert(pg_collection).cuda().eval()
+                model.load_state_dict(reference.state_dict())
+                with torch.no_grad():
+                    logits, binary_logits = model(input_ids, attention_mask)
+
+            assert model.embedding.tp_group is pg_collection.tp
+            assert model.encoder.pg_collection is pg_collection
+            assert model.output_layer.tp_group is pg_collection.tp
+            assert model.pooler.tp_group is pg_collection.tp
+            if position_embedding_type == "rope":
+                assert model.rotary_pos_emb.cp_group is pg_collection.cp
+            torch.testing.assert_close(logits, expected_logits)
+            torch.testing.assert_close(binary_logits, expected_binary_logits)
+        finally:
+            grid.destroy()
