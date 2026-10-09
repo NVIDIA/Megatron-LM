@@ -161,11 +161,11 @@ def _multimem_reduce_scatter_residual_add_kernel(
             res_out_ptrs = residual_output_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
             res_in_ptrs = residual_input_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
             # reduce-scatter
-            (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True)
+            x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True)
             # load residual
-            (rx, ry, rz, rw) = ld_128(res_in_ptrs, mask=mask, multicast_op=False)
+            rx, ry, rz, rw = ld_128(res_in_ptrs, mask=mask, multicast_op=False)
             # add residual
-            (x, y, z, w) = add_v8_bf16_from_u32(x, y, z, w, rx, ry, rz, rw)
+            x, y, z, w = add_v8_bf16_from_u32(x, y, z, w, rx, ry, rz, rw)
             # store residual
             st_128(res_out_ptrs, x, y, z, w, mask=mask, multicast_op=False)
             # update squared sum for computing the norm later
@@ -192,9 +192,9 @@ def _multimem_reduce_scatter_residual_add_kernel(
                 rms_norm_weights_ptr.to(tl.pointer_type(tl.uint64)) + (thread_offset + tid) * 2
             )
 
-            (rx, ry, rz, rw) = ld_128(res_out_ptrs, mask=mask, multicast_op=False)
-            (wx, wy, wz, ww) = ld_128(rms_norm_weights_ptrs, mask=mask, multicast_op=False)
-            (nx, ny, nz, nw) = apply_norm(rx, ry, rz, rw, wx, wy, wz, ww, rrms, mask)
+            rx, ry, rz, rw = ld_128(res_out_ptrs, mask=mask, multicast_op=False)
+            wx, wy, wz, ww = ld_128(rms_norm_weights_ptrs, mask=mask, multicast_op=False)
+            nx, ny, nz, nw = apply_norm(rx, ry, rz, rw, wx, wy, wz, ww, rrms, mask)
             st_128(multicast_ptrs, nx, ny, nz, nw, mask=mask, multicast_op=True)
 
     sync_threads()
