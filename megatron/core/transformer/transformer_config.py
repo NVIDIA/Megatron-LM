@@ -616,17 +616,24 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    choices: "core_attn", "attention", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
+    "attention": recompute the complete self/cross-attention block (QKV projection, RoPE,
+    core attention, and output projection) as a single checkpoint. Subsumes "core_attn"
+    (do not set both — "core_attn"'s own checkpoint would nest inside "attention"'s,
+    which is redundant and wastes the outer checkpoint's memory savings).
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "gdn": recompute the complete GatedDeltaNet/GatedDeltaNet2 mixer forward. Subsumes
+    "gdn_norm_out" (that finer-grained checkpoint is skipped when "gdn" is also set, to
+    avoid nesting CheckpointWithoutOutput inside a normal checkpoint).
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
@@ -640,7 +647,8 @@ class TransformerConfig(ModelParallelConfig):
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "attention", "mlp", "moe", "shared_experts", and "gdn" use normal
+    checkpointing.
     """
 
     ####################
@@ -1511,6 +1519,10 @@ class TransformerConfig(ModelParallelConfig):
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
     "attn_proj": offload the input of the attn linear projection part.
+    "qkv_linear"/"core_attn"/"attn_proj" cannot be combined with "attention" in
+    recompute_modules: those offload points are nested inside Attention._forward, which
+    "attention" wraps wholesale in a single checkpoint, so their own saved-tensor hooks never
+    reach the checkpoint's own save and would be dead code (see moe/moe_act precedent below).
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
@@ -2364,12 +2376,14 @@ class TransformerConfig(ModelParallelConfig):
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
+                    "attention",
                     "moe_act",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
@@ -2394,12 +2408,20 @@ class TransformerConfig(ModelParallelConfig):
                     "multi_latent_attention."
                 )
 
-            if "gdn_norm_out" in self.recompute_modules and (
+            if {"gdn", "gdn_norm_out"} & set(self.recompute_modules) and (
                 not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
-                    "gdn_norm_out in recompute_modules is only supported with "
+                    "gdn and gdn_norm_out in recompute_modules are only supported with "
                     "experimental_attention_variant='gdn' or 'gdn2'."
+                )
+
+            if "attention" in self.recompute_modules and "core_attn" in self.recompute_modules:
+                raise ValueError(
+                    "attention and core_attn cannot both be in recompute_modules: 'attention' "
+                    "already wraps the whole self/cross-attention block (including core_attn) "
+                    "in a single checkpoint, so nesting core_attn's own checkpoint inside it is "
+                    "redundant. Remove 'core_attn' from recompute_modules."
                 )
 
             if "core_attn" in self.recompute_modules:
@@ -2647,6 +2669,20 @@ class TransformerConfig(ModelParallelConfig):
                     f"so offloading activations inside it is redundant and will cause errors. "
                     f"Either remove 'moe' from --recompute-modules or remove "
                     f"{offload_inside_moe} from --offload-modules."
+                )
+
+            if self.recompute_granularity == "selective" and "attention" in self.recompute_modules:
+                offload_inside_attention = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                    self.offload_modules
+                )
+                assert not offload_inside_attention, (
+                    f"Cannot offload {offload_inside_attention} while recomputing the whole "
+                    f"self/cross-attention block. 'attention' in recompute_modules wraps QKV "
+                    f"projection, core attention, and output projection in a single checkpoint, "
+                    f"so their own offload scopes never reach the checkpoint's own "
+                    f"save_for_backward call and would be dead code. Either remove 'attention' "
+                    f"from --recompute-modules or remove {offload_inside_attention} from "
+                    f"--offload-modules."
                 )
             assert (
                 self.min_offloaded_tensor_size >= 0
@@ -3435,7 +3471,7 @@ class TransformerConfig(ModelParallelConfig):
                         assert (
                             not full_cudagraph
                             and CudaGraphModule.attn not in self.cuda_graph_modules
-                        ) or "core_attn" not in self.recompute_modules, (
+                        ) or not ({"core_attn", "attention"} & set(self.recompute_modules)), (
                             "attention dropout is not supported with graphed attention "
                             "recomputation."
                         )
