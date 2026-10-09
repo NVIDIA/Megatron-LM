@@ -206,6 +206,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
     ),
     KernelEntry(
+        name="fused_row_copy",
+        sources=("megatron/core/fusions/fused_row_copy.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Copy with unique stores; bit-identical to Tensor.contiguous.",
+    ),
+    KernelEntry(
         name="fused_mla_yarn_rope",
         sources=("megatron/core/fusions/fused_mla_yarn_rope_apply.py",),
         tests=(K + "test_fused_triton_kernels.py",),
@@ -492,9 +499,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ddp_grad_buffer_reductions",
         sources=("megatron/core/distributed/param_and_grad_buffer.py",),
-        tests=(C + "test_gpt_model.py",),
+        tests=(
+            C + "test_gpt_model.py",
+            "tests/unit_tests/distributed/test_param_storage_copyback.py",
+        ),
         kind="external-lib",
-        notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite.",
+        notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
+        "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay.",
     ),
     KernelEntry(
         name="nccl_allocator",
