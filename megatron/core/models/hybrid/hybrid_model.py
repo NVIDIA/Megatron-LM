@@ -558,7 +558,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         cp_batch: ContextParallelBatch | None = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
-    ) -> Tensor:
+    ) -> Any:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -572,6 +572,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
+            output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
+                it receives the decoder output and output-layer/loss helpers, and its return
+                value is returned directly. The default output projection, logits/loss
+                computation, and inference postprocessing are skipped.
+            output_processor_context (Any, optional): Opaque caller-owned context passed to
+                ``output_processor`` as ``context``.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -843,7 +849,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     ),
                     main_hidden_states=hidden_states,
                 )
-        # Match GPTModel's hook for caller-owned output projection and loss.
+        # Give callers a post-decoder hook before the default output projection and loss path.
         if output_processor is not None:
             return output_processor(
                 hidden_states=hidden_states,
