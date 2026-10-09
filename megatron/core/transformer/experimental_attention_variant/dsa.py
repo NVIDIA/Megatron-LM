@@ -2520,6 +2520,11 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
+                if self.config.dsa_indexer_topk_tie_break is not None:
+                    raise RuntimeError(
+                        "dsa_indexer_topk_tie_break requires cuDNN top-k; "
+                        "the reference indexer-loss path does not support it."
+                    )
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
             # No TP-local top-k slicing here: the guard above forbids the indexer loss
             # under sequence-local TP query shards, so the top-k rows are already global.
@@ -2567,6 +2572,11 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
+                if self.config.dsa_indexer_topk_tie_break is not None:
+                    raise RuntimeError(
+                        "dsa_indexer_topk_tie_break requires cuDNN top-k; "
+                        "the reference indexer path does not support it."
+                    )
                 with torch.no_grad():
                     index_scores, topk_indices = fused_qk_topk_naive(
                         q,
