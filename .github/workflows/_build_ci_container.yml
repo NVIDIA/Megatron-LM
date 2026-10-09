@@ -349,6 +349,7 @@ jobs:
           echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
@@ -370,6 +371,28 @@ jobs:
           tags: |
             ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
             ${{ matrix.registry }}/megatron-lm:${{ inputs.source-sha }}-${{ matrix.cloud }}
+
+      # The config digest is also docker image inspect's .Id. CPU Testmon
+      # selection can prove the GPU environment matches without pulling it.
+      - name: Record unit-test image identity
+        id: unit-test-image
+        continue-on-error: true
+        env:
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          IMAGE_ID=$(jq -er '.["containerimage.config.digest"]' <<< "$BUILD_METADATA")
+          [[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/unit-test-image"
+          printf '%s\n' "$IMAGE_ID" > "$RUNNER_TEMP/unit-test-image/image-id.txt"
+
+      - name: Upload unit-test image identity
+        if: steps.unit-test-image.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unit-test-image-${{ inputs.source-sha }}-${{ matrix.cloud }}
+          path: ${{ runner.temp }}/unit-test-image/image-id.txt
+          overwrite: true
 
       - name: Verify exported cache
         if: inputs.verify-cache
