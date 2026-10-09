@@ -67,6 +67,7 @@ class FsdpContext:
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
         use_trace_replay: bool = False,
+        max_reuse_distance: int | None = 0,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -88,6 +89,8 @@ class FsdpContext:
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
             use_trace_replay: Enable communication replay inside explicit iteration scopes.
+            max_reuse_distance: Maximum intervening logical events for retaining weights.
+                None disables retention; zero allows only immediate reuse.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -100,7 +103,7 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.scheduler = TraceAndReplayScheduler() if use_trace_replay else None
+        self.scheduler = TraceAndReplayScheduler(max_reuse_distance) if use_trace_replay else None
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
@@ -213,8 +216,13 @@ class FsdpContext:
     def iteration(self) -> Iterator[None]:
         """Scope all microbatches of one global batch, including backward work.
 
-        Evaluation must use a separate iteration scope so its execution pattern
-        cannot be replayed without validation by the next training iteration.
+        A changed execution pattern requires invalidating the plan with
+        ``context.scheduler.abort_iteration()`` between completed iterations.
+        Replay mismatch or truncation raises after cleanup and plan invalidation.
+        Cleanup does not restore module hook phases or unwind interrupted forward
+        or autograd execution. A mismatch is fatal to the current training
+        execution: discard its graph and use a fresh model/runtime, rather than
+        resume the failed forward or backward.
         All ranks must follow collective-compatible control flow; replay fallback
         cannot undo speculative collectives on rank-divergent paths.
 

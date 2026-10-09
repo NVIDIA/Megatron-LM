@@ -54,24 +54,39 @@ class TraceEvent:
     phase: str = "none"
 
 
+@dataclass(frozen=True)
+class PlanAction:
+    """Communication annotation compiled for one logical trace occurrence."""
+
+    prefetch_target: "FsdpModule | None" = None
+    retain: bool = False
+
+
 class TraceAndReplayScheduler:
     """Observe complete iterations and optimize communication without ordering compute.
 
-    A divergent iteration runs demand-only and is discarded. The next complete
-    iteration is traced afresh. Speculative and retained materializations are
-    released on divergence, iteration completion, and abort.
+    Replay validates every logical occurrence before executing its compiled action.
+    Divergent or truncated replay raises after cleanup and invalidates the plan.
+    Cleanup does not restore module hook phases or unwind interrupted forward or
+    autograd execution. A replay mismatch is fatal to the current training
+    execution: discard the failed graph and construct a fresh model/runtime
+    rather than resume it. Invalidation between completed iterations is safe
+    and allows the next iteration to trace a deliberately changed pattern.
 
     All ranks must follow collective-compatible control flow. Local divergence
     recovery cannot undo speculative collectives already submitted, and cannot
     make rank-divergent execution safe.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_reuse_distance: int | None = 0) -> None:
+        if max_reuse_distance is not None and max_reuse_distance < 0:
+            raise ValueError("max_reuse_distance must be non-negative or None.")
+        self.max_reuse_distance = max_reuse_distance
         self._plan: list[TraceEvent] = []
+        self._actions: list[PlanAction] = []
         self._events: list[TraceEvent] = []
         self._position = 0
         self._active = False
-        self._diverged = False
         self._held: dict[int, FsdpModule] = {}
         self._touched: dict[int, FsdpModule] = {}
 
@@ -82,7 +97,6 @@ class TraceAndReplayScheduler:
         self._active = True
         self._events = []
         self._position = 0
-        self._diverged = False
         self._touched = {}
 
     def end_iteration(self) -> None:
@@ -90,71 +104,96 @@ class TraceAndReplayScheduler:
         if not self._active:
             raise RuntimeError("No FSDP trace iteration is active.")
         if self._plan and self._position != len(self._plan):
-            self._diverged = True
+            self.abort_iteration()
+            raise RuntimeError("FSDP trace replay ended before all logical events were consumed.")
         self._release_held()
         self._release_touched()
-        self._plan = [] if self._diverged else list(self._events)
+        if not self._plan:
+            self._plan = list(self._events)
+            self._compile_actions()
         self._active = False
 
     def abort_iteration(self) -> None:
-        """Discard an interrupted iteration and release speculative storage."""
+        """Invalidate the plan and release storage, without restoring hook lifecycle state.
+
+        After interrupted module execution, use a fresh model/runtime. Calling
+        this between completed iterations safely prepares a new execution pattern.
+        """
         self._release_held()
         self._release_touched()
         self._plan = []
+        self._actions = []
         self._events = []
         self._active = False
 
-    def _record(self, event: TraceEvent) -> bool:
+    def _record(self, event: TraceEvent) -> PlanAction:
         if not self._active:
             raise RuntimeError("Call context.begin_iteration() before using trace replay.")
-        replaying = bool(self._plan) and not self._diverged
-        if replaying:
+        if self._plan:
             if self._position >= len(self._plan) or self._plan[self._position] != event:
-                self._diverged = True
-                self._release_held()
-                replaying = False
-            else:
-                self._position += 1
+                self.abort_iteration()
+                raise RuntimeError("FSDP trace replay diverged from its logical event sequence.")
+            action = self._actions[self._position]
+            self._position += 1
+            return action
         self._events.append(event)
-        return replaying
+        return PlanAction()
 
-    def record_unshard(self, module: "FsdpModule", phase: str) -> None:
-        """Validate a demand unshard before using any speculative materialization."""
-        self._record(TraceEvent("unshard", module, phase))
+    def unshard(self, module: "FsdpModule", prefetch: str = "none") -> None:
+        """Execute a validated demand gather and wait, then its annotated prefetch."""
+        action = self._record(TraceEvent("unshard", module, prefetch))
         self._touched[id(module)] = module
         self._held.pop(id(module), None)
+        module._unshard_parameter_groups()
+        assert module._unshard_event is not None
+        module.context.current_stream().wait_event(module._unshard_event)
+        target = action.prefetch_target
+        if target is not None and target._unshard_event is None:
+            self._held[id(target)] = target
+            target._unshard_parameter_groups()
 
-    def prefetch(self, module: "FsdpModule", phase: str) -> None:
-        """Prefetch one safe successor after the current demand wait."""
-        if phase == "none" or not self._plan or self._diverged:
+    def reshard(self, module: "FsdpModule") -> None:
+        """Execute a validated release, retaining only a bounded planned reuse."""
+        action = self._record(TraceEvent("reshard", module))
+        if action.retain:
+            self._held[id(module)] = module
             return
-        budget = (
-            module._schedule_policy.backward_prefetch_size
-            if phase == "backward"
-            else module._schedule_policy.forward_prefetch_size
-        )
-        if budget == 0:
-            return
-        released: set[int] = set()
-        for event in self._plan[self._position :]:
-            if event.kind == "reshard":
-                released.add(id(event.module))
-            elif event.module is not module and id(event.module) not in released:
-                if event.module._unshard_event is None:
-                    self._held[id(event.module)] = event.module
-                    event.module._unshard_parameter_groups()
-                return
-
-    def record_reshard(self, module: "FsdpModule") -> bool:
-        """Retain storage only when the next logical operation consumes it again."""
-        replaying = self._record(TraceEvent("reshard", module))
-        if replaying and self._position < len(self._plan):
-            successor = self._plan[self._position]
-            if successor.kind == "unshard" and successor.module is module:
-                self._held[id(module)] = module
-                return True
         self._held.pop(id(module), None)
-        return False
+        module._reshard_parameter_groups()
+
+    def _compile_actions(self) -> None:
+        actions = []
+        for position, event in enumerate(self._plan):
+            target = None
+            retain = False
+            if event.kind == "reshard" and self.max_reuse_distance is not None:
+                for successor_position in range(position + 1, len(self._plan)):
+                    successor = self._plan[successor_position]
+                    if successor.module is event.module:
+                        retain = (
+                            successor.kind == "unshard"
+                            and successor_position - position - 1 <= self.max_reuse_distance
+                        )
+                        break
+            if event.kind == "unshard" and event.phase != "none":
+                budget = (
+                    event.module._schedule_policy.backward_prefetch_size
+                    if event.phase == "backward"
+                    else event.module._schedule_policy.forward_prefetch_size
+                )
+                if budget != 0:
+                    released: set[int] = set()
+                    for successor in self._plan[position + 1 :]:
+                        if successor.kind == "reshard":
+                            released.add(id(successor.module))
+                        elif (
+                            successor.module is not event.module
+                            and id(successor.module) not in released
+                        ):
+                            target = successor.module
+                            break
+            actions.append(PlanAction(target, retain))
+        self._actions = actions
 
     def _release_held(self) -> None:
         for module in self._held.values():
