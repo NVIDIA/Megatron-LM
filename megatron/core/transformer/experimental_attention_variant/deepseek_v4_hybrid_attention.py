@@ -612,7 +612,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
-                query = fused_mla_rope_inplace(
+                # Keep RoPE functional in the training graph.  The in-place
+                # kernel bypasses autograd's version counter and can corrupt
+                # the shared KV tensor (K and V alias) after the optimizer step.
+                query = fused_mla_rope_out_of_place(
                     q,
                     rotary_pos_cos,
                     rotary_pos_sin,
@@ -624,7 +627,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     remove_interleaving=True,
                 )
                 kv = kv.unsqueeze(-2)
-                kv = fused_mla_rope_inplace(
+                kv = fused_mla_rope_out_of_place(
                     kv,
                     rotary_pos_cos,
                     rotary_pos_sin,
