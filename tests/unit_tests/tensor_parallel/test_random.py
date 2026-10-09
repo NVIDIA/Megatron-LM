@@ -1,8 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextvars import ContextVar
+
 import pytest
 import torch
 
+from megatron.core.tensor_observation import capture_tensor_observations, observe_tensor
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
@@ -398,5 +401,47 @@ def test_checkpoint_without_output_retain_input_tensors(use_manager):
         weight.grad = None
         output2.backward(grad)
         assert torch.allclose(ref_input_grad, input2.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+_FORWARD_SCOPE: ContextVar[str] = ContextVar("test_checkpoint_forward_scope", default="default")
+
+
+@pytest.mark.parametrize("without_output", [False, True])
+def test_checkpoint_recompute_restores_forward_context(without_output):
+    """Recompute on the CUDA autograd thread sees the forward scope, observed exactly once."""
+    scopes = []
+    observed = []
+
+    def run_function(x):
+        scopes.append(_FORWARD_SCOPE.get())
+        observe_tensor(None, "x", "test", x)
+        return x * x
+
+    Utils.initialize_model_parallel()
+    try:
+        x = torch.arange(1.0, 5.0, device="cuda", requires_grad=True)
+        token = _FORWARD_SCOPE.set("forward")
+        try:
+            with capture_tensor_observations(
+                lambda *args: observed.append(args), frozenset({"test"})
+            ):
+                if without_output:
+                    ckpt = CheckpointWithoutOutput()
+                    y = ckpt.checkpoint(run_function, x)
+                    out = y * x
+                    ckpt.discard_output_and_register_recompute(out)
+                else:
+                    out = checkpoint(run_function, False, x) * x
+        finally:
+            _FORWARD_SCOPE.reset(token)
+
+        # Backward runs outside both scopes; only the saved forward context can supply them.
+        out.sum().backward()
+        assert scopes == ["forward", "forward"]
+        assert len(observed) == 1
+        assert _FORWARD_SCOPE.get() == "default"
+        torch.testing.assert_close(x.grad, 3 * x.detach() ** 2)
     finally:
         Utils.destroy_model_parallel()
