@@ -1299,10 +1299,14 @@ class TELinear(te.pytorch.Linear):
         name: str | None = None,
         gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups of the model that owns
+                this layer. A per-module quantization recipe reduces amaxes over its amax
+                reduction group. Falls back to the MPU global process groups when not given.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1311,6 +1315,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         self.config = config
+        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -1499,7 +1504,9 @@ class TELinear(te.pytorch.Linear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params, self.training, pg_collection=self._pg_collection
+        )
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
@@ -1571,6 +1578,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         self.config = config
+        self._pg_collection = pg_collection
 
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
@@ -1748,7 +1756,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params, self.training, pg_collection=self._pg_collection
+        )
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
         # TE LayerNormLinear requires its input dtype to match its BF16/FP16 parameters outside
@@ -1866,6 +1876,7 @@ class TEColumnParallelLinear(TELinear):
             name=name,
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            pg_collection=pg_collection,
         )
 
         # Set proper partition_stride
@@ -2061,7 +2072,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
 
-        with get_fp8_context(self.config):
+        with get_fp8_context(self.config, pg_collection=self._pg_collection):
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
                 output_parallel, output_bias = super().forward(input_)
@@ -2139,6 +2150,7 @@ class TERowParallelLinear(TELinear):
             name=name,
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            pg_collection=pg_collection,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -3046,7 +3058,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 _is_first_microbatch = None
             else:
                 _is_first_microbatch = _resolve_is_first_microbatch(self)
-            quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+            quant_context = _get_fp8_autocast_for_quant_params(
+                self.te_quant_params, self.training, pg_collection=self._pg_collection
+            )
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
