@@ -3064,8 +3064,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Re-derive and all-gather the model params (see MegatronOptimizer)."""
         if self.is_stub_optimizer:
             return
-        for model_chunk in self.model_chunks:
-            model_chunk.finish_pending_param_sync()
+        # Only DDP owns pending parameter gathers; Megatron-FSDP manages its
+        # own synchronization and does not expose the DDP drain API.
+        if not self.ddp_config.use_megatron_fsdp:
+            for model_chunk in self.model_chunks:
+                model_chunk.finish_pending_param_sync()
         self._stage_model_params_from_main_params()
         # Each rank only owns a shard of the main params, so the full params have to be
         # gathered. The caller is outside the training loop, so gather synchronously
