@@ -159,6 +159,8 @@ def _moe_identity_layer(calls):
     layer.is_moe_layer = True
     layer.mlp = Mock(spec=MoELayer)
     layer.mlp.router = Mock(spec=TopKRouter)
+    # MoELayer declares the scoped slot with a None class default.
+    layer.mlp._shared_prefix_token_multiplicities = None
 
     def forward(hidden_states, attention_mask):
         calls.append(layer.mlp._shared_prefix_token_multiplicities.clone())

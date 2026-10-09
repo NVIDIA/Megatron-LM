@@ -1418,8 +1418,10 @@ def router_gating_token_blocks(block_size: int = 1024) -> Iterator[None]:
     activations and expert choices. Fixed rows make this reduction independent of
     packing. Padding is removed before routing, so it never dispatches extra tokens.
 
-    The caller must enter this scope inside any activation-checkpoint callable so
-    backward recomputation uses the same router arithmetic as the original forward.
+    Megatron's ``tensor_parallel.checkpoint`` and ``CheckpointWithoutOutput`` restore the
+    forward context during recomputation, so backward recomputation keeps this scope. With
+    ``te_checkpoint`` or ``torch.utils.checkpoint``, enter the scope inside the checkpointed
+    callable instead.
     """
     if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
         raise ValueError("router gating token block size must be a positive integer")

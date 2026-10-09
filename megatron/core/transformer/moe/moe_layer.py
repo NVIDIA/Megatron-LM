@@ -234,6 +234,10 @@ class MoELayer(BaseMoELayer):
     strategies such as All-to-All and All-Gather.
     """
 
+    # Per-call shared-prefix token multiplicities. forward_hybrid_stack_shared_prefix sets it on
+    # the instance around each layer call and deletes it afterwards, restoring this default.
+    _shared_prefix_token_multiplicities = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -725,7 +729,7 @@ class MoELayer(BaseMoELayer):
 
         # Keep the tensor in the checkpoint closure: the shared-prefix caller
         # removes the scoped attribute before selective recomputation in backward.
-        token_multiplicities = getattr(self, "_shared_prefix_token_multiplicities", None)
+        token_multiplicities = self._shared_prefix_token_multiplicities
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):

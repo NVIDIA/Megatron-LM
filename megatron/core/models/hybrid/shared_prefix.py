@@ -1039,7 +1039,7 @@ def forward_hybrid_stack_shared_prefix(
                 layer.mlp if expert_bias_enabled and getattr(layer, "is_moe_layer", False) else None
             )
             if moe_layer is not None:
-                if getattr(moe_layer, "_shared_prefix_token_multiplicities", None) is not None:
+                if moe_layer._shared_prefix_token_multiplicities is not None:
                     raise RuntimeError("nested shared-prefix MoE dispatch is not supported")
                 moe_layer._shared_prefix_token_multiplicities = token_multiplicities
             try:
@@ -1052,7 +1052,7 @@ def forward_hybrid_stack_shared_prefix(
                     hidden_states = layer(hidden_states=hidden_states, attention_mask=None)
                 else:
                     attention = layer.self_attention
-                    if getattr(attention, "_shared_prefix_forest", None) is not None:
+                    if attention._shared_prefix_forest is not None:
                         raise RuntimeError(
                             "nested shared-prefix attention dispatch is not supported"
                         )
