@@ -750,3 +750,40 @@ def test_dense_teacher_allocation_stays_within_the_budget(num_query_heads, num_q
     if num_query_groups > 1:
         assert peak < 1.5 * tile, (num_query_heads, num_query_groups, peak, tile)
     assert peak <= 2 * _SCORE_TILE_BUDGET_BYTES
+
+
+@pytest.mark.parametrize(
+    "needs_grad", [(True, False, True), (True, True, False), (False, True, True)]
+)
+def test_sparse_attention_rejects_partial_qkv_gradients(needs_grad):
+    """Mixed requires_grad has no working backward, so say so instead of failing in autograd.
+
+    The fused backward runs only when all three of Q/K/V need gradients. Below that it drops to
+    replaying the forward under autograd, which cannot work while Triton dispatch is on:
+    _sparse_attention_tile returns a raw kernel result with no grad_fn.
+    """
+    torch.manual_seed(17)
+    seqlen, batch_size, hidden_size = 8, 1, 12
+    attention_dim, index_dim = 4, 6
+    needs_q, needs_k, needs_v = needs_grad
+    query = torch.randn(seqlen, batch_size, 4, attention_dim, requires_grad=needs_q)
+    key = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=needs_k)
+    value = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=needs_v)
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+    indexer = _simplified_test_indexer(hidden_size, index_dim, topk=3)
+
+    output, _ = dsa_min_memory_gqa(
+        query,
+        key,
+        value,
+        hidden_states,
+        indexer,
+        attention_dim**-0.5,
+        0.2,
+        False,
+        query_chunk_size=4,
+        key_chunk_size=4,
+        use_triton=False,
+    )
+    with pytest.raises(RuntimeError, match="all of query, key and value or none"):
+        output.sum().backward()

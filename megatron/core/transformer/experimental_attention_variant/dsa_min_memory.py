@@ -1232,8 +1232,17 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             if compute_loss_grad and grad_linear_k_weight is not None
             else None
         )
+        needs_query_grad, needs_key_grad, needs_value_grad = ctx.needs_input_grad[:3]
+        if any((needs_query_grad, needs_key_grad, needs_value_grad)) and not all(
+            (needs_query_grad, needs_key_grad, needs_value_grad)
+        ):
+            raise RuntimeError(
+                "min-memory DSA sparse attention needs gradients for all of query, key and "
+                f"value or none, got query={needs_query_grad}, key={needs_key_grad}, "
+                f"value={needs_value_grad}. Partial Q/K/V gradients are not supported."
+            )
         use_triton_attention_backward = (
-            ctx.needs_input_grad[0] and ctx.needs_input_grad[1] and ctx.needs_input_grad[2]
+            needs_query_grad and needs_key_grad and needs_value_grad
         )
         grad_key_accum = None
         grad_value_accum = None
