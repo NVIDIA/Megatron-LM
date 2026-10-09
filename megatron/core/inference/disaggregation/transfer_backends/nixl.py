@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 import torch
 
@@ -145,36 +145,60 @@ class NixlPullHandle:
 
     def poll(self) -> bool:
         """Return True if every transfer has settled, without blocking."""
+        if self.error is not None:
+            raise RuntimeError(self.error)
         if self.done:
-            if self.error is not None:
-                raise RuntimeError(self.error)
             return True
         if not self.xfers:
             self.done = True
             return True
 
-        errors: List[str] = []
         pending: List[str] = []
         for xfer, ctx in zip(self.xfers, self.contexts):
-            state = self.agent.check_xfer_state(xfer)
+            try:
+                state = self.agent.check_xfer_state(xfer)
+            except Exception as exc:
+                # NIXL's Python bindings raise for error statuses instead of
+                # returning "ERR". The remaining transfers may still be active.
+                self._fail(f"NIXL transfer failed ({ctx}): {exc}")
             if state == "DONE":
                 continue
             if state == "ERR":
-                errors.append(ctx)
-                continue
+                self._fail(f"NIXL transfer failed ({ctx})")
             pending.append(f"{ctx}: {state}")
 
         if not pending:
             self.done = True
-            if errors:
-                self.error = f"NIXL transfer failed ({', '.join(errors)})"
-                raise RuntimeError(self.error)
             return True
         if time.perf_counter() - self.submitted_at > self.timeout_s:
             raise TimeoutError(
                 f"NIXL transfer timed out after {self.timeout_s}s; pending={pending}"
             )
         return False
+
+    def _fail(self, message: str) -> NoReturn:
+        """Release failed and outstanding transfers before allowing storage reuse."""
+
+        self.error = message
+        unreleased = []
+        contexts = []
+        for xfer, ctx in zip(self.xfers, self.contexts):
+            try:
+                # Successful release cancels active operations. An exception
+                # does not establish that the transport has stopped using storage.
+                self.agent.release_xfer_handle(xfer)
+            except Exception as exc:
+                unreleased.append(xfer)
+                contexts.append(ctx)
+                self.error += f"; NIXL cleanup failed ({ctx}): {exc}"
+        self.xfers = unreleased
+        self.contexts = contexts
+        self.done = not unreleased
+        if unreleased:
+            self.error += "; storage remains quarantined until backend teardown"
+        # Keep unsuccessful releases alive, but never poll or release a terminal
+        # request again. Subsequent polls report the cached failure only.
+        raise RuntimeError(self.error)
 
     def wait(self) -> None:
         """Block until the transfer completes; NIXL has no blocking wait, so
@@ -648,15 +672,12 @@ class NixlTransferBackend:
                 )
                 try:
                     cleanup.wait()
-                except TimeoutError:
-                    # Tell the owner not to recycle the destination storage while
-                    # an already-submitted transfer may still write to it.
-                    storage_safe = False
-                    unsafe_cleanup = cleanup
                 except Exception:
-                    # Transfer errors are reported only after every submitted
-                    # transfer has reached a terminal state.
-                    pass
+                    # Polling or cleanup can fail before all submitted operations
+                    # stop accessing storage. Preserve their handles for the owner.
+                    if not cleanup.storage_safe:
+                        storage_safe = False
+                        unsafe_cleanup = cleanup
             if isinstance(exc, TransferStartError):
                 if unsafe_cleanup is not None:
                     exc.resources = (unsafe_cleanup, exc.resources)
