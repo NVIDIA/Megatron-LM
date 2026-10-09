@@ -14,6 +14,7 @@ from megatron.core.models.hybrid.shared_prefix_layout import (
     SharedPrefixLayout,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.moe import moe_utils
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, process_mtp_loss
 from tests.unit_tests.test_utilities import Utils
 
@@ -269,3 +270,16 @@ class TestSharedPrefixMTPModel:
             # A star has no loss groups and keeps the global normalization.
             with pytest.raises(_ReachedBackbone):
                 self._forward(model, roots[0])
+
+    def test_mtp_runs_inside_router_gating_token_blocks(self):
+        model = self._model()
+        block_sizes = []
+        original_forward = model.mtp.forward
+
+        def recording_forward(*args, **kwargs):
+            block_sizes.append(moe_utils._ROUTER_GATING_TOKEN_BLOCK_SIZE.get())
+            return original_forward(*args, **kwargs)
+
+        model.mtp.forward = recording_forward
+        self._forward(model, _star(16, (9, 23)))
+        assert len(block_sizes) == 1 and block_sizes[0] is not None

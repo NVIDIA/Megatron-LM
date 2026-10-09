@@ -34,6 +34,7 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.moe_utils import router_gating_token_blocks
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -854,16 +855,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             raise NotImplementedError(
                 "shared-prefix MTP supports only RoPE or positionless Hybrid models"
             )
-        packed_mtp_hidden = self.mtp(
-            input_ids=packed_input_ids,
-            position_ids=packed_position_ids,
-            hidden_states=packed_hidden,
-            attention_mask=None,
-            inference_params=None,
-            rotary_pos_emb=packed_rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            embedding=self.embedding,
-        )
+        # Use the backbone's fixed router GEMM row blocks for MoE layers inside the
+        # predictor too, so star and forest packing give the same MTP routing.
+        with router_gating_token_blocks():
+            packed_mtp_hidden = self.mtp(
+                input_ids=packed_input_ids,
+                position_ids=packed_position_ids,
+                hidden_states=packed_hidden,
+                attention_mask=None,
+                inference_params=None,
+                rotary_pos_emb=packed_rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                embedding=self.embedding,
+            )
         del packed_hidden
         # MultiTokenPredictionBlock returns depth-major chunks [depth_0 | ... |
         # depth_D], each the SP shard of the branch-major pack, which is the layout
