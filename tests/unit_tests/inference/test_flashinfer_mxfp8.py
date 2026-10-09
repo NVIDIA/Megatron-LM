@@ -84,6 +84,14 @@ def test_prepare_cutlass_mxfp8_weights_reuses_existing_swizzled_scale_bytes(monk
     assert prepared.scale.dtype == torch.int32
     assert torch.equal(prepared.scale.view(torch.uint8).reshape_as(scale_bytes), scale_bytes)
     assert torch.equal(prepared.input_scale, torch.ones(experts))
+    assert prepared.data.data_ptr() == weight.data.data_ptr()
+    assert prepared.scale.data_ptr() == weight.scale.data_ptr()
+
+    # Same byte count, wrong layout: stacking per-expert unswizzled matrices
+    # must not silently reinterpret them as tiled scales.
+    weight.scale = weight.scale.reshape(experts, rows, cols // 32)
+    with pytest.raises(ValueError, match="1D swizzled scales per expert"):
+        prepare_cutlass_mxfp8_weights(weight)
 
 
 def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
@@ -236,6 +244,45 @@ def test_flashinfer_clamped_relu2_config_accepts_supported_precisions(fp8):
         activation_func_tanh_clamp_scale=16.0,
     )
     assert config.activation_func_tanh_clamp_scale == 16.0
+
+
+@pytest.mark.parametrize("backend", ["torch", "vllm", "flashinfer"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "field", ["activation_func_tanh_clamp_scale", "activation_func_tanh_clamp_scale_linear"]
+)
+def test_clamp_scales_must_be_finite(backend, value, field):
+    with pytest.raises(ValueError, match="finite clamp scale"):
+        _make_bounded_mxfp8_config(
+            inference_grouped_gemm_backend=backend,
+            inference_flashinfer_mxfp8_token_capacity=None,
+            **{field: value},
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"hidden_size": 192}, {"moe_latent_size": 192}, {"moe_ffn_hidden_size": 192}]
+)
+def test_cutlass_mxfp8_config_rejects_unaligned_expert_dimensions(overrides):
+    with pytest.raises(ValueError, match="dimensions divisible by 128"):
+        _make_bounded_mxfp8_config(
+            activation_func_tanh_clamp_scale=16.0,
+            inference_flashinfer_mxfp8_token_capacity=None,
+            **overrides,
+        )
+
+
+@pytest.mark.parametrize("fp8", [None, "e4m3"])
+def test_cutlass_alignment_uses_latent_size_and_only_restricts_mxfp8(fp8):
+    _make_bounded_mxfp8_config(
+        hidden_size=192,
+        moe_latent_size=128 if fp8 else 192,
+        moe_ffn_hidden_size=128 if fp8 else 192,
+        fp8=fp8,
+        fp8_param=fp8 is not None,
+        activation_func_tanh_clamp_scale=16.0,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
 
 
 @pytest.mark.parametrize(

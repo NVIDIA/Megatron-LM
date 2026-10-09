@@ -308,7 +308,9 @@ class TestMXFP8ReshardTransform:
             ),
         ],
     )
-    def test_flashinfer_moe_buffers_refresh_in_place(self, clamp_scale, rows, prepare_weights):
+    def test_flashinfer_moe_buffers_refresh_in_place(
+        self, clamp_scale, rows, prepare_weights, monkeypatch
+    ):
         """Refit refreshes derived FlashInfer weights without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -346,14 +348,45 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
 
+        if clamp_scale is not None:
+            for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
+                stack = getattr(grouped_mlp, buf_name)
+                for i in range(num_experts):
+                    canonical = buffers[f"{linear_name}.weight{i}"]
+                    assert getattr(getattr(grouped_mlp, linear_name), f"weight{i}") is canonical
+                    assert canonical.data.data_ptr() == stack.data[i].data_ptr()
+                    assert canonical.scale.data_ptr() == stack.scale[i].data_ptr()
+
         transform = MXFP8ReshardTransform(
             convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
         )
         for name in buffers:
             new_data = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
             transform.finalize_recv(name, (slice(None), slice(None)), [new_data])
+            if clamp_scale is not None:
+                linear_name, expert_name = name.split(".")
+                stack = getattr(
+                    grouped_mlp, "_fc1_weight" if linear_name == "linear_fc1" else "_fc2_weight"
+                )
+                expert_idx = int(expert_name.removeprefix("weight"))
+                quantized = MXFP8Tensor.from_bf16(new_data, backend="triton")
+                assert torch.equal(stack.data[expert_idx], quantized.data)
+                assert torch.equal(
+                    stack.scale[expert_idx].view(torch.uint8).reshape(-1),
+                    quantized.scale.view(torch.uint8),
+                )
 
-        assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is True
+        # CUTLASS refits must be visible immediately, without restacking or refresh copies.
+        with monkeypatch.context() as patch:
+            if clamp_scale is not None:
+
+                def forbidden_stack(*args, **kwargs):
+                    pytest.fail("CUTLASS refit must not restack shared weights")
+
+                patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
+            assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is (
+                clamp_scale is None
+            )
 
         for linear_name, flashinfer_weight in (
             ("linear_fc1", grouped_mlp._fc1_weight),

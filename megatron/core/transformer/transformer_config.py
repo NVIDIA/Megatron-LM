@@ -1979,14 +1979,34 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and (mxfp8_enabled or self.activation_func_tanh_clamp_scale is not None)
+                and self.activation_func != squared_relu
+            ):
+                raise ValueError(
+                    "FlashInfer MXFP8 or tanh-clamped MoE supports only non-gated squared-ReLU "
+                    "experts."
+                )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                 and self.activation_func_tanh_clamp_scale is not None
             ):
-                if not math.isfinite(self.activation_func_tanh_clamp_scale):
-                    raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
-                if self.gated_linear_unit or self.activation_func != squared_relu:
-                    raise ValueError(
-                        "FlashInfer tanh-clamped MoE supports only non-gated squared-ReLU."
+                if mxfp8_enabled:
+                    expert_hidden = (
+                        self.moe_latent_size
+                        if self.moe_latent_size is not None
+                        else self.hidden_size
                     )
+                    expert_ffn = (
+                        self.moe_ffn_hidden_size
+                        if self.moe_ffn_hidden_size is not None
+                        else self.ffn_hidden_size
+                    )
+                    if expert_hidden % 128 or expert_ffn % 128:
+                        raise ValueError(
+                            "FlashInfer CUTLASS MXFP8 requires expert hidden and FFN "
+                            f"dimensions divisible by 128; got ({expert_hidden}, {expert_ffn})."
+                        )
                 if self.add_bias_linear:
                     raise ValueError(
                         "FlashInfer CUTLASS ClampedRelu2 requires add_bias_linear=False."
@@ -2008,18 +2028,6 @@ class TransformerConfig(ModelParallelConfig):
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
                     )
-
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and mxfp8_enabled
-                and (self.gated_linear_unit or self.activation_func != squared_relu)
-            ):
-                raise ValueError(
-                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
-                    "squared-ReLU experts. Set activation_func=squared_relu and "
-                    "gated_linear_unit=False, or select inference_grouped_gemm_backend "
-                    "'torch' or 'vllm'."
-                )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:
@@ -2965,6 +2973,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_tanh_clamp_scale is not None:
+            if not math.isfinite(self.activation_func_tanh_clamp_scale):
+                raise ValueError("activation_func_tanh_clamp_scale requires a finite clamp scale.")
             if self.activation_func_tanh_clamp_scale <= 0.0:
                 raise ValueError(
                     "activation_func_tanh_clamp_scale must be positive, got "
@@ -2995,6 +3005,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_tanh_clamp_scale_linear is not None:
+            if not math.isfinite(self.activation_func_tanh_clamp_scale_linear):
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear requires a finite clamp scale."
+                )
             if self.activation_func_tanh_clamp_scale_linear <= 0.0:
                 raise ValueError(
                     "activation_func_tanh_clamp_scale_linear must be positive, got "

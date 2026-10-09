@@ -103,6 +103,11 @@ def _pack_cutlass_mxfp8_scale(
             f"by 128; got shape=({rows}, {cols})"
         )
     scale_cols = cols // 32
+    if scale.ndim != 2 or scale.shape[0] != experts:
+        raise ValueError(
+            "FlashInfer CUTLASS requires 1D swizzled scales per expert, stacked "
+            "as [experts, bytes]; unswizzled scale matrices are not supported."
+        )
     scale_u8 = scale.contiguous().view(torch.uint8)
     expected = experts * rows * scale_cols
     if scale_u8.numel() != expected:
@@ -119,7 +124,11 @@ def _pack_cutlass_mxfp8_scale(
 def prepare_cutlass_mxfp8_weights(
     weight: MXFP8Tensor, out: FlashInferCutlassMXFP8Weight | None = None
 ) -> FlashInferCutlassMXFP8Weight:
-    """Prepare an MCore MXFP8 expert stack for FlashInfer's CUTLASS MoE."""
+    """View a canonical expert stack as CUTLASS weights, sharing its storage.
+
+    Callers must retain canonical per-expert views for in-place refits. Neither
+    the data nor the scale bytes need a layout conversion for this backend.
+    """
     require_flashinfer_cutlass_mxfp8()
     if weight.backend != "triton":
         raise ValueError(
@@ -135,8 +144,8 @@ def prepare_cutlass_mxfp8_weights(
 
     if out is None:
         return FlashInferCutlassMXFP8Weight(
-            data=weight.data.contiguous().clone(),
-            scale=packed_scale.clone(),
+            data=weight.data.contiguous(),
+            scale=packed_scale,
             input_scale=torch.ones(experts, dtype=torch.float32, device=weight.data.device),
             logical_rows=rows,
             logical_cols=cols,
