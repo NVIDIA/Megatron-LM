@@ -4982,6 +4982,13 @@ class TransformerConfig(ModelParallelConfig):
                     "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
                 )
 
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Full-iteration CUDA graphs with paged stash require at least two eager "
+                    "warmup steps to discover the stash schedule and allocate its buffers "
+                    "before capture."
+                )
+
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
                     assert (

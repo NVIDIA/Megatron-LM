@@ -620,6 +620,20 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
             )
 
+    def test_full_iteration_paged_stash_requires_two_warmup_steps(self):
+        kwargs = dict(
+            cuda_graph_impl="full_iteration",
+            cuda_graph_modules=[],
+            moe_expert_capacity_factor=1.0,
+            moe_pad_expert_input_to_capacity=True,
+        )
+        for warmup_steps in (0, 1):
+            with pytest.raises(AssertionError, match="at least two eager warmup steps"):
+                _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=warmup_steps, **kwargs)
+
+        config = _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=2, **kwargs)
+        assert config.cuda_graph_warmup_steps == 2
+
     @pytest.mark.parametrize(
         "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
     )
