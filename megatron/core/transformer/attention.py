@@ -33,6 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
@@ -1710,12 +1711,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):
-        x_dtype = x.dtype
         gate = gate.contiguous()
         gate = gate.view(*x.shape)
-        x = x * torch.sigmoid(gate.float())
-        x = x.to(x_dtype)
-        return x
+        return apply_attention_output_gate(x, gate, 'elementwise', cast_mode='after')
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""

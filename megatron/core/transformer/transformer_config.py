@@ -305,7 +305,14 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Whether to apply output gate to the attention layers."""
+    """Whether to apply output gating to attention layers."""
+
+    gated_attention_proj_granularity: Literal['elementwise', 'headwise'] = "elementwise"
+    """Projection granularity for ``attention_output_gate``.
+
+    ``elementwise`` projects one gate per output element. ``headwise`` projects one
+    scalar per head and is supported only by absorbed MLA.
+    """
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -1737,6 +1744,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+
+        if self.gated_attention_proj_granularity not in ('elementwise', 'headwise'):
+            raise ValueError(
+                "gated_attention_proj_granularity must be either 'elementwise' or 'headwise', "
+                f"got {self.gated_attention_proj_granularity!r}."
+            )
+        if self.gated_attention_proj_granularity == 'headwise' and not self.multi_latent_attention:
+            raise ValueError(
+                "Regular attention does not support headwise "
+                "gated_attention_proj_granularity; use 'elementwise'."
+            )
 
         if self.num_query_groups > 0 and self.num_attention_heads % self.num_query_groups != 0:
             raise ValueError(
@@ -4038,7 +4056,10 @@ class MLATransformerConfig(TransformerConfig):
             )
 
         if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
+            if self.experimental_attention_variant != 'dsa':
+                raise NotImplementedError("Output gating is only supported for absorbed MLA.")
+            if self.mla_down_proj_fusion:
+                raise ValueError("Absorbed MLA output gating requires unfused down projections.")
 
         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
         if self.experimental_attention_variant == "dsv4_hybrid":

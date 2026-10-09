@@ -151,12 +151,29 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_attention_output_gate.py",
+        ),
         kind="dispatch",
-        notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
+        notes="Attention._apply_output_gate is replayed in test_fused_activations.py and "
+        "test_attention_output_gate.py (FP32/BF16 output, input and gate gradients). "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py.",
+    ),
+    KernelEntry(
+        name="attention_output_gate",
+        sources=(
+            "megatron/core/transformer/attention_output_gate.py",
+            "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
+        ),
+        tests=(K + "test_attention_output_gate.py",),
+        kind="torch.compile",
+        notes="Shared FP32 sigmoid gate math is replayed through the actual regular Attention "
+        "elementwise and absorbed MLA headwise jit_fuser wrappers, including the headwise "
+        "gate-gradient reduction over value channels under side-stream contention.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -640,11 +657,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            K + "test_attention_output_gate.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py) and TE fused RoPE (test_te_wrappers.py). The TE "
-        "FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
+        "FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed. The absorbed "
+        "MLA headwise output gate is replayed in test_attention_output_gate.py.",
     ),
     KernelEntry(
         name="fp8_fp4_master_weight_casts",

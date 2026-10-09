@@ -122,6 +122,7 @@ def get_dsa_module_spec_for_backend(
             linear_kv_down_proj=backend.linear(),
             linear_kv_up_proj=backend.column_parallel_linear(),
             core_attention=core_attention,
+            linear_gate=backend.column_parallel_linear(),
             linear_proj=backend.row_parallel_linear(),
             q_layernorm=qk_norm,
             kv_layernorm=qk_norm,
