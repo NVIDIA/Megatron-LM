@@ -802,7 +802,7 @@ class TEGroupedMLP(MegatronModule):
             # an FC2 bias the two placements are the same function, and the prob gradient
             # becomes an ordinary (deterministic) torch reduction.
             post_probs = None
-            if self.config.deterministic_mode:
+            if getattr(self.config, "deterministic_mode", False):
                 if self.linear_fc2.use_bias:
                     raise RuntimeError(
                         "deterministic_mode with the Transformer Engine operation-fuser grouped "

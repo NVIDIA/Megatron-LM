@@ -67,6 +67,12 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
     # and gathers prefix sums. Both orders use the same batch-offset key ids.
     # Tiny test heads otherwise allocate a large unused padding-id array under the 1 GiB budget.
     monkeypatch.setattr(dk, "_DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES", 4096)
+    # The fp32 tolerance below assumes true fp32 GEMMs; an earlier test in the same process may
+    # have enabled TF32, which cuBLAS honours for the small bmm/matmul shapes used here.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    prior_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
     if chunk_rows is not None:
         monkeypatch.setattr(dk, "_deterministic_indexer_dk_chunk_rows", lambda *_: chunk_rows)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -96,6 +102,7 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
         ]
     finally:
         torch.use_deterministic_algorithms(prior_deterministic, warn_only=prior_warn_only)
+        torch.set_float32_matmul_precision(prior_precision)
     tolerance = (
         dict(rtol=2e-2, atol=2e-3) if dtype == torch.bfloat16 else dict(rtol=1e-5, atol=2e-6)
     )
