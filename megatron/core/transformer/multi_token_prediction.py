@@ -2561,12 +2561,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         cp_batch: Optional[ContextParallelBatch],
     ) -> MultiTokenPredictionInputs:
         """Prepare activations and token-aligned inputs for the MTP block's CP layout."""
-        source_layout = (
+        source_layout: CPLayout = (
             cp_batch.boundary_layout
             if cp_batch is not None
             else getattr(self.config, "cp_partition_mode", "zigzag")
         )
-        target_layout = (
+        target_layout: CPLayout = (
             self.config.attention_cp_layout
             if cp_batch is not None
             and getattr(self.config, "sequence_packing_scheduler", None) is None
