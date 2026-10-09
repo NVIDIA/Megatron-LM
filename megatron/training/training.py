@@ -100,8 +100,8 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,

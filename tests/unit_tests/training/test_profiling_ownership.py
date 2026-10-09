@@ -101,7 +101,9 @@ def inline_profiler(monkeypatch, run_config):
                 train_data_iterator=None,
                 valid_data_iterator=None,
                 process_non_loss_data_func=None,
-                config=SimpleNamespace(finalize_model_grads_func=Mock()),
+                config=SimpleNamespace(
+                    finalize_model_grads_func=Mock(), pipeline_model_parallel_prewarm=False
+                ),
                 checkpointing_context={},
                 non_loss_data_func=None,
             )

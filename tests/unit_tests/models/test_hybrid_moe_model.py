@@ -345,6 +345,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "pipeline_dtype": "torch.bfloat16",
     "pipeline_model_parallel_comm_backend": None,
     "pipeline_model_parallel_layout": None,
+    "pipeline_model_parallel_prewarm": False,
     "pipeline_model_parallel_size": 1,
     "qk_clip": False,
     "qk_clip_alpha": 0.5,
