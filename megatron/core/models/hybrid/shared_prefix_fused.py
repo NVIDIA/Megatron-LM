@@ -185,6 +185,7 @@ class _ComposedForestAttn(torch.autograd.Function):
             )  # o [rows, np, hn], lse [np, rows]
             outs.append(o)
             lses.append(lse)
+        del kx, vx, o  # free the gathered K/V; pass outputs are freed as they are merged
 
         # Zero-length-K padding rows report LSE=+inf: give them weight 0 in the merge.
         merge_lses = [lse.float().masked_fill(torch.isinf(lse), float("-inf")) for lse in lses]
@@ -193,9 +194,10 @@ class _ComposedForestAttn(torch.autograd.Function):
             lse_final[:, rows] = torch.logaddexp(lse_final[:, rows], lse)
         # merged output: sum_pass w_pass * o_pass, w_pass = exp(lse_pass - lse_final).
         o_merged = torch.zeros(total, np_, hn, device=q.device, dtype=torch.float32)
-        for (rows, *_), o, lse in zip(passes, outs, merge_lses):
-            contrib = torch.exp(lse - lse_final[:, rows]).transpose(0, 1).unsqueeze(-1) * o.float()
-            o_merged[rows] += contrib
+        for index, ((rows, *_), lse) in enumerate(zip(passes, merge_lses)):
+            weight = torch.exp(lse - lse_final[:, rows]).transpose(0, 1).unsqueeze(-1)
+            o_merged[rows].add_(weight * outs[index])
+            outs[index] = None  # release each pass output once merged
         o_merged = o_merged.to(q.dtype)
 
         ctx.save_for_backward(q, k, v, o_merged)
@@ -221,7 +223,8 @@ class _ComposedForestAttn(torch.autograd.Function):
             weight = torch.exp(
                 lse.float().masked_fill(torch.isinf(lse), float("-inf")) - lse_final[:, rows]
             )  # 0 on zero-K padding rows
-            dox = (weight.transpose(0, 1).unsqueeze(-1) * do[rows]).to(q.dtype)
+            dox = torch.empty(qx.shape, device=q.device, dtype=q.dtype)
+            torch.mul(weight.transpose(0, 1).unsqueeze(-1), do[rows], out=dox)
             dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
             _flash_attn_varlen_backward(
                 dout=dox,
@@ -246,10 +249,10 @@ class _ComposedForestAttn(torch.autograd.Function):
                 alibi_slopes=None,
                 deterministic=deterministic,
             )
-            dq[rows] += dqx.float()
+            dq[rows].add_(dqx)
             if k_idx is None:
-                dk += dkx.float()
-                dv += dvx.float()
+                dk.add_(dkx)
+                dv.add_(dvx)
             else:
                 dk.index_add_(0, k_idx, dkx.float())
                 dv.index_add_(0, k_idx, dvx.float())
