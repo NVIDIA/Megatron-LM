@@ -844,7 +844,14 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert n == 3
     assert called_context is context
     sample_kwargs = controller._sampling.sample_kernel.call_args.kwargs
-    assert set(sample_kwargs) == {"gather_indices", "no_top_k", "no_top_p", "output"}
+    assert set(sample_kwargs) == {
+        "gather_indices",
+        "no_top_k",
+        "no_top_p",
+        "output",
+        "sequence_lengths",
+    }
+    assert sample_kwargs["sequence_lengths"] is None
     assert sample_kwargs["gather_indices"] is None
     assert not sample_kwargs["no_top_k"]
     assert sample_kwargs["no_top_p"]
@@ -1392,6 +1399,7 @@ def test_async_sched_step_wires_sampling_through_resolution(
     assert context.async_sched_compaction_step_count == expected_compaction_count
 
 
+@pytest.mark.internal
 def test_async_overlap_seed_uses_pending_logits_positions():
     """Preparing the next forward must not change the pending token's RNG draw."""
     context = _make_async_sched_context(total_request_count=3)
@@ -1403,9 +1411,18 @@ def test_async_overlap_seed_uses_pending_logits_positions():
     )
     pending_positions = context.get_active_sequence_lengths().clone()
     controller = _make_async_sched_controller(context)
-    controller._all_logits_cuda = torch.randn(1, 3, 97, generator=torch.Generator().manual_seed(17))
+    controller._all_logits_cuda = torch.randn(
+        1, 3, 97, device="cuda", generator=torch.Generator(device="cuda").manual_seed(17)
+    )
+    controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
+    controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
+        3, dtype=torch.int64, pin_memory=True
+    )
+    controller._async_sched_sample_gpu_ready_event = torch.cuda.Event()
+    controller._async_sched_sample_cpu_ready_event = torch.cuda.Event()
+    controller._async_sched_copy_stream = torch.cuda.Stream()
     sampler = TorchSampling.__new__(TorchSampling)
-    sampler._rng = torch.Generator().manual_seed(18)
+    sampler._rng = torch.Generator(device="cuda").manual_seed(18)
     sampler._vocab_size = 97
     controller._sampling = sampler
     expected = sampler.sample_kernel(
@@ -1420,7 +1437,6 @@ def test_async_overlap_seed_uses_pending_logits_positions():
     controller._run_async_sched_prepare = mock.Mock(side_effect=prepare_successor)
     controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
     controller._run_async_sched_forward = mock.Mock()
-    controller._synchronize_async_sched_event = mock.Mock()
 
     result = asyncio.run(controller._run_async_sched_step_overlap())
 
@@ -1428,7 +1444,7 @@ def test_async_overlap_seed_uses_pending_logits_positions():
     assert torch.equal(
         sampler.sample_kernel.call_args.kwargs["sequence_lengths"], pending_positions
     )
-    assert torch.equal(result.output["sample"], expected)
+    assert torch.equal(result.output["sample"], expected.cpu())
 
 
 def test_async_sched_step_yields_after_resolution_outside_inference_mode():
