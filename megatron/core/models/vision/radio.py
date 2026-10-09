@@ -543,7 +543,7 @@ class RADIOViTModel(VisionModule):
             device = packed_seq_params.cu_seqlens_q.device
             dtype = packed_seq_params.cu_seqlens_q.dtype
             cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=dtype, device=device)
-            max_seqlen = torch.tensor(max(seq_lens) if seq_lens else 0, dtype=dtype, device=device)
+            max_seqlen = max(seq_lens, default=0)
             new_packed_seq_params = PackedSeqParams(
                 cu_seqlens_q=cu_seqlens_tensor,
                 cu_seqlens_kv=cu_seqlens_tensor,

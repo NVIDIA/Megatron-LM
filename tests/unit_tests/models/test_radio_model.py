@@ -622,6 +622,60 @@ class TestApplyTemporalGrouping:
     def _stub(self):
         return SimpleNamespace(patch_dim=self.PATCH_DIM, temporal_patch_dim=self.TEMPORAL_PATCH_DIM)
 
+    @pytest.mark.internal
+    @pytest.mark.parametrize("skip_image_duplication", [False, True])
+    @pytest.mark.parametrize(
+        "num_frames,patch_grids,expected_cu_seqlens,expected_max_seqlen",
+        [
+            ([2], [(2, 2)] * 2, [0, 4], 4),
+            ([2, 2], [(2, 4)] * 2 + [(2, 6)] * 2, [0, 8, 20], 12),
+            ([1, 3], [(2, 2)] + [(2, 4)] * 3, [0, 4, 12, 20], 8),
+        ],
+        ids=["uniform-video", "ragged-videos", "image-and-odd-video"],
+    )
+    def test_packed_sequence_metadata_uses_integer_max_lengths(
+        self,
+        num_frames,
+        patch_grids,
+        expected_cu_seqlens,
+        expected_max_seqlen,
+        skip_image_duplication,
+    ):
+        """Temporal regrouping keeps host integer lengths required by attention backends."""
+        sequence_lengths = torch.tensor([h * w for h, w in patch_grids], dtype=torch.int32)
+        cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int32), sequence_lengths)).cumsum(
+            dim=0, dtype=torch.int32
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(sequence_lengths.max()),
+            max_seqlen_kv=int(sequence_lengths.max()),
+        )
+        images = torch.zeros(1, int(cu_seqlens[-1]), 8)
+        imgs_sizes = torch.tensor(patch_grids, dtype=torch.int32) * self.PATCH_DIM
+
+        _, _, _, grouped_params, _ = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            images,
+            imgs_sizes,
+            num_frames,
+            packed_seq_params,
+            skip_image_duplication=skip_image_duplication,
+        )
+
+        assert type(grouped_params.max_seqlen_q) is int
+        assert type(grouped_params.max_seqlen_kv) is int
+        assert grouped_params.max_seqlen_q == expected_max_seqlen
+        assert grouped_params.max_seqlen_kv == expected_max_seqlen
+        assert grouped_params.qkv_format == "thd"
+        expected = torch.tensor(expected_cu_seqlens, dtype=cu_seqlens.dtype)
+        for cumulative_lengths in (grouped_params.cu_seqlens_q, grouped_params.cu_seqlens_kv):
+            assert cumulative_lengths.dtype == cu_seqlens.dtype
+            assert cumulative_lengths.device == cu_seqlens.device
+            assert torch.equal(cumulative_lengths, expected)
+
     def _make_global(self, num_frames_list, hidden=8):
         """Build an [1, total_patches, hidden] tensor and matching imgs_sizes.
 
@@ -835,5 +889,7 @@ class TestApplyTemporalGrouping:
         expected_cumulative = cumulative.new_tensor([0, 4, 12, 20])
         torch.testing.assert_close(grouped_packed.cu_seqlens_q, expected_cumulative)
         torch.testing.assert_close(grouped_packed.cu_seqlens_kv, expected_cumulative)
+        assert type(grouped_packed.max_seqlen_q) is int
+        assert type(grouped_packed.max_seqlen_kv) is int
         assert grouped_packed.max_seqlen_q == grouped_packed.max_seqlen_kv == 8
         assert grouped_packed.qkv_format == packed.qkv_format
