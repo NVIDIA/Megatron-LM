@@ -18,8 +18,6 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.shared_prefix import (
-    SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
-    SHARED_PREFIX_TRAINING_CAPABILITIES,
     SharedPrefixForestLayout,
     SharedPrefixLayout,
     _validate_shared_prefix_physical_length,
@@ -743,14 +741,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         shifts all respect the ``cu_seqlens`` branch boundaries, so this equals running
         the block once per branch while issuing one set of kernels and collectives.
         """
-        if (
-            isinstance(layout, SharedPrefixForestLayout)
-            and layout.mtp_loss_group_root_counts
-            and not self.config.calculate_per_token_loss
-        ):
-            raise NotImplementedError(
-                "explicit MTP loss groups require calculate_per_token_loss=True"
-            )
         tp_group = self.pg_collection.tp
         cp_group = self.pg_collection.cp
         tp_size = tp_group.size()
@@ -945,17 +935,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 objective. Disabling it skips the MTP branch while leaving its parameters
                 loaded. This does not control speculative decoding. On post-process stages,
                 ``labels`` still determine whether the model returns loss or logits.
-                Defaults to True.
+                With ``shared_prefix_layout``, MTP runs only in training mode: an eval-mode
+                shared-prefix forward skips MTP as if this were False. MTP never changes the
+                returned logits. Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
-        ``shared_prefix_layout`` explicitly selects the star path. The global packed input is
-        ``[prefix, completion_1, ..., completion_G, optional_topology_padding]`` with batch size
-        one; CP1 receives it whole, while CP>1 receives standard two-chunk zigzag sequence shards.
-        With TP>1, input IDs remain CP-local and replicated over TP; sequence parallelism starts at
-        the embedding output. The layout owns the exact tree mask and prefix-continued RoPE
-        positions. The normal decoder path is unchanged when the argument is ``None``. With
-        ``labels=None`` and parallel output, logits remain
-        ``[1, physical_len/CP, padded_vocab/TP]`` in the input shard's zigzag token order; this
-        model gathers neither sequence across CP nor vocabulary across TP.
+            shared_prefix_layout (SharedPrefixLayout | SharedPrefixForestLayout, optional):
+                Explicitly selects the star path. The global packed input is
+                ``[prefix, completion_1, ..., completion_G, optional_topology_padding]`` with
+                batch size one; CP1 receives it whole, while CP>1 receives standard two-chunk
+                zigzag sequence shards. With TP>1, input IDs remain CP-local and replicated
+                over TP; sequence parallelism starts at the embedding output. The layout owns
+                the exact tree mask and prefix-continued RoPE positions. With
+                ``labels=None`` and parallel output, logits remain
+                ``[1, physical_len/CP, padded_vocab/TP]`` in the input shard's zigzag token
+                order; this model gathers neither sequence across CP nor vocabulary across TP.
+                Training-mode MTP rebuilds the dense branches from ``input_ids`` and requires
+                ``loss_mask``; it rejects ``decoder_input`` and ``mtp_input_mask``, and a
+                forest layout also requires ``calculate_per_token_loss``. The normal decoder
+                path is unchanged when the argument is ``None``. Defaults to None.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -994,22 +991,33 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise NotImplementedError(
                     "shared-prefix HybridModel forward currently requires a complete PP1 model"
                 )
-            if (
-                self.mtp_process
-                and self.training
-                and SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY
-                not in SHARED_PREFIX_TRAINING_CAPABILITIES
-            ):
-                raise NotImplementedError(
-                    "shared-prefix Hybrid MTP dense-head support is implemented but not "
-                    "advertised for production; distributed forward/backward parity must "
-                    f"promote capability {SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY!r}"
-                )
-            if self.mtp_process and self.training:
+            # Shared-prefix MTP runs only in training; see ``compute_mtp_loss``.
+            if self.mtp_process and self.training and compute_mtp_loss:
                 _validate_shared_prefix_mtp_pattern(self.mtp_pattern)
                 _validate_shared_prefix_mtp_attention_backend(self.config.attention_backend)
-            if self.mtp_process and self.training and loss_mask is None:
-                raise ValueError("shared-prefix Hybrid MTP requires an explicit loss mask")
+                if loss_mask is None:
+                    raise ValueError("shared-prefix Hybrid MTP requires an explicit loss mask")
+                # The dense branches are rebuilt from input_ids and loss_mask only, so
+                # reject the inputs that the dense MTP path would otherwise consume.
+                if decoder_input is not None:
+                    raise NotImplementedError(
+                        "shared-prefix Hybrid MTP re-embeds input_ids and does not support a "
+                        "precomputed decoder_input; pass compute_mtp_loss=False to skip MTP"
+                    )
+                if mtp_input_mask is not None:
+                    raise NotImplementedError(
+                        "shared-prefix Hybrid MTP does not support mtp_input_mask; pass "
+                        "compute_mtp_loss=False to skip MTP"
+                    )
+                # Every forest normalizes MTP per loss group (one group per root by
+                # default), which process_mtp_loss supports only with per-token loss.
+                if (
+                    isinstance(shared_prefix_layout, SharedPrefixForestLayout)
+                    and not self.config.calculate_per_token_loss
+                ):
+                    raise NotImplementedError(
+                        "shared-prefix forest MTP loss groups require calculate_per_token_loss=True"
+                    )
             if self.position_embedding_type not in ('rope', 'none'):
                 raise NotImplementedError(
                     "shared-prefix Hybrid forward supports only RoPE or positionless attention"
@@ -1234,6 +1242,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
+        # Shared-prefix MTP is training-only: an eval-mode shared-prefix forward skips it,
+        # exactly as compute_mtp_loss=False would (documented on ``compute_mtp_loss``).
         mtp_forward_ran = (
             self.mtp_process
             and not (in_inference_mode or is_spec_decode)
