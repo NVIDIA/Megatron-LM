@@ -783,7 +783,7 @@ def fused_sparse_mla_absorbed(
         return None
     if query.size(-1) != key.size(-1):
         return None
-    if query.size(-1) != 576 or v_channels != 512:
+    if query.size(-1) not in (512, 576) or v_channels != 512:
         # Current copied TileLang kernels are specialized for GLM5/DeepSeek V3.2 absorbed dims.
         return None
     query_heads = query.size(2)
@@ -792,8 +792,16 @@ def fused_sparse_mla_absorbed(
     kernel_heads = max(query_heads, 16)
     if not _is_supported_sparse_mla_head_count(kernel_heads, kv_group=key.size(2)):
         return None
+    if query.size(-1) == 512:
+        # NoPE has no positional channels. Zero padding preserves QK scores and gradients
+        # while satisfying SparseMLA's 512 latent + 64 RoPE layout; keep the caller's scale.
+        query = torch.nn.functional.pad(query, (0, 64))
+        key = torch.nn.functional.pad(key, (0, 64))
     if topk_indices.size(-1) % 64 != 0:
-        return None
+        # Invalid slots leave the selected keys unchanged, including KPool tail tokens.
+        topk_indices = torch.nn.functional.pad(
+            topk_indices, (0, -topk_indices.size(-1) % 64), value=-1
+        )
 
     query_bshd = query.permute(1, 0, 2, 3).contiguous()
     if kernel_heads != query_heads:
