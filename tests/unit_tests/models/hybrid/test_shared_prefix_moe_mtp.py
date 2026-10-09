@@ -657,6 +657,46 @@ class TestSharedPrefixMTPDistributedParity:
             )
 
     @pytest.mark.usefixtures("_mtp_scale")
+    def test_shared_mtp_rerun_is_bitwise_tp2_sp_cp2(self, monkeypatch):
+        """With deterministic kernels, a shared forest with MoE MTP heads reruns bit for bit.
+
+        Routing is natural (not replayed): the fixed router row blocks and the fixed-order
+        prompt-copy gradient sum must leave nothing to scheduling at TP2/SP/CP2.
+        """
+        if Utils.world_size < 4 or Utils.world_size % 4:
+            pytest.skip("requires a world size divisible by 4")
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+        monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+        previous = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
+            model_parallel_cuda_manual_seed(123)
+            clear_attention_env(monkeypatch)
+            torch.manual_seed(0)
+            model = build_hybrid_model(MTP_PATTERN, torch.bfloat16, calculate_per_token_loss=True)
+            problem = SharedPrefixProblem(MTP_CP2_FOREST, padding_multiple=8, topology_multiple=8)
+            tokens = TokenProblem(problem, vocab_size=2048, seed=1)
+            layout = problem.layout(forest=True)
+            first = run_shared(model, tokens, layout)
+            second = run_shared(model, tokens, layout)
+        finally:
+            torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+        for first_logits, second_logits in zip(first.logits, second.logits):
+            assert torch.equal(first_logits, second_logits)
+        assert any(name.startswith("mtp.") for name in first.grads)
+        for name, grad in first.grads.items():
+            assert torch.equal(grad, second.grads[name]), name
+        assert len(first.counts) == MTP_PATTERN.count("E")
+        for first_count, second_count in zip(first.counts, second.counts):
+            assert torch.equal(first_count, second_count)
+
+    @pytest.mark.usefixtures("_mtp_scale")
     @pytest.mark.parametrize("root_counts", [(), (2, 1)], ids=["per-root", "explicit-2-1"])
     def test_grouped_mtp_normalization_tp2_sp_cp2(self, root_counts, monkeypatch):
         """CP-local loss groups (``length // cp_size``) under zigzag ownership and SP."""
