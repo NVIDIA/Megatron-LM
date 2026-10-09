@@ -57,6 +57,17 @@ def test_single_completion_slots_still_enforce_physical_capacity() -> None:
         )
 
 
+@pytest.mark.parametrize("pad_multiple", [None, 0, 2.0, True])
+def test_slot_planning_rejects_a_non_integer_pad_multiple(pad_multiple) -> None:
+    with pytest.raises(ValueError, match="sequence_length_pad_multiple must be a positive integer"):
+        plan_fixed_execution_slots(
+            group_ids=["a", "a"],
+            sequence_lengths=[3, 4],
+            bin_capacity=16,
+            sequence_length_pad_multiple=pad_multiple,
+        )
+
+
 @pytest.mark.parametrize("num_rows, group_size", [(3, 2), (2, 0), (-2, 2)])
 def test_make_repeated_group_ids_rejects_invalid_shape(num_rows: int, group_size: int) -> None:
     with pytest.raises(ValueError):

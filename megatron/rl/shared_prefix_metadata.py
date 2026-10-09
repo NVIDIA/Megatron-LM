@@ -20,7 +20,7 @@ No batch transport, training configuration, or model runtime is required.
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from megatron.rl.shared_prefix_packing import MAX_SHARED_PREFIX_BRANCHES, _round_up
+from megatron.rl.shared_prefix_packing import MAX_SHARED_PREFIX_BRANCHES, _is_int, _round_up
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,9 +101,10 @@ def plan_fixed_execution_slots(
     """
     if bin_capacity < 1:
         raise ValueError(f"bin_capacity must be positive, got {bin_capacity}")
-    if sequence_length_pad_multiple < 1:
+    if not _is_int(sequence_length_pad_multiple) or sequence_length_pad_multiple < 1:
         raise ValueError(
-            "sequence_length_pad_multiple must be positive, got " f"{sequence_length_pad_multiple}"
+            "sequence_length_pad_multiple must be a positive integer, got "
+            f"{sequence_length_pad_multiple!r}"
         )
     if max_rows_per_slot < 1:
         raise ValueError(f"max_rows_per_slot must be positive, got {max_rows_per_slot}")
