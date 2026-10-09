@@ -3,12 +3,10 @@
 """
 Distributed tests for the `gather_scatter` module.
 
-These tests require `torchrun` (≥2 ranks and ≥1 GPU per rank). They create a `DBuffer` with known
-data, gather full tensors to the owners via P2P, verify correctness, then scatter the results back
-and verify that remote `DBuffer` views receive the changed results.
+These tests require `torchrun` (≥2 ranks); the stream test also requires CUDA. They create a `DBuffer`
+with known data, gather full tensors to the owners via P2P, verify correctness, then scatter the
+results back and verify that remote `DBuffer` views receive the changed results.
 """
-
-import os
 
 import pytest
 import torch
@@ -25,26 +23,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_plannin
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import intersect_ranges
-
-
-def _setup() -> tuple[int, int, torch.device, DeviceMesh]:
-    """Read torchrun env and return (rank, world_size, device, mesh)."""
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
-    world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < 2:
-        pytest.skip("Needs at least two ranks.")
-    if torch.cuda.is_available() and torch.cuda.device_count() < world_size:
-        pytest.skip("Needs at least one GPU per rank when using CUDA.")
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank % torch.cuda.device_count())
-        device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        device = torch.device("cpu")
-    mesh = init_device_mesh(device.type, (world_size,))
-    return rank, world_size, device, mesh
 
 
 def _make_dbuffer(
@@ -106,15 +84,19 @@ def _nonempty_local_tensors(
 
 @pytest.mark.parametrize("subgroup", [False, True])
 @pytest.mark.parametrize("noncontiguous", [False, True])
-def test_gather_scatter_round_trip(subgroup, noncontiguous):
+def test_gather_scatter_round_trip(subgroup, noncontiguous, distributed_setup):
     """Gather tensors and scatter changed results into the remote DBuffer views."""
-    rank, world_size, device, mesh = _setup()
+    if distributed_setup.world_size < 2:
+        pytest.skip("Needs at least two ranks.")
+    device = distributed_setup.device
     if subgroup:
-        if world_size < 4:
+        if distributed_setup.world_size < 4:
             pytest.skip("Needs four ranks to test the noncontiguous subgroup [1, 3].")
         mesh = DeviceMesh(device.type, [1, 3])
-        if rank not in (1, 3):
-            return
+        if mesh.get_coordinate() is None:
+            pytest.skip("Rank is outside the test subgroup [1, 3].")
+    else:
+        mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
     dbuffer = _make_dbuffer(mesh, device, tensor_shapes)
     owner_layout = _owner_layout(dbuffer)
@@ -166,15 +148,16 @@ def test_gather_scatter_round_trip(subgroup, noncontiguous):
         torch.testing.assert_close(local_view.flatten(), expected, atol=0, rtol=0)
 
 
-def test_gather_scatter_with_stream():
+def test_gather_scatter_with_stream(distributed_setup):
     """gather -> scatter on a separate stream with explicit waits produces correct results.
 
     The scatter destination is plain flat tensors (not `DBuffer` views), matching `scatter`'s
     caller-owned application contract.
     """
-    _, _, device, mesh = _setup()
-    if not torch.cuda.is_available():
-        pytest.skip("Needs CUDA for stream testing.")
+    if distributed_setup.world_size < 2:
+        pytest.skip("Needs at least two ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
     tensor_shapes = [torch.Size((8, 4)), torch.Size((4, 4))]
     dbuffer = _make_dbuffer(mesh, device, tensor_shapes)

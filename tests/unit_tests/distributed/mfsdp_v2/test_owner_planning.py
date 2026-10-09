@@ -121,7 +121,9 @@ def test_group_owner_layout_custom_eligibility_and_cost(distributed_setup):
         seen_shapes.append(shape)
         return shape.numel()
 
-    owner_layout = GroupOwnerLayout.from_group(group, cost_fn=cost, eligible_fn=lambda p: p.numel() >= 8)
+    owner_layout = GroupOwnerLayout.from_group(
+        group, cost_fn=cost, eligible_fn=lambda p: p.numel() >= 8
+    )
     assert owner_layout.layout is group.main_weight.layout
     assert set(owner_layout.tensor_to_owner) == {0, 1}
     assert seen_shapes == [torch.Size((6, 3)), torch.Size((4, 2))]
