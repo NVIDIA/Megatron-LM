@@ -80,6 +80,16 @@ class TestParallelAttention:
         else:
             assert num_weights == 66304
 
+    def test_shared_prefix_forest_slot(self):
+        # The shared-prefix stack sets this per call and deletes it afterwards.
+        attention = self.parallel_attention
+        assert attention._shared_prefix_forest is None
+        forest = object()
+        attention._shared_prefix_forest = forest
+        assert attention._shared_prefix_forest is forest
+        del attention._shared_prefix_forest
+        assert attention._shared_prefix_forest is None
+
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass

@@ -292,6 +292,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     "cross attn" specializations.
     """
 
+    # Per-call shared-prefix forest. forward_hybrid_stack_shared_prefix sets it on the
+    # instance around each layer call and deletes it afterwards, restoring this default.
+    _shared_prefix_forest = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1623,7 +1627,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
-        shared_prefix_forest = getattr(self, "_shared_prefix_forest", None)
+        shared_prefix_forest = self._shared_prefix_forest
         if shared_prefix_forest is not None:
             if inference_context is not None or packed_seq_params is not None:
                 raise NotImplementedError(
