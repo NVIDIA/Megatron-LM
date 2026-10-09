@@ -78,7 +78,7 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     usage
 fi
 
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "preselected" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
@@ -217,7 +217,7 @@ write_testmon_summary() {
         echo "- Bucket: \`$BUCKET\`"
         echo "- Result: $result"
         if [[ -n "$selected_count" ]]; then
-            echo "- Selected tests: \`$selected_count\`"
+            echo "- Selected pytest targets across phases: \`$selected_count\`"
         fi
         if [[ -n "$mandatory_count" ]]; then
             echo "- Mandatory test files (changed source mappings): \`$mandatory_count\`"
@@ -337,19 +337,33 @@ run_selected_phase() {
 run_enforced_tests() {
     local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
-
-    if ! run_testmon_phase select prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections prod \
-        || ! apply_mandatory_tests prod \
-        || ! run_testmon_phase select experimental \
-            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections experimental \
-        || ! apply_mandatory_tests experimental; then
-        write_testmon_summary "full fallback: Testmon selection failed"
-        run_full_tests
-        return
+    if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
+        # CPU selection has already finished. Check the actual runtime before
+        # consuming its plan; no distributed collection runs on this path.
+        if ! uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0" \
+            || ! uv run --no-sync python tests/unit_tests/testmon_plan.py prepare \
+                --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
+                --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
+                --source-sha "$(git rev-parse HEAD)" \
+                --check-runtime --world-size "$((NUM_NODES * GPUS_PER_NODE))"; then
+            write_testmon_summary "full fallback: CPU selection plan failed runtime validation"
+            run_full_tests
+            return
+        fi
+    else
+        rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
+        if ! run_testmon_phase select prod \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections prod \
+            || ! apply_mandatory_tests prod \
+            || ! run_testmon_phase select experimental \
+                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections experimental \
+            || ! apply_mandatory_tests experimental; then
+            write_testmon_summary "full fallback: Testmon selection failed"
+            run_full_tests
+            return
+        fi
     fi
 
     prod_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/selected-tests")
@@ -382,7 +396,7 @@ full)
 baseline)
     run_baseline_tests
     ;;
-enforce)
+enforce|preselected)
     run_enforced_tests
     ;;
 esac
