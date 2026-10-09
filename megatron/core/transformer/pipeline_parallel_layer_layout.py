@@ -159,7 +159,7 @@ class PipelineParallelLayerLayout:
         """Get the number of layers to build in the pipeline stage"""
         if pp_rank is None:
             pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        if self.virtual_pipeline_model_parallel_size > 1:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
             vp_stage = 0
@@ -177,7 +177,7 @@ class PipelineParallelLayerLayout:
         """Get the layer offset in the pipeline stage"""
         if pp_rank is None:
             pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        if self.virtual_pipeline_model_parallel_size > 1:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
             vp_stage = 0
