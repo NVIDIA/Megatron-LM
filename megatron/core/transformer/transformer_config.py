@@ -1867,6 +1867,17 @@ class TransformerConfig(ModelParallelConfig):
     global batch size. Increasing the source global batch size with step_batch_size_schedule
     after capture is rejected rather than retaining an unbounded number of graph instances."""
 
+    cuda_graph_static_dynamic_cp: bool = False
+    """Allow dynamic CP with a full-iteration graph only through the static-certificate path.
+
+    This is an explicit fail-closed opt-in, not general dynamic-CP CUDA Graph support. The
+    dynamic scheduler still runs eagerly before every iteration, while each realized
+    microbatch slot must retain the captured microbatch count, effective CP size, process-group
+    identity and rank membership, partition mode, and (for CP>1) exact packed boundaries and
+    route-defining geometry. Any mismatch is rejected before replay. This option is only valid
+    for the full-iteration CUDA Graph implementation; layer/chunk implementations reject it.
+    """
+
     ####################
     # Hyper-Connection Configuration
     ####################
@@ -2450,8 +2461,13 @@ class TransformerConfig(ModelParallelConfig):
         """
         # Full-iteration capture cannot include the per-step pipeline shape handshake. Enable
         # the shared fixed-shape packed-P2P path before the base config validates its static
-        # token-capacity, padding, and sequence-parallel divisibility requirements.
-        if self.cuda_graph_impl == "full_iteration" and self.sequence_packing_scheduler is not None:
+        # token-capacity, padding, and sequence-parallel divisibility requirements. The base
+        # config maps the deprecated hybrid_context_parallel alias to dynamic CP only then.
+        if self.cuda_graph_impl == "full_iteration" and (
+            self.sequence_packing_scheduler is not None
+            or self.dynamic_context_parallel
+            or self.hybrid_context_parallel
+        ):
             self.pipeline_p2p_fixed_shape = True
         super().__post_init__()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
@@ -5332,6 +5348,19 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
+        if self.cuda_graph_static_dynamic_cp:
+            assert self.cuda_graph_impl == "full_iteration", (
+                "--cuda-graph-static-dynamic-cp is only valid with "
+                "cuda_graph_impl='full_iteration'."
+            )
+            assert (
+                self.dynamic_context_parallel
+            ), "--cuda-graph-static-dynamic-cp requires --dynamic-context-parallel."
+            assert self.sequence_packing_scheduler == 'default_dynamic_cp', (
+                "--cuda-graph-static-dynamic-cp requires "
+                "sequence_packing_scheduler='default_dynamic_cp'."
+            )
+
         if self.dynamic_context_parallel:
             # Captured graphs bake in static communicators, so they cannot follow the
             # per-microbatch CP group that dynamic context parallelism selects at runtime.
@@ -5357,8 +5386,10 @@ class TransformerConfig(ModelParallelConfig):
                 context_parallel_size=self.context_parallel_size,
                 cuda_graph_impl=self.cuda_graph_impl,
             )
+            # Full-iteration graphs validate dynamic CP with the THD checks below, which
+            # accept it only through the explicit cuda_graph_static_dynamic_cp certificate.
             assert (
-                self.cuda_graph_impl == "none" or packed_dsa_cp_cuda_graphs
+                self.cuda_graph_impl in ("none", "full_iteration") or packed_dsa_cp_cuda_graphs
             ), "Dynamic context parallelism not supported with CUDA Graph"
             assert (
                 self.calculate_per_token_loss
@@ -6702,10 +6733,13 @@ class TransformerConfig(ModelParallelConfig):
                     "THD full-iteration CUDA graph is only supported with a "
                     "sequence packing scheduler."
                 )
-                assert not self.dynamic_context_parallel, (
-                    "THD full-iteration CUDA graph does not support dynamic context "
-                    "parallel; use a static CP topology."
-                )
+                if self.dynamic_context_parallel:
+                    assert self.cuda_graph_static_dynamic_cp, (
+                        "THD full-iteration CUDA graph with dynamic context parallelism "
+                        "requires --cuda-graph-static-dynamic-cp. This explicit opt-in "
+                        "enables per-slot realized-schedule certification; it does not "
+                        "permit the schedule topology to change after capture."
+                    )
                 assert self.max_seqlen_per_dp_cp_rank is not None, (
                     "THD full-iteration CUDA graph requires --max-seqlen-per-dp-cp-rank "
                     "to define the static per-rank token capacity."
@@ -6720,7 +6754,7 @@ class TransformerConfig(ModelParallelConfig):
                     "THD full-iteration CUDA graph does not support standalone MTP: "
                     "its PP shape handshake is not graph-capturable."
                 )
-                if self.context_parallel_size > 1:
+                if self.context_parallel_size > 1 or self.dynamic_context_parallel:
                     assert self.cuda_graph_warmup_steps > 0, (
                         "THD full-iteration CUDA graph with context parallelism requires "
                         "cuda_graph_warmup_steps > 0 so consumers can materialize "
