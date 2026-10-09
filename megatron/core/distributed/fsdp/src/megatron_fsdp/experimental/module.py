@@ -30,8 +30,8 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import Flat
+from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
 
@@ -51,6 +51,12 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    caller_managed_grad_sync: bool
+    """Leave gradient synchronization to the caller instead of an autograd callback.
+
+    The caller must call ``finish_grad_sync()`` after all gradient producers,
+    including delayed weight-gradient computation, and before consuming gradients.
+    """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -66,6 +72,8 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        caller_managed_grad_sync: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -75,15 +83,21 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            parameter_to_owner: Construction-time TensorAtomic owner assignments. See
+                ``fully_shard_context``.
+            caller_managed_grad_sync: Disable the automatic autograd completion callback.
+                The caller must synchronize gradient reductions with ``finish_grad_sync()``.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
+        self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self.allgather_stream = torch.cuda.Stream(device)
         if unify_communication_stream:
@@ -122,6 +136,7 @@ class FsdpContext:
             _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
         self._registered_modules.clear()
+        self.parameter_to_owner = None
         self._is_finalized = True
 
     def ensure_finalized(self) -> None:
@@ -135,13 +150,33 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def post_backward(self) -> None:
-        """Order current-stream consumers after this context's gradient reductions."""
+    def validate_grad_sync(self) -> None:
+        """Require a caller-owned wait or a pending autograd completion callback."""
+        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+            return
+        raise RuntimeError(
+            "Gradient reduction has no pending autograd completion callback. "
+            "Use fully_shard_context(caller_managed_grad_sync=True) and call "
+            "context.finish_grad_sync() after all backward work, including "
+            "delayed weight-gradient computation, before consuming gradients."
+        )
+
+    def finish_grad_sync(self) -> None:
+        """Order current-stream consumers after all gradient reductions submitted so far.
+
+        Call after all backward work, including delayed weight-gradient computation,
+        and before reading or modifying gradients. This enqueues a stream dependency;
+        it does not block the CPU or wait for reductions that have not yet been launched.
+        """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+
+    def post_backward(self) -> None:
+        """Order current-stream consumers after this backward's gradient reductions."""
+        self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
-        """Register one context-level final callback for the current backward.
+        """Register one final callback unless the caller manages gradient synchronization.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -149,7 +184,12 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
+        if self.caller_managed_grad_sync:
+            # Leave the wait to the caller's finish_grad_sync(), after all backward work,
+            # including delayed weight-gradient computation, has been launched.
+            return
         if self._post_backward_hook_registered:
+            # Another root sharing this context already queued the completion wait.
             return
         self._post_backward_hook_registered = True
 
@@ -213,7 +253,8 @@ class FsdpModule:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
-            group_dtype = next(iter(group_parameters.values())).dtype
+            first_parameter = next(iter(group_parameters.values()))
+            group_dtype = effective_dtype(first_parameter)
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
@@ -229,6 +270,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    parameter_to_owner=context.parameter_to_owner,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -517,6 +559,7 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
+        self.context.validate_grad_sync()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
@@ -619,25 +662,27 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
     grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
 
 def _specialize_placements(
-    placements: tuple[Placement, ...], dtype: torch.dtype
+    placements: tuple[Placement, ...], group_dtype: torch.dtype
 ) -> tuple[Placement, ...]:
     """Specialize public placements for one homogeneous parameter group.
 
-    Today every parameter group maps Torch's user-facing ``Shard(0)`` to the
-    DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
-    where MXFP8 groups will instead select ``BlockAtomic``.
+    Map Torch's user-facing ``Shard(0)`` to ``BlockAtomic`` for MXFP8 groups
+    and ``RowAtomic`` for ordinary floating-point groups.
     """
-    if dtype not in (torch.float32, torch.bfloat16, torch.float16):
-        raise NotImplementedError(f"Unsupported dtype: {dtype}.")
+    if group_dtype not in (torch.uint8, torch.float32, torch.bfloat16, torch.float16):
+        raise NotImplementedError(f"Unsupported group dtype: {group_dtype}.")
     for placement in placements:
         if type(placement) is Shard and placement.dim != 0:
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    return tuple(Flat() if type(placement) is Shard else placement for placement in placements)
+    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else RowAtomic()
+    return tuple(
+        placement_type if type(placement) is Shard else placement for placement in placements
+    )

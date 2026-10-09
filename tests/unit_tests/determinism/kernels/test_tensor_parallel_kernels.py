@@ -233,3 +233,66 @@ def test_fused_scale_mask_softmax_replays(mask_type):
         replays=3,
         what=f"FusedScaleMaskSoftmax[{mask_type.name}]",
     )
+
+
+@pytest.mark.parametrize("with_caller_mask", [False, True], ids=["swa", "swa+padding"])
+def test_sliding_window_softmax_torch_path_replays(with_caller_mask):
+    """The torch fallback path behind ``window_size``: the sliding-window mask alone, and
+    composed with a caller-provided padding mask (which used to be silently discarded).
+    ``window_size`` never routes to the apex kernel, so this covers ``forward_torch_softmax``
+    for both fwd and bwd, with and without the composed mask."""
+    seeded()
+    module = FusedScaleMaskSoftmax(
+        input_in_fp16=False,
+        input_in_bf16=True,
+        attn_mask_type=AttnMaskType.causal,
+        scaled_masked_softmax_fusion=False,
+        mask_func=attention_mask_func,
+        softmax_in_fp32=True,
+        scale=None,
+        window_size=(128, 0),
+    )
+    b, np_, sq, sk = 2, 8, 512, 512
+    scores = torch.randn(b, np_, sq, sk, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mask = (torch.rand(b, 1, sq, sk, device="cuda") < 0.2) if with_caller_mask else None
+    assert not module.is_kernel_available(mask, b, np_, sq, sk), "expected the torch path"
+    assert_replays_bit_exact(
+        lambda s: module(s, mask),
+        (scores,),
+        replays=3,
+        what=f"FusedScaleMaskSoftmax[torch, swa{'+padding' if with_caller_mask else ''}]",
+    )
+
+
+@pytest.mark.skipif(not HAVE_SCALED_SOFTMAX_EXT, reason="apex scaled softmax extensions missing")
+@pytest.mark.parametrize("with_caller_mask", [False, True], ids=["swa", "swa+padding"])
+def test_windowed_config_with_fusion_uses_torch_path_replays(with_caller_mask):
+    """A windowed config must not route to the apex fused kernels (issue #7847).
+
+    The fused kernels have no window parameter, so selecting them for a
+    windowed config silently computes full-causal attention. Windowed configs
+    must therefore fall through to ``forward_torch_softmax`` even when every
+    shape/dtype gate would admit the kernel; this covers that routed path for
+    both fwd and bwd, with and without a composed caller mask.
+    """
+    seeded()
+    module = FusedScaleMaskSoftmax(
+        input_in_fp16=False,
+        input_in_bf16=True,
+        attn_mask_type=AttnMaskType.causal,
+        scaled_masked_softmax_fusion=True,
+        mask_func=attention_mask_func,
+        softmax_in_fp32=True,
+        scale=None,
+        window_size=(128, 0),
+    )
+    b, np_, sq, sk = 2, 8, 512, 512
+    scores = torch.randn(b, np_, sq, sk, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mask = (torch.rand(b, 1, sq, sk, device="cuda") < 0.2) if with_caller_mask else None
+    assert not module.is_kernel_available(mask, b, np_, sq, sk), "windowed config took fused path"
+    assert_replays_bit_exact(
+        lambda s: module(s, mask),
+        (scores,),
+        replays=3,
+        what=f"FusedScaleMaskSoftmax[torch, swa-fusion{'+padding' if with_caller_mask else ''}]",
+    )
