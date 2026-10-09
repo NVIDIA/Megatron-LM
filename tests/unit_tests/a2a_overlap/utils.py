@@ -361,6 +361,7 @@ def overlap_train_step(model, optimizer, config, data):
         no_sync_func=nullcontext,
         total_num_tokens=torch.zeros([], dtype=torch.int, device="cuda"),
         check_first_val_step=lambda cond: cond,
+        cp_group_size=config.context_parallel_size,
     )
     torch.cuda.synchronize()
     loss = forward_data_store[0]['lm loss'].detach().clone()

@@ -302,10 +302,15 @@ def forward_step_calc_loss(
     collect_non_loss_data,
     num_microbatches,
     forward_data_store,
-    cp_group_size=None,
-    is_last_stage=None,
+    cp_group_size,
+    is_last_stage,
 ):
-    """Calculate the loss and number of tokens for forward_step()"""
+    """Calculate the loss and number of tokens for forward_step()
+
+    ``is_last_stage`` says whether this model chunk is the last pipeline stage, counting virtual
+    stages; only the last stage computes the loss. ``cp_group_size`` is the context-parallel size
+    that scales the loss; it may be ``None`` on the other stages.
+    """
 
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
@@ -315,16 +320,10 @@ def forward_step_calc_loss(
             vp_stage == model_vp_stage
         ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
 
-    if cp_group_size is None and is_last_stage is None:
-        # fallback to parallel state
-        cp_group_size = parallel_state.get_context_parallel_world_size()
-        is_last_stage = parallel_state.is_pipeline_last_stage(
-            ignore_virtual=False, vp_stage=vp_stage
-        )
-    else:
-        assert is_last_stage is not None, "is_last_stage must be provided"
-        if is_last_stage:
-            assert cp_group_size is not None, "cp_group_size must be provided on last stage"
+    if is_last_stage is None:
+        raise ValueError("forward_step_calc_loss: is_last_stage must be True or False")
+    if is_last_stage and cp_group_size is None:
+        raise ValueError("forward_step_calc_loss: cp_group_size must be set on the last stage")
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
@@ -792,6 +791,7 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
+            pg_collection.cp.size(),
         )
     elif config.hybrid_context_parallel:
         forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
@@ -1500,6 +1500,8 @@ def forward_backward_pipelining_with_interleaving(
                 partial(check_first_val_step, first_val_step, forward_only),
                 is_first_microbatch_for_model_chunk,
                 collect_non_loss_data,
+                cp_group_size=cp_size,
+                pp_group=pp_group,
                 f_virtual_microbatch_id=f_virtual_microbatch_id,
                 b_virtual_microbatch_id=b_virtual_microbatch_id,
                 pre_forward=pre_forward,
