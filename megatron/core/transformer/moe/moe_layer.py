@@ -668,6 +668,7 @@ class MoELayer(BaseMoELayer):
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -684,6 +685,9 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            residual (torch.Tensor, optional): Added to the output, inside the combine when the
+                token dispatcher supports it. Not supported with MoE layer recompute or partial
+                execution through ``intermediate_tensors``.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -704,6 +708,15 @@ class MoELayer(BaseMoELayer):
             else:
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+        if residual is not None:
+            assert intermediate_tensors is None and not (
+                self.moe_layer_recompute and self.training
+            ), "residual is not supported with partial execution or MoE layer recompute"
+        fuse_residual = (
+            residual is not None
+            and getattr(self.token_dispatcher, "supports_combine_residual", False)
+            and not self.config.moe_latent_size
+        )
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
@@ -733,7 +746,10 @@ class MoELayer(BaseMoELayer):
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
+                if fuse_residual:
+                    output = self.token_dispatcher.token_combine(output, residual=residual)
+                else:
+                    output = self.combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -747,6 +763,8 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     return output
 
+            if residual is not None and not fuse_residual:
+                output = output + residual
             return output, mlp_bias
 
         if self.moe_layer_recompute and self.training:

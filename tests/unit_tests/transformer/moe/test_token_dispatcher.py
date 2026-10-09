@@ -667,3 +667,42 @@ class TestFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
         container.moe_layer_variant_parity_test(variant)
+
+
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_hybridep_combine_adds_residual(monkeypatch, group_size):
+    """The residual is fused into the combine of a single-rank group and added after it
+    otherwise."""
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False)
+    manager.group = SimpleNamespace(size=lambda: group_size)
+    manager.router_topk = 2
+    manager.drop_and_pad = False
+    manager.num_permuted_tokens = 8
+    manager.pad_multiple = None
+    manager._original_num_tokens = None
+    manager._padded_num_tokens = None
+    dense_chunk_layout = torch.tensor([4], dtype=torch.int32)
+    dense_to_expert_map = torch.zeros(4, 3, dtype=torch.int32)
+    manager.handle = (None,) * 5 + (dense_chunk_layout, dense_to_expert_map) + (None,) * 5
+
+    combined = torch.randn(4, 6)
+    residual = torch.randn(2, 2, 6)
+    calls = []
+
+    def fake_combine(x, handle, num_permuted_tokens, pad_multiple, fused):
+        calls.append("combine")
+        return combined
+
+    def fake_local_combine_add(x, residual, handle, num_permuted_tokens, pad_multiple, topk):
+        calls.append("local_combine_add")
+        assert handle[6] is dense_to_expert_map and topk == 2
+        return combined + residual.reshape(combined.shape)
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_combine", fake_combine)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_local_combine_add", fake_local_combine_add)
+
+    out = manager.combine(torch.randn(8, 6), residual=residual)
+
+    assert calls == (["local_combine_add"] if group_size == 1 else ["combine"])
+    torch.testing.assert_close(out, combined + residual.reshape(combined.shape))

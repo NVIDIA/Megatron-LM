@@ -110,6 +110,30 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+    def test_gpu_forward_row_parallel_bias_gemm_fusion(self):
+        config = copy.deepcopy(self.transformer_config)
+        config.row_parallel_bias_gemm_fusion = True
+        fused_attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+        )
+        with torch.no_grad():
+            self.parallel_attention.linear_proj.bias.normal_()
+        fused_attention.load_state_dict(self.parallel_attention.state_dict())
+        self.parallel_attention.cuda().eval()
+        fused_attention.cuda().eval()
+
+        hidden_states = torch.randn(
+            (32, 2, config.hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        attention_mask = torch.ones((2, 1, 1, 32), dtype=bool).cuda()
+        output, bias = self.parallel_attention(hidden_states, attention_mask)
+        fused_output, fused_bias = fused_attention(hidden_states, attention_mask)
+
+        assert fused_bias is None
+        torch.testing.assert_close(fused_output, output + bias, rtol=1.6e-2, atol=1e-2)
+
     @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     @pytest.mark.parametrize("rotary_interleaved", [True, False])
     @pytest.mark.parametrize("fused_qkv_rope", [True, False])

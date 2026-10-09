@@ -1366,9 +1366,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
             )
         )
+        moe_adds_residual = (
+            not mlp_state
+            and moe_unflatten_mbs is None
+            and self._moe_can_add_residual(inference_context)
+        )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context, input_ids=input_ids
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            input_ids=input_ids,
+            moe_adds_residual=moe_adds_residual,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1378,6 +1388,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             mlp_output_with_bias = (mlp_output, mlp_bias)
 
+        if moe_adds_residual:
+            return self._apply_mlp_bda_step(
+                mlp_output_with_bias, residual, mlp_state, mlp_output_has_residual=True
+            )
         if (
             self.is_moe_layer
             and self.config.cuda_graph_impl == "transformer_engine"
@@ -1403,6 +1417,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 residual_stream_recompute_context=residual_stream_recompute_context,
             )
 
+    def _moe_can_add_residual(self, inference_context: BaseInferenceContext | None) -> bool:
+        """Whether the MoE layer can add the residual (in its combine) in place of the MLP
+        bias-dropout-add."""
+        return (
+            self.config.moe_combine_residual_fusion
+            and self.is_moe_layer
+            and inference_context is None
+            and (self.hidden_dropout == 0.0 or not self.training)
+            and self._legacy_forward_post_mlp is None
+            and self._get_mlp_residual_connection() is None
+            and not self.recompute_mlp
+            and not (self.config.mlp_chunks_for_training > 1 and self.training)
+            and not (self.mlp.moe_layer_recompute and self.training)
+            and not (
+                self.config.cuda_graph_impl == "transformer_engine"
+                and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            )
+        )
+
     def _run_mlp(
         self,
         pre_mlp_layernorm_output: Tensor,
@@ -1410,6 +1443,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         padding_mask: Tensor | None,
         inference_context: BaseInferenceContext | None,
         input_ids: Optional[Tensor] = None,
+        moe_adds_residual: bool = False,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1417,6 +1451,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         chunked-prefill, and direct-call paths. Shared by both
         :class:`TransformerLayer` and :class:`HyperConnectionTransformerLayer` so
         the MLP-call branching stays in one place.
+
+        With ``moe_adds_residual`` the MoE layer adds ``residual`` to its output.
 
         Returns:
             ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
@@ -1443,6 +1479,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
+        if moe_adds_residual:
+            moe_kwargs["residual"] = residual
 
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
@@ -1527,6 +1565,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual: Tensor,
         mlp_state: tuple = (),
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        mlp_output_has_residual: bool = False,
     ) -> Tensor:
         """
         Perform operations after the MLP computation: bias-dropout-add for
@@ -1540,6 +1579,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
             mlp_state: Opaque payload from ``_pre_mlp_layernorm_and_residual``. Default ``()``.
+            mlp_output_has_residual (bool): The MLP already added ``residual`` (and there is no
+                bias or dropout), so the bias-dropout-add is skipped.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1583,6 +1624,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # MLP module.
+            hidden_states = mlp_output_with_bias[0]
+        elif mlp_output_has_residual:
+            assert mlp_output_with_bias[1] is None, "MLP bias is not supported here"
             hidden_states = mlp_output_with_bias[0]
         elif residual_connection is not None:
             if not mlp_state:

@@ -565,6 +565,10 @@ class TransformerConfig(ModelParallelConfig):
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
     """If True, uses bias dropout fusion."""
 
+    row_parallel_bias_gemm_fusion: bool = False
+    """If True and the tensor parallel size is 1, row-parallel TE linear layers add their bias in
+    the GEMM epilogue instead of returning it for the bias-dropout-add."""
+
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
 
@@ -995,6 +999,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
+
+    moe_combine_residual_fusion: bool = False
+    """Add the residual of MoE layers in the MoE layer instead of the MLP bias-dropout-add (requires
+    no hidden dropout in training). With the HybridEP flex dispatcher and a single-rank expert
+    group the add is fused into the combine, rounding once instead of twice."""
 
     moe_hybridep_pad_uneven_dispatch_inputs: bool = False
     """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
