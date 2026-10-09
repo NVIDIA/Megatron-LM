@@ -2171,6 +2171,7 @@ def _build_moe_act_recompute_module():
     module.config = SimpleNamespace(
         fp8=False,
         fp4=False,
+        moe_paged_stash=False,
         moe_router_padding_for_quantization=False,
         moe_token_dispatcher_type=None,
         moe_flex_dispatcher_backend=None,
