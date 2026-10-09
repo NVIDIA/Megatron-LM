@@ -7,8 +7,12 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
+from megatron.core.inference.moe import flashinfer_mxfp8 as flashinfer_mxfp8_module
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     HAVE_FLASHINFER_ROUTED_MXFP8,
+    FlashInferCutlassMXFP8Weight,
+    flashinfer_cutlass_mxfp8_moe,
+    prepare_cutlass_mxfp8_weights,
     select_routed_mxfp8_active_rows,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -61,6 +65,93 @@ def test_flashinfer_mxfp8_active_row_policy(token_capacity, use_bounded_rows, ex
     )
 
 
+def test_prepare_cutlass_mxfp8_weights_reuses_existing_swizzled_scale_bytes(monkeypatch):
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    experts, rows, cols = 2, 128, 128
+    data = torch.zeros(experts, rows, cols, dtype=torch.float8_e4m3fn)
+    scale_bytes = (
+        torch.arange(experts * rows * (cols // 32), dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(experts, -1)
+    )
+    weight = MXFP8Tensor(data=data, scale=scale_bytes.view(torch.float8_e8m0fnu), backend="triton")
+
+    prepared = prepare_cutlass_mxfp8_weights(weight)
+
+    assert prepared.data.shape == data.shape
+    assert prepared.scale.shape == (experts, rows, cols // 128)
+    assert prepared.scale.dtype == torch.int32
+    assert torch.equal(prepared.scale.view(torch.uint8).reshape_as(scale_bytes), scale_bytes)
+    assert torch.equal(prepared.input_scale, torch.ones(experts))
+
+
+def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    captured = {}
+
+    def fake_quantize(hidden_states, is_sf_swizzled_layout, alignment):
+        captured["quantize"] = (hidden_states.clone(), is_sf_swizzled_layout, alignment)
+        return hidden_states.to(torch.float8_e4m3fn), torch.zeros(512, dtype=torch.uint8)
+
+    def fake_cutlass(input, selected_experts, final_scales, *args, **kwargs):
+        captured["input"] = input
+        captured["selected_experts"] = selected_experts
+        captured["final_scales"] = final_scales
+        captured["kwargs"] = kwargs
+        return [torch.full(input.shape, 2.0, dtype=torch.bfloat16)]
+
+    monkeypatch.setattr(flashinfer_mxfp8_module, "mxfp8_quantize", fake_quantize, raising=False)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "cutlass_fused_moe", fake_cutlass, raising=False)
+
+    experts, hidden_size, intermediate_size = 2, 128, 128
+    fc1 = FlashInferCutlassMXFP8Weight(
+        data=torch.zeros(experts, intermediate_size, hidden_size, dtype=torch.float8_e4m3fn),
+        scale=torch.zeros(experts, intermediate_size, hidden_size // 128, dtype=torch.int32),
+        input_scale=torch.ones(experts),
+        logical_rows=intermediate_size,
+        logical_cols=hidden_size,
+    )
+    fc2 = FlashInferCutlassMXFP8Weight(
+        data=torch.zeros(experts, hidden_size, intermediate_size, dtype=torch.float8_e4m3fn),
+        scale=torch.zeros(experts, hidden_size, intermediate_size // 128, dtype=torch.int32),
+        input_scale=torch.ones(experts),
+        logical_rows=hidden_size,
+        logical_cols=intermediate_size,
+    )
+    hidden_states = torch.ones(8, hidden_size, dtype=torch.bfloat16)
+    routing_map = torch.zeros(8, 2, dtype=torch.int64)
+    probabilities = torch.full((8, 2), 0.5, dtype=torch.float32)
+    output = torch.full((8, hidden_size), -1.0, dtype=torch.bfloat16)
+
+    result = flashinfer_cutlass_mxfp8_moe(
+        hidden_states,
+        routing_map,
+        probabilities,
+        fc1,
+        fc2,
+        ep_size=4,
+        ep_rank=1,
+        activation_type=12,
+        out=output,
+        activation_clamp_limit=torch.tensor([16.0], dtype=torch.float32),
+    )
+
+    assert result is output
+    assert torch.equal(output, torch.full_like(output, 2.0))
+    assert captured["quantize"][0].shape == (8, hidden_size)
+    assert captured["quantize"][1:] == (True, 32)
+    assert captured["selected_experts"].dtype == torch.int32
+    assert captured["selected_experts"].shape == (8, 2)
+    assert captured["final_scales"].shape == (8, 2)
+    assert captured["kwargs"]["use_mxfp8_act_scaling"] is True
+    assert captured["kwargs"]["swizzled_input_sf"] is True
+    assert captured["kwargs"]["ep_size"] == 4
+    assert captured["kwargs"]["ep_rank"] == 1
+    assert torch.equal(captured["kwargs"]["clamped_relu2_limit"], torch.tensor([16.0]))
+    assert "swiglu_limit" not in captured["kwargs"]
+
+
 def _make_bounded_mxfp8_config(**overrides):
     kwargs = dict(
         num_layers=1,
@@ -104,6 +195,114 @@ def test_flashinfer_mxfp8_config_accepts_batch_invariant_mode():
     )
 
     assert config.batch_invariant_mode
+
+
+def test_flashinfer_maps_tanh_clamped_squared_relu_to_clamped_relu2(monkeypatch):
+    from megatron.core.transformer.moe import experts
+
+    clamped_relu2 = object()
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(
+        experts, "ActivationType", SimpleNamespace(ClampedRelu2=clamped_relu2), raising=False
+    )
+    monkeypatch.setattr(
+        experts,
+        "fused_moe",
+        SimpleNamespace(cutlass_fused_moe=lambda *, clamped_relu2_limit: None),
+        raising=False,
+    )
+    grouped_mlp = SimpleNamespace(
+        config=SimpleNamespace(activation_func=squared_relu, activation_func_tanh_clamp_scale=16.0)
+    )
+    assert (
+        experts.InferenceGroupedMLP._resolve_flashinfer_activation_type(grouped_mlp)
+        is clamped_relu2
+    )
+
+
+@pytest.mark.parametrize("has_enum", [False, True])
+def test_flashinfer_clamped_relu2_requires_backend_capability(monkeypatch, has_enum):
+    from megatron.core.transformer.moe import experts
+
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(
+        experts,
+        "ActivationType",
+        SimpleNamespace(**({"ClampedRelu2": object()} if has_enum else {})),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        experts,
+        "fused_moe",
+        SimpleNamespace(cutlass_fused_moe=lambda *, swiglu_limit: None),
+        raising=False,
+    )
+    grouped_mlp = SimpleNamespace(
+        config=SimpleNamespace(activation_func=squared_relu, activation_func_tanh_clamp_scale=16.0)
+    )
+
+    with pytest.raises(RuntimeError, match="does not provide ActivationType.ClampedRelu2"):
+        experts.InferenceGroupedMLP._resolve_flashinfer_activation_type(grouped_mlp)
+
+
+def test_flashinfer_bf16_rejects_clamp_for_non_squared_relu():
+    with pytest.raises(ValueError, match="only non-gated squared-ReLU"):
+        _make_bounded_mxfp8_config(
+            fp8=None,
+            fp8_param=False,
+            inference_flashinfer_mxfp8_token_capacity=None,
+            activation_func=F.relu,
+            activation_func_tanh_clamp_scale=16.0,
+        )
+
+
+@pytest.mark.parametrize("fp8", [None, "e4m3"])
+def test_flashinfer_clamped_relu2_config_accepts_supported_precisions(fp8):
+    config = _make_bounded_mxfp8_config(
+        fp8=fp8,
+        fp8_param=fp8 is not None,
+        inference_flashinfer_mxfp8_token_capacity=None,
+        activation_func_tanh_clamp_scale=16.0,
+    )
+    assert config.activation_func_tanh_clamp_scale == 16.0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"inference_flashinfer_mxfp8_token_capacity": 1024}, "unclamped routed backend"),
+        ({"batch_invariant_mode": True}, "does not support batch_invariant_mode"),
+        ({"add_bias_linear": True}, "requires add_bias_linear=False"),
+        ({"activation_func_tanh_clamp_scale": float("nan")}, "finite clamp scale"),
+        ({"activation_func_tanh_clamp_scale": float("inf")}, "finite clamp scale"),
+    ],
+)
+def test_flashinfer_clamped_relu2_rejects_unsupported_options(overrides, message):
+    kwargs = dict(
+        activation_func_tanh_clamp_scale=16.0, inference_flashinfer_mxfp8_token_capacity=None
+    )
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_bounded_mxfp8_config(**kwargs)
+
+
+def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    module = torch.nn.Module()
+    module.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
+    module._activation_clamp_scale = 16.0
+    module._flashinfer_clamp_limit = None
+    module.bfloat16()
+    InferenceGroupedMLP._build_flashinfer_clamp_limit(module, torch.device("cpu"))
+    limit = module._flashinfer_clamp_limit
+    module.bfloat16()
+    assert module._flashinfer_clamp_limit is limit
+    assert limit.dtype == torch.float32
+    assert limit.shape == (1,)
+    assert limit.item() == 16.0
+    assert "_flashinfer_clamp_limit" not in module.state_dict()
 
 
 def test_flashinfer_bf16_config_rejects_batch_invariant_mode():
@@ -323,17 +522,23 @@ def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
         assert torch.count_nonzero(output_alone).item() == 0
 
 
-def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
+@pytest.mark.parametrize("clamp_scale", [None, 16.0])
+def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch, clamp_scale):
     from megatron.core.transformer.moe import experts
 
     expected = torch.empty(4, 8, dtype=torch.bfloat16)
     captured = {}
+    clamped_relu2 = object()
 
     def cutlass_fused_moe(*args, **kwargs):
         captured["output"] = kwargs["output"]
+        captured.update(kwargs)
         return (expected,)
 
     monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(
+        experts, "ActivationType", SimpleNamespace(ClampedRelu2=clamped_relu2), raising=False
+    )
     monkeypatch.setattr(
         experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
     )
@@ -342,8 +547,9 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
         _uses_mxfp8_weights=False,
         _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _flashinfer_activation_type=object(),
-        _activation_clamp_scale=None,
+        _flashinfer_activation_type=clamped_relu2,
+        _activation_clamp_scale=clamp_scale,
+        _flashinfer_clamp_limit=torch.tensor([16.0], dtype=torch.float32),
         _nvls_dispatcher=True,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
     )
@@ -357,6 +563,11 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     assert output is expected
     assert bias is None
     assert captured["output"] is None
+    if clamp_scale is not None:
+        assert torch.equal(captured["clamped_relu2_limit"], torch.tensor([clamp_scale]))
+    else:
+        assert "clamped_relu2_limit" not in captured
+    assert "swiglu_limit" not in captured
 
 
 def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):

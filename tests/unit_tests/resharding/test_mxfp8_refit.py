@@ -18,7 +18,12 @@ try:
 except ImportError:
     _HAVE_FLASHINFER = False
 
-from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    HAVE_FLASHINFER_CUTLASS_MXFP8,
+    HAVE_FLASHINFER_ROUTED_MXFP8,
+    prepare_cutlass_mxfp8_weights,
+    prepare_routed_mxfp8_weights,
+)
 
 pytestmark = pytest.mark.skipif(
     not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"
@@ -279,13 +284,33 @@ class TestMXFP8ReshardTransform:
             assert buf.scale.data_ptr() == scale_ptr
             assert buf.backend == "triton"
 
-    @pytest.mark.skipif(
-        not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
+    @pytest.mark.parametrize(
+        ("clamp_scale", "rows", "prepare_weights"),
+        [
+            pytest.param(
+                None,
+                96,
+                prepare_routed_mxfp8_weights,
+                marks=pytest.mark.skipif(
+                    not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
+                ),
+                id="routed",
+            ),
+            pytest.param(
+                16.0,
+                128,
+                prepare_cutlass_mxfp8_weights,
+                marks=pytest.mark.skipif(
+                    not HAVE_FLASHINFER_CUTLASS_MXFP8,
+                    reason="test requires FlashInfer CUTLASS MXFP8",
+                ),
+                id="cutlass-clamped",
+            ),
+        ],
     )
-    def test_flashinfer_routed_moe_buffers_refresh_in_place(self):
-        """Refit refreshes derived Major-K weights without changing graph addresses."""
+    def test_flashinfer_moe_buffers_refresh_in_place(self, clamp_scale, rows, prepare_weights):
+        """Refit refreshes derived FlashInfer weights without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
-        from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
@@ -293,10 +318,11 @@ class TestMXFP8ReshardTransform:
         class Namespace:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
-        num_experts, rows, cols = 2, 96, 128
+        num_experts, cols = 2, 128
         grouped_mlp = Namespace()
         grouped_mlp.num_local_experts = num_experts
         grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
+        grouped_mlp._activation_clamp_scale = clamp_scale
         grouped_mlp._concatenated_weights_built = False
         buffers = {}
         for linear_name in ("linear_fc1", "linear_fc2"):
@@ -329,16 +355,16 @@ class TestMXFP8ReshardTransform:
 
         assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is True
 
-        for linear_name, routed_weight in (
+        for linear_name, flashinfer_weight in (
             ("linear_fc1", grouped_mlp._fc1_weight),
             ("linear_fc2", grouped_mlp._fc2_weight),
         ):
             canonical = InferenceGroupedMLP._stack_mxfp8_linear_weight(
                 grouped_mlp, linear_name, "triton"
             )
-            expected = prepare_routed_mxfp8_weights(canonical)
-            assert torch.equal(routed_weight.data, expected.data)
-            assert torch.equal(routed_weight.scale, expected.scale)
+            expected = prepare_weights(canonical)
+            assert torch.equal(flashinfer_weight.data, expected.data)
+            assert torch.equal(flashinfer_weight.scale, expected.scale)
 
         assert data_ptrs == (
             grouped_mlp._fc1_weight.data.data_ptr(),

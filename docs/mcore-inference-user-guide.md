@@ -480,6 +480,28 @@ default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
 `torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
 `window_size` for sliding-window attention.
 
+#### Tanh-clamped squared ReLU with FlashInfer
+
+On SM10x GPUs, the FlashInfer backend supports non-gated squared ReLU with
+`activation_func_tanh_clamp_scale=L`: `(L * tanh(relu(x) / L)) ** 2`.
+Set `inference_grouped_gemm_backend="flashinfer"`, `activation_func=squared_relu`,
+and `add_bias_linear=False`. BF16 experts and MXFP8 experts use a CUTLASS GEMM1
+activation epilogue; MXFP8 also generates the quantized GEMM2 input and block scales
+in that epilogue. MXFP8 requires `fp8_recipe="mxfp8"`, `fp8_param=True`, and expert
+weight dimensions divisible by 128. Unclamped MXFP8 continues to use the routed backend.
+
+This requires a FlashInfer build containing
+[FlashInfer #5696](https://github.com/flashinfer-ai/flashinfer/pull/5696)
+(merged as `6dc4f76598340a2ec6aaaaa8f7c925ea1d60f1d3`), exposing
+`ActivationType.ClampedRelu2` and the `clamped_relu2_limit` keyword. Older installations
+remain usable for unclamped activations; requesting the new activation gives an
+upgrade error. A minimum released version will be documented once available.
+
+The clamped CUTLASS path processes the full dispatched row count; it does not support
+`inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`. Its FP32 clamp
+tensor and derived expert weights are allocated during inference warmup before CUDA
+graph capture. Weight refits update the derived MXFP8 weights in place.
+
 ### Reading Results
 
 `generate` returns `DynamicInferenceRequest` objects. The most commonly used fields are:

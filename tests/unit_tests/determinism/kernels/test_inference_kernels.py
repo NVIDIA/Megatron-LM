@@ -11,6 +11,9 @@ log-softmax / mean kernels, and the CUDA-graph routing-map padding mask. Multi-r
 symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
 """
 
+import inspect
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -34,6 +37,83 @@ pytestmark = pytest.mark.skipif(
 
 def _dev_scalar(value, dtype=torch.int32):
     return torch.tensor([value], dtype=dtype, device="cuda")
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("ep_rank", [0, 1])
+def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
+    """Replay the MCore adapter, including graph capture and local-EP expert offsets.
+
+    Top-k=1 avoids the fused finalize atomic top-k reduction: this test does not
+    claim determinism for the default multi-expert atomic reduction.
+    """
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("ClampedRelu2 requires SM10x")
+    fi = pytest.importorskip("flashinfer.fused_moe")
+    from flashinfer.fused_moe import ActivationType
+
+    if not hasattr(ActivationType, "ClampedRelu2") or "clamped_relu2_limit" not in (
+        inspect.signature(fi.cutlass_fused_moe).parameters
+    ):
+        pytest.skip("requires FlashInfer #5696")
+
+    from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_cutlass_mxfp8_weights
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    seeded()
+    rows, hidden, local_experts = 32, 512, 2
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    weights = torch.eye(hidden, device="cuda", dtype=torch.bfloat16).repeat(local_experts, 1, 1)
+    if precision == "mxfp8":
+        parts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in weights]
+        weights = prepare_cutlass_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([w.data for w in parts]),
+                scale=torch.stack([w.scale for w in parts]),
+                backend="triton",
+                dtype=torch.bfloat16,
+            )
+        )
+    module = SimpleNamespace(
+        _uses_mxfp8_weights=precision == "mxfp8",
+        _fc1_weight=weights,
+        _fc2_weight=weights,
+        _flashinfer_activation_type=ActivationType.ClampedRelu2,
+        _activation_clamp_scale=16.0,
+        _flashinfer_clamp_limit=torch.full((1,), 16.0, device="cuda", dtype=torch.float32),
+        _nvls_dispatcher=False,
+        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: ep_rank),
+    )
+    routing = (torch.arange(rows, device="cuda", dtype=torch.int32) % 4).view(rows, 1)
+    probabilities = torch.ones(rows, 1, device="cuda", dtype=torch.float32)
+
+    def run(x):
+        return InferenceGroupedMLP._flashinfer_forward(module, x, routing, probabilities)[0]
+
+    # Warm up compilation and allocations outside capture, on a side stream.
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            expected = run(x)
+    torch.cuda.current_stream().wait_stream(warmup)
+    assert torch.isfinite(expected).all()
+    local_rows = (routing[:, 0] // local_experts) == ep_rank
+    assert torch.count_nonzero(expected[local_rows]) > 0
+    assert torch.count_nonzero(expected[~local_rows]) == 0
+    assert_replays_bit_exact(run, (x,), backward=False, what=f"clamped_relu2_{precision}")
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(x)
+
+    def replay():
+        graph.replay()
+        return captured
+
+    assert_replays_bit_exact(replay, (), backward=False, what=f"clamped_relu2_graph_{precision}")
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
 # --- KV-cache tensor ops ---------------------------------------------------------------------

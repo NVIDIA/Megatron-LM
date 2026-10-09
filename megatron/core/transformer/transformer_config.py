@@ -1391,9 +1391,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
-      block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
-      for refit and also stores a padded TRT-LLM Major-K copy, increasing
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
+      squared-ReLU MXFP8, and TRT-LLM routed block-scale MoE for unclamped MXFP8.
+      The MXFP8 paths retain canonical expert weights
+      for refit and also store a derived execution copy, increasing
       expert-weight memory relative to the torch backend.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
@@ -1975,6 +1976,30 @@ class TransformerConfig(ModelParallelConfig):
                     "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.activation_func_tanh_clamp_scale is not None
+            ):
+                if not math.isfinite(self.activation_func_tanh_clamp_scale):
+                    raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
+                if self.gated_linear_unit or self.activation_func != squared_relu:
+                    raise ValueError(
+                        "FlashInfer tanh-clamped MoE supports only non-gated squared-ReLU."
+                    )
+                if self.add_bias_linear:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 requires add_bias_linear=False."
+                    )
+                if self.batch_invariant_mode:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 does not support batch_invariant_mode."
+                    )
+                if self.inference_flashinfer_mxfp8_token_capacity is not None:
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity is supported only by the "
+                        "unclamped routed backend, not CUTLASS ClampedRelu2."
+                    )
 
             if mxfp8_enabled:
                 if not self.fp8_param:
