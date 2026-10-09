@@ -118,6 +118,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch.compile",
     ),
     KernelEntry(
+        name="paged_stash_marker_propagation",
+        sources=("megatron/core/fusions/fused_utils.py",),
+        tests=(K + "test_fused_activations.py",),
+        kind="dispatch",
+        notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+    ),
+    KernelEntry(
         name="fused_bias_gelu",
         sources=("megatron/core/fusions/fused_bias_gelu.py",),
         tests=(K + "test_fused_activations.py",),
