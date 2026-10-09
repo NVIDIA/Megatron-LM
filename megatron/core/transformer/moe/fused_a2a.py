@@ -354,6 +354,10 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     if num_sms_preprocessing_api is not None:
         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
+    # HybridEP's custom allgather gives up after ~20 s if a rank is late and continues with that
+    # rank's routing rows from the previous dispatch, silently corrupting it. Use NCCL instead.
+    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:
+        kwargs['enable_custom_allgather'] = False
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,

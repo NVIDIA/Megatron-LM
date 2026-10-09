@@ -1320,6 +1320,9 @@ def save_checkpoint(
         else:
             wandb_finalize_fn()
 
+    # Conversion tools register an inference container, which has no RL section.
+    rl_config = getattr(get_run_config(), "rl", None)
+    durable_rollout_bank = rl_config is not None and rl_config.rl_durable_rollout_bank
     if args.async_save:
         # Schedule logits flush AFTER the checkpoint request so the persistent
         # worker processes checkpoint preload first (unblocking the main
@@ -1362,7 +1365,7 @@ def save_checkpoint(
             )
 
         if (
-            getattr(args, "rl_durable_rollout_bank", False)
+            durable_rollout_bank
             and async_save_request is not None
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
         ):
@@ -1391,7 +1394,7 @@ def save_checkpoint(
         # compacted-through T tracks this (now durable) checkpoint. Only on sync
         # saves; async saves compact in their durability finalize callback above.
         # Rank-0 no-op otherwise.
-        if getattr(args, "rl_durable_rollout_bank", False):
+        if durable_rollout_bank:
             _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
