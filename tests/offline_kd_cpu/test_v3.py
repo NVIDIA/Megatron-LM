@@ -535,6 +535,24 @@ def test_chunked_remote_reads_issue_one_request_per_chunk(tmp_path, chunk):
     assert len(remote.reads) == 1
 
 
+def test_chunked_reader_serves_small_reads_without_rebuilding_its_chunk(tmp_path):
+    storage, _ = write_cache(tmp_path)
+    name = "dp0__0-16.targets.tar"
+    expected = (tmp_path / name).read_bytes()
+    chunk = len(expected) // 3 + 1
+    reader = storage_module.ChunkedReader(_CountingRemote(tmp_path), name, chunk)
+    pieces, chunks = [], []
+    while piece := reader.read(512):  # tarfile-sized reads.
+        assert len(piece) <= 512
+        pieces.append(piece)
+        if not chunks or chunks[-1] is not reader.chunk:
+            chunks.append(reader.chunk)
+    assert b"".join(pieces) == expected
+    # One chunk object per fetch: reads advance an offset instead of re-slicing it.
+    assert len(chunks) == -(-len(expected) // chunk)
+    assert reader.read() == b""
+
+
 def test_discard_unpublished_only_touches_its_own_range(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=6)
     (tmp_path / "dp1__16-32.targets.tar").unlink()
@@ -848,6 +866,51 @@ def test_frontier_is_collective_and_errors_together(tmp_path, runtime_environmen
     assert len(listings) == 2
 
 
+def test_first_train_step_establishes_the_replay_plan(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    args.logits_load_shuffle_shards = None
+    replay_cache(tmp_path, args, runtime)
+    loader = runtime.build_replay_loader(args, consumed=0)  # Before any plan exists.
+    assert runtime._PLAN is None
+    assert not runtime.before_train_step(args)
+    assert runtime._PLAN["available"] == 32
+    iterator = iter(loader.dataset)
+    try:
+        assert next(iterator)["_kd_sample_ids"] == [0, 1]
+    finally:
+        iterator.close()
+
+
+def test_targets_are_handed_from_get_batch_to_forward_step(runtime_environment, monkeypatch):
+    args, runtime, _ = runtime_environment
+    runtime._PLAN = {"metadata": {"tokenizer": {"eod": 2}}, "readers": []}
+    mpu = sys.modules["megatron.core"].parallel_state
+    mpu.is_pipeline_last_stage = lambda **kw: True
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    cached = types.ModuleType(f"{_namespace}.cached_logits_loss")
+    logits = iter(["logits-0", "logits-1"])
+    cached.get_student_logits_capture = lambda: types.SimpleNamespace(pop=lambda: next(logits))
+    monkeypatch.setitem(sys.modules, cached.__name__, cached)
+    cached_batch = {
+        "tokens": torch.zeros(1, 8, dtype=torch.long),
+        "_kd_values": torch.ones(8, 1, 1),
+        "_kd_indices": torch.zeros(8, 1, 1, dtype=torch.long),
+        "_kd_sample_ids": [3],
+    }
+    for attempt in range(2):  # A rerun re-reads the same cached batch.
+        model_batch = runtime.on_tp0_batch(cached_batch)
+        assert set(model_batch) == {"tokens"}
+        runtime.stage_targets()
+        bound = runtime.take_targets()
+        assert bound["sample_ids"] == [3] and bound["logits"] == f"logits-{attempt}"
+        assert torch.equal(bound["values"], cached_batch["_kd_values"])
+        assert runtime.take_targets() is None  # Consumed by exactly one forward.
+    runtime.on_tp0_batch({"tokens": torch.zeros(1, 8, dtype=torch.long)})  # Validation data.
+    runtime.stage_targets()
+    assert runtime.take_targets() is None
+
+
 def test_frontier_rejects_changed_published_prefix(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     args.logits_load_shuffle_shards = None
@@ -875,7 +938,7 @@ def test_context_parallel_replay_scatters_shards_and_errors(runtime_environment,
     monkeypatch.setattr(runtime.dist, "scatter_object_list", scatter)
     batch = {"tokens": torch.zeros(1), "_kd_values": ["v0", "v1"], "_kd_indices": ["i0", "i1"]}
     rank = [0]
-    sender = runtime._ContextParallelReplay(iter([batch]), 0, 2)
+    sender = runtime._ContextParallelReplay(lambda: iter([batch]), 0, 2)
     assert next(sender)["_kd_values"] == "v0"
     rank[0] = 1
     receiver = runtime._ContextParallelReplay(None, 1, 2)
@@ -887,7 +950,7 @@ def test_context_parallel_replay_scatters_shards_and_errors(runtime_environment,
 
     rank[0] = 0
     with pytest.raises(RuntimeError, match="corrupt tar"):
-        next(runtime._ContextParallelReplay(broken(), 0, 2))
+        next(runtime._ContextParallelReplay(broken, 0, 2))
     rank[0] = 1
     with pytest.raises(RuntimeError, match="corrupt tar"):
         next(receiver)

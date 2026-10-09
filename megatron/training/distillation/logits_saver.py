@@ -108,6 +108,36 @@ def check_logits_saver_failure() -> None:
         )
 
 
+def build_logits_saver(args: Any) -> "LogitsSaverHooks":
+    """Construct the teacher saver selected by the CLI (paired v3 with --logits-save-inputs)."""
+    saver_class = LogitsSaverHooks
+    if getattr(args, "logits_save_inputs", False):
+        from .v3_saver import PairedLogitsSaver
+
+        saver_class = PairedLogitsSaver
+    return saver_class(
+        save_dir=args.logits_save_dir,
+        k=args.logits_save_top_k,
+        p=args.logits_save_top_p,
+        min_k=args.logits_save_top_p_min_k,
+        save_dtype=args.logits_save_dtype,
+    )
+
+
+def begin_logits_attempt() -> None:
+    """Discard provisional saver data before a train-step attempt (rerun-safe v3 dumps)."""
+    saver = get_logits_saver()
+    if saver is not None and hasattr(saver, "begin_attempt"):
+        saver.begin_attempt()
+
+
+def commit_logits_attempt() -> None:
+    """Commit the accepted train-step attempt's saver data."""
+    saver = get_logits_saver()
+    if saver is not None and hasattr(saver, "commit_attempt"):
+        saver.commit_attempt()
+
+
 _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
 
 class LogitsSaverHooks:

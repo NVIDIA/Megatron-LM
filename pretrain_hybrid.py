@@ -120,7 +120,6 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             return_context_parallel_batch=True,
         )
 
-    kd_batch = None
     cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
@@ -140,24 +139,19 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        empty_batch = ContextParallelBatch(
+        return ContextParallelBatch(
             boundary_layout=cfg.model.transformer.linear_cp_layout,
             batches_by_layout={cfg.model.transformer.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
             packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
         )
-        return (empty_batch, None) if getattr(args, "logits_load_inputs", False) else empty_batch
 
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
-        if getattr(args, "logits_save_inputs", False):
-            from megatron.training.distillation.v3_runtime import capture_dump_batch
+        if getattr(args, "logits_save_inputs", False) or getattr(args, "logits_load_inputs", False):
+            from megatron.training.distillation.v3_runtime import on_tp0_batch
 
-            capture_dump_batch(batch, hybrid=True, vp_stage=vp_stage)
-        if getattr(args, "logits_load_inputs", False) and "_kd_sample_ids" in batch:
-            from megatron.training.distillation.v3_runtime import prepare_replay_batch
-
-            batch, kd_batch = prepare_replay_batch(batch)
+            batch = on_tp0_batch(batch, hybrid=True, vp_stage=vp_stage)
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -219,11 +213,10 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         tokens_per_sample=args.seq_length,
     )
     if getattr(args, "logits_load_inputs", False):
-        from megatron.training.distillation.v3_runtime import broadcast_targets
+        from megatron.training.distillation.v3_runtime import stage_targets
 
-        return cp_batch, broadcast_targets(kd_batch, vp_stage=vp_stage)
+        stage_targets(vp_stage=vp_stage)
     return cp_batch
-
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -350,9 +343,6 @@ def forward_step(data_iterator, model: HybridModel):
         cp_batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
-        kd_batch = None
-        if getattr(get_args(), "logits_load_inputs", False):
-            cp_batch, kd_batch = cp_batch
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -394,10 +384,11 @@ def forward_step(data_iterator, model: HybridModel):
             cp_batch=cp_batch,
         )
 
-    if kd_batch is not None:
-        from megatron.training.distillation.v3_runtime import bind_student_logits
+    kd_batch = None
+    if getattr(get_args(), "logits_load_inputs", False):
+        from megatron.training.distillation.v3_runtime import take_targets
 
-        kd_batch = bind_student_logits(kd_batch)
+        kd_batch = take_targets()
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model, kd_batch=kd_batch)

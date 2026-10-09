@@ -144,25 +144,33 @@ class ChunkedReader:
         self.name = name
         self.chunk_bytes = max(1, chunk_bytes)
         self.size = storage.size(name)
-        self.position = 0
-        self.buffer = b""
+        self.position = 0  # Object offset of the next chunk to fetch.
+        self.chunk = b""
+        self.offset = 0  # Read offset within the current chunk.
 
     def read(self, size: int = -1) -> bytes:
-        """Return up to ``size`` bytes, fetching the next chunk when the buffer is empty."""
-        if not self.buffer and self.position < self.size:
+        """Return up to ``size`` bytes, fetching the next chunk when the current one is spent.
+
+        The chunk is never rebuilt: each read copies only the bytes it returns.
+        """
+        if self.offset == len(self.chunk) and self.position < self.size:
             length = min(self.chunk_bytes, self.size - self.position)
-            self.buffer = self.storage.read_range(self.name, self.position, length)
-            if len(self.buffer) != length:
+            self.chunk = self.storage.read_range(self.name, self.position, length)
+            if len(self.chunk) != length:
                 raise IOError(f"Short ranged read from offline KD v3 object {self.name}")
             self.position += length
-        if size is None or size < 0:
-            size = len(self.buffer)
-        data, self.buffer = self.buffer[:size], self.buffer[size:]
+            self.offset = 0
+        end = len(self.chunk)
+        if size is not None and size >= 0:
+            end = min(self.offset + size, end)
+        data = self.chunk[self.offset : end]
+        self.offset = end
         return data
 
     def close(self) -> None:
         """Release the buffered chunk."""
-        self.buffer = b""
+        self.chunk = b""
+        self.offset = 0
 
 
 def _open_stream(storage: Storage, name: str, chunk_bytes: int) -> Any:

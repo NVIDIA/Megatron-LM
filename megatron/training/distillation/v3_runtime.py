@@ -4,7 +4,7 @@
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,9 @@ from .v3_storage import (
 
 _PLAN = None
 _HYBRID_LAYOUT = False
+# One-slot handoff of the current forward's targets from get_batch to forward_step.
+_PENDING_TARGETS = None
+_STAGED_TARGETS = None
 
 
 def validate_options(args: Any) -> None:
@@ -406,6 +409,7 @@ def ensure_replay_frontier(args: Any) -> None:
 def before_train_step(args: Any) -> bool:
     """Run v3 checks at the top of each training iteration; True means exit cleanly."""
     if getattr(args, "logits_load_inputs", False):
+        initialize_replay(args)  # Once, collectively, before the first replay batch.
         ensure_replay_frontier(args)
     if getattr(args, "logits_save_inputs", False):
         start, end = dump_range(args)
@@ -428,11 +432,13 @@ class _ContextParallelReplay:
     """Serve replay batches to every CP rank while only CP rank 0 reads storage.
 
     CP rank 0 maps the teacher targets for every CP rank in its prefetch thread;
-    this iterator scatters each rank its inputs and its own target shard.
+    this iterator scatters each rank its inputs and its own target shard. The
+    reader is created on first use, after the replay plan has been agreed.
     """
 
-    def __init__(self, source: ReplayIterator | None, cp_rank: int, cp_size: int):
-        self.source = source
+    def __init__(self, source_factory: Callable[[], Any] | None, cp_rank: int, cp_size: int):
+        self.source_factory = source_factory
+        self._source = None
         self.cp_rank = cp_rank
         self.cp_size = cp_size
         if cp_size > 1:
@@ -442,9 +448,16 @@ class _ContextParallelReplay:
             self.src = dist.get_global_rank(self.group, 0)
 
     @property
+    def source(self) -> Any:
+        """The replay iterator on CP rank 0, created on first use."""
+        if self._source is None and self.source_factory is not None:
+            self._source = self.source_factory()
+        return self._source
+
+    @property
     def reader(self) -> ReplayReader | None:
         """The underlying reader on CP rank 0."""
-        return None if self.source is None else self.source.reader
+        return getattr(self.source, "reader", None)
 
     def __iter__(self) -> "_ContextParallelReplay":
         return self
@@ -476,8 +489,8 @@ class _ContextParallelReplay:
 
     def close(self) -> None:
         """Stop the reader's streams."""
-        if self.source is not None:
-            self.source.close()
+        if self._source is not None:
+            self._source.close()
 
 
 def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader | None:
@@ -496,8 +509,8 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
         return None
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = args.context_parallel_size
-    source = None
-    if cp_rank == 0:
+
+    def source_factory() -> ReplayIterator:
         reader = ReplayReader(
             Storage(args.logits_load_dir),
             _PLAN["metadata"],
@@ -510,7 +523,7 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             chunk_bytes=args.logits_load_read_chunk_mb << 20,
         )
         _PLAN["readers"].append(reader)
-        source = ReplayIterator(
+        return ReplayIterator(
             reader,
             consumed=consumed,
             dp_rank=mpu.get_data_parallel_rank(),
@@ -522,7 +535,8 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             cp_size=cp_size,
             layout=layout_options(args, hybrid=_HYBRID_LAYOUT),
         )
-    iterator = _ContextParallelReplay(source, cp_rank, cp_size)
+
+    iterator = _ContextParallelReplay(source_factory if cp_rank == 0 else None, cp_rank, cp_size)
 
     class Dataset(torch.utils.data.IterableDataset):
         def __iter__(self):
@@ -543,6 +557,45 @@ def validation_only_config(config: Any, sample_counts: list) -> list:
     if config.blend_per_split is not None:
         config.blend_per_split = [None, *config.blend_per_split[1:]]
     return [0, *sample_counts[1:]]
+
+
+def on_tp0_batch(batch: dict, *, hybrid: bool = False, vp_stage: int | None = None) -> dict:
+    """Entrypoint hook on TP rank 0, right after ``next(data_iterator)``.
+
+    Dumping captures the raw batch; replay strips this CP rank's targets from the
+    model batch and holds them until :func:`stage_targets`.
+    """
+    global _PENDING_TARGETS
+    from megatron.training import get_args
+
+    args = get_args()
+    if getattr(args, "logits_save_inputs", False):
+        capture_dump_batch(batch, hybrid=hybrid, vp_stage=vp_stage)
+    if getattr(args, "logits_load_inputs", False) and "_kd_sample_ids" in batch:
+        batch, _PENDING_TARGETS = prepare_replay_batch(batch)
+    return batch
+
+
+def stage_targets(*, vp_stage: int | None = None) -> None:
+    """Entrypoint hook at the end of ``get_batch`` on every rank that reaches it.
+
+    Broadcasts the pending targets to the final stage's TP ranks and stages them
+    for :func:`take_targets` in the same forward step.
+    """
+    global _PENDING_TARGETS, _STAGED_TARGETS
+    _STAGED_TARGETS = broadcast_targets(_PENDING_TARGETS, vp_stage=vp_stage)
+    _PENDING_TARGETS = None
+
+
+def take_targets() -> dict | None:
+    """Entrypoint hook in ``forward_step`` after the model call.
+
+    Binds the staged targets to this forward's student logits for its loss closure.
+    Reruns re-read the cached batch, so targets are re-staged rather than lost.
+    """
+    global _STAGED_TARGETS
+    staged, _STAGED_TARGETS = _STAGED_TARGETS, None
+    return bind_student_logits(staged)
 
 
 def capture_dump_batch(batch: dict, *, hybrid: bool = False, vp_stage: int | None = None) -> None:
@@ -652,7 +705,8 @@ def finish_dump() -> None:
 
 def reset_runtime() -> None:
     """Clear replay state when Megatron is torn down or restarted in-process."""
-    global _PLAN, _HYBRID_LAYOUT
+    global _PLAN, _HYBRID_LAYOUT, _PENDING_TARGETS, _STAGED_TARGETS
+    _PENDING_TARGETS = _STAGED_TARGETS = None
     if _PLAN is not None:
         for reader in _PLAN.get("readers", []):
             reader.close()

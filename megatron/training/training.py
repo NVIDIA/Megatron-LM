@@ -3010,20 +3010,9 @@ def setup_model_and_optimizer(
         )
 
     if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
-        from megatron.training.distillation import LogitsSaverHooks
+        from megatron.training.distillation import build_logits_saver
 
-        if getattr(args, "logits_save_inputs", False):
-            from megatron.training.distillation.v3_saver import PairedLogitsSaver
-
-            LogitsSaverHooks = PairedLogitsSaver
-
-        logits_saver = LogitsSaverHooks(
-            save_dir=args.logits_save_dir,
-            k=args.logits_save_top_k,
-            p=args.logits_save_top_p,
-            min_k=args.logits_save_top_p_min_k,
-            save_dtype=args.logits_save_dtype,
-        )
+        logits_saver = build_logits_saver(args)
         logits_saver.attach_hooks(unwrapped_model[-1])
 
     if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
@@ -3450,14 +3439,11 @@ def train_step(
     save_dgrads_in_this_iteration = (checkpoint.save_dgrads_interval is not None and
                                      (iteration + 1) % checkpoint.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        if args.logits_save_dir is not None:
+            from megatron.training.distillation import begin_logits_attempt
+
+            begin_logits_attempt()
         # Set grad to zero.
-        if getattr(args, "logits_save_inputs", False):
-            from megatron.training.distillation.logits_saver import get_logits_saver
-
-            saver = get_logits_saver()
-            if saver is not None:
-                saver.begin_attempt()
-
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
@@ -3613,12 +3599,10 @@ def train_step(
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, None, scheduled_num_microbatches
 
-    if getattr(args, "logits_save_inputs", False):
-        from megatron.training.distillation.logits_saver import get_logits_saver
+    if args.logits_save_dir is not None:
+        from megatron.training.distillation import commit_logits_attempt
 
-        saver = get_logits_saver()
-        if saver is not None:
-            saver.commit_attempt()
+        commit_logits_attempt()
 
     # Empty unused memory.
     if cfg.train.empty_unused_memory_level >= 1:
@@ -6246,11 +6230,6 @@ def build_train_valid_test_data_loaders(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
-
-    if getattr(args, "logits_load_inputs", False):
-        from megatron.training.distillation.v3_runtime import initialize_replay
-
-        initialize_replay(args)
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
