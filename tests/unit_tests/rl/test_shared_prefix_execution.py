@@ -23,6 +23,7 @@ from megatron.rl.shared_prefix_execution import (
     SharedPrefixExecutionPlan,
     SharedPrefixExecutionUnit,
     plan_shared_prefix_execution_units,
+    validate_shared_prefix_execution_units,
 )
 from megatron.rl.shared_prefix_metadata import get_prescribed_shared_prefix_slots
 from megatron.rl.shared_prefix_packing import SharedPrefixRow, build_shared_prefix_layout
@@ -67,6 +68,22 @@ def test_mismatch_and_single_completion_groups_retain_real_dense_rows():
     )
     restored = pickle.loads(pickle.dumps(SharedPrefixExecutionPlan(units)))
     assert restored.units == units and restored.max_physical_length == 8
+
+
+def test_unit_validation_requires_shared_units_to_execute_their_layout():
+    rows = [SharedPrefixRow(index, "a", (1, 2, 3), 2) for index in range(3)]
+    (unit,) = plan_shared_prefix_execution_units(
+        rows, row_slots=((0, 1, 2),), bin_capacity=16, padding_multiple=1
+    )
+    layout = unit.shared_layout
+    assert layout is not None
+    validate_shared_prefix_execution_units((unit,), batch_size=3)
+    reordered = SharedPrefixExecutionUnit((2, 0, 1), layout, unit.physical_length)
+    with pytest.raises(ValueError, match="rows in layout order"):
+        validate_shared_prefix_execution_units((reordered,), batch_size=3)
+    padded = SharedPrefixExecutionUnit(unit.row_indices, layout, unit.physical_length + 4)
+    with pytest.raises(ValueError, match="physical length must equal"):
+        validate_shared_prefix_execution_units((padded,), batch_size=3)
 
 
 @pytest.mark.parametrize("slots", [((0,),), ((0, 0),), ((0, 1), ()), ((0, 2),)])

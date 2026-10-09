@@ -72,7 +72,11 @@ class SharedPrefixExecutionPlan:
 def validate_shared_prefix_execution_units(
     units: tuple[SharedPrefixExecutionUnit, ...], *, batch_size: int
 ) -> None:
-    """Reject a precomputed plan that does not cover this batch exactly once."""
+    """Reject a precomputed plan that does not cover this batch exactly once.
+
+    A shared unit must also execute exactly its layout: the layout's rows in layout order and
+    the layout's physical length.
+    """
     if not units:
         raise ValueError("shared-prefix train mode received an empty local batch")
     covered_rows = sorted(index for unit in units for index in unit.row_indices)
@@ -82,6 +86,21 @@ def validate_shared_prefix_execution_units(
             f"row exactly once; batch has {batch_size} rows, units cover "
             f"{covered_rows}"
         )
+    for unit in units:
+        layout = unit.shared_layout
+        if layout is None:
+            continue
+        if tuple(unit.row_indices) != tuple(layout.row_indices):
+            raise ValueError(
+                "shared-prefix execution unit rows must equal its layout's rows in layout "
+                f"order; unit has {tuple(unit.row_indices)}, layout has "
+                f"{tuple(layout.row_indices)}"
+            )
+        if unit.physical_length != layout.physical_total_length:
+            raise ValueError(
+                "shared-prefix execution unit physical length must equal its layout's; "
+                f"unit has {unit.physical_length}, layout has {layout.physical_total_length}"
+            )
 
 
 def pack_dense_rows(
@@ -150,15 +169,16 @@ def plan_shared_prefix_execution_units(
     ):
         raise ValueError("Execution slots must cover every source row exactly once")
     if pack_dense_fallbacks and not pack_groups:
-        raise ValueError("dense fallback repacking requires DP1 pack_groups mode")
+        raise ValueError("dense fallback repacking requires pack_groups")
     if merge_dense_fallbacks and not (pack_groups and pack_dense_fallbacks):
         raise ValueError("dense fallback merging requires pack_groups and pack_dense_fallbacks")
     if pack_groups and repack_groups:
-        # Forest execution is guarded to DP1 by the worker. The driver's
-        # equal-slot schedule protects cross-DP collectives, but in DP1 one
-        # long group must not force unrelated groups into singleton fallbacks.
-        # Repack each complete group with the same conventional token bound;
-        # both expanded MTP work and prompt-mismatch fallbacks still fit.
+        # Repacking ignores the driver's equal-slot schedule, so the caller
+        # must keep forward counts matched across data-parallel ranks (NeMo-RL
+        # aligns them at DP>1). One long group must not force unrelated groups
+        # into singleton fallbacks: repack each complete group with the same
+        # conventional token bound; both expanded MTP work and prompt-mismatch
+        # fallbacks still fit.
         grouped_indices: dict[str | None, list[int]] = {}
         for row in rows:
             grouped_indices.setdefault(row.group_id, []).append(row.row_index)
