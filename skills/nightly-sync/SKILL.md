@@ -731,5 +731,5 @@ comment should include:
 - Git committer identity: `svcnvidia-nemo-ci`
 - After editing imports, run `isort` on those files
 - **Push directly to NVIDIA/Megatron-LM** (not a fork). The bot uses a PAT
-  with write access. CLAUDE.md says "never push directly" but that rule is
+  with write access. AGENTS.md says "never push directly" but that rule is
   for human contributors — the sync bot is an exception.
