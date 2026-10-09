@@ -322,7 +322,9 @@ class TestFP8Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout, "Both Muon layouts must retain Adam DistOpt routing"
+            assert (
+                has_param_layout == args.use_layer_wise_param_layout
+            ), "Only padded Muon uses a full parameter layout and separate Adam DistOpt"
             assert_param_storage_policy(gpt_model[0], args)
         self._on_model_built(gpt_model, optimizer, args)
 

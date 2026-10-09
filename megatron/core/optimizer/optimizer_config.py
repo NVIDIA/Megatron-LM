@@ -359,8 +359,8 @@ class OptimizerConfig:
 
     use_layer_wise_param_layout: bool = True
     """Use a padded layout for LayerWise-managed parameters. If false, use a compact
-    layout with whole-parameter ownership and all-reduced gradients. Parameters managed
-    by other optimizers retain DistributedOptimizer byte-level sharding in either layout."""
+    layout with whole-parameter ownership and all-reduced gradients for both Muon and
+    its scalar optimizer. Padded layout keeps scalar parameters in DistributedOptimizer."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 

@@ -1799,7 +1799,7 @@ def validate_args(args, defaults={}):
 
     if args.use_layer_wise_distributed_optimizer:
         assert args.num_distributed_optimizer_instances == 1, (
-            "LayerWise Muon with sibling Adam DistributedOptimizer requires "
+            "LayerWiseDistributedOptimizer requires "
             "num_distributed_optimizer_instances == 1."
         )
         if not args.use_layer_wise_param_layout:
@@ -3135,10 +3135,10 @@ def _add_distributed_args(parser):
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',
-                       help='Use compact LayerWise (Muon) buffers instead of shard-aligned '
-                       'padding. Muon gradients use all-reduce and parameters use whole-parameter '
-                       'all-gather. Sibling Adam parameters retain DistributedOptimizer sharding '
-                       'with either layout. FP8 gather staging is independent of this toggle. '
+                       help='Use compact LayerWise buffers instead of shard-aligned padding. '
+                       'Muon and Adam remain inside LayerWise, with all-reduce gradients and '
+                       'whole-parameter ownership. The padded layout keeps Adam in '
+                       'DistributedOptimizer. FP8 gather staging is independent of this toggle. '
                        'The layouts can produce different reduction ordering and are not '
                        'guaranteed to match loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',

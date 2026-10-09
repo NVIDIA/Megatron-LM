@@ -2354,11 +2354,10 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True``, enables the distributed-optimizer
-    path for sibling Adam parameters and computes layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. The layout toggle
-    selects padded or compact Muon buffers without changing Adam sharding. Compact
-    Muon buffers use a private DDP config copy to all-reduce their gradients.
+    For ``use_layer_wise_distributed_optimizer=True``, padded layout keeps Muon in
+    LayerWise and scalar parameters in DistributedOptimizer. Compact layout keeps
+    both optimizers inside LayerWise, with whole-parameter ownership and all-reduced
+    gradients. Its private DDP config does not enable DistributedOptimizer.
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -2373,11 +2372,12 @@ def wrap_model_chunks_with_ddp(
     Args:
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
-        ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True``.
+        ddp_config: :class:`DistributedDataParallelConfig`. Padded LayerWise enables
+            DistOpt in place; compact LayerWise uses a private configuration copy.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            selects padded (True) or compact (False) Muon buffers. Adam remains sharded.
+            selects padded Muon plus sharded Adam (True), or compact LayerWise
+            ownership for both Muon and Adam (False).
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -2401,13 +2401,22 @@ def wrap_model_chunks_with_ddp(
     per_chunk_layouts = [None] * n
     if DP is DDP:
         if use_layer_wise_distributed_optimizer:
-            ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
-            ddp_config.use_distributed_optimizer = True
-            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-            # (Muon's Newton-Schulz domain) to a separate buffer and routes
-            # everything else (embeddings, biases, layernorm) to a separate
-            # DistOpt-style buffer.
+            if use_layer_wise_param_layout:
+                ddp_config.use_layer_wise_param_layout = True
+                ddp_config.use_distributed_optimizer = True
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            else:
+                # Keep main's compact LayerWise(Muon + Adam) ownership. Bucket sizing
+                # has already been resolved, so clear the count in this private copy.
+                ddp_config = dataclasses.replace(
+                    ddp_config,
+                    use_distributed_optimizer=False,
+                    use_layer_wise_param_layout=False,
+                    num_buckets=None,
+                )
+                compute_layout = None
+            # Retain the Muon/scalar distinction for the shared FP8 reuse policy.
+            # Compact LayerWise owns both kinds; padded Adam keeps its DistOpt buffer.
             tag_params_for_buffer_routing(model_chunks)
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout

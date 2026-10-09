@@ -103,6 +103,9 @@ def require_fp8_recipe(recipe):
 def assert_param_storage_policy(ddp, args):
     """Check actual allocations and optimizer routing, independently of forward numerics."""
     counts = {"muon_fp8": 0, "adam_blockwise": 0, "high_precision": 0}
+    compact_layerwise = (
+        args.use_layer_wise_distributed_optimizer and not args.use_layer_wise_param_layout
+    )
     for buffer in ddp.buffers + ddp.expert_parallel_buffers:
         for bucket in buffer.buckets:
             owners = {
@@ -110,9 +113,9 @@ def assert_param_storage_policy(ddp, args):
             }
             assert len(owners) == 1, "A bucket must not mix optimizer ownership"
             owner = owners.pop()
-            assert buffer.ddp_config.use_distributed_optimizer == (
-                not owner or args.use_layer_wise_param_layout
-            )
+            # The tag selects Muon staging, not whole-parameter ownership: compact
+            # LayerWise also owns the scalar Adam fallback, as on main.
+            assert buffer.ddp_config.use_distributed_optimizer is (not compact_layerwise)
             reused = [
                 p
                 for p in bucket.params
@@ -128,7 +131,11 @@ def assert_param_storage_policy(ddp, args):
                 ) or fp8_utils.is_grouped_tensor_with_quantized_storage(param):
                     if owner:
                         counts["muon_fp8"] += 1
-                    if fp8_utils.is_blockwise_float8tensor(param) and not owner:
+                    if (
+                        fp8_utils.is_blockwise_float8tensor(param)
+                        and not owner
+                        and buffer.ddp_config.use_distributed_optimizer
+                    ):
                         counts["adam_blockwise"] += 1
                         assert not bucket.reuse_grad_buffer_for_param_ag
                         assert buffer.param_dtype == torch.uint8
@@ -156,12 +163,14 @@ def assert_param_storage_policy(ddp, args):
                         param, ddp.ddp_config
                     )
                     assert param.data.untyped_storage().data_ptr() != grad_ptr
-                    if not owner or args.use_layer_wise_param_layout:
+                    if buffer.ddp_config.use_distributed_optimizer:
                         assert bucket.param_data is not None
                         assert (
                             param.data.untyped_storage().data_ptr()
                             == bucket.param_data.untyped_storage().data_ptr()
                         )
+                    elif not reused:
+                        assert bucket.param_data is None
     assert counts[
         "high_precision"
     ], "Expected embeddings/norms with persistent high-precision storage"
@@ -363,19 +372,17 @@ def test_nested_optimizer_staging_and_deferred_gather(native_sibling):
 
 @pytest.mark.parametrize("layout", [False, True])
 @pytest.mark.parametrize("num_buckets", [None, 2])
-def test_direct_ddp_keeps_shared_config_and_adam_sharding(layout, num_buckets):
-    """Direct DDP construction honors owner tags without a precomputed layout."""
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+def test_layerwise_ddp_preserves_resolved_bucket_config(layout, num_buckets):
+    """Compact all-reduce and padded sharding keep the resolved bucket size."""
+    from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.training import resolve_ddp_bucket_size
+    from megatron.training.training import resolve_ddp_bucket_size, wrap_model_chunks_with_ddp
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel()
     try:
         module = torch.nn.Linear(16, 16, bias=True, device="cuda", dtype=torch.bfloat16)
-        module.weight.is_managed_by_layer_wise_optimizer = True
-        module.bias.is_managed_by_layer_wise_optimizer = False
         config = DistributedDataParallelConfig(
             use_distributed_optimizer=True,
             use_layer_wise_param_layout=layout,
@@ -388,25 +395,30 @@ def test_direct_ddp_keeps_shared_config_and_adam_sharding(layout, num_buckets):
             config, pg_collection.dp_cp, True, sum(param.numel() for param in module.parameters())
         )
         config.bucket_size = resolved_bucket_size
-        ddp = DistributedDataParallel(
+        ddp = wrap_model_chunks_with_ddp(
+            [module],
             TransformerConfig(num_layers=1, num_attention_heads=1),
             config,
-            module,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=layout,
             pg_collection=pg_collection,
-        )
+        )[0]
         assert config.use_distributed_optimizer, "Muon must not mutate the shared config"
         assert config.num_buckets == num_buckets
         assert config.bucket_size == resolved_bucket_size
+        assert module.weight.is_managed_by_layer_wise_optimizer
+        assert not module.bias.is_managed_by_layer_wise_optimizer
+        assert (ddp.full_param_layout is not None) is layout
         assert len(ddp.buffers) == 2
         for buffer in ddp.buffers:
-            owner = buffer.params[0].is_managed_by_layer_wise_optimizer
-            assert buffer.ddp_config.use_distributed_optimizer == (layout or not owner)
-            if owner and not layout:
-                assert buffer.ddp_config is not config
-                assert buffer.ddp_config.num_buckets is None
-                assert buffer.ddp_config.bucket_size == resolved_bucket_size
-                assert buffer.numel == buffer.numel_unpadded
-            if not owner:
+            assert buffer.ddp_config.use_distributed_optimizer is layout
+            assert buffer.ddp_config.bucket_size == resolved_bucket_size
+            if layout:
                 assert buffer.param_data is not None
+            else:
+                assert ddp.ddp_config is not config
+                assert buffer.ddp_config.num_buckets is None
+                assert buffer.numel == buffer.numel_unpadded
+                assert buffer.param_data is None
     finally:
         Utils.destroy_model_parallel()

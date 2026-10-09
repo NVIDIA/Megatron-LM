@@ -766,6 +766,7 @@ class TestDdpWrapFullParamLayout:
         assert layout_args.kwargs["expert_data_parallel_world_size"] == 2
 
     @pytest.mark.parametrize("layout", [False, True])
+    @pytest.mark.parametrize("num_buckets", [None, 2])
     @patch("megatron.training.models.dist_utils.tag_params_for_buffer_routing")
     @patch("megatron.training.models.dist_utils.LayerWiseDistributedOptimizer")
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
@@ -783,15 +784,24 @@ class TestDdpWrapFullParamLayout:
         mock_layer_wise_optimizer,
         mock_tag_params,
         layout,
+        num_buckets,
     ):
-        """Both layouts route Muon separately while retaining Adam parameter sharding."""
+        """Compact uses private all-reduce config; only padded splits Adam into DistOpt."""
+        from megatron.core.distributed import DistributedDataParallelConfig
+
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
         mock_layer_wise_optimizer.compute_full_param_layout.return_value = "LAYERWISE_LAYOUT"
         chunk, param = self._make_chunk_with_params()
-        # Seed with the other layout so the assertion below proves _ddp_wrap wrote it.
-        ddp_config = self._ddp_config(
-            use_distributed_optimizer=False, use_layer_wise_param_layout=not layout
+        param.nelement.return_value = 16_000
+        # A real dataclass exercises replace and its num_buckets/bucket_size validation.
+        # Seed the opposite layout to distinguish private compact changes from mutation.
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=False,
+            use_layer_wise_param_layout=not layout,
+            overlap_grad_reduce=True,
+            num_buckets=num_buckets,
+            bucket_size=8_000 if num_buckets is None else None,
         )
 
         _ddp_wrap(
@@ -804,13 +814,26 @@ class TestDdpWrapFullParamLayout:
             use_layer_wise_param_layout=layout,
         )
 
-        assert ddp_config.use_distributed_optimizer
-        assert ddp_config.use_layer_wise_param_layout == layout
         mock_tag_params.assert_called_once_with([chunk])
-        layout_args = mock_layer_wise_optimizer.compute_full_param_layout.call_args
-        assert layout_args.args[0] == [param]
-        assert layout_args.args[3] is ddp_config
-        assert mock_ddp.call_args.kwargs["full_param_layout"] == "LAYERWISE_LAYOUT"
+        passed_config = mock_ddp.call_args.kwargs["ddp_config"]
+        assert ddp_config.num_buckets == num_buckets
+        assert ddp_config.bucket_size == passed_config.bucket_size == 8_000
+        assert passed_config.use_distributed_optimizer is layout
+        assert passed_config.use_layer_wise_param_layout is layout
+        self._opt.compute_full_param_layout.assert_not_called()
+        if layout:
+            assert passed_config is ddp_config
+            layout_args = mock_layer_wise_optimizer.compute_full_param_layout.call_args
+            assert layout_args.args[0] == [param]
+            assert layout_args.args[3] is ddp_config
+            assert mock_ddp.call_args.kwargs["full_param_layout"] == "LAYERWISE_LAYOUT"
+        else:
+            assert passed_config is not ddp_config
+            assert not ddp_config.use_distributed_optimizer
+            assert ddp_config.use_layer_wise_param_layout
+            assert passed_config.num_buckets is None
+            mock_layer_wise_optimizer.compute_full_param_layout.assert_not_called()
+            assert "full_param_layout" not in mock_ddp.call_args.kwargs
 
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
