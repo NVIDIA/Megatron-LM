@@ -423,11 +423,6 @@ def copy_back_gathered_bf16_into_fp8_params(
     copy_tensors_to_quantized_params(model_params, srcs_bf16)
 
 
-def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
-    """Single-parameter compatibility wrapper for LayerWise BF16 copy-back."""
-    copy_back_gathered_bf16_into_fp8_params([model_p], [src_bf16])
-
-
 def _resolve_callable_from_python_import_path(dotted_path: str):
     """Resolve a Python import path like 'pkg.mod.func' to a callable.
 
