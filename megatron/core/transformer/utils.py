@@ -290,18 +290,33 @@ def _get_extra_state_offsets(
     return extra_state_shape, extra_state_offset
 
 
-def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
+def ensure_metadata_has_dp_cp_group(
+    metadata: Optional[dict], dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+) -> dict:
     """Ensure `metadata` is a dict containing `dp_cp_group` entry.
 
     If `metadata` is None, a new dict is returned with `dp_cp_group` set.
     If `metadata` is a dict and missing `dp_cp_group`, it is updated in-place.
     Otherwise, asserts that `dp_cp_group` exists.
+
+    Args:
+        metadata: Sharded state dict metadata from the caller, or None.
+        dp_cp_group: The group to fill in when `metadata` has none: the module's data- and
+            context-parallel group including GTP-remat peers (``dp_cp_gtp_remat``), whose ranks
+            the replica ids are computed over. A `dp_cp_group` already in `metadata` takes
+            precedence. Defaults to the global
+            ``parallel_state.get_data_parallel_group(with_context_parallel=True)``.
     """
+    if metadata is not None:
+        assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
+        if 'dp_cp_group' in metadata:
+            return metadata
+    if dp_cp_group is None:
+        # Migration fallback for callers that do not pass their module's group.
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     if metadata is None:
-        return {'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)}
-    assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
-    if 'dp_cp_group' not in metadata:
-        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        return {'dp_cp_group': dp_cp_group}
+    metadata['dp_cp_group'] = dp_cp_group
     return metadata
 
 

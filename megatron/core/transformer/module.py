@@ -129,8 +129,13 @@ class MegatronModule(torch.nn.Module):
             tp_group = parallel_state.get_tensor_model_parallel_group()
         else:
             tp_group = self.tp_group
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided. A module with its own collection supplies
+        # its GTP-inclusive DP x CP group, the group the global default stands for.
+        pg_collection = getattr(self, 'pg_collection', None)
+        dp_cp_group = None
+        if pg_collection is not None:
+            dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,

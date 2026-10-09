@@ -38,7 +38,10 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    sharded_state_dict_default,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -847,6 +850,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     ' Setting non_homogeneous_layers=True.'
                 )
             non_homogeneous_layers = True
+
+        # Guard for cases metadata is not provided: replica ids span the block's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
 
