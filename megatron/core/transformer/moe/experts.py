@@ -795,6 +795,22 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors = (
                 [permuted_local_hidden_states] if fine_grained_activation_offloading else []
             )
+            # Deterministic mode: TE's fused grouped-MLP backward accumulates the routing-prob
+            # gradient (dprob) with atomics inside the fused dactivation kernel, so the router
+            # gradient is not bit-reproducible (newer TE raises for this on the GLU path). Feed a
+            # unit scale to the fused op and apply the probs on the FC2 output instead: without
+            # an FC2 bias the two placements are the same function, and the prob gradient
+            # becomes an ordinary (deterministic) torch reduction.
+            post_probs = None
+            if self.config.deterministic_mode:
+                if self.linear_fc2.use_bias:
+                    raise RuntimeError(
+                        "deterministic_mode with the Transformer Engine operation-fuser grouped "
+                        "MLP requires FC2 without bias: the routing probabilities are applied on "
+                        "the FC2 output, which is only exact when FC2 has no bias."
+                    )
+                post_probs = permuted_probs
+                permuted_probs = torch.ones_like(permuted_probs)
             with stash_context:
                 # Call fused impl
                 output = ops(
@@ -803,6 +819,8 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,  # Scaled activation
                     tokens_per_expert,  # FC2
                 )
+                if post_probs is not None:
+                    output = (output * post_probs.unsqueeze(-1).float()).to(output.dtype)
         output = fused_group_mlp_manager.group_offload(
             output,
             forced_released_tensors=forced_released_tensors,
