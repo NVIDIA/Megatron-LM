@@ -24,6 +24,11 @@ from itertools import accumulate
 import torch
 
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
+from megatron.core.utils import is_fa_min_version
+
+# The exact backward calls FlashAttention 2's private ``_flash_attn_varlen_backward`` by keyword;
+# its ``window_size_left``/``window_size_right`` arguments first appear in flash-attn 2.7.0.
+_MIN_FLASH_ATTN_VERSION = "2.7.0"
 
 # Cache pass plans because the same packed layout recurs across model layers.
 _PLAN_CACHE: dict = {}
@@ -117,6 +122,17 @@ def _star_forest_plan_cached(forest, device):
     return plan
 
 
+def _flash_attn_varlen_backward(**kwargs):
+    """Call FlashAttention 2's private varlen backward with keyword arguments.
+
+    Keywords make an incompatible release fail with a TypeError instead of misbinding the
+    positional arguments; :func:`flash_composed_forest_attention` checks the minimum version.
+    """
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_backward as backward
+
+    return backward(**kwargs)
+
+
 class _ComposedForestAttn(torch.autograd.Function):
     """Composed forest attention with an EXACT backward.
 
@@ -177,8 +193,6 @@ class _ComposedForestAttn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         """Accumulate pass gradients using the merged output for the global softmax correction."""
-        from flash_attn.flash_attn_interface import _flash_attn_varlen_backward
-
         q, k, v, o_merged = ctx.saved_tensors
         lse_final = ctx.lse_final
         do = do.contiguous()
@@ -195,29 +209,27 @@ class _ComposedForestAttn(torch.autograd.Function):
             dox = (weight.transpose(0, 1).unsqueeze(-1) * do[rows]).to(q.dtype)
             dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
             _flash_attn_varlen_backward(
-                dox,
-                qx,
-                kx,
-                vx,
-                o_merged[rows],  # MERGED output -> exact
-                lse,
-                dqx,
-                dkx,
-                dvx,
-                cu_q,
-                cu_k,
-                max_q,
-                max_k,
-                0.0,
-                ctx.scale,
-                causal,
-                -1,
-                -1,
-                0.0,
-                None,
-                deterministic,
-                None,
-                False,
+                dout=dox,
+                q=qx,
+                k=kx,
+                v=vx,
+                out=o_merged[rows],  # MERGED output -> exact
+                softmax_lse=lse,
+                dq=dqx,
+                dk=dkx,
+                dv=dvx,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                dropout_p=0.0,
+                softmax_scale=ctx.scale,
+                causal=causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                alibi_slopes=None,
+                deterministic=deterministic,
             )
             dq[rows] += dqx.float()
             if k_idx is None:
@@ -238,9 +250,17 @@ def flash_composed_forest_attention(query, key, value, forest, scale=None):
     trailing rows past the forest get zero outputs. Returns ``[sq, 1, np * hn]``. ``scale``
     defaults to ``1 / sqrt(hn)``.
     """
-    sq, b, np_, hn = query.shape
-    assert b == 1, "shared-prefix packing uses a single packed sequence (b == 1)"
+    sq, batch, np_, hn = query.shape
+    if batch != 1:
+        raise ValueError("shared-prefix attention requires a single packed sequence (b == 1)")
     total, passes = _star_forest_plan_cached(forest, query.device)
+    if total > sq:
+        raise ValueError(f"shared-prefix forest covers {total} tokens but the sequence has {sq}")
+    if not is_fa_min_version(_MIN_FLASH_ATTN_VERSION):
+        raise RuntimeError(
+            f"shared-prefix attention requires flash-attn >= {_MIN_FLASH_ATTN_VERSION} for its "
+            "exact backward"
+        )
     scale = scale if scale is not None else hn**-0.5
     out = _ComposedForestAttn.apply(
         query[:total, 0], key[:total, 0], value[:total, 0], passes, scale

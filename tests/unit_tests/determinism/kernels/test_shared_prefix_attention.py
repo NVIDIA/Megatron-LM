@@ -140,6 +140,7 @@ def test_plan_attends_each_visible_pair_exactly_once(attention, forest):
         ([(0, 4, [2]), (7, 3, [1])], "contiguously from token 0"),
         ([(0, 0, [2])], "empty prompt or completion"),
         ([(0, 3, [2, 0])], "empty prompt or completion"),
+        ([(0, 40, [50, 30])], "covers 120 tokens but the sequence has 100"),
     ],
 )
 def test_invalid_forest_is_rejected_before_attention(attention, forest, match):
@@ -147,6 +148,25 @@ def test_invalid_forest_is_rejected_before_attention(attention, forest, match):
     query = torch.zeros(100, 1, 2, 8)
     with pytest.raises(ValueError, match=match):
         attention.flash_composed_forest_attention(query, query, query, forest)
+
+
+def test_multiple_packed_sequences_are_rejected(attention):
+    """Shared-prefix attention takes one packed sequence."""
+    query = torch.zeros(8, 2, 2, 8)
+    with pytest.raises(ValueError, match="single packed sequence"):
+        attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
+
+
+def test_old_flash_attention_is_rejected_before_attention(attention, monkeypatch):
+    """The exact backward binds FlashAttention 2.7+ private keyword arguments."""
+    from packaging.version import Version
+
+    from megatron.core import utils
+
+    monkeypatch.setattr(utils, "_fa_version", Version("2.6.3"))
+    query = torch.zeros(8, 1, 2, 8)
+    with pytest.raises(RuntimeError, match=r"flash-attn >= 2\.7\.0"):
+        attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
 
 
 def _qkv(tokens, dtype, *, heads=8, kv_heads=2, dim=64, strided=True):
@@ -269,6 +289,26 @@ def test_composed_attention_replays(attention, dtype, kind, strided):
     )
     assert torch.count_nonzero(outputs["out"][-8:]) == 0
     assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in grads.values())
+
+
+@_CUDA
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_backward_follows_torch_deterministic_algorithms(attention, monkeypatch, deterministic):
+    """``--deterministic-mode`` selects FlashAttention's deterministic backward."""
+    selected = []
+    backward = attention._flash_attn_varlen_backward
+
+    def recording_backward(**kwargs):
+        selected.append(kwargs["deterministic"])
+        return backward(**kwargs)
+
+    monkeypatch.setattr(attention, "_flash_attn_varlen_backward", recording_backward)
+    forest = _FORESTS["multi-star"]
+    inputs = _qkv(_total(forest), torch.bfloat16)
+    with deterministic_algorithms(deterministic):
+        attention.flash_composed_forest_attention(*inputs, forest).sum().backward()
+    assert selected == [deterministic, deterministic]
 
 
 @_CUDA
