@@ -485,11 +485,13 @@ default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
 On SM10x GPUs, BF16 and MXFP8 experts support the activation `(L * tanh(relu(x) / L)) ** 2` with
 `inference_grouped_gemm_backend="flashinfer"`, `activation_func=squared_relu`,
 `activation_func_tanh_clamp_scale=L`, `gated_linear_unit=False`,
-and `add_bias_linear=False`. MXFP8 additionally requires FP8 enabled,
-`fp8_recipe="mxfp8"`, `fp8_param=True`, and expert weight dimensions divisible by 128.
+and `add_bias_linear=False`. 
+
 Use a FlashInfer build containing [#5696](https://github.com/flashinfer-ai/flashinfer/pull/5696),
 with `ActivationType.ClampedRelu2` and `clamped_relu2_limit` support. This path does not
-support `inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`. TODO(helenn): Document a minimum release version.
+support `inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`. 
+
+TODO(helenn): Document a minimum FlashInfer release version.
 
 ### Reading Results
 
