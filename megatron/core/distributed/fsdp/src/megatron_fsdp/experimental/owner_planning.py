@@ -341,19 +341,19 @@ class OwnerGatherPlan:
     recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
-    def pack(cls, plan: GroupOwnerLayout, local_shards: dict[int, torch.Tensor]) -> Self:
+    def pack(cls, owner_layout: GroupOwnerLayout, local_shards: dict[int, torch.Tensor]) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
         Args:
-            plan: The group's owner layout.
+            owner_layout: The group's owner layout.
             local_shards: This rank's local shard per parameter, only required for every parameter
                 it holds elements of. Shards may be passed in any shape.
         """
-        mesh = plan.mesh
+        mesh = owner_layout.mesh
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
-        layouts = plan.layouts
-        owners = plan.owners
+        layouts = owner_layout.layouts
+        owners = owner_layout.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
         for tensor_index, layout in layouts.items():
@@ -476,19 +476,19 @@ class OwnerScatterPlan:
     recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
-    def pack(cls, plan: GroupOwnerLayout, full_results: dict[int, torch.Tensor]) -> Self:
+    def pack(cls, owner_layout: GroupOwnerLayout, full_results: dict[int, torch.Tensor]) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
         Args:
-            plan: The group's owner layout.
+            owner_layout: The group's owner layout.
             full_results: Full result tensor per parameter this rank owns. Tensors may be passed in
                 any shape.
         """
-        mesh = plan.mesh
+        mesh = owner_layout.mesh
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
-        layouts = plan.layouts
-        owners = plan.owners
+        layouts = owner_layout.layouts
+        owners = owner_layout.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
         for tensor_index, layout in layouts.items():
