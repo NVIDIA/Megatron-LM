@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
 from pathlib import Path
 
-SCHEMA = 1
+SCHEMA = 2
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
 PLATFORMS = {
@@ -40,6 +40,7 @@ COMPATIBILITY_FILES = (
     "tests/unit_tests/testmon_selector.py",
     "tests/unit_tests/testmon_cache.py",
     "tests/unit_tests/testmon_mandatory.py",
+    "tests/unit_tests/testmon_plan.py",
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
@@ -100,6 +101,80 @@ def _write_json(path: Path, data: dict) -> None:
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def collection_inventory(root: Path) -> dict[str, str]:
+    """Fingerprint test sources and helpers without importing GPU dependencies."""
+    return {
+        path.relative_to(root).as_posix(): _digest(path)
+        for path in sorted((root / "tests/unit_tests").rglob("*.py"))
+        if path.is_file()
+    }
+
+
+def record_collection(
+    cache_dir: Path, phase: str, rank: int, world_size: int, collection: dict
+) -> None:
+    """Record a successful rank's collection for the baseline finalizer."""
+    collection = {**collection, "rank": rank, "world_size": world_size}
+    _validate_collection(collection)
+    if not 0 <= rank < world_size:
+        raise ValueError("invalid Testmon collection rank")
+    directory = _database(cache_dir, phase).parent / "collection"
+    directory.mkdir(parents=True, exist_ok=True)
+    _write_json(directory / f"rank-{rank}.json", collection)
+
+
+def _validate_collection(collection: object) -> None:
+    if not isinstance(collection, dict):
+        raise ValueError("missing Testmon collection inventory")
+    world_size = collection.get("world_size")
+    nodeids = collection.get("nodeids")
+    files = collection.get("files")
+    if (
+        type(world_size) is not int
+        or world_size < 1
+        or not isinstance(collection.get("rootpath"), str)
+        or not collection["rootpath"]
+        or not isinstance(nodeids, list)
+        or any(not isinstance(nodeid, str) or not nodeid or "\n" in nodeid for nodeid in nodeids)
+        or not isinstance(files, dict)
+        or any(
+            not isinstance(path, str)
+            or not path.startswith("tests/unit_tests/")
+            or ".." in Path(path).parts
+            or not path.endswith(".py")
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            for path, digest in files.items()
+        )
+    ):
+        raise ValueError("invalid Testmon collection inventory")
+
+
+def _merge_collections(cache_dir: Path, phase: str) -> dict:
+    directory = _database(cache_dir, phase).parent / "collection"
+    first = _read_json(directory / "rank-0.json")
+    _validate_collection(first)
+    world_size = first["world_size"]
+    expected = {f"rank-{rank}.json" for rank in range(world_size)}
+    if {path.name for path in directory.glob("rank-*.json")} != expected:
+        raise ValueError(f"incomplete Testmon rank collections: {phase}")
+    nodeids = set()
+    for rank in range(world_size):
+        collection = _read_json(directory / f"rank-{rank}.json")
+        _validate_collection(collection)
+        if collection.get("rank") != rank or any(
+            collection[field] != first[field] for field in ("world_size", "rootpath", "files")
+        ):
+            raise ValueError(f"inconsistent Testmon rank collections: {phase}")
+        nodeids.update(collection["nodeids"])
+    return {
+        "world_size": world_size,
+        "rootpath": first["rootpath"],
+        "nodeids": sorted(nodeids),
+        "files": first["files"],
+    }
 
 
 def cache_identity(
@@ -215,8 +290,14 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
         r"[0-9]+-[0-9]+", generation
     ):
         raise ValueError("invalid baseline source or generation")
+    metadata_by_phase = {}
     for phase in PHASES:
         validate_phase(cache_dir, phase, check_runtime=False)
+        metadata = _read_json(_database(cache_dir, phase).parent / "metadata.json")
+        metadata["collection"] = _merge_collections(cache_dir, phase)
+        metadata_by_phase[phase] = metadata
+    for phase, metadata in metadata_by_phase.items():
+        _write_json(_database(cache_dir, phase).parent / "metadata.json", metadata)
     manifest = {
         "schema": SCHEMA,
         "source_ref": "refs/heads/main",
@@ -251,6 +332,8 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
         raise ValueError("Testmon baseline creation time must include a timezone")
     for phase in PHASES:
         validate_phase(cache_dir, phase, check_runtime=False)
+        metadata = _read_json(_database(cache_dir, phase).parent / "metadata.json")
+        _validate_collection(metadata.get("collection"))
     return manifest
 
 

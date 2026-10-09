@@ -67,7 +67,7 @@ inputs:
     required: false
     default: ""
   unit_testmon_mode:
-    description: "Unit-test mode: full, enforce (restore only), or baseline (main producer only)."
+    description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
     required: false
     default: "full"
   unit_testmon_target_branch:
@@ -76,6 +76,10 @@ inputs:
     default: ""
   unit_test_pr_files_artifact_id:
     description: "Artifact containing the validated PR file list from the configure job."
+    required: false
+    default: ""
+  unit_testmon_plan_artifact:
+    description: "Artifact containing the CPU-selected plan.json for this bucket."
     required: false
     default: ""
 runs:
@@ -201,6 +205,15 @@ runs:
         path: ${{ steps.unit-test-pr-files-directory.outputs.path }}
         merge-multiple: true
 
+    - name: Download CPU unit Testmon plan
+      id: download-unit-testmon-plan
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && inputs.unit_testmon_plan_artifact != '' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      continue-on-error: true
+      with:
+        name: ${{ inputs.unit_testmon_plan_artifact }}
+        path: assets_dir/testmon
+
     - name: Resolve unit Testmon mode
       id: unit-testmon
       if: inputs.is_unit_test == 'true'
@@ -213,6 +226,10 @@ runs:
         PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
         PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
         TESTED_SHA: ${{ inputs.sha || github.sha }}
+        PLAN_OUTCOME: ${{ steps.download-unit-testmon-plan.outcome }}
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -222,6 +239,19 @@ runs:
           baseline)
             [[ "$IDENTITY_OUTCOME" == "success" ]]
             EFFECTIVE_MODE=baseline
+            ;;
+          preselected)
+            if [[ "$IDENTITY_OUTCOME" == "success" && "$PLAN_OUTCOME" == "success" ]] \
+              && python tests/unit_tests/testmon_plan.py prepare \
+                --plan assets_dir/testmon/plan.json --cache-dir assets_dir/testmon \
+                --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+                --source-sha "$(git rev-parse HEAD)" \
+                --image-id "$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE")"; then
+              EFFECTIVE_MODE=preselected
+            else
+              EFFECTIVE_MODE=full
+              FALLBACK_REASON="CPU selection plan unavailable or invalid; running the full bucket"
+            fi
             ;;
           enforce)
             if [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
