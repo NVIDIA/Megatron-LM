@@ -3,11 +3,14 @@
 """Shared-prefix Mamba backend selection, convolution layout and ragged Triton kernels."""
 
 import copy
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import megatron.core.ssm
 from megatron.core.models.hybrid import shared_prefix
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -45,6 +48,8 @@ def kernels_present(monkeypatch):
     """Let the validation tests run without the optional Mamba kernels."""
     monkeypatch.setattr(shared_prefix, "causal_conv1d_fn", object())
     monkeypatch.setattr(shared_prefix, "mamba_chunk_scan_combined", object())
+    for name in ("mamba_ragged", "mamba_ragged_scan"):
+        monkeypatch.setitem(sys.modules, f"megatron.core.ssm.{name}", types.ModuleType(name))
 
 
 def test_ragged_state_fork_is_the_default(monkeypatch):
@@ -80,6 +85,16 @@ def test_ragged_rejects_non_default_ssm_state_dtype(monkeypatch, kernels_present
     shared_prefix._validate_mamba_fork(_fake_mixer(state_dtype=torch.bfloat16))
     monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "state_fork")
     shared_prefix._validate_mamba_fork(fp32_states)
+
+
+def test_ragged_kernel_import_failure_fails_validation(monkeypatch, kernels_present):
+    monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
+    monkeypatch.delattr(megatron.core.ssm, "mamba_ragged_scan", raising=False)
+    monkeypatch.setitem(sys.modules, "megatron.core.ssm.mamba_ragged_scan", None)
+    with pytest.raises(RuntimeError, match="NRL_SP_MAMBA_IMPL=state_fork"):
+        shared_prefix._validate_mamba_fork(_fake_mixer())
+    monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "state_fork")
+    shared_prefix._validate_mamba_fork(_fake_mixer())
 
 
 def _dense_rows(layer, hidden_states, layout):

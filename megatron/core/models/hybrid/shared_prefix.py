@@ -95,6 +95,17 @@ def _validate_mamba_fork(mixer: MambaMixer) -> None:
     if causal_conv1d_fn is None or mamba_chunk_scan_combined is None:
         raise RuntimeError("shared-prefix Mamba state forking requires causal-conv1d and mamba-ssm")
     if _shared_prefix_mamba_impl().startswith("ragged_state_fork"):
+        try:
+            # Ragged imports private mamba_ssm SSD kernels; fail before any layer runs.
+            from megatron.core.ssm import (  # pylint: disable=unused-import
+                mamba_ragged,
+                mamba_ragged_scan,
+            )
+        except ImportError as error:
+            raise RuntimeError(
+                "shared-prefix ragged Mamba cannot import its kernels; set "
+                "NRL_SP_MAMBA_IMPL=state_fork to use the public mamba_ssm API"
+            ) from error
         chunk_size = mixer.chunk_size
         if (
             isinstance(chunk_size, bool)
