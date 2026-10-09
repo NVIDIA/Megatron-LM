@@ -122,11 +122,17 @@ def test_replay_matches_dense_training(distributed_setup):
         assert all(module._unshard_event is None for module in (model, model[0], model[2]))
 
 
-def test_replay_mismatch_cleans_up():
-    """Fail before unexpected work and release both retained and prefetched storage."""
+@pytest.mark.parametrize("failure", ["mismatch", "unclosed_trace"])
+def test_replay_fails_fast(failure):
+    """Reject an unclosed trace or unexpected replay before executing new work."""
     scheduler = TraceAndReplayScheduler()
     repeated, prefetched, unexpected = (_fake_module() for _ in range(3))
     scheduler.begin_iteration()
+    if failure == "unclosed_trace":
+        scheduler.unshard(repeated, prefetch="forward")
+        with pytest.raises(RuntimeError, match="end with reshard"):
+            scheduler.end_iteration()
+        return
     for module in (repeated, repeated, prefetched):
         scheduler.unshard(module, prefetch="forward")
         scheduler.reshard(module)
@@ -139,9 +145,5 @@ def test_replay_mismatch_cleans_up():
     with pytest.raises(RuntimeError, match="diverged"):
         scheduler.unshard(unexpected, prefetch="forward")
     unexpected._unshard_parameter_groups.assert_not_called()
-    assert all(module._unshard_event is None for module in (repeated, prefetched))
-    assert not scheduler._active
-    assert not scheduler._plan
-    assert not scheduler._actions
-    assert not scheduler._held
-    assert not scheduler._touched
+    with pytest.raises(RuntimeError, match="already active"):
+        scheduler.begin_iteration()
