@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -33,7 +34,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -372,6 +373,25 @@ class AbsorbedMLASelfAttention(Attention):
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
             name=(name + ".linear_kv_up_proj") if name is not None else None,
+        )
+
+        q_up_proj = self.linear_q_proj if self.config.q_lora_rank is None else self.linear_q_up_proj
+        q_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+            self.config.num_attention_heads,
+            (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim),
+        )
+        self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+            self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
+        )
+        q_up_proj.weight.muon_layout = MuonProjectionLayout.matrices(
+            q_up_proj.weight.qkv_layout.per_head_split_shapes * self.config.num_attention_heads
+        )
+        self.linear_kv_up_proj.weight.muon_layout = MuonProjectionLayout.matrices(
+            self.linear_kv_up_proj.weight.qkv_layout.per_head_split_shapes
+            * self.config.num_attention_heads
+        )
+        self.linear_kv_down_proj.weight.muon_layout = MuonProjectionLayout.matrices(
+            (self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim)
         )
 
         if self.config.q_lora_rank is not None:

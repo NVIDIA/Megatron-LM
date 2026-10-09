@@ -25,6 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -233,6 +234,14 @@ class MLP(MegatronModule):
             stride=fc1_stride,
             name=(name + ".linear_fc1") if name is not None else None,
         )
+
+        if self.config.gated_linear_unit:
+            # Physical TP storage is [gate_local, up_local], not a contiguous
+            # chunk of [gate_global, up_global]. Both are feature matrices.
+            local_width = ffn_hidden_size // (2 * get_pg_size(self.tp_group))
+            self.linear_fc1.weight.muon_layout = MuonProjectionLayout.matrices(
+                (local_width, local_width), tp_local=True, tp_partitioned=True
+            )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))

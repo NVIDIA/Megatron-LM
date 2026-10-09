@@ -11,9 +11,12 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import Any, Callable, Dict, Literal, Optional, get_args
 
 import torch
+from packaging.version import Version
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -54,6 +57,18 @@ logger = logging.getLogger(__name__)
 # ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
 # elsewhere in the tree are written.
 _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
+
+try:
+    EMERGING_OPTIMIZERS_VERSION = Version(package_version("emerging-optimizers"))
+except PackageNotFoundError:
+    EMERGING_OPTIMIZERS_VERSION = Version("0")
+
+_BATCHED_NEWTON_SCHULZ_MIN_VERSION = Version("0.3.0")
+
+
+def _supports_batched_newton_schulz() -> bool:
+    """Return whether Emerging-Optimizers supports batched Newton-Schulz."""
+    return EMERGING_OPTIMIZERS_VERSION >= _BATCHED_NEWTON_SCHULZ_MIN_VERSION
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -154,11 +169,29 @@ def _is_muon_excluded(param):
     return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
 
 
-def _get_qkv_split_shapes(model_cfg) -> list[int]:
-    """Compute QKV split shapes from model config."""
+def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[int]:
+    """Compute fused QKV split shapes from logical attention layout metadata.
+
+    Args:
+        model_cfg: Transformer config or an owning attention layer's ``QKVLayout`` metadata.
+        split_qkv_per_head: Return one split size per physical attention head. When false,
+            return the per-query-group Q, gate (if present), K, and V projection widths.
+    """
+    if hasattr(model_cfg, 'projection_split_shapes'):
+        if split_qkv_per_head:
+            return list(model_cfg.per_head_split_shapes) * model_cfg.num_groups
+        return list(model_cfg.projection_split_shapes)
+
     query_projection_size = (
         model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
     )
+    if split_qkv_per_head:
+        num_query_heads_per_group = model_cfg.num_attention_heads // model_cfg.num_query_groups
+        per_group_shapes = [model_cfg.kv_channels] * num_query_heads_per_group
+        if getattr(model_cfg, 'attention_output_gate', False):
+            per_group_shapes += [model_cfg.kv_channels] * num_query_heads_per_group
+        per_group_shapes += [model_cfg.kv_channels, model_cfg.kv_channels]
+        return per_group_shapes * model_cfg.num_query_groups
     if getattr(model_cfg, 'attention_output_gate', False):
         return [
             query_projection_size,
@@ -167,6 +200,46 @@ def _get_qkv_split_shapes(model_cfg) -> list[int]:
             model_cfg.kv_channels,
         ]
     return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
+
+
+def _localize_qkv_split_shapes(
+    global_split_shapes: list[int], local_start: int, local_rows: int
+) -> tuple[list[int], bool]:
+    """Intersect global per-head split sizes with a rank-local contiguous row range.
+
+    Returns:
+        The physical rank-local split sizes and whether every intersected head is complete.
+    """
+    local_stop = local_start + local_rows
+    local_split_shapes = []
+    all_heads_complete = True
+    head_start = 0
+    for head_rows in global_split_shapes:
+        head_stop = head_start + head_rows
+        overlap_start = max(head_start, local_start)
+        overlap_stop = min(head_stop, local_stop)
+        if overlap_start < overlap_stop:
+            overlap_rows = overlap_stop - overlap_start
+            local_split_shapes.append(overlap_rows)
+            all_heads_complete &= overlap_rows == head_rows
+        head_start = head_stop
+
+    if sum(local_split_shapes) != local_rows:
+        raise RuntimeError(
+            f"Muon per-head QKV local range [{local_start}, {local_stop}) is outside "
+            f"the global split shape with {sum(global_split_shapes)} rows"
+        )
+    return local_split_shapes, all_heads_complete
+
+
+def _qkv_split_groups_are_complete(
+    split_shapes: list[int], local_start: int, local_rows: int
+) -> bool:
+    """Return whether a local row range contains only complete fused QKV groups."""
+    split_width = sum(split_shapes)
+    if split_width <= 0:
+        raise ValueError(f"Muon QKV split shapes must sum to a positive size: {split_shapes}")
+    return local_start % split_width == 0 and local_rows % split_width == 0
 
 
 # ===========================================================================
@@ -266,6 +339,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_qkv_per_head: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
@@ -276,6 +350,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        adamw_betas: tuple[float, float] = (0.9, 0.999),
+        adamw_eps: float = 1e-8,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -285,6 +361,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f"{get_emerging_optimizers_version()} is installed. Upgrade "
                 "emerging_optimizers or drop --muon-use-syrk."
             )
+        if split_qkv_per_head and not split_qkv:
+            raise ValueError("split_qkv_per_head requires split_qkv=True")
+        # Emerging-Optimizers >=0.3.0 has a faster batched 3-D Newton-Schulz
+        # kernel. Older environments still support the same per-head update
+        # through the 2-D path; _orthogonalize_split_qkv falls back to that
+        # implementation below so per-head Muon remains usable during rollout.
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -326,15 +408,19 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
         self.split_qkv = split_qkv
+        self.split_qkv_per_head = split_qkv_per_head
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
         # For the tp_mode="auto" cost model (_resolve_tp_mode / _select_tp_mode).
         self.num_ns_steps = num_ns_steps
+        self.scale_mode = scale_mode
         self.use_syrk = use_syrk
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
+        self._warned_distributed_qkv_fallback = False
+        self._semantic_plans: dict[torch.Tensor, tuple] = {}
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -352,12 +438,424 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+        for group in self.param_groups:
+            group.setdefault("adamw_betas", adamw_betas)
+            group.setdefault("adamw_eps", adamw_eps)
+            if split_qkv_per_head:
+                group.setdefault("muon_semantic_version", 3)
+                for p in group["params"]:
+                    layout = getattr(p, "muon_layout", None)
+                    if layout is not None:
+                        self._semantic_plan(p)
+                        if any(layout.adamw):
+                            if not use_decoupled_weight_decay:
+                                raise ValueError(
+                                    "Mixed Muon/AdamW projections require decoupled decay"
+                                )
+                            if isinstance(self, AdaptiveMuon):
+                                raise NotImplementedError(
+                                    "Mixed AdamW slices currently require plain Muon, "
+                                    "not AdaptiveMuon"
+                                )
+            beta1, beta2 = group["adamw_betas"]
+            if not (0 <= beta1 < 1 and 0 <= beta2 < 1 and group["adamw_eps"] > 0):
+                raise ValueError("Invalid AdamW betas or epsilon")
+
+    def _semantic_plan(self, p):
+        """Cache physical shard offsets and a collective schedule shared by all peers."""
+        if p in self._semantic_plans:
+            return self._semantic_plans[p]
+        layout = p.muon_layout
+        tp = None
+        if self.pg_collection:
+            tp = (
+                self.pg_collection.expt_tp
+                if getattr(p, 'expert_tp', False)
+                else self.pg_collection.tp
+            )
+        # Replicated MLA down projections must not be multiplied by TP size.
+        tp_sharded = (
+            bool(getattr(p, "tensor_model_parallel", False))
+            and getattr(p, "partition_dim", -1) == 0
+        )
+        tp_size = get_pg_size(tp) if tp_sharded else 1
+        tp_rank = get_pg_rank(tp) if tp_sharded else 0
+        gtp = self._get_gtp_remat_group(p) if getattr(p, 'is_gtp_weight_remat', False) else None
+        gtp_size, gtp_rank = get_pg_size(gtp), get_pg_rank(gtp)
+        padding = int(getattr(p, "pad_length", 0)) if gtp_size > 1 else 0
+        rows = p.shape[0]
+        tp_rows = rows * gtp_size - padding
+        expected = tp_rows if layout.tp_local else tp_rows * tp_size
+        if padding < 0 or tp_rows <= 0 or sum(layout.splits) != expected:
+            raise ValueError(
+                f"Invalid Muon semantic layout: shape={tuple(p.shape)}, splits={layout.splits}, "
+                f"tp={tp_size}, gtp={gtp_size}, padding={padding}. Refusing whole-matrix fallback."
+            )
+        start = gtp_rank * rows + (0 if layout.tp_local else tp_rank * tp_rows)
+        valid_rows = max(0, min(rows, tp_rows - gtp_rank * rows))
+        adamw_ranges = layout.adamw_ranges(start, valid_rows)
+        # Use local batched NS only when *every* peer has complete matrices.
+        # A rank-local decision here could deadlock peers that need all-gather.
+        if layout.tp_reorder_splits and any(n % tp_size for n in layout.tp_reorder_splits):
+            raise ValueError("Fused MLA projection blocks must divide evenly over TP")
+        local_ok = (
+            padding == 0
+            and not layout.tp_partitioned
+            and not (layout.tp_reorder_splits and tp_size > 1)
+        )
+        if local_ok:
+            for tr in range(1 if layout.tp_local else tp_size):
+                for gr in range(gtp_size):
+                    _, complete = layout.localize(tr * tp_rows + gr * rows, rows)
+                    local_ok &= complete
+        local_layout = layout.localize(start, rows)[0] if local_ok else layout
+        plan = (
+            local_layout,
+            adamw_ranges,
+            local_ok,
+            tp,
+            tp_size,
+            tp_rank,
+            gtp,
+            gtp_size,
+            gtp_rank,
+            padding,
+        )
+        self._semantic_plans[p] = plan
+        return plan
+
+    @torch.no_grad()
+    def _init_group(self, group, skip_non_grad_params=True):
+        """Keep Adam moments parameter-shaped for Megatron's sharded checkpoints."""
+        # Preserve AdaptiveMuon's second-moment initialization through the MRO.
+        super()._init_group(group, skip_non_grad_params)
+        if not self.split_qkv_per_head:
+            return
+        for p in group["params"]:
+            if skip_non_grad_params and p.grad is None:
+                continue
+            # Use Mcore's conventional per-parameter step checkpoint handling.
+            # A parameter without a gradient must not advance Adam bias correction.
+            self.state[p].setdefault("step", 0)
+            layout = getattr(p, "muon_layout", None)
+            if layout is not None and any(layout.adamw):
+                state = self.state[p]
+                if "gate_exp_avg" not in state:
+                    state["gate_exp_avg"] = torch.zeros_like(p)
+                    state["gate_exp_avg_sq"] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Step fused tensors; AdamW slices use raw gradients, not Muon momentum."""
+        if closure is not None:
+            raise ValueError("closure is not supported")
+        if self.split_qkv_per_head:
+            for group in self.param_groups:
+                self._init_group(group)
+                for p in group["params"]:
+                    if p.grad is not None:
+                        self.state[p]["step"] += 1
+        return OrthogonalizedOptimizer.step(self)
+
+    def load_state_dict(self, state_dict):
+        """Reject old per-head state instead of silently reinterpreting gate momentum."""
+        if self.split_qkv_per_head and any(
+            getattr(p, "muon_layout", None) is not None
+            for g in self.param_groups
+            for p in g["params"]
+        ):
+            if any(g.get("muon_semantic_version") != 3 for g in state_dict["param_groups"]):
+                raise ValueError(
+                    "This checkpoint predates per-parameter semantic Muon/AdamW steps. "
+                    "Load model weights with a fresh optimizer (--no-load-optim); "
+                    "old gate state cannot determine per-parameter update counts."
+                )
+        self._semantic_plans.clear()
+        return super().load_state_dict(state_dict)
+
+    def _orthogonalize_semantic_projection(self, p, grad, group):
+        """Batched independent-matrix NS plus local elementwise AdamW slices."""
+        layout, ranges, local_ok, tp, tp_size, tp_rank, gtp, gtp_size, gtp_rank, padding = (
+            self._semantic_plan(p)
+        )
+        rows = grad.shape[0]
+        if not local_ok:
+            if gtp_size > 1:
+                grad = self._strip_pad(self._all_gather_tensor(grad, gtp, 0), padding)
+            tp_rows = grad.shape[0]
+            if not layout.tp_local and tp_size > 1:
+                grad = self._all_gather_tensor(grad, tp, 0)
+                if layout.tp_reorder_splits:
+                    rank_blocks = grad.reshape(tp_size, tp_rows, grad.shape[1])
+                    blocks = rank_blocks.split(
+                        [n // tp_size for n in layout.tp_reorder_splits], dim=1
+                    )
+                    grad = torch.cat([b.reshape(-1, grad.shape[1]) for b in blocks], dim=0)
+        if sum(layout.splits) != grad.shape[0]:
+            raise RuntimeError("Muon physical layout changed after optimizer construction")
+        pieces = torch.split(grad, layout.splits)
+        # AdamW ranges stay zero here and never enter NS, including 1-row gates.
+        output = torch.zeros_like(grad)
+        outputs = torch.split(output, layout.splits)
+        by_size = {}
+        for index, (size, use_adam) in enumerate(zip(layout.splits, layout.adamw)):
+            if not use_adam:
+                by_size.setdefault(size, []).append(index)
+        matrix_tp = layout.tp_partitioned and tp_size > 1 and self.tp_mode != "blockwise"
+        # Small, unequal MLA down matrices otherwise need separate NS launches.
+        # Zero-row padding preserves each matrix's norm and Gram block exactly;
+        # the extra rows remain zero under every NS polynomial. Only use this
+        # when orientation and the scale of every *real* matrix are unchanged.
+        max_rows = max(layout.splits)
+        if (
+            len(by_size) > 1
+            and len(layout.splits) <= 3
+            and not any(layout.adamw)
+            and not matrix_tp
+            and not self.use_syrk
+            and _supports_batched_newton_schulz()
+            and max_rows <= min(512, grad.shape[1])
+            and max_rows * len(layout.splits) <= 2 * sum(layout.splits)
+            and len(
+                {get_muon_scale_factor(n, grad.shape[1], self.scale_mode) for n in layout.splits}
+            )
+            == 1
+        ):
+            batch = grad.new_zeros((len(pieces), max_rows, grad.shape[1]))
+            for index, piece in enumerate(pieces):
+                batch[index, : piece.shape[0]].copy_(piece)
+            updates = self.scaled_orthogonalize_fn(batch, None, None)
+            for index, target in enumerate(outputs):
+                target.copy_(updates[index, : target.shape[0]])
+            by_size = {}
+        for indices in by_size.values():
+            if (
+                len(indices) > 1
+                and _supports_batched_newton_schulz()
+                and not self.use_syrk
+                and not matrix_tp
+            ):
+                # Contiguous, equal-sized heads can use a view without a stack copy.
+                first, last = indices[0], indices[-1]
+                if indices == list(range(first, last + 1)):
+                    offset = sum(layout.splits[:first])
+                    batch = grad.narrow(0, offset, len(indices) * layout.splits[first]).reshape(
+                        len(indices), layout.splits[first], grad.shape[1]
+                    )
+                else:
+                    batch = torch.stack([pieces[i] for i in indices])
+                updates = self.scaled_orthogonalize_fn(batch, None, None)
+                if indices == list(range(first, last + 1)):
+                    output.narrow(0, offset, len(indices) * layout.splits[first]).copy_(
+                        updates.reshape(-1, grad.shape[1])
+                    )
+                else:
+                    for index, update in zip(indices, updates.unbind(0)):
+                        outputs[index].copy_(update)
+            else:
+                for index in indices:
+                    outputs[index].copy_(
+                        self.scaled_orthogonalize_fn(
+                            pieces[index],
+                            tp if matrix_tp else None,
+                            0 if matrix_tp else None,
+                            tp_mode_this_group=(
+                                self.tp_mode if self.tp_mode != "auto" else "duplicated"
+                            ),
+                        )
+                    )
+        if not local_ok:
+            if not layout.tp_local and tp_size > 1:
+                if layout.tp_reorder_splits:
+                    output = torch.cat(
+                        [
+                            block.chunk(tp_size, dim=0)[tp_rank]
+                            for block in output.split(layout.tp_reorder_splits, dim=0)
+                        ],
+                        dim=0,
+                    )
+                else:
+                    output = output.narrow(0, tp_rank * tp_rows, tp_rows)
+            if gtp_size > 1:
+                output = self._restore_pad(output, padding).narrow(0, gtp_rank * rows, rows)
+            output = output.contiguous()
+        if ranges:
+            state = self.state[p]
+            beta1, beta2 = group["adamw_betas"]
+            step = state["step"]
+            if p.grad is None or step < 1:
+                raise RuntimeError("Mixed Muon/AdamW updates must be called via optimizer.step()")
+            # Coalesced slices keep GDN z/beta/alpha to one elementwise update.
+            for lo, hi in ranges:
+                raw = p.grad[lo:hi]
+                m, v = state["gate_exp_avg"][lo:hi], state["gate_exp_avg_sq"][lo:hi]
+                m.lerp_(raw, 1 - beta1)
+                v.mul_(beta2).addcmul_(raw, raw, value=1 - beta2)
+                denom = v.sqrt().div_((1 - beta2**step) ** 0.5).add_(group["adamw_eps"])
+                output[lo:hi].copy_(m).div_(1 - beta1**step).div_(denom)
+        return output
+
     @staticmethod
     def _all_gather_tensor(t, group, dim):
         """All-gather equal-size shards of ``t`` over ``group`` and concat along ``dim``."""
         shards = [torch.empty_like(t) for _ in range(get_pg_size(group))]
         torch.distributed.all_gather(shards, t.contiguous(), group)
         return torch.cat(shards, dim=dim)
+
+    def _get_gtp_remat_group(self, p):
+        """Return the GTP-remat process group for a parameter, if configured."""
+        is_expert = getattr(p, 'expert_tp', False)
+        return (
+            resolve_gtp_remat_group(self.pg_collection, is_expert) if self.pg_collection else None
+        )
+
+    def _warn_distributed_qkv_fallback(self):
+        """Warn once when a QKV layout cannot use distributed Newton-Schulz."""
+        if self.tp_mode != "distributed" or self._warned_distributed_qkv_fallback:
+            return
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "muon_tp_mode='distributed' is not supported for per-head, GTP-rematerialized, "
+            "or fragmented QKV splitting; falling back to non-TP Newton-Schulz.",
+        )
+        self._warned_distributed_qkv_fallback = True
+
+    def _gather_qkv_grad(self, p, grad, tp_group, expected_rows, gather_gtp=True):
+        """Reconstruct a fused QKV gradient and record how to restore its local shard."""
+        gathered_grad = grad
+        gtp_slice = None
+        gtp_remat_group = self._get_gtp_remat_group(p)
+        gtp_pad_length = int(getattr(p, "qkv_gtp_pad_length", 0))
+        if gtp_pad_length < 0:
+            raise RuntimeError(f"Muon QKV GTP padding must be non-negative: {gtp_pad_length}")
+        if (
+            gather_gtp
+            and gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+            and getattr(p, 'is_gtp_weight_remat', False)
+        ):
+            gtp_size = get_pg_size(gtp_remat_group)
+            gtp_rank = get_pg_rank(gtp_remat_group)
+            gtp_local_rows = gathered_grad.shape[0]
+            shards = [torch.empty_like(gathered_grad) for _ in range(gtp_size)]
+            torch.distributed.all_gather(shards, gathered_grad, gtp_remat_group)
+            gathered_grad = torch.cat(shards, dim=0)
+            if gtp_pad_length >= gathered_grad.shape[0]:
+                raise RuntimeError(
+                    "Invalid Muon QKV GTP padding after gathering: "
+                    f"pad_length={gtp_pad_length}, gathered_rows={gathered_grad.shape[0]}"
+                )
+            if gtp_pad_length > 0:
+                gathered_grad = gathered_grad[:-gtp_pad_length]
+            gtp_slice = (gtp_rank, gtp_local_rows, gtp_pad_length)
+        elif gtp_pad_length > 0:
+            raise RuntimeError(
+                "Muon QKV has GTP padding but its GTP-remat shards were not gathered"
+            )
+
+        tp_slice = None
+        if gathered_grad.shape[0] != expected_rows:
+            partition_dim = getattr(p, "partition_dim", None)
+            if partition_dim != 0 or tp_group is None:
+                raise RuntimeError(
+                    f"Muon QKV split shape mismatch: grad_shape={tuple(gathered_grad.shape)}, "
+                    f"expected_rows={expected_rows}, partition_dim={partition_dim}"
+                )
+            tp_size = get_pg_size(tp_group)
+            if gathered_grad.shape[0] * tp_size != expected_rows:
+                raise RuntimeError(
+                    "Muon QKV split cannot reconstruct the global tensor: "
+                    f"local_grad_shape={tuple(gathered_grad.shape)}, tp_size={tp_size}, "
+                    f"expected_rows={expected_rows}"
+                )
+            tp_rank = get_pg_rank(tp_group)
+            tp_local_rows = gathered_grad.shape[0]
+            shards = [torch.empty_like(gathered_grad) for _ in range(tp_size)]
+            torch.distributed.all_gather(shards, gathered_grad, tp_group)
+            gathered_grad = torch.cat(shards, dim=0)
+            tp_slice = (tp_rank, tp_local_rows)
+
+        if gathered_grad.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Muon QKV split shape mismatch after gathering: "
+                f"grad_shape={tuple(gathered_grad.shape)}, expected_rows={expected_rows}"
+            )
+        return gathered_grad, tp_slice, gtp_slice
+
+    @staticmethod
+    def _restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice):
+        """Restore the TP and GTP-remat shards recorded by ``_gather_qkv_grad``."""
+        if tp_slice is not None:
+            tp_rank, tp_local_rows = tp_slice
+            gathered_grad = gathered_grad[tp_rank * tp_local_rows : (tp_rank + 1) * tp_local_rows]
+        if gtp_slice is not None:
+            gtp_rank, gtp_local_rows, gtp_pad_length = gtp_slice
+            if gtp_pad_length > 0:
+                gathered_grad = torch.nn.functional.pad(gathered_grad, (0, 0, 0, gtp_pad_length))
+            gathered_grad = gathered_grad[
+                gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows
+            ]
+        return gathered_grad.contiguous()
+
+    def _orthogonalize_split_qkv(self, grad, split_shapes, orthogonalize_fn):
+        """Split and reconstruct Megatron's interleaved fused QKV update."""
+        if grad.ndim != 2:
+            raise RuntimeError(f"Muon QKV gradient must be 2D, got {grad.ndim}D")
+        if not split_shapes or any(size <= 0 for size in split_shapes):
+            raise RuntimeError(f"Muon QKV split shapes must be positive: {split_shapes}")
+        split_width = sum(split_shapes)
+        if self.split_qkv_per_head:
+            if grad.shape[0] != split_width:
+                raise RuntimeError(
+                    f"Muon per-head QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
+                    f"split_shapes={split_shapes}"
+                )
+            if not _supports_batched_newton_schulz() or self.use_syrk:
+                # Older EO releases and SYRK only support the 2-D NS path.
+                return torch.cat(
+                    [orthogonalize_fn(head) for head in torch.split(grad, split_shapes, dim=0)],
+                    dim=0,
+                )
+            if len(set(split_shapes)) == 1:
+                # A separate batch dimension preserves each head's normalization
+                # and scale; concatenating heads into one matrix would not.
+                batch = grad.reshape(len(split_shapes), split_shapes[0], grad.shape[-1])
+                return orthogonalize_fn(batch).reshape_as(grad)
+
+            # GDN mixes Q/K/V/z heads and one-row beta/alpha heads. Batch each
+            # row size separately, then restore the original fused layout.
+            heads = torch.split(grad, split_shapes, dim=0)
+            indices_by_size = {}
+            for index, rows in enumerate(split_shapes):
+                indices_by_size.setdefault(rows, []).append(index)
+            results = [None] * len(heads)
+            for indices in indices_by_size.values():
+                if len(indices) == 1:
+                    index = indices[0]
+                    results[index] = orthogonalize_fn(heads[index])
+                else:
+                    batch = torch.stack([heads[index] for index in indices])
+                    for index, result in zip(indices, orthogonalize_fn(batch).unbind(0)):
+                        results[index] = result
+            return torch.cat(results, dim=0)
+
+        if grad.shape[0] % split_width != 0:
+            raise RuntimeError(
+                f"Muon QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
+                f"split_shapes={split_shapes}"
+            )
+        num_query_groups = grad.shape[0] // split_width
+        grouped_grad = grad.view(num_query_groups, split_width, -1)
+        projection_grads = torch.split(grouped_grad, split_shapes, dim=1)
+        projection_grads = [
+            projection.reshape(-1, grad.shape[-1]) for projection in projection_grads
+        ]
+        projection_grads = [
+            orthogonalize_fn(projection).view(num_query_groups, -1, grad.shape[-1])
+            for projection in projection_grads
+        ]
+        return torch.cat(projection_grads, dim=1).view_as(grad)
 
     @staticmethod
     def _strip_pad(t, pad_length):
@@ -602,6 +1100,53 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             smaller_dim, reshard_rank * shard_size, shard_size
         ).contiguous()
 
+    def _orthogonalize_qkv_per_head(self, p, grad, tp_group):
+        """Orthogonalize every Q, gate, K, and V head independently.
+
+        Split sizes may describe complete heads in the local tensor or the global fused
+        QKV tensor. For a global layout, reconstruct GTP-remat and TP dimension 0 before
+        splitting so heads crossing rank boundaries remain complete.
+        """
+        self._warn_distributed_qkv_fallback()
+        local_split_shapes = getattr(p, "qkv_split_shapes", None)
+        heads_are_complete = getattr(p, "qkv_split_heads_are_complete", None)
+        has_gtp_padding = int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
+        use_local_layout = not has_gtp_padding and (
+            heads_are_complete is True
+            or (
+                heads_are_complete is None
+                and local_split_shapes is not None
+                and sum(local_split_shapes) == grad.shape[0]
+            )
+        )
+        if use_local_layout:
+            qkv_split_shapes = local_split_shapes
+        else:
+            qkv_split_shapes = getattr(p, "qkv_split_shapes_global", None)
+            if qkv_split_shapes is None:
+                qkv_split_shapes = self.qkv_split_shapes
+        if qkv_split_shapes is None:
+            raise RuntimeError("Muon per-head QKV split requested but qkv_split_shapes is not set")
+        if not qkv_split_shapes or any(size <= 0 for size in qkv_split_shapes):
+            raise RuntimeError(
+                f"Muon per-head QKV split shapes must be positive: {qkv_split_shapes}"
+            )
+
+        expected_rows = sum(qkv_split_shapes)
+        gathered_grad, tp_slice, gtp_slice = self._gather_qkv_grad(
+            p, grad, tp_group, expected_rows, gather_gtp=not use_local_layout
+        )
+
+        gathered_grad = self._orthogonalize_split_qkv(
+            gathered_grad,
+            qkv_split_shapes,
+            lambda head_grad: self.scaled_orthogonalize_fn(
+                head_grad, tp_group=None, partition_dim=None
+            ),
+        )
+
+        return self._restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice)
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -614,6 +1159,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        if self.split_qkv_per_head and getattr(p, "muon_layout", None) is not None:
+            return self._orthogonalize_semantic_projection(p, grad, kwargs)
+
         # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (
@@ -626,6 +1174,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+
+        if (
+            self.split_qkv
+            and self.split_qkv_per_head
+            and self.is_qkv_fn is not None
+            and self.is_qkv_fn(p)
+        ):
+            return self._orthogonalize_qkv_per_head(p, grad, tp_group)
 
         # Look up the shapes only. `grad` is still this rank's row shard here, so the
         # split has to wait until the callee has gathered the whole matrix.
@@ -659,6 +1215,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         weight_decay: Weight decay coefficient.
         use_decoupled_weight_decay: Whether to use decoupled weight decay.
         split_qkv: Whether to split QKV weights for orthogonalization.
+        split_qkv_per_head: Whether to orthogonalize individual Q, gate, K, and V heads.
         is_qkv_fn: Function to determine if a tensor is a QKV weight.
         qkv_split_shapes: Shapes for splitting QKV weights.
         fp32_matmul_prec: Precision for FP32 matrix multiplication.
@@ -684,6 +1241,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_qkv_per_head: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
@@ -694,6 +1252,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        adamw_betas: tuple[float, float] = (0.9, 0.999),
+        adamw_eps: float = 1e-8,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -707,6 +1267,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             weight_decay=weight_decay,
             use_decoupled_weight_decay=use_decoupled_weight_decay,
             split_qkv=split_qkv,
+            split_qkv_per_head=split_qkv_per_head,
             is_qkv_fn=is_qkv_fn,
             qkv_split_shapes=qkv_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,
@@ -717,6 +1278,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            adamw_betas=adamw_betas,
+            adamw_eps=adamw_eps,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
@@ -775,8 +1338,12 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
-    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
+    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(
+        model_chunks[0].config, split_qkv_per_head=kwargs.get("split_qkv_per_head", False)
+    )
     kwargs["pg_collection"] = pg_collection
+    kwargs["adamw_betas"] = (config.adam_beta1, config.adam_beta2)
+    kwargs["adamw_eps"] = config.adam_eps
     return kwargs
 
 
@@ -791,6 +1358,9 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     cls = _muon_config_to_cls(config)
     if cls is TensorParallelMuon:
         return kwargs
+    # Per-head routing is rejected by OptimizerConfig for this whole-matrix backend.
+    for key in ("split_qkv_per_head", "adamw_betas", "adamw_eps"):
+        kwargs.pop(key)
     # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
     kwargs.update(_kwargs_from_config(cls, "muon", config))
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
