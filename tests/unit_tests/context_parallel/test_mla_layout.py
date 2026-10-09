@@ -29,6 +29,7 @@ def test_mla_checks_actual_input_layout_before_rope(mla, packed, cp_size, input_
         config=SimpleNamespace(cp_partition_mode="contiguous", cache_mla_latents=False),
         cache_mla_latents=False,
         training=False,
+        offload_qkv_linear=False,
         pg_collection=SimpleNamespace(cp=group),
         get_query_key_value_tensors=projection,
     )
@@ -50,6 +51,7 @@ def test_mla_sbhd_uses_config_without_manager_annotation(mla):
         config=SimpleNamespace(cp_partition_mode="contiguous", cache_mla_latents=False),
         cache_mla_latents=False,
         training=False,
+        offload_qkv_linear=False,
         pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 2)),
     )
     with pytest.raises(ValueError, match="requires cp_partition_mode='zigzag'"):

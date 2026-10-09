@@ -1493,6 +1493,7 @@ def test_scheduler_marks_mixer_and_attention_boundary_layout(monkeypatch, layout
         cp_partition_mode=layout,
         linear_cp_layout="contiguous",
         sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=512,
     )
     block = HybridStack(
         config=config,

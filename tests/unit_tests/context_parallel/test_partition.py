@@ -88,7 +88,11 @@ def test_sample_level_masking_does_not_require_document_routes(monkeypatch, cu_v
     full = torch.arange(16, device="cuda")
     batch = {"tokens": full[None].clone(), "cu_seqlens": cu[None]}
     result = get_batch_on_this_cp_rank(
-        batch, cp_group=group, use_per_sequence_balancing=True, cp_partition_mode="zigzag"
+        batch,
+        is_hybrid_cp=False,
+        cp_group=group,
+        use_per_sequence_balancing=True,
+        cp_partition_mode="zigzag",
     )
     params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, tokens_per_sample=16)
     finalize_packed_seq_params(params, group, needs_layout_conversion=False)

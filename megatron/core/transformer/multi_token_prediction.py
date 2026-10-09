@@ -1747,7 +1747,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
-        cp_partition_mode = _mtp_cp_partition_mode(self.config, self.mtp_layer_pattern)
+        cp_partition_mode = _mtp_cp_partition_mode(
+            self.config, getattr(self, "mtp_layer_pattern", None)
+        )
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
         if mtp_input_mask is None:
             input_ids, _ = roll_tensor(
@@ -2768,7 +2770,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
         """
-        cp_partition_mode = _mtp_cp_partition_mode(self.config, self.mtp_layer_pattern)
+        cp_partition_mode = _mtp_cp_partition_mode(
+            self.config, getattr(self, "mtp_layer_pattern", None)
+        )
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage, pp_rank=self.pp_rank)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))

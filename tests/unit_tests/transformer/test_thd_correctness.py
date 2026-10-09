@@ -823,8 +823,13 @@ def _run_gqa_mtp_model(model, batch, packed_seq_params, dp_cp_group):
     dist.all_reduce(global_stats, group=dp_cp_group)
     global_denominator = global_stats[1].clamp(min=1)
 
-    MTPLossAutoScaler.set_loss_scale(global_denominator.reciprocal())
-    (local_numerator / global_denominator).backward()
+    previous_loss_scale = MTPLossAutoScaler.main_loss_backward_scale
+    try:
+        MTPLossAutoScaler.set_loss_scale(global_denominator.reciprocal())
+        (local_numerator / global_denominator).backward()
+    finally:
+        # Do not leave a CUDA scale attached to later CPU-only MTP fixtures.
+        MTPLossAutoScaler.main_loss_backward_scale = previous_loss_scale
 
     MTPLossLoggingHelper.reduce_metrics_in_tracker()
     assert "loss_values" in MTPLossLoggingHelper.tracker
