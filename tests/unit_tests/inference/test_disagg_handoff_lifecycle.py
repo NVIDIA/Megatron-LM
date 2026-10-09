@@ -720,11 +720,66 @@ def test_quarantined_import_survives_backend_poll_error(handoff_loop, caplog):
     pending.handle.poll.side_effect = ValueError("backend poll failed")
     engine._quarantined_kv_imports.append(pending)
 
-    engine._poll_quarantined_kv_imports()
+    for _ in range(3):
+        engine._poll_quarantined_kv_imports()
 
     assert engine.context.kv_block_allocator.releases == []
     assert engine._quarantined_kv_imports == [pending]
-    assert "Polling quarantined KV import failed" in caplog.text
+    assert caplog.text.count("Polling quarantined KV import failed") == 1
+
+
+@pytest.mark.parametrize("cleanup_succeeds", [False, True])
+@pytest.mark.parametrize("failed_handle_index", [0, 1])
+def test_quarantined_nixl_failure_progresses_other_handles(
+    handoff_loop, caplog, cleanup_succeeds, failed_handle_index
+):
+    from megatron.core.inference.disaggregation.transfer_backends.nixl import NixlPullHandle
+
+    engine = _HandoffHarness(handoff_loop, hybrid=True, available=1)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    agents = [mock.Mock() for _ in range(3)]
+    for index, agent in enumerate(agents):
+        agent.check_xfer_state.side_effect = (
+            Exception("NIXL_ERR_INVALID_PARAM")
+            if index == failed_handle_index
+            else ["PROC", "DONE"]
+        )
+    failed_agent = agents[failed_handle_index]
+    if not cleanup_succeeds:
+        failed_agent.release_xfer_handle.side_effect = Exception("cannot cancel")
+    handles = [
+        NixlPullHandle(agent, [index], [str(index)], submitted_at=0, timeout_s=float("inf"))
+        for index, agent in enumerate(agents)
+    ]
+    pending.handle = handles[0]
+    slot = engine.context.mamba_metadata.allocate_slot()
+    pending.ssm = PendingSSMImport(handles=handles[1:], live_slot=slot)
+    engine._quarantined_kv_imports.append(pending)
+
+    with mock.patch.object(engine, "_notify_kv_read_done") as read_done:
+        engine._poll_quarantined_kv_imports()
+        assert engine.context.kv_block_allocator.releases == []
+        assert engine.context.mamba_metadata.freed == []
+        read_done.assert_not_called()
+
+        engine._poll_quarantined_kv_imports()
+        engine._poll_quarantined_kv_imports()
+        if cleanup_succeeds:
+            assert engine.context.kv_block_allocator.releases == [[block_id]]
+            assert engine.context.mamba_metadata.freed == [slot]
+            assert not engine._quarantined_kv_imports
+            read_done.assert_called_once_with(4)
+        else:
+            assert engine.context.kv_block_allocator.releases == []
+            assert engine.context.mamba_metadata.freed == []
+            assert engine._quarantined_kv_imports == [pending]
+            read_done.assert_not_called()
+
+    failed_agent.check_xfer_state.assert_called_once()
+    failed_agent.release_xfer_handle.assert_called_once()
+    assert all(handle.storage_safe for i, handle in enumerate(handles) if i != failed_handle_index)
+    assert caplog.text.count("Polling quarantined KV import failed") == 1
 
 
 def test_quarantined_import_releases_after_start_cleanup_completes(handoff_loop):

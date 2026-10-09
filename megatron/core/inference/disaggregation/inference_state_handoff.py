@@ -1377,13 +1377,20 @@ class InferenceStateHandoffMixin:
         remaining = []
         for pending in self._quarantined_kv_imports:
             handles = self._pending_transfer_handles(pending)
-            try:
-                for handle in handles:
+            for handle in handles:
+                if handle.storage_safe:
+                    continue
+                try:
                     handle.poll()
-            except Exception:
-                logging.exception(
-                    "Polling quarantined KV import failed for request_id=%d", pending.request_id
-                )
+                except Exception as exc:
+                    # Keep progressing other KV/SSM handles. Report the first
+                    # failure once; terminal handles can raise on every poll.
+                    if pending.local_error is None:
+                        pending.local_error = exc
+                        logging.exception(
+                            "Polling quarantined KV import failed for request_id=%d",
+                            pending.request_id,
+                        )
             if self._pending_destinations_safe(pending) and all(
                 handle.storage_safe for handle in handles
             ):
