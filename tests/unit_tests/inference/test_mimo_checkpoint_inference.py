@@ -61,6 +61,26 @@ def test_checkpoint_detection(checkpoint_keys):
         vlm._mimo_checkpoint_prefix_map(args)
 
 
+@pytest.mark.parametrize("vision", [False, True], ids=["text", "vision"])
+def test_checkpoint_without_saved_args_uses_cli_vision_args(monkeypatch, vision):
+    """Without saved args (e.g. Megatron-Bridge), --vision-model-type selects the VLM."""
+    args = SimpleNamespace(model_provider='gpt', vision_model_type='pixtral-vit-large')
+    monkeypatch.setattr(vlm, 'load_args_from_checkpoint', lambda _: args)
+    passed = {'vision_model_type'} if vision else set()
+
+    assert vlm._detect_vlm_from_checkpoint(args, passed) is vision
+    if vision:
+        # LLaVAModel's own key names, each loaded from itself.
+        assert args.mimo_checkpoint_prefix_map == {
+            'language_model.': 'language_model.',
+            'vision_model.': 'vision_model.',
+            'vision_projection.': 'vision_projection.',
+        }
+        assert args.img_h == 1540  # from the encoder registry
+    else:
+        assert not hasattr(args, 'mimo_checkpoint_prefix_map')
+
+
 def test_sharded_state_dict_uses_checkpoint_keys(monkeypatch):
     names = ('language_model.embedding.weight', 'vision_model.patch_embed.weight')
     monkeypatch.setattr(
