@@ -927,3 +927,41 @@ def test_gpt_builder_forwards_rope_scaling_factor():
         assert (
             call_kwargs.get('rope_scaling_factor') == 32.0
         ), "rope_scaling_factor must be forwarded from args"
+
+
+def test_gpt_builder_uses_experimental_mtp_spec_for_empty_decoder_stage():
+    """An MTP-only PP stage must not fall back to standard attention."""
+    args = MagicMock()
+    args.yaml_cfg = None
+    args.spec = None
+    args.transformer_impl = "transformer_engine"
+    args.experimental_attention_variant = "dsa"
+    args.mtp_num_layers = 7
+    config = MagicMock()
+    config.transformer_impl = "transformer_engine"
+
+    empty_block = MagicMock()
+    empty_block.layer_specs = []
+    expected_spec = MagicMock()
+
+    with (
+        patch('gpt_builders.core_transformer_config_from_args', return_value=config),
+        patch(
+            'gpt_builders.get_transformer_block_with_experimental_attention_variant_spec',
+            return_value=empty_block,
+        ),
+        patch(
+            'gpt_builders.get_transformer_layer_with_experimental_attention_variant_spec',
+            return_value=[MagicMock(), expected_spec],
+        ) as mock_experimental_specs,
+        patch('gpt_builders._get_transformer_layer_spec') as mock_generic_spec,
+        patch('gpt_builders.get_gpt_mtp_block_spec', return_value=MagicMock()) as mock_get_mtp,
+        patch('gpt_builders.GPTModel', return_value=MagicMock()),
+    ):
+        from gpt_builders import gpt_builder
+
+        gpt_builder(args, pre_process=False, post_process=True, vp_stage=None)
+
+    mock_experimental_specs.assert_called_once_with(config=config)
+    mock_generic_spec.assert_not_called()
+    assert mock_get_mtp.call_args.args[1] is expected_spec
