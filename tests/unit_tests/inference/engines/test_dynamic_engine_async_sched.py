@@ -718,7 +718,8 @@ _ASYNC_PAIR_SCENARIOS = (
         "flashinfer-fused-rope",
         "kernel:flashinfer-fused-rope",
         config={
-            "hidden_size": 64,
+            # Use 64-wide heads; BF16 NeoX fallback vector loads overrun 16-wide heads.
+            "hidden_size": 256,
             "position_embedding_type": "rope",
             "use_flashinfer_fused_rope": True,
         },
