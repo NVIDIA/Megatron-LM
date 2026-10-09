@@ -351,7 +351,7 @@ class TestSharedPrefixMTPModel:
                 )
             }
         with patch(
-            "megatron.core.models.hybrid.hybrid_model.forward_hybrid_stack_shared_prefix",
+            "megatron.core.models.hybrid.shared_prefix.forward_hybrid_stack_shared_prefix",
             side_effect=_ReachedBackbone,
         ):
             with pytest.raises(NotImplementedError, match=ignored_input):
@@ -393,7 +393,7 @@ class TestSharedPrefixMTPModel:
             roots, mtp_loss_group_root_counts=(2,) if explicit_groups else ()
         )
         with patch(
-            "megatron.core.models.hybrid.hybrid_model.forward_hybrid_stack_shared_prefix",
+            "megatron.core.models.hybrid.shared_prefix.forward_hybrid_stack_shared_prefix",
             side_effect=_ReachedBackbone,
         ):
             with pytest.raises(NotImplementedError, match="calculate_per_token_loss"):

@@ -2,6 +2,9 @@
 
 """Shared-prefix HybridStack guard tests that need no GPU or process-group setup."""
 
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -331,3 +334,34 @@ def test_forward_rejects_unsupported_stack_before_running_layers():
         forward_hybrid_stack_shared_prefix(
             _stack(_config()), hidden_states.float(), _PADDED_LAYOUT, position_embedding_type="none"
         )
+
+
+# Run in a fresh interpreter as if einops were not installed (Transformer Engine needs einops, so
+# it is hidden too), import HybridModel, and check that the adapter was not loaded.
+_IMPORT_HYBRID_MODEL_WITHOUT_EINOPS = """
+import sys
+
+sys.path.insert(0, sys.argv[1])
+
+
+class HideModules:
+    def find_spec(self, name, path=None, target=None):
+        top = name.partition(".")[0]
+        if top in ("einops", "transformer_engine"):
+            raise ModuleNotFoundError(f"No module named {top!r}", name=top)
+        return None
+
+
+sys.meta_path.insert(0, HideModules())
+import megatron.core.models.hybrid.hybrid_model
+
+assert "megatron.core.models.hybrid.shared_prefix" not in sys.modules
+"""
+
+
+def test_hybrid_model_import_does_not_load_the_adapter():
+    """Without a layout, HybridModel keeps its import graph and does not need einops."""
+    repo = Path(__file__).resolve().parents[4]
+    subprocess.run(
+        [sys.executable, "-c", _IMPORT_HYBRID_MODEL_WITHOUT_EINOPS, str(repo)], check=True
+    )

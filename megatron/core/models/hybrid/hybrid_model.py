@@ -17,11 +17,9 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.layers import utils as layer_utils
-from megatron.core.models.hybrid.shared_prefix import (
+from megatron.core.models.hybrid.shared_prefix_layout import (
     SharedPrefixForestLayout,
     SharedPrefixLayout,
-    _validate_hybrid_stack,
-    forward_hybrid_stack_shared_prefix,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -1060,6 +1058,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Validate a shared-prefix request before any preprocessing or partial forward runs.
         shared_prefix_physical_len = None
         if shared_prefix_layout is not None:
+            # Imported here: the adapter loads the Mamba modules and requires einops, which
+            # models that never pass a layout must not need.
+            from megatron.core.models.hybrid.shared_prefix import _validate_hybrid_stack
+
             if cp_batch is not None:
                 raise ValueError("Shared prefix owns CP token layout; cp_batch must be None")
             if (
@@ -1297,6 +1299,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
         with backbone_context:
             if shared_prefix_layout is not None:
+                from megatron.core.models.hybrid.shared_prefix import (
+                    forward_hybrid_stack_shared_prefix,
+                )
+
                 hidden_states = forward_hybrid_stack_shared_prefix(
                     self.decoder,
                     decoder_input,
