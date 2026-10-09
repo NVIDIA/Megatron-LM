@@ -552,6 +552,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -615,6 +616,7 @@ class TopKRouter(Router):
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_aux_loss_fusion,
+                deterministic=self.config.deterministic_mode,
             )
             / bsz
         )
@@ -667,6 +669,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,

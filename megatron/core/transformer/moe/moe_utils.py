@@ -8,7 +8,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    te_supports_deterministic_moe_aux_loss,
+)
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -71,6 +74,7 @@ def switch_load_balancing_loss_func(
     moe_aux_loss_coeff: float,
     fused: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
@@ -123,6 +127,8 @@ def switch_load_balancing_loss_func(
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
                                                False for padding tokens. Defaults to None.
+        deterministic (bool): Require deterministic fused loss execution. PyTorch's global
+                              deterministic-algorithms setting also enables this requirement.
 
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
@@ -136,6 +142,15 @@ def switch_load_balancing_loss_func(
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
+        deterministic = deterministic or torch.are_deterministic_algorithms_enabled()
+        supports_deterministic = te_supports_deterministic_moe_aux_loss()
+        if deterministic and not supports_deterministic:
+            raise ValueError(
+                "Deterministic fused MoE auxiliary loss requires Transformer Engine with "
+                "fused_moe_aux_loss(deterministic=...) support. Upgrade Transformer Engine "
+                "or set moe_router_aux_loss_fusion=False (--no-moe-router-aux-loss-fusion)."
+            )
+        deterministic_kwargs = {"deterministic": deterministic} if supports_deterministic else {}
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
@@ -143,6 +158,7 @@ def switch_load_balancing_loss_func(
             topk=topk,
             num_experts=num_experts,
             coeff=moe_aux_loss_coeff,
+            **deterministic_kwargs,
         )
 
     aggregated_probs_per_expert = probs.sum(dim=0)
