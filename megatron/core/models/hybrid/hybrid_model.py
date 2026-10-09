@@ -294,24 +294,6 @@ def _validate_shared_prefix_mtp_attention_backend(attention_backend: AttnBackend
         )
 
 
-def _hybrid_mtp_is_enabled(
-    configured_num_layers: Optional[int], mtp_pattern: Optional[str], mtp_pattern_depths: int
-) -> bool:
-    """Return whether this Hybrid runtime should construct and execute MTP.
-
-    Native Nemotron-H configs can retain MTP pattern metadata while a training
-    recipe explicitly overrides ``mtp_num_layers=0``.  The pattern still
-    describes the checkpoint architecture, but zero must disable the runtime
-    MTP block and its post-processing path.
-    """
-    return bool(
-        configured_num_layers is not None
-        and configured_num_layers > 0
-        and mtp_pattern is not None
-        and mtp_pattern_depths > 0
-    )
-
-
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -509,9 +491,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
-            _hybrid_mtp_is_enabled(
-                self.config.mtp_num_layers, self.mtp_pattern, self.mtp_num_depths
-            )
+            self.mtp_pattern is not None
+            and self.mtp_num_depths > 0
             # The following forces MTP to be on the final pipeline stage. It might be more optimal
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
@@ -1311,7 +1292,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if not self.post_process:
             return mtp_hidden_states if mtp_forward_ran else hidden_states
 
-        if self.mtp_process:
+        if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if is_spec_decode:
                 assert inference_context is not None
