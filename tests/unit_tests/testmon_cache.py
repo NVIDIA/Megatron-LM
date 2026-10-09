@@ -27,7 +27,7 @@ TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
-COMPATIBILITY_FILES: set[str] = set()
+COMPATIBILITY_FILES: set[str] = {"tests/test_utils/python_scripts/download_unit_tests_dataset.py"}
 COMPATIBILITY_GLOBS = (".dockerignore", "tests/unit_tests/**/conftest.py")
 DATABASE_TABLES = {
     "metadata",
