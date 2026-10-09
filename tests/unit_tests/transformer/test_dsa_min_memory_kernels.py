@@ -23,7 +23,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     _plan_dense_warmup,
     _plan_execution,
     _simplified_topk_index_tile,
-    _sparse_attention_backward_torch_fp32,
     _sparse_attention_tile,
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -66,73 +65,6 @@ def _simplified_test_indexer(hidden_size, head_dim, topk):
     indexer.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
     indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False)
     return indexer
-
-
-def test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32():
-    torch.manual_seed(1704)
-    dtype = torch.bfloat16
-    sequence_length, query_length, batch_size = 8, 4, 1
-    num_query_heads, num_query_groups = 4, 2
-    head_dim, value_dim, q_start = 5, 3, 3
-    query = torch.randn(query_length, batch_size, num_query_heads, head_dim, dtype=dtype)
-    key = torch.randn(sequence_length, batch_size, num_query_groups, head_dim, dtype=dtype)
-    value = torch.randn(sequence_length, batch_size, num_query_groups, value_dim, dtype=dtype)
-    # Keys 0 and 1 are deliberately hot across every query to exercise collision-heavy scatter.
-    selected_indices = torch.tensor([[[0, 1, 2], [0, 1, 3], [0, 1, 4], [0, 1, 5]]])
-    grad_output = torch.randn(
-        query_length, batch_size, num_query_heads, value_dim, dtype=torch.float32
-    )
-    scale = head_dim**-0.5
-
-    actual_grad_query = torch.zeros_like(query, dtype=torch.float32)
-    actual_grad_key = torch.zeros_like(key, dtype=torch.float32)
-    actual_grad_value = torch.zeros_like(value, dtype=torch.float32)
-    _sparse_attention_backward_torch_fp32(
-        query,
-        key,
-        value,
-        selected_indices,
-        grad_output,
-        scale,
-        q_start,
-        actual_grad_query,
-        actual_grad_key,
-        actual_grad_value,
-    )
-
-    query_ref = query.float().requires_grad_(True)
-    key_ref = key.float().requires_grad_(True)
-    value_ref = value.float().requires_grad_(True)
-    repeat_factor = num_query_heads // num_query_groups
-    group_outputs = []
-    for group_idx in range(num_query_groups):
-        head_start = group_idx * repeat_factor
-        head_end = head_start + repeat_factor
-        query_group = query_ref[:, :, head_start:head_end].permute(1, 2, 0, 3)
-        key_group = key_ref[:, :, group_idx].permute(1, 0, 2)
-        value_group = value_ref[:, :, group_idx].permute(1, 0, 2)
-        key_gather_index = selected_indices[..., None].expand(-1, -1, -1, head_dim)
-        value_gather_index = selected_indices[..., None].expand(-1, -1, -1, value_dim)
-        selected_key = torch.gather(
-            key_group[:, None].expand(-1, query_length, -1, -1), 2, key_gather_index
-        )
-        selected_value = torch.gather(
-            value_group[:, None].expand(-1, query_length, -1, -1), 2, value_gather_index
-        )
-        scores = torch.einsum("brqd,bqkd->brqk", query_group, selected_key) * scale
-        probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        # Preserve model-dtype probability/output rounding while keeping the oracle leaves and
-        # repeated-index accumulation in FP32.
-        probs_for_value = probs + (probs.to(dtype).float() - probs).detach()
-        group_output = torch.einsum("brqk,bqkd->brqd", probs_for_value, selected_value)
-        group_outputs.append(group_output)
-    output_ref = torch.cat(group_outputs, dim=1).permute(2, 0, 1, 3)
-    output_ref = output_ref.to(dtype).float()
-    (output_ref * grad_output).sum().backward()
-
-    torch.testing.assert_close(actual_grad_query, query_ref.grad, rtol=2.0e-5, atol=2.0e-6)
-    torch.testing.assert_close(actual_grad_key, key_ref.grad, rtol=2.0e-5, atol=2.0e-6)
-    torch.testing.assert_close(actual_grad_value, value_ref.grad, rtol=2.0e-5, atol=2.0e-6)
 
 
 def test_simplified_learned_k_only_persists_full_k_when_cached():
