@@ -617,7 +617,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shared_experts", "gdn_norm_out", "gdn_in_proj", "gdn_qkv", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
@@ -628,6 +628,9 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "gdn_in_proj": recompute the GatedDeltaNet input projection and its CP-to-HP all-to-all.
+    "gdn_qkv": recompute the GatedDeltaNet causal conv and q/k/v preparation. Not supported
+    with gdn_pre_gated_delta_rule_fusion.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
     "gdp_qkv": recompute the GatedDeltaProduct causal conv and QKV preparation.
@@ -638,8 +641,9 @@ class TransformerConfig(ModelParallelConfig):
             Requires moe_shortcut_connection=True and selective recomputation.
     "residual_stream": replay wide-residual reads, connected norms, and writes via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdn_in_proj", "gdn_qkv",
+    "gdp_in_proj", "gdp_qkv", "mhc", "shortcut_pre_mlp_layernorm", and "residual_stream" use
+    output-discarding checkpointing;
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1505,7 +1509,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdn_qkv", "gdp_qkv",
              "shortcut_post_norm".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
@@ -1515,6 +1519,8 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
+    "gdn_qkv": offload the input of the causal conv and q/k/v preparation in the
+               GatedDeltaNet layer. Not supported with gdn_pre_gated_delta_rule_fusion.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
@@ -2371,6 +2377,8 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "gdn_in_proj",
+                    "gdn_qkv",
                     "gdp_in_proj",
                     "gdp_qkv",
                     "mhc",
@@ -2394,12 +2402,20 @@ class TransformerConfig(ModelParallelConfig):
                     "multi_latent_attention."
                 )
 
-            if "gdn_norm_out" in self.recompute_modules and (
-                not is_gated_delta_net_variant(self.experimental_attention_variant)
-            ):
+            for gdn_module in ("gdn_norm_out", "gdn_in_proj", "gdn_qkv"):
+                if gdn_module in self.recompute_modules and (
+                    not is_gated_delta_net_variant(self.experimental_attention_variant)
+                ):
+                    raise ValueError(
+                        f"{gdn_module} in recompute_modules is only supported with "
+                        "experimental_attention_variant='gdn' or 'gdn2'."
+                    )
+
+            if "gdn_qkv" in self.recompute_modules and self.gdn_pre_gated_delta_rule_fusion:
                 raise ValueError(
-                    "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gdn' or 'gdn2'."
+                    "gdn_qkv in recompute_modules is not supported with "
+                    "gdn_pre_gated_delta_rule_fusion, which fuses the causal conv and q/k/v "
+                    "preparation with the gate computation."
                 )
 
             if "core_attn" in self.recompute_modules:
@@ -2612,6 +2628,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "gdn_qkv",
                 "gdp_qkv",
                 "shortcut_post_norm",
             }
@@ -2637,6 +2654,27 @@ class TransformerConfig(ModelParallelConfig):
                     "conv and rematerializes it at the start of the mixer backward, leaving "
                     "nothing for the gdp_qkv offload group to keep on the host."
                 )
+            if "gdn_qkv" in self.offload_modules:
+                if not is_gated_delta_net_variant(self.experimental_attention_variant):
+                    raise ValueError(
+                        "gdn_qkv in offload_modules is only supported with "
+                        "experimental_attention_variant='gdn' or 'gdn2'."
+                    )
+                if self.gdn_pre_gated_delta_rule_fusion:
+                    raise ValueError(
+                        "gdn_qkv in offload_modules is not supported with "
+                        "gdn_pre_gated_delta_rule_fusion."
+                    )
+                if (
+                    self.recompute_granularity == "selective"
+                    and "gdn_in_proj" in self.recompute_modules
+                ):
+                    raise ValueError(
+                        "gdn_qkv cannot be set in offload_modules together with gdn_in_proj in "
+                        "recompute_modules, because gdn_in_proj discards the input of the causal "
+                        "conv and rematerializes it in the backward pass, leaving nothing for "
+                        "the gdn_qkv offload group to keep on the host."
+                    )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
                 offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
                     self.offload_modules
