@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
+from typing import Any
 
 import httpx
 import torch.distributed as dist
 from openai import AsyncOpenAI, DefaultAioHttpClient
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, model_validator
 
 try:
     import h2  # noqa: F401
@@ -23,20 +24,14 @@ from megatron.core.utils import get_pg_size, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training.utils import print_rank_0
 
-from ..inference.inference_interface import (
-    InferenceRequest,
-    InferenceResponse,
-    LLMChatMessage,
-    ReturnsRaw,
-    ReturnsTokens,
-)
 from ..server.api import InferenceServer
+from .chat_interface import MegatronChatInterface
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
+class MegatronLocal(MegatronChatInterface, InferenceServer):
     """Interface to use MCoreEngine directly as an inference engine."""
 
     host: str
@@ -45,50 +40,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
-    _openai_client: AsyncOpenAI = PrivateAttr(None)
 
-    async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-        tokenizer = get_tokenizer()
-        args = get_args()
-
-        # Use the shared, optimized client instead of spinning up a new one
-        client = self._openai_client
-
-        # Things that may be problematic when doing this switch
-        # - Add BOS token
-        # - Skip prompt logprobs
-        temperature = request.generation_args.temperature
-        response = await client.chat.completions.create(
-            model="",
-            messages=[message.model_dump() for message in request.prompt],
-            temperature=1.0 if temperature is None else temperature,
-            top_p=request.generation_args.top_p or 0.0,
-            n=1,
-            logprobs=True,
-            extra_body={
-                "skip_prompt_log_probs": True,
-                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
-                # TODO: These are non-standard fields that add significant memory overheads to the
-                # chat completions payload. return_raw_text also wastes a lot of CPU cycles
-                # detokenizing prompt tokens, especially expensive for long prompts in agentic RL.
-                # Set to False if not needed in MRL.
-                "return_tokenized_data": True,
-                "return_raw_text": True,
-            },
-        )
-
-        choice = response.choices[0]
-
-        return InferenceResponse(
-            # TODO: Handle tool calls and reasoning in LLMChatMessage
-            response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-            raw_text=choice.message.raw_text,
-            token_ids=choice.message.prompt_token_ids + choice.message.generation_token_ids,
-            logprobs=choice.message.generation_log_probs,
-            finish_reason=choice.finish_reason,
-            prompt_length=len(choice.message.prompt_token_ids),
-            completion_id=response.id,
-        )
+    @model_validator(mode="before")
+    @classmethod
+    def _chat_endpoint_from_host_port(cls, data: Any) -> Any:
+        """The chat endpoint is the text-generation server this interface launches."""
+        if isinstance(data, dict) and "base_url" not in data and {"host", "port"} <= data.keys():
+            data = {**data, "base_url": f"http://{data['host']}:{data['port']}"}
+        return data
 
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
@@ -166,7 +125,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         else:
             client = None
 
-        launched_server = cls(**kwargs)
+        launched_server = cls(
+            add_bos=(not args.rl_skip_bos_token and tokenizer.bos is not None), **kwargs
+        )
         launched_server._client = client
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
@@ -187,7 +148,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         launched_server._openai_client = AsyncOpenAI(
-            base_url=f"http://{launched_server.host}:{launched_server.port}",
+            base_url=launched_server.base_url,
             api_key="NONE",
             http_client=http_client
         )
