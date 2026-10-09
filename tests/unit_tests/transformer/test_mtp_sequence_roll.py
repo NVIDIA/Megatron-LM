@@ -1200,16 +1200,22 @@ class TestContiguousPackedCPPreparedRollRowsDistributed:
                     hidden_states.dtype
                 )
                 hidden_states = hidden_states + aligned_value
-                return hidden_states, input_ids, position_ids, padding_mask
+                return hidden_states, input_ids, position_ids, padding_mask, None
 
         def run(sequence_roll_context, sequence_roll_padding_mask=None):
             config = SimpleNamespace(
-                pipeline_model_parallel_size=1, mtp_num_layers=num_depths, mtp_detach_heads=False
+                pipeline_model_parallel_size=1,
+                mtp_num_layers=num_depths,
+                mtp_detach_heads=False,
+                mtp_repeated_layer_shared_components=None,
+                mtp_hsm=False,
             )
             block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
             torch.nn.Module.__init__(block)
             block.config = config
             block.vp_stage = None
+            block.pp_rank = None
+            block.cp_group = None
             block.mtp_use_repeated_layer = False
             block.layers = torch.nn.ModuleList(RollAwareLayer() for _ in range(num_depths))
             output = block.forward(
@@ -1422,18 +1428,22 @@ def test_mtp_block_scatters_only_prepared_global_padding_masks(
                 kwargs.get("_inputs_pre_aligned", False),
                 "_inputs_pre_aligned" in kwargs,
             )
-            return (hidden_states, kwargs["input_ids"], kwargs["position_ids"], padding_mask)
+            return (hidden_states, kwargs["input_ids"], kwargs["position_ids"], padding_mask, None)
 
     config = SimpleNamespace(
         pipeline_model_parallel_size=1,
         mtp_num_layers=1,
         mtp_detach_heads=False,
         sequence_parallel=sequence_parallel,
+        mtp_repeated_layer_shared_components=None,
+        mtp_hsm=False,
     )
     block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
     torch.nn.Module.__init__(block)
     block.config = config
     block.vp_stage = None
+    block.pp_rank = None
+    block.cp_group = None
     block.mtp_use_repeated_layer = False
     block.layers = torch.nn.ModuleList((RecordingLayer(),))
 
