@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
 
 
 class NestedModel(nn.Module):
@@ -75,6 +76,19 @@ class NestedSiblingModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_context_defaults_to_current_cuda_device(distributed_setup):
+    """Omitting the device should create the stream on the current CUDA device."""
+    assert FsdpContext().allgather_stream.device == torch.device(
+        "cuda", torch.cuda.current_device()
+    )
+
+
+def test_context_rejects_non_cuda_device(distributed_setup):
+    """The context constructor should reject non-CUDA devices."""
+    with pytest.raises(ValueError, match="CUDA device"):
+        FsdpContext(device=torch.device("cpu"))
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
