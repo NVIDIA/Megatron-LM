@@ -336,6 +336,31 @@ def test_forward_rejects_unsupported_stack_before_running_layers():
         )
 
 
+def test_prevalidated_forward_checks_only_the_physical_length():
+    """A caller that already validated the stack is not validated again; the length must match."""
+    config = _config(moe=True, moe_router_enable_expert_bias=True)
+    hidden_states = torch.zeros(12, 1, 8, dtype=torch.bfloat16)
+    calls = []
+
+    def forward(**kwargs):
+        # A fresh mock layer per call: the stack deletes the per-call slot after each layer.
+        stack = _stack(config, [_moe_identity_layer(calls)])
+        forward_hybrid_stack_shared_prefix(
+            stack, hidden_states, _PADDED_LAYOUT, position_embedding_type="none", **kwargs
+        )
+
+    with patch.object(shared_prefix, "_validate_hybrid_stack") as validate:
+        with pytest.raises(RuntimeError, match="validated for 16"):
+            forward(validated_physical_len=16)
+        assert calls == []
+        forward(validated_physical_len=12)
+        validate.assert_not_called()
+        forward()
+        validate.assert_called_once()
+        assert validate.call_args.kwargs == {"physical_len": 12}
+    assert len(calls) == 2
+
+
 # Run in a fresh interpreter as if einops were not installed (Transformer Engine needs einops, so
 # it is hidden too), import HybridModel, and check that the adapter was not loaded.
 _IMPORT_HYBRID_MODEL_WITHOUT_EINOPS = """

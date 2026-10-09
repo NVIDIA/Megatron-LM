@@ -1010,6 +1010,7 @@ def forward_hybrid_stack_shared_prefix(
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
     position_embedding_type: str = "rope",
     exclude_sequence_padding_from_expert_bias: bool = False,
+    validated_physical_len: int | None = None,
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
@@ -1021,6 +1022,10 @@ def forward_hybrid_stack_shared_prefix(
     convention for per-branch padding rows. The default counts them, as a dense forward with
     ``padding_mask=None`` does; ``True`` matches a dense caller that masks packed-sequence padding.
     Trailing topology padding is never counted.
+
+    ``validated_physical_len`` is the global physical length for which the caller has already
+    validated this stack and layout, as ``HybridModel.forward`` does before its embedding. The
+    stack validation is then not repeated; the length implied by ``hidden_states`` must match.
     """
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
@@ -1034,7 +1039,13 @@ def forward_hybrid_stack_shared_prefix(
     tp_size = tp_group.size()
     sequence_shards = tp_size if stack.config.sequence_parallel else 1
     physical_len = hidden_states.shape[0] * cp_group.size() * sequence_shards
-    _validate_hybrid_stack(stack, layout, physical_len=physical_len)
+    if validated_physical_len is None:
+        _validate_hybrid_stack(stack, layout, physical_len=physical_len)
+    elif validated_physical_len != physical_len:
+        raise RuntimeError(
+            f"shared-prefix hidden states imply physical length {physical_len}, but the stack "
+            f"was validated for {validated_physical_len}"
+        )
     has_attention = any(
         isinstance(layer, TransformerLayer) and isinstance(layer.self_attention, SelfAttention)
         for layer in stack.layers

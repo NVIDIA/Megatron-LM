@@ -1312,6 +1312,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     exclude_sequence_padding_from_expert_bias=(
                         shared_prefix_exclude_sequence_padding_from_expert_bias
                     ),
+                    validated_physical_len=shared_prefix_physical_len,
                 )
                 mhc_multistream = None
             else:

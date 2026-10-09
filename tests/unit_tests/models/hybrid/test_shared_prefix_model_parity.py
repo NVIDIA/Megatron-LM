@@ -343,6 +343,25 @@ class TestSharedPrefixHybridModelParity:
                 shared_prefix_exclude_sequence_padding_from_expert_bias=True,
             )
 
+    def test_forward_validates_the_stack_once(self, monkeypatch):
+        """HybridModel validates before its embedding; the stack forward does not repeat it."""
+        from megatron.core.models.hybrid import shared_prefix
+
+        clear_attention_env(monkeypatch)
+        torch.manual_seed(0)
+        model = build_hybrid_model(PATTERN, torch.bfloat16)
+        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
+        validate = shared_prefix._validate_hybrid_stack
+        physical_lens = []
+
+        def counting_validate(*args, physical_len, **kwargs):
+            physical_lens.append(physical_len)
+            return validate(*args, physical_len=physical_len, **kwargs)
+
+        monkeypatch.setattr(shared_prefix, "_validate_hybrid_stack", counting_validate)
+        run_shared(model, tokens, tokens.problem.layout(forest=False))
+        assert physical_lens == [tokens.problem.physical_len]
+
     @pytest.mark.usefixtures("_deterministic_kernels")
     @pytest.mark.parametrize("pattern", [PATTERN, MTP_PATTERN], ids=["no-mtp", "mtp"])
     def test_explicit_none_layout_is_the_default_path(self, pattern, monkeypatch):
