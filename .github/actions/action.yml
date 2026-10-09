@@ -149,6 +149,39 @@ runs:
         docker pull ${{ inputs.container-image }}
         echo "::endgroup::"
 
+    - name: Compute GDN compiler cache identity
+      id: gdn-compiler-identity
+      if: inputs.is_unit_test == 'true' && inputs.tag == 'latest' && inputs.test_case == 'tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py'
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+      run: |
+        sudo rm -rf -- assets_dir/compiler-cache/gdn
+        docker run --rm --gpus all \
+          --volume "$PWD:/opt/megatron-lm:ro" \
+          --entrypoint /opt/venv/bin/python "$CONTAINER_IMAGE" \
+          /opt/megatron-lm/tests/test_utils/python_scripts/unit_compiler_cache.py \
+          --platform "$RECIPE_PLATFORM" | tee -a "$GITHUB_OUTPUT"
+
+    # Only a successful trusted main baseline publishes this namespace. A cache
+    # miss leaves the normal compiler path intact, including single-nodeid runs.
+    - name: Restore GDN compiler cache
+      id: restore-gdn-compiler
+      if: steps.gdn-compiler-identity.outcome == 'success'
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      continue-on-error: true
+      with:
+        path: assets_dir/compiler-cache/gdn
+        key: ${{ steps.gdn-compiler-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ steps.gdn-compiler-identity.outputs.cache_prefix }}
+
+    - name: Discard an incomplete GDN compiler cache restore
+      if: steps.gdn-compiler-identity.outcome == 'success' && steps.restore-gdn-compiler.outcome != 'success'
+      shell: bash -e -u -o pipefail {0}
+      run: sudo rm -rf -- assets_dir/compiler-cache/gdn
+
     - name: Compute unit Testmon cache identity
       id: unit-testmon-identity
       if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode != 'full'
@@ -375,6 +408,21 @@ runs:
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
         exit $EXIT_CODE
+
+    - name: Prepare GDN compiler cache publication
+      id: prepare-gdn-compiler
+      if: steps.gdn-compiler-identity.outcome == 'success' && steps.unit-testmon.outputs.mode == 'baseline' && steps.run-main-script.outcome == 'success' && github.repository == 'NVIDIA/Megatron-LM' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      run: sudo chown -R "$(id -u):$(id -g)" assets_dir/compiler-cache/gdn
+
+    - name: Save GDN compiler cache
+      if: steps.prepare-gdn-compiler.outcome == 'success'
+      uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      continue-on-error: true
+      with:
+        path: assets_dir/compiler-cache/gdn
+        key: ${{ steps.gdn-compiler-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Prepare unit Testmon baseline cache
       id: prepare-unit-testmon-cache
