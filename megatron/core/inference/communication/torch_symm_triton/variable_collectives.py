@@ -8,6 +8,10 @@ a different number of tokens. The caller provides:
   - local_tokens: this rank's token count.
 
 One CTA processes one token; the outer loop is persistent over local_tokens.
+
+Do not autotune the number of blocks with Triton: every rank must launch the same
+grid of at most max_num_blocks blocks, or the barrier overflows the signal pad or
+hangs. See kernel_config.py.
 """
 
 from unittest.mock import MagicMock
@@ -33,6 +37,7 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .barrier import symm_mem_sync
+from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_64, ld_128, st_64, st_128
 from .utils import is_device_nvls_capable, sync_threads
 
@@ -321,9 +326,9 @@ def multimem_reduce_scatter_v(
         f"{row_bytes} bytes is not 16-byte aligned; RSV requires 128-bit alignment."
     )
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
-    MAX_BLOCK_SIZE = 1024
-    WARP_SIZE = 32
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = output_tensor.shape[0]
     numel_per_thread = 128 // (output_tensor.element_size() * 8)
@@ -332,6 +337,7 @@ def multimem_reduce_scatter_v(
     block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     reduce_f32 = output_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
@@ -592,9 +598,9 @@ def multimem_all_gather_v(
     )
     bits = 128 if row_bytes % 16 == 0 else 64
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
-    MAX_BLOCK_SIZE = 1024
-    WARP_SIZE = 32
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = input_tensor.shape[0]
     numel_per_thread = bits // (input_tensor.element_size() * 8)
@@ -607,6 +613,7 @@ def multimem_all_gather_v(
     # All ranks launch the same fixed number of CTAs. CTAs with
     # pid >= ep_max_tokens exit immediately at kernel entry.
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _multimem_all_gather_v_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
@@ -715,9 +722,9 @@ def multimem_all_gatherv_3tensor(
         symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size == symm_mem_hdl_2.world_size
     ), "All three symmetric memory handles must belong to the same EP group (world_size mismatch)."
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
-    MAX_BLOCK_SIZE = 1024
-    WARP_SIZE = 32
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = input_tensor_0.shape[0]
 
@@ -743,6 +750,7 @@ def multimem_all_gatherv_3tensor(
     block_size = max(block_size_0, block_size_1, block_size_2)
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _multimem_all_gatherv_3tensor_kernel[(num_blocks, 1, 1)](
         input_tensor_0.data_ptr(),

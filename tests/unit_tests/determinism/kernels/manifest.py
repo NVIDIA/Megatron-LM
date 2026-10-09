@@ -570,6 +570,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/communication/torch_symm_triton/barrier.py",
             "megatron/core/inference/communication/torch_symm_triton/collectives.py",
             "megatron/core/inference/communication/torch_symm_triton/fused_collectives.py",
+            "megatron/core/inference/communication/torch_symm_triton/kernel_config.py",
             "megatron/core/inference/communication/torch_symm_triton/multimem_asm.py",
             "megatron/core/inference/communication/torch_symm_triton/utils.py",
             "megatron/core/inference/communication/torch_symm_triton/variable_collectives.py",
