@@ -52,6 +52,12 @@ spec:
         export GPUS_PER_NODE=4
     fi
 
+    # These kernel/reference comparisons have no distributed communication.
+    # One worker avoids compiling and autotuning the same kernels on every rank.
+    if [[ "$BUCKET" == "tests/unit_tests/fusions/test_fused_mhc_kernels.py" ]]; then
+        export GPUS_PER_NODE=1
+    fi
+
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
     else
@@ -88,6 +94,13 @@ products:
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/fusions/test_fused_mhc_kernels.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]

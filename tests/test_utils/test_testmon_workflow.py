@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 import json
 import os
 import shutil
@@ -11,6 +12,60 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_mhc_kernel_file_has_one_recipe_bucket(monkeypatch, capsys):
+    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/h100/unit-tests.yaml").read_text())
+    buckets = [case for product in recipe["products"] for case in product["test_case"]]
+    kernel_file = "tests/unit_tests/fusions/test_fused_mhc_kernels.py"
+    assert buckets.count(kernel_file) == 1
+
+    spec = importlib.util.spec_from_file_location(
+        "mhc_test_case_finder", ROOT / "tests/unit_tests/find_test_cases.py"
+    )
+    assert spec is not None and spec.loader is not None
+    finder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(finder)
+    monkeypatch.chdir(ROOT)
+    monkeypatch.setattr(finder, "get_test_cases", lambda _: buckets)
+
+    for bucket, excluded in [("tests/unit_tests/**/*.py", True), (kernel_file, False)]:
+        monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, "h100"])
+        finder.main()
+        ignored = capsys.readouterr().out.splitlines()
+        assert (f"--ignore={kernel_file}" in ignored) is excluded
+
+
+@pytest.mark.parametrize("mode", ["full", "baseline", "enforce"])
+@pytest.mark.parametrize(
+    "bucket,workers",
+    [
+        ("tests/unit_tests/fusions/test_fused_mhc_kernels.py", 1),
+        ("tests/unit_tests/**/*.py", 8),
+        ("tests/unit_tests/generalized_tensor_parallel/**/*.py", 4),
+    ],
+)
+def test_unit_recipe_worker_count_is_shared_by_baseline_and_consumers(
+    tmp_path, mode, bucket, workers
+):
+    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/h100/unit-tests.yaml").read_text())
+    script = recipe["spec"]["script"].format(
+        tag="latest", environment="dev", test_case=bucket, n_repeat=1, assets_dir=tmp_path
+    )
+    # Execute the recipe, intercepting filesystem operations and the GPU harness.
+    stubs = '\n'.join(
+        (
+            'rm() { :; }',
+            'ls() { :; }',
+            'cd() { :; }',
+            'bash() { printf "workers=%s\\n" "$GPUS_PER_NODE" >> "$GITHUB_OUTPUT"; }',
+        )
+    )
+    result, outputs = _run(
+        stubs + "\n" + script, tmp_path, {"UNIT_TESTMON_MODE": mode, "GPUS_PER_NODE": "8"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs["workers"] == str(workers)
 
 
 def _step(workflow: str, job: str, step_id: str) -> dict:
