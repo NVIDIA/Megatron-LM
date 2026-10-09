@@ -369,6 +369,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
@@ -395,7 +397,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

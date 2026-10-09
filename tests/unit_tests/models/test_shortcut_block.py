@@ -230,6 +230,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     expected_layer_kwargs = (
         {"residual_stream_recompute_context": attn_context} if residual_replay else {}
     )
+    input_padding_mask = torch.tensor([[False, True]])
+    moe_padding_mask = torch.tensor([[True, False]])
+    masks_by_layout = {"zigzag": moe_padding_mask}
 
     class RecordingCPLayoutState:
         def prepare_layer(self, layer_idx, hidden_states):
@@ -239,6 +242,12 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         def finalize_layer(self, layer_idx, hidden_states):
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
+
+        def get_layer_padding_mask(self, layer_idx, padding_mask, padding_mask_by_layout):
+            assert layer_idx == 5
+            assert padding_mask is input_padding_mask
+            assert padding_mask_by_layout is masks_by_layout
+            return moe_padding_mask
 
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
@@ -257,11 +266,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is attn_context
         observed["route_packed"] = packed_seq_params
+        assert padding_mask is moe_padding_mask
         return shortcut_hidden, shortcut_hidden
 
     def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is moe_context
         observed["shared_packed"] = packed_seq_params
+        assert padding_mask is moe_padding_mask
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def postprocess(
@@ -301,12 +312,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         rotary_pos_emb=None,
         sequence_len_offset=None,
         packed_seq_params="packed-input",
-        padding_mask=None,
+        padding_mask=input_padding_mask,
         quant_context_factory=quant_context_factory,
         cp_layout_state=RecordingCPLayoutState(),
         packed_sequence_cp_metadata=cp_metadata,
         attn_recompute_context=attn_context,
         moe_recompute_context=moe_context,
+        padding_mask_by_layout=masks_by_layout,
     )
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
