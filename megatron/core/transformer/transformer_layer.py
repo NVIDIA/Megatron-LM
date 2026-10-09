@@ -602,11 +602,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
             from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
 
-            return get_fp8_context(self.config, self.layer_number - 1)
+            return get_fp8_context(
+                self.config, self.layer_number - 1, pg_collection=self.pg_collection
+            )
         if self.config.fp4:
             from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
 
-            return get_fp4_context(self.config, self.layer_number - 1)
+            return get_fp4_context(
+                self.config, self.layer_number - 1, pg_collection=self.pg_collection
+            )
         return nullcontext()
 
     def create_mcore_cudagraph_manager(self, config):

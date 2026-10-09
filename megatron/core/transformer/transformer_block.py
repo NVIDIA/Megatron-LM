@@ -651,7 +651,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
             use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
             outer_quantization_context = (
-                get_fp8_context(self.config) if use_outer_quantization_context else nullcontext()
+                get_fp8_context(self.config, pg_collection=self.pg_collection)
+                if use_outer_quantization_context
+                else nullcontext()
             )
         elif self.config.fp4:
             use_outer_quantization_context = False
@@ -713,11 +715,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if use_inner_quantization_context:
                         if self.config.fp8:
                             inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
+                                self.config,
+                                layer.layer_number - 1,
+                                pg_collection=self.pg_collection,
                             )
                         elif self.config.fp4:
                             inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
+                                self.config,
+                                layer.layer_number - 1,
+                                pg_collection=self.pg_collection,
                             )
                         else:
                             inner_quantization_context = nullcontext()
