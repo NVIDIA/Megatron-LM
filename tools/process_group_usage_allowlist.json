@@ -228,7 +228,7 @@
       "SelfAttention.run_realtime_tests:accessor:parallel_state.get_tensor_model_parallel_world_size"
     ],
     "megatron/core/transformer/cuda_graphs.py": [
-      "CudaGraphManager.__init__:shim:use_mpu_process_groups",
+      "CudaGraphManager._resolve_reuse_cudagraphs:shim:use_mpu_process_groups",
       "TECudaGraphHelper.__init__:shim:use_mpu_process_groups",
       "_CudaGraphRunner._set_gtp_finalize_hook_plan:shim:use_mpu_process_groups"
     ],

@@ -1918,10 +1918,8 @@ class CudaGraphManager(torch.nn.Module):
         self._num_warmup_steps = num_warmup_steps
         # Modules create their manager in GraphableMegatronModule.__init__, before they store
         # their own pg_collection, so the module's collection is looked up on the first call
-        # (see _resolve_reuse_cudagraphs). The global parallel state serves only a graphed module
-        # whose collection does not set pp, and is read at that point rather than here.
+        # (see _resolve_reuse_cudagraphs).
         self.pg_collection = pg_collection
-        self._global_pg_collection = lambda: ProcessGroupCollection.use_mpu_process_groups()
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
 
@@ -1991,7 +1989,8 @@ class CudaGraphManager(torch.nn.Module):
             if pg_collection is None:
                 pg_collection = getattr(megatron_module, "pg_collection", None)
             if pg_collection is None or "pp" not in vars(pg_collection):
-                pg_collection = self._global_pg_collection()
+                # Compatibility fallback for graphed modules without a pipeline group.
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['pp'])
             self.reuse_cudagraphs = get_pg_size(pg_collection.pp) == 1
         return self.reuse_cudagraphs
 
