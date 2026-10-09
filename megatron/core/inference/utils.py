@@ -48,6 +48,17 @@ def detokenize_tokens(
     return tokenizer.detokenize(tokens)
 
 
+def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the language model: the one a multimodal wrapper holds, or the model itself.
+
+    Multimodal wrappers (e.g. LLaVAModel) keep the language model under ``language_model``.
+    Inference code that reads language-model state (vocab size, MTP block, embedding) resolves
+    it here rather than checking for a specific wrapper class.
+    """
+    language_model = getattr(model, "language_model", None)
+    return model if language_model is None else language_model
+
+
 def model_eos_token_ids(tokenizer: Any) -> frozenset:
     """Return the model-level EOS token IDs.
 
