@@ -27,24 +27,8 @@ TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
-COMPATIBILITY_FILES = (
-    ".github/actions/action.yml",
-    ".github/workflows/_build_ci_container.yml",
-    "README.md",
-    "pyproject.toml",
-    "uv.lock",
-    "megatron/core/__init__.py",
-    "megatron/core/package_info.py",
-    "tests/unit_tests/run_ci_test.sh",
-    "tests/unit_tests/find_test_cases.py",
-    "tests/unit_tests/testmon_selector.py",
-    "tests/unit_tests/testmon_cache.py",
-    "tests/unit_tests/testmon_mandatory.py",
-    "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
-    "tests/test_utils/python_scripts/recipe_parser.py",
-    "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-)
-COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
+COMPATIBILITY_FILES = ("README.md", "tests/unit_tests/testmon_mandatory.py")
+COMPATIBILITY_GLOBS = (".dockerignore", "tests/unit_tests/**/conftest.py")
 DATABASE_TABLES = {
     "metadata",
     "environment",
@@ -111,7 +95,6 @@ def cache_identity(
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
-    paths.update(root / definition["recipe"] for definition in PLATFORMS.values())
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )
