@@ -369,6 +369,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
+    "fine_grained_offloading_buffer_size_gib": 0.0,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
