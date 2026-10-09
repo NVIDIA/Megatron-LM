@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
@@ -7,6 +7,7 @@
 import inspect
 import logging
 import math
+from copy import copy
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import List, Optional, Tuple, Union
@@ -16,13 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel import convert_module_input_tensors_cp_partition_mode
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -524,8 +526,16 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         )
 
     def forward_post_core_attn(self, y):
-        """Apply GDP's output projection to a recurrence output."""
-        return self.out_proj(y)
+        """Apply GDP's output projection and restore this call's input layout."""
+        back_to_input_converter = None
+        if isinstance(y, tuple):
+            y, back_to_input_converter = y
+        output, bias = self.out_proj(y)
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                value=output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+        return output, bias
 
     def forward(
         self,
@@ -591,7 +601,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
-        return self.out_proj(y)
+        return self.forward_post_core_attn(y)
 
     def _packed_metadata(
         self, packed_seq_params: PackedSeqParams | None
@@ -642,6 +652,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
             _, batch_size, _ = hidden_states.shape
             assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
+
+        # Each split call owns its metadata and return converter. Do not change the
+        # caller's view while another core stage is waiting for its output projection.
+        packed_seq_params = copy(packed_seq_params)
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=resolve_cp_group(self.pg_collection.cp, packed_seq_params),
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            target_partition_mode=self.config.linear_cp_layout,
+            sequence_parallel=self.config.sequence_parallel,
+            source_partition_mode=getattr(self, "_cp_input_partition_mode", None),
+            config=self.config,
+        )
 
         if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
@@ -743,6 +768,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             # which come later in the backward pass.
             in_proj_checkpoint.discard_output_and_register_recompute(y)
 
+        if back_to_input_converter is not None:
+            return y, back_to_input_converter
         return y
 
     def _run_gdp_kernel(

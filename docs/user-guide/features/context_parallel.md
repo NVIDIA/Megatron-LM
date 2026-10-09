@@ -65,8 +65,11 @@ THD plans are prepared with the batch that owns their physical token ordering:
   also building equal-length module routes for those metadata views.
 - Sequence-packing scheduler batches have one physical layout. Hybrid batch
   preparation finalizes their `PackedSeqParams.cp_partition_route` for module-local
-  conversion before entering the model. GPT prepares its module route before model
-  forward as well.
+  conversion before entering the model. GPT prepares a module route only when its
+  boundary layout requires conversion to zigzag attention. Default GPT inter-document
+  masking partitions whole samples; it does not require per-document routes or document
+  lengths divisible by `2 * CP`. Contiguous CP with this sample-level masking path is
+  currently rejected, even when document lengths happen to be aligned.
 
 The two THD contracts remain distinct: module routes require packed sequence
 lengths divisible by `2 * CP` and preserve local token count, while managed plans
@@ -93,3 +96,25 @@ set, `cp_group` must have that size, including a singleton group for CP=1. An ex
 `cp_group` also takes precedence when `local_cp_size` is omitted. TE temporarily binds
 the resolved group for each forward and restores its previous group on exit; singleton
 metadata disables CP communication in TE without changing the shared model groups.
+
+## MTP and mixer layout contracts
+
+MTP keeps scheduler and GPT tensors in their boundary layout. Its rolling operations
+use that physical layout for tokens, positions, labels, loss masks and precomputed
+embeddings. Contiguous rolling exchanges a single boundary element with adjacent CP
+ranks, then clears document ends and padding. Its backward exchanges gradients in the
+opposite direction. Sequence-parallel precomputed embeddings gather before rolling and
+scatter afterward; local HSM rolling instead clears the local shard seam. Managed Hybrid
+MTP still uses its prepared attention-layout batch for both inputs and loss computation.
+
+When a packing scheduler disables Hybrid's cross-layer layout manager, Mamba and GDP
+convert inputs to `linear_cp_layout` and restore the caller's layout after their output
+projection. Both ordinary and split execution follow this contract; split calls keep
+independent return converters and packed metadata. MLA and AbsorbedMLA require zigzag
+at their actual module input for both SBHD and THD. They raise before RoPE or attention
+if an unsupported contiguous shard reaches them; a manager-converted zigzag input is valid.
+
+GDN and GDN2 currently convert to zigzag and execute headwise CP. GDP's chunkwise CP is
+a separate implementation. This main-branch port does not provide a GDN chunkwise kernel
+that directly consumes contiguous shards, and does not claim a two-thirds reduction in
+GDN layout conversions or a measured Qwen throughput improvement.

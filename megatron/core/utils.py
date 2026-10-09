@@ -2822,6 +2822,17 @@ def get_batch_on_this_cp_rank(
             )
         use_contiguous_cp = cp_partition_mode == "contiguous"
 
+    if (
+        use_contiguous_cp
+        and use_per_sequence_balancing
+        and batch.get("cu_seqlens") is not None
+        and get_pg_size(cp_group) > 1
+    ):
+        raise NotImplementedError(
+            "Contiguous CP with sample-level inter-document masking is not supported. "
+            "Its attention shards use sample-level zigzag ownership, not per-document THD routes."
+        )
+
     if use_contiguous_cp:
         from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
 

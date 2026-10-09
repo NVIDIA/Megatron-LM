@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -8,6 +8,7 @@
 import inspect
 import logging
 import math
+from copy import copy
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple, Union
 
@@ -16,12 +17,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
@@ -486,6 +488,21 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         inference_mode=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
+        # Each split call owns its metadata and return converter. Do not change the
+        # caller's view while another core stage is waiting for its output projection.
+        packed_seq_params = copy(packed_seq_params)
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=resolve_cp_group(self.pg_collection.cp, packed_seq_params),
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            target_partition_mode=self.config.linear_cp_layout,
+            sequence_parallel=self.config.sequence_parallel,
+            source_partition_mode=getattr(self, "_cp_input_partition_mode", None),
+            config=self.config,
+        )
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -501,6 +518,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
+        if back_to_input_converter is not None:
+            return y, back_to_input_converter
         return y
 
     def forward_pre_attn_and_core_attn(
@@ -520,8 +539,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         return self._mamba_chunk(hidden_states, packed_seq_params=packed_seq_params)
 
     def forward_post_core_attn(self, y):
-        """Apply the Mamba output projection to an SSM output tensor."""
-        return self.out_proj(y)
+        """Apply Mamba's output projection and restore this call's input layout."""
+        back_to_input_converter = None
+        if isinstance(y, tuple):
+            y, back_to_input_converter = y
+        output, bias = self.out_proj(y)
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                value=output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+        return output, bias
 
     def forward(
         self,
@@ -559,7 +586,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             packed_seq_params=packed_seq_params,
             inference_mode=in_inference_mode,
         )
-        return self.out_proj(y)
+        return self.forward_post_core_attn(y)
 
     # ==================================================================
     # Static / eager inference

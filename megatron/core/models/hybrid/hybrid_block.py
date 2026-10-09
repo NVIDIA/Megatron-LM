@@ -376,6 +376,8 @@ class HybridStack(MegatronModule):
                 )
             if hasattr(layer, "self_attention"):
                 layer.self_attention._cp_input_partition_mode = module_input_layouts[i]
+            if hasattr(layer, "mixer"):
+                layer.mixer._cp_input_partition_mode = module_input_layouts[i]
 
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)

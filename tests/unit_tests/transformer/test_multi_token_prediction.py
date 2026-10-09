@@ -3874,6 +3874,7 @@ class TestMultiTokenPredictionHybrid:
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
+            decoder_input=None,
             mhc_multistream=None,
             labels=labels,
             loss_mask=loss_mask,

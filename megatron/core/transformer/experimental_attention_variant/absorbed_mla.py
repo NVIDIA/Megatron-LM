@@ -835,17 +835,16 @@ class AbsorbedMLASelfAttention(Attention):
             if packed_seq_params is not None and packed_seq_params.cp_group is not None
             else self.pg_collection.cp
         )
-        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-        if (
-            thd_packed_seq
-            and cp_group is not None
-            and get_pg_size(cp_group) > 1
-            and packed_seq_params.cp_partition_mode != "zigzag"
-        ):
+        input_partition_mode = (
+            packed_seq_params.cp_partition_mode
+            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+            else getattr(self, "_cp_input_partition_mode", self.config.cp_partition_mode)
+        )
+        if cp_group is not None and get_pg_size(cp_group) > 1 and input_partition_mode != "zigzag":
             raise ValueError(
                 "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag', but "
-                f"packed_seq_params has {packed_seq_params.cp_partition_mode!r}. CP partition "
-                "conversion must be handled before entering AbsorbedMLA."
+                f"the input layout is {input_partition_mode!r}. CP partition "
+                "conversion must be handled before entering MLA."
             )
 
         # =====================

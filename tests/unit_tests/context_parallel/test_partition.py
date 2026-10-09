@@ -72,3 +72,34 @@ def test_shared_partition_preserves_sequence_dimension_and_gradients():
     torch.testing.assert_close(tensor.grad, expected_grad)
     assert batch["optional"] is None
     assert "missing" not in batch
+
+
+@pytest.mark.parametrize("cu_values", [[0, 5, 16], [0, 8, 16]])
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_sample_level_masking_does_not_require_document_routes(monkeypatch, cu_values, cp_rank):
+    from megatron.core.context_parallel import finalize_packed_seq_params
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.utils import get_batch_on_this_cp_rank
+
+    cu = torch.tensor(cu_values, device="cuda", dtype=torch.int32)
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda _group: cp_rank)
+    full = torch.arange(16, device="cuda")
+    batch = {"tokens": full[None].clone(), "cu_seqlens": cu[None]}
+    result = get_batch_on_this_cp_rank(
+        batch, cp_group=group, use_per_sequence_balancing=True, cp_partition_mode="zigzag"
+    )
+    params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, tokens_per_sample=16)
+    finalize_packed_seq_params(params, group, needs_layout_conversion=False)
+    indices = [*range(cp_rank * 4, (cp_rank + 1) * 4), *range((3 - cp_rank) * 4, (4 - cp_rank) * 4)]
+    torch.testing.assert_close(result["tokens"][0], full[indices])
+    assert params.cp_partition_route is None
+    with pytest.raises(NotImplementedError, match="sample-level inter-document masking"):
+        get_batch_on_this_cp_rank(
+            {"tokens": full[None], "cu_seqlens": cu[None]},
+            is_hybrid_cp=False,
+            cp_group=group,
+            use_per_sequence_balancing=True,
+            cp_partition_mode="contiguous",
+        )

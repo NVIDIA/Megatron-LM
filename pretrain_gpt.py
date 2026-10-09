@@ -58,15 +58,18 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from model_provider import model_provider
 
 try:
@@ -369,7 +372,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     tokens_per_sample=args.seq_length,
                 )
         finalize_packed_seq_params(
-            packed_seq_params=packed_seq_params, cp_group=get_context_parallel_group()
+            packed_seq_params=packed_seq_params,
+            cp_group=get_context_parallel_group(),
+            needs_layout_conversion=(
+                get_attr_wrapped_model(model, "config").cp_partition_mode != "zigzag"
+            ),
         )
 
     timers('batch-generator').stop()
