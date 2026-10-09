@@ -92,6 +92,12 @@ def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
 
 
 def test_platform_and_bucket_are_isolated(source_tree):
+    root_conftest = "tests/unit_tests/conftest.py"
+    nested_conftest = "tests/unit_tests/pipeline_parallel/nested/conftest.py"
+    for name in (root_conftest, nested_conftest):
+        path = source_tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture")
     identities = [
         cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID),
         cache.cache_identity(source_tree, BUCKET, "dgx_gb200", IMAGE_ID),
@@ -101,6 +107,25 @@ def test_platform_and_bucket_are_isolated(source_tree):
     assert all(
         identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
+    assert all(root_conftest in identity["compatibility"]["inputs"] for identity in identities)
+    assert all(
+        nested_conftest in identity["compatibility"]["inputs"] for identity in identities[:2]
+    )
+    assert nested_conftest not in identities[2]["compatibility"]["inputs"]
+
+    unrelated = source_tree / "tests/unit_tests/tuning/conftest.py"
+    unrelated.parent.mkdir()
+    unrelated.write_text("unrelated fixture")
+    for identity in identities:
+        assert (
+            cache.cache_identity(
+                source_tree,
+                identity["compatibility"]["bucket"],
+                identity["compatibility"]["platform"],
+                IMAGE_ID,
+            )
+            == identity
+        )
 
 
 def test_new_platform_uses_registry_without_hashing_its_recipe(source_tree, monkeypatch):
