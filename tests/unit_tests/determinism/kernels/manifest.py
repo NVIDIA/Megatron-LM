@@ -622,6 +622,41 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py.",
     ),
+    # Shared-prefix Mamba: the ragged state-fork forest, the chunk-aligned packed recurrence
+    # and the hybrid-stack dispatch that selects them.
+    KernelEntry(
+        name="ssm_mamba_ragged_forest",
+        sources=("megatron/core/ssm/mamba_ragged.py", "megatron/core/ssm/mamba_ragged_scan.py"),
+        tests=(K + "test_shared_prefix_mamba_kernels.py",),
+        kind="triton",
+        notes="_RaggedGather forward/backward (one owner per input element, fixed-order FP32 "
+        "sibling sum, no atomics), channel-last causal_conv1d_fn with seq_idx, and the forest "
+        "state-passing kernels around the private mamba_ssm SSD kernels, whose ddt/dD/ddA "
+        "atomics need MAMBA_DETERMINISTIC=1 (negative control without it). Replayed kernel by "
+        "kernel (star and forest, D per head and per head-dim, save_intermediates on/off "
+        "bitwise equal) and through a real MambaMixer's parameters.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_sequence_packing",
+        sources=("megatron/core/ssm/mamba_sequence_packing.py",),
+        tests=(K + "test_shared_prefix_mamba_kernels.py",),
+        kind="dispatch",
+        notes="Pads every sequence to a scan-chunk boundary and calls causal_conv1d_fn and "
+        "mamba_chunk_scan_combined with seq_idx; scan_mamba_packed_recurrence is replayed "
+        "through a real MambaMixer's parameters in test_shared_prefix_mamba_kernels.py.",
+    ),
+    KernelEntry(
+        name="shared_prefix_hybrid_dispatch",
+        sources=("megatron/core/models/hybrid/shared_prefix.py",),
+        tests=(K + "test_shared_prefix_mamba_kernels.py", K + "test_shared_prefix_attention.py"),
+        kind="dispatch",
+        notes="forward_hybrid_stack_shared_prefix routes Mamba layers to the ragged forest "
+        "(mamba_ragged), the packed recurrence (mamba_sequence_packing) or its own state-fork "
+        "helpers, which call causal_conv1d_fn and mamba_chunk_scan_combined directly, and "
+        "attention layers to shared_prefix_fused. The ragged and packed scans are replayed in "
+        "test_shared_prefix_mamba_kernels.py and the attention in "
+        "test_shared_prefix_attention.py; the state-fork helpers have no layer-level replay.",
+    ),
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
