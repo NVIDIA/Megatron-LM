@@ -1328,13 +1328,16 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(
-            logits,
-            padding_mask=padding_mask,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
-            token_multiplicities=token_multiplicities,
-        )
+        routing_kwargs = {
+            "padding_mask": padding_mask,
+            "input_ids": input_ids,
+            "packed_seq_params": packed_seq_params,
+        }
+        # Forward shared-prefix multiplicities only when set, so replacement routing callables
+        # with the upstream signature keep working on the default path.
+        if token_multiplicities is not None:
+            routing_kwargs["token_multiplicities"] = token_multiplicities
+        probs, routing_map = self.routing(logits, **routing_kwargs)
 
         return probs, routing_map
 
@@ -1477,6 +1480,7 @@ class InferenceTopKRouter(TopKRouter):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Simplified forward pass for inference - returns dense tensors only.
 
@@ -1484,6 +1488,9 @@ class InferenceTopKRouter(TopKRouter):
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
             input_ids (torch.Tensor, optional): Token IDs used by hash routing.
+            token_multiplicities (torch.Tensor, optional): Shared-prefix expert-bias count
+                weights, forwarded to the training fallback. Not used in inference, which
+                does not update expert bias.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -1493,7 +1500,11 @@ class InferenceTopKRouter(TopKRouter):
 
         if not InferenceMode.is_active():
             return super().forward(
-                input, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                input,
+                padding_mask,
+                input_ids,
+                packed_seq_params=packed_seq_params,
+                token_multiplicities=token_multiplicities,
             )
 
         return self._forward(input, padding_mask, input_ids)
