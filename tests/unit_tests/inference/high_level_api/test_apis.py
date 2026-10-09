@@ -3,6 +3,7 @@
 """Unit tests for the high-level inference APIs."""
 
 import asyncio
+import contextlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,17 +11,37 @@ import pytest
 import megatron.core.inference.apis._llm_base as base_mod
 import megatron.core.inference.apis.async_llm as async_llm_mod
 import megatron.core.inference.apis.llm as llm_mod
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.apis.serve_config import ServeConfig
+from megatron.core.inference.config import InferenceConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
+
+
+class _StubGroup:
+    """A process-group stand-in that reports a fixed size."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+class GlobalProcessGroupRead(Exception):
+    """A read of the global parallel grid where the test forbids one."""
+
+
+def _forbidden_global_read(*args, **kwargs):
+    raise GlobalProcessGroupRead("parallel_state.get_expert_model_parallel_world_size")
 
 
 @pytest.fixture
 def mock_pipeline(monkeypatch):
     """Stub out the engine pipeline so the constructor runs without torch/megatron."""
-    from megatron.core import parallel_state
-
     monkeypatch.setattr(base_mod, "DynamicInferenceContext", MagicMock())
     monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
@@ -30,16 +51,23 @@ def mock_pipeline(monkeypatch):
     # base_mod patch above is what steers them at construction time.
     monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
-    # Bypass the EP-group initialization assert when no distributed setup
-    # is in scope. Individual tests can override (e.g.,
-    # ``test_ep_gt_1_requires_use_coordinator``).
-    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)
+    # The EP precondition reads the model's process groups, not the global grid. Tests of a
+    # model without a collection override this.
+    monkeypatch.setattr(
+        parallel_state, "get_expert_model_parallel_world_size", _forbidden_global_read
+    )
+
+
+def _model_with_expert_parallel_size(ep_size):
+    model = MagicMock()
+    model.config = MagicMock()
+    model.pg_collection = ProcessGroupCollection(ep=_StubGroup(ep_size))
+    return model
 
 
 @pytest.fixture
 def fake_model_and_tokenizer():
-    model = MagicMock()
-    model.config = MagicMock()
+    model = _model_with_expert_parallel_size(1)
     tokenizer = MagicMock()
     return model, tokenizer
 
@@ -93,17 +121,51 @@ class TestConstructorValidation:
         with pytest.raises(ValueError, match="requires use_coordinator=True"):
             MegatronAsyncLLM(model=model, tokenizer=tok, use_coordinator=False)
 
-    def test_ep_gt_1_requires_use_coordinator(
-        self, mock_pipeline, fake_model_and_tokenizer, monkeypatch
-    ):
+    def test_ep_gt_1_requires_use_coordinator(self, mock_pipeline):
         """Direct mode with expert_model_parallel_size > 1 must raise --
-        EP routing requires the coordinator."""
-        from megatron.core import parallel_state
-
-        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 4)
-        model, tok = fake_model_and_tokenizer
+        EP routing requires the coordinator. The EP size comes from the model's collection."""
+        model = _model_with_expert_parallel_size(4)
         with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
-            MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+            MegatronLLM(model=model, tokenizer=MagicMock(), use_coordinator=False)
+
+    def test_ep_group_of_wrapped_model(self, mock_pipeline):
+        """The EP size comes from the unwrapped model; DDP does not expose the collection."""
+        inner = _model_with_expert_parallel_size(4)
+        model = MagicMock(spec=DistributedDataParallel)
+        model.module = inner
+        model.config = inner.config
+        with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
+            MegatronLLM(model=model, tokenizer=MagicMock(), use_coordinator=False)
+
+    def test_ep_group_of_inference_config(self, mock_pipeline):
+        """A collection set on the inference config, which the engine runs on, is checked
+        before the model's."""
+        inference_config = InferenceConfig(pg_collection=ProcessGroupCollection(ep=_StubGroup(4)))
+        model = _model_with_expert_parallel_size(1)
+        with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
+            MegatronLLM(
+                model=model,
+                tokenizer=MagicMock(),
+                inference_config=inference_config,
+                use_coordinator=False,
+            )
+
+    @pytest.mark.parametrize("global_ep_size", [1, 4])
+    def test_model_without_collection_uses_global_ep_size(
+        self, mock_pipeline, monkeypatch, global_ep_size
+    ):
+        """A model that carries no collection falls back to the global EP size."""
+        monkeypatch.setattr(
+            parallel_state, "get_expert_model_parallel_world_size", lambda: global_ep_size
+        )
+        model = MagicMock(spec=["config"])
+        expectation = (
+            pytest.raises(ValueError, match="expert_model_parallel_size > 1")
+            if global_ep_size > 1
+            else contextlib.nullcontext()
+        )
+        with expectation:
+            MegatronLLM(model=model, tokenizer=MagicMock(), use_coordinator=False)
 
 
 class TestLifecycleGuards:
