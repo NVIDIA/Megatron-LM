@@ -488,7 +488,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """Run Mamba through its normalized SSM output, before output projection."""
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
+        local_gate = None
+        if not inference_mode and self.use_mem_eff_path and self.config.sequence_relative_kernels:
+            # Gated norm runs in the original local token/channel order. The
+            # recurrence never reads z, so avoid its round-trip CP exchange.
+            local_gate = zxBCdt[..., : self.cp.d_inner_local_tp].contiguous()
+        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params, include_gate=local_gate is None)
 
         if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
@@ -499,7 +504,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            if local_gate is None:
+                y = self._ssm_training(zxBCdt, packed_seq_params)
+            else:
+                y = self._ssm_training(zxBCdt, packed_seq_params, local_gate=local_gate)
 
         return y
 
@@ -716,7 +724,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         return y
 
     def _ssm_training(
-        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        zxBCdt: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        local_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
@@ -725,6 +737,17 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         of forward activations stored for backprop and therefore reduces memory pressure during
         training.
         """
+
+        if self.config.sequence_relative_kernels:
+            # Import lazily because the packing helper uses the Mamba kernel symbols above.
+            from megatron.core.ssm.mamba_sequence_packing import mamba_sequence_relative_scan
+
+            return mamba_sequence_relative_scan(
+                self, zxBCdt, packed_seq_params, local_gate=local_gate
+            )
+
+        if local_gate is not None:
+            raise ValueError("A local Mamba gate requires sequence-relative kernels")
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()

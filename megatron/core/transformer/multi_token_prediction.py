@@ -1088,6 +1088,7 @@ def process_mtp_loss(
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[Tensor] = None,
+    loss_group_lengths: Optional[tuple[int, ...]] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1109,6 +1110,9 @@ def process_mtp_loss(
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
         scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
             scale logits before loss computation (e.g., MuP output scaling).
+        loss_group_lengths: Optional CP-local lengths of independently normalized
+            packed groups. Requires per-token loss and preserves each group's
+            original/shifted token-count correction when forwards are combined.
         input_ids (Optional[Tensor]): Input token IDs. Used to derive labels when
             ``labels`` is None (e.g. RL training), by rolling left to match the SFT
             label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
@@ -1168,6 +1172,21 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    original_group_counts = None
+    if loss_group_lengths is not None:
+        if (
+            not loss_group_lengths
+            or any(length < 1 for length in loss_group_lengths)
+            or sum(loss_group_lengths) != loss_mask.shape[-1]
+        ):
+            raise ValueError("MTP loss groups must partition the CP-local packed sequence")
+        if not config.calculate_per_token_loss:
+            raise NotImplementedError(
+                "grouped MTP normalization requires calculate_per_token_loss=True"
+            )
+        original_group_counts = tuple(
+            part.sum() for part in loss_mask.split(loss_group_lengths, dim=-1)
+        )
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1283,10 +1302,27 @@ def process_mtp_loss(
             # per-token gradient weighting, we normalize by the rolled token count
             # and re-scale by the original token count.
             # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
+            if loss_group_lengths is None:
+                num_tokens_safe = torch.clamp(num_tokens, min=1)
+                mtp_loss_normalized = (
+                    mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+                )
+            else:
+                assert original_group_counts is not None
+                # Coalescing forwards must not change the pre-existing per-star
+                # token-count correction, especially at short prompt boundaries.
+                mtp_loss_normalized = torch.cat(
+                    [
+                        mtp_loss_scale * part * (original / mask.sum().clamp(min=1))
+                        for part, mask, original in zip(
+                            mtp_loss.split(loss_group_lengths, dim=-1),
+                            loss_mask.split(loss_group_lengths, dim=-1),
+                            original_group_counts,
+                            strict=True,
+                        )
+                    ],
+                    dim=-1,
+                )
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
