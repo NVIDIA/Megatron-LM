@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Router hooks used by shared-prefix execution."""
+"""Router hooks used by shared-prefix execution: routing kwargs, logical expert counts and
+fixed-row router GEMM blocks."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,7 +10,9 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.moe import moe_utils
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import router_gating_linear, router_gating_token_blocks
 from megatron.core.transformer.moe.router import (
     InferenceTopKRouter,
     TopKRouter,
@@ -167,3 +170,59 @@ def test_topk_router_expert_bias_counts_logical_tokens(with_padding):
         assert torch.equal(router.local_tokens_per_expert, expected)
     finally:
         Utils.destroy_model_parallel()
+
+
+def _blocked_reference(inp, weight, bias, block_size):
+    # Previous implementation: pad and run every block as a separate copy.
+    outputs = []
+    for start in range(0, inp.shape[0], block_size):
+        rows = inp[start : start + block_size]
+        padded = torch.nn.functional.pad(rows, (0, 0, 0, block_size - rows.shape[0]))
+        outputs.append(moe_utils._router_gating_gemm(padded, weight, bias, torch.float32))
+    return torch.cat(outputs)[: inp.shape[0]]
+
+
+@pytest.mark.parametrize("num_rows", [1, 7, 8, 9, 24, 29])
+def test_router_gemm_blocks_use_views_of_one_padded_input(num_rows):
+    block_size = 8
+    inp = torch.randn(num_rows, 1, 5, dtype=torch.float64)
+    weight = torch.randn(3, 5, dtype=torch.float64)
+    seen = []
+    gemm = moe_utils._router_gating_gemm
+
+    def recording_gemm(rows, *args):
+        seen.append((rows.shape, rows.untyped_storage().data_ptr()))
+        return gemm(rows, *args)
+
+    with patch.object(moe_utils, "_router_gating_gemm", recording_gemm):
+        with router_gating_token_blocks(block_size):
+            actual = router_gating_linear(inp, weight, None, torch.float64)
+    torch.testing.assert_close(actual, inp @ weight.t(), rtol=0, atol=1e-12)
+    assert actual.shape == (num_rows, 1, 3)
+    assert len(seen) == -(-num_rows // block_size)
+    assert all(shape == (block_size, 5) for shape, _ in seen)
+    assert len({storage for _, storage in seen}) == 1
+
+
+def test_router_gemm_default_path_skips_blocks():
+    inp = torch.randn(9, 1, 5, dtype=torch.float64)
+    weight = torch.randn(3, 5, dtype=torch.float64)
+    with patch.object(moe_utils, "_router_gating_gemm_blocks", side_effect=AssertionError):
+        actual = router_gating_linear(inp, weight, None, torch.float64)
+    torch.testing.assert_close(actual, inp @ weight.t(), rtol=0, atol=1e-12)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the TE/cuBLAS router GEMM")
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("num_rows", [1, 333, 1024, 2048, 2500])
+def test_router_gemm_blocks_bitwise_match_per_block_copies(input_dtype, with_bias, num_rows):
+    generator = torch.Generator(device="cuda").manual_seed(num_rows)
+    inp = torch.randn(num_rows, 1, 256, device="cuda", generator=generator).to(input_dtype)
+    weight = torch.randn(64, 256, device="cuda", generator=generator).to(input_dtype)
+    bias = torch.randn(64, device="cuda", generator=generator).to(input_dtype)
+    bias = bias if with_bias else None
+    with router_gating_token_blocks(1024):
+        actual = router_gating_linear(inp, weight, bias, torch.float32)
+    expected = _blocked_reference(inp.view(num_rows, -1), weight, bias, 1024)
+    assert torch.equal(actual.view(num_rows, -1), expected)

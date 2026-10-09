@@ -1433,28 +1433,37 @@ def router_gating_token_blocks(block_size: int = 1024) -> Iterator[None]:
 def _router_gating_gemm(
     inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
 ) -> torch.Tensor:
-    """Run the existing router GEMM, optionally in fixed, padded row blocks."""
+    """Run the router GEMM on 2D rows."""
+    if te_general_gemm is not None and router_dtype != torch.float64:
+        # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
+        # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
+        # small bias vector before passing it to TE.
+        gemm_bias = bias.to(router_dtype) if bias is not None else None
+        return te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
+    if bias is None:
+        return torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+    return torch.addmm(bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t())
 
-    def gemm(rows: torch.Tensor) -> torch.Tensor:
-        if te_general_gemm is not None and router_dtype != torch.float64:
-            # Preserve the baseline TE bias/output dtype contract.
-            gemm_bias = bias.to(router_dtype) if bias is not None else None
-            return te_general_gemm(weight, rows, router_dtype, layout="TN", bias=gemm_bias)[0]
-        if bias is None:
-            return torch.mm(rows.to(router_dtype), weight.to(router_dtype).t())
-        return torch.addmm(
-            bias.to(router_dtype), rows.to(router_dtype), weight.to(router_dtype).t()
-        )
 
-    block_size = _ROUTER_GATING_TOKEN_BLOCK_SIZE.get()
-    if block_size is None or inp.shape[0] == 0:
-        return gemm(inp)
-    outputs = []
-    for start in range(0, inp.shape[0], block_size):
-        rows = inp[start : start + block_size]
-        padded = torch.nn.functional.pad(rows, (0, 0, 0, block_size - rows.shape[0]))
-        outputs.append(gemm(padded)[: rows.shape[0]])
-    return torch.cat(outputs, dim=0)
+def _router_gating_gemm_blocks(
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    router_dtype: torch.dtype,
+    block_size: int,
+) -> torch.Tensor:
+    """Run the router GEMM in fixed row blocks, zero-padding the last block."""
+    num_rows = inp.shape[0]
+    tail_padding = -num_rows % block_size
+    if tail_padding:
+        # Pad once so every block is a contiguous view; the zero rows are sliced off below.
+        inp = torch.nn.functional.pad(inp, (0, 0, 0, tail_padding))
+    outputs = [
+        _router_gating_gemm(inp[start : start + block_size], weight, bias, router_dtype)
+        for start in range(0, inp.shape[0], block_size)
+    ]
+    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+    return output[:num_rows]
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -1489,7 +1498,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        output = _router_gating_gemm(inp, weight, bias, router_dtype)
+        block_size = _ROUTER_GATING_TOKEN_BLOCK_SIZE.get()
+        if block_size is None or inp.shape[0] == 0:
+            output = _router_gating_gemm(inp, weight, bias, router_dtype)
+        else:
+            output = _router_gating_gemm_blocks(inp, weight, bias, router_dtype, block_size)
         output = output.view(*inp_shape[:-1], -1)
         return output
 
