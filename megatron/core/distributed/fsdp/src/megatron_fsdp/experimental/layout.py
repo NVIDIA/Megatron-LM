@@ -29,6 +29,15 @@ Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
+class TensorRange:
+    """Contiguous global element range occupied by one logical tensor."""
+
+    start: int
+    end: int
+    tensor_id: int
+
+
+@dataclasses.dataclass(frozen=True)
 class GlobalLayout:
     """Global tensor layout in element coordinates.
 
@@ -53,14 +62,6 @@ class GlobalLayout:
 
     def __post_init__(self) -> None:
         """Validate offsets are in bounds and tensor ranges do not overlap."""
-
-        @dataclasses.dataclass(frozen=True)
-        class TensorRange:
-            """Contiguous global element range occupied by one logical tensor."""
-
-            start: int
-            end: int
-            tensor_id: int
 
         if self.size < 0:
             raise AssertionError(f"Global layout size {self.size} is negative.")
