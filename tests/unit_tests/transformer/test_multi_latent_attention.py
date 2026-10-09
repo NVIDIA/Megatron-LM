@@ -21,6 +21,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -1794,6 +1795,59 @@ class TestFusedMLAPreMLPResidualNorm:
         self._assert_close_up_to_rounding(input_grad, ref_input_grad, "input")
 
 
+class TestMLAUpProjectionInput:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_local_up_projection_reads_the_slice_without_a_copy(self):
+        """Only Transformer Engine projections get the vectorized copy; a local (non-TE)
+        up-projection receives the row-strided kv slice of the down-projection output as it is."""
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True
+        ).self_attention.submodules
+        submodules.linear_q_up_proj = ColumnParallelLinear
+        submodules.linear_kv_up_proj = ColumnParallelLinear
+        attention = MLASelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        ).cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        received = []
+        hook = attention.linear_kv_up_proj.register_forward_pre_hook(
+            lambda module, args: received.append(args[0])
+        )
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            attention(hidden_states, attention_mask)
+        hook.remove()
+        assert copy.call_count == 0
+        assert len(received) == 1 and not received[0].is_contiguous()
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestFusedMLASelfAttention:
 
@@ -1831,6 +1885,20 @@ class TestFusedMLASelfAttention:
         assert isinstance(self.fused_attention, MLASelfAttention)
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+
+    def test_up_projection_inputs_copied_as_contiguous_rows(self):
+        config = self.transformer_config
+        self.fused_attention.cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            self.fused_attention(hidden_states, attention_mask)
+        # The q and kv slices of the fused down-projection output take the vectorized copy.
+        assert copy.call_count == 2
+        assert not any(call.args[0].is_contiguous() for call in copy.call_args_list)
 
     def test_fused_weight_shape(self):
         config = self.transformer_config

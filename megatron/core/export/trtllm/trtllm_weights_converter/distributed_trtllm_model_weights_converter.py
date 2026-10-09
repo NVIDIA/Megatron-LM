@@ -72,6 +72,13 @@ class DistributedTRTLLMModelWeightsConverter:
         # Single compatibility boundary rather than five separate global reads. Export runs on
         # whatever grid the model was loaded on; see docs/developer/parallel-state-deprecation.md.
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp'])
+        # The collection holds None for groups that were never created. get_pg_size(None) is 1, so
+        # without this check an uninitialized grid would export a TP1/PP1 mapping.
+        if pg_collection.tp is None or pg_collection.pp is None:
+            raise RuntimeError(
+                "DistributedTRTLLMModelWeightsConverter needs the tensor- and pipeline-parallel "
+                "groups of the grid the model was loaded on; call initialize_model_parallel first."
+            )
         self.inference_pp_size = get_pg_size(pg_collection.pp)
         self.inference_tp_size = get_pg_size(pg_collection.tp)
         self.tp_rank = get_pg_rank(pg_collection.tp)
