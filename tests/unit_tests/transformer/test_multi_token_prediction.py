@@ -3337,7 +3337,7 @@ class TestMultiTokenPredictionHybrid:
         layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
         torch.nn.Module.__init__(layer)
         layer.config = types.SimpleNamespace(recompute_granularity='full')
-        layer.mtp_layer_pattern = "M"
+        layer.is_hybrid_mtp = True
         layer.training = True
 
         input_ids = torch.arange(4).reshape(1, 4)
@@ -3623,6 +3623,7 @@ class TestMultiTokenPredictionHybrid:
             ),
             pre_process=False,
             post_process=True,
+            hybrid_layer_config_list=None,
             position_embedding_type='none',
             decoder=decoder,
             share_embeddings_and_output_weights=False,
