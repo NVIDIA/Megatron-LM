@@ -87,8 +87,32 @@ def _build_packed_seq_params(config, kwargs):
     )
 
 
+def _reuse_model_chunk_request_carriers(model_chunk, kwargs, request_carrier_cache):
+    """Reuse the DSA sharing carriers across one model chunk's layer prewarms.
+
+    Pipeline prewarm invokes layers independently, while DSA keeps the tensors that later
+    layers reuse (IndexShare, repeated MTP) on the forward's packed-sequence metadata or
+    attention mask. Keep those carriers common within one model chunk, but isolated across
+    chunks.
+    """
+    chunk_carriers = request_carrier_cache.setdefault(id(model_chunk), {})
+    for name in ('packed_seq_params', 'attention_mask'):
+        if name not in kwargs:
+            continue
+        if name in chunk_carriers:
+            kwargs[name] = chunk_carriers[name]
+        else:
+            chunk_carriers[name] = kwargs[name]
+
+
 def _build_layer_inputs(
-    layer, model_chunk, config, seq_length, micro_batch_size, rotary_pos_emb_cache
+    layer,
+    model_chunk,
+    config,
+    seq_length,
+    micro_batch_size,
+    rotary_pos_emb_cache,
+    request_carrier_cache,
 ):
     """Build one eager synthetic sample for a local transformer layer."""
     if not hasattr(layer, 'get_layer_static_inputs'):
@@ -102,6 +126,7 @@ def _build_layer_inputs(
     hidden_states = static_inputs.pop('hidden_states')
     kwargs = static_inputs
     _build_packed_seq_params(config, kwargs)
+    _reuse_model_chunk_request_carriers(model_chunk, kwargs, request_carrier_cache)
 
     if (
         getattr(model_chunk, 'position_embedding_type', None) == 'rope'
@@ -235,6 +260,7 @@ def prewarm_pipeline_model_parallel(
             else nullcontext()
         )
         rotary_pos_emb_cache = {}
+        request_carrier_cache = {}
 
         with ExitStack() as stack:
             for model_chunk in model:
@@ -251,13 +277,32 @@ def prewarm_pipeline_model_parallel(
                         seq_length,
                         micro_batch_size,
                         rotary_pos_emb_cache,
+                        request_carrier_cache,
                     )
                     inner_quantization_context = (
                         nullcontext()
                         if config.fp8 and config.fp8_recipe == Fp8Recipe.delayed
                         else _get_quantization_context(layer, is_mtp)
                     )
-                    with inner_quantization_context:
+                    repeated_depth_scope = nullcontext()
+                    if (
+                        is_mtp
+                        and getattr(config, "mtp_use_repeated_layer", False)
+                        and (
+                            config.mtp_repeated_layer_shared_components
+                            or getattr(config, "experimental_attention_variant", None) == "dsa"
+                        )
+                    ):
+                        from megatron.core.transformer.multi_token_prediction import (
+                            mtp_repeated_depth_scope,
+                        )
+
+                        # Run as depth 0 of a real MTP forward, which publishes the state that
+                        # later depths share (MultiTokenPredictionBlock marks the same).
+                        repeated_depth_scope = mtp_repeated_depth_scope(
+                            config.num_layers + layer.layer_number, 0
+                        )
+                    with inner_quantization_context, repeated_depth_scope:
                         outputs = layer.forward(*args, **kwargs)
                     differentiable_outputs = _collect_differentiable_tensors(outputs)
                     assert (
