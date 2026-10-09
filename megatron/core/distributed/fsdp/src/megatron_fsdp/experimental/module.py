@@ -51,6 +51,12 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    caller_managed_grad_sync: bool
+    """Leave gradient synchronization to the caller instead of an autograd callback.
+
+    The caller must call ``finish_grad_sync()`` after all gradient producers,
+    including delayed weight-gradient computation, and before consuming gradients.
+    """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -67,6 +73,7 @@ class FsdpContext:
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        caller_managed_grad_sync: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -78,10 +85,13 @@ class FsdpContext:
                 communication stream to reduce peak transient memory.
             parameter_to_owner: Construction-time TensorAtomic owner assignments. See
                 ``fully_shard_context``.
+            caller_managed_grad_sync: Disable the automatic autograd completion callback.
+                The caller must synchronize gradient reductions with ``finish_grad_sync()``.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
@@ -140,13 +150,33 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def post_backward(self) -> None:
-        """Order current-stream consumers after this context's gradient reductions."""
+    def validate_grad_sync(self) -> None:
+        """Require a caller-owned wait or a pending autograd completion callback."""
+        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+            return
+        raise RuntimeError(
+            "Gradient reduction has no pending autograd completion callback. "
+            "Use fully_shard_context(caller_managed_grad_sync=True) and call "
+            "context.finish_grad_sync() after all backward work, including "
+            "delayed weight-gradient computation, before consuming gradients."
+        )
+
+    def finish_grad_sync(self) -> None:
+        """Order current-stream consumers after all gradient reductions submitted so far.
+
+        Call after all backward work, including delayed weight-gradient computation,
+        and before reading or modifying gradients. This enqueues a stream dependency;
+        it does not block the CPU or wait for reductions that have not yet been launched.
+        """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+
+    def post_backward(self) -> None:
+        """Order current-stream consumers after this backward's gradient reductions."""
+        self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
-        """Register one context-level final callback for the current backward.
+        """Register one final callback unless the caller manages gradient synchronization.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -154,7 +184,12 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
+        if self.caller_managed_grad_sync:
+            # Leave the wait to the caller's finish_grad_sync(), after all backward work,
+            # including delayed weight-gradient computation, has been launched.
+            return
         if self._post_backward_hook_registered:
+            # Another root sharing this context already queued the completion wait.
             return
         self._post_backward_hook_registered = True
 
@@ -524,6 +559,7 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         self.reshard()
+        self.context.validate_grad_sync()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
