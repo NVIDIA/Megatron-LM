@@ -422,9 +422,22 @@ def test_materializer_rejects_a_layout_past_the_unpadded_row() -> None:
     )
     input_ids = torch.tensor([[1, 2, 3, -1], [1, 2, 4, -1]])
 
-    with pytest.raises(ValueError, match="layout requires 4 tokens"):
+    with pytest.raises(ValueError, match="completion length differs from source row"):
         materialize_shared_prefix_layout(
             input_ids, input_lengths=torch.tensor([3, 3]), layout=layout
+        )
+
+
+def test_materializer_rejects_a_row_that_grew_past_its_layout() -> None:
+    """A stale layout must not silently drop the source row's extra completion tokens."""
+    layout = build_shared_prefix_layout(
+        [SharedPrefixRow(0, "g", (1, 2), 2), SharedPrefixRow(1, "g", (1, 2), 1)]
+    )
+    input_ids = torch.tensor([[1, 2, 7, 8, 9], [1, 2, 4, 0, 0]])
+
+    with pytest.raises(ValueError, match="completion length differs from source row"):
+        materialize_shared_prefix_layout(
+            input_ids, input_lengths=torch.tensor([5, 3]), layout=layout
         )
 
 

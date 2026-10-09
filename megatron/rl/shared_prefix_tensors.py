@@ -315,8 +315,9 @@ def materialize_shared_prefix_layout(
         and tensorized gather/fan-out/scatter indices on ``input_ids.device``.
 
     Raises:
-        ValueError: If the source tensor cannot satisfy the layout or its prompt
-            tokens no longer match the planned exact prompt.
+        ValueError: If a source row's unpadded length differs from the planned
+            prompt plus completion, or its prompt tokens no longer match the
+            planned exact prompt.
     """
     _validate_input_ids(input_ids)
     batch_size, sequence_width = input_ids.shape
@@ -348,10 +349,10 @@ def materialize_shared_prefix_layout(
                 )
             required_length = root.prompt_length + completion_length
             source_length = int(input_lengths_cpu[row_index].item())
-            if required_length > source_length:
+            if required_length != source_length:
                 raise ValueError(
-                    f"source row {row_index} has length {source_length}, but layout "
-                    f"requires {required_length} tokens"
+                    f"layout completion length differs from source row {row_index}: "
+                    f"layout requires {required_length} tokens, row has {source_length}"
                 )
             source_prompt = input_ids[row_index, : root.prompt_length]
             if not torch.equal(source_prompt, expected_prompt):
