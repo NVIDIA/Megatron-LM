@@ -175,14 +175,10 @@ class FsdpContext:
     def iteration(self) -> Iterator[None]:
         """Scope all microbatches of one global batch, including backward work.
 
-        A changed execution pattern requires invalidating the plan with
-        ``context.scheduler.abort_iteration()`` between completed iterations.
-        Replay mismatch or truncation raises after cleanup and plan invalidation.
-        Cleanup does not restore module hook phases or unwind interrupted forward
-        or autograd execution. A mismatch is fatal to the current training
-        execution: discard its graph and use a fresh model/runtime, rather than
-        resume the failed forward or backward.
-        All ranks must follow collective-compatible control flow; replay fallback
+        Trace replay requires the same logical execution pattern each iteration.
+        A mismatch or interrupted iteration is fatal: discard its graph and use a
+        fresh model/runtime rather than resume the failed forward or backward.
+        All ranks must follow collective-compatible control flow; validation
         cannot undo speculative collectives on rank-divergent paths.
 
         Example:
@@ -197,14 +193,8 @@ class FsdpContext:
                 optimizer.step()
         """
         self.begin_iteration()
-        try:
-            yield
-        except BaseException:
-            if self.scheduler is not None:
-                self.scheduler.abort_iteration()
-            raise
-        else:
-            self.end_iteration()
+        yield
+        self.end_iteration()
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""

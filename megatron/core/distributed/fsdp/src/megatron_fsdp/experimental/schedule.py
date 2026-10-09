@@ -66,12 +66,13 @@ class TraceAndReplayScheduler:
     """Observe complete iterations and optimize communication without ordering compute.
 
     Replay validates every logical occurrence before executing its compiled action.
-    Divergent or truncated replay raises after cleanup and invalidates the plan.
-    Cleanup does not restore module hook phases or unwind interrupted forward or
-    autograd execution. A replay mismatch is fatal to the current training
-    execution: discard the failed graph and construct a fresh model/runtime
-    rather than resume it. Invalidation between completed iterations is safe
-    and allows the next iteration to trace a deliberately changed pattern.
+    Every module's final logical operation must reshard its parameters. Compiled
+    prefetches are consumed within that iteration, and retention never skips a
+    final release, so ordinary module operations own storage cleanup.
+
+    Divergent, truncated, or interrupted execution is fatal: discard the failed
+    graph and construct a fresh model/runtime rather than resume it. The scheduler
+    does not unwind module hook phases, autograd work, or materialized storage.
 
     All ranks must follow collective-compatible control flow. Local divergence
     recovery cannot undo speculative collectives already submitted, and cannot
@@ -87,8 +88,6 @@ class TraceAndReplayScheduler:
         self._events: list[TraceEvent] = []
         self._position = 0
         self._active = False
-        self._held: dict[int, FsdpModule] = {}
-        self._touched: dict[int, FsdpModule] = {}
 
     def begin_iteration(self) -> None:
         """Begin one global batch, including all its microbatches."""
@@ -97,33 +96,16 @@ class TraceAndReplayScheduler:
         self._active = True
         self._events = []
         self._position = 0
-        self._touched = {}
 
     def end_iteration(self) -> None:
-        """Compile a full trace or validate replay, then release speculative storage."""
+        """Compile a fully resharded trace or validate complete replay."""
         if not self._active:
             raise RuntimeError("No FSDP trace iteration is active.")
         if self._plan and self._position != len(self._plan):
-            self.abort_iteration()
             raise RuntimeError("FSDP trace replay ended before all logical events were consumed.")
-        self._release_held()
-        self._release_touched()
         if not self._plan:
             self._plan = list(self._events)
             self._compile_actions()
-        self._active = False
-
-    def abort_iteration(self) -> None:
-        """Invalidate the plan and release storage, without restoring hook lifecycle state.
-
-        After interrupted module execution, use a fresh model/runtime. Calling
-        this between completed iterations safely prepares a new execution pattern.
-        """
-        self._release_held()
-        self._release_touched()
-        self._plan = []
-        self._actions = []
-        self._events = []
         self._active = False
 
     def _record(self, event: TraceEvent) -> PlanAction:
@@ -131,7 +113,6 @@ class TraceAndReplayScheduler:
             raise RuntimeError("Call context.begin_iteration() before using trace replay.")
         if self._plan:
             if self._position >= len(self._plan) or self._plan[self._position] != event:
-                self.abort_iteration()
                 raise RuntimeError("FSDP trace replay diverged from its logical event sequence.")
             action = self._actions[self._position]
             self._position += 1
@@ -142,26 +123,24 @@ class TraceAndReplayScheduler:
     def unshard(self, module: "FsdpModule", prefetch: str = "none") -> None:
         """Execute a validated demand gather and wait, then its annotated prefetch."""
         action = self._record(TraceEvent("unshard", module, prefetch))
-        self._touched[id(module)] = module
-        self._held.pop(id(module), None)
         module._unshard_parameter_groups()
         assert module._unshard_event is not None
         module.context.current_stream().wait_event(module._unshard_event)
         target = action.prefetch_target
         if target is not None and target._unshard_event is None:
-            self._held[id(target)] = target
             target._unshard_parameter_groups()
 
     def reshard(self, module: "FsdpModule") -> None:
         """Execute a validated release, retaining only a bounded planned reuse."""
         action = self._record(TraceEvent("reshard", module))
         if action.retain:
-            self._held[id(module)] = module
             return
-        self._held.pop(id(module), None)
         module._reshard_parameter_groups()
 
     def _compile_actions(self) -> None:
+        final_operations = {id(event.module): event.kind for event in self._plan}
+        if any(kind != "reshard" for kind in final_operations.values()):
+            raise RuntimeError("FSDP trace must end with reshard for every materialized module.")
         actions = []
         for position, event in enumerate(self._plan):
             target = None
@@ -194,14 +173,3 @@ class TraceAndReplayScheduler:
                             break
             actions.append(PlanAction(target, retain))
         self._actions = actions
-
-    def _release_held(self) -> None:
-        for module in self._held.values():
-            module._reshard_parameter_groups()
-        self._held.clear()
-
-    def _release_touched(self) -> None:
-        for module in self._touched.values():
-            if module._unshard_event is not None:
-                module._reshard_parameter_groups()
-        self._touched.clear()
