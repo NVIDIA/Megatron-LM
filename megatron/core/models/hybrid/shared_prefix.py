@@ -642,6 +642,11 @@ def _forward_mamba_layer_shared_prefix_cp(
     )
 
 
+# MoE router load-balancing types that leave top-k routing unchanged; any loss they add is
+# rejected separately through its coefficient.
+_AUX_LOSS_LOAD_BALANCING_TYPES = frozenset({"none", "aux_loss", "seq_aux_loss", "global_aux_loss"})
+
+
 def _has_nonzero_config_value(value) -> bool:
     """Return whether a scalar or per-layer configuration contains a nonzero value."""
     if value is None:
@@ -830,9 +835,12 @@ def _validate_hybrid_stack(
         load_balancing_types = (
             [load_balancing] if isinstance(load_balancing, str) else load_balancing
         )
-        if any(item != "none" for item in load_balancing_types):
+        # Sinkhorn and quantile balancing replace top-k routing itself. The auxiliary-loss
+        # types only add a loss term, which the coefficient check below rejects when active.
+        if any(item not in _AUX_LOSS_LOAD_BALANCING_TYPES for item in load_balancing_types):
             raise NotImplementedError(
-                "shared-prefix Hybrid adapter requires MoE router load balancing type 'none'"
+                "shared-prefix Hybrid adapter does not support MoE router load balancing type "
+                f"{load_balancing!r}"
             )
         if _has_nonzero_config_value(stack.config.moe_aux_loss_coeff):
             raise NotImplementedError(
@@ -858,6 +866,18 @@ def _validate_hybrid_stack(
                 'shared-prefix Hybrid adapter does not support MoE expert capacity or token '
                 'dropping'
             )
+        # Both flex backends can drop tokens over the per-rank budget. A dropped prompt row
+        # would remove its expert contribution from every completion that shares it.
+        if stack.config.moe_expert_rank_capacity_factor is not None:
+            raise NotImplementedError(
+                "shared-prefix Hybrid adapter does not support MoE expert rank capacity or "
+                "token dropping"
+            )
+        # Replay targets are recorded per dense row; shared-prefix routes physical star rows.
+        if stack.config.moe_enable_routing_replay:
+            raise NotImplementedError(
+                "shared-prefix Hybrid adapter does not support MoE routing replay"
+            )
         if getattr(stack.config, "mlp_chunks_for_training", 1) != 1:
             raise NotImplementedError(
                 "shared-prefix Hybrid MoE adapter does not support training MLP chunking"
@@ -877,6 +897,12 @@ def _validate_hybrid_stack(
             if layer.mixer.cp.cp_size != cp_size:
                 raise RuntimeError(
                     "shared-prefix Mamba CP helper does not match the Hybrid stack CP group"
+                )
+            # The shared path shards the star by attention zigzag and relies on the Mamba CP
+            # helper to undo it; a contiguous linear layout would skip that reordering.
+            if cp_size > 1 and layer.mixer.cp.sequence_is_contiguous:
+                raise NotImplementedError(
+                    "shared-prefix Mamba CP requires linear_cp_layout='zigzag'"
                 )
         elif isinstance(layer, TransformerLayer):
             if not isinstance(layer.self_attention, (IdentityOp, SelfAttention)):
