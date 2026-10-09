@@ -10,7 +10,7 @@ from packaging.version import Version
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import (
     is_float8tensor,
@@ -762,10 +762,11 @@ class TestFP8Param:
             loss = output.mean()
             losses.append(loss.detach().clone())
             loss.backward()
-            # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
-            # grad sync and is what flushes an accumulated wgrad.
-            _gtp_grad_fence()
-            model[0].finish_grad_sync()
+            # Include TP reductions for sequence-parallel layernorms. DDP alone leaves
+            # replicated Adam moments inconsistent across TP ranks before checkpointing.
+            finalize_model_grads(
+                model, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
             update_successful, _, _ = optimizer.step()
             assert update_successful
             if opt_param_scheduler is not None:
@@ -1116,14 +1117,18 @@ class TestFP8Param:
             ]
         state = TestFP8Param.snapshot_optimizer_state(state)
         if inner is not None:
-            # DistOpt checkpoints align TE FusedAdam's step across all groups, while
-            # FusedAdam never advances empty groups. Loading therefore adds a harmless
-            # step field to those groups. Keep the canonical wrapper metadata and every
-            # populated group's step/moments/masters strict; normalize only this field
-            # in the copied raw optimizer snapshot, never in the live optimizer.
-            for group in state["inner"]["param_groups"]:
-                if not group["params"]:
-                    group.pop("step", None)
+            # Checkpoints align TE FusedAdam's step across groups, while FusedAdam
+            # never advances empty groups. Normalize only that field in copied raw
+            # state, including Float16Optimizer's duplicate payload. Populated groups,
+            # canonical DistOpt metadata, moments and masters remain strict.
+            raw_states = [state["inner"]]
+            wrapped_inner = state["wrapper"].get("optimizer", {})
+            if "state" in wrapped_inner:
+                raw_states.append(wrapped_inner)
+            for raw_state in raw_states:
+                for group in raw_state["param_groups"]:
+                    if not group["params"]:
+                        group.pop("step", None)
         return state
 
     @staticmethod
