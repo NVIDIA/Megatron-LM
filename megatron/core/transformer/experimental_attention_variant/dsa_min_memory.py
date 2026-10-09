@@ -211,9 +211,7 @@ def _plan_execution(
         if query_chunk_override is not None and query_chunk_override > 0:
             query_chunk = min(query_chunk_override, query_length)
 
-    return _DSAExecutionPlan(
-        query_chunk=query_chunk, routing_key_chunk=routing_key_chunk
-    )
+    return _DSAExecutionPlan(query_chunk=query_chunk, routing_key_chunk=routing_key_chunk)
 
 
 def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -385,9 +383,9 @@ def _dense_teacher_logits_block(
         head_end = head_start + repeat_factor
         q = query_tile[:, :, head_start:head_end, :].permute(1, 2, 0, 3)
         k = key_block[:, :, group_idx, :].permute(1, 0, 2)
-        scores[:, head_start:head_end] = torch.einsum(
-            "brqd,bkd->brqk", q.float(), k.float()
-        ).mul_(softmax_scale)
+        scores[:, head_start:head_end] = torch.einsum("brqd,bkd->brqk", q.float(), k.float()).mul_(
+            softmax_scale
+        )
     return _mask_dense_causal_scores(scores, q_start, q_start + q_len, k_start, k_start + k_len)
 
 
@@ -1241,9 +1239,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 f"value or none, got query={needs_query_grad}, key={needs_key_grad}, "
                 f"value={needs_value_grad}. Partial Q/K/V gradients are not supported."
             )
-        use_triton_attention_backward = (
-            needs_query_grad and needs_key_grad and needs_value_grad
-        )
+        use_triton_attention_backward = needs_query_grad and needs_key_grad and needs_value_grad
         grad_key_accum = None
         grad_value_accum = None
 
