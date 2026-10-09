@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Process groups used by the Transformer Engine fused MLP wrappers."""
+"""Process groups used by the Transformer Engine fused MLP and dot-product attention wrappers."""
 
 import contextlib
 
@@ -11,6 +11,8 @@ import torch.nn.functional as F
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TEDotProductAttention,
     TEFusedMLP,
     TEFusedMLPWithGroupedLinear,
     TELayerNormColumnParallelLinear,
@@ -19,6 +21,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -158,3 +161,57 @@ class TestTEFusedMLPTensorParallelGroup:
         unfused_results, fused_results = results
         # With sequence parallelism, the two paths sum some gradient terms in a different order.
         torch.testing.assert_close(fused_results, unfused_results, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed")
+class TestTEDotProductAttentionContextParallelGroup:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _tp_and_cp_groups():
+        world_size = torch.distributed.get_world_size()
+        grid = HyperCommGrid([1, 2, world_size // 2], ["tp", "cp", "dp"])
+        return grid.create_pg("tp"), grid.create_pg("cp")
+
+    @staticmethod
+    def _build(pg_collection):
+        config = TransformerConfig(
+            num_layers=1, hidden_size=64, num_attention_heads=4, context_parallel_size=2
+        )
+        return TEDotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=pg_collection,
+        )
+
+    @pytest.mark.parametrize("cp_field", ["absent", "none"])
+    def test_rejects_context_parallelism_without_cp_group(self, cp_field):
+        """A missing CP group must not turn every rank of the job into the CP ranks."""
+        if Utils.world_size % 2:
+            pytest.skip("needs an even number of ranks")
+        tp_group, _ = self._tp_and_cp_groups()
+        if cp_field == "absent":
+            pg_collection = ProcessGroupCollection(tp=tp_group)
+        else:
+            pg_collection = ProcessGroupCollection(tp=tp_group, cp=None)
+
+        with pytest.raises(ValueError, match="pg_collection.cp"):
+            self._build(pg_collection)
+
+    def test_uses_the_cp_group_of_the_collection(self):
+        if Utils.world_size % 2:
+            pytest.skip("needs an even number of ranks")
+        tp_group, cp_group = self._tp_and_cp_groups()
+
+        attention = self._build(ProcessGroupCollection(tp=tp_group, cp=cp_group))
+
+        assert attention.cp_group is cp_group
+        assert attention.cp_global_ranks == torch.distributed.get_process_group_ranks(cp_group)

@@ -2163,8 +2163,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     that also has "flash attention" enabled.
 
     Note that if Megatron's parallel_state has not been initialized yet, the
-    tp_group and cp_group passed to TE will be None and must be set later
-    via set_tensor_parallel_group() and set_context_parallel_group().
+    tp_group passed to TE will be None and must be set later via
+    set_tensor_parallel_group(). With context_parallel_size > 1, the
+    context-parallel group is required at construction.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2247,6 +2248,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
+            # torch.distributed resolves a None group to the default group, so the ranks of the
+            # whole job would become the context-parallel ranks.
+            if pg_collection.cp is None:
+                raise ValueError(
+                    "TEDotProductAttention with context_parallel_size > 1 requires a "
+                    "context-parallel group in pg_collection.cp"
+                )
             assert is_te_min_version(
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
