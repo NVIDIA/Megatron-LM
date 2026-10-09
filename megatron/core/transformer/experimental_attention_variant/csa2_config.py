@@ -51,11 +51,15 @@ def validate_csa2_config(config) -> None:
     }
     if config.recompute_granularity is not None:
         if config.recompute_granularity == "full":
-            raise NotImplementedError(
-                "CSA2 cross-layer state requires eager attention; full recompute "
-                "re-runs attention layers and re-publishes cross-layer KV"
-            )
-        if config.recompute_granularity == "selective":
+            if (config.dsa_indexer_loss_coeff or 0) > 0:
+                raise NotImplementedError(
+                    "CSA2 full recompute does not yet support indexer-loss tracking"
+                )
+            if config.recompute_method != "uniform" or config.recompute_num_layers != 1:
+                raise NotImplementedError(
+                    "CSA2 full recompute currently checkpoints one layer per region"
+                )
+        elif config.recompute_granularity == "selective":
             _attn_in_recompute = set(config.recompute_modules or []) & _CSA2_ATTN_RECOMPUTE_MODULES
             if _attn_in_recompute:
                 raise NotImplementedError(
