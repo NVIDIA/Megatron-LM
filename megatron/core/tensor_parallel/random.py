@@ -919,6 +919,12 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+        # A custom autograd.Function is not attached to the graph when none of
+        # its tensor inputs require gradients.  Such a checkpoint has no saved
+        # tensors and cannot be replayed, but its output can still feed a later
+        # trainable operation (for example, a frozen prefix before LoRA). Keep
+        # that output resident and exclude it from unified recomputation.
+        self._needs_recompute = any(output.requires_grad for output in self.outputs)
 
         # Auto-register to manager if provided
         if self.ckpt_manager is not None:
@@ -933,7 +939,7 @@ class CheckpointWithoutOutput(object):
 
         # The recomputation has been triggered already. Just return.
         # Handle cudagraphs: do nothing if currently in graph warmup
-        if self.ctx is None or is_graph_warmup():
+        if self.ctx is None or is_graph_warmup() or not self._needs_recompute:
             return
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
@@ -985,6 +991,12 @@ class CheckpointWithoutOutput(object):
 
     def _discard_outputs(self):
         """Release output storage, preserving outputs that alias retained inputs."""
+        # Outputs from a checkpoint whose inputs did not require gradients are
+        # not represented by an autograd context and cannot be recomputed. They
+        # may nevertheless be consumed by a later trainable operation, so keep
+        # their storage for the forward/backward interval.
+        if not self._needs_recompute:
+            return
         if self.retain_input_tensors:
             # Skip outputs whose storage is shared with a saved input — freeing those
             # would destroy the data needed for recomputation (e.g. TE.ops.Sequential

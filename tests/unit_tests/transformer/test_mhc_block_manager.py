@@ -129,6 +129,23 @@ class TestCheckpointWithoutOutputManagerAPI:
         with pytest.raises(ValueError):
             manager.add_checkpoint(ckpt)
 
+    def test_frozen_checkpoint_is_retained_and_not_recomputed(self):
+        """A no-grad prefix may feed a later trainable operation."""
+        manager = CheckpointWithoutOutputManager()
+        frozen_input = torch.randn(4, 4, device='cuda')
+        frozen_output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            lambda x: x * 2, frozen_input
+        )
+        trainable_weight = torch.randn(4, 4, device='cuda', requires_grad=True)
+        output = frozen_output @ trainable_weight
+
+        manager.discard_all_outputs_and_register_unified_recompute(output)
+
+        assert not frozen_output.requires_grad
+        assert frozen_output.untyped_storage().size() > 0
+        output.sum().backward()
+        assert trainable_weight.grad is not None
+
 
 class TestCheckpointManagerSequentialChain:
     """Test CheckpointWithoutOutputManager with sequential checkpoint chains."""
