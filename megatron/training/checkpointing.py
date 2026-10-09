@@ -53,6 +53,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import (
+    get_attr_wrapped_model,
     get_pg_rank,
     get_pg_size,
     grant_shape_mismatch_for_gtp_padding,
@@ -76,6 +77,7 @@ try:
         preprocess_state_dict_for_uneven_dtensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        get_ep_rank_and_size,
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
@@ -1922,7 +1924,11 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     # layout used on disk. No-op for unfused models.
     apply(handle_mla_down_proj_in_state_dict)
     if args.num_experts:
-        state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
+        # Name the experts by the model's own expert-parallel layout.
+        ep_rank, ep_size = get_ep_rank_and_size(get_attr_wrapped_model(model, "pg_collection"))
+        state_dict['model'] = handle_experts_in_state_dict(
+            state_dict['model'], args.num_experts, ep_rank=ep_rank, ep_size=ep_size
+        )
     # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
     # above resolve keys against live module paths, which still use the new name.
     apply(handle_mtp_in_state_dict)
