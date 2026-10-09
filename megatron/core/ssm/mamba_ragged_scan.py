@@ -39,7 +39,10 @@ from torch.autograd.function import once_differentiable
 _STATE_BLOCK = 256
 
 
-@triton.jit
+# Strides are runtime arguments so a new chunk count does not compile a new kernel; the dA
+# head stride (nchunks * chunk_size) is not specialized at all. IDX is tl.int32, or tl.int64
+# when a tensor reaches 2^31 elements (see _index_dtype).
+@triton.jit(do_not_specialize=["stride_a_head"])
 def _forest_state_fwd_kernel(
     chunk_states,
     dA,
@@ -47,18 +50,19 @@ def _forest_state_fwd_kernel(
     root_segments,
     out,
     dim: tl.constexpr,
-    stride_chunk: tl.constexpr,
-    stride_head: tl.constexpr,
-    stride_dim: tl.constexpr,
-    stride_a_head: tl.constexpr,
-    stride_a_chunk: tl.constexpr,
-    stride_out_chunk: tl.constexpr,
-    stride_out_head: tl.constexpr,
+    stride_chunk,
+    stride_head,
+    stride_dim,
+    stride_a_head,
+    stride_a_chunk,
+    stride_out_chunk,
+    stride_out_head,
     BLOCK: tl.constexpr,
+    IDX: tl.constexpr,
 ):
     tile = tl.program_id(0)
     root = tl.program_id(1)
-    head = tl.program_id(2)
+    head = tl.program_id(2).to(IDX)
     offsets = tile * BLOCK + tl.arange(0, BLOCK)
     valid = offsets < dim
     state_base = chunk_states + head * stride_head + offsets * stride_dim
@@ -66,8 +70,8 @@ def _forest_state_fwd_kernel(
     a_base = dA + head * stride_a_head
     first_segment = tl.load(root_segments + root)
     stop_segment = tl.load(root_segments + root + 1)
-    prefix_start = tl.load(segment_chunks + first_segment)
-    prefix_stop = tl.load(segment_chunks + first_segment + 1)
+    prefix_start = tl.load(segment_chunks + first_segment).to(IDX)
+    prefix_stop = tl.load(segment_chunks + first_segment + 1).to(IDX)
 
     # Keep the FP32 accumulator live across chunks, including at the fork.
     # The stored entries have the same rounding as upstream state passing.
@@ -79,8 +83,8 @@ def _forest_state_fwd_kernel(
         prefix_state = scale * prefix_state + delta
 
     for segment in range(first_segment + 1, stop_segment):
-        start = tl.load(segment_chunks + segment)
-        stop = tl.load(segment_chunks + segment + 1)
+        start = tl.load(segment_chunks + segment).to(IDX)
+        stop = tl.load(segment_chunks + segment + 1).to(IDX)
         state = prefix_state
         for chunk in range(start, stop):
             tl.store(out_base + chunk * stride_out_chunk, state, valid)
@@ -89,7 +93,8 @@ def _forest_state_fwd_kernel(
             state = scale * state + delta
 
 
-@triton.jit
+# As in the forward kernel; the dA_tiles head stride (nchunks * tiles) also varies per pack.
+@triton.jit(do_not_specialize=["stride_a_head", "stride_da_head"])
 def _forest_state_bwd_kernel(
     entries,
     direct_grads,
@@ -100,26 +105,27 @@ def _forest_state_bwd_kernel(
     dA_tiles,
     converted_entries,
     dim: tl.constexpr,
-    stride_entry_chunk: tl.constexpr,
-    stride_entry_head: tl.constexpr,
-    stride_entry_dim: tl.constexpr,
-    stride_direct_chunk: tl.constexpr,
-    stride_direct_head: tl.constexpr,
-    stride_direct_dim: tl.constexpr,
-    stride_a_head: tl.constexpr,
-    stride_a_chunk: tl.constexpr,
-    stride_grad_chunk: tl.constexpr,
-    stride_grad_head: tl.constexpr,
-    stride_da_head: tl.constexpr,
-    stride_da_chunk: tl.constexpr,
-    stride_converted_chunk: tl.constexpr,
-    stride_converted_head: tl.constexpr,
+    stride_entry_chunk,
+    stride_entry_head,
+    stride_entry_dim,
+    stride_direct_chunk,
+    stride_direct_head,
+    stride_direct_dim,
+    stride_a_head,
+    stride_a_chunk,
+    stride_grad_chunk,
+    stride_grad_head,
+    stride_da_head,
+    stride_da_chunk,
+    stride_converted_chunk,
+    stride_converted_head,
     CONVERT_ENTRIES: tl.constexpr,
     BLOCK: tl.constexpr,
+    IDX: tl.constexpr,
 ):
     tile = tl.program_id(0)
     root = tl.program_id(1)
-    head = tl.program_id(2)
+    head = tl.program_id(2).to(IDX)
     offsets = tile * BLOCK + tl.arange(0, BLOCK)
     valid = offsets < dim
     entry_base = entries + head * stride_entry_head + offsets * stride_entry_dim
@@ -131,15 +137,15 @@ def _forest_state_bwd_kernel(
         converted_base = converted_entries + head * stride_converted_head + offsets
     first_segment = tl.load(root_segments + root)
     stop_segment = tl.load(root_segments + root + 1)
-    prefix_start = tl.load(segment_chunks + first_segment)
-    prefix_stop = tl.load(segment_chunks + first_segment + 1)
+    prefix_start = tl.load(segment_chunks + first_segment).to(IDX)
+    prefix_stop = tl.load(segment_chunks + first_segment + 1).to(IDX)
 
     # Sum siblings in a fixed reverse order in FP32. No atomic state updates,
     # no materialized per-branch initial-state gradients, and no host loops.
     prefix_adjoint = tl.full((BLOCK,), 0.0, tl.float32)
     for segment in range(stop_segment - 1, first_segment, -1):
-        start = tl.load(segment_chunks + segment)
-        stop = tl.load(segment_chunks + segment + 1)
+        start = tl.load(segment_chunks + segment).to(IDX)
+        stop = tl.load(segment_chunks + segment + 1).to(IDX)
         adjoint = tl.full((BLOCK,), 0.0, tl.float32)
         for chunk in range(stop - 1, start - 1, -1):
             tl.store(grad_base + chunk * stride_grad_chunk, adjoint, valid)
@@ -165,6 +171,14 @@ def _forest_state_bwd_kernel(
             tl.store(converted_base + chunk * stride_converted_chunk, entry, valid)
 
 
+def _index_dtype(*tensors):
+    """Return the Triton index dtype: int64 only when an element offset can reach 2^31."""
+    span = max(
+        sum((size - 1) * stride for size, stride in zip(t.shape, t.stride())) for t in tensors
+    )
+    return tl.int64 if span >= 2**31 else tl.int32
+
+
 def _forest_state_fwd(states, dA, segment_chunks, root_segments, out_dtype):
     _, nchunks, nheads, dim = states.shape
     out = torch.empty((1, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
@@ -185,6 +199,7 @@ def _forest_state_fwd(states, dA, segment_chunks, root_segments, out_dtype):
             out.stride(1),
             out.stride(2),
             BLOCK=_STATE_BLOCK,
+            IDX=_index_dtype(states, dA, out),
         )
     return out
 
@@ -223,6 +238,7 @@ def _forest_state_bwd(entries, dA, direct_grads, segment_chunks, root_segments, 
             converted.stride(2),
             CONVERT_ENTRIES=converted is not entries,
             BLOCK=_STATE_BLOCK,
+            IDX=_index_dtype(entries, direct_grads, dA, chunk_grads, dA_tiles, converted),
         )
     return chunk_grads, dA_tiles.sum(dim=-1).to(dA.dtype), converted
 

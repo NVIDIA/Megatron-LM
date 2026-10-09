@@ -250,3 +250,153 @@ class TestSharedPrefixMambaBackends:
         hidden_states = torch.randn(layout.total_len, 1, 256, device="cuda", dtype=torch.bfloat16)
         with pytest.raises(ValueError, match="NRL_SP_MAMBA_IMPL must be one of"):
             shared_prefix.forward_hybrid_stack_shared_prefix(stack, hidden_states, layout)
+
+
+def _require_free_memory(nbytes):
+    if torch.cuda.mem_get_info()[0] < nbytes:
+        pytest.skip(f"requires {nbytes / 2**30:.0f} GiB of free GPU memory")
+
+
+def _jit_variants(*kernels):
+    counts = []
+    for kernel in kernels:
+        caches = getattr(kernel, "device_caches", None)
+        if caches is None:
+            pytest.skip("this Triton version does not expose JIT caches")
+        counts.append(sum(len(cache[0]) for cache in caches.values()))
+    return counts
+
+
+def _ragged_step(completion_lens):
+    """Run the ragged gather and forest-state kernels forward and backward on one small root."""
+    from megatron.core.ssm.mamba_ragged import _RaggedGather, ragged_mamba_layout
+    from megatron.core.ssm.mamba_ragged_scan import _forest_state_bwd, _forest_state_fwd
+
+    chunk_size, heads, dim = 16, 2, 64
+    metadata = ragged_mamba_layout(
+        ((40, tuple(completion_lens)),), chunk_size, 4, torch.device("cuda")
+    )
+    value = torch.randn(metadata.input_tokens, 1, 48, device="cuda", requires_grad=True)
+    gathered = _RaggedGather.apply(value, metadata.convolution_indices, metadata.contributors)
+    gathered.backward(torch.randn_like(gathered))
+
+    nchunks = metadata.scan_tokens // chunk_size
+    states = torch.randn(1, nchunks, heads, dim, device="cuda")
+    # The scan passes dA_cumsum[..., -1], whose head stride grows with the chunk count.
+    dA = -torch.rand(1, heads, nchunks, chunk_size, device="cuda")[..., -1]
+    direct = torch.randn(1, nchunks, heads, dim, device="cuda")
+    boundaries = (metadata.segment_chunks, metadata.root_segments)
+    forward = _forest_state_fwd(states, dA, *boundaries, torch.bfloat16)
+    entries = _forest_state_fwd(states, dA, *boundaries, torch.float32)
+    backward = _forest_state_bwd(entries, dA, direct, *boundaries, torch.bfloat16)
+    return (gathered.detach(), value.grad, forward, entries, *backward)
+
+
+@requires_mamba_kernels
+class TestRaggedMambaKernels:
+
+    def test_kernels_compile_once_across_pack_lengths_and_chunk_counts(self):
+        from megatron.core.ssm import mamba_ragged, mamba_ragged_scan
+
+        kernels = (
+            mamba_ragged._gather_forward,
+            mamba_ragged._gather_backward,
+            mamba_ragged_scan._forest_state_fwd_kernel,
+            mamba_ragged_scan._forest_state_bwd_kernel,
+        )
+        _ragged_step((3, 9))
+        compiled = _jit_variants(*kernels)
+        # New physical lengths and new chunk counts with the same group size.
+        for completion_lens in ((4, 9), (3, 10), (5, 30), (21, 70), (100, 3)):
+            _ragged_step(completion_lens)
+        assert _jit_variants(*kernels) == compiled
+
+    @pytest.mark.parametrize("completion_lens", [(3, 9), (21, 70, 0, 5)])
+    def test_int64_offsets_match_int32(self, monkeypatch, completion_lens):
+        import triton.language as tl
+
+        from megatron.core.ssm import mamba_ragged, mamba_ragged_scan
+
+        results = []
+        for index_dtype in (tl.int32, tl.int64):
+            select = lambda *tensors, dtype=index_dtype: dtype
+            monkeypatch.setattr(mamba_ragged, "_index_dtype", select)
+            monkeypatch.setattr(mamba_ragged_scan, "_index_dtype", select)
+            torch.manual_seed(0)
+            results.append(_ragged_step(completion_lens))
+        for int32_result, int64_result in zip(*results, strict=True):
+            assert torch.equal(int32_result, int64_result)
+
+    def test_gather_backward_matches_index_add_reference(self):
+        from megatron.core.ssm.mamba_ragged import _RaggedGather, ragged_mamba_layout
+
+        layout = ((70, (5, 33, 0, 64)), (20, (9,)), (16, (1, 2)))
+        metadata = ragged_mamba_layout(layout, 16, 4, torch.device("cuda"))
+        value = torch.randn(metadata.input_tokens, 1, 40, device="cuda", requires_grad=True)
+        gathered = _RaggedGather.apply(value, metadata.convolution_indices, metadata.contributors)
+        gradient = torch.randn_like(gathered)
+        gathered.backward(gradient)
+
+        indices = metadata.convolution_indices.long()
+        valid = indices >= 0
+        expected = torch.zeros_like(gathered)
+        expected[valid] = value.detach()[indices[valid]]
+        expected_grad = torch.zeros_like(value).index_add_(0, indices[valid], gradient[valid])
+        assert torch.equal(gathered, expected)
+        torch.testing.assert_close(value.grad, expected_grad)
+
+    def test_index_dtype_switches_to_int64_at_two_to_the_31(self):
+        import triton.language as tl
+
+        from megatron.core.ssm import mamba_ragged, mamba_ragged_scan
+
+        below = torch.empty(2**31 - 1, device="meta")
+        above = torch.empty(2**31 + 1, device="meta")
+        assert mamba_ragged._index_dtype(below) == tl.int32
+        assert mamba_ragged._index_dtype(below, above) == tl.int64
+        assert mamba_ragged_scan._index_dtype(torch.empty(4, 8, device="meta")) == tl.int32
+        assert mamba_ragged_scan._index_dtype(above) == tl.int64
+        # Strided views count their full span: dA_cumsum[..., -1] has few elements but large
+        # offsets.
+        view = torch.empty(1, 2**12, 2**20, device="meta")[..., -1]
+        assert view.numel() < 2**31
+        assert mamba_ragged_scan._index_dtype(view) == tl.int64
+
+    def test_gather_beyond_int32_offsets(self):
+        from megatron.core.ssm.mamba_ragged import _RaggedGather
+
+        _require_free_memory(24 * 2**30)
+        width = 8192
+        rows = 2**31 // width + 64
+        pattern = torch.arange(rows, device="cuda").remainder(251).to(torch.bfloat16)
+        value = pattern[:, None, None].expand(rows, 1, width).contiguous().requires_grad_(True)
+        # Reverse the rows so both source and destination offsets cross 2^31 elements.
+        indices = torch.arange(rows - 1, -1, -1, device="cuda", dtype=torch.int32)
+        contributors = indices[:, None].contiguous()
+        gathered = _RaggedGather.apply(value, indices, contributors)
+        rows_view = gathered.detach().view(rows, width)
+        assert torch.equal(rows_view.amin(dim=1), pattern.flip(0))
+        assert torch.equal(rows_view.amax(dim=1), pattern.flip(0))
+        gathered.backward(gathered.detach())
+        del gathered, rows_view
+        grad_rows = value.grad.view(rows, width)
+        assert torch.equal(grad_rows.amin(dim=1), pattern)
+        assert torch.equal(grad_rows.amax(dim=1), pattern)
+
+    def test_forest_state_forward_beyond_int32_offsets(self):
+        from megatron.core.ssm.mamba_ragged_scan import _forest_state_fwd
+
+        _require_free_memory(24 * 2**30)
+        heads, dim = 64, 8192
+        nchunks = 2**31 // (heads * dim) + 64
+        # dA = 0 keeps each state: every chunk after the first enters with state 1.
+        states = torch.zeros(1, nchunks, heads, dim, device="cuda")
+        states[0, 0] = 1
+        dA = torch.zeros(1, heads, nchunks, device="cuda")
+        segment_chunks = torch.tensor([0, nchunks], device="cuda", dtype=torch.int32)
+        root_segments = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        out = _forest_state_fwd(states, dA, segment_chunks, root_segments, torch.bfloat16)
+        del states
+        assert out[0, 0].abs().amax().item() == 0
+        assert out[0, 1:].amin().item() == 1
+        assert out[0, 1:].amax().item() == 1

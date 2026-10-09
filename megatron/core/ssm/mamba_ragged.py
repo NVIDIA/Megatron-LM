@@ -26,35 +26,43 @@ from megatron.core.models.hybrid.shared_prefix_layout import (
 from megatron.core.ssm.mamba_mixer import MAMBA_HAS_STATE_DTYPE, MambaMixer
 
 
+# IDX is tl.int32, or tl.int64 when a tensor reaches 2^31 elements (see _index_dtype).
 @triton.jit
-def _gather_forward(X, INDEX, Y, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0)
+def _gather_forward(X, INDEX, Y, WIDTH: tl.constexpr, BLOCK: tl.constexpr, IDX: tl.constexpr):
+    row = tl.program_id(0).to(IDX)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    source = tl.load(INDEX + row)
+    source = tl.load(INDEX + row).to(IDX)
     value = tl.load(X + source * WIDTH + col, (source >= 0) & (col < WIDTH), other=0)
     tl.store(Y + row * WIDTH + col, value, col < WIDTH)
 
 
+# CONTRIBUTORS is row-major [rows, COPIES], so no argument depends on the pack length. COPIES
+# depends only on the group size; the unrolled constexpr loop is ~1.4x faster than a runtime one.
 @triton.jit
 def _gather_backward(
     DY,
     CONTRIBUTORS,
     DX,
-    ROWS: tl.constexpr,
     WIDTH: tl.constexpr,
     COPIES: tl.constexpr,
     BLOCK: tl.constexpr,
+    IDX: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(IDX)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     value = tl.zeros((BLOCK,), tl.float32)
     # One owner per input element: deterministic FP32 accumulation, no atomics.
     for copy in range(COPIES - 1, -1, -1):
-        source = tl.load(CONTRIBUTORS + copy * ROWS + row)
+        source = tl.load(CONTRIBUTORS + row * COPIES + copy).to(IDX)
         value += tl.load(DY + source * WIDTH + col, (source >= 0) & (col < WIDTH), other=0).to(
             tl.float32
         )
     tl.store(DX + row * WIDTH + col, value, col < WIDTH)
+
+
+def _index_dtype(*tensors: torch.Tensor):
+    """Return the Triton index dtype: int64 only when an element offset can reach 2^31."""
+    return tl.int64 if max(tensor.numel() for tensor in tensors) >= 2**31 else tl.int32
 
 
 class _RaggedGather(torch.autograd.Function):
@@ -66,7 +74,7 @@ class _RaggedGather(torch.autograd.Function):
         ctx.save_for_backward(contributors)
         ctx.input_shape = value.shape
         _gather_forward[(indices.numel(), triton.cdiv(value.shape[-1], 256))](
-            value, indices, output, value.shape[-1], 256
+            value, indices, output, value.shape[-1], 256, _index_dtype(value, output)
         )
         return output
 
@@ -80,10 +88,10 @@ class _RaggedGather(torch.autograd.Function):
             gradient,
             contributors,
             output,
-            output.shape[0],
             output.shape[-1],
-            contributors.shape[0],
+            contributors.shape[1],
             256,
+            _index_dtype(gradient, output, contributors),
         )
         return output, None, None
 
@@ -94,6 +102,7 @@ class RaggedMambaLayout:
 
     convolution_indices: torch.Tensor
     convolution_sequences: torch.Tensor
+    # [input tokens, copies]: each input token's convolution rows, padded with -1.
     contributors: torch.Tensor
     scan_indices: torch.Tensor
     output_indices: torch.Tensor
@@ -172,8 +181,8 @@ def ragged_mamba_layout(
     counts = np.bincount(sources, minlength=input_start)
     starts = np.cumsum(counts) - counts
     copy_indices = np.arange(sources.size) - np.repeat(starts, counts)
-    inverse = np.full((int(counts.max()), input_start), -1, dtype=np.int32)
-    inverse[copy_indices, sources[order]] = destinations[order]
+    inverse = np.full((input_start, int(counts.max())), -1, dtype=np.int32)
+    inverse[sources[order], copy_indices] = destinations[order]
     if len(output_indices) != input_start:
         raise RuntimeError("Ragged Mamba output map does not cover the canonical input")
     tensor = lambda values: torch.tensor(values, dtype=torch.int32, device=device)

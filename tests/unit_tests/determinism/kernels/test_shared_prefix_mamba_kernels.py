@@ -97,7 +97,8 @@ def test_ragged_gather_replays(roots):
     out, grads = assert_replays_bit_exact(
         fn, (value,), grad_outputs={"out": grad}, contention=True, what="ragged gather"
     )
-    assert int((meta.contributors >= 0).sum(0).max()) > 1, "no row is copied to a sibling"
+    # contributors is [input_tokens, copies]: count the copies of each input row.
+    assert int((meta.contributors >= 0).sum(1).max()) > 1, "no row is copied to a sibling"
     index = meta.convolution_indices.long()
     expected = torch.where(
         (index >= 0)[:, None, None], value.detach()[index.clamp_min(0)], value.new_zeros(())
