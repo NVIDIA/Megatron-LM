@@ -792,6 +792,7 @@ class TransformerConfig(ModelParallelConfig):
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
+    Requires BF16 or FP16 model parameters when GLU is enabled.
     """
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
@@ -1124,7 +1125,7 @@ class TransformerConfig(ModelParallelConfig):
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
-    advanced fused kernels."""
+    advanced fused kernels. Requires BF16 or FP16 model parameters when GLU is enabled."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
     """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
@@ -2891,6 +2892,15 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
+
+        has_glu_interleave = self.moe_mlp_glu_interleave_size is not None or (
+            self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        )
+        if self.gated_linear_unit and has_glu_interleave and self.params_dtype == torch.float32:
+            raise ValueError(
+                "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
+            )
 
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu, quick_gelu]:

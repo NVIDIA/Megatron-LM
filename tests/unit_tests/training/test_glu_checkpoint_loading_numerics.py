@@ -3,6 +3,7 @@
 """Import canonical checkpoints into real DDP MoE models with active or inactive GLU layouts."""
 
 import sys
+from copy import deepcopy
 
 import pytest
 import torch
@@ -10,9 +11,10 @@ import torch
 from megatron.core import dist_checkpointing
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.enums import ModelType
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.training import checkpointing
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import get_args, set_args
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -71,6 +73,7 @@ def _setup_model(
     precision,
     load,
     gated=True,
+    restore_optimizer=False,
 ):
     args = case.create_test_args(
         precision=precision,
@@ -96,8 +99,8 @@ def _setup_model(
     args.ckpt_assume_constant_structure = False
     args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
-    args.no_save_optim = True
-    args.no_load_optim = True
+    args.no_save_optim = not restore_optimizer
+    args.no_load_optim = not restore_optimizer
     args.no_save_rng = True
     args.no_load_rng = True
     args.load_main_params_from_ckpt = True
@@ -118,12 +121,98 @@ def _setup_model(
     assert experts._with_fused_impl == use_op_fuser
     assert experts.config.gated_linear_unit == gated
     assert not experts.config.bias_activation_fusion
-    if load:
+    if load and not restore_optimizer:
         # setup_model_and_optimizer calls the real loader once, including master initialization.
         assert args.iteration == 1
         # Rebuild model storage from the loaded FP32 masters before checking exact rows.
         optimizer.quantize_and_sync_model_params_from_main_params()
     return model, optimizer, scheduler, experts
+
+
+def _snapshot_state(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _snapshot_state(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_snapshot_state(item) for item in value)
+    return deepcopy(value)
+
+
+def _assert_state_equal(actual, expected, path="state"):
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(
+            actual, expected, rtol=0, atol=0, msg=lambda message: f"{path}: {message}"
+        )
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys(), path
+        for key in expected:
+            _assert_state_equal(actual[key], expected[key], f"{path}.{key}")
+    elif isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected), path
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            _assert_state_equal(actual_item, expected_item, f"{path}[{index}]")
+    else:
+        assert actual == expected, path
+
+
+def _snapshot_training_state(model, optimizer, scheduler):
+    args = get_args()
+    optimizer_states = []
+    for part in getattr(optimizer, "chained_optimizers", [optimizer]):
+        assert isinstance(part, DistributedOptimizer)
+        assert part.config.optimizer == "adam"
+        assert not part.config.use_precision_aware_optimizer
+        assert torch.distributed.get_world_size(part.data_parallel_group) > 1
+        masters = [param for group in part.optimizer.param_groups for param in group["params"]]
+        assert masters and all(param.dtype == torch.float32 for param in masters)
+        assert sum(param.numel() for param in masters) < sum(
+            param.numel() for group in part.model_float16_groups for param in group
+        )
+        states = [part.optimizer.state[param] for param in masters]
+        for name in ("exp_avg", "exp_avg_sq"):
+            assert all(name in state for state in states)
+            assert any(torch.count_nonzero(state[name]).item() for state in states)
+        # The common state includes Adam step counts and group LR/WD; parameter
+        # state includes each local FP32 master shard and both Adam moments.
+        common = part.state_dict()
+        assert all(group["step"] == args.iteration for group in common["optimizer"]["param_groups"])
+        optimizer_states.append({"common": common, "masters": masters, "state": states})
+    assert scheduler.num_steps == args.consumed_train_samples
+    return _snapshot_state(
+        {
+            "model": dict(model[0].named_parameters()),
+            "optimizer": optimizer_states,
+            "scheduler": scheduler.state_dict(),
+            "iteration": args.iteration,
+            "consumed_train_samples": args.consumed_train_samples,
+        }
+    )
+
+
+def _train_step(case, model, optimizer, scheduler):
+    model[0].train()
+    model[0].zero_grad_buffer()
+    optimizer.zero_grad()
+    model[0].set_is_first_microbatch()
+    batch = case.get_batch()
+    loss = model[0](
+        input_ids=batch[0],
+        labels=batch[1],
+        position_ids=batch[2],
+        attention_mask=batch[3],
+        loss_mask=batch[4],
+    ).mean()
+    assert torch.isfinite(loss)
+    loss.backward()
+    model[0].finish_grad_sync()
+    update_successful, _, _ = optimizer.step()
+    assert update_successful
+    args = get_args()
+    scheduler.step(increment=args.global_batch_size)
+    args.iteration += 1
+    args.consumed_train_samples += args.global_batch_size
+    return loss.detach().float().cpu()
 
 
 def _canonical_parameters(*, gated=True):
@@ -439,3 +528,85 @@ def test_non_glu_checkpoint_ignores_interleave_size(
         torch.distributed.barrier()
         _assert_checkpoint_parameters(directory, 2, canonical)
         _assert_parameters(experts, canonical)
+
+
+@pytest.mark.parametrize("interleave", [None, 32], ids=["canonical", "interleaved"])
+def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
+    moe_case, tmp_path_dist_ckpt, interleave
+):
+    """Restore real DP shards and Adam state, then compare two further parameter updates.
+
+    Saving after two updates exercises nonzero moments and an advanced LR schedule.
+    Compare every model parameter, FP32 master, Adam moment/step, and scheduler state
+    exactly, both immediately after restore and after each subsequent update. Dropout
+    is disabled and each step uses the same deterministic batch, so RNG loading is
+    deliberately unnecessary. Full optimizer loading must not rebuild model weights
+    from masters before the immediate model comparison.
+    """
+    numerics._skip_if_unsupported("bf16")
+    setup_kwargs = dict(
+        single_weight=False,
+        single_bias=False,
+        interleave=interleave,
+        use_op_fuser=False,
+        precision="bf16",
+        restore_optimizer=True,
+    )
+    with TempNamedDir(tmp_path_dist_ckpt / "bf16_optimizer_resume", sync=True) as directory:
+        model, optimizer, scheduler, experts = _setup_model(
+            moe_case, directory, load=False, **setup_kwargs
+        )
+        reference_losses, reference_states = [], []
+        for _ in range(4):
+            reference_losses.append(_train_step(moe_case, model, optimizer, scheduler))
+            reference_states.append(_snapshot_training_state(model, optimizer, scheduler))
+        del experts, model, optimizer, scheduler
+
+        model, optimizer, scheduler, experts = _setup_model(
+            moe_case, directory, load=False, **setup_kwargs
+        )
+        for step in range(2):
+            loss = _train_step(moe_case, model, optimizer, scheduler)
+            _assert_state_equal(loss, reference_losses[step])
+            _assert_state_equal(
+                _snapshot_training_state(model, optimizer, scheduler), reference_states[step]
+            )
+
+        canonical = {name: _read_parameter(experts, name) for name in _canonical_parameters()}
+        assert all(tensor.dtype == torch.bfloat16 for tensor in canonical.values())
+        if interleave is not None:
+            for name, tensor in canonical.items():
+                if name.startswith("linear_fc1."):
+                    # Independent oracle: collect alternating gate/up blocks, without
+                    # using the production reshape/transpose conversion.
+                    blocks = tensor.split(interleave, dim=1)
+                    canonical[name] = torch.cat((*blocks[::2], *blocks[1::2]), dim=1)
+
+        args = get_args()
+        assert args.no_save_optim is False and args.no_load_optim is False
+        assert (
+            checkpointing._build_sharded_state_dict_metadata(args)["distrib_optim_sharding_type"]
+            == "dp_reshardable"
+        )
+        force_param_sync(model, optimizer=optimizer)
+        checkpointing.save_checkpoint(2, model, optimizer, scheduler, 0)
+        torch.distributed.barrier()
+        _assert_state_equal(
+            _snapshot_training_state(model, optimizer, scheduler), reference_states[1]
+        )
+        _assert_checkpoint_parameters(directory, 2, canonical)
+        del experts, model, optimizer, scheduler
+
+        model, optimizer, scheduler, experts = _setup_model(
+            moe_case, directory, load=True, **setup_kwargs
+        )
+        # No extra master -> model sync here: independently check both loaded copies.
+        _assert_state_equal(
+            _snapshot_training_state(model, optimizer, scheduler), reference_states[1]
+        )
+        for step in range(2, 4):
+            loss = _train_step(moe_case, model, optimizer, scheduler)
+            _assert_state_equal(loss, reference_losses[step])
+            _assert_state_equal(
+                _snapshot_training_state(model, optimizer, scheduler), reference_states[step]
+            )

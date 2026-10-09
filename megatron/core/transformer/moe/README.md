@@ -508,6 +508,10 @@ per-expert weights and single grouped weights are supported. Shared experts use
 their separate `--moe-shared-expert-glu-interleave-size` setting when
 `--use-grouped-gemm-for-shared-expert` is enabled.
 
+GLU interleaving is unsupported with FP32 model parameters and is rejected during
+configuration validation. BF16 and FP16 model parameters remain supported,
+including when the optimizer uses FP32 master weights.
+
 For `torch` and `torch_dist` checkpoints, model weights are saved in contiguous
 `[all gate | all up]` layout. Optimizer master weights and moments retain their
 runtime layout, described by the existing saved configuration. GLU conversion
