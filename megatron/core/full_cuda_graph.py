@@ -10,6 +10,7 @@ import torch
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
     get_all_rng_states,
+    prime_cuda_rng_states_for_graph_capture,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,6 +234,8 @@ class FullCudaGraphWrapper:
                 pool=get_graph_pool(self.use_single_mempool),
                 capture_error_mode="thread_local",
             ):
+                # Must precede all other captured work; see the helper's docstring.
+                prime_cuda_rng_states_for_graph_capture()
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )

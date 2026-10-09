@@ -192,9 +192,9 @@ from .global_vars import (
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
+    get_train_state,
     get_wandb_writer,
     get_run_config,
-    set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1692,7 +1692,6 @@ def pretrain(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
-    set_run_config(cfg_container)
     timers = get_timers()
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
@@ -2025,7 +2024,7 @@ def pretrain(
             # Determine which context manager to use for model allocation
             # Use torch_memory_saver if offloading is requested but UVM is not enabled
             use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
+                args.rl_offload_inference_model_weights
                 and uvm_level == 0
                 and HAVE_TORCH_MEMORY_SAVER
             )
@@ -2050,9 +2049,9 @@ def pretrain(
             inference_model[0].eval()
 
         # Validate: offloading flag requires a separate inference model
-        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
+        if args.rl_offload_inference_model_weights and inference_model is None:
             raise ValueError(
-                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
+                "--rl-offload-inference-model-weights requires a separate inference model. "
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
@@ -2467,7 +2466,7 @@ def wrap_model_chunks_with_ddp(
         DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
-        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
         if is_mfsdp_v2
         else nullcontext()
     )
@@ -2563,6 +2562,7 @@ def _forward_backward_grad_context(args):
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
+    cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
@@ -2758,7 +2758,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
@@ -3482,7 +3482,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
-    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    timers('optimizer', log_level=1).start(barrier=config.barrier_with_L1_time)
     _opt_cm = (
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
@@ -3497,7 +3497,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
-    if args.qk_clip or args.log_max_attention_logit:
+    if args.qk_clip or config.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
@@ -3685,7 +3685,7 @@ def training_log(
     # iteration always prints: under --log-interval 100 that is an extra line inside an
     # interval still accumulating, so it must not reset; under --log-interval 1 that line
     # *is* the interval, so it must, or the next print covers two iterations.
-    should_reset = not is_first_iteration or iteration % args.log_interval == 0
+    should_reset = not is_first_iteration or iteration % cfg.logger.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3715,7 +3715,7 @@ def training_log(
 
     # Logging.
     timers_to_log = []
-    if args.timing_log_level >= 1:
+    if cfg.logger.timing_log_level >= 1:
         timers_to_log.extend([
             'dataloader-next',
             'batch-generator',
@@ -3732,7 +3732,7 @@ def training_log(
             'optimizer-copy-main-to-model-params',
             'optimizer',
         ])
-    if args.timing_log_level >= 2:
+    if cfg.logger.timing_log_level >= 2:
         timers_to_log.extend([
             'forward-compute',
             'backward-compute',
@@ -3775,7 +3775,7 @@ def training_log(
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0):
+    if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
         if learning_rate is not None:
@@ -3803,12 +3803,12 @@ def training_log(
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
-        if args.log_loss_scale_to_tensorboard:
+        if cfg.logger.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
-        if args.log_world_size_to_tensorboard:
+        if cfg.logger.log_world_size_to_tensorboard:
             writer.add_scalar('world-size', args.world_size, iteration)
             writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
             if wandb_writer:
@@ -3835,7 +3835,7 @@ def training_log(
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
-        if args.log_memory_to_tensorboard:
+        if cfg.logger.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
                 "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
@@ -3847,7 +3847,8 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
-        if args.log_max_attention_logit:
+        model_config = get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
+        if model_config is not None and model_config.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
@@ -3962,7 +3963,7 @@ def training_log(
         )
 
     # Dump memory snapshot and print metrics to stdout.
-    if iteration % args.log_interval == 0 or is_first_iteration:
+    if iteration % cfg.logger.log_interval == 0 or is_first_iteration:
         should_prof_rank = (cfg.profiling.profile_ranks == [] or safe_get_rank() in cfg.profiling.profile_ranks)  # [] is all ranks
         if cfg.profiling.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
@@ -3981,12 +3982,12 @@ def training_log(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
-        one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
+        one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
         # We log to stdout after the first iteration (controlled by `is_first_iteration`)
         # to document initialization overhead. Log statistics to TensorBoard and
         # WandB according to the regular schedule.
-        if args.log_timers_to_tensorboard and not is_first_iteration:
+        if cfg.logger.log_timers_to_tensorboard and not is_first_iteration:
             if writer:
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
@@ -4008,14 +4009,14 @@ def training_log(
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
-        if args.log_throughput:
+        if cfg.logger.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
+            if cfg.logger.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        if args.log_energy:
+        if cfg.logger.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
             log_string += f' energy per GPU (J/iter/GPU): {energy:.1f} |'
@@ -4107,7 +4108,7 @@ def training_log(
                 meter=_otel_telemetry_log.meter,
                 step_duration_ms=elapsed_time_per_iteration * 1000.0,
                 loss=_avg_loss,
-                throughput_tflops=throughput if args.log_throughput else None,
+                throughput_tflops=throughput if cfg.logger.log_throughput else None,
                 grad_norm=grad_norm,
                 learning_rate=learning_rate,
                 skipped_iters=_otel_skipped_iters_snapshot,
@@ -4130,7 +4131,7 @@ def training_log(
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
-        if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
+        if cfg.logger.log_memory_interval is not None and iteration % cfg.logger.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(
                 f'(after {iteration} iterations)',
@@ -4143,30 +4144,31 @@ def training_log(
                 iteration=iteration,
                 timers=timers,
                 elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
-                throughput_tflops=throughput if args.log_throughput else None,
+                throughput_tflops=throughput if cfg.logger.log_throughput else None,
                 global_batch_size=batch_size,
                 wandb_writer=wandb_writer,
                 tb_writer=writer,
             )
 
         # Write timers to wandb, don't reset the counts.
-        if args.log_timers_to_tensorboard:
-            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
-            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
+        if cfg.logger.log_timers_to_tensorboard:
+            timers.write(timers_to_log, writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
+            timers.write(timers_to_log, wandb_writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
         # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
+        timers.log(timers_to_log, normalizer=cfg.logger.log_interval, reset=should_reset)
 
     return report_memory_flag
 
 
 def _should_compute_params_norm(args, iteration, is_first_iteration):
     """Whether this iteration can emit the parameter norm."""
-    return args.log_params_norm and (
+    cfg = get_run_config()
+    return cfg.logger.log_params_norm and (
         is_first_iteration
-        or iteration % args.log_interval == 0
+        or iteration % cfg.logger.log_interval == 0
         or (
-            bool(args.tensorboard_dir)
-            and iteration % args.tensorboard_log_interval == 0
+            bool(cfg.logger.tensorboard_dir)
+            and iteration % cfg.logger.tensorboard_log_interval == 0
         )
     )
 
@@ -4258,6 +4260,7 @@ def save_checkpoint_and_time(
     non_persistent_ckpt=False,
     train_data_iterator=None,
 ):
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
@@ -4374,7 +4377,7 @@ def save_checkpoint_and_time(
 
         one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
-        if args.log_progress and not non_persistent_ckpt:
+        if cfg.logger.log_progress and not non_persistent_ckpt:
             compute_throughputs_and_append_to_progress_log(
                 iteration, num_floating_point_operations_so_far
             )
@@ -4436,9 +4439,9 @@ def post_training_step_callbacks(
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % args.log_interval == 0 and args.log_straggler:
+    if iteration % cfg.logger.log_interval == 0 and args.log_straggler:
         # Use FLOPs accumulated since last log event and then reset the counter
-        stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
+        stimer.report(num_floating_point_operations_since_last_log_event, cfg.logger.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
 
     # Check weight hash across DP replicas.
@@ -4644,6 +4647,7 @@ def train(
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
+    train_state = get_train_state()
 
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -4760,7 +4764,7 @@ def train(
     if args.hybrid_context_parallel:
         train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
-    if args.run_workload_inspector_server:
+    if cfg.profiling.run_workload_inspector_server:
         try:
             import threading
 
@@ -4802,7 +4806,7 @@ def train(
         train_iters=args.train_iters,
         save=args.save,
         async_save=args.async_save,
-        log_throughput=args.log_throughput,
+        log_throughput=cfg.logger.log_throughput,
         num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
     )
 
@@ -4839,7 +4843,7 @@ def train(
     if config.finalize_model_grads_func is None:
         config.finalize_model_grads_func = finalize_model_grads
 
-    if args.log_energy:
+    if cfg.logger.log_energy:
         energy_monitor.setup()
         energy_monitor.resume()
 
@@ -4853,17 +4857,17 @@ def train(
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
     # layer).  advance_step() is called at the end of each train_step().
-    if getattr(args, 'moe_routing_trace_path', None):
+    if cfg.logger.moe_routing_trace_path:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        max_steps = getattr(args, 'moe_routing_trace_max_training_iters', None) or args.train_iters
+        max_steps = cfg.logger.moe_routing_trace_max_training_iters or args.train_iters
         init_moe_router_tracer(
-            output_dir=args.moe_routing_trace_path,
+            output_dir=cfg.logger.moe_routing_trace_path,
             max_steps=max_steps,
             rank=rank,
             training_mode=True,
-            capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
-            capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
-            dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+            capture_hidden_states=cfg.logger.moe_routing_trace_capture_hidden_states,
+            capture_logits=cfg.logger.moe_routing_trace_capture_logits,
+            dump_router_weights=cfg.logger.moe_routing_trace_dump_weights,
         )
         get_moe_router_tracer().register_hooks(model)
 
@@ -4957,13 +4961,13 @@ def train(
              torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
         if cfg.profiling.pytorch_profiler_collect_chakra:
-            et_dir = Path(f"{args.tensorboard_dir}/../chakra")
+            et_dir = Path(f"{cfg.logger.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
             et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         else:
             et = None
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            profile_dir = Path(f"{cfg.logger.tensorboard_dir}/../torch_profile")
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
@@ -5289,6 +5293,7 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        train_state.iteration += 1
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -5324,6 +5329,7 @@ def train(
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
+        train_state.consumed_train_samples += iteration_sequences
 
         # Use iteration_sequences as batch_size for floating point operations
         batch_size = iteration_sequences
@@ -5336,6 +5342,7 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
+        train_state.skipped_train_samples += num_skipped_samples_in_batch
         # Drain the per-iteration packed-sequence stats so the FLOPs computation
         # reflects THD per-chunk causal attention AND excludes padding tokens
         # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
@@ -5355,6 +5362,7 @@ def train(
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
+        train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
 
         # OTel: super-span over the whole post-step REPORTING block (loss-scale
         # sync, param-norm reduction, throughput/tensorboard/wandb logging). One
@@ -5429,7 +5437,7 @@ def train(
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid \
                 and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
-            if args.log_energy:
+            if cfg.logger.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
             if should_disable_forward_pre_hook(args):
@@ -5488,7 +5496,7 @@ def train(
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
-            if args.log_energy:
+            if cfg.logger.log_energy:
                 energy_monitor.resume()
             if args.num_experts is not None:
                 get_moe_metrics_tracker().clear()
@@ -5553,7 +5561,7 @@ def train(
         maybe_finalize_async_save(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
-    if args.log_energy:
+    if cfg.logger.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
@@ -5632,6 +5640,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
+    train_state = get_train_state()
 
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
@@ -5772,6 +5781,7 @@ def evaluate(
                         raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
 
             args.consumed_valid_samples += eval_batch_size
+            train_state.consumed_valid_samples += eval_batch_size
 
             if args.exit_duration_in_mins:
                 train_time = (time.time() - _TRAIN_START_TIME) / 60.0
@@ -5848,6 +5858,7 @@ def evaluate_and_print_results(
     is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
+    cfg = get_run_config()
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     if write_to_tensorboard:
@@ -5929,7 +5940,7 @@ def evaluate_and_print_results(
                     total_loss_dict[key].item(),
                     args.consumed_train_samples,
                 )
-                if args.log_validation_ppl_to_tensorboard:
+                if cfg.logger.log_validation_ppl_to_tensorboard:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
@@ -6101,6 +6112,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
+
+    train_state = get_train_state()
+    train_state.do_train = args.do_train
+    train_state.do_valid = args.do_valid
+    train_state.do_test = args.do_test
+
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
