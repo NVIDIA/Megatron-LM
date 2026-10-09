@@ -109,12 +109,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/models/hybrid/shared_prefix_fused.py",),
         tests=(K + "test_shared_prefix_attention.py",),
         kind="external-lib",
-        notes="Native FlashAttention varlen forward/private backward, eager online-softmax merge "
-        "and Q/K/V index_add accumulation. Exact output/gradient replay explicitly selects "
-        "NRL_SP_DETERMINISTIC_BACKWARD=1 AND deterministic Torch algorithms; default backward "
-        "has independent numerical checks without an exact-replay claim. CP1/2/4 tests use "
-        "real NCCL all-to-all, including replicated GQA KV heads. Deferred Triton opt-ins "
-        "are checked by executing the actual module import guards.",
+        notes="Native FlashAttention varlen forward and private backward (called by keyword, "
+        "flash-attn >= 2.7.0), eager online-softmax merge and FP32 K/V index_add_ "
+        "accumulation. Exact output/gradient replay needs only "
+        "torch.use_deterministic_algorithms(True): the backward passes "
+        "deterministic=torch.are_deterministic_algorithms_enabled() to FlashAttention. Fused "
+        "errors vs FP64 are bounded by 2x the dense-branch FlashAttention error. CP1/2/4 tests "
+        "use real NCCL all-to-all, including replicated GQA KV heads.",
     ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
@@ -164,12 +165,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_shared_prefix_attention.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py.",
+        "test_runtime_cp_attention.py. The shared-prefix branch (a forest attached by the Hybrid "
+        "stack selects shared_prefix_fused instead of core attention) is replayed through a real "
+        "SelfAttention at CP1/CP2 in test_shared_prefix_attention.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -627,35 +634,60 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_mamba_ragged_forest",
         sources=("megatron/core/ssm/mamba_ragged.py", "megatron/core/ssm/mamba_ragged_scan.py"),
-        tests=(K + "test_shared_prefix_mamba_kernels.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
         kind="triton",
         notes="_RaggedGather forward/backward (one owner per input element, fixed-order FP32 "
         "sibling sum, no atomics), channel-last causal_conv1d_fn with seq_idx, and the forest "
         "state-passing kernels around the private mamba_ssm SSD kernels, whose ddt/dD/ddA "
         "atomics need MAMBA_DETERMINISTIC=1 (negative control without it). Replayed kernel by "
         "kernel (star and forest, D per head and per head-dim, save_intermediates on/off "
-        "bitwise equal) and through a real MambaMixer's parameters.",
+        "bitwise equal) and through a real MambaMixer's parameters. "
+        "test_shared_prefix_mamba_backends.py checks int32 and int64 offsets bitwise, the "
+        "gather backward against index_add_ and compile reuse across lengths; "
+        "test_shared_prefix_mamba_numerics.py compares the layer with dense rows and checks "
+        "eval == train forward bitwise.",
     ),
     KernelEntry(
         name="ssm_mamba_sequence_packing",
         sources=("megatron/core/ssm/mamba_sequence_packing.py",),
-        tests=(K + "test_shared_prefix_mamba_kernels.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
         kind="dispatch",
         notes="Pads every sequence to a scan-chunk boundary and calls causal_conv1d_fn and "
         "mamba_chunk_scan_combined with seq_idx; scan_mamba_packed_recurrence is replayed "
-        "through a real MambaMixer's parameters in test_shared_prefix_mamba_kernels.py.",
+        "through a real MambaMixer's parameters in test_shared_prefix_mamba_kernels.py, and "
+        "the packed_recurrence backend is compared with dense rows in "
+        "test_shared_prefix_mamba_numerics.py.",
     ),
     KernelEntry(
         name="shared_prefix_hybrid_dispatch",
         sources=("megatron/core/models/hybrid/shared_prefix.py",),
-        tests=(K + "test_shared_prefix_mamba_kernels.py", K + "test_shared_prefix_attention.py"),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            K + "test_shared_prefix_attention.py",
+            "tests/unit_tests/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/models/hybrid/test_shared_prefix_model_parity.py",
+        ),
         kind="dispatch",
-        notes="forward_hybrid_stack_shared_prefix routes Mamba layers to the ragged forest "
-        "(mamba_ragged), the packed recurrence (mamba_sequence_packing) or its own state-fork "
-        "helpers, which call causal_conv1d_fn and mamba_chunk_scan_combined directly, and "
-        "attention layers to shared_prefix_fused. The ragged and packed scans are replayed in "
+        notes="forward_hybrid_stack_shared_prefix routes every Mamba layer through "
+        "NRL_SP_MAMBA_IMPL: the default ragged forest (mamba_ragged), the packed recurrence "
+        "(mamba_sequence_packing) or the opt-in state_fork/replay_prefix helpers, which call "
+        "causal_conv1d_fn and mamba_chunk_scan_combined directly; attention layers go to "
+        "shared_prefix_fused. The ragged and packed scans are replayed in "
         "test_shared_prefix_mamba_kernels.py and the attention in "
-        "test_shared_prefix_attention.py; the state-fork helpers have no layer-level replay.",
+        "test_shared_prefix_attention.py. test_shared_prefix_mamba_backends.py covers the "
+        "selector and dispatch; test_shared_prefix_mamba_numerics.py compares every backend "
+        "with dense rows and checks eval == train bitwise; test_shared_prefix_model_parity.py "
+        "compares HybridModel with dense rows and checks the feature-off path bitwise under "
+        "deterministic kernels. The state_fork/replay_prefix helpers have no bit-exact backward "
+        "replay.",
     ),
     KernelEntry(
         name="ssm_gated_delta_product",

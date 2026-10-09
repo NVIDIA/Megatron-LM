@@ -7,7 +7,8 @@ Exact replay needs only ``torch.use_deterministic_algorithms(True)``, which
 reference; their error must stay within twice the error of ordinary FlashAttention over
 the dense, unshared ``[prompt, completion]`` branches. CP1/2/4 tests use real NCCL
 exchanges and real FlashAttention forward/backward. No CUDA compute or communication
-implementation is substituted. The pass-plan, validation and cache tests run on CPU.
+implementation is substituted. The pass-plan, validation and cache tests run on CPU. One
+replay drives the shared-prefix branch of ``SelfAttention.forward`` at CP1 and CP2.
 """
 
 import itertools
@@ -18,6 +19,7 @@ import pytest
 import torch
 
 from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
     deterministic_algorithms,
@@ -489,3 +491,95 @@ def test_shared_prefix_cp_replays_and_matches_reference(attention, dtype, heads,
                     result, reference_inputs, reference_output, cotangent, shard=shard
                 )
             )
+
+
+@_CUDA
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_self_attention_shared_prefix_branch_replays(cp_size):
+    """Replay SelfAttention.forward's shared-prefix branch with real projections and RoPE.
+
+    The Hybrid stack attaches the forest to ``Attention._shared_prefix_forest`` around each layer
+    call; the branch then runs the fused forest attention (CP all-to-all at CP2) between the TE
+    QKV and output projections. Inputs, RoPE positions and CP shards are built as HybridModel
+    builds them.
+    """
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.models.hybrid.shared_prefix_layout import (
+        SharedPrefixForestLayout,
+        SharedPrefixLayout,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    if Utils.world_size % cp_size:
+        pytest.skip(f"CP{cp_size} needs a world size divisible by {cp_size}")
+    Utils.initialize_model_parallel(context_parallel_size=cp_size)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=64,
+            context_parallel_size=cp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+        )
+        module = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).cuda()
+        layout = SharedPrefixForestLayout(
+            (SharedPrefixLayout(64, (80, 80)), SharedPrefixLayout(32, (32, 32)))
+        )
+        physical_len = layout.total_len  # 320, a multiple of 2 * CP
+        hidden = torch.randn(physical_len, 1, config.hidden_size, device="cuda").bfloat16()
+        rotary_table = RotaryEmbedding(kv_channels=config.kv_channels, rotary_percent=1.0).get_emb(
+            max(layout.dense_branch_lengths)
+        )
+        positions = layout.padded_position_ids(physical_len, "cuda")
+        cp_group = module.pg_collection.cp
+        if cp_size > 1:
+            local = layout.cp_local_indices(physical_len, cp_size, cp_group.rank(), "cuda")
+            hidden, positions = hidden.index_select(0, local), positions.index_select(0, local)
+        inputs = dict(
+            hidden_states=hidden.detach().requires_grad_(True),
+            attention_mask=None,
+            rotary_pos_emb=rotary_table.index_select(0, positions),
+        )
+        module._shared_prefix_forest = layout.forest
+        try:
+            with deterministic_algorithms(True):
+                outputs, grads = assert_module_replays_bit_exact(
+                    module,
+                    inputs,
+                    replays=3,
+                    contention=True,
+                    what=f"SelfAttention shared-prefix branch CP{cp_size}",
+                )
+        finally:
+            del module._shared_prefix_forest
+        assert "in.hidden_states" in grads
+        assert any("linear_qkv" in name for name in grads)
+        assert any("linear_proj" in name for name in grads)
+        assert all(
+            torch.isfinite(tensor).all()
+            for tensors in (outputs, grads)
+            for tensor in tensors.values()
+        )
+    finally:
+        Utils.destroy_model_parallel()
